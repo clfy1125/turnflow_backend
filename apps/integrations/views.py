@@ -6,7 +6,7 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
-from drf_spectacular.utils import extend_schema, OpenApiResponse, OpenApiParameter
+from drf_spectacular.utils import extend_schema, OpenApiResponse, OpenApiParameter, OpenApiExample
 from django.shortcuts import redirect
 from django.http import HttpResponse
 from django.conf import settings
@@ -16,7 +16,7 @@ import secrets
 
 from apps.workspace.models import Workspace
 from apps.workspace.permissions import IsWorkspaceMember
-from .models import IGAccountConnection, AutoDMCampaign, SentDMLog
+from .models import IGAccountConnection, AutoDMCampaign, SentDMLog, SpamFilterConfig, SpamCommentLog
 from .serializers import (
     IGAccountConnectionSerializer,
     ConnectionStartResponseSerializer,
@@ -24,6 +24,9 @@ from .serializers import (
     AutoDMCampaignSerializer,
     AutoDMCampaignCreateSerializer,
     SentDMLogSerializer,
+    SpamFilterConfigSerializer,
+    SpamFilterConfigUpdateSerializer,
+    SpamCommentLogSerializer,
 )
 from .services import InstagramOAuthService, MockInstagramProvider
 import requests
@@ -1593,3 +1596,679 @@ def instagram_webhook(request):
         except Exception as e:
             logger.exception(f"Error processing webhook: {str(e)}")
             return HttpResponse("Error", status=500)
+
+
+class SpamFilterViewSet(viewsets.ViewSet):
+    """
+    스팸 필터 관리 ViewSet
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get_spam_filter(self, ig_connection_id):
+        """스팸 필터 설정 가져오기 (없으면 생성)"""
+        from rest_framework.exceptions import NotFound
+
+        try:
+            ig_connection = IGAccountConnection.objects.get(id=ig_connection_id)
+        except IGAccountConnection.DoesNotExist:
+            raise NotFound(
+                detail="Instagram 계정을 찾을 수 없습니다. 올바른 ig_connection_id를 사용하세요."
+            )
+
+        # 워크스페이스 멤버십 확인
+        if not ig_connection.workspace.memberships.filter(user=self.request.user).exists():
+            from rest_framework.exceptions import PermissionDenied
+
+            raise PermissionDenied("You are not a member of this workspace")
+
+        # 스팸 필터 설정 가져오기 또는 생성
+        spam_filter, created = SpamFilterConfig.objects.get_or_create(
+            ig_connection=ig_connection,
+            defaults={
+                "spam_keywords": ["아이돌", "주소창", "사건", "원본영상", "실시간검색"],
+                "block_urls": True,
+            },
+        )
+
+        return spam_filter
+
+    @extend_schema(
+        summary="스팸 필터 설정 조회",
+        description="""
+        ## 목적
+        Instagram Business 계정에 연결된 스팸 필터 설정을 조회합니다.
+        설정이 없는 경우 자동으로 기본 설정을 생성하여 반환합니다.
+        
+        ## 사용 시나리오
+        - 스팸 필터 관리 페이지 진입 시 현재 설정 로드
+        - 스팸 필터 활성화 상태 확인
+        - 현재 설정된 스팸 키워드 목록 확인
+        
+        ## 인증
+        - **Bearer 토큰 필수**
+        - 해당 Instagram 계정이 속한 워크스페이스의 멤버여야 함
+        
+        ## 기본 설정 (자동 생성 시)
+        - `status`: inactive (비활성)
+        - `spam_keywords`: ["아이돌", "주소창", "사건", "원본영상", "실시간검색"]
+        - `block_urls`: true
+        
+        ## 응답 필드
+        - `is_active`: 현재 활성화 여부 (boolean)
+        - `total_spam_detected`: 총 스팸 감지 수
+        - `total_hidden`: 총 숨김 처리 수
+        
+        ## 사용 예시
+        ```javascript
+        // Instagram 계정의 스팸 필터 설정 조회
+        const response = await fetch(
+            `/api/v1/integrations/spam-filters/ig-connections/${igConnectionId}/`,
+            {
+                method: 'GET',
+                headers: {
+                    'Authorization': `Bearer ${accessToken}`,
+                    'Content-Type': 'application/json'
+                }
+            }
+        );
+        
+        const config = await response.json();
+        console.log('활성화 상태:', config.is_active);
+        console.log('스팸 키워드:', config.spam_keywords);
+        ```
+        
+        ## 응답 예시
+        ```json
+        {
+            "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+            "ig_connection_id": "f1e2d3c4-b5a6-7890-dcba-fe0987654321",
+            "ig_username": "my_business_account",
+            "status": "active",
+            "spam_keywords": ["아이돌", "주소창", "사건", "원본영상"],
+            "block_urls": true,
+            "total_spam_detected": 127,
+            "total_hidden": 122,
+            "is_active": true,
+            "created_at": "2026-02-15T10:30:00Z",
+            "updated_at": "2026-02-18T02:00:00Z"
+        }
+        ```
+        """,
+        responses={
+            200: SpamFilterConfigSerializer,
+            401: OpenApiResponse(description="인증 실패 - Bearer 토큰이 없거나 유효하지 않음"),
+            403: OpenApiResponse(description="권한 없음 - 해당 워크스페이스의 멤버가 아님"),
+            404: OpenApiResponse(description="Instagram 계정을 찾을 수 없음"),
+        },
+    )
+    @action(detail=False, methods=["get"], url_path="ig-connections/(?P<ig_connection_id>[^/.]+)")
+    def get_config(self, request, ig_connection_id=None):
+        """스팸 필터 설정 조회"""
+        spam_filter = self.get_spam_filter(ig_connection_id)
+        serializer = SpamFilterConfigSerializer(spam_filter)
+        return Response(serializer.data)
+
+    @extend_schema(
+        summary="스팸 필터 설정 업데이트",
+        description="""
+        ## 목적
+        Instagram Business 계정의 스팸 필터 설정을 부분적으로 업데이트합니다.
+        상태, 스팸 키워드, URL 차단 설정을 개별적으로 또는 한 번에 변경할 수 있습니다.
+        
+        ## 사용 시나리오
+        - 스팸 필터 활성화/비활성화 토글
+        - 스팸 키워드 추가/제거
+        - URL 차단 기능 켜기/끄기
+        - 여러 설정 동시 변경
+        
+        ## 인증
+        - **Bearer 토큰 필수**
+        - 해당 Instagram 계정이 속한 워크스페이스의 멤버여야 함
+        
+        ## 업데이트 가능 항목
+        - `status`: 필터 상태 ("active" 또는 "inactive")
+        - `spam_keywords`: 스팸 키워드 배열 (최대 100개)
+        - `block_urls`: URL 포함 댓글 차단 여부 (boolean)
+        
+        ## 검증 규칙
+        - `spam_keywords`는 반드시 배열이어야 함
+        - 키워드는 최대 100개까지 설정 가능
+        - `status`는 "active" 또는 "inactive"만 허용
+        
+        ## 주의사항
+        - PATCH 메서드이므로 변경하고 싶은 필드만 전송하면 됨
+        - 스팸 키워드는 대소문자 구분 없이 검사됨
+        - 설정 변경 후 새로 수신되는 댓글부터 적용됨
+        
+        ## 사용 예시
+        ```javascript
+        // 스팸 필터 활성화 및 키워드 업데이트
+        const response = await fetch(
+            `/api/v1/integrations/spam-filters/ig-connections/${igConnectionId}/`,
+            {
+                method: 'PATCH',
+                headers: {
+                    'Authorization': `Bearer ${accessToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    status: 'active',
+                    spam_keywords: ['아이돌', '주소창', '사건', '원본영상', '실시간검색'],
+                    block_urls: true
+                })
+            }
+        );
+        
+        const updated = await response.json();
+        console.log('업데이트 완료:', updated);
+        ```
+        
+        ## 요청 예시 (키워드만 변경)
+        ```json
+        {
+            "spam_keywords": ["스팸키워드1", "스팸키워드2", "악성댓글"]
+        }
+        ```
+        
+        ## 요청 예시 (전체 변경)
+        ```json
+        {
+            "status": "active",
+            "spam_keywords": ["아이돌", "주소창", "사건"],
+            "block_urls": false
+        }
+        ```
+        """,
+        request=SpamFilterConfigUpdateSerializer,
+        responses={
+            200: SpamFilterConfigSerializer,
+            400: OpenApiResponse(
+                description="유효성 검증 실패",
+                examples=[
+                    OpenApiExample(
+                        "Validation Error",
+                        value={
+                            "spam_keywords": ["스팸 키워드는 최대 100개까지 설정할 수 있습니다."]
+                        },
+                    )
+                ],
+            ),
+            401: OpenApiResponse(description="인증 실패"),
+            403: OpenApiResponse(description="권한 없음"),
+            404: OpenApiResponse(description="Instagram 계정을 찾을 수 없음"),
+        },
+    )
+    @action(detail=False, methods=["patch"], url_path="ig-connections/(?P<ig_connection_id>[^/.]+)")
+    def update_config(self, request, ig_connection_id=None):
+        """스팸 필터 설정 업데이트"""
+        spam_filter = self.get_spam_filter(ig_connection_id)
+
+        serializer = SpamFilterConfigUpdateSerializer(spam_filter, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+
+        response_serializer = SpamFilterConfigSerializer(spam_filter)
+        return Response(response_serializer.data)
+
+    @extend_schema(
+        summary="스팸 필터 활성화",
+        description="""
+        ## 목적
+        Instagram Business 계정의 스팸 필터를 즉시 활성화합니다.
+        활성화 후 수신되는 모든 댓글에 대해 스팸 검사가 자동으로 수행됩니다.
+        
+        ## 사용 시나리오
+        - 스팸 필터 토글 버튼을 ON으로 전환할 때
+        - 스팸 댓글이 갑자기 많아져서 긴급하게 필터를 켜야 할 때
+        - 설정 완료 후 필터 작동 시작
+        
+        ## 인증
+        - **Bearer 토큰 필수**
+        - 해당 Instagram 계정이 속한 워크스페이스의 멤버여야 함
+        
+        ## 동작 방식
+        1. 스팸 필터 상태를 "active"로 변경
+        2. 이후 수신되는 댓글부터 스팸 검사 시작
+        3. 스팸으로 판정된 댓글은 자동으로 숨김 처리
+        4. 정상 댓글만 DM 자동발송 대상이 됨
+        
+        ## 주의사항
+        - 이미 수신된 댓글에는 소급 적용되지 않음
+        - 스팸 키워드가 설정되어 있어야 정상 작동
+        - 활성화 즉시 웹훅으로 들어오는 댓글부터 필터링됨
+        
+        ## 사용 예시
+        ```javascript
+        // 스팸 필터 활성화
+        const response = await fetch(
+            `/api/v1/integrations/spam-filters/ig-connections/${igConnectionId}/activate/`,
+            {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${accessToken}`,
+                    'Content-Type': 'application/json'
+                }
+            }
+        );
+        
+        const result = await response.json();
+        if (result.is_active) {
+            console.log('스팸 필터가 활성화되었습니다.');
+        }
+        ```
+        
+        ## 응답 예시
+        ```json
+        {
+            "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+            "ig_connection_id": "f1e2d3c4-b5a6-7890-dcba-fe0987654321",
+            "ig_username": "my_business_account",
+            "status": "active",
+            "is_active": true,
+            "spam_keywords": ["아이돌", "주소창"],
+            "block_urls": true,
+            "total_spam_detected": 127,
+            "total_hidden": 122,
+            "updated_at": "2026-02-18T02:30:00Z"
+        }
+        ```
+        """,
+        responses={
+            200: SpamFilterConfigSerializer,
+            401: OpenApiResponse(description="인증 실패"),
+            403: OpenApiResponse(description="권한 없음"),
+            404: OpenApiResponse(description="Instagram 계정을 찾을 수 없음"),
+        },
+    )
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="ig-connections/(?P<ig_connection_id>[^/.]+)/activate",
+    )
+    def activate(self, request, ig_connection_id=None):
+        """스팸 필터 활성화"""
+        spam_filter = self.get_spam_filter(ig_connection_id)
+        spam_filter.status = SpamFilterConfig.Status.ACTIVE
+        spam_filter.save()
+
+        serializer = SpamFilterConfigSerializer(spam_filter)
+        return Response(serializer.data)
+
+    @extend_schema(
+        summary="스팸 필터 비활성화",
+        description="""
+        ## 목적
+        Instagram Business 계정의 스팸 필터를 즉시 비활성화합니다.
+        비활성화 후에는 스팸 검사가 수행되지 않으며, 모든 댓글이 정상 처리됩니다.
+        
+        ## 사용 시나리오
+        - 스팸 필터 토글 버튼을 OFF로 전환할 때
+        - 스팸 필터가 정상 댓글을 너무 많이 차단할 때
+        - 일시적으로 필터링을 중단하고 싶을 때
+        - 테스트 또는 디버깅 목적
+        
+        ## 인증
+        - **Bearer 토큰 필수**
+        - 해당 Instagram 계정이 속한 워크스페이스의 멤버여야 함
+        
+        ## 동작 방식
+        1. 스팸 필터 상태를 "inactive"로 변경
+        2. 이후 수신되는 댓글에 대해 스팸 검사 미수행
+        3. 모든 댓글이 정상 댓글로 처리됨
+        4. DM 자동발송 캠페인이 설정되어 있으면 모든 댓글에 DM 발송
+        
+        ## 주의사항
+        - 비활성화해도 기존 스팸 로그는 유지됨
+        - 스팸 키워드 설정도 그대로 보존됨
+        - 언제든지 다시 활성화 가능
+        - 통계 데이터는 초기화되지 않음
+        
+        ## 사용 예시
+        ```javascript
+        // 스팸 필터 비활성화
+        const response = await fetch(
+            `/api/v1/integrations/spam-filters/ig-connections/${igConnectionId}/deactivate/`,
+            {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${accessToken}`,
+                    'Content-Type': 'application/json'
+                }
+            }
+        );
+        
+        const result = await response.json();
+        if (!result.is_active) {
+            console.log('스팸 필터가 비활성화되었습니다.');
+        }
+        ```
+        
+        ## 응답 예시
+        ```json
+        {
+            "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+            "ig_connection_id": "f1e2d3c4-b5a6-7890-dcba-fe0987654321",
+            "ig_username": "my_business_account",
+            "status": "inactive",
+            "is_active": false,
+            "spam_keywords": ["아이돌", "주소창"],
+            "block_urls": true,
+            "total_spam_detected": 127,
+            "total_hidden": 122,
+            "updated_at": "2026-02-18T02:35:00Z"
+        }
+        ```
+        """,
+        responses={
+            200: SpamFilterConfigSerializer,
+            401: OpenApiResponse(description="인증 실패"),
+            403: OpenApiResponse(description="권한 없음"),
+            404: OpenApiResponse(description="Instagram 계정을 찾을 수 없음"),
+        },
+    )
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="ig-connections/(?P<ig_connection_id>[^/.]+)/deactivate",
+    )
+    def deactivate(self, request, ig_connection_id=None):
+        """스팸 필터 비활성화"""
+        spam_filter = self.get_spam_filter(ig_connection_id)
+        spam_filter.status = SpamFilterConfig.Status.INACTIVE
+        spam_filter.save()
+
+        serializer = SpamFilterConfigSerializer(spam_filter)
+        return Response(serializer.data)
+
+    @extend_schema(
+        summary="스팸 댓글 로그 조회",
+        description="""
+        ## 목적
+        스팸으로 감지된 댓글들의 상세 로그를 조회합니다.
+        댓글 내용, 작성자, 스팸 판정 이유, 처리 상태 등을 확인할 수 있습니다.
+        
+        ## 사용 시나리오
+        - 스팸 필터 성능 모니터링
+        - 잘못 차단된 댓글(오탐) 확인
+        - 특정 사용자의 스팸 댓글 이력 조회
+        - 스팸 패턴 분석을 위한 데이터 수집
+        
+        ## 인증
+        - **Bearer 토큰 필수**
+        - 해당 Instagram 계정이 속한 워크스페이스의 멤버여야 함
+        
+        ## Query Parameters
+        - `status`: 로그 상태 필터 (선택)
+          - `detected`: 스팸으로 감지됨
+          - `hidden`: 숨김 처리 완료
+          - `failed`: 숨김 처리 실패
+        - `limit`: 반환할 최대 개수 (선택, 기본: 50, 최대: 500)
+        
+        ## 응답 필드
+        - `spam_reasons`: 스팸으로 판정된 이유 배열
+          - `contains_url`: URL 포함
+          - `keyword:xxx`: 특정 키워드 매칭
+        - `status`: 처리 상태
+        - `hidden_at`: 숨김 처리된 시각 (null일 수 있음)
+        
+        ## 정렬
+        - 최신 순으로 정렬됨 (created_at DESC)
+        
+        ## 주의사항
+        - 대량 조회 시 성능을 위해 limit 설정 권장
+        - 웹훅 원본 데이터도 포함되므로 민감 정보 주의
+        
+        ## 사용 예시
+        ```javascript
+        // 최근 숨김 처리된 스팸 댓글 20개 조회
+        const response = await fetch(
+            `/api/v1/integrations/spam-filters/ig-connections/${igConnectionId}/logs/?status=hidden&limit=20`,
+            {
+                method: 'GET',
+                headers: {
+                    'Authorization': `Bearer ${accessToken}`,
+                    'Content-Type': 'application/json'
+                }
+            }
+        );
+        
+        const logs = await response.json();
+        logs.forEach(log => {
+            console.log(`${log.commenter_username}: ${log.comment_text}`);
+            console.log(`판정 이유: ${log.spam_reasons.join(', ')}`);
+        });
+        ```
+        
+        ## 응답 예시
+        ```json
+        [
+            {
+                "id": "log-uuid-1",
+                "spam_filter_id": "filter-uuid",
+                "ig_username": "my_business_account",
+                "comment_id": "comment-123",
+                "comment_text": "주소창 yako.asia 아이돌A양 사건",
+                "commenter_user_id": "user-456",
+                "commenter_username": "spam_user_123",
+                "media_id": "media-789",
+                "spam_reasons": [
+                    "contains_url",
+                    "keyword:주소창",
+                    "keyword:아이돌",
+                    "keyword:사건"
+                ],
+                "status": "hidden",
+                "error_message": "",
+                "created_at": "2026-02-18T02:15:00Z",
+                "hidden_at": "2026-02-18T02:15:02Z"
+            }
+        ]
+        ```
+        """,
+        parameters=[
+            OpenApiParameter(
+                name="status",
+                type=str,
+                required=False,
+                description="로그 상태 필터 (detected/hidden/failed)",
+                enum=["detected", "hidden", "failed"],
+            ),
+            OpenApiParameter(
+                name="limit",
+                type=int,
+                required=False,
+                description="반환할 최대 개수 (기본: 50, 최대: 500)",
+            ),
+        ],
+        responses={
+            200: SpamCommentLogSerializer(many=True),
+            401: OpenApiResponse(description="인증 실패"),
+            403: OpenApiResponse(description="권한 없음"),
+            404: OpenApiResponse(description="Instagram 계정을 찾을 수 없음"),
+        },
+    )
+    @action(
+        detail=False, methods=["get"], url_path="ig-connections/(?P<ig_connection_id>[^/.]+)/logs"
+    )
+    def get_logs(self, request, ig_connection_id=None):
+        """스팸 댓글 로그 조회"""
+        spam_filter = self.get_spam_filter(ig_connection_id)
+
+        logs = SpamCommentLog.objects.filter(spam_filter=spam_filter)
+
+        # 상태 필터
+        status_param = request.query_params.get("status")
+        if status_param:
+            logs = logs.filter(status=status_param)
+
+        # 개수 제한
+        limit = int(request.query_params.get("limit", 50))
+        logs = logs[:limit]
+
+        serializer = SpamCommentLogSerializer(logs, many=True)
+        return Response(serializer.data)
+
+    @extend_schema(
+        summary="스팸 필터 통계 조회",
+        description="""
+        ## 목적
+        스팸 필터의 성능 지표와 통계 데이터를 조회합니다.
+        대시보드나 리포트 화면에서 스팸 필터 효과를 시각화할 때 사용합니다.
+        
+        ## 사용 시나리오
+        - 스팸 필터 대시보드 화면 로드
+        - 필터 성능 모니터링
+        - 일별 스팸 추이 그래프 데이터 수집
+        - 필터 효과성 평가 (성공률 확인)
+        
+        ## 인증
+        - **Bearer 토큰 필수**
+        - 해당 Instagram 계정이 속한 워크스페이스의 멤버여야 함
+        
+        ## 응답 필드
+        - `total_spam_detected`: 총 스팸 감지 수 (누적)
+        - `total_hidden`: 총 숨김 처리 수 (누적)
+        - `success_rate`: 숨김 처리 성공률 (% 단위, 소수점 2자리)
+        - `recent_spam`: 최근 7일간 일별 스팸 감지 수
+          - `date`: 날짜 (YYYY-MM-DD)
+          - `count`: 해당 날짜의 스팸 감지 수
+        
+        ## 성공률 계산식
+        ```
+        success_rate = (total_hidden / total_spam_detected) * 100
+        ```
+        
+        ## 주의사항
+        - 통계는 실시간으로 업데이트됨
+        - `recent_spam`은 최근 7일간 데이터만 포함
+        - 데이터가 없는 날짜는 배열에 포함되지 않음
+        
+        ## 사용 예시
+        ```javascript
+        // 스팸 필터 통계 조회 및 차트 렌더링
+        const response = await fetch(
+            `/api/v1/integrations/spam-filters/ig-connections/${igConnectionId}/stats/`,
+            {
+                method: 'GET',
+                headers: {
+                    'Authorization': `Bearer ${accessToken}`,
+                    'Content-Type': 'application/json'
+                }
+            }
+        );
+        
+        const stats = await response.json();
+        
+        // 성공률 표시
+        console.log(`스팸 차단 성공률: ${stats.success_rate}%`);
+        
+        // 일별 스팸 추이 차트 데이터
+        const chartData = stats.recent_spam.map(item => ({
+            x: new Date(item.date),
+            y: item.count
+        }));
+        
+        renderChart(chartData);
+        ```
+        
+        ## 응답 예시
+        ```json
+        {
+            "total_spam_detected": 427,
+            "total_hidden": 413,
+            "success_rate": 96.72,
+            "recent_spam": [
+                {
+                    "date": "2026-02-12",
+                    "count": 12
+                },
+                {
+                    "date": "2026-02-13",
+                    "count": 28
+                },
+                {
+                    "date": "2026-02-14",
+                    "count": 45
+                },
+                {
+                    "date": "2026-02-15",
+                    "count": 67
+                },
+                {
+                    "date": "2026-02-16",
+                    "count": 89
+                },
+                {
+                    "date": "2026-02-17",
+                    "count": 103
+                },
+                {
+                    "date": "2026-02-18",
+                    "count": 83
+                }
+            ]
+        }
+        ```
+        
+        ## 데이터 해석
+        - **성공률 90% 이상**: 필터가 잘 작동하고 있음
+        - **성공률 80% 미만**: API 오류 또는 네트워크 문제 확인 필요
+        - **일별 추이 급증**: 스팸 공격 가능성, 키워드 업데이트 고려
+        """,
+        responses={
+            200: OpenApiResponse(
+                description="스팸 필터 통계",
+                examples=[
+                    OpenApiExample(
+                        "Success Example",
+                        value={
+                            "total_spam_detected": 427,
+                            "total_hidden": 413,
+                            "success_rate": 96.72,
+                            "recent_spam": [{"date": "2026-02-18", "count": 83}],
+                        },
+                    )
+                ],
+            ),
+            401: OpenApiResponse(description="인증 실패"),
+            403: OpenApiResponse(description="권한 없음"),
+            404: OpenApiResponse(description="Instagram 계정을 찾을 수 없음"),
+        },
+    )
+    @action(
+        detail=False, methods=["get"], url_path="ig-connections/(?P<ig_connection_id>[^/.]+)/stats"
+    )
+    def get_stats(self, request, ig_connection_id=None):
+        """스팸 필터 통계 조회"""
+        spam_filter = self.get_spam_filter(ig_connection_id)
+
+        # 최근 7일간 스팸 통계
+        from django.db.models import Count
+        from django.db.models.functions import TruncDate
+
+        seven_days_ago = timezone.now() - timedelta(days=7)
+        recent_spam = (
+            SpamCommentLog.objects.filter(spam_filter=spam_filter, created_at__gte=seven_days_ago)
+            .annotate(date=TruncDate("created_at"))
+            .values("date")
+            .annotate(count=Count("id"))
+            .order_by("date")
+        )
+
+        # 성공률 계산
+        success_rate = 0
+        if spam_filter.total_spam_detected > 0:
+            success_rate = (spam_filter.total_hidden / spam_filter.total_spam_detected) * 100
+
+        return Response(
+            {
+                "total_spam_detected": spam_filter.total_spam_detected,
+                "total_hidden": spam_filter.total_hidden,
+                "success_rate": round(success_rate, 2),
+                "recent_spam": [
+                    {"date": item["date"].strftime("%Y-%m-%d"), "count": item["count"]}
+                    for item in recent_spam
+                ],
+            }
+        )

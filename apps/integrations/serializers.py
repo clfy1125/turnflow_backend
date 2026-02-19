@@ -3,7 +3,7 @@ Instagram integration serializers
 """
 
 from rest_framework import serializers
-from .models import IGAccountConnection, AutoDMCampaign, SentDMLog
+from .models import IGAccountConnection, AutoDMCampaign, SentDMLog, SpamFilterConfig, SpamCommentLog
 
 
 class IGAccountConnectionSerializer(serializers.ModelSerializer):
@@ -160,5 +160,88 @@ class SentDMLogSerializer(serializers.ModelSerializer):
             "api_response",
             "created_at",
             "sent_at",
+        ]
+        read_only_fields = fields  # 모두 읽기 전용
+
+
+class SpamFilterConfigSerializer(serializers.ModelSerializer):
+    """스팸 필터 설정 Serializer"""
+
+    ig_connection_id = serializers.UUIDField(source="ig_connection.id", read_only=True)
+    ig_username = serializers.CharField(source="ig_connection.username", read_only=True)
+    is_active = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SpamFilterConfig
+        fields = [
+            "id",
+            "ig_connection_id",
+            "ig_username",
+            "status",
+            "spam_keywords",
+            "block_urls",
+            "total_spam_detected",
+            "total_hidden",
+            "is_active",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "ig_connection_id",
+            "ig_username",
+            "total_spam_detected",
+            "total_hidden",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_is_active(self, obj):
+        """스팸 필터 활성화 여부"""
+        return obj.is_active()
+
+
+class SpamFilterConfigUpdateSerializer(serializers.ModelSerializer):
+    """스팸 필터 설정 업데이트 Serializer"""
+
+    class Meta:
+        model = SpamFilterConfig
+        fields = ["status", "spam_keywords", "block_urls"]
+
+    def validate_spam_keywords(self, value):
+        """스팸 키워드 검증"""
+        if not isinstance(value, list):
+            raise serializers.ValidationError("스팸 키워드는 리스트 형식이어야 합니다.")
+
+        if len(value) > 100:
+            raise serializers.ValidationError("스팸 키워드는 최대 100개까지 설정할 수 있습니다.")
+
+        return value
+
+
+class SpamCommentLogSerializer(serializers.ModelSerializer):
+    """스팸 댓글 로그 Serializer"""
+
+    spam_filter_id = serializers.UUIDField(source="spam_filter.id", read_only=True)
+    ig_username = serializers.CharField(source="spam_filter.ig_connection.username", read_only=True)
+
+    class Meta:
+        model = SpamCommentLog
+        fields = [
+            "id",
+            "spam_filter_id",
+            "ig_username",
+            "comment_id",
+            "comment_text",
+            "commenter_user_id",
+            "commenter_username",
+            "media_id",
+            "spam_reasons",
+            "status",
+            "error_message",
+            "webhook_payload",
+            "api_response",
+            "created_at",
+            "hidden_at",
         ]
         read_only_fields = fields  # 모두 읽기 전용

@@ -409,3 +409,150 @@ class InstagramMessagingService:
 
         # 24시간 = 86400초
         return time_diff.total_seconds() < 86400
+
+
+class SpamDetectionService:
+    """
+    스팸 댓글 감지 서비스
+    """
+
+    # 기본 스팸 키워드 (관리자 설정에서 추가 가능)
+    DEFAULT_SPAM_KEYWORDS = [
+        "아이돌",
+        "주소창",
+        "사건",
+        "원본영상",
+        "실시간검색",
+    ]
+
+    @classmethod
+    def is_spam(
+        cls, text: str, spam_keywords: list = None, check_urls: bool = True
+    ) -> tuple[bool, list]:
+        """
+        댓글이 스팸인지 검사
+
+        Args:
+            text: 검사할 댓글 텍스트
+            spam_keywords: 검사할 스팸 키워드 리스트
+            check_urls: URL 포함 여부 검사
+
+        Returns:
+            (is_spam: bool, reasons: list) - 스팸 여부와 판정 이유 목록
+        """
+        if not text:
+            return False, []
+
+        text_lower = text.lower()
+        reasons = []
+
+        # 1. URL 검사
+        if check_urls and cls._contains_url(text_lower):
+            reasons.append("contains_url")
+
+        # 2. 스팸 키워드 검사
+        keywords_to_check = spam_keywords if spam_keywords else cls.DEFAULT_SPAM_KEYWORDS
+        for keyword in keywords_to_check:
+            if keyword.lower() in text_lower:
+                reasons.append(f"keyword:{keyword}")
+
+        return len(reasons) > 0, reasons
+
+    @classmethod
+    def _contains_url(cls, text: str) -> bool:
+        """
+        텍스트에 URL이 포함되어 있는지 검사
+        """
+        import re
+
+        # HTTP/HTTPS URL 패턴
+        url_pattern = r"https?://[^\s]+"
+        if re.search(url_pattern, text):
+            return True
+
+        # 도메인 패턴 (예: example.com, site.co.kr)
+        domain_pattern = r"\b[a-zA-Z0-9-]+\.(com|net|org|co\.kr|asia|io|app|xyz|info|biz)\b"
+        if re.search(domain_pattern, text):
+            return True
+
+        return False
+
+
+class InstagramCommentService:
+    """
+    Instagram 댓글 관리 서비스
+    """
+
+    GRAPH_API_BASE = f"https://graph.facebook.com/v24.0"
+
+    @classmethod
+    def hide_comment(cls, comment_id: str, access_token: str) -> Dict:
+        """
+        댓글 숨김 처리
+
+        Args:
+            comment_id: 숨길 댓글 ID
+            access_token: Instagram Business Account 액세스 토큰
+
+        Returns:
+            API 응답 데이터
+
+        Raises:
+            requests.HTTPError: API 호출 실패 시
+        """
+        url = f"{cls.GRAPH_API_BASE}/{comment_id}"
+
+        params = {
+            "hide": "true",
+            "access_token": access_token,
+        }
+
+        response = requests.post(url, params=params)
+        response.raise_for_status()
+
+        return response.json()
+
+    @classmethod
+    def unhide_comment(cls, comment_id: str, access_token: str) -> Dict:
+        """
+        댓글 숨김 해제
+
+        Args:
+            comment_id: 숨김 해제할 댓글 ID
+            access_token: Instagram Business Account 액세스 토큰
+
+        Returns:
+            API 응답 데이터
+        """
+        url = f"{cls.GRAPH_API_BASE}/{comment_id}"
+
+        params = {
+            "hide": "false",
+            "access_token": access_token,
+        }
+
+        response = requests.post(url, params=params)
+        response.raise_for_status()
+
+        return response.json()
+
+    @classmethod
+    def delete_comment(cls, comment_id: str, access_token: str) -> Dict:
+        """
+        댓글 삭제 (영구 삭제)
+
+        Args:
+            comment_id: 삭제할 댓글 ID
+            access_token: Instagram Business Account 액세스 토큰
+
+        Returns:
+            API 응답 데이터
+        """
+        url = f"{cls.GRAPH_API_BASE}/{comment_id}"
+
+        params = {"access_token": access_token}
+
+        response = requests.delete(url, params=params)
+        response.raise_for_status()
+
+        return response.json()

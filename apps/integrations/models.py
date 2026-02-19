@@ -243,12 +243,12 @@ class SentDMLog(models.Model):
             models.Index(fields=["status"]),
             models.Index(fields=["created_at"]),
         ]
-        constraints = [
-            # 같은 캠페인에서 같은 댓글에 대해 중복 발송 방지
-            models.UniqueConstraint(
-                fields=["campaign", "comment_id"], name="unique_campaign_comment"
-            )
-        ]
+        # constraints = [
+        #     # 같은 캠페인에서 같은 댓글에 대해 중복 발송 방지 - 실험용으로 비활성화
+        #     models.UniqueConstraint(
+        #         fields=["campaign", "comment_id"], name="unique_campaign_comment"
+        #     )
+        # ]
 
     # Primary key
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -311,3 +311,162 @@ class SentDMLog(models.Model):
         self.status = self.Status.SKIPPED
         self.error_message = reason
         self.save(update_fields=["status", "error_message"])
+
+
+class SpamFilterConfig(models.Model):
+    """
+    Instagram 계정별 스팸 필터 설정
+    """
+
+    class Status(models.TextChoices):
+        ACTIVE = "active", "활성"
+        INACTIVE = "inactive", "비활성"
+
+    class Meta:
+        db_table = "spam_filter_configs"
+        verbose_name = "Spam Filter Config"
+        verbose_name_plural = "Spam Filter Configs"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["ig_connection", "status"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["ig_connection"], name="unique_spam_filter_per_ig_connection"
+            )
+        ]
+
+    # Primary key
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    # Relations
+    ig_connection = models.OneToOneField(
+        IGAccountConnection,
+        on_delete=models.CASCADE,
+        related_name="spam_filter",
+        verbose_name="Instagram Connection",
+    )
+
+    # 상태
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.INACTIVE, verbose_name="상태"
+    )
+
+    # 스팸 키워드 리스트
+    spam_keywords = models.JSONField(
+        default=list,
+        verbose_name="스팸 키워드",
+        help_text="검사할 스팸 키워드 목록 (예: ['아이돌', '주소창', '사건'])",
+    )
+
+    # URL 차단 설정
+    block_urls = models.BooleanField(default=True, verbose_name="URL 차단")
+
+    # 통계
+    total_spam_detected = models.IntegerField(default=0, verbose_name="총 스팸 감지 수")
+    total_hidden = models.IntegerField(default=0, verbose_name="총 숨김 처리 수")
+
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="생성일시")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="수정일시")
+
+    def __str__(self):
+        return f"{self.ig_connection.username} - {self.status}"
+
+    def is_active(self) -> bool:
+        """스팸 필터가 활성화되어 있는지"""
+        return self.status == self.Status.ACTIVE
+
+    def increment_spam_detected(self):
+        """스팸 감지 카운트 증가"""
+        self.total_spam_detected += 1
+        self.save(update_fields=["total_spam_detected", "updated_at"])
+
+    def increment_hidden(self):
+        """숨김 처리 카운트 증가"""
+        self.total_hidden += 1
+        self.save(update_fields=["total_hidden", "updated_at"])
+
+
+class SpamCommentLog(models.Model):
+    """
+    스팸 댓글 탐지 및 처리 로그
+    """
+
+    class Status(models.TextChoices):
+        DETECTED = "detected", "감지됨"
+        HIDDEN = "hidden", "숨김처리"
+        FAILED = "failed", "처리실패"
+
+    class Meta:
+        db_table = "spam_comment_logs"
+        verbose_name = "Spam Comment Log"
+        verbose_name_plural = "Spam Comment Logs"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["spam_filter", "status"]),
+            models.Index(fields=["comment_id"]),
+            models.Index(fields=["created_at"]),
+        ]
+
+    # Primary key
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    # Relations
+    spam_filter = models.ForeignKey(
+        SpamFilterConfig,
+        on_delete=models.CASCADE,
+        related_name="spam_logs",
+        verbose_name="스팸 필터",
+    )
+
+    # 댓글 정보
+    comment_id = models.CharField(max_length=255, verbose_name="댓글 ID", db_index=True)
+    comment_text = models.TextField(verbose_name="댓글 내용")
+    commenter_user_id = models.CharField(max_length=255, verbose_name="작성자 Instagram ID")
+    commenter_username = models.CharField(max_length=255, verbose_name="작성자 Username")
+
+    # 미디어 정보
+    media_id = models.CharField(max_length=255, verbose_name="미디어 ID", blank=True)
+
+    # 스팸 탐지 정보
+    spam_reasons = models.JSONField(
+        default=list,
+        verbose_name="스팸 판정 이유",
+        help_text="스팸으로 판단한 이유 목록 (예: ['contains_url', 'keyword:아이돌'])",
+    )
+
+    # 처리 상태
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.DETECTED, verbose_name="상태"
+    )
+
+    # 에러 정보
+    error_message = models.TextField(blank=True, verbose_name="에러 메시지")
+
+    # 메타데이터
+    webhook_payload = models.JSONField(default=dict, blank=True, verbose_name="Webhook 원본 데이터")
+    api_response = models.JSONField(default=dict, blank=True, verbose_name="API 응답 데이터")
+
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="감지일시")
+    hidden_at = models.DateTimeField(null=True, blank=True, verbose_name="숨김처리일시")
+
+    def __str__(self):
+        return f"Spam: {self.commenter_username} - {self.status}"
+
+    def mark_as_hidden(self, api_response: dict = None):
+        """숨김 처리 완료"""
+        self.status = self.Status.HIDDEN
+        self.hidden_at = timezone.now()
+        if api_response:
+            self.api_response = api_response
+        self.save(update_fields=["status", "hidden_at", "api_response"])
+
+    def mark_as_failed(self, error_message: str, api_response: dict = None):
+        """숨김 처리 실패"""
+        self.status = self.Status.FAILED
+        self.error_message = error_message
+        if api_response:
+            self.api_response = api_response
+        self.save(update_fields=["status", "error_message", "api_response"])
