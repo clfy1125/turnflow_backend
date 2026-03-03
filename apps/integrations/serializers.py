@@ -136,6 +136,31 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
     )
 
 
+class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
+    """Serializer for updating Auto DM Campaign (used for Swagger/edit forms)
+
+    This serializer exposes only the editable fields so API docs and UI
+    show sensible defaults and editable values.
+    """
+
+    class Meta:
+        model = AutoDMCampaign
+        fields = [
+            "media_url",
+            "name",
+            "description",
+            "message_template",
+            "max_sends_per_hour",
+            "status",
+        ]
+        extra_kwargs = {
+            "media_url": {"required": False, "allow_null": True, "allow_blank": True},
+            "description": {"required": False, "allow_blank": True},
+            "max_sends_per_hour": {"required": False},
+            "status": {"required": False},
+        }
+
+
 class SentDMLogSerializer(serializers.ModelSerializer):
     """Serializer for Sent DM Log"""
 

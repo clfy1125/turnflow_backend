@@ -115,6 +115,35 @@ class IGAccountConnection(models.Model):
         return cls.objects.filter(workspace=workspace, status=cls.Status.ACTIVE).first()
 
 
+class IGOAuthState(models.Model):
+    """
+    Temporary storage for Instagram OAuth state tokens when frontend opens popup
+    This avoids relying on Django session cookies for popup-based flows.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    state = models.CharField(max_length=255, unique=True, db_index=True)
+    workspace = models.ForeignKey(
+        "workspace.Workspace",
+        on_delete=models.CASCADE,
+        related_name="ig_oauth_states",
+        verbose_name="Workspace",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+
+    class Meta:
+        db_table = "ig_oauth_states"
+        verbose_name = "Instagram OAuth State"
+        verbose_name_plural = "Instagram OAuth States"
+
+    def is_expired(self):
+        return timezone.now() >= self.expires_at
+
+    def __str__(self):
+        return f"IGOAuthState(state={self.state}, workspace={self.workspace_id})"
+
+
 class AutoDMCampaign(models.Model):
     """
     자동 DM 발송 캠페인

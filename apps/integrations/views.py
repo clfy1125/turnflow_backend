@@ -16,13 +16,14 @@ import secrets
 
 from apps.workspace.models import Workspace
 from apps.workspace.permissions import IsWorkspaceMember
-from .models import IGAccountConnection, AutoDMCampaign, SentDMLog, SpamFilterConfig, SpamCommentLog
+from .models import IGAccountConnection, AutoDMCampaign, SentDMLog, SpamFilterConfig, SpamCommentLog, IGOAuthState
 from .serializers import (
     IGAccountConnectionSerializer,
     ConnectionStartResponseSerializer,
     ConnectionCallbackResponseSerializer,
     AutoDMCampaignSerializer,
     AutoDMCampaignCreateSerializer,
+    AutoDMCampaignUpdateSerializer,
     SentDMLogSerializer,
     SpamFilterConfigSerializer,
     SpamFilterConfigUpdateSerializer,
@@ -118,9 +119,9 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         # Generate state for CSRF protection
         state = secrets.token_urlsafe(32)
 
-        # Store state in session
-        request.session[f"ig_oauth_state_{workspace_id}"] = state
-        request.session[f"ig_oauth_workspace_{state}"] = str(workspace_id)
+        # Persist state in DB instead of session so popup flows without cookie/session work
+        expires_at = timezone.now() + timedelta(minutes=10)
+        IGOAuthState.objects.create(state=state, workspace=workspace, expires_at=expires_at)
 
         # Build redirect URI - use INSTAGRAM_REDIRECT_URI from settings if available
         redirect_uri = settings.INSTAGRAM_REDIRECT_URI
@@ -300,9 +301,9 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
             """
             return HttpResponse(html)
 
-        # Verify state (CSRF protection)
-        workspace_id = request.session.get(f"ig_oauth_workspace_{state}")
-        if not workspace_id:
+        # Verify state (CSRF protection) using persisted IGOAuthState
+        state_obj = IGOAuthState.objects.filter(state=state).first()
+        if not state_obj or state_obj.is_expired():
             html = """
             <!DOCTYPE html>
             <html>
@@ -324,7 +325,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                             type: 'INSTAGRAM_ERROR',
                             success: false,
                             errorCode: 'INVALID_STATE',
-                            message: '세션이 만료되었습니다. 다시 시도해주세요.'
+                            message: '세션이 만료되었거나 잘못된 요청입니다. 다시 시도해주세요.'
                         }, '*');
                         setTimeout(() => window.close(), 2000);
                     }
@@ -335,7 +336,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
             return HttpResponse(html)
 
         try:
-            workspace = Workspace.objects.get(id=workspace_id)
+            workspace = state_obj.workspace
 
             # Build redirect URI - use INSTAGRAM_REDIRECT_URI from settings if available
             redirect_uri = settings.INSTAGRAM_REDIRECT_URI
@@ -567,9 +568,11 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 connection.error_message = ""
                 connection.save()
 
-            # Clean up session
-            request.session.pop(f"ig_oauth_state_{workspace_id}", None)
-            request.session.pop(f"ig_oauth_workspace_{state}", None)
+            # Clean up persisted state
+            try:
+                state_obj.delete()
+            except Exception:
+                pass
 
             # Return success response with HTML
             connection_data = IGAccountConnectionSerializer(connection).data
@@ -1213,7 +1216,45 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         """캠페인 목록 조회"""
         queryset = self.get_queryset()
         serializer = self.get_serializer(queryset, many=True)
-        return Response(serializer.data)
+        data = serializer.data
+
+        # Enrich missing `media_url` by querying Instagram Graph API using the
+        # campaign's `media_id` and its `ig_connection` access token.
+        # We keep this best-effort: if the API call fails or the token is
+        # unavailable/expired, we silently leave `media_url` as-is.
+        campaigns = list(queryset)
+        campaign_map = {str(c.id): c for c in campaigns}
+
+        for item in data:
+            if not item.get("media_url") and item.get("media_id"):
+                campaign = campaign_map.get(item["id"])
+                if not campaign:
+                    continue
+                connection = getattr(campaign, "ig_connection", None)
+                if not connection or not connection.access_token:
+                    continue
+                try:
+                    # Skip if token appears expired
+                    if not connection.refresh_token_if_needed():
+                        continue
+
+                    media_id = item["media_id"]
+                    url = f"{InstagramOAuthService.GRAPH_API_BASE}/{media_id}"
+                    params = {
+                        "fields": "id,media_type,media_url,permalink",
+                        "access_token": connection.access_token,
+                    }
+                    resp = requests.get(url, params=params, timeout=5)
+                    resp.raise_for_status()
+                    media_data = resp.json()
+                    media_url = media_data.get("media_url") or media_data.get("permalink")
+                    if media_url:
+                        item["media_url"] = media_url
+                except Exception:
+                    # Best-effort fallback: ignore and continue
+                    continue
+
+        return Response(data)
 
     @extend_schema(
         summary="캠페인 상세 조회",
@@ -1343,7 +1384,7 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
     @extend_schema(
         summary="캠페인 수정",
         description="기존 Auto DM 캠페인을 수정합니다.",
-        request=AutoDMCampaignSerializer,
+        request=AutoDMCampaignUpdateSerializer,
         responses={200: AutoDMCampaignSerializer},
         tags=["Auto DM"],
     )
@@ -1358,7 +1399,7 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
     @extend_schema(
         summary="캠페인 부분 수정",
         description="Auto DM 캠페인의 일부 필드만 수정합니다.",
-        request=AutoDMCampaignSerializer,
+        request=AutoDMCampaignUpdateSerializer,
         responses={200: AutoDMCampaignSerializer},
         tags=["Auto DM"],
     )
@@ -1708,108 +1749,33 @@ class SpamFilterViewSet(viewsets.ViewSet):
         spam_filter = self.get_spam_filter(ig_connection_id)
         serializer = SpamFilterConfigSerializer(spam_filter)
         return Response(serializer.data)
-
     @extend_schema(
-        summary="스팸 필터 설정 업데이트",
-        description="""
-        ## 목적
-        Instagram Business 계정의 스팸 필터 설정을 부분적으로 업데이트합니다.
-        상태, 스팸 키워드, URL 차단 설정을 개별적으로 또는 한 번에 변경할 수 있습니다.
-        
-        ## 사용 시나리오
-        - 스팸 필터 활성화/비활성화 토글
-        - 스팸 키워드 추가/제거
-        - URL 차단 기능 켜기/끄기
-        - 여러 설정 동시 변경
-        
-        ## 인증
-        - **Bearer 토큰 필수**
-        - 해당 Instagram 계정이 속한 워크스페이스의 멤버여야 함
-        
-        ## 업데이트 가능 항목
-        - `status`: 필터 상태 ("active" 또는 "inactive")
-        - `spam_keywords`: 스팸 키워드 배열 (최대 100개)
-        - `block_urls`: URL 포함 댓글 차단 여부 (boolean)
-        
-        ## 검증 규칙
-        - `spam_keywords`는 반드시 배열이어야 함
-        - 키워드는 최대 100개까지 설정 가능
-        - `status`는 "active" 또는 "inactive"만 허용
-        
-        ## 주의사항
-        - PATCH 메서드이므로 변경하고 싶은 필드만 전송하면 됨
-        - 스팸 키워드는 대소문자 구분 없이 검사됨
-        - 설정 변경 후 새로 수신되는 댓글부터 적용됨
-        
-        ## 사용 예시
-        ```javascript
-        // 스팸 필터 활성화 및 키워드 업데이트
-        const response = await fetch(
-            `/api/v1/integrations/spam-filters/ig-connections/${igConnectionId}/`,
-            {
-                method: 'PATCH',
-                headers: {
-                    'Authorization': `Bearer ${accessToken}`,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    status: 'active',
-                    spam_keywords: ['아이돌', '주소창', '사건', '원본영상', '실시간검색'],
-                    block_urls: true
-                })
-            }
-        );
-        
-        const updated = await response.json();
-        console.log('업데이트 완료:', updated);
-        ```
-        
-        ## 요청 예시 (키워드만 변경)
-        ```json
-        {
-            "spam_keywords": ["스팸키워드1", "스팸키워드2", "악성댓글"]
-        }
-        ```
-        
-        ## 요청 예시 (전체 변경)
-        ```json
-        {
-            "status": "active",
-            "spam_keywords": ["아이돌", "주소창", "사건"],
-            "block_urls": false
-        }
-        ```
-        """,
+        summary="스팸 필터 설정 조회 및 업데이트",
+        description="GET으로 조회하고 PATCH로 부분 업데이트합니다.",
         request=SpamFilterConfigUpdateSerializer,
         responses={
             200: SpamFilterConfigSerializer,
-            400: OpenApiResponse(
-                description="유효성 검증 실패",
-                examples=[
-                    OpenApiExample(
-                        "Validation Error",
-                        value={
-                            "spam_keywords": ["스팸 키워드는 최대 100개까지 설정할 수 있습니다."]
-                        },
-                    )
-                ],
-            ),
+            400: OpenApiResponse(description="유효성 검증 실패"),
             401: OpenApiResponse(description="인증 실패"),
             403: OpenApiResponse(description="권한 없음"),
             404: OpenApiResponse(description="Instagram 계정을 찾을 수 없음"),
         },
     )
-    @action(detail=False, methods=["patch"], url_path="ig-connections/(?P<ig_connection_id>[^/.]+)")
-    def update_config(self, request, ig_connection_id=None):
-        """스팸 필터 설정 업데이트"""
+    @action(detail=False, methods=["get", "patch"], url_path="ig-connections/(?P<ig_connection_id>[^/.]+)")
+    def config(self, request, ig_connection_id=None):
+        """스팸 필터 설정 조회/업데이트"""
         spam_filter = self.get_spam_filter(ig_connection_id)
 
+        if request.method == "GET":
+            serializer = SpamFilterConfigSerializer(spam_filter)
+            return Response(serializer.data)
+
+        # PATCH
         serializer = SpamFilterConfigUpdateSerializer(spam_filter, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
 
-        response_serializer = SpamFilterConfigSerializer(spam_filter)
-        return Response(response_serializer.data)
+        return Response(SpamFilterConfigSerializer(spam_filter).data)
 
     @extend_schema(
         summary="스팸 필터 활성화",

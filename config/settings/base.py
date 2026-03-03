@@ -35,6 +35,7 @@ INSTALLED_APPS = [
     "apps.workspace",
     "apps.billing",
     "apps.integrations",
+    "apps.pages",
 ]
 
 MIDDLEWARE = [
@@ -164,6 +165,10 @@ SPECTACULAR_SETTINGS = {
     "SERVE_INCLUDE_SCHEMA": False,
     "SCHEMA_PATH_PREFIX": "/api/v1/",
     "COMPONENT_SPLIT_REQUEST": True,
+    "POSTPROCESSING_HOOKS": [
+        "drf_spectacular.hooks.postprocess_schema_enums",
+        "apps.pages.openapi.postprocess_block_data_schema",
+    ],
     "SWAGGER_UI_SETTINGS": {
         "deepLinking": True,
         "persistAuthorization": True,
