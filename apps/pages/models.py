@@ -116,3 +116,78 @@ class Block(models.Model):
         """현재 페이지의 마지막 order + 1 반환."""
         last = Block.objects.filter(page=self.page).order_by("-order").first()
         return (last.order + 1) if last else 1
+
+
+# ─────────────────────────────────────────────────────────────
+# 통계 모델
+# ─────────────────────────────────────────────────────────────
+
+class PageView(models.Model):
+    """공개 페이지 조회 이벤트. 방문자가 페이지를 열 때 1건 기록."""
+
+    page = models.ForeignKey(
+        Page,
+        on_delete=models.CASCADE,
+        related_name="views",
+        verbose_name="페이지",
+    )
+    viewed_at = models.DateTimeField(auto_now_add=True, db_index=True, verbose_name="조회 일시")
+    referer = models.CharField(
+        max_length=500,
+        blank=True,
+        default="",
+        verbose_name="유입 채널 URL",
+        help_text="HTTP Referer 헤더 원문. 집계 시 도메인으로 파싱됩니다.",
+    )
+    country = models.CharField(
+        max_length=2,
+        blank=True,
+        default="",
+        verbose_name="유입 국가",
+        help_text="ISO 3166-1 alpha-2 코드 (예: KR, US). Cloudflare CF-IPCountry 헤더 기반.",
+    )
+    ip_hash = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        verbose_name="IP 해시",
+        help_text="SHA-256(IP). 개인정보 보호를 위해 원본 IP는 저장하지 않습니다.",
+    )
+
+    class Meta:
+        verbose_name = "페이지 조회"
+        verbose_name_plural = "페이지 조회 목록"
+        indexes = [
+            models.Index(fields=["page", "viewed_at"]),
+            models.Index(fields=["page", "country"]),
+        ]
+
+
+class BlockClick(models.Model):
+    """블록 클릭 이벤트. 방문자가 링크/연락처 블록을 클릭할 때 1건 기록."""
+
+    block = models.ForeignKey(
+        Block,
+        on_delete=models.CASCADE,
+        related_name="clicks",
+        verbose_name="블록",
+    )
+    page = models.ForeignKey(
+        Page,
+        on_delete=models.CASCADE,
+        related_name="block_clicks",
+        verbose_name="페이지",
+        help_text="집계 쿼리 최적화를 위해 비정규화 저장.",
+    )
+    clicked_at = models.DateTimeField(auto_now_add=True, db_index=True, verbose_name="클릭 일시")
+    referer = models.CharField(max_length=500, blank=True, default="", verbose_name="유입 채널 URL")
+    country = models.CharField(max_length=2, blank=True, default="", verbose_name="유입 국가")
+    ip_hash = models.CharField(max_length=64, blank=True, default="", verbose_name="IP 해시")
+
+    class Meta:
+        verbose_name = "블록 클릭"
+        verbose_name_plural = "블록 클릭 목록"
+        indexes = [
+            models.Index(fields=["page", "clicked_at"]),
+            models.Index(fields=["block", "clicked_at"]),
+        ]

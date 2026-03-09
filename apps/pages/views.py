@@ -13,15 +13,30 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.viewsets import ViewSet
 
-from .models import Block, Page
+from .models import Block, BlockClick, Page, PageView
 from .permissions import IsPageOwner, IsPublicPageOrOwner
 from .serializers import (
     BlockSerializer,
+    BlockStatSerializer,
+    BlockStatsSerializer,
+    ChartDataSerializer,
     PagePublicSerializer,
     PageSerializer,
+    RecordClickSerializer,
+    RecordViewSerializer,
     ReorderSerializer,
     SlugChangeSerializer,
     SlugCheckSerializer,
+    StatsSummarySerializer,
+)
+from .stats import (
+    get_block_stats,
+    get_chart_data,
+    get_country,
+    get_stats_summary,
+    hash_ip,
+    parse_referer,
+    resolve_period,
 )
 
 
@@ -748,3 +763,156 @@ const newPublicUrl = `https://yourdomain.com/@${res.data.slug}`;
         page.slug = serializer.validated_data["slug"]
         page.save(update_fields=["slug", "updated_at"])
         return Response(PageSerializer(page).data)
+
+
+# ─────────────────────────────────────────────────────────────
+# 페이지 조회 기록 (공개 — 프론트가 렌더링 시 호출)
+# ─────────────────────────────────────────────────────────────
+
+class PageViewRecordView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []  # JWT 토큰 파싱 불필요
+
+    @extend_schema(
+        tags=["통계"],
+        summary="페이지 조회 기록",
+        description="""공개 페이지가 렌더링될 때 호출합니다.  
+조회 이벤트(IP 해시, 유입 채널, 국가)를 기록합니다.  
+인증 불필요 — 누구나 호출 가능.""",
+        request=RecordViewSerializer,
+        responses={204: None, 404: OpenApiResponse(description="페이지 없음")},
+    )
+    def post(self, request, slug):
+        page = Page.objects.filter(slug=slug, is_public=True).first()
+        if not page:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        referer_url = request.data.get("referer", "") or request.META.get("HTTP_REFERER", "")
+        PageView.objects.create(
+            page=page,
+            ip_hash=hash_ip(request),
+            referer=parse_referer(referer_url),
+            country=get_country(request),
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ─────────────────────────────────────────────────────────────
+# 블록 클릭 기록 (공개)
+# ─────────────────────────────────────────────────────────────
+
+class BlockClickRecordView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    @extend_schema(
+        tags=["통계"],
+        summary="블록 클릭 기록",
+        description="""사용자가 블록을 클릭할 때 호출합니다.  
+클릭 이벤트(IP 해시, 유입 채널, 국가)를 기록합니다.  
+인증 불필요 — 누구나 호출 가능.""",
+        request=RecordClickSerializer,
+        responses={
+            204: None,
+            404: OpenApiResponse(description="페이지 또는 블록 없음"),
+        },
+    )
+    def post(self, request, slug, block_id):
+        page = Page.objects.filter(slug=slug, is_public=True).first()
+        if not page:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        block = Block.objects.filter(pk=block_id, page=page).first()
+        if not block:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        referer_url = request.data.get("referer", "") or request.META.get("HTTP_REFERER", "")
+        BlockClick.objects.create(
+            block=block,
+            page=page,
+            ip_hash=hash_ip(request),
+            referer=parse_referer(referer_url),
+            country=get_country(request),
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ─────────────────────────────────────────────────────────────
+# 통계 요약 (인증 필수 — 페이지 소유자)
+# ─────────────────────────────────────────────────────────────
+
+class PageStatsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["통계"],
+        summary="페이지 통계 요약",
+        description="""## 개요
+기간별 페이지 조회수·클릭수·클릭율과 유입 채널/국가 Top5를 반환합니다.
+
+## 쿼리 파라미터
+| 파라미터 | 기본값 | 허용값 |
+|---------|--------|--------|
+| `period` | `7d` | `7d` `30d` `90d` |
+""",
+        responses={200: StatsSummarySerializer, 401: OpenApiResponse(description="인증 실패")},
+    )
+    def get(self, request):
+        period_key, days = resolve_period(request.query_params.get("period", "7d"))
+        page, _ = Page.get_or_create_for_user(request.user)
+        data = get_stats_summary(page, days)
+        data["period"] = period_key
+        return Response(StatsSummarySerializer(data).data)
+
+
+# ─────────────────────────────────────────────────────────────
+# 차트 데이터 (인증 필수)
+# ─────────────────────────────────────────────────────────────
+
+class StatsChartView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["통계"],
+        summary="페이지 통계 차트 데이터",
+        description="""## 개요
+날짜별 조회수·클릭수 배열을 반환합니다 (라인 차트용).
+
+## 쿼리 파라미터
+| 파라미터 | 기본값 | 허용값 |
+|---------|--------|--------|
+| `period` | `7d` | `7d` `30d` `90d` |
+""",
+        responses={200: ChartDataSerializer, 401: OpenApiResponse(description="인증 실패")},
+    )
+    def get(self, request):
+        period_key, days = resolve_period(request.query_params.get("period", "7d"))
+        page, _ = Page.get_or_create_for_user(request.user)
+        data = get_chart_data(page, days)
+        data["period"] = period_key
+        return Response(ChartDataSerializer(data).data)
+
+
+# ─────────────────────────────────────────────────────────────
+# 블록별 통계 (인증 필수)
+# ─────────────────────────────────────────────────────────────
+
+class StatsBlocksView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["통계"],
+        summary="블록별 클릭 통계",
+        description="""## 개요
+각 블록의 기간 내 클릭수와 클릭율을 반환합니다.
+
+## 쿼리 파라미터
+| 파라미터 | 기본값 | 허용값 |
+|---------|--------|--------|
+| `period` | `7d` | `7d` `30d` `90d` |
+""",
+        responses={200: BlockStatsSerializer, 401: OpenApiResponse(description="인증 실패")},
+    )
+    def get(self, request):
+        period_key, days = resolve_period(request.query_params.get("period", "7d"))
+        page, _ = Page.get_or_create_for_user(request.user)
+        blocks = get_block_stats(page, days)
+        data = {"period": period_key, "blocks": blocks}
+        return Response(BlockStatsSerializer(data).data)

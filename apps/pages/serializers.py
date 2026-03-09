@@ -254,3 +254,73 @@ class ReorderSerializer(serializers.Serializer):
         if len(ids) != len(set(ids)):
             raise serializers.ValidationError("id 값에 중복이 있습니다.")
         return value
+
+
+# ─── 통계 시리얼라이저 ────────────────────────────────────────
+
+class RefererStatSerializer(serializers.Serializer):
+    source = serializers.CharField(help_text="유입 채널명 (Instagram, 직접 방문 등)")
+    count = serializers.IntegerField(help_text="해당 채널 유입 횟수")
+    percentage = serializers.FloatField(help_text="전체 조회수 대비 비율 (%)")
+
+
+class CountryStatSerializer(serializers.Serializer):
+    code = serializers.CharField(help_text="ISO 3166-1 alpha-2 국가 코드 (KR, US …)")
+    name = serializers.CharField(help_text="국가명 (한국어)")
+    count = serializers.IntegerField(help_text="해당 국가 유입 횟수")
+    percentage = serializers.FloatField(help_text="전체 조회수 대비 비율 (%)")
+
+
+class StatsSummarySerializer(serializers.Serializer):
+    period = serializers.CharField(help_text="조회 기간 (7d / 30d / 90d)")
+    total_views = serializers.IntegerField(help_text="기간 내 페이지 총 조회수")
+    total_clicks = serializers.IntegerField(help_text="기간 내 블록 총 클릭수")
+    click_rate = serializers.FloatField(help_text="클릭율 = 클릭수 / 조회수 × 100 (%)")
+    referers = RefererStatSerializer(many=True, help_text="유입 채널 Top5")
+    countries = CountryStatSerializer(many=True, help_text="유입 국가 Top5")
+
+
+class ChartDataSerializer(serializers.Serializer):
+    period = serializers.CharField(help_text="조회 기간 (7d / 30d / 90d)")
+    labels = serializers.ListField(
+        child=serializers.CharField(),
+        help_text="날짜 배열 (YYYY-MM-DD). 오늘 포함 period 일치",
+    )
+    views = serializers.ListField(
+        child=serializers.IntegerField(),
+        help_text="labels와 같은 길이의 일별 조회수 배열",
+    )
+    clicks = serializers.ListField(
+        child=serializers.IntegerField(),
+        help_text="labels와 같은 길이의 일별 클릭수 배열",
+    )
+
+
+class BlockStatSerializer(serializers.Serializer):
+    block_id = serializers.IntegerField(help_text="블록 ID")
+    type = serializers.CharField(help_text="블록 타입 (single_link / profile / contact)")
+    label = serializers.CharField(help_text="블록 대표 레이블 (data.label 또는 data.headline)")
+    is_enabled = serializers.BooleanField(help_text="현재 노출 여부")
+    clicks = serializers.IntegerField(help_text="기간 내 클릭수")
+    click_rate = serializers.FloatField(help_text="클릭율 = 클릭수 / 페이지 조회수 × 100 (%)")
+
+
+class BlockStatsSerializer(serializers.Serializer):
+    period = serializers.CharField()
+    blocks = BlockStatSerializer(many=True)
+
+
+class RecordViewSerializer(serializers.Serializer):
+    """POST /api/pages/@{slug}/view/ 요청 바디 (모두 선택)."""
+    referer = serializers.CharField(
+        required=False, allow_blank=True, default="",
+        help_text="방문자 브라우저의 document.referrer 값. 없으면 빈 문자열.",
+    )
+
+
+class RecordClickSerializer(serializers.Serializer):
+    """POST /api/pages/@{slug}/blocks/{block_id}/click/ 요청 바디 (모두 선택)."""
+    referer = serializers.CharField(
+        required=False, allow_blank=True, default="",
+        help_text="방문자 브라우저의 document.referrer 값.",
+    )

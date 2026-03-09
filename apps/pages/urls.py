@@ -1,13 +1,18 @@
 from django.urls import path
 
 from .views import (
+    BlockClickRecordView,
     BlockDetailView,
     BlockListCreateView,
     BlockReorderView,
     MyPageView,
+    PageStatsView,
+    PageViewRecordView,
     PublicPageView,
     SlugChangeView,
     SlugCheckView,
+    StatsBlocksView,
+    StatsChartView,
 )
 
 app_name = "pages"
@@ -19,8 +24,15 @@ urlpatterns = [
     path("check-slug/", SlugCheckView.as_view(), name="check-slug"),
     # slug 변경
     path("me/slug/", SlugChangeView.as_view(), name="change-slug"),
+    # 통계 (인증 필수)
+    path("me/stats/", PageStatsView.as_view(), name="stats"),
+    path("me/stats/chart/", StatsChartView.as_view(), name="stats-chart"),
+    path("me/stats/blocks/", StatsBlocksView.as_view(), name="stats-blocks"),
     # 공개 페이지 조회
     path("@<slug:slug>/", PublicPageView.as_view(), name="public-page"),
+    # 공개 — 조회·클릭 기록 (인증 불필요)
+    path("@<slug:slug>/view/", PageViewRecordView.as_view(), name="record-view"),
+    path("@<slug:slug>/blocks/<int:block_id>/click/", BlockClickRecordView.as_view(), name="record-click"),
     # 내 블록 목록/생성
     path("me/blocks/", BlockListCreateView.as_view(), name="block-list-create"),
     # 블록 reorder
