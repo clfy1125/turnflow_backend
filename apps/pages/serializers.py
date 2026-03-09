@@ -170,6 +170,37 @@ class PageSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "slug", "created_at", "updated_at"]
 
 
+class SlugChangeSerializer(serializers.Serializer):
+    """
+    PATCH /api/pages/me/slug/ 전용.
+    slug 형식 검증 + 중복 검증.
+    """
+    slug = serializers.SlugField(
+        max_length=120,
+        help_text="영문 소문자, 숫자, 하이픈(헤더/톨미 불가)만 허용. 2~120자.",
+    )
+
+    def validate_slug(self, value: str) -> str:
+        value = value.lower().strip("-")
+        if len(value) < 2:
+            raise serializers.ValidationError("slug는 2자 이상이어야 합니다.")
+        # 소유자 자신의 변경 전제외 중복 체크
+        user = self.context.get("user")
+        qs = Page.objects.filter(slug=value)
+        if user:
+            qs = qs.exclude(user=user)
+        if qs.exists():
+            raise serializers.ValidationError("이미 사용 중인 slug입니다.")
+        return value
+
+
+class SlugCheckSerializer(serializers.Serializer):
+    """GET /api/pages/check-slug/?slug=xxx 전용 응답 스키마."""
+    slug = serializers.SlugField()
+    available = serializers.BooleanField()
+    message = serializers.CharField()
+
+
 class PagePublicSerializer(serializers.ModelSerializer):
     """공개 페이지 조회 - is_enabled=True 블록 포함."""
 

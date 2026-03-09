@@ -20,6 +20,8 @@ from .serializers import (
     PagePublicSerializer,
     PageSerializer,
     ReorderSerializer,
+    SlugChangeSerializer,
+    SlugCheckSerializer,
 )
 
 
@@ -107,7 +109,9 @@ const publicUrl = `https://yourdomain.com/@${page.slug}`;
 | `title` | string | 페이지 상단 제목. 빈 문자열 허용 |
 | `is_public` | bool | `true` → 즉시 전체 공개. `false` → 비공개 전환 |
 
-> `slug`는 읽기 전용으로 변경 불가합니다.
+> **`slug`는 이 API로 변경 불가합니실.**
+> slug 변경은 `PATCH /api/pages/me/slug/` 를 사용하세요.
+> 변경 전 `GET /api/pages/check-slug/?slug=xxx` 로 중복 확인을 권장합니다.
 
 ## 공개 전환 플로우
 ```
@@ -576,3 +580,171 @@ const handleDragEnd = async (reorderedBlocks: Block[]) => {
 
         updated = page.blocks.order_by("order")
         return Response(BlockSerializer(updated, many=True).data)
+
+
+# ─────────────────────────────────────────────────────────────
+# slug 중복 확인 / slug 변경
+# ─────────────────────────────────────────────────────────────
+
+class SlugCheckView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["페이지 서비스"],
+        summary="slug 사용 가능 여부 확인",
+        description="""
+## 개요
+slug 변경 **전**에 해당 slug가 이미 사용 중인지 미리 확인하는 API입니다.  
+UI에서 입력 시 debounce + 이 API 호출로 실시간 중복 표시를 구현하세요.
+
+## 인증
+`Authorization: Bearer <access_token>` 헤더 필수
+
+## Query Parameter
+| 파라미터 | 필수 | 설명 |
+|----------|------|------|
+| `slug` | ✅ | 확인할 slug 문자열 |
+
+## 응답
+- `available: true` → 사용 가능 (PATCH /api/pages/me/slug/ 협출 허용)
+- `available: false` → 이미 사용 중 (오류 표시)
+
+## 프론트엔드 통합 패턴
+```typescript
+// 입력 시 debounce 적용
+const checkSlug = useDebouncedCallback(async (value: string) => {
+  const res = await api.get(`/api/pages/check-slug/?slug=${value}`);
+  setSlugAvailable(res.data.available);
+}, 400);
+```
+
+## 에러
+| 코드 | 원인 |
+|------|------|
+| 400 | slug 파라미터 누락 |
+| 401 | 토큰 없음/만료 |
+        """,
+        responses={
+            200: OpenApiResponse(
+                response=SlugCheckSerializer,
+                description="사용 가능 여부",
+                examples=[
+                    OpenApiExample(
+                        "Available",
+                        value={"slug": "my-brand", "available": True, "message": "사용 가능한 slug입니다."},
+                    ),
+                    OpenApiExample(
+                        "Taken",
+                        value={"slug": "clfy", "available": False, "message": "이미 사용 중인 slug입니다."},
+                    ),
+                ],
+            ),
+            400: OpenApiResponse(description="slug 파라미터 누락"),
+            401: OpenApiResponse(description="인증 실패"),
+        },
+    )
+    def get(self, request):
+        slug = request.query_params.get("slug", "").lower().strip("-")
+        if not slug:
+            return Response(
+                {"detail": "slug 파라미터가 필요합니다."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        taken = Page.objects.filter(slug=slug).exclude(user=request.user).exists()
+        if taken:
+            return Response({"slug": slug, "available": False, "message": "이미 사용 중인 slug입니다."})
+        return Response({"slug": slug, "available": True, "message": "사용 가능한 slug입니다."})
+
+
+class SlugChangeView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["페이지 서비스"],
+        summary="내 페이지 slug 변경",
+        description="""
+## 개요
+공개 URL의 slug(주소)를 변경합니다.  
+**변경 즉시 기존 slug는 사용 불가** — 기존 URL로 접속하는 방문자는 새 slug로 안내해주세요.
+
+## 인증
+`Authorization: Bearer <access_token>` 헤더 필수
+
+## 권장 흐름
+```
+1. GET /api/pages/check-slug/?slug=new-name  → available: true 확인
+2. PATCH /api/pages/me/slug/  { slug: "new-name" }  → 변경 완료
+3. 프론트 저장된 공개 URL을 새 slug로 갱신
+```
+
+## 요청 필드
+| 필드 | 필수 | 설명 |
+|------|------|------|
+| `slug` | ✅ | 주소로 사용할 새 slug. 영문 소문자/숫자/하이픈만 허용, 2~120자 |
+
+## slug 형식 규칙
+- 영문 소문자(a-z), 숫자(0-9), 하이픈(-) 만 허용  
+- 첫글자/끝에 하이픈 불가  
+- 2자 이상 120자 이하  
+- 대소문자 입력 시 소문자로 자동 변환
+
+## Request 예시
+```typescript
+// 새 slug로 변경
+const res = await api.patch('/api/pages/me/slug/', { slug: 'my-brand-2026' });
+console.log(res.data.slug); // 'my-brand-2026'
+// 저장한 공개 URL도 갱신
+const newPublicUrl = `https://yourdomain.com/@${res.data.slug}`;
+```
+
+## 에러
+| 코드 | 원인 |
+|------|------|
+| 400 | slug 형식 오류 |
+| 400 | 이미 사용 중인 slug |
+| 401 | 토큰 없음/만료 |
+        """,
+        request=SlugChangeSerializer,
+        responses={
+            200: OpenApiResponse(
+                response=PageSerializer,
+                description="slug가 변경된 페이지 정보",
+                examples=[
+                    OpenApiExample(
+                        "Success",
+                        value={
+                            "id": 1,
+                            "slug": "my-brand-2026",
+                            "title": "내 링크 페이지",
+                            "is_public": True,
+                            "created_at": "2026-03-01T00:00:00Z",
+                            "updated_at": "2026-03-09T12:00:00Z",
+                        },
+                    )
+                ],
+            ),
+            400: OpenApiResponse(
+                description="유효성 검증 실패",
+                examples=[
+                    OpenApiExample(
+                        "Taken",
+                        value={"slug": ["이미 사용 중인 slug입니다."]},
+                    ),
+                    OpenApiExample(
+                        "Format Error",
+                        value={"slug": ["Enter a valid \u2018slug\u2019 consisting of letters, numbers, underscores or hyphens."]},
+                    ),
+                ],
+            ),
+            401: OpenApiResponse(description="인증 실패"),
+        },
+    )
+    def patch(self, request):
+        page, _ = Page.get_or_create_for_user(request.user)
+        serializer = SlugChangeSerializer(
+            data=request.data, context={"user": request.user}
+        )
+        serializer.is_valid(raise_exception=True)
+        page.slug = serializer.validated_data["slug"]
+        page.save(update_fields=["slug", "updated_at"])
+        return Response(PageSerializer(page).data)
