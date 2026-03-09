@@ -1,7 +1,9 @@
 from django.db import transaction
 from drf_spectacular.utils import (
     OpenApiExample,
+    OpenApiParameter,
     OpenApiResponse,
+    OpenApiTypes,
     extend_schema,
     extend_schema_view,
 )
@@ -776,11 +778,86 @@ class PageViewRecordView(APIView):
     @extend_schema(
         tags=["통계"],
         summary="페이지 조회 기록",
-        description="""공개 페이지가 렌더링될 때 호출합니다.  
-조회 이벤트(IP 해시, 유입 채널, 국가)를 기록합니다.  
-인증 불필요 — 누구나 호출 가능.""",
+        description="""
+## 개요
+공개 페이지(`@slug`)가 화면에 렌더링될 때 **프론트엔드가 자동 호출**해야 하는 엔드포인트입니다.  
+조회 이벤트(IP 해시·유입 채널·국가)를 서버에 기록하며, 이 데이터가 통계 대시보드의 **조회수** 수치로 집계됩니다.
+
+## 인증
+**불필요** — JWT 토큰 없이 누구나 호출 가능합니다.
+
+## 경로 파라미터
+| 파라미터 | 타입 | 설명 |
+|----------|------|------|
+| `slug` | string | 공개 페이지의 slug. `@hong-gildong` → slug는 `hong-gildong` |
+
+## 요청 바디 필드
+| 필드 | 필수 | 타입 | 설명 |
+|------|------|------|------|
+| `referer` | 선택 | string | 방문자 브라우저의 `document.referrer` 값. 어디서 왔는지 파악하는 유입 채널 데이터입니다. 없으면 빈 문자열 `""` 전송 |
+
+> **`referer`가 뭔가요?**  
+> 브라우저 내장 값인 `document.referrer`입니다.  
+> 예를 들어 인스타그램 프로필 링크를 클릭해서 들어왔으면 `"https://l.instagram.com/..."` 이 담깁니다.  
+> 이 값을 서버가 파싱해서 **"인스타그램", "네이버", "카카오", "직접 방문"** 등으로 분류합니다.
+
+## 응답
+성공 시 **204 No Content** — 바디 없음.
+
+## 프론트엔드 통합 패턴
+```typescript
+// pages/@[slug]/page.tsx (Next.js)
+
+useEffect(() => {
+  // 페이지가 마운트되자마자 1회 호출
+  fetch(`/api/pages/@${slug}/view/`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      referer: document.referrer,   // 브라우저에서 자동으로 채워지는 값
+    }),
+  });
+}, [slug]);
+```
+
+## 에러
+| 상태코드 | 원인 |
+|----------|------|
+| 404 | `slug`에 해당하는 공개 페이지가 없거나 비공개(`is_public: false`) 상태 |
+""",
+        parameters=[
+            OpenApiParameter(
+                name="slug",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.PATH,
+                description="공개 페이지의 slug (예: `hong-gildong`)",
+            )
+        ],
         request=RecordViewSerializer,
-        responses={204: None, 404: OpenApiResponse(description="페이지 없음")},
+        examples=[
+            OpenApiExample(
+                "기본 호출 (referer 있음)",
+                value={"referer": "https://l.instagram.com/"},
+                request_only=True,
+            ),
+            OpenApiExample(
+                "직접 방문 (referer 없음)",
+                value={"referer": ""},
+                request_only=True,
+            ),
+        ],
+        responses={
+            204: OpenApiResponse(description="기록 완료 — 바디 없음"),
+            404: OpenApiResponse(
+                description="페이지 없음",
+                examples=[
+                    OpenApiExample(
+                        "Not Found",
+                        value={"detail": "Not found."},
+                    )
+                ],
+            ),
+        },
     )
     def post(self, request, slug):
         page = Page.objects.filter(slug=slug, is_public=True).first()
@@ -807,13 +884,90 @@ class BlockClickRecordView(APIView):
     @extend_schema(
         tags=["통계"],
         summary="블록 클릭 기록",
-        description="""사용자가 블록을 클릭할 때 호출합니다.  
-클릭 이벤트(IP 해시, 유입 채널, 국가)를 기록합니다.  
-인증 불필요 — 누구나 호출 가능.""",
+        description="""
+## 개요
+방문자가 공개 페이지의 **블록(링크)을 클릭할 때** 프론트엔드가 호출해야 하는 엔드포인트입니다.  
+클릭 이벤트(IP 해시·유입 채널·국가)를 기록하며, 통계 대시보드의 **클릭수·클릭율** 수치로 집계됩니다.
+
+## 인증
+**불필요** — JWT 토큰 없이 누구나 호출 가능합니다.
+
+## 경로 파라미터
+| 파라미터 | 타입 | 설명 |
+|----------|------|------|
+| `slug` | string | 공개 페이지의 slug (예: `hong-gildong`) |
+| `block_id` | integer | 클릭된 블록의 `id` (블록 목록 조회 시 반환되는 `id` 필드값) |
+
+## 요청 바디 필드
+| 필드 | 필수 | 타입 | 설명 |
+|------|------|------|------|
+| `referer` | 선택 | string | 방문자 브라우저의 `document.referrer` 값. 없으면 빈 문자열 `""` 전송 |
+
+## 응답
+성공 시 **204 No Content** — 바디 없음.
+
+## 프론트엔드 통합 패턴
+```typescript
+// 블록 컴포넌트에서 클릭 핸들러
+const handleBlockClick = async (block: Block) => {
+  // 1) 클릭 기록 (fire-and-forget — 실패해도 사용자 경험에 영향 없음)
+  fetch(`/api/pages/@${slug}/blocks/${block.id}/click/`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      referer: document.referrer,
+    }),
+  }).catch(() => {});  // 통계 실패가 페이지 동작을 막으면 안 됨
+
+  // 2) 실제 링크 이동
+  window.open(block.data.url, '_blank');
+};
+```
+
+## 에러
+| 상태코드 | 원인 |
+|----------|------|
+| 404 | `slug`에 해당하는 공개 페이지가 없거나 비공개 상태 |
+| 404 | `block_id`가 해당 페이지에 속하지 않음 |
+""",
+        parameters=[
+            OpenApiParameter(
+                name="slug",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.PATH,
+                description="공개 페이지의 slug (예: `hong-gildong`)",
+            ),
+            OpenApiParameter(
+                name="block_id",
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.PATH,
+                description="클릭된 블록의 ID (`GET /api/pages/me/blocks/` 응답의 `id` 필드)",
+            ),
+        ],
         request=RecordClickSerializer,
+        examples=[
+            OpenApiExample(
+                "기본 호출 (referer 있음)",
+                value={"referer": "https://l.instagram.com/"},
+                request_only=True,
+            ),
+            OpenApiExample(
+                "직접 방문 (referer 없음)",
+                value={"referer": ""},
+                request_only=True,
+            ),
+        ],
         responses={
-            204: None,
-            404: OpenApiResponse(description="페이지 또는 블록 없음"),
+            204: OpenApiResponse(description="기록 완료 — 바디 없음"),
+            404: OpenApiResponse(
+                description="페이지 또는 블록 없음",
+                examples=[
+                    OpenApiExample(
+                        "Not Found",
+                        value={"detail": "Not found."},
+                    )
+                ],
+            ),
         },
     )
     def post(self, request, slug, block_id):
