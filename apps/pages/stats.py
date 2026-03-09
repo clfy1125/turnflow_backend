@@ -10,11 +10,20 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from datetime import timedelta
 from urllib.parse import urlparse
 
+import requests as http_requests
+from django.core.cache import cache
 from django.db.models import Count, Q
 from django.utils import timezone
+
+logger = logging.getLogger(__name__)
+
+# ip-api.com 무료 플랜: 분당 45회, 키 불필요
+_IP_API_URL = "http://ip-api.com/json/{ip}?fields=countryCode"
+_IP_CACHE_TTL = 60 * 60 * 24  # 24시간 (같은 IP는 재요청 안 함)
 
 # ─── 상수 ────────────────────────────────────────────────────
 
@@ -84,10 +93,7 @@ COUNTRY_NAME_MAP: dict[str, str] = {
 
 def hash_ip(request) -> str:
     """IP 주소를 SHA-256으로 해시. X-Forwarded-For 우선."""
-    ip = (
-        request.META.get("HTTP_X_FORWARDED_FOR", "").split(",")[0].strip()
-        or request.META.get("REMOTE_ADDR", "")
-    )
+    ip = _get_real_ip(request)
     if not ip:
         return ""
     return hashlib.sha256(ip.encode()).hexdigest()
@@ -115,17 +121,69 @@ def parse_referer(referer_url: str) -> str:
         return "기타"
 
 
+def _get_real_ip(request) -> str:
+    """X-Forwarded-For 또는 REMOTE_ADDR에서 실제 IP 추출."""
+    return (
+        request.META.get("HTTP_X_FORWARDED_FOR", "").split(",")[0].strip()
+        or request.META.get("REMOTE_ADDR", "")
+    )
+
+
+def _lookup_country_by_ip(ip: str) -> str:
+    """
+    ip-api.com으로 국가 코드 조회.
+    결과를 24시간 캐시하여 반복 호출 방지.
+    loopback/private IP는 건너뜀.
+    """
+    if not ip or ip in ("127.0.0.1", "::1", "localhost"):
+        return ""
+    # private 대역 (10.x, 172.16-31.x, 192.168.x) 건너뜀
+    import ipaddress
+    try:
+        if ipaddress.ip_address(ip).is_private:
+            return ""
+    except ValueError:
+        return ""
+
+    cache_key = f"geoip:{ip}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        resp = http_requests.get(
+            _IP_API_URL.format(ip=ip),
+            timeout=1.5,
+        )
+        data = resp.json()
+        code = data.get("countryCode", "").upper().strip()
+        result = code if len(code) == 2 and code.isalpha() else ""
+    except Exception as e:
+        logger.debug("ip-api lookup failed for %s: %s", ip, e)
+        result = ""
+
+    cache.set(cache_key, result, _IP_CACHE_TTL)
+    return result
+
+
 def get_country(request) -> str:
     """
     국가 코드(ISO 3166-1 alpha-2) 반환.
-    우선순위: CF-IPCountry → X-Country-Code → ""
+    우선순위:
+      1) CF-IPCountry  헤더 (Cloudflare 프록시 환경 — 프로덕션)
+      2) X-Country-Code 헤더 (nginx GeoIP 등 커스텀 리버스 프록시)
+      3) ip-api.com IP 조회 (위 두 헤더 없을 때 자동 fallback — 개발/ngrok 환경)
     """
-    country = (
+    # 1·2순위: 서버/프록시가 주입한 헤더
+    header_country = (
         request.META.get("HTTP_CF_IPCOUNTRY", "")
         or request.META.get("HTTP_X_COUNTRY_CODE", "")
     ).upper().strip()
-    # 'XX' = Cloudflare unknown, 'T1' = Tor 등 제외
-    return country if len(country) == 2 and country.isalpha() else ""
+    if len(header_country) == 2 and header_country.isalpha() and header_country not in ("XX", "T1"):
+        return header_country
+
+    # 3순위: IP 직접 조회 (fallback)
+    return _lookup_country_by_ip(_get_real_ip(request))
 
 
 def get_country_name(code: str) -> str:
