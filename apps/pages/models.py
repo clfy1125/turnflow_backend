@@ -33,6 +33,12 @@ class Page(models.Model):
     )
     title = models.CharField(max_length=255, blank=True, default="", verbose_name="페이지 제목")
     is_public = models.BooleanField(default=False, verbose_name="공개 여부")
+    data = models.JSONField(
+        default=dict,
+        blank=True,
+        verbose_name="페이지 설정 데이터",
+        help_text="프론트엔드가 자유롭게 저장하는 페이지 설정 (테마, 배경색, 폰트 등). 서버는 구조를 강제하지 않습니다.",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

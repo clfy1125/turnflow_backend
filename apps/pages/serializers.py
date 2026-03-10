@@ -166,7 +166,7 @@ class BlockPublicSerializer(serializers.ModelSerializer):
 class PageSerializer(serializers.ModelSerializer):
     class Meta:
         model = Page
-        fields = ["id", "slug", "title", "is_public", "created_at", "updated_at"]
+        fields = ["id", "slug", "title", "is_public", "data", "created_at", "updated_at"]
         read_only_fields = ["id", "slug", "created_at", "updated_at"]
 
 
@@ -208,7 +208,7 @@ class PagePublicSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Page
-        fields = ["slug", "title", "is_public", "blocks"]
+        fields = ["slug", "title", "is_public", "data", "blocks"]
 
     def get_blocks(self, obj):
         now = timezone.now()

@@ -67,6 +67,7 @@ class MyPageView(APIView):
 | `slug` | string | 공개 URL 식별자 (`@slug` 형태로 사용). **읽기 전용** |
 | `title` | string | 페이지 상단에 표시되는 제목 (기본값: 빈 문자열) |
 | `is_public` | bool | `true`이면 누구나 열람 가능. 기본값 `false` |
+| `data` | object | **프론트엔드 전용 설정 저장소** — 테마, 배경색, 폰트 등 자유 형식. 서버는 내용을 파싱하지 않음 |
 | `created_at` | datetime | ISO 8601 |
 | `updated_at` | datetime | ISO 8601 |
 
@@ -74,6 +75,25 @@ class MyPageView(APIView):
 - 최초 호출 시 `username` 기반 slug(`hong-gildong` 등)로 페이지 자동 생성
 - slug 충돌 시 `-2`, `-3` … 접미사 자동 부여
 - **`is_public` 기본값: `false`** → 공개 전까지 외부 접근 차단됨
+
+## `data` 필드 사용법
+서버는 `data` 안의 구조를 강제하지 않습니다.  
+프론트엔드가 필요한 설정을 자유롭게 저장하고 읽으면 됩니다.  
+PATCH 시 `data` 필드를 전송하면 해당 값으로 **전체 덮어쓰기**됩니다 (merge 아님).
+
+```json
+// 예시 — 프론트엔드에서 직접 정의하는 구조
+{
+  "data": {
+    "theme": "dark",
+    "background_color": "#1a1a2e",
+    "font_family": "Pretendard",
+    "button_style": "rounded",
+    "button_color": "#e94560",
+    "profile_image_url": "https://cdn.example.com/avatar.jpg"
+  }
+}
+```
 
 ## 프론트엔드 통합 패턴
 ```typescript
@@ -99,6 +119,25 @@ const publicUrl = `https://yourdomain.com/@${page.slug}`;
                             "slug": "hong-gildong",
                             "title": "",
                             "is_public": False,
+                            "data": {},
+                            "created_at": "2026-03-01T00:00:00Z",
+                            "updated_at": "2026-03-01T00:00:00Z",
+                        },
+                    ),
+                    OpenApiExample(
+                        "data 필드 예시",
+                        value={
+                            "id": 1,
+                            "slug": "hong-gildong",
+                            "title": "내 링크 페이지",
+                            "is_public": True,
+                            "data": {
+                                "theme": "dark",
+                                "background_color": "#1a1a2e",
+                                "font_family": "Pretendard",
+                                "button_style": "rounded",
+                                "button_color": "#e94560",
+                            },
                             "created_at": "2026-03-01T00:00:00Z",
                             "updated_at": "2026-03-01T00:00:00Z",
                         },
@@ -126,34 +165,67 @@ const publicUrl = `https://yourdomain.com/@${page.slug}`;
 |------|------|------|
 | `title` | string | 페이지 상단 제목. 빈 문자열 허용 |
 | `is_public` | bool | `true` → 즉시 전체 공개. `false` → 비공개 전환 |
+| `data` | object | **프론트엔드 전용 설정 저장소**. 전송한 값으로 전체 덮어쓰기 |
 
 > **`slug`는 이 API로 변경 불가합니실.**
 > slug 변경은 `PATCH /api/pages/me/slug/` 를 사용하세요.
 > 변경 전 `GET /api/pages/check-slug/?slug=xxx` 로 중복 확인을 권장합니다.
 
-## 공개 전환 플로우
-```
-페이지 편집 완료 → PATCH { is_public: true } → 사용자에게 공개 URL 노출
-```
+## `data` 필드 동작 방식
+- 서버는 `data` 내부 구조를 검증하지 않습니다 — 프론트엔드가 정의하는 형식 자유롭게 사용 가능
+- `data` 전송 시 **덮어쓰기** 동작 (merge 아님). 특정 키만 변경하려면 프론트엔드에서 전체 객체를 고쳐서 전송해야 합니다
 
 ## Request 예시
 ```typescript
-// 제목 변경 + 공개 전환
+// 1) 제목 변경 + 공개 전환
 await api.patch('/api/pages/me/', { title: '내 링크 페이지', is_public: true });
 
-// 비공개로 전환만
+// 2) 디자인 설정 저장 (테마 변경)
+const { data: page } = await api.get('/api/pages/me/');
+await api.patch('/api/pages/me/', {
+  data: {
+    ...page.data,          // 기존 설정 유지
+    theme: 'dark',         // 특정 키만 업데이트
+    background_color: '#1a1a2e',
+  },
+});
+
+// 3) 비공개로 전환만
 await api.patch('/api/pages/me/', { is_public: false });
 ```
 
 ## 에러
 | 코드 | 원인 |
 |------|------|
-| 400 | 필드 타입 오류 |
+| 400 | 필드 타입 오류 (`data`는 object여야 함) |
 | 401 | 토큰 없음/만료 |
         """,
         request=PageSerializer,
         responses={
-            200: OpenApiResponse(response=PageSerializer, description="수정된 페이지"),
+            200: OpenApiResponse(
+                response=PageSerializer,
+                description="수정된 페이지",
+                examples=[
+                    OpenApiExample(
+                        "성공 응답",
+                        value={
+                            "id": 1,
+                            "slug": "hong-gildong",
+                            "title": "내 링크 페이지",
+                            "is_public": True,
+                            "data": {
+                                "theme": "dark",
+                                "background_color": "#1a1a2e",
+                                "font_family": "Pretendard",
+                                "button_style": "rounded",
+                                "button_color": "#e94560",
+                            },
+                            "created_at": "2026-03-01T00:00:00Z",
+                            "updated_at": "2026-03-10T12:00:00Z",
+                        },
+                    )
+                ],
+            ),
             400: OpenApiResponse(description="유효성 검증 실패"),
             401: OpenApiResponse(description="인증 실패"),
         },
