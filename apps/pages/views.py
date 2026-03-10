@@ -1,4 +1,5 @@
 from django.db import transaction
+from django.db.models import Case, IntegerField, When
 from drf_spectacular.utils import (
     OpenApiExample,
     OpenApiParameter,
@@ -540,7 +541,7 @@ class BlockReorderView(APIView):
 
 ## 동작 방식
 - 페이지의 **전체 블록을 모두 포함할 필요는 없습니다** — 포함된 id의 block만 order 변경됨
-- 내부적으로 `unique_together(page, order)` 충돌을 피하기 위해 음수 임시값으로 2-pass 저장
+- 내부적으로 `CASE/WHEN` 단일 UPDATE 쿼리로 처리 — 원자적 순서 교환 보장
 - 실패 시 전체 롤백 (원자성 보장)
 
 ## 제약
@@ -575,10 +576,9 @@ const handleDragEnd = async (reorderedBlocks: Block[]) => {
         orders = serializer.validated_data["orders"]
 
         requested_ids = [item["id"] for item in orders]
-        blocks = Block.objects.filter(pk__in=requested_ids, page=page)
 
         # 다른 페이지 블록 포함 여부 검증
-        if blocks.count() != len(requested_ids):
+        if Block.objects.filter(pk__in=requested_ids, page=page).count() != len(requested_ids):
             return Response(
                 {"detail": "요청한 블록 중 이 페이지에 속하지 않거나 존재하지 않는 블록이 있습니다."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -587,13 +587,11 @@ const handleDragEnd = async (reorderedBlocks: Block[]) => {
         id_to_order = {item["id"]: item["order"] for item in orders}
 
         with transaction.atomic():
-            # unique_together 충돌 방지를 위해 임시로 음수 order로 먼저 저장
-            for block in blocks:
-                block.order = -(id_to_order[block.pk])
-                block.save(update_fields=["order"])
-            for block in blocks:
-                block.order = id_to_order[block.pk]
-                block.save(update_fields=["order"])
+            # 단일 UPDATE CASE/WHEN — PostgreSQL은 문장 단위로 unique 검사하므로 충돌 없음
+            cases = [When(pk=pk, then=order) for pk, order in id_to_order.items()]
+            Block.objects.filter(pk__in=id_to_order.keys(), page=page).update(
+                order=Case(*cases, output_field=IntegerField())
+            )
 
         updated = page.blocks.order_by("order")
         return Response(BlockSerializer(updated, many=True).data)
