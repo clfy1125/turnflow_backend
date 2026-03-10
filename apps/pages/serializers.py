@@ -3,7 +3,7 @@ from rest_framework import serializers
 from django.db.models import Q
 from django.utils import timezone
 
-from .models import Block, Page
+from .models import Block, ContactInquiry, Page
 from .validators import validate_block_data
 
 
@@ -324,3 +324,54 @@ class RecordClickSerializer(serializers.Serializer):
         required=False, allow_blank=True, default="",
         help_text="방문자 브라우저의 document.referrer 값.",
     )
+
+
+# ─── 문의 시리얼라이저 ────────────────────────────────────────
+
+class ContactInquirySubmitSerializer(serializers.ModelSerializer):
+    """
+    POST /api/pages/@{slug}/inquiries/ — 방문자가 문의를 보낼 때 사용.
+    page 필드는 뷰에서 slug로 자동 주입하므로 요청 바디에서는 제외.
+    """
+
+    class Meta:
+        model = ContactInquiry
+        fields = ["name", "category", "email", "phone", "subject", "content", "agreed_to_terms"]
+
+    def validate_phone(self, value: str) -> str:
+        if not value.strip():
+            raise serializers.ValidationError("휴대폰번호는 필수입니다.")
+        return value.strip()
+
+    def validate_agreed_to_terms(self, value: bool) -> bool:
+        if not value:
+            raise serializers.ValidationError("이용약관 및 개인정보 처리방침에 동의해야 문의를 보낼 수 있습니다.")
+        return value
+
+
+class ContactInquirySerializer(serializers.ModelSerializer):
+    """GET /api/pages/me/inquiries/ — 페이지 관리자용 목록/상세 조회."""
+
+    category_display = serializers.CharField(source="get_category_display", read_only=True)
+
+    class Meta:
+        model = ContactInquiry
+        fields = [
+            "id", "name", "category", "category_display",
+            "email", "phone", "subject", "content",
+            "agreed_to_terms", "memo", "created_at", "updated_at",
+        ]
+        read_only_fields = [
+            "id", "name", "category", "category_display",
+            "email", "phone", "subject", "content",
+            "agreed_to_terms", "created_at", "updated_at",
+        ]
+
+
+class ContactInquiryMemoSerializer(serializers.ModelSerializer):
+    """PATCH /api/pages/me/inquiries/{id}/memo/ — 관리자 메모 수정 전용."""
+
+    class Meta:
+        model = ContactInquiry
+        fields = ["id", "memo", "updated_at"]
+        read_only_fields = ["id", "updated_at"]

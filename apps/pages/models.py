@@ -197,3 +197,70 @@ class BlockClick(models.Model):
             models.Index(fields=["page", "clicked_at"]),
             models.Index(fields=["block", "clicked_at"]),
         ]
+
+
+# ─────────────────────────────────────────────────────────────
+# 문의 모델
+# ─────────────────────────────────────────────────────────────
+
+class ContactInquiry(models.Model):
+    """페이지 방문자가 페이지 관리자에게 보내는 문의."""
+
+    class Category(models.TextChoices):
+        GENERAL = "general", "일반 문의"
+        BUSINESS = "business", "비즈니스 협업"
+        SUPPORT = "support", "고객 지원"
+        OTHER = "other", "기타"
+
+    page = models.ForeignKey(
+        Page,
+        on_delete=models.CASCADE,
+        related_name="inquiries",
+        verbose_name="페이지",
+    )
+
+    # ── 방문자가 입력하는 정보 ─────────────────────────────
+    name = models.CharField(max_length=100, verbose_name="보낸 사람")
+    category = models.CharField(
+        max_length=20,
+        choices=Category.choices,
+        default=Category.GENERAL,
+        verbose_name="분류",
+    )
+    email = models.EmailField(blank=True, default="", verbose_name="이메일")
+    phone = models.CharField(max_length=30, verbose_name="휴대폰번호")
+    subject = models.CharField(max_length=255, verbose_name="문의 제목")
+    content = models.TextField(blank=True, default="", verbose_name="문의 내용")
+    agreed_to_terms = models.BooleanField(
+        default=False,
+        verbose_name="이용약관 및 개인정보 처리방침 동의",
+    )
+
+    # ── 페이지 관리자 전용 ─────────────────────────────────
+    memo = models.TextField(
+        blank=True,
+        default="",
+        verbose_name="관리자 메모",
+        help_text="작성 내용은 확인용으로, 문의 고객에게 전달되지 않습니다.",
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True, verbose_name="문의 일시")
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "문의"
+        verbose_name_plural = "문의 목록"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["page", "created_at"]),
+            models.Index(fields=["page", "category"]),
+        ]
+
+    def __str__(self):
+        return f"[{self.get_category_display()}] {self.subject} — {self.name} ({self.created_at:%Y-%m-%d})"
+
+        verbose_name_plural = "블록 클릭 목록"
+        indexes = [
+            models.Index(fields=["page", "clicked_at"]),
+            models.Index(fields=["block", "clicked_at"]),
+        ]
