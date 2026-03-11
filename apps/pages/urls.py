@@ -1,5 +1,6 @@
 from django.urls import path
 
+from .image_views import PageMediaDetailView, PageMediaView
 from .views import (
     BlockClickRecordView,
     BlockDetailView,
@@ -49,6 +50,9 @@ urlpatterns = [
     path("@<slug:slug>/inquiries/", ContactInquirySubmitView.as_view(), name="inquiry-submit"),
     # 공개 — 구독 등록 (인증 불필요)
     path("@<slug:slug>/subscriptions/", PageSubscriptionSubmitView.as_view(), name="subscription-submit"),
+    # 미디어 업로드/목록 (인증 필수)
+    path("me/media/", PageMediaView.as_view(), name="media-list-upload"),
+    path("me/media/<int:pk>/", PageMediaDetailView.as_view(), name="media-detail"),
     # 내 블록 목록/생성
     path("me/blocks/", BlockListCreateView.as_view(), name="block-list-create"),
     # 블록 reorder

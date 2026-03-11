@@ -3,7 +3,7 @@ from rest_framework import serializers
 from django.db.models import Q
 from django.utils import timezone
 
-from .models import Block, ContactInquiry, Page, PageSubscription
+from .models import Block, ContactInquiry, Page, PageMedia, PageSubscription
 from .validators import validate_block_data
 
 
@@ -424,3 +424,37 @@ class PageSubscriptionMemoSerializer(serializers.ModelSerializer):
         model = PageSubscription
         fields = ["id", "memo", "updated_at"]
         read_only_fields = ["id", "updated_at"]
+
+
+# ─── 미디어 시리얼라이저 ──────────────────────────────────────
+
+class PageMediaSerializer(serializers.ModelSerializer):
+    """GET·POST /api/pages/me/media/ — 업로드된 미디어 파일 정보."""
+
+    url = serializers.SerializerMethodField(
+        help_text="파일 접근 URL. block.data 의 thumbnail_url / avatar_url 등에 그대로 사용."
+    )
+    size_display = serializers.SerializerMethodField(
+        help_text="사람이 읽기 좋은 파일 크기 (예: 1.2 MB)"
+    )
+
+    class Meta:
+        model = PageMedia
+        fields = ["id", "original_name", "mime_type", "size", "size_display", "url", "created_at"]
+        read_only_fields = ["id", "original_name", "mime_type", "size", "size_display", "url", "created_at"]
+
+    def get_url(self, obj) -> str:
+        request = self.context.get("request")
+        if not obj.file:
+            return ""
+        if request:
+            return request.build_absolute_uri(obj.file.url)
+        return obj.file.url
+
+    def get_size_display(self, obj) -> str:
+        size = obj.size
+        if size < 1024:
+            return f"{size} B"
+        if size < 1024 * 1024:
+            return f"{size / 1024:.1f} KB"
+        return f"{size / (1024 * 1024):.1f} MB"

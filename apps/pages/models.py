@@ -317,3 +317,43 @@ class PageSubscription(models.Model):
 
     def __str__(self):
         return f"[{self.get_category_display()}] {self.email} ({self.created_at:%Y-%m-%d})"
+
+
+# ─────────────────────────────────────────────────────────────
+# 미디어 파일 모델
+# ─────────────────────────────────────────────────────────────
+
+class PageMedia(models.Model):
+    """페이지 관리자가 업로드한 이미지/파일. block.data 의 URL 필드에서 참조."""
+
+    page = models.ForeignKey(
+        Page,
+        on_delete=models.CASCADE,
+        related_name="media_files",
+        verbose_name="페이지",
+    )
+    file = models.FileField(
+        upload_to="pages/%Y/%m/",
+        verbose_name="파일",
+    )
+    original_name = models.CharField(max_length=500, verbose_name="원본 파일명")
+    mime_type = models.CharField(max_length=100, verbose_name="MIME 타입")
+    size = models.PositiveIntegerField(verbose_name="파일 크기 (bytes)")
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True, verbose_name="업로드 일시")
+
+    class Meta:
+        verbose_name = "미디어 파일"
+        verbose_name_plural = "미디어 파일 목록"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["page", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.page.slug} / {self.original_name}"
+
+    def delete(self, *args, **kwargs):
+        """DB 레코드 삭제 시 스토리지 파일도 함께 제거."""
+        if self.file:
+            self.file.delete(save=False)
+        super().delete(*args, **kwargs)
