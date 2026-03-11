@@ -19,7 +19,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.viewsets import ViewSet
 
-from .models import Block, BlockClick, ContactInquiry, Page, PageView
+from .models import Block, BlockClick, ContactInquiry, Page, PageSubscription, PageView
 from .permissions import IsPageOwner, IsPublicPageOrOwner
 from .serializers import (
     BlockSerializer,
@@ -31,6 +31,9 @@ from .serializers import (
     ContactInquirySubmitSerializer,
     PagePublicSerializer,
     PageSerializer,
+    PageSubscriptionMemoSerializer,
+    PageSubscriptionSerializer,
+    PageSubscriptionSubmitSerializer,
     RecordClickSerializer,
     RecordViewSerializer,
     ReorderSerializer,
@@ -1473,3 +1476,334 @@ await api.patch(`/api/pages/me/inquiries/${id}/memo/`, {
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(serializer.data)
+
+
+# ─────────────────────────────────────────────────────────────
+# 구독 제출 (AllowAny — 방문자)
+# ─────────────────────────────────────────────────────────────
+
+class PageSubscriptionSubmitView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    @extend_schema(
+        tags=["구독"],
+        summary="구독 등록 (방문자 → 페이지 관리자)",
+        description="""
+## 개요
+공개 페이지(`@slug`)의 방문자가 구독 등록하는 엔드포인트입니다.  
+등록 정보는 관리자의 구독자 대시보드에 쌓입니다.
+
+## 인증
+**불필요** — 누구나 호출 가능합니다.
+
+## 경로 파라미터
+| 파라미터 | 타입 | 설명 |
+|----------|------|------|
+| `slug` | string | 페이지의 slug |
+
+## 요청 필드
+| 필드 | 필수 | 타입 | 설명 |
+|------|:------:|------|------|
+| `email` | ✅ | string | 이메일 주소 |
+| `agreed_to_terms` | ✅ | boolean | 반드시 `true`여야 등록 가능 |
+| `name` | 선택 | string | 구독자 이름 |
+| `category` | 선택 | string | `page_subscribe`(기본) `newsletter` `event` `other` |
+| `phone` | 선택 | string | 휴대폰번호 |
+
+## 에러
+| 코드 | 원인 |
+|------|------|
+| 400 | 필수 필드 누락, 동의 체크 안 함 |
+| 404 | slug에 해당하는 공개 페이지 없음 |
+
+## 프론트엔드 예시
+```typescript
+await fetch(`/api/pages/@${slug}/subscriptions/`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    email: 'user@example.com',
+    name: '홍길동',
+    phone: '010-1234-5678',
+    category: 'page_subscribe',
+    agreed_to_terms: true,
+  }),
+});
+```
+""",
+        parameters=[
+            OpenApiParameter(
+                name="slug", type=OpenApiTypes.STR, location=OpenApiParameter.PATH,
+                description="공개 페이지의 slug",
+            ),
+        ],
+        request=PageSubscriptionSubmitSerializer,
+        examples=[
+            OpenApiExample(
+                "구독 등록 예시",
+                request_only=True,
+                value={
+                    "email": "user@example.com",
+                    "name": "홍길동",
+                    "phone": "010-1234-5678",
+                    "category": "page_subscribe",
+                    "agreed_to_terms": True,
+                },
+            ),
+        ],
+        responses={
+            201: OpenApiResponse(
+                response=PageSubscriptionSubmitSerializer,
+                description="구독 등록 성공",
+                examples=[
+                    OpenApiExample(
+                        "Success",
+                        value={
+                            "name": "홍길동",
+                            "category": "page_subscribe",
+                            "email": "user@example.com",
+                            "phone": "010-1234-5678",
+                            "agreed_to_terms": True,
+                        },
+                    )
+                ],
+            ),
+            400: OpenApiResponse(
+                description="유효성 검증 실패",
+                examples=[
+                    OpenApiExample(
+                        "동의 누락",
+                        value={"agreed_to_terms": ["개인정보 수집 및 이용에 동의해야 구독할 수 있습니다."]},
+                    ),
+                    OpenApiExample(
+                        "이메일 누락",
+                        value={"email": ["이메일은 필수입니다."]},
+                    ),
+                ],
+            ),
+            404: OpenApiResponse(description="페이지 없음"),
+        },
+    )
+    def post(self, request, slug):
+        page = Page.objects.filter(slug=slug, is_public=True).first()
+        if not page:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        serializer = PageSubscriptionSubmitSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save(page=page)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+# ─────────────────────────────────────────────────────────────
+# 구독자 목록 / 삭제 / 메모 (IsAuthenticated — 페이지 관리자)
+# ─────────────────────────────────────────────────────────────
+
+_SUBSCRIPTION_PERIOD_MAP = {
+    "all": None,
+    "6m": 180,
+    "1m": 30,
+    "7d": 7,
+}
+
+
+class PageSubscriptionListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["구독"],
+        summary="구독자 목록 조회 (관리자)",
+        description="""
+## 개요
+내 페이지에 등록된 구독자 목록을 최신순으로 반환합니다.  
+기간 필터와 키워드 검색을 지원합니다.
+
+## 인증
+`Authorization: Bearer <access_token>` 헤더 필수
+
+## 쿼리 파라미터
+| 파라미터 | 기본값 | 허용값 | 설명 |
+|---------|--------|--------|------|
+| `period` | `all` | `all` `6m` `1m` `7d` | 조회 기간 |
+| `q` | - | 문자열 | 이름·이메일·휴대폰번호 통합 검색 |
+
+## 응답 필드
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `id` | int | 구독자 ID |
+| `name` | string | 이름 (빈 문자열 가능) |
+| `category` | string | 분류 코드 (`page_subscribe` `newsletter` `event` `other`) |
+| `category_display` | string | 한글 분류명 |
+| `email` | string | 이메일 |
+| `phone` | string | 휴대폰번호 (빈 문자열 가능) |
+| `agreed_to_terms` | boolean | 개인정보 수집 동의 여부 |
+| `memo` | string | 관리자 메모 (없으면 빈 문자열) |
+| `created_at` | datetime | 구독 일시 |
+""",
+        parameters=[
+            OpenApiParameter(
+                name="period", type=OpenApiTypes.STR, location=OpenApiParameter.QUERY,
+                description="조회 기간. `all`=전체, `6m`=6개월, `1m`=1개월, `7d`=7일",
+                required=False, enum=["all", "6m", "1m", "7d"],
+            ),
+            OpenApiParameter(
+                name="q", type=OpenApiTypes.STR, location=OpenApiParameter.QUERY,
+                description="키워드 검색 — 이름, 이메일, 휴대폰번호를 통합 검색합니다.",
+                required=False,
+            ),
+        ],
+        responses={
+            200: OpenApiResponse(
+                response=PageSubscriptionSerializer(many=True),
+                description="구독자 목록",
+                examples=[
+                    OpenApiExample(
+                        "Success",
+                        value=[
+                            {
+                                "id": 1,
+                                "name": "홍길동",
+                                "category": "page_subscribe",
+                                "category_display": "페이지 구독",
+                                "email": "user@example.com",
+                                "phone": "010-1234-5678",
+                                "agreed_to_terms": True,
+                                "memo": "",
+                                "created_at": "2026-03-11T07:18:00Z",
+                                "updated_at": "2026-03-11T07:18:00Z",
+                            }
+                        ],
+                    )
+                ],
+            ),
+            401: OpenApiResponse(description="인증 실패"),
+        },
+    )
+    def get(self, request):
+        page, _ = Page.get_or_create_for_user(request.user)
+        qs = PageSubscription.objects.filter(page=page)
+
+        # 기간 필터
+        period = request.query_params.get("period", "all")
+        days = _SUBSCRIPTION_PERIOD_MAP.get(period)
+        if days is not None:
+            since = timezone.now() - timedelta(days=days)
+            qs = qs.filter(created_at__gte=since)
+
+        # 키워드 검색 (이름, 이메일, 휴대폰번호)
+        q = request.query_params.get("q", "").strip()
+        if q:
+            from django.db.models import Q as DQ
+            qs = qs.filter(
+                DQ(name__icontains=q) | DQ(email__icontains=q) | DQ(phone__icontains=q)
+            )
+
+        return Response(PageSubscriptionSerializer(qs, many=True).data)
+
+
+class PageSubscriptionDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def _get_subscription(self, request, pk):
+        page, _ = Page.get_or_create_for_user(request.user)
+        return PageSubscription.objects.filter(pk=pk, page=page).first()
+
+    @extend_schema(
+        tags=["구독"],
+        summary="구독자 삭제 (관리자)",
+        description="""
+## 개요
+특정 구독자 1건을 영구 삭제합니다.  
+**본인 페이지에 속한 구독자만** 삭제 가능합니다.
+
+## 인증
+`Authorization: Bearer <access_token>` 헤더 필수
+
+## 응답
+성공 시 **204 No Content** — 바디 없음.
+""",
+        parameters=[
+            OpenApiParameter(
+                name="id", type=OpenApiTypes.INT, location=OpenApiParameter.PATH,
+                description="삭제할 구독자 ID",
+            ),
+        ],
+        responses={
+            204: OpenApiResponse(description="삭제 완료"),
+            401: OpenApiResponse(description="인증 실패"),
+            404: OpenApiResponse(description="구독자 없음 또는 권한 없음"),
+        },
+    )
+    def delete(self, request, pk):
+        subscription = self._get_subscription(request, pk)
+        if not subscription:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        subscription.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @extend_schema(
+        tags=["구독"],
+        summary="구독자 메모 수정 (관리자)",
+        description="""
+## 개요
+특정 구독자에 **관리자 메모**를 작성하거나 수정합니다.  
+메모는 관리자만 볼 수 있으며 구독자에게 노출되지 않습니다.
+
+## 인증
+`Authorization: Bearer <access_token>` 헤더 필수
+
+## 요청 필드
+| 필드 | 필수 | 타입 | 설명 |
+|------|:------:|------|------|
+| `memo` | ✅ | string | 메모 내용. 빈 문자열로 메모 삭제 가능 |
+
+## 프론트엔드 예시
+```typescript
+await api.patch(`/api/pages/me/subscriptions/${id}/`, {
+  memo: 'VIP 고객, 뉴스레터 별도 발송 예정',
+});
+```
+""",
+        parameters=[
+            OpenApiParameter(
+                name="id", type=OpenApiTypes.INT, location=OpenApiParameter.PATH,
+                description="메모를 수정할 구독자 ID",
+            ),
+        ],
+        request=PageSubscriptionMemoSerializer,
+        examples=[
+            OpenApiExample(
+                "메모 작성",
+                request_only=True,
+                value={"memo": "VIP 고객, 뉴스레터 별도 발송 예정"},
+            ),
+            OpenApiExample(
+                "메모 삭제",
+                request_only=True,
+                value={"memo": ""},
+            ),
+        ],
+        responses={
+            200: OpenApiResponse(
+                response=PageSubscriptionMemoSerializer,
+                description="수정된 메모",
+                examples=[
+                    OpenApiExample(
+                        "Success",
+                        value={"id": 1, "memo": "VIP 고객, 뉴스레터 별도 발송 예정", "updated_at": "2026-03-11T10:00:00Z"},
+                    )
+                ],
+            ),
+            401: OpenApiResponse(description="인증 실패"),
+            404: OpenApiResponse(description="구독자 없음 또는 권한 없음"),
+        },
+    )
+    def patch(self, request, pk):
+        subscription = self._get_subscription(request, pk)
+        if not subscription:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        serializer = PageSubscriptionMemoSerializer(subscription, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+

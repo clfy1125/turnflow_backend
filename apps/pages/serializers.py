@@ -3,7 +3,7 @@ from rest_framework import serializers
 from django.db.models import Q
 from django.utils import timezone
 
-from .models import Block, ContactInquiry, Page
+from .models import Block, ContactInquiry, Page, PageSubscription
 from .validators import validate_block_data
 
 
@@ -373,5 +373,54 @@ class ContactInquiryMemoSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ContactInquiry
+        fields = ["id", "memo", "updated_at"]
+        read_only_fields = ["id", "updated_at"]
+
+
+# ─── 구독 시리얼라이저 ────────────────────────────────────────
+
+class PageSubscriptionSubmitSerializer(serializers.ModelSerializer):
+    """
+    POST /api/pages/@{slug}/subscriptions/ — 방문자가 구독 등록할 때 사용.
+    page 필드는 뷰에서 slug로 자동 주입하므로 요청 바디에서는 제외.
+    """
+
+    class Meta:
+        model = PageSubscription
+        fields = ["name", "category", "email", "phone", "agreed_to_terms"]
+
+    def validate_agreed_to_terms(self, value: bool) -> bool:
+        if not value:
+            raise serializers.ValidationError("개인정보 수집 및 이용에 동의해야 구독할 수 있습니다.")
+        return value
+
+    def validate_email(self, value: str) -> str:
+        if not value or not value.strip():
+            raise serializers.ValidationError("이메일은 필수입니다.")
+        return value.strip().lower()
+
+
+class PageSubscriptionSerializer(serializers.ModelSerializer):
+    """GET /api/pages/me/subscriptions/ — 페이지 관리자용 목록 조회."""
+
+    category_display = serializers.CharField(source="get_category_display", read_only=True)
+
+    class Meta:
+        model = PageSubscription
+        fields = [
+            "id", "name", "category", "category_display",
+            "email", "phone", "agreed_to_terms", "memo", "created_at", "updated_at",
+        ]
+        read_only_fields = [
+            "id", "name", "category", "category_display",
+            "email", "phone", "agreed_to_terms", "created_at", "updated_at",
+        ]
+
+
+class PageSubscriptionMemoSerializer(serializers.ModelSerializer):
+    """PATCH /api/pages/me/subscriptions/{id}/ — 관리자 메모 수정 전용."""
+
+    class Meta:
+        model = PageSubscription
         fields = ["id", "memo", "updated_at"]
         read_only_fields = ["id", "updated_at"]

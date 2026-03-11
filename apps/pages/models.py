@@ -259,8 +259,61 @@ class ContactInquiry(models.Model):
     def __str__(self):
         return f"[{self.get_category_display()}] {self.subject} — {self.name} ({self.created_at:%Y-%m-%d})"
 
-        verbose_name_plural = "블록 클릭 목록"
+
+# ─────────────────────────────────────────────────────────────
+# 구독 모델
+# ─────────────────────────────────────────────────────────────
+
+class PageSubscription(models.Model):
+    """페이지 방문자가 페이지 관리자의 구독 폼을 통해 등록하는 구독자."""
+
+    class Category(models.TextChoices):
+        PAGE_SUBSCRIBE = "page_subscribe", "페이지 구독"
+        NEWSLETTER = "newsletter", "뉴스레터"
+        EVENT = "event", "이벤트 알림"
+        OTHER = "other", "기타"
+
+    page = models.ForeignKey(
+        Page,
+        on_delete=models.CASCADE,
+        related_name="subscriptions",
+        verbose_name="페이지",
+    )
+
+    # ── 방문자가 입력하는 정보 ─────────────────────────────
+    name = models.CharField(max_length=100, blank=True, default="", verbose_name="이름")
+    category = models.CharField(
+        max_length=20,
+        choices=Category.choices,
+        default=Category.PAGE_SUBSCRIBE,
+        verbose_name="분류",
+    )
+    email = models.EmailField(verbose_name="이메일")
+    phone = models.CharField(max_length=30, blank=True, default="", verbose_name="휴대폰번호")
+    agreed_to_terms = models.BooleanField(
+        default=False,
+        verbose_name="개인정보 수집 동의",
+    )
+
+    # ── 페이지 관리자 전용 ─────────────────────────────────
+    memo = models.TextField(
+        blank=True,
+        default="",
+        verbose_name="관리자 메모",
+        help_text="구독자에게 노출되지 않는 관리자 전용 메모입니다.",
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True, verbose_name="구독 일시")
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "구독자"
+        verbose_name_plural = "구독자 목록"
+        ordering = ["-created_at"]
         indexes = [
-            models.Index(fields=["page", "clicked_at"]),
-            models.Index(fields=["block", "clicked_at"]),
+            models.Index(fields=["page", "created_at"]),
+            models.Index(fields=["page", "category"]),
         ]
+
+    def __str__(self):
+        return f"[{self.get_category_display()}] {self.email} ({self.created_at:%Y-%m-%d})"
