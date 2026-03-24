@@ -650,6 +650,11 @@ curl -X DELETE http://localhost:8000/api/v1/auth/me/delete/ \\
         except ImportError:
             pass
 
+        # PROTECT FK로 인해 자동 삭제되지 않는 모델을 먼저 제거
+        from apps.workspace.models import Workspace
+
+        Workspace.objects.filter(owner=user).delete()
+
         user.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
