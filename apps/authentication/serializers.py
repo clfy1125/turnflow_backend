@@ -75,3 +75,29 @@ class AuthResponseSerializer(serializers.Serializer):
 
     user = UserSerializer()
     tokens = TokenSerializer()
+
+
+class AccountDeleteSerializer(serializers.Serializer):
+    """회원 탈퇴 요청 시리얼라이저. 비밀번호 확인 필수."""
+
+    password = serializers.CharField(
+        required=True,
+        write_only=True,
+        style={"input_type": "password"},
+        help_text="본인 확인을 위한 현재 비밀번호",
+    )
+
+    def validate_password(self, value):
+        user = self.context.get("user")
+        if user and not user.check_password(value):
+            raise serializers.ValidationError("비밀번호가 올바르지 않습니다.")
+        return value
+
+
+class GoogleLoginSerializer(serializers.Serializer):
+    """Google OAuth 로그인 요청 시리얼라이저."""
+
+    token = serializers.CharField(
+        required=True,
+        help_text="프론트엔드에서 Google 로그인 후 받은 ID Token",
+    )

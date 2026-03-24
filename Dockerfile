@@ -25,8 +25,11 @@ RUN pip install --upgrade pip && \
 # 애플리케이션 코드 복사
 COPY . .
 
+# 로그 디렉토리 생성
+RUN mkdir -p /app/logs
+
 # 포트 노출
 EXPOSE 8000
 
-# 기본 명령어
-CMD ["python", "manage.py", "runserver", "0.0.0.0:8000"]
+# 기본 명령어 (프로덕션: docker-compose.prod.yml에서 gunicorn으로 오버라이드)
+CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "3"]

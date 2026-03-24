@@ -17,12 +17,12 @@ def _generate_unique_slug(username: str) -> str:
 
 
 class Page(models.Model):
-    """사용자당 1개의 공개 가능한 블록형 페이지."""
+    """사용자당 여러 개 생성 가능한 공개 가능한 블록형 페이지."""
 
-    user = models.OneToOneField(
+    user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
-        related_name="page",
+        related_name="pages",
         verbose_name="소유자",
     )
     slug = models.SlugField(
@@ -51,13 +51,12 @@ class Page(models.Model):
 
     @classmethod
     def get_or_create_for_user(cls, user):
-        """유저의 Page 반환. 없으면 자동 생성."""
-        try:
-            return cls.objects.get(user=user), False
-        except cls.DoesNotExist:
-            slug = _generate_unique_slug(user.username)
-            page = cls.objects.create(user=user, slug=slug, is_public=False)
-            return page, True
+        """유저의 첫 번째 Page 반환. 없으면 자동 생성."""
+        page = cls.objects.filter(user=user).order_by("created_at").first()
+        if page:
+            return page, False
+        slug = _generate_unique_slug(user.username)
+        return cls.objects.create(user=user, slug=slug, is_public=False), True
 
 
 class Block(models.Model):
@@ -185,6 +184,13 @@ class BlockClick(models.Model):
         verbose_name="페이지",
         help_text="집계 쿼리 최적화를 위해 비정규화 저장.",
     )
+    link_id = models.CharField(
+        max_length=200,
+        blank=True,
+        default="",
+        verbose_name="서브링크 ID",
+        help_text="social 블록의 플랫폼 키(instagram, youtube 등), group_link의 개별 링크 ID. 빈 문자열이면 블록 단위 클릭.",
+    )
     clicked_at = models.DateTimeField(auto_now_add=True, db_index=True, verbose_name="클릭 일시")
     referer = models.CharField(max_length=500, blank=True, default="", verbose_name="유입 채널 URL")
     country = models.CharField(max_length=2, blank=True, default="", verbose_name="유입 국가")
@@ -196,6 +202,7 @@ class BlockClick(models.Model):
         indexes = [
             models.Index(fields=["page", "clicked_at"]),
             models.Index(fields=["block", "clicked_at"]),
+            models.Index(fields=["block", "link_id", "clicked_at"]),
         ]
 
 

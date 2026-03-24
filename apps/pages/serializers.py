@@ -310,6 +310,26 @@ class BlockStatsSerializer(serializers.Serializer):
     blocks = BlockStatSerializer(many=True)
 
 
+class LinkStatSerializer(serializers.Serializer):
+    """서브링크 단위 클릭 통계 항목."""
+
+    block_id = serializers.IntegerField(help_text="블록 ID")
+    link_id = serializers.CharField(help_text="서브링크 ID (social: 플랫폼 키, group_link: 개별 링크 ID, 빈 문자열이면 블록 단위)")
+    type = serializers.CharField(help_text="블록 타입 (social / group_link / single_link 등)")
+    label = serializers.CharField(help_text="서브링크 표시명 (link_id가 있으면 해당 서브링크명, 없으면 블록 레이블)")
+    is_enabled = serializers.BooleanField(help_text="현재 노출 여부")
+    clicks = serializers.IntegerField(help_text="기간 내 클릭수")
+    click_rate = serializers.FloatField(help_text="클릭율 = 클릭수 / 페이지 조회수 x 100 (%)")
+
+
+class LinkClicksStatsSerializer(serializers.Serializer):
+    """GET multipages/{id}/stats/links/ 응답. 서브링크별 클릭수."""
+
+    period = serializers.CharField(help_text="조회 기간 (7d / 30d / 90d)")
+    total_clicks = serializers.IntegerField(help_text="해당 기간 페이지 전체 클릭수")
+    link_clicks = LinkStatSerializer(many=True, help_text="서브링크별 클릭수 배열")
+
+
 class RecordViewSerializer(serializers.Serializer):
     """POST /api/pages/@{slug}/view/ 요청 바디 (모두 선택)."""
     referer = serializers.CharField(
@@ -323,6 +343,10 @@ class RecordClickSerializer(serializers.Serializer):
     referer = serializers.CharField(
         required=False, allow_blank=True, default="",
         help_text="방문자 브라우저의 document.referrer 값.",
+    )
+    link_id = serializers.CharField(
+        required=False, allow_blank=True, default="",
+        help_text="서브링크 식별자. social 블록: 플랫폼 키(instagram 등), group_link: 개별 링크 ID. 없으면 빈 문자열.",
     )
 
 

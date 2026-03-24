@@ -18,6 +18,7 @@ PyJWT==2.8.0
 djangorestframework-simplejwt==5.3.1
 cryptography==42.0.2
 requests==2.31.0
+google-auth==2.29.0
 
 # Environment & Configuration
 python-decouple==3.8

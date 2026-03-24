@@ -25,6 +25,7 @@ INSTALLED_APPS = [
     # Third-party apps
     "rest_framework",
     "rest_framework_simplejwt",
+    "rest_framework_simplejwt.token_blacklist",
     "corsheaders",
     "django_filters",
     "drf_spectacular",
@@ -210,6 +211,9 @@ SIMPLE_JWT = {
     "AUTH_TOKEN_CLASSES": ("rest_framework_simplejwt.tokens.AccessToken",),
     "TOKEN_TYPE_CLAIM": "token_type",
 }
+
+# Google OAuth
+GOOGLE_CLIENT_ID = config("GOOGLE_CLIENT_ID", default="")
 
 # Redis & Caching
 REDIS_HOST = config("REDIS_HOST", default="localhost")

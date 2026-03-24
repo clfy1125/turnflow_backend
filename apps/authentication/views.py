@@ -10,11 +10,14 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import get_user_model
 from drf_spectacular.utils import extend_schema, OpenApiResponse
 
+from drf_spectacular.utils import OpenApiExample
+
 from .serializers import (
     UserRegistrationSerializer,
     UserSerializer,
     UserUpdateSerializer,
     AuthResponseSerializer,
+    GoogleLoginSerializer,
 )
 
 User = get_user_model()
@@ -557,3 +560,282 @@ class TokenRefreshView(generics.GenericAPIView):
         serializer.is_valid(raise_exception=True)
 
         return Response(serializer.validated_data, status=status.HTTP_200_OK)
+
+
+class AccountDeleteView(generics.GenericAPIView):
+    """
+    회원 탈퇴 (계정 영구 삭제) endpoint
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["auth"],
+        summary="회원 탈퇴 (계정 삭제)",
+        description="""
+## 개요
+로그인한 사용자의 계정을 **영구 삭제**합니다.  
+Bearer 토큰으로 본인 인증이 완료된 상태이므로 별도 비밀번호 확인 없이 즉시 삭제됩니다.
+
+## 사용 시나리오
+- 사용자가 설정 화면에서 "회원 탈퇴" 버튼을 클릭했을 때
+- 계정을 완전히 삭제하고 싶을 때
+
+## 인증
+`Authorization: Bearer <access_token>` 헤더 필수
+
+## 요청 바디
+없음 (빈 바디 또는 생략 가능)
+
+## 삭제 범위
+계정 삭제 시 아래 데이터가 **모두 영구 삭제**됩니다:
+- 사용자 계정 정보 (이메일, 이름 등)
+- 소유한 모든 페이지 및 페이지 하위 데이터 (블록, 통계, 문의, 구독자, 미디어)
+- 워크스페이스 멤버십
+- 인스타그램 연동 정보
+- 발급된 JWT 토큰 (즉시 무효화)
+
+> **되돌릴 수 없습니다.** UI에서 "정말 탈퇴하시겠습니까?" 등 확인 절차를 반드시 거치세요.
+
+## 프론트엔드 통합 패턴
+```typescript
+const handleDeleteAccount = async () => {
+  const confirmed = window.confirm('정말 탈퇴하시겠습니까? 모든 데이터가 삭제됩니다.');
+  if (!confirmed) return;
+
+  try {
+    await api.delete('/api/v1/auth/me/delete/');
+    localStorage.removeItem('access_token');
+    localStorage.removeItem('refresh_token');
+    router.push('/login');
+  } catch (err) {
+    if (err.response?.status === 401) {
+      alert('로그인이 필요합니다.');
+    }
+  }
+};
+```
+
+```bash
+# curl 예시
+curl -X DELETE http://localhost:8000/api/v1/auth/me/delete/ \\
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN"
+```
+
+## 에러
+| 코드 | 원인 |
+|------|------|
+| 401 | 토큰 없음/만료 |
+        """,
+        request=None,
+        responses={
+            204: OpenApiResponse(description="계정 삭제 완료 — 바디 없음. 이후 모든 토큰이 무효화됩니다."),
+            401: OpenApiResponse(description="인증 실패 — 토큰이 없거나 유효하지 않음"),
+        },
+    )
+    def delete(self, request):
+        user = request.user
+        # Outstanding refresh token을 블랙리스트에 추가하여 즉시 무효화
+        try:
+            from rest_framework_simplejwt.token_blacklist.models import OutstandingToken
+            from rest_framework_simplejwt.tokens import RefreshToken as RefreshTokenClass
+
+            tokens = OutstandingToken.objects.filter(user=user)
+            for token in tokens:
+                try:
+                    t = RefreshTokenClass(token.token)
+                    t.blacklist()
+                except Exception:
+                    pass
+        except ImportError:
+            pass
+
+        user.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class GoogleLoginView(generics.GenericAPIView):
+    """
+    Google OAuth 로그인 endpoint
+    프론트엔드에서 받은 Google ID Token을 검증하고 JWT를 발급합니다.
+    """
+
+    permission_classes = [AllowAny]
+    serializer_class = GoogleLoginSerializer
+
+    @extend_schema(
+        tags=["auth"],
+        summary="Google 소셜 로그인",
+        description="""
+## 개요
+프론트엔드에서 Google 로그인 후 받은 **ID Token**을 전송하면,
+백엔드가 Google에 토큰을 검증하고, 유저 조회/생성 후 JWT를 발급합니다.
+
+## 흐름
+1. 프론트엔드에서 Google OAuth로 로그인 → ID Token 획득
+2. `POST /api/v1/auth/google/` 에 `{ "token": "GOOGLE_ID_TOKEN" }` 전송
+3. 백엔드가 `google-auth` 라이브러리로 토큰 검증 (iss, aud, email 확인)
+4. 이메일 기반으로 기존 유저 조회 또는 신규 생성
+5. JWT (access, refresh) 발급 후 반환
+
+## 인증
+- **인증 불필요** (공개 API)
+- Google ID Token만 필요
+
+## 요청 필드
+| 필드 | 필수 | 타입 | 설명 |
+|------|:------:|------|------|
+| `token` | ✅ | string | Google 로그인 후 받은 ID Token |
+
+## 응답 데이터
+- `user`: 사용자 정보 (id, email, full_name, date_joined, last_login)
+- `tokens`: JWT 토큰
+  - `access`: 액세스 토큰 (유효기간: 1시간)
+  - `refresh`: 리프레시 토큰 (유효기간: 7일)
+
+## 계정 연동 규칙
+- **신규 유저**: Google 이메일로 계정 자동 생성 (비밀번호 없음 → 일반 로그인 불가)
+- **기존 유저 (같은 이메일)**: 기존 계정에 로그인 (계정 통합)
+
+## 프론트엔드 통합 패턴
+```javascript
+// Google 로그인 버튼 클릭 핸들러
+const handleGoogleLogin = async (googleIdToken) => {
+  const response = await fetch('/api/v1/auth/google/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: googleIdToken }),
+  });
+
+  if (response.ok) {
+    const data = await response.json();
+    localStorage.setItem('access_token', data.tokens.access);
+    localStorage.setItem('refresh_token', data.tokens.refresh);
+    // 메인 페이지로 이동
+  }
+};
+```
+
+```bash
+# curl 예시
+curl -X POST http://localhost:8000/api/v1/auth/google/ \\
+  -H "Content-Type: application/json" \\
+  -d '{"token": "GOOGLE_ID_TOKEN"}'
+```
+
+## 에러
+| 코드 | 원인 |
+|------|------|
+| 400  | 토큰 누락 또는 Google 토큰 검증 실패 (유효하지 않은 토큰, iss/aud 불일치 등) |
+        """,
+        request=GoogleLoginSerializer,
+        examples=[
+            OpenApiExample(
+                "Google 로그인 요청",
+                request_only=True,
+                value={"token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9..."},
+            ),
+        ],
+        responses={
+            200: OpenApiResponse(
+                response=AuthResponseSerializer,
+                description="로그인 성공 — 사용자 정보와 JWT 토큰 반환",
+                examples=[
+                    OpenApiExample(
+                        "성공 응답",
+                        value={
+                            "user": {
+                                "id": 1,
+                                "email": "user@gmail.com",
+                                "full_name": "홍길동",
+                                "date_joined": "2026-03-16T12:00:00Z",
+                                "last_login": "2026-03-16T12:00:00Z",
+                            },
+                            "tokens": {
+                                "access": "eyJ...",
+                                "refresh": "eyJ...",
+                            },
+                        },
+                    ),
+                ],
+            ),
+            400: OpenApiResponse(
+                description="Google 토큰 검증 실패",
+                examples=[
+                    OpenApiExample(
+                        "유효하지 않은 토큰",
+                        value={"detail": "유효하지 않은 Google 토큰입니다."},
+                    ),
+                    OpenApiExample(
+                        "이메일 누락",
+                        value={"detail": "Google 계정에 이메일 정보가 없습니다."},
+                    ),
+                ],
+            ),
+        },
+    )
+    def post(self, request):
+        from django.conf import settings as django_settings
+        from google.oauth2 import id_token
+        from google.auth.transport import requests as google_requests
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        token = serializer.validated_data["token"]
+        client_id = django_settings.GOOGLE_CLIENT_ID
+
+        try:
+            idinfo = id_token.verify_oauth2_token(
+                token,
+                google_requests.Request(),
+                client_id,
+            )
+        except ValueError:
+            return Response(
+                {"detail": "유효하지 않은 Google 토큰입니다."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if idinfo.get("iss") not in (
+            "accounts.google.com",
+            "https://accounts.google.com",
+        ):
+            return Response(
+                {"detail": "유효하지 않은 토큰 발급자(iss)입니다."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        email = idinfo.get("email")
+        if not email:
+            return Response(
+                {"detail": "Google 계정에 이메일 정보가 없습니다."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        name = idinfo.get("name", "")
+
+        user, created = User.objects.get_or_create(
+            email=email,
+            defaults={"full_name": name},
+        )
+
+        if created:
+            user.set_unusable_password()
+            user.save(update_fields=["password"])
+        elif name and not user.full_name:
+            user.full_name = name
+            user.save(update_fields=["full_name"])
+
+        refresh = RefreshToken.for_user(user)
+
+        return Response(
+            {
+                "user": UserSerializer(user).data,
+                "tokens": {
+                    "refresh": str(refresh),
+                    "access": str(refresh.access_token),
+                },
+            },
+            status=status.HTTP_200_OK,
+        )

@@ -57,6 +57,13 @@ REFERER_NAME_MAP: dict[str, str] = {
     "linkedin.com": "LinkedIn",
     "whatsapp.com": "WhatsApp",
     "threads.net": "Threads",
+    "naver.me": "Naver",
+    "daum.net": "Daum",
+    "dcinside.com": "DCInside",
+    "gall.dcinside.com": "DCInside",
+    "cafe.naver.com": "Naver Cafe",
+    "blog.naver.com": "Naver Blog",
+
 }
 
 # ISO 3166-1 → 한국어 국가명 (자주 유입되는 국가 위주)
@@ -213,6 +220,7 @@ def get_stats_summary(page, days: int) -> dict:
     click_rate = round(total_clicks / total_views * 100, 1) if total_views else 0.0
 
     # 유입 채널 Top5
+    # DB에는 이미 parse_referer()로 변환된 값이 저장되어 있으므로 그대로 사용
     referer_raw = (
         views_qs.values("referer")
         .annotate(count=Count("id"))
@@ -220,7 +228,7 @@ def get_stats_summary(page, days: int) -> dict:
     )
     referer_map: dict[str, int] = {}
     for row in referer_raw:
-        name = parse_referer(row["referer"])
+        name = row["referer"] or "직접 방문"
         referer_map[name] = referer_map.get(name, 0) + row["count"]
     referer_top5 = sorted(referer_map.items(), key=lambda x: -x[1])[:5]
     referers = [
@@ -329,3 +337,59 @@ def get_block_stats(page, days: int) -> list[dict]:
             }
         )
     return result
+
+
+def get_link_stats(page, days: int) -> list[dict]:
+    """
+    서브링크 단위 클릭 통계.
+    link_id가 있는 클릭 → (block_id, link_id) 기준 분리,
+    link_id가 빈 문자열인 클릭 → block_id 단위 합산.
+    """
+    from .models import BlockClick
+
+    since = timezone.now() - timedelta(days=days)
+    total_views = page.views.filter(viewed_at__gte=since).count()
+
+    rows = (
+        BlockClick.objects.filter(page=page, clicked_at__gte=since)
+        .values("block_id", "link_id", "block__type", "block__data", "block__is_enabled")
+        .annotate(clicks=Count("id"))
+        .order_by("-clicks")
+    )
+
+    result = []
+    for row in rows:
+        data = row["block__data"] or {}
+        lid = row["link_id"] or ""
+
+        if lid:
+            label = _resolve_sublink_label(data, lid, row["block__type"])
+        else:
+            label = (
+                data.get("label")
+                or data.get("headline")
+                or data.get("phone")
+                or f"블록 #{row['block_id']}"
+            )
+
+        result.append(
+            {
+                "block_id": row["block_id"],
+                "link_id": lid,
+                "type": row["block__type"],
+                "label": label,
+                "is_enabled": row["block__is_enabled"],
+                "clicks": row["clicks"],
+                "click_rate": round(row["clicks"] / total_views * 100, 1) if total_views else 0.0,
+            }
+        )
+    return result
+
+
+def _resolve_sublink_label(block_data: dict, link_id: str, block_type: str) -> str:
+    """블록 data JSON에서 서브링크의 label/title을 추출. 못 찾으면 link_id 그대로 반환."""
+    if block_type == "group_link":
+        for link in block_data.get("links", []):
+            if str(link.get("id", "")) == link_id:
+                return link.get("title") or link.get("label") or link_id
+    return link_id

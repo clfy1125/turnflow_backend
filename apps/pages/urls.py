@@ -1,6 +1,24 @@
 from django.urls import path
 
 from .image_views import PageMediaDetailView, PageMediaView
+from .multi_views import (
+    MultiBlockDetailView,
+    MultiBlockListCreateView,
+    MultiBlockReorderView,
+    MultiInquiryDetailView,
+    MultiInquiryListView,
+    MultiPageDetailView,
+    MultiPageListView,
+    MultiPageMediaDetailView,
+    MultiPageMediaView,
+    MultiPageSlugChangeView,
+    MultiStatsBlocksView,
+    MultiStatsChartView,
+    MultiStatsLinksView,
+    MultiPageStatsView,
+    MultiSubscriptionDetailView,
+    MultiSubscriptionListView,
+)
 from .views import (
     BlockClickRecordView,
     BlockDetailView,
@@ -25,6 +43,7 @@ from .views import (
 app_name = "pages"
 
 urlpatterns = [
+    # ─── 기존 단일 페이지 API (프론트 연결 유지) ──────────────────
     # 내 페이지
     path("me/", MyPageView.as_view(), name="my-page"),
     # slug 중복 확인 (변경 전 사전 확인)
@@ -59,4 +78,32 @@ urlpatterns = [
     path("me/blocks/reorder/", BlockReorderView.as_view(), name="block-reorder"),
     # 블록 상세(수정/삭제)
     path("me/blocks/<int:pk>/", BlockDetailView.as_view(), name="block-detail"),
+
+    # ─── 다중 페이지 API ──────────────────────────────────────────
+    # 페이지 목록 / 생성
+    path("multipages/", MultiPageListView.as_view(), name="multipage-list"),
+    # 페이지 상세 / 수정 / 삭제
+    path("multipages/<int:page_id>/", MultiPageDetailView.as_view(), name="multipage-detail"),
+    # 페이지 slug 변경
+    path("multipages/<int:page_id>/slug/", MultiPageSlugChangeView.as_view(), name="multipage-slug"),
+    # 블록 목록 / 생성
+    path("multipages/<int:page_id>/blocks/", MultiBlockListCreateView.as_view(), name="multipage-block-list"),
+    # 블록 reorder (blocks/ 보다 먼저 등록)
+    path("multipages/<int:page_id>/blocks/reorder/", MultiBlockReorderView.as_view(), name="multipage-block-reorder"),
+    # 블록 수정 / 삭제
+    path("multipages/<int:page_id>/blocks/<int:block_id>/", MultiBlockDetailView.as_view(), name="multipage-block-detail"),
+    # 통계
+    path("multipages/<int:page_id>/stats/", MultiPageStatsView.as_view(), name="multipage-stats"),
+    path("multipages/<int:page_id>/stats/chart/", MultiStatsChartView.as_view(), name="multipage-stats-chart"),
+    path("multipages/<int:page_id>/stats/blocks/", MultiStatsBlocksView.as_view(), name="multipage-stats-blocks"),
+    path("multipages/<int:page_id>/stats/links/", MultiStatsLinksView.as_view(), name="multipage-stats-links"),
+    # 문의 관리
+    path("multipages/<int:page_id>/inquiries/", MultiInquiryListView.as_view(), name="multipage-inquiry-list"),
+    path("multipages/<int:page_id>/inquiries/<int:pk>/", MultiInquiryDetailView.as_view(), name="multipage-inquiry-detail"),
+    # 구독자 관리
+    path("multipages/<int:page_id>/subscriptions/", MultiSubscriptionListView.as_view(), name="multipage-subscription-list"),
+    path("multipages/<int:page_id>/subscriptions/<int:pk>/", MultiSubscriptionDetailView.as_view(), name="multipage-subscription-detail"),
+    # 미디어
+    path("multipages/<int:page_id>/media/", MultiPageMediaView.as_view(), name="multipage-media-list"),
+    path("multipages/<int:page_id>/media/<int:media_id>/", MultiPageMediaDetailView.as_view(), name="multipage-media-detail"),
 ]

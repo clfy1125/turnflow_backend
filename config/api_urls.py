@@ -11,4 +11,5 @@ urlpatterns = [
     path("", include("apps.workspace.urls")),
     path("", include("apps.billing.urls")),
     path("integrations/", include("apps.integrations.urls")),
+    path("pages/", include("apps.pages.urls", namespace="pages")),
 ]

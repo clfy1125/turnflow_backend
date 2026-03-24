@@ -1,0 +1,101 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: turnflow_instagram_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-instagram_service}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - turnflow_instagram_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - turnflow_instagram_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: turnflow_instagram_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - turnflow_instagram_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - turnflow_instagram_net
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: turnflow_instagram_web
+    container_name: turnflow_instagram_web
+    restart: unless-stopped
+    command: >
+      sh -c "python manage.py collectstatic --noinput &&
+             python manage.py migrate --noinput &&
+             gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 3 --timeout 120"
+    env_file:
+      - .env.production
+    environment:
+      - DJANGO_SETTINGS_MODULE=config.settings.prod
+      - DB_HOST=db
+      - DB_PORT=5432
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - turnflow_instagram_static:/app/staticfiles
+      - turnflow_instagram_media:/app/media
+      - turnflow_instagram_logs:/app/logs
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - turnflow_instagram_net
+
+  celery_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: turnflow_instagram_web
+    container_name: turnflow_instagram_celery
+    restart: unless-stopped
+    command: celery -A config worker -l info
+    env_file:
+      - .env.production
+    environment:
+      - DJANGO_SETTINGS_MODULE=config.settings.prod
+      - DB_HOST=db
+      - DB_PORT=5432
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - turnflow_instagram_logs:/app/logs
+    depends_on:
+      - db
+      - redis
+      - web
+    networks:
+      - turnflow_instagram_net
+
+volumes:
+  turnflow_instagram_postgres:
+  turnflow_instagram_redis:
+  turnflow_instagram_static:
+  turnflow_instagram_media:
+  turnflow_instagram_logs:
+
+networks:
+  turnflow_instagram_net:
+    name: turnflow_instagram_net
+    driver: bridge

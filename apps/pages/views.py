@@ -981,6 +981,7 @@ class BlockClickRecordView(APIView):
 | 필드 | 필수 | 타입 | 설명 |
 |------|------|------|------|
 | `referer` | 선택 | string | 방문자 브라우저의 `document.referrer` 값. 없으면 빈 문자열 `""` 전송 |
+| `link_id` | 선택 | string | 서브링크 식별자. social 블록: 플랫폼 키(`instagram`, `youtube` 등), group_link: 개별 링크 ID. 없으면 빈 문자열 `""` |
 
 ## 응답
 성공 시 **204 No Content** — 바디 없음.
@@ -995,6 +996,7 @@ const handleBlockClick = async (block: Block) => {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       referer: document.referrer,
+      link_id: linkId || '',  // social: 'instagram', group_link: '1773124482018', 나머지: ''
     }),
   }).catch(() => {});  // 통계 실패가 페이지 동작을 막으면 안 됨
 
@@ -1027,12 +1029,17 @@ const handleBlockClick = async (block: Block) => {
         examples=[
             OpenApiExample(
                 "기본 호출 (referer 있음)",
-                value={"referer": "https://l.instagram.com/"},
+                value={"referer": "https://l.instagram.com/", "link_id": ""},
                 request_only=True,
             ),
             OpenApiExample(
-                "직접 방문 (referer 없음)",
-                value={"referer": ""},
+                "social 블록 서브링크 클릭",
+                value={"referer": "", "link_id": "instagram"},
+                request_only=True,
+            ),
+            OpenApiExample(
+                "group_link 서브링크 클릭",
+                value={"referer": "", "link_id": "1773124482018"},
                 request_only=True,
             ),
         ],
@@ -1060,6 +1067,7 @@ const handleBlockClick = async (block: Block) => {
         BlockClick.objects.create(
             block=block,
             page=page,
+            link_id=request.data.get("link_id", ""),
             ip_hash=hash_ip(request),
             referer=parse_referer(referer_url),
             country=get_country(request),
