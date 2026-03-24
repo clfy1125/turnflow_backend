@@ -3,6 +3,8 @@ services:
     image: postgres:16-alpine
     container_name: turnflow_instagram_db
     restart: unless-stopped
+    env_file:
+      - .env.production
     environment:
       POSTGRES_DB: ${DB_NAME:-instagram_service}
       POSTGRES_USER: ${DB_USER:-postgres}
@@ -64,9 +66,6 @@ services:
       - turnflow_instagram_net
 
   celery_worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
     image: turnflow_instagram_web
     container_name: turnflow_instagram_celery
     restart: unless-stopped
