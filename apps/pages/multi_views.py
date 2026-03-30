@@ -72,6 +72,7 @@ from .serializers import (
     ChartDataSerializer,
     ContactInquiryMemoSerializer,
     ContactInquirySerializer,
+    CustomCssSerializer,
     LinkClicksStatsSerializer,
     PageMediaSerializer,
     PageSubscriptionMemoSerializer,
@@ -549,6 +550,116 @@ class MultiPageSlugChangeView(APIView):
         serializer.is_valid(raise_exception=True)
         page.slug = serializer.validated_data["slug"]
         page.save(update_fields=["slug", "updated_at"])
+        return Response(MultiPageSerializer(page).data)
+
+
+# ═════════════════════════════════════════════════════════════
+# 커스텀 CSS 수정
+# ═════════════════════════════════════════════════════════════
+
+class MultiPageCustomCssView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=[_MULTIPAGE_TAG],
+        summary="특정 페이지 커스텀 CSS 조회",
+        description="""
+## 개요
+특정 페이지에 적용된 **커스텀 CSS**를 조회합니다.
+
+## 인증
+`Authorization: Bearer <access_token>` 헤더 필수
+
+## 경로 파라미터
+| 파라미터 | 타입 | 설명 |
+|----------|------|------|
+| `id` | int | 페이지 ID |
+
+## 응답
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `custom_css` | string | 현재 저장된 CSS 문자열. 빈 문자열이면 커스텀 CSS 미설정 |
+        """,
+        parameters=[
+            OpenApiParameter(
+                name="id", type=OpenApiTypes.INT, location=OpenApiParameter.PATH,
+                description="페이지 ID",
+            ),
+        ],
+        responses={
+            200: OpenApiResponse(response=CustomCssSerializer, description="현재 커스텀 CSS"),
+            401: OpenApiResponse(description="인증 실패"),
+            404: OpenApiResponse(description="페이지 없음 또는 접근 권한 없음"),
+        },
+    )
+    def get(self, request, page_id: int):
+        page = _get_owned_page(request, page_id)
+        if not page:
+            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"custom_css": page.custom_css})
+
+    @extend_schema(
+        tags=[_MULTIPAGE_TAG],
+        summary="특정 페이지 커스텀 CSS 수정",
+        description="""
+## 개요
+특정 페이지에 적용할 **커스텀 CSS**를 저장합니다.  
+프론트엔드에서 공개 페이지 렌더링 시 `<style>` 태그로 주입하여 사용합니다.
+
+## 인증
+`Authorization: Bearer <access_token>` 헤더 필수
+
+## 경로 파라미터
+| 파라미터 | 타입 | 설명 |
+|----------|------|------|
+| `id` | int | 페이지 ID |
+
+## 요청 필드
+| 필드 | 필수 | 타입 | 설명 |
+|------|------|------|------|
+| `custom_css` | ✅ | string | 적용할 CSS 문자열. 빈 문자열 `""` 전송 시 초기화 |
+
+## 프론트엔드 통합 패턴
+```typescript
+// CSS 저장
+await api.patch(`/api/v1/pages/multipages/${pageId}/css/`, {
+  custom_css: `.page-container { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+.block-link { border-radius: 16px; backdrop-filter: blur(10px); }`
+});
+
+// CSS 초기화
+await api.patch(`/api/v1/pages/multipages/${pageId}/css/`, { custom_css: '' });
+```
+
+## 에러
+| 코드 | 원인 |
+|------|------|
+| 400 | `custom_css` 필드 누락 |
+| 401 | 토큰 없음/만료 |
+| 404 | 페이지 없음 또는 다른 사용자의 페이지 |
+        """,
+        parameters=[
+            OpenApiParameter(
+                name="id", type=OpenApiTypes.INT, location=OpenApiParameter.PATH,
+                description="페이지 ID",
+            ),
+        ],
+        request=CustomCssSerializer,
+        responses={
+            200: OpenApiResponse(response=MultiPageSerializer, description="수정된 페이지 전체 정보"),
+            400: OpenApiResponse(description="유효성 검증 실패"),
+            401: OpenApiResponse(description="인증 실패"),
+            404: OpenApiResponse(description="페이지 없음 또는 접근 권한 없음"),
+        },
+    )
+    def patch(self, request, page_id: int):
+        page = _get_owned_page(request, page_id)
+        if not page:
+            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+        serializer = CustomCssSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        page.custom_css = serializer.validated_data["custom_css"]
+        page.save(update_fields=["custom_css", "updated_at"])
         return Response(MultiPageSerializer(page).data)
 
 

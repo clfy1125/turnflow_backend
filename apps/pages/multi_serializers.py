@@ -41,7 +41,7 @@ class MultiPageSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Page
-        fields = ["id", "slug", "title", "is_public", "data", "created_at", "updated_at"]
+        fields = ["id", "slug", "title", "is_public", "data", "custom_css", "created_at", "updated_at"]
         read_only_fields = ["id", "slug", "created_at", "updated_at"]
 
 
@@ -102,6 +102,12 @@ class MultiPageCreateSerializer(serializers.Serializer):
         required=False,
         default=dict,
         help_text="프론트엔드 전용 설정 저장소 (테마, 배경색 등). 서버는 내용을 파싱하지 않습니다.",
+    )
+    custom_css = serializers.CharField(
+        required=False,
+        default="",
+        allow_blank=True,
+        help_text="페이지에 적용할 커스텀 CSS. 빈 문자열 허용.",
     )
 
     def validate_slug(self, value: str) -> str:

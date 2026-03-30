@@ -7,6 +7,7 @@ from .multi_views import (
     MultiBlockReorderView,
     MultiInquiryDetailView,
     MultiInquiryListView,
+    MultiPageCustomCssView,
     MultiPageDetailView,
     MultiPageListView,
     MultiPageMediaDetailView,
@@ -27,6 +28,7 @@ from .views import (
     ContactInquiryDetailView,
     ContactInquiryListView,
     ContactInquirySubmitView,
+    CustomCssView,
     MyPageView,
     PageStatsView,
     PageSubscriptionDetailView,
@@ -50,6 +52,8 @@ urlpatterns = [
     path("check-slug/", SlugCheckView.as_view(), name="check-slug"),
     # slug 변경
     path("me/slug/", SlugChangeView.as_view(), name="change-slug"),
+    # 커스텀 CSS 수정
+    path("me/css/", CustomCssView.as_view(), name="custom-css"),
     # 통계 (인증 필수)
     path("me/stats/", PageStatsView.as_view(), name="stats"),
     path("me/stats/chart/", StatsChartView.as_view(), name="stats-chart"),
@@ -86,6 +90,8 @@ urlpatterns = [
     path("multipages/<int:page_id>/", MultiPageDetailView.as_view(), name="multipage-detail"),
     # 페이지 slug 변경
     path("multipages/<int:page_id>/slug/", MultiPageSlugChangeView.as_view(), name="multipage-slug"),
+    # 페이지 커스텀 CSS 수정
+    path("multipages/<int:page_id>/css/", MultiPageCustomCssView.as_view(), name="multipage-css"),
     # 블록 목록 / 생성
     path("multipages/<int:page_id>/blocks/", MultiBlockListCreateView.as_view(), name="multipage-block-list"),
     # 블록 reorder (blocks/ 보다 먼저 등록)

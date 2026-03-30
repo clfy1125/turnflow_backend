@@ -39,6 +39,12 @@ class Page(models.Model):
         verbose_name="페이지 설정 데이터",
         help_text="프론트엔드가 자유롭게 저장하는 페이지 설정 (테마, 배경색, 폰트 등). 서버는 구조를 강제하지 않습니다.",
     )
+    custom_css = models.TextField(
+        blank=True,
+        default="",
+        verbose_name="커스텀 CSS",
+        help_text="사용자가 자유롭게 작성하는 CSS. 공개 페이지 렌더링 시 <style> 태그로 주입됩니다.",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

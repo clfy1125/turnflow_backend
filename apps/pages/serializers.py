@@ -166,7 +166,7 @@ class BlockPublicSerializer(serializers.ModelSerializer):
 class PageSerializer(serializers.ModelSerializer):
     class Meta:
         model = Page
-        fields = ["id", "slug", "title", "is_public", "data", "created_at", "updated_at"]
+        fields = ["id", "slug", "title", "is_public", "data", "custom_css", "created_at", "updated_at"]
         read_only_fields = ["id", "slug", "created_at", "updated_at"]
 
 
@@ -208,7 +208,7 @@ class PagePublicSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Page
-        fields = ["slug", "title", "is_public", "data", "blocks"]
+        fields = ["slug", "title", "is_public", "data", "custom_css", "blocks"]
 
     def get_blocks(self, obj):
         now = timezone.now()
@@ -328,6 +328,16 @@ class LinkClicksStatsSerializer(serializers.Serializer):
     period = serializers.CharField(help_text="조회 기간 (7d / 30d / 90d)")
     total_clicks = serializers.IntegerField(help_text="해당 기간 페이지 전체 클릭수")
     link_clicks = LinkStatSerializer(many=True, help_text="서브링크별 클릭수 배열")
+
+
+class CustomCssSerializer(serializers.Serializer):
+    """PATCH /pages/me/css/ — 커스텀 CSS 수정 전용."""
+
+    custom_css = serializers.CharField(
+        required=True,
+        allow_blank=True,
+        help_text="페이지에 적용할 커스텀 CSS. 빈 문자열로 초기화 가능.",
+    )
 
 
 class RecordViewSerializer(serializers.Serializer):
