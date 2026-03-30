@@ -101,7 +101,7 @@ class BlockSerializer(serializers.ModelSerializer):
     class Meta:
         model = Block
         fields = [
-            "id", "type", "order", "is_enabled", "data",
+            "id", "type", "order", "is_enabled", "data", "custom_css",
             "schedule_enabled", "publish_at", "hide_at",
             "created_at", "updated_at",
         ]
@@ -160,7 +160,7 @@ class BlockPublicSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Block
-        fields = ["id", "type", "order", "data"]
+        fields = ["id", "type", "order", "data", "custom_css"]
 
 
 class PageSerializer(serializers.ModelSerializer):
@@ -331,12 +331,12 @@ class LinkClicksStatsSerializer(serializers.Serializer):
 
 
 class CustomCssSerializer(serializers.Serializer):
-    """PATCH /pages/me/css/ — 커스텀 CSS 수정 전용."""
+    """커스텀 CSS 수정 전용 (페이지/블록 공용)."""
 
     custom_css = serializers.CharField(
         required=True,
         allow_blank=True,
-        help_text="페이지에 적용할 커스텀 CSS. 빈 문자열로 초기화 가능.",
+        help_text="적용할 커스텀 CSS. 빈 문자열로 초기화 가능.",
     )
 
 

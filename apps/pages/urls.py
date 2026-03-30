@@ -2,6 +2,7 @@ from django.urls import path
 
 from .image_views import PageMediaDetailView, PageMediaView
 from .multi_views import (
+    MultiBlockCustomCssView,
     MultiBlockDetailView,
     MultiBlockListCreateView,
     MultiBlockReorderView,
@@ -22,6 +23,7 @@ from .multi_views import (
 )
 from .views import (
     BlockClickRecordView,
+    BlockCustomCssView,
     BlockDetailView,
     BlockListCreateView,
     BlockReorderView,
@@ -80,6 +82,8 @@ urlpatterns = [
     path("me/blocks/", BlockListCreateView.as_view(), name="block-list-create"),
     # 블록 reorder
     path("me/blocks/reorder/", BlockReorderView.as_view(), name="block-reorder"),
+    # 블록 커스텀 CSS 수정
+    path("me/blocks/<int:pk>/css/", BlockCustomCssView.as_view(), name="block-custom-css"),
     # 블록 상세(수정/삭제)
     path("me/blocks/<int:pk>/", BlockDetailView.as_view(), name="block-detail"),
 
@@ -96,6 +100,8 @@ urlpatterns = [
     path("multipages/<int:page_id>/blocks/", MultiBlockListCreateView.as_view(), name="multipage-block-list"),
     # 블록 reorder (blocks/ 보다 먼저 등록)
     path("multipages/<int:page_id>/blocks/reorder/", MultiBlockReorderView.as_view(), name="multipage-block-reorder"),
+    # 블록 커스텀 CSS 수정
+    path("multipages/<int:page_id>/blocks/<int:block_id>/css/", MultiBlockCustomCssView.as_view(), name="multipage-block-css"),
     # 블록 수정 / 삭제
     path("multipages/<int:page_id>/blocks/<int:block_id>/", MultiBlockDetailView.as_view(), name="multipage-block-detail"),
     # 통계

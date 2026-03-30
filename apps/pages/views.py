@@ -855,7 +855,7 @@ class CustomCssView(APIView):
     permission_classes = [IsAuthenticated]
 
     @extend_schema(
-        tags=["페이지 서비스"],
+        tags=["커스텀 CSS"],
         summary="내 페이지 커스텀 CSS 조회",
         description="""
 ## 개요
@@ -882,7 +882,7 @@ class CustomCssView(APIView):
         return Response({"custom_css": page.custom_css})
 
     @extend_schema(
-        tags=["페이지 서비스"],
+        tags=["커스텀 CSS"],
         summary="내 페이지 커스텀 CSS 수정",
         description="""
 ## 개요
@@ -940,6 +940,100 @@ if (page.custom_css) {
         page.custom_css = serializer.validated_data["custom_css"]
         page.save(update_fields=["custom_css", "updated_at"])
         return Response(PageSerializer(page).data)
+
+
+# ─────────────────────────────────────────────────────────────
+# 블록 커스텀 CSS 수정 (단일 페이지)
+# ─────────────────────────────────────────────────────────────
+
+class BlockCustomCssView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["커스텀 CSS"],
+        summary="블록 커스텀 CSS 조회",
+        description="""
+## 개요
+내 페이지의 특정 블록에 적용된 **커스텀 CSS**를 조회합니다.
+
+## 인증
+`Authorization: Bearer <access_token>` 헤더 필수
+
+## 경로 파라미터
+| 파라미터 | 타입 | 설명 |
+|----------|------|------|
+| `block_id` | int | 블록 ID |
+        """,
+        parameters=[
+            OpenApiParameter(
+                name="block_id", type=OpenApiTypes.INT, location=OpenApiParameter.PATH,
+                description="블록 ID",
+            ),
+        ],
+        responses={
+            200: OpenApiResponse(response=CustomCssSerializer, description="현재 커스텀 CSS"),
+            401: OpenApiResponse(description="인증 실패"),
+            404: OpenApiResponse(description="블록 없음 또는 접근 권한 없음"),
+        },
+    )
+    def get(self, request, pk: int):
+        page, _ = Page.get_or_create_for_user(request.user)
+        block = Block.objects.filter(pk=pk, page=page).first()
+        if not block:
+            return Response({"detail": "블록을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"custom_css": block.custom_css})
+
+    @extend_schema(
+        tags=["커스텀 CSS"],
+        summary="블록 커스텀 CSS 수정",
+        description="""
+## 개요
+내 페이지의 특정 블록에 적용할 **커스텀 CSS**를 저장합니다.
+
+## 인증
+`Authorization: Bearer <access_token>` 헤더 필수
+
+## 경로 파라미터
+| 파라미터 | 타입 | 설명 |
+|----------|------|------|
+| `block_id` | int | 블록 ID |
+
+## 요청 필드
+| 필드 | 필수 | 타입 | 설명 |
+|------|------|------|------|
+| `custom_css` | ✅ | string | 적용할 CSS 문자열. 빈 문자열 `""` 전송 시 초기화 |
+
+## 프론트엔드 통합 패턴
+```typescript
+await api.patch(`/api/v1/pages/me/blocks/${blockId}/css/`, {
+  custom_css: `.block-wrapper { border: 2px solid #ff6b6b; border-radius: 12px; }`
+});
+```
+        """,
+        parameters=[
+            OpenApiParameter(
+                name="block_id", type=OpenApiTypes.INT, location=OpenApiParameter.PATH,
+                description="블록 ID",
+            ),
+        ],
+        request=CustomCssSerializer,
+        responses={
+            200: OpenApiResponse(response=BlockSerializer, description="수정된 블록 전체 정보"),
+            400: OpenApiResponse(description="유효성 검증 실패"),
+            401: OpenApiResponse(description="인증 실패"),
+            404: OpenApiResponse(description="블록 없음 또는 접근 권한 없음"),
+        },
+    )
+    def patch(self, request, pk: int):
+        page, _ = Page.get_or_create_for_user(request.user)
+        block = Block.objects.filter(pk=pk, page=page).first()
+        if not block:
+            return Response({"detail": "블록을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+        serializer = CustomCssSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        block.custom_css = serializer.validated_data["custom_css"]
+        block.save(update_fields=["custom_css", "updated_at"])
+        return Response(BlockSerializer(block).data)
 
 
 # ─────────────────────────────────────────────────────────────

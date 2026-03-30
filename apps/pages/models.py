@@ -87,6 +87,12 @@ class Block(models.Model):
     order = models.PositiveIntegerField(default=0, verbose_name="표시 순서")
     is_enabled = models.BooleanField(default=True, verbose_name="노출 여부")
     data = models.JSONField(default=dict, verbose_name="블록 데이터")
+    custom_css = models.TextField(
+        blank=True,
+        default="",
+        verbose_name="커스텀 CSS",
+        help_text="블록에 적용할 커스텀 CSS. 공개 페이지 렌더링 시 해당 블록 영역에 주입.",
+    )
 
     # ── 예약 설정 ──────────────────────────────────────────
     schedule_enabled = models.BooleanField(
