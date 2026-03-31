@@ -74,11 +74,13 @@ def _validate_contact(data: dict):
 
 def _validate_single_link(data: dict):
     """
-    필수: url(valid URL), label(str)
-    선택: thumbnail_url(url), layout(enum: small|medium|large)
+    선택: url(valid URL or blank), label(str), thumbnail_url(url), layout(enum)
+    빈 문자열 허용 — 프론트에서 편집 중 임시 저장을 위해 완화.
     """
-    _require_url(data, "url")
-    _require_str(data, "label")
+    url = data.get("url")
+    if url and isinstance(url, str) and url.strip():
+        _optional_url(data, "url")
+    _optional_str(data, "label")
     _optional_url(data, "thumbnail_url")
     _optional_enum(data, "layout", ["small", "medium", "large"])
 
