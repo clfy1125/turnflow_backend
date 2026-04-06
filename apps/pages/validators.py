@@ -52,10 +52,10 @@ def _optional_enum(data: dict, key: str, choices: list):
 
 def _validate_profile(data: dict):
     """
-    필수: headline(str)
-    선택: subline(str), image_url(url), layout(str), size(str)
+    선택: headline(str), subline(str), image_url(url), layout(str), size(str)
+    빈 문자열 허용 — 편집 중 임시 저장을 위해 완화.
     """
-    _require_str(data, "headline")
+    _optional_str(data, "headline")
     _optional_str(data, "subline")
     _optional_url(data, "image_url")
     _optional_str(data, "layout")
@@ -64,11 +64,11 @@ def _validate_profile(data: dict):
 
 def _validate_contact(data: dict):
     """
-    필수: country_code(str), phone(str)
-    선택: label(str)
+    선택: country_code(str), phone(str), label(str)
+    빈 문자열 허용 — 편집 중 임시 저장을 위해 완화.
     """
-    _require_str(data, "country_code")
-    _require_str(data, "phone")
+    _optional_str(data, "country_code")
+    _optional_str(data, "phone")
     _optional_str(data, "label")
 
 
