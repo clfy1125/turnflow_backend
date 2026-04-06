@@ -1,5 +1,6 @@
 from django.urls import path
 
+from .aiviews import AiCloneFromSlugView, AiPageEditView
 from .image_views import PageMediaDetailView, PageMediaView
 from .multi_views import (
     MultiBlockCustomCssView,
@@ -118,4 +119,10 @@ urlpatterns = [
     # 미디어
     path("multipages/<int:page_id>/media/", MultiPageMediaView.as_view(), name="multipage-media-list"),
     path("multipages/<int:page_id>/media/<int:media_id>/", MultiPageMediaDetailView.as_view(), name="multipage-media-detail"),
+
+    # ─── AI 도구 전용 API ─────────────────────────────────────
+    # 슬러그로 페이지 복사
+    path("ai/clone-from-slug/", AiCloneFromSlugView.as_view(), name="ai-clone-from-slug"),
+    # 페이지 전체 편집 (1-shot)
+    path("ai/@<slug:slug>/", AiPageEditView.as_view(), name="ai-page-edit"),
 ]
