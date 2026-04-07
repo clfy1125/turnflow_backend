@@ -353,7 +353,25 @@ class PageMedia(models.Model):
     )
     file = models.FileField(
         upload_to="pages/%Y/%m/",
-        verbose_name="파일",
+        verbose_name="완성(크롭) 파일",
+        help_text="편집(크롭) 완료된 최종 이미지. 블록 렌더링에 사용.",
+    )
+    original_file = models.FileField(
+        upload_to="pages/originals/%Y/%m/",
+        null=True,
+        blank=True,
+        verbose_name="편집 전 원본 파일",
+        help_text="크롭/편집하기 전의 원본 이미지. 재편집 시 이 파일로 편집기를 복원합니다.",
+    )
+    crop_data = models.JSONField(
+        default=dict,
+        blank=True,
+        verbose_name="크롭 파라미터",
+        help_text=(
+            "이미지 편집 파라미터. "
+            "{x, y, width, height, aspect_ratio, locked, rotation, original_width, original_height}. "
+            "빈 dict이면 (기존 이미지) 프론트에서 전체 영역(최대 크롭)으로 간주합니다."
+        ),
     )
     original_name = models.CharField(max_length=500, verbose_name="원본 파일명")
     mime_type = models.CharField(max_length=100, verbose_name="MIME 타입")
@@ -375,4 +393,6 @@ class PageMedia(models.Model):
         """DB 레코드 삭제 시 스토리지 파일도 함께 제거."""
         if self.file:
             self.file.delete(save=False)
+        if self.original_file:
+            self.original_file.delete(save=False)
         super().delete(*args, **kwargs)

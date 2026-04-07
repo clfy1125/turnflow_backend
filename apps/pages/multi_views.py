@@ -44,6 +44,8 @@ apps/pages/multi_views.py
 
 from datetime import timedelta
 
+import json
+
 from django.db import transaction
 from django.db.models import Case, IntegerField, Q, When
 from django.utils import timezone
@@ -1920,10 +1922,11 @@ class MultiPageMediaView(APIView):
 
     @extend_schema(
         tags=[_MULTIPAGE_TAG],
-        summary="특정 페이지에 미디어 파일 업로드",
+        summary="특정 페이지에 미디어 파일 업로드 (원본 + 크롭 파라미터 포함)",
         description="""
 ## 개요
 특정 페이지에 블록에서 사용할 **이미지 파일을 서버에 업로드**합니다.  
+**이미지 편집(크롭) 기능**을 지원하기 위해 완성본, 원본 이미지, 크롭 파라미터를 함께 저장합니다.  
 업로드 완료 후 반환된 `url`을 `block.data` 의 URL 필드에 저장하는 **2단계 방식**입니다.
 
 ## 인증
@@ -1939,35 +1942,44 @@ class MultiPageMediaView(APIView):
 
 | 필드 | 필수 | 타입 | 설명 |
 |------|:------:|------|------|
-| `file` | ✅ | File | 업로드할 이미지 파일 |
+| `file` | ✅ | File | **편집(크롭) 완료된 최종 이미지** |
+| `original_file` | ❌ | File | **편집 전 원본 이미지**. 재편집 시 사용 |
+| `crop_data` | ❌ | string(JSON) | **크롭 파라미터**. 재편집 시 편집기 상태 복원용 |
+
+## crop_data 기본 정책
+| 상황 | 프론트엔드 동작 |
+|------|----------------|
+| `crop_data`가 `{}`(빈 객체) | 전체 영역(최대 크롭)으로 간주 |
+| `locked` 미지정 | `false`로 간주 |
+| `original_url`이 빈 문자열 | `url`(완성본)을 원본으로 간주 |
 
 ## 파일 제한
 | 항목 | 제한 |
 |------|------|
-| 최대 크기 | **10 MB** |
+| 최대 크기 | **10 MB** (file, original_file 각각) |
 | 허용 MIME | `image/jpeg` `image/png` `image/gif` `image/webp` `image/svg+xml` `image/bmp` `image/tiff` |
 
 ## 전체 흐름 예시
 ```typescript
-// Step 1: 파일 업로드
 const formData = new FormData();
-formData.append('file', selectedFile);
+formData.append('file', croppedBlob);
+formData.append('original_file', originalFile);
+formData.append('crop_data', JSON.stringify({
+  x: 120, y: 80, width: 400, height: 300,
+  aspect_ratio: '4:3', locked: true,
+  original_width: 1200, original_height: 900,
+}));
 const { data: media } = await api.post(
   `/api/v1/pages/multipages/${pageId}/media/`,
   formData,
   { headers: { 'Content-Type': 'multipart/form-data' } }
 );
-
-// Step 2: 반환된 URL을 블록에 저장
-await api.patch(`/api/v1/pages/multipages/${pageId}/blocks/${blockId}/`, {
-  data: { ...block.data, thumbnail_url: media.url },
-});
 ```
 
 ## 에러
 | 코드 | 원인 |
 |------|------|
-| 400 | 파일 미첨부 / 허용되지 않는 MIME / 파일 크기 초과 |
+| 400 | 파일 미첨부 / 허용되지 않는 MIME / 파일 크기 초과 / crop_data JSON 오류 |
 | 401 | 토큰 없음/만료 |
 | 404 | 페이지 없음 또는 접근 권한 없음 |
         """,
@@ -1980,6 +1992,7 @@ await api.patch(`/api/v1/pages/multipages/${pageId}/blocks/${blockId}/`, {
                     OpenApiExample("파일 미첨부", value={"file": ["파일을 첨부해 주세요."]}),
                     OpenApiExample("MIME 타입 오류", value={"file": ["지원하지 않는 파일 형식입니다."]}),
                     OpenApiExample("파일 크기 초과", value={"file": ["파일 크기가 너무 큽니다. 최대 10MB까지 업로드 가능합니다."]}),
+                    OpenApiExample("crop_data 오류", value={"crop_data": ["crop_data는 유효한 JSON이어야 합니다."]}),
                 ],
             ),
             401: OpenApiResponse(description="인증 실패"),
@@ -2008,9 +2021,41 @@ await api.patch(`/api/v1/pages/multipages/${pageId}/blocks/${blockId}/`, {
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # 원본 파일 검증 (선택)
+        original_file = request.FILES.get("original_file")
+        if original_file:
+            orig_mime = original_file.content_type or ""
+            if orig_mime not in _ALLOWED_MIME_TYPES:
+                return Response(
+                    {"original_file": ["지원하지 않는 파일 형식입니다."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if original_file.size > _MAX_FILE_SIZE_BYTES:
+                return Response(
+                    {"original_file": ["파일 크기가 너무 큽니다. 최대 10MB까지 업로드 가능합니다."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        # crop_data 파싱 (선택)
+        crop_data = {}
+        raw_crop = request.data.get("crop_data")
+        if raw_crop:
+            if isinstance(raw_crop, str):
+                try:
+                    crop_data = json.loads(raw_crop)
+                except (json.JSONDecodeError, ValueError):
+                    return Response(
+                        {"crop_data": ["crop_data는 유효한 JSON이어야 합니다."]},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+            elif isinstance(raw_crop, dict):
+                crop_data = raw_crop
+
         media = PageMedia.objects.create(
             page=page,
             file=file,
+            original_file=original_file,
+            crop_data=crop_data,
             original_name=file.name,
             mime_type=mime_type,
             size=file.size,
@@ -2023,13 +2068,16 @@ await api.patch(`/api/v1/pages/multipages/${pageId}/blocks/${blockId}/`, {
 
 class MultiPageMediaDetailView(APIView):
     permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
 
     @extend_schema(
         tags=[_MULTIPAGE_TAG],
-        summary="특정 페이지의 미디어 파일 상세 조회",
+        summary="특정 페이지의 미디어 파일 상세 조회 (재편집용)",
         description="""
 ## 개요
-특정 페이지에 업로드된 미디어 파일 1건의 정보를 반환합니다.
+특정 페이지에 업로드된 미디어 파일 1건의 정보를 반환합니다.  
+**이미지 재편집** 시 이 API를 호출하여 `original_url`과 `crop_data`를 가져온 뒤
+편집기의 이전 상태를 복원합니다.
 
 ## 인증
 `Authorization: Bearer <access_token>` 헤더 필수
@@ -2039,6 +2087,25 @@ class MultiPageMediaDetailView(APIView):
 |----------|------|------|
 | `id` | int | 페이지 ID |
 | `media_id` | int | 미디어 파일 ID |
+
+## 재편집 흐름
+```typescript
+const { data: media } = await api.get(
+  `/api/v1/pages/multipages/${pageId}/media/${mediaId}/`
+);
+const editUrl = media.original_url || media.url;
+openEditor(editUrl, {
+  ...media.crop_data,
+  locked: media.crop_data.locked ?? false,
+});
+```
+
+## crop_data 기본 정책
+| 상황 | 프론트엔드 동작 |
+|------|----------------|
+| `crop_data`가 `{}`(빈) | 전체 영역(최대 크롭)으로 간주 |
+| `locked` 미지정 | `false`로 간주 |
+| `original_url`이 빈 문자열 | `url`(완성본)을 원본으로 사용 |
 
 ## 에러
 | 코드 | 원인 |
@@ -2063,7 +2130,110 @@ class MultiPageMediaDetailView(APIView):
 
     @extend_schema(
         tags=[_MULTIPAGE_TAG],
-        summary="특정 페이지의 미디어 파일 삭제",
+        summary="특정 페이지의 미디어 파일 재편집",
+        description="""
+## 개요
+이미지 **재편집(재크롭) 완료 후** 완성본 파일과 크롭 파라미터를 업데이트합니다.  
+원본 이미지(`original_file`)는 변경되지 않습니다.
+
+## 인증
+`Authorization: Bearer <access_token>` 헤더 필수
+
+## 경로 파라미터
+| 파라미터 | 타입 | 설명 |
+|----------|------|------|
+| `id` | int | 페이지 ID |
+| `media_id` | int | 수정할 미디어 파일 ID |
+
+## 요청 형식
+`Content-Type: multipart/form-data` 필수
+
+| 필드 | 필수 | 타입 | 설명 |
+|------|:------:|------|------|
+| `file` | ❌ | File | 재편집(재크롭) 완료된 새 최종 이미지 |
+| `crop_data` | ❌ | string(JSON) | 새 크롭 파라미터 |
+
+> 전송한 필드만 업데이트됩니다.
+
+## 재편집 전체 흐름
+```typescript
+const { data: media } = await api.get(
+  `/api/v1/pages/multipages/${pageId}/media/${mediaId}/`
+);
+const editUrl = media.original_url || media.url;
+const { croppedBlob, newCropData } = await openEditor(editUrl, media.crop_data);
+
+const formData = new FormData();
+formData.append('file', croppedBlob);
+formData.append('crop_data', JSON.stringify(newCropData));
+await api.patch(
+  `/api/v1/pages/multipages/${pageId}/media/${mediaId}/`,
+  formData,
+  { headers: { 'Content-Type': 'multipart/form-data' } }
+);
+```
+
+## 에러
+| 코드 | 원인 |
+|------|------|
+| 400 | 파일 형식/크기 오류, crop_data JSON 파싱 실패 |
+| 401 | 토큰 없음/만료 |
+| 404 | 페이지 또는 파일 없음 |
+        """,
+        request=OpenApiTypes.BINARY,
+        responses={
+            200: OpenApiResponse(response=PageMediaSerializer, description="업데이트된 미디어 파일 정보"),
+            400: OpenApiResponse(description="유효성 검증 실패"),
+            401: OpenApiResponse(description="인증 실패"),
+            404: OpenApiResponse(description="페이지 또는 파일 없음"),
+        },
+    )
+    def patch(self, request, page_id: int, media_id: int):
+        page = _get_owned_page(request, page_id)
+        if not page:
+            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+        media = PageMedia.objects.filter(pk=media_id, page=page).first()
+        if not media:
+            return Response({"detail": "파일을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+
+        # 새 완성본 파일 (선택)
+        new_file = request.FILES.get("file")
+        if new_file:
+            mime_type = new_file.content_type or ""
+            if mime_type not in _ALLOWED_MIME_TYPES:
+                return Response(
+                    {"file": ["지원하지 않는 파일 형식입니다."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if new_file.size > _MAX_FILE_SIZE_BYTES:
+                return Response(
+                    {"file": ["파일 크기가 너무 큽니다. 최대 10MB까지 업로드 가능합니다."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if media.file:
+                media.file.delete(save=False)
+            media.file = new_file
+            media.mime_type = mime_type
+            media.size = new_file.size
+
+        # crop_data 업데이트 (선택)
+        raw_crop = request.data.get("crop_data")
+        if raw_crop is not None:
+            if isinstance(raw_crop, str):
+                try:
+                    media.crop_data = json.loads(raw_crop)
+                except (json.JSONDecodeError, ValueError):
+                    return Response(
+                        {"crop_data": ["crop_data는 유효한 JSON이어야 합니다."]},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+            elif isinstance(raw_crop, dict):
+                media.crop_data = raw_crop
+
+        media.save()
+        return Response(PageMediaSerializer(media, context={"request": request}).data)
+
+    @extend_schema(
         description="""
 ## 개요
 특정 페이지에 업로드된 미디어 파일 1건을 **영구 삭제**합니다.  

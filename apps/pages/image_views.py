@@ -1,18 +1,27 @@
 """
 apps/pages/image_views.py
 
-미디어 파일(이미지) 업로드·목록·삭제 API
+미디어 파일(이미지) 업로드·목록·삭제·재편집 API
 
-■ 사용 흐름
-  1) POST  /api/pages/me/media/        → 파일 업로드  → { id, url, ... } 반환
+■ 사용 흐름 (이미지 편집 포함)
+  1) POST  /api/pages/me/media/        → 완성본(file) + 원본(original_file) + 크롭 파라미터(crop_data) 업로드
   2) PATCH /api/pages/me/blocks/{id}/  → { data: { thumbnail_url: "<반환된 url>" } }
-  3) DELETE /api/pages/me/media/{id}/  → 파일 교체 시 이전 파일 삭제
+  3) 재편집 시:
+     GET   /api/pages/me/media/{id}/   → original_url + crop_data 로 편집기 복원
+     PATCH /api/pages/me/media/{id}/   → 새 완성본(file) + 새 crop_data 전송
+  4) DELETE /api/pages/me/media/{id}/  → 파일 교체 시 이전 파일 삭제
+
+■ crop_data 기본 정책
+  - crop_data가 빈 객체({})이면 → 프론트: 전체 영역(최대 크롭)으로 간주
+  - locked 미지정 시 → false 로 간주
 
 ■ block.data 사용 예
   single_link  → data.thumbnail_url
   profile      → data.avatar_url
   (그 외 필드도 URL 문자열로 자유롭게 사용 가능)
 """
+
+import json
 
 from drf_spectacular.utils import (
     OpenApiExample,
@@ -134,11 +143,11 @@ const { data: mediaList } = await api.get('/api/pages/me/media/');
 
     @extend_schema(
         tags=["미디어"],
-        summary="미디어 파일 업로드",
+        summary="미디어 파일 업로드 (원본 + 크롭 파라미터 포함)",
         description="""
 ## 개요
 블록에서 사용할 **이미지 파일을 서버에 업로드**합니다.  
-업로드 완료 후 반환된 `url`을 `block.data` 의 URL 필드에 저장하는 **2단계 방식**입니다.
+**이미지 편집(크롭) 기능**을 지원하기 위해 완성본, 원본 이미지, 크롭 파라미터를 함께 저장합니다.
 
 ## 인증
 `Authorization: Bearer <access_token>` 헤더 필수
@@ -148,54 +157,66 @@ const { data: mediaList } = await api.get('/api/pages/me/media/');
 
 | 필드 | 필수 | 타입 | 설명 |
 |------|:------:|------|------|
-| `file` | ✅ | File | 업로드할 이미지 파일 |
+| `file` | ✅ | File | **편집(크롭) 완료된 최종 이미지**. 블록 렌더링에 사용되는 파일 |
+| `original_file` | ❌ | File | **편집 전 원본 이미지**. 재편집 시 편집기에서 이 파일을 로드 |
+| `crop_data` | ❌ | string(JSON) | **크롭 파라미터 JSON 문자열**. 재편집 시 편집기 상태 복원용 |
+
+## crop_data 구조 예시
+```json
+{
+  "x": 120,
+  "y": 80,
+  "width": 400,
+  "height": 300,
+  "aspect_ratio": "4:3",
+  "locked": true,
+  "rotation": 0,
+  "original_width": 1200,
+  "original_height": 900
+}
+```
+
+## crop_data 기본 정책
+| 상황 | 프론트엔드 동작 |
+|------|----------------|
+| `crop_data`가 `{}`(빈 객체) | 전체 영역(최대 크롭)으로 간주 |
+| `locked` 미지정 | `false`로 간주 (비율 고정 안 함) |
+| `original_url`이 빈 문자열 | `url`(완성본)을 원본으로 사용하여 편집기 로드 |
 
 ## 파일 제한
 | 항목 | 제한 |
 |------|------|
-| 최대 크기 | **10 MB** |
+| 최대 크기 | **10 MB** (file, original_file 각각) |
 | 허용 MIME | `image/jpeg` `image/png` `image/gif` `image/webp` `image/svg+xml` `image/bmp` `image/tiff` |
-
-## 응답
-성공 시 업로드된 파일 정보와 **`url`** 을 반환합니다.  
-이 `url`을 블록 편집 시 `block.data` 에 저장하세요.
 
 ## 전체 흐름 예시
 ```typescript
-// Step 1: 파일 업로드
+// Step 1: 사용자가 이미지 선택 후 편집기에서 크롭
 const formData = new FormData();
-formData.append('file', selectedFile);  // <input type="file"> 에서 선택된 파일
+formData.append('file', croppedBlob);           // 크롭 완료된 최종 이미지
+formData.append('original_file', originalFile);  // 편집 전 원본 이미지
+formData.append('crop_data', JSON.stringify({
+  x: 120, y: 80, width: 400, height: 300,
+  aspect_ratio: '4:3', locked: true,
+  original_width: 1200, original_height: 900,
+}));
 
 const { data: media } = await api.post('/api/pages/me/media/', formData, {
   headers: { 'Content-Type': 'multipart/form-data' },
 });
-// media.url → "https://yourdomain.com/media/pages/2026/03/product-thumb.jpg"
 
 // Step 2: 반환된 URL을 블록에 저장
 await api.patch(`/api/pages/me/blocks/${blockId}/`, {
-  data: {
-    url: 'https://naver.me/abc',
-    label: '상품 링크',
-    thumbnail_url: media.url,   // ← 여기에 그대로 사용
-  },
+  data: { ...block.data, thumbnail_url: media.url },
 });
 ```
 
-## React Hook 통합 패턴
-```typescript
-const uploadImage = async (file: File): Promise<string> => {
-  const formData = new FormData();
-  formData.append('file', file);
-  const res = await api.post('/api/pages/me/media/', formData, {
-    headers: { 'Content-Type': 'multipart/form-data' },
-  });
-  return res.data.url;  // URL만 꺼내서 사용
-};
-
-// 사용
-const imageUrl = await uploadImage(e.target.files[0]);
-setBlockData(prev => ({ ...prev, thumbnail_url: imageUrl }));
-```
+## 응답 필드
+| 필드 | 설명 |
+|------|------|
+| `url` | 완성(크롭) 이미지 URL → 블록 렌더링에 사용 |
+| `original_url` | 원본 이미지 URL → 재편집 시 편집기 로드용 |
+| `crop_data` | 크롭 파라미터 → 재편집 시 편집기 상태 복원용 |
 
 ## 에러
 | 코드 | 원인 | 메시지 예시 |
@@ -203,6 +224,7 @@ setBlockData(prev => ({ ...prev, thumbnail_url: imageUrl }));
 | 400 | 파일 미첨부 | `"파일을 첨부해 주세요."` |
 | 400 | 허용되지 않는 MIME | `"지원하지 않는 파일 형식입니다."` |
 | 400 | 파일 크기 초과 | `"파일 크기가 너무 큽니다. 최대 10MB까지 업로드 가능합니다."` |
+| 400 | crop_data JSON 파싱 실패 | `"crop_data는 유효한 JSON이어야 합니다."` |
 | 401 | 토큰 없음/만료 | — |
 """,
         request=OpenApiTypes.BINARY,
@@ -220,6 +242,12 @@ setBlockData(prev => ({ ...prev, thumbnail_url: imageUrl }));
                             "size": 245760,
                             "size_display": "240.0 KB",
                             "url": "https://yourdomain.com/media/pages/2026/03/product-thumb.jpg",
+                            "original_url": "https://yourdomain.com/media/pages/originals/2026/03/product-thumb.jpg",
+                            "crop_data": {
+                                "x": 120, "y": 80, "width": 400, "height": 300,
+                                "aspect_ratio": "4:3", "locked": True,
+                                "original_width": 1200, "original_height": 900,
+                            },
                             "created_at": "2026-03-11T10:00:00Z",
                         },
                     )
@@ -239,6 +267,10 @@ setBlockData(prev => ({ ...prev, thumbnail_url: imageUrl }));
                     OpenApiExample(
                         "파일 크기 초과",
                         value={"file": ["파일 크기가 너무 큽니다. 최대 10MB까지 업로드 가능합니다."]},
+                    ),
+                    OpenApiExample(
+                        "crop_data 파싱 오류",
+                        value={"crop_data": ["crop_data는 유효한 JSON이어야 합니다."]},
                     ),
                 ],
             ),
@@ -268,9 +300,41 @@ setBlockData(prev => ({ ...prev, thumbnail_url: imageUrl }));
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # 원본 파일 검증 (선택)
+        original_file = request.FILES.get("original_file")
+        if original_file:
+            orig_mime = original_file.content_type or ""
+            if orig_mime not in ALLOWED_MIME_TYPES:
+                return Response(
+                    {"original_file": ["지원하지 않는 파일 형식입니다."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if original_file.size > MAX_FILE_SIZE_BYTES:
+                return Response(
+                    {"original_file": ["파일 크기가 너무 큽니다. 최대 10MB까지 업로드 가능합니다."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        # crop_data 파싱 (선택)
+        crop_data = {}
+        raw_crop = request.data.get("crop_data")
+        if raw_crop:
+            if isinstance(raw_crop, str):
+                try:
+                    crop_data = json.loads(raw_crop)
+                except (json.JSONDecodeError, ValueError):
+                    return Response(
+                        {"crop_data": ["crop_data는 유효한 JSON이어야 합니다."]},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+            elif isinstance(raw_crop, dict):
+                crop_data = raw_crop
+
         media = PageMedia.objects.create(
             page=page,
             file=file,
+            original_file=original_file,
+            crop_data=crop_data,
             original_name=file.name,
             mime_type=mime_type,
             size=file.size,
@@ -286,9 +350,221 @@ setBlockData(prev => ({ ...prev, thumbnail_url: imageUrl }));
 # ─────────────────────────────────────────────────────────────
 
 class PageMediaDetailView(APIView):
-    """DELETE /api/pages/me/media/{id}/ — 미디어 파일 삭제 (스토리지 + DB 동시)"""
+    """
+    GET    /api/pages/me/media/{id}/ — 미디어 상세 조회 (재편집 시 original_url + crop_data 확인용)
+    PATCH  /api/pages/me/media/{id}/ — 재편집 후 완성본 + crop_data 업데이트
+    DELETE /api/pages/me/media/{id}/ — 미디어 파일 삭제 (스토리지 + DB 동시)
+    """
 
     permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
+
+    @extend_schema(
+        tags=["미디어"],
+        summary="미디어 파일 상세 조회 (재편집용)",
+        description="""
+## 개요
+특정 미디어 파일의 상세 정보를 반환합니다.  
+**이미지 재편집** 시 이 API를 호출하여 `original_url`과 `crop_data`를 가져온 뒤  
+편집기의 이전 상태를 복원합니다.
+
+## 인증
+`Authorization: Bearer <access_token>` 헤더 필수
+
+## 재편집 흐름
+```typescript
+// 1) 사용자가 이미지 클릭 → 미디어 상세 조회
+const { data: media } = await api.get(`/api/pages/me/media/${mediaId}/`);
+
+// 2) 편집기 복원
+//    - original_url이 있으면 → 원본으로 편집기 열기
+//    - 없으면 → url(완성본)으로 편집기 열기
+const editUrl = media.original_url || media.url;
+
+// 3) crop_data로 편집기 상태 복원
+//    - crop_data가 {} 이면 → 전체 영역(최대 크롭) 적용
+//    - locked가 없으면 → false로 간주
+openEditor(editUrl, {
+  ...media.crop_data,
+  locked: media.crop_data.locked ?? false,
+});
+```
+
+## 에러
+| 코드 | 원인 |
+|------|------|
+| 401 | 토큰 없음/만료 |
+| 404 | 파일 없음 또는 본인 페이지의 파일이 아님 |
+""",
+        parameters=[
+            OpenApiParameter(
+                name="pk",
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.PATH,
+                description="미디어 파일 ID",
+            ),
+        ],
+        responses={
+            200: OpenApiResponse(
+                response=PageMediaSerializer,
+                description="미디어 파일 상세 정보",
+                examples=[
+                    OpenApiExample(
+                        "Success",
+                        value={
+                            "id": 5,
+                            "original_name": "product-thumb.jpg",
+                            "mime_type": "image/jpeg",
+                            "size": 245760,
+                            "size_display": "240.0 KB",
+                            "url": "https://yourdomain.com/media/pages/2026/03/product-thumb.jpg",
+                            "original_url": "https://yourdomain.com/media/pages/originals/2026/03/product-thumb.jpg",
+                            "crop_data": {
+                                "x": 120, "y": 80, "width": 400, "height": 300,
+                                "aspect_ratio": "4:3", "locked": True,
+                                "original_width": 1200, "original_height": 900,
+                            },
+                            "created_at": "2026-03-11T10:00:00Z",
+                        },
+                    ),
+                    OpenApiExample(
+                        "기존 이미지 (crop_data 없음 → 전체 크롭)",
+                        value={
+                            "id": 2,
+                            "original_name": "avatar.png",
+                            "mime_type": "image/png",
+                            "size": 51200,
+                            "size_display": "50.0 KB",
+                            "url": "https://yourdomain.com/media/pages/2026/03/avatar.png",
+                            "original_url": "",
+                            "crop_data": {},
+                            "created_at": "2026-03-10T09:00:00Z",
+                        },
+                    ),
+                ],
+            ),
+            401: OpenApiResponse(description="인증 실패"),
+            404: OpenApiResponse(description="파일 없음 또는 접근 권한 없음"),
+        },
+    )
+    def get(self, request, pk):
+        page, _ = Page.get_or_create_for_user(request.user)
+        media = PageMedia.objects.filter(pk=pk, page=page).first()
+        if not media:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        return Response(PageMediaSerializer(media, context={"request": request}).data)
+
+    @extend_schema(
+        tags=["미디어"],
+        summary="미디어 파일 재편집 (완성본 + 크롭 파라미터 업데이트)",
+        description="""
+## 개요
+이미지 **재편집(재크롭) 완료 후** 완성본 파일과 크롭 파라미터를 업데이트합니다.  
+원본 이미지(`original_file`)는 변경되지 않습니다.
+
+## 인증
+`Authorization: Bearer <access_token>` 헤더 필수
+
+## 요청 형식
+`Content-Type: multipart/form-data` 필수
+
+| 필드 | 필수 | 타입 | 설명 |
+|------|:------:|------|------|
+| `file` | ❌ | File | 재편집(재크롭) 완료된 새 최종 이미지 |
+| `crop_data` | ❌ | string(JSON) | 새 크롭 파라미터 |
+
+> 전송한 필드만 업데이트됩니다. `file`만 보내면 `crop_data`는 유지됩니다.
+
+## 재편집 전체 흐름
+```typescript
+// 1) 미디어 상세 조회
+const { data: media } = await api.get(`/api/pages/me/media/${mediaId}/`);
+
+// 2) 편집기 복원 → 사용자 재편집 → 새 크롭 완료
+const editUrl = media.original_url || media.url;
+const { croppedBlob, newCropData } = await openEditor(editUrl, media.crop_data);
+
+// 3) 재편집 결과 업데이트
+const formData = new FormData();
+formData.append('file', croppedBlob);
+formData.append('crop_data', JSON.stringify(newCropData));
+const { data: updated } = await api.patch(
+  `/api/pages/me/media/${mediaId}/`,
+  formData,
+  { headers: { 'Content-Type': 'multipart/form-data' } }
+);
+// updated.url → 블록에서 참조하던 URL이 자동 갱신됨 (동일 media_id)
+```
+
+## 에러
+| 코드 | 원인 |
+|------|------|
+| 400 | 파일 형식/크기 오류, crop_data JSON 파싱 실패 |
+| 401 | 토큰 없음/만료 |
+| 404 | 파일 없음 또는 본인 페이지의 파일이 아님 |
+""",
+        parameters=[
+            OpenApiParameter(
+                name="pk",
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.PATH,
+                description="수정할 미디어 파일 ID",
+            ),
+        ],
+        request=OpenApiTypes.BINARY,
+        responses={
+            200: OpenApiResponse(
+                response=PageMediaSerializer,
+                description="업데이트된 미디어 파일 정보",
+            ),
+            400: OpenApiResponse(description="유효성 검증 실패"),
+            401: OpenApiResponse(description="인증 실패"),
+            404: OpenApiResponse(description="파일 없음 또는 접근 권한 없음"),
+        },
+    )
+    def patch(self, request, pk):
+        page, _ = Page.get_or_create_for_user(request.user)
+        media = PageMedia.objects.filter(pk=pk, page=page).first()
+        if not media:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+
+        # 새 완성본 파일 (선택)
+        new_file = request.FILES.get("file")
+        if new_file:
+            mime_type = new_file.content_type or ""
+            if mime_type not in ALLOWED_MIME_TYPES:
+                return Response(
+                    {"file": ["지원하지 않는 파일 형식입니다."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if new_file.size > MAX_FILE_SIZE_BYTES:
+                return Response(
+                    {"file": ["파일 크기가 너무 큽니다. 최대 10MB까지 업로드 가능합니다."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            # 기존 완성본 파일 스토리지 삭제
+            if media.file:
+                media.file.delete(save=False)
+            media.file = new_file
+            media.mime_type = mime_type
+            media.size = new_file.size
+
+        # crop_data 업데이트 (선택)
+        raw_crop = request.data.get("crop_data")
+        if raw_crop is not None:
+            if isinstance(raw_crop, str):
+                try:
+                    media.crop_data = json.loads(raw_crop)
+                except (json.JSONDecodeError, ValueError):
+                    return Response(
+                        {"crop_data": ["crop_data는 유효한 JSON이어야 합니다."]},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+            elif isinstance(raw_crop, dict):
+                media.crop_data = raw_crop
+
+        media.save()
+        return Response(PageMediaSerializer(media, context={"request": request}).data)
 
     @extend_schema(
         tags=["미디어"],

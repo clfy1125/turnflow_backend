@@ -466,7 +466,17 @@ class PageMediaSerializer(serializers.ModelSerializer):
     """GET·POST /api/pages/me/media/ — 업로드된 미디어 파일 정보."""
 
     url = serializers.SerializerMethodField(
-        help_text="파일 접근 URL. block.data 의 thumbnail_url / avatar_url 등에 그대로 사용."
+        help_text="완성(크롭) 파일 URL. block.data 의 thumbnail_url / avatar_url 등에 그대로 사용."
+    )
+    original_url = serializers.SerializerMethodField(
+        help_text="편집 전 원본 파일 URL. 재편집 시 이 URL로 편집기를 복원. 없으면 빈 문자열."
+    )
+    crop_data = serializers.JSONField(
+        read_only=True,
+        help_text=(
+            "크롭 파라미터 {x, y, width, height, aspect_ratio, locked, ...}. "
+            "빈 객체({})이면 전체 영역(최대 크롭)으로 간주. locked 미지정 시 false."
+        ),
     )
     size_display = serializers.SerializerMethodField(
         help_text="사람이 읽기 좋은 파일 크기 (예: 1.2 MB)"
@@ -474,8 +484,14 @@ class PageMediaSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = PageMedia
-        fields = ["id", "original_name", "mime_type", "size", "size_display", "url", "created_at"]
-        read_only_fields = ["id", "original_name", "mime_type", "size", "size_display", "url", "created_at"]
+        fields = [
+            "id", "original_name", "mime_type", "size", "size_display",
+            "url", "original_url", "crop_data", "created_at",
+        ]
+        read_only_fields = [
+            "id", "original_name", "mime_type", "size", "size_display",
+            "url", "original_url", "crop_data", "created_at",
+        ]
 
     def get_url(self, obj) -> str:
         request = self.context.get("request")
@@ -484,6 +500,14 @@ class PageMediaSerializer(serializers.ModelSerializer):
         if request:
             return request.build_absolute_uri(obj.file.url)
         return obj.file.url
+
+    def get_original_url(self, obj) -> str:
+        request = self.context.get("request")
+        if not obj.original_file:
+            return ""
+        if request:
+            return request.build_absolute_uri(obj.original_file.url)
+        return obj.original_file.url
 
     def get_size_display(self, obj) -> str:
         size = obj.size
