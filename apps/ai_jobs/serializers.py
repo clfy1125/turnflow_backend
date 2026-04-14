@@ -17,6 +17,12 @@ class AiJobCreateSerializer(serializers.Serializer):
         max_length=2000,
         help_text="페이지 컨셉 설명. 예: '제품 판매 랜딩 페이지', '밴드 프로필 페이지'",
     )
+    model = serializers.ChoiceField(
+        choices=AiJob.LlmModel.choices,
+        default=AiJob.LlmModel.GEMMA,
+        required=False,
+        help_text="사용할 AI 모델. `gemma`(기본), `gpt5`(GPT-5.4, 개발 중)",
+    )
 
 
 class AiJobSerializer(serializers.ModelSerializer):

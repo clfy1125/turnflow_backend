@@ -52,7 +52,7 @@ def run_ai_job(self, job_id: str):
         # ── 1. 프롬프트 준비 ────────────────────────
         job.set_stage(AiJob.Stage.PREPARING_PROMPT, 10, "프롬프트를 구성하고 있습니다.")
 
-        model_name = resolve_model(job.job_type)
+        model_name = resolve_model(job.llm_model)
         job.model_name = model_name
         job.save(update_fields=["model_name", "updated_at"])
 

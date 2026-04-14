@@ -118,9 +118,10 @@ AI가 링크인바이오 페이지 JSON을 생성하는 **비동기 작업**을 
 |------|:----:|------|------|
 | `concept` | ✅ | string | 페이지 컨셉 설명 (최대 2000자) |
 | `slug` | ❌ | string | 리메이크할 기존 페이지의 slug. 전달 시 해당 페이지의 블록을 참고하여 AI가 리메이크 |
+| `model` | ❌ | string | AI 모델 선택. `gemma`(기본), `gpt5`(GPT-5.4, 개발 중). 기본값 `gemma` |
 
 ## 토큰 시스템
-- 1회 생성당 **1토큰** 소모
+- 1회 생성당 **1토큰** 소모 (모델 무관)
 - 작업 성공 시에만 토큰이 차감됩니다. 실패 시 차감되지 않습니다.
 - 구독 등급별 월 토큰 지급: free=3, pro=100, pro_plus=500
 - 잔액 부족 시 `402` 에러
@@ -211,6 +212,16 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
         ser.is_valid(raise_exception=True)
         vd = ser.validated_data
 
+        # 모델 선택
+        llm_model = vd.get("model", AiJob.LlmModel.GEMMA)
+
+        # gpt5 는 개발 중
+        if llm_model == AiJob.LlmModel.GPT5:
+            return Response(
+                {"detail": "GPT-5.4 모델은 현재 개발 중입니다. 기본 모델(gemma)을 사용해주세요."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         token_cost = AiJob.TOKEN_COST
 
         # 토큰 잔액 확인
@@ -269,6 +280,7 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
             user=request.user,
             page=page,
             job_type=AiJob.JobType.BIO_REMAKE,
+            llm_model=llm_model,
             input_payload=input_payload,
         )
 

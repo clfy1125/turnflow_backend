@@ -12,6 +12,16 @@ class AiJob(models.Model):
         THEME_GENERATION = "theme_generation", "테마 생성"
         COPY_GENERATION = "copy_generation", "카피 생성"
 
+    class LlmModel(models.TextChoices):
+        GEMMA = "gemma", "Gemma (기본)"
+        GPT5 = "gpt5", "GPT-5.4"
+
+    # LlmModel → 실제 LiteLLM 모델명
+    LLM_MODEL_MAP = {
+        "gemma": "gemma-4",
+        "gpt5": "gpt-5.4",
+    }
+
     # AI 작업 1건당 고정 토큰 비용
     TOKEN_COST = 1
 
@@ -49,6 +59,12 @@ class AiJob(models.Model):
         choices=JobType.choices,
         default=JobType.BIO_REMAKE,
         verbose_name="작업 유형",
+    )
+    llm_model = models.CharField(
+        max_length=20,
+        choices=LlmModel.choices,
+        default=LlmModel.GEMMA,
+        verbose_name="LLM 모델",
     )
     status = models.CharField(
         max_length=20,
