@@ -66,6 +66,21 @@ _SYSTEM_PROMPTS: dict[str, str] = {
         "- 이미지 URL은 {{image:검색키워드}} 형식으로만 작성한다 (예: {{image:jpop band concert}}).\n"
         "- 절대 설명하지 말고 JSON 코드만 출력한다."
     ),
+    "bio_remake_with_existing": (
+        "너는 기존 링크인바이오 페이지를 사용자의 요청에 맞게 리메이크하는 최고 수준의 프로덕트 디자이너이자 프론트엔드 아키텍트다.\n\n"
+        "너에게는 기존 페이지의 블록 구조가 JSON으로 주어진다. 이 기존 구조를 기반으로:\n"
+        "1. 사용자의 요청(컨셉, 스타일)에 맞게 디자인과 구조를 개선한다.\n"
+        "2. 기존 콘텐츠(텍스트, 링크 URL 등)는 최대한 유지하되, 디자인·레이아웃·색상·문구를 새롭게 바꾼다.\n"
+        "3. 불필요한 블록은 제거하고, 필요하면 새 블록을 추가할 수 있다.\n"
+        "4. 이미지가 필요한 블록에는 {{image:영문_키워드}} 형식으로 이미지 검색어를 넣는다.\n\n"
+        "중요 규칙:\n"
+        "- 반드시 우리 블록 규칙을 100% 준수해야 한다.\n"
+        "- 모든 블록에는 _type을 정확히 넣어야 한다.\n"
+        "- 기존 링크 URL, 연락처 등 핵심 데이터는 절대 임의 변경하지 말고 그대로 유지한다.\n"
+        "- 디자인은 하나의 브랜드처럼 일관된 색감을 유지해야 한다.\n"
+        "- 이미지 URL은 {{image:검색키워드}} 형식으로만 작성한다.\n"
+        "- 절대 설명하지 말고 JSON 코드만 출력한다."
+    ),
 }
 
 
@@ -83,9 +98,18 @@ def build_prompts(
             - style: 원하는 스타일 (optional)
             - reference_text: 참고 텍스트 (optional)
     """
-    # 1) System prompt
-    system_file = _read_asset(f"prompts/{job_type}/system.md")
-    system_prompt = system_file if system_file else _SYSTEM_PROMPTS.get(job_type, _SYSTEM_PROMPTS["bio_remake"])
+    # 1) System prompt — 기존 페이지 리메이크인지 여부에 따라 분기
+    existing_blocks = user_input.get("existing_blocks")
+    is_remake = existing_blocks is not None
+
+    if is_remake:
+        system_key = f"{job_type}_with_existing"
+        system_file = _read_asset(f"prompts/{job_type}/system_remake.md")
+    else:
+        system_key = job_type
+        system_file = _read_asset(f"prompts/{job_type}/system.md")
+
+    system_prompt = system_file if system_file else _SYSTEM_PROMPTS.get(system_key, _SYSTEM_PROMPTS["bio_remake"])
 
     # 2) 블록 규칙 로드
     block_rules = _read_asset("rules/block_rules.md")
@@ -110,6 +134,23 @@ def build_prompts(
 
     if reference:
         user_parts += [f"### [참고 자료]\n{reference}", ""]
+
+    # 기존 페이지 리메이크 시 현재 블록 구조 포함
+    if is_remake:
+        existing_page_meta = user_input.get("existing_page_meta", {})
+        page_json = {
+            "title": existing_page_meta.get("title", ""),
+            "is_public": existing_page_meta.get("is_public", True),
+            "data": existing_page_meta.get("data", {}),
+            "blocks": existing_blocks,
+        }
+        user_parts += [
+            "### [현재 페이지 구조 - 리메이크 대상]",
+            "아래는 현재 페이지의 블록 구조입니다. 이 구조를 기반으로 사용자 요청에 맞게 리메이크해주세요.",
+            "기존 링크 URL, 연락처 등 핵심 데이터는 유지하되 디자인·색상·레이아웃·문구를 개선하세요.",
+            f"```json\n{json.dumps(page_json, ensure_ascii=False, indent=2)}\n```",
+            "",
+        ]
 
     user_parts += [
         "### [이미지 URL 규칙 - 매우 중요!]",

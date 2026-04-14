@@ -12,6 +12,13 @@ class AiJobCreateSerializer(serializers.Serializer):
         allow_null=True,
         default=None,
     )
+    slug = serializers.SlugField(
+        max_length=120,
+        required=False,
+        allow_blank=True,
+        default="",
+        help_text="리메이크할 기존 페이지의 slug. 전달 시 해당 페이지의 현재 블록을 참고하여 AI가 리메이크합니다.",
+    )
     job_type = serializers.ChoiceField(
         choices=AiJob.JobType.choices,
         default=AiJob.JobType.BIO_REMAKE,

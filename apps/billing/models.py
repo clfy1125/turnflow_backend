@@ -2,6 +2,7 @@
 Billing models: Plans and Usage tracking
 """
 
+from django.conf import settings
 from django.db import models
 from django.utils import timezone
 from datetime import datetime
@@ -157,3 +158,151 @@ class UsageCounter(models.Model):
         current_value = getattr(self, metric)
         remaining = limit - current_value
         return max(0, remaining)
+
+
+# ──────────────────────────────────────────────
+# 개인 구독 시스템 (Personal Subscription)
+# ──────────────────────────────────────────────
+
+
+class SubscriptionPlan(models.Model):
+    """
+    DB-driven subscription plan configuration.
+    features JSONField로 확장 가능한 기능 제한 관리.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=30, unique=True)  # free / pro / pro_plus
+    display_name = models.CharField(max_length=50)  # 무료 / 프로 / 프로 플러스
+    monthly_price = models.IntegerField(default=0, help_text="월 요금 (원)")
+    yearly_price = models.IntegerField(default=0, help_text="연 요금 (원)")
+    features = models.JSONField(
+        default=dict,
+        help_text="기능 제한 설정. 예: {max_pages: 3, ai_generation: false, ...}",
+    )
+    sort_order = models.IntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "subscription_plans"
+        ordering = ["sort_order"]
+
+    def __str__(self):
+        return self.display_name
+
+
+class SubscriptionStatus(models.TextChoices):
+    ACTIVE = "active", "Active"
+    CANCELLED = "cancelled", "Cancelled"
+    PAST_DUE = "past_due", "Past Due"
+    TRIALING = "trialing", "Trialing"
+
+
+class BillingCycle(models.TextChoices):
+    MONTHLY = "monthly", "Monthly"
+    YEARLY = "yearly", "Yearly"
+
+
+class UserSubscription(models.Model):
+    """
+    User 1:1 구독 정보.
+    토스페이먼츠 필드는 nullable — 승인 후 연동만 추가하면 됨.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="subscription",
+    )
+    plan = models.ForeignKey(
+        SubscriptionPlan,
+        on_delete=models.PROTECT,
+        related_name="subscriptions",
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=SubscriptionStatus.choices,
+        default=SubscriptionStatus.ACTIVE,
+    )
+    billing_cycle = models.CharField(
+        max_length=10,
+        choices=BillingCycle.choices,
+        default=BillingCycle.MONTHLY,
+    )
+    current_period_start = models.DateTimeField(default=timezone.now)
+    current_period_end = models.DateTimeField(null=True, blank=True)
+
+    # 토스페이먼츠 (nullable — 승인 대기)
+    toss_customer_key = models.CharField(max_length=200, null=True, blank=True)
+    toss_billing_key = models.CharField(max_length=200, null=True, blank=True)
+    toss_subscription_id = models.CharField(max_length=200, null=True, blank=True)
+
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "user_subscriptions"
+
+    def __str__(self):
+        return f"{self.user.email} - {self.plan.display_name} ({self.status})"
+
+    @property
+    def is_active(self):
+        return self.status in (SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIALING)
+
+    @property
+    def is_paid_plan(self):
+        return self.plan.name != "free"
+
+
+class PaymentStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    PAID = "paid", "Paid"
+    FAILED = "failed", "Failed"
+    REFUNDED = "refunded", "Refunded"
+
+
+class PaymentHistory(models.Model):
+    """
+    결제 내역. 토스페이먼츠 필드는 nullable — 승인 후 채움.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="payments",
+    )
+    subscription = models.ForeignKey(
+        UserSubscription,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="payments",
+    )
+    amount = models.IntegerField(help_text="결제 금액 (원)")
+    status = models.CharField(
+        max_length=20,
+        choices=PaymentStatus.choices,
+        default=PaymentStatus.PENDING,
+    )
+    payment_method = models.CharField(max_length=50, null=True, blank=True)
+    description = models.CharField(max_length=200, default="")
+
+    # 토스페이먼츠 (nullable — 승인 대기)
+    toss_payment_key = models.CharField(max_length=200, null=True, blank=True)
+    toss_order_id = models.CharField(max_length=200, null=True, blank=True)
+
+    paid_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "payment_history"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.user.email} - {self.amount}원 ({self.status})"

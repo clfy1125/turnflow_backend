@@ -23,7 +23,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.pages.models import Page
+from apps.pages.models import Block, Page
 
 from .models import AiJob
 from .serializers import AiJobCreateSerializer, AiJobListSerializer, AiJobSerializer
@@ -116,6 +116,7 @@ AI가 링크인바이오 페이지 JSON을 생성하는 **비동기 작업**을 
 | 필드 | 필수 | 타입 | 설명 |
 |------|:----:|------|------|
 | `concept` | ✅ | string | 페이지 컨셉 설명 (최대 2000자) |
+| `slug` | ❌ | string | 리메이크할 기존 페이지의 slug. 전달 시 해당 페이지의 블록을 참고하여 AI가 리메이크 |
 | `style` | ❌ | string | 디자인 스타일 힌트 |
 | `reference_text` | ❌ | string | 참고용 텍스트 (브랜드 소개, 상품 목록 등) |
 | `job_type` | ❌ | string | 작업 유형. 기본값 `bio_remake` |
@@ -185,9 +186,19 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
         examples=[
             OpenApiExample(
                 "기본 생성",
-                summary="컨셉만 전달",
+                summary="컨셉만 전달 (새 페이지 생성)",
                 value={
                     "concept": "제품 판매 링크 여러 개 모여있는 랜딩 페이지",
+                },
+                request_only=True,
+            ),
+            OpenApiExample(
+                "기존 페이지 리메이크",
+                summary="slug로 기존 페이지를 AI가 리메이크",
+                value={
+                    "concept": "좀 더 세련되고 모던한 느낌으로 바꿔줘",
+                    "slug": "my-page",
+                    "style": "미니멀, 화이트 베이스, 블루 포인트",
                 },
                 request_only=True,
             ),
@@ -220,16 +231,54 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
                     status=status.HTTP_404_NOT_FOUND,
                 )
 
+        # slug로 기존 페이지 리메이크
+        slug = vd.get("slug", "")
+        existing_blocks_data = None
+        existing_page_meta = None
+        if slug:
+            source_page = Page.objects.filter(slug=slug, user=request.user).first()
+            if not source_page:
+                return Response(
+                    {"detail": f"slug '{slug}'에 해당하는 페이지를 찾을 수 없거나 권한이 없습니다."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            # page를 source_page로 연결 (page_id가 없을 때)
+            if not page:
+                page = source_page
+
+            # 기존 블록을 JSON으로 직렬화
+            blocks = Block.objects.filter(page=source_page).order_by("order")
+            existing_blocks_data = [
+                {
+                    "_type": b.type,
+                    "order": b.order,
+                    "is_enabled": b.is_enabled,
+                    "data": b.data,
+                }
+                for b in blocks
+            ]
+            existing_page_meta = {
+                "title": source_page.title,
+                "is_public": source_page.is_public,
+                "data": source_page.data,
+            }
+
+        # input_payload 구성
+        input_payload = {
+            "concept": vd["concept"],
+            "style": vd.get("style", ""),
+            "reference_text": vd.get("reference_text", ""),
+        }
+        if existing_blocks_data is not None:
+            input_payload["existing_blocks"] = existing_blocks_data
+            input_payload["existing_page_meta"] = existing_page_meta
+
         # AiJob 생성
         job = AiJob.objects.create(
             user=request.user,
             page=page,
             job_type=vd["job_type"],
-            input_payload={
-                "concept": vd["concept"],
-                "style": vd.get("style", ""),
-                "reference_text": vd.get("reference_text", ""),
-            },
+            input_payload=input_payload,
         )
 
         # Celery 태스크 enqueue

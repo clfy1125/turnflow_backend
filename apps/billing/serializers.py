@@ -67,3 +67,85 @@ class UsageCounterSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
+
+
+# ──────────────────────────────────────────────
+# 개인 구독 Serializers
+# ──────────────────────────────────────────────
+
+
+class SubscriptionPlanSerializer(serializers.ModelSerializer):
+    """구독 플랜 목록/상세용"""
+
+    class Meta:
+        model = None  # set below
+        fields = [
+            "id",
+            "name",
+            "display_name",
+            "monthly_price",
+            "yearly_price",
+            "features",
+            "sort_order",
+        ]
+
+
+class UserSubscriptionSerializer(serializers.ModelSerializer):
+    """내 구독 조회용"""
+
+    plan = SubscriptionPlanSerializer(read_only=True)
+    plan_id = serializers.UUIDField(source="plan.id", read_only=True)
+
+    class Meta:
+        model = None  # set below
+        fields = [
+            "id",
+            "plan",
+            "plan_id",
+            "status",
+            "billing_cycle",
+            "current_period_start",
+            "current_period_end",
+            "cancelled_at",
+            "created_at",
+            "updated_at",
+        ]
+
+
+class ChangeSubscriptionRequestSerializer(serializers.Serializer):
+    """플랜 변경 요청용"""
+
+    plan_id = serializers.UUIDField()
+    billing_cycle = serializers.ChoiceField(
+        choices=[("monthly", "Monthly"), ("yearly", "Yearly")],
+        default="monthly",
+    )
+
+
+class PaymentHistorySerializer(serializers.ModelSerializer):
+    """결제 내역 조회용"""
+
+    class Meta:
+        model = None  # set below
+        fields = [
+            "id",
+            "amount",
+            "status",
+            "payment_method",
+            "description",
+            "toss_order_id",
+            "paid_at",
+            "created_at",
+        ]
+
+
+# Avoid circular import: set model references after class definition
+def _patch_serializer_models():
+    from .models import SubscriptionPlan, UserSubscription, PaymentHistory
+
+    SubscriptionPlanSerializer.Meta.model = SubscriptionPlan
+    UserSubscriptionSerializer.Meta.model = UserSubscription
+    PaymentHistorySerializer.Meta.model = PaymentHistory
+
+
+_patch_serializer_models()

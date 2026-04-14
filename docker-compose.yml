@@ -52,6 +52,9 @@ services:
       - META_APP_SECRET=${META_APP_SECRET}
       - INSTAGRAM_REDIRECT_URI=${INSTAGRAM_REDIRECT_URI}
       - INSTAGRAM_MOCK_MODE=${INSTAGRAM_MOCK_MODE:-False}
+      - LLM_URL=${LLM_URL:-}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - PIXABAY_API_KEY=${PIXABAY_API_KEY:-}
     volumes:
       - .:/app
     ports:
@@ -86,6 +89,9 @@ services:
       - INSTAGRAM_REDIRECT_URI=${INSTAGRAM_REDIRECT_URI}
       - INSTAGRAM_MOCK_MODE=${INSTAGRAM_MOCK_MODE:-False}
       - INSTAGRAM_WEBHOOK_VERIFY_TOKEN=${INSTAGRAM_WEBHOOK_VERIFY_TOKEN}
+      - LLM_URL=${LLM_URL:-}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - PIXABAY_API_KEY=${PIXABAY_API_KEY:-}
     volumes:
       - .:/app
     depends_on:
