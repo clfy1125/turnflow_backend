@@ -241,6 +241,30 @@ CELERY_TIMEZONE = TIME_ZONE
 CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutes
 
+# Celery Beat Schedule (정기 결제 관련 배치)
+CELERY_BEAT_SCHEDULE = {
+    "check-missed-payments": {
+        "task": "billing.check_missed_payments",
+        "schedule": 60 * 60 * 24,  # 매일 (cron은 django-celery-beat로 전환 가능)
+        "options": {"queue": "billing"},
+    },
+    "handle-grace-period-expiry": {
+        "task": "billing.handle_grace_period_expiry",
+        "schedule": 60 * 60 * 24,
+        "options": {"queue": "billing"},
+    },
+}
+
+# PayApp 결제 연동
+PAYAPP_USERID = config("PAYAPP_USERID", default="")
+PAYAPP_LINKKEY = config("PAYAPP_LINKKEY", default="")
+PAYAPP_LINKVAL = config("PAYAPP_LINKVAL", default="")
+PAYAPP_API_URL = config("PAYAPP_API_URL", default="https://api.payapp.kr/oapi/apiLoad.html")
+PAYAPP_FEEDBACK_URL = config("PAYAPP_FEEDBACK_URL", default="")
+PAYAPP_FAIL_URL = config("PAYAPP_FAIL_URL", default="")
+PAYAPP_RETURN_URL = config("PAYAPP_RETURN_URL", default="")
+PAYAPP_SHOPNAME = config("PAYAPP_SHOPNAME", default="TurnFlow")
+
 # Logging
 LOGGING = {
     "version": 1,

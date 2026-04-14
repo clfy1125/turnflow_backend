@@ -84,7 +84,6 @@ class SubscriptionPlanSerializer(serializers.ModelSerializer):
             "name",
             "display_name",
             "monthly_price",
-            "yearly_price",
             "features",
             "sort_order",
         ]
@@ -103,7 +102,6 @@ class UserSubscriptionSerializer(serializers.ModelSerializer):
             "plan",
             "plan_id",
             "status",
-            "billing_cycle",
             "current_period_start",
             "current_period_end",
             "cancelled_at",
@@ -116,9 +114,11 @@ class ChangeSubscriptionRequestSerializer(serializers.Serializer):
     """플랜 변경 요청용"""
 
     plan_id = serializers.UUIDField()
-    billing_cycle = serializers.ChoiceField(
-        choices=[("monthly", "Monthly"), ("yearly", "Yearly")],
-        default="monthly",
+    phone_number = serializers.CharField(
+        max_length=20,
+        required=False,
+        default="",
+        help_text="구매자 휴대전화번호 (예: 01012345678). PayApp 정기결제 등록 시 필요.",
     )
 
 
@@ -133,7 +133,9 @@ class PaymentHistorySerializer(serializers.ModelSerializer):
             "status",
             "payment_method",
             "description",
-            "toss_order_id",
+            "payapp_mul_no",
+            "receipt_url",
+            "pay_type_display",
             "paid_at",
             "created_at",
         ]

@@ -175,7 +175,6 @@ class SubscriptionPlan(models.Model):
     name = models.CharField(max_length=30, unique=True)  # free / pro / pro_plus
     display_name = models.CharField(max_length=50)  # 무료 / 프로 / 프로 플러스
     monthly_price = models.IntegerField(default=0, help_text="월 요금 (원)")
-    yearly_price = models.IntegerField(default=0, help_text="연 요금 (원)")
     features = models.JSONField(
         default=dict,
         help_text="기능 제한 설정. 예: {max_pages: 3, ai_generation: false, ...}",
@@ -200,15 +199,10 @@ class SubscriptionStatus(models.TextChoices):
     TRIALING = "trialing", "Trialing"
 
 
-class BillingCycle(models.TextChoices):
-    MONTHLY = "monthly", "Monthly"
-    YEARLY = "yearly", "Yearly"
-
-
 class UserSubscription(models.Model):
     """
     User 1:1 구독 정보.
-    토스페이먼츠 필드는 nullable — 승인 후 연동만 추가하면 됨.
+    PayApp 정기결제(rebill) 연동. 월간 구독만 지원.
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -227,18 +221,25 @@ class UserSubscription(models.Model):
         choices=SubscriptionStatus.choices,
         default=SubscriptionStatus.ACTIVE,
     )
-    billing_cycle = models.CharField(
-        max_length=10,
-        choices=BillingCycle.choices,
-        default=BillingCycle.MONTHLY,
-    )
     current_period_start = models.DateTimeField(default=timezone.now)
     current_period_end = models.DateTimeField(null=True, blank=True)
 
-    # 토스페이먼츠 (nullable — 승인 대기)
-    toss_customer_key = models.CharField(max_length=200, null=True, blank=True)
-    toss_billing_key = models.CharField(max_length=200, null=True, blank=True)
-    toss_subscription_id = models.CharField(max_length=200, null=True, blank=True)
+    # PayApp 정기결제
+    payapp_rebill_no = models.CharField(
+        max_length=100, null=True, blank=True,
+        verbose_name="PayApp 정기결제 등록번호",
+        help_text="rebillRegist 응답의 rebill_no",
+    )
+    payapp_rebill_expire = models.DateField(
+        null=True, blank=True,
+        verbose_name="PayApp 정기결제 만료일",
+        help_text="rebillExpire로 설정한 만료일",
+    )
+    payapp_pay_url = models.URLField(
+        max_length=500, null=True, blank=True,
+        verbose_name="PayApp 결제 URL",
+        help_text="최초 결제 시 프론트가 리다이렉트할 URL",
+    )
 
     cancelled_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -293,9 +294,26 @@ class PaymentHistory(models.Model):
     payment_method = models.CharField(max_length=50, null=True, blank=True)
     description = models.CharField(max_length=200, default="")
 
-    # 토스페이먼츠 (nullable — 승인 대기)
-    toss_payment_key = models.CharField(max_length=200, null=True, blank=True)
-    toss_order_id = models.CharField(max_length=200, null=True, blank=True)
+    # PayApp
+    payapp_mul_no = models.CharField(
+        max_length=100, null=True, blank=True, unique=True,
+        verbose_name="PayApp 결제요청번호",
+        help_text="PayApp mul_no — 멱등 키",
+    )
+    payapp_rebill_no = models.CharField(
+        max_length=100, null=True, blank=True,
+        verbose_name="PayApp 정기결제 등록번호",
+    )
+    receipt_url = models.URLField(
+        max_length=500, null=True, blank=True,
+        verbose_name="매출전표 URL",
+        help_text="PayApp csturl — 카드 결제 시 영수증 URL",
+    )
+    pay_type_display = models.CharField(
+        max_length=50, null=True, blank=True,
+        verbose_name="결제수단 표시명",
+        help_text="예: 신용카드, 휴대전화, 카카오페이 등",
+    )
 
     paid_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -306,6 +324,54 @@ class PaymentHistory(models.Model):
 
     def __str__(self):
         return f"{self.user.email} - {self.amount}원 ({self.status})"
+
+
+# ──────────────────────────────────────────────
+# PayApp 웹훅 로그 (멱등 보장용)
+# ──────────────────────────────────────────────
+
+
+class PayAppWebhookLog(models.Model):
+    """
+    PayApp feedbackurl / failurl 수신 로그.
+    동일 (mul_no, pay_state) 조합에 대해 unique 제약으로 중복 처리 방지.
+    """
+
+    WEBHOOK_TYPES = [
+        ("feedback", "Feedback (결제통보)"),
+        ("fail", "Fail (정기결제 실패)"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    webhook_type = models.CharField(max_length=20, choices=WEBHOOK_TYPES)
+    mul_no = models.CharField(
+        max_length=100, null=True, blank=True, db_index=True,
+        verbose_name="결제요청번호",
+    )
+    rebill_no = models.CharField(
+        max_length=100, null=True, blank=True, db_index=True,
+        verbose_name="정기결제 등록번호",
+    )
+    pay_state = models.CharField(
+        max_length=10,
+        verbose_name="결제요청 상태",
+    )
+    raw_data = models.JSONField(
+        default=dict,
+        verbose_name="수신 데이터 원본",
+    )
+    processed = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "payapp_webhook_logs"
+        unique_together = [["mul_no", "pay_state"]]
+        ordering = ["-created_at"]
+        verbose_name = "PayApp 웹훅 로그"
+        verbose_name_plural = "PayApp 웹훅 로그 목록"
+
+    def __str__(self):
+        return f"[{self.webhook_type}] mul_no={self.mul_no} pay_state={self.pay_state}"
 
 
 # ──────────────────────────────────────────────

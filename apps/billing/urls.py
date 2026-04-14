@@ -12,9 +12,10 @@ from .subscription_views import (
     CancelSubscriptionView,
 )
 from .payment_views import (
-    PaymentConfirmView,
-    PaymentWebhookView,
+    PayAppFeedbackView,
+    PayAppFailView,
     PaymentHistoryView,
+    RefundPaymentView,
 )
 
 app_name = "billing"
@@ -28,8 +29,10 @@ urlpatterns = router.urls + [
     path("billing/my-subscription/", MySubscriptionView.as_view(), name="my-subscription"),
     path("billing/change-plan/", ChangeSubscriptionView.as_view(), name="change-plan"),
     path("billing/cancel/", CancelSubscriptionView.as_view(), name="cancel-subscription"),
-    # 결제 (토스페이먼츠)
-    path("billing/payments/confirm/", PaymentConfirmView.as_view(), name="payment-confirm"),
-    path("billing/payments/webhook/", PaymentWebhookView.as_view(), name="payment-webhook"),
+    # PayApp 웹훅 (PG사 → 백엔드)
+    path("billing/payapp/feedback/", PayAppFeedbackView.as_view(), name="payapp-feedback"),
+    path("billing/payapp/fail/", PayAppFailView.as_view(), name="payapp-fail"),
+    # 결제 내역 / 환불
     path("billing/payments/history/", PaymentHistoryView.as_view(), name="payment-history"),
+    path("billing/payments/<uuid:payment_id>/refund/", RefundPaymentView.as_view(), name="payment-refund"),
 ]

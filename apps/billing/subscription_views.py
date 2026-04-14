@@ -2,6 +2,10 @@
 Subscription API views — 구독 관리
 """
 
+import logging
+from datetime import timedelta
+
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
@@ -15,6 +19,9 @@ from .serializers import (
     ChangeSubscriptionRequestSerializer,
 )
 from .subscription_utils import ensure_subscription
+from .payapp_service import PayAppClient, PayAppError
+
+logger = logging.getLogger(__name__)
 
 
 class SubscriptionPlanListView(APIView):
@@ -40,11 +47,11 @@ class SubscriptionPlanListView(APIView):
 
 ## 플랜 구조
 
-| 플랜 | name | 월 요금 | 연 요금 | 주요 기능 |
-|------|------|---------|---------|-----------|
-| 무료 | `free` | 0원 | 0원 | 페이지 3개 제한 |
-| 프로 | `pro` | 9,900원 | 99,000원 | 무제한 페이지, AI 생성, 로고 삭제 |
-| 프로 플러스 | `pro_plus` | 19,900원 | 199,000원 | 프로 + 커스텀 CSS |
+| 플랜 | name | 월 요금 | 주요 기능 |
+|------|------|---------|-----------||
+| 무료 | `free` | 0원 | 페이지 3개 제한 |
+| 프로 | `pro` | 9,900원 | 무제한 페이지, AI 생성, 로고 삭제 |
+| 프로 플러스 | `pro_plus` | 19,900원 | 프로 + 커스텀 CSS |
 
 ## 응답 필드 설명
 | 필드 | 타입 | 설명 |
@@ -53,7 +60,6 @@ class SubscriptionPlanListView(APIView):
 | `name` | string | 플랜 코드명 (`free` / `pro` / `pro_plus`) |
 | `display_name` | string | UI 표시용 이름 (`무료` / `프로` / `프로 플러스`) |
 | `monthly_price` | int | 월간 요금 (원). 0이면 무료 |
-| `yearly_price` | int | 연간 요금 (원). 0이면 무료 |
 | `features` | object | 기능 제한 설정 (아래 참조) |
 | `sort_order` | int | UI 정렬 순서 (오름차순) |
 
@@ -92,7 +98,6 @@ plans.forEach(plan => {
                                 "name": "free",
                                 "display_name": "무료",
                                 "monthly_price": 0,
-                                "yearly_price": 0,
                                 "features": {"max_pages": 3, "ai_generation": False, "remove_logo": False, "custom_css": False},
                                 "sort_order": 0,
                             },
@@ -101,7 +106,6 @@ plans.forEach(plan => {
                                 "name": "pro",
                                 "display_name": "프로",
                                 "monthly_price": 9900,
-                                "yearly_price": 99000,
                                 "features": {"max_pages": -1, "ai_generation": True, "remove_logo": True, "custom_css": False},
                                 "sort_order": 1,
                             },
@@ -110,7 +114,6 @@ plans.forEach(plan => {
                                 "name": "pro_plus",
                                 "display_name": "프로 플러스",
                                 "monthly_price": 19900,
-                                "yearly_price": 199000,
                                 "features": {"max_pages": -1, "ai_generation": True, "remove_logo": True, "custom_css": True},
                                 "sort_order": 2,
                             },
@@ -159,7 +162,6 @@ class MySubscriptionView(APIView):
 | `plan` | object | 현재 플랜 상세 (SubscriptionPlan 객체) |
 | `plan_id` | uuid | 현재 플랜 ID |
 | `status` | string | `active` / `cancelled` / `past_due` / `trialing` |
-| `billing_cycle` | string | `monthly` / `yearly` |
 | `current_period_start` | datetime | 현재 결제 주기 시작일 (ISO 8601) |
 | `current_period_end` | datetime | 현재 결제 주기 종료일 (ISO 8601). null이면 무기한 |
 | `cancelled_at` | datetime | 취소 시각. null이면 취소하지 않음 |
@@ -213,13 +215,11 @@ if (subscription.status === 'cancelled') {
                                 "name": "free",
                                 "display_name": "무료",
                                 "monthly_price": 0,
-                                "yearly_price": 0,
                                 "features": {"max_pages": 3, "ai_generation": False, "remove_logo": False, "custom_css": False},
                                 "sort_order": 0,
                             },
                             "plan_id": "550e8400-e29b-41d4-a716-446655440001",
                             "status": "active",
-                            "billing_cycle": "monthly",
                             "current_period_start": "2026-04-01T00:00:00Z",
                             "current_period_end": None,
                             "cancelled_at": None,
@@ -236,13 +236,11 @@ if (subscription.status === 'cancelled') {
                                 "name": "pro",
                                 "display_name": "프로",
                                 "monthly_price": 9900,
-                                "yearly_price": 99000,
                                 "features": {"max_pages": -1, "ai_generation": True, "remove_logo": True, "custom_css": False},
                                 "sort_order": 1,
                             },
                             "plan_id": "550e8400-e29b-41d4-a716-446655440002",
                             "status": "active",
-                            "billing_cycle": "monthly",
                             "current_period_start": "2026-04-01T00:00:00Z",
                             "current_period_end": "2026-05-01T00:00:00Z",
                             "cancelled_at": None,
@@ -285,30 +283,33 @@ class ChangeSubscriptionView(APIView):
 | 필드 | 필수 | 타입 | 설명 |
 |------|------|------|------|
 | `plan_id` | ✅ | uuid | 변경할 플랜의 ID. `GET /api/v1/billing/plans/`에서 확인 |
-| `billing_cycle` | 선택 | string | `monthly`(기본) 또는 `yearly` |
+| `phone_number` | 선택 | string | 구매자 휴대전화번호 (예: 01012345678). PayApp 정기결제 등록 시 사용 |
 
 ## 플랜 변경 시나리오별 동작
 
 ### 유료 → 무료 (다운그레이드)
 - **즉시 처리**: `status`가 `cancelled`로 변경됨
 - `current_period_end`까지 기존 유료 기능 **계속 사용 가능**
+- 정기결제가 등록된 경우 PayApp 정기결제도 자동 해지
 - 프론트에서 "○월 ○일까지 프로 기능을 사용할 수 있습니다" 안내 권장
 
-### 무료 → 유료 (업그레이드) ⚠️ 현재 미구현
-- **토스페이먼츠 연동 전**: `402 Payment Required` 응답
-- 응답에 `payment_required: true`와 선택한 플랜 정보가 포함됨
-- 토스 연동 완료 후 결제 → 플랜 변경 자동 처리 예정
+### 무료 → 유료 / 유료 → 유료 (업그레이드)
+- PayApp 정기결제(`rebillRegist`)가 생성됨 — 매월 자동결제
+- 응답에 `pay_url`이 포함됨 → **프론트에서 이 URL로 리다이렉트**
+- 사용자가 결제를 완료하면 feedbackurl 웹훅으로 자동 처리됨
 
-### 유료 → 유료 (플랜 변경) ⚠️ 현재 미구현
-- 동일하게 `402 Payment Required` 응답
+## 결제 흐름 (업그레이드)
+```
+1. POST /change-plan/ → 응답에 pay_url 포함
+2. 프론트: pay_url로 리다이렉트 (또는 새 창 열기)
+3. 사용자: PayApp 결제 페이지에서 결제 완료
+4. PayApp → 백엔드 feedbackurl 웹훅 호출
+5. 백엔드: 구독 활성화 + 토큰 부여 자동 처리
+6. 프론트: 구독 상태 재조회로 결과 확인
+```
 
 ## 프론트엔드 통합
 ```typescript
-// 1) 플랜 목록에서 원하는 플랜 ID 확인
-const plans = await fetch('/api/v1/billing/plans/').then(r => r.json());
-const proPlan = plans.find(p => p.name === 'pro');
-
-// 2) 플랜 변경 요청
 const res = await fetch('/api/v1/billing/change-plan/', {
   method: 'POST',
   headers: {
@@ -317,38 +318,34 @@ const res = await fetch('/api/v1/billing/change-plan/', {
   },
   body: JSON.stringify({
     plan_id: proPlan.id,
-    billing_cycle: 'monthly'
+    phone_number: '01012345678'  // 선택
   })
 });
 
-if (res.status === 402) {
-  // 결제가 필요한 경우 → 결제 페이지로 이동
-  const data = await res.json();
-  console.log('결제 필요:', data.plan.display_name, data.billing_cycle);
-  // → 토스 결제 위젯 호출
-}
+const data = await res.json();
 
-if (res.status === 200) {
+if (data.pay_url) {
+  // 결제 필요 → PayApp 결제 페이지로 이동
+  window.location.href = data.pay_url;
+} else {
   // 다운그레이드 완료
-  const subscription = await res.json();
-  console.log('변경 완료:', subscription.status);
+  console.log('변경 완료:', data.status);
 }
 ```
 
 ## 에러
-| 코드 | 원인 | 응답 예시 |
-|------|------|-----------|
-| 400 | 동일 플랜으로 변경 시도 | `{"detail": "이미 동일한 플랜을 사용 중입니다."}` |
-| 400 | 유효성 검증 실패 | `{"plan_id": ["This field is required."]}` |
-| 401 | 토큰 없음/만료 | — |
-| 402 | 결제 필요 (유료 전환) | `{"payment_required": true, "plan": {...}, "billing_cycle": "monthly"}` |
-| 404 | 존재하지 않거나 비활성 플랜 | `{"detail": "플랜을 찾을 수 없습니다."}` |
+| 코드 | 원인 |
+|------|------|
+| 400 | 동일 플랜으로 변경 시도 / 유효성 검증 실패 |
+| 401 | 토큰 없음/만료 |
+| 404 | 존재하지 않거나 비활성 플랜 |
+| 502 | PayApp API 호출 실패 |
         """,
         request=ChangeSubscriptionRequestSerializer,
         responses={
             200: OpenApiResponse(
                 response=UserSubscriptionSerializer,
-                description="다운그레이드 성공 (유료 → 무료)",
+                description="다운그레이드 성공 (유료 → 무료) 또는 결제 URL 포함 응답",
                 examples=[
                     OpenApiExample(
                         "다운그레이드 성공",
@@ -356,37 +353,24 @@ if (res.status === 200) {
                             "id": "a1b2c3d4-0000-0000-0000-000000000002",
                             "plan": {"id": "550e8400-...", "name": "pro", "display_name": "프로"},
                             "status": "cancelled",
-                            "billing_cycle": "monthly",
                             "current_period_end": "2026-05-01T00:00:00Z",
                             "cancelled_at": "2026-04-13T12:00:00Z",
                         },
-                    )
+                    ),
+                    OpenApiExample(
+                        "결제 필요 (업그레이드)",
+                        value={
+                            "detail": "결제 페이지로 이동해주세요.",
+                            "pay_url": "https://www.payapp.kr/oapi/pay/...",
+                            "plan": {"id": "550e8400-...", "name": "pro", "display_name": "프로"},
+                        },
+                    ),
                 ],
             ),
             400: OpenApiResponse(description="동일 플랜 변경 시도 / 유효성 검증 실패"),
             401: OpenApiResponse(description="인증 실패"),
-            402: OpenApiResponse(
-                description="결제 필요 — 토스페이먼츠 연동 후 사용 가능",
-                examples=[
-                    OpenApiExample(
-                        "결제 필요 응답",
-                        value={
-                            "detail": "결제가 필요합니다. 토스페이먼츠 연동 후 사용 가능합니다.",
-                            "payment_required": True,
-                            "plan": {
-                                "id": "550e8400-e29b-41d4-a716-446655440002",
-                                "name": "pro",
-                                "display_name": "프로",
-                                "monthly_price": 9900,
-                                "yearly_price": 99000,
-                                "features": {"max_pages": -1, "ai_generation": True, "remove_logo": True, "custom_css": False},
-                            },
-                            "billing_cycle": "monthly",
-                        },
-                    )
-                ],
-            ),
             404: OpenApiResponse(description="플랜을 찾을 수 없음"),
+            502: OpenApiResponse(description="PayApp API 오류"),
         },
     )
     def post(self, request):
@@ -394,7 +378,6 @@ if (res.status === 200) {
         serializer.is_valid(raise_exception=True)
 
         plan_id = serializer.validated_data["plan_id"]
-        billing_cycle = serializer.validated_data.get("billing_cycle", "monthly")
 
         try:
             new_plan = SubscriptionPlan.objects.get(id=plan_id, is_active=True)
@@ -413,27 +396,77 @@ if (res.status === 200) {
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # 유료 → Free 다운그레이드
+        # ── 유료 → Free 다운그레이드 ──
         if new_plan.name == "free":
-            sub.status = SubscriptionStatus.CANCELLED
-            from django.utils import timezone
+            # 기존 정기결제 해지
+            if sub.payapp_rebill_no:
+                try:
+                    PayAppClient.cancel_rebill(sub.payapp_rebill_no)
+                except PayAppError:
+                    logger.warning(
+                        "PayApp 정기결제 해지 실패: rebill_no=%s", sub.payapp_rebill_no
+                    )
 
+            sub.status = SubscriptionStatus.CANCELLED
             sub.cancelled_at = timezone.now()
-            # current_period_end까지 기존 기능 유지 (프론트에서 안내)
             sub.save(update_fields=["status", "cancelled_at", "updated_at"])
             return Response(UserSubscriptionSerializer(sub).data)
 
-        # Free → 유료 or 유료 → 유료 (토스 연동 전)
-        # 토스페이먼츠 승인 후 이 부분에 결제 로직 추가
-        return Response(
-            {
-                "detail": "결제가 필요합니다. 토스페이먼츠 연동 후 사용 가능합니다.",
-                "payment_required": True,
-                "plan": SubscriptionPlanSerializer(new_plan).data,
-                "billing_cycle": billing_cycle,
-            },
-            status=status.HTTP_402_PAYMENT_REQUIRED,
-        )
+        # ── Free → 유료 / 유료 → 유료 (업그레이드) ──
+        # PayApp 문서: "금액 변경 시 기존 정기결제 취소 후 새로 등록"
+        if sub.payapp_rebill_no and sub.is_paid_plan:
+            try:
+                PayAppClient.cancel_rebill(sub.payapp_rebill_no)
+                logger.info(
+                    "기존 정기결제 해지 완료: rebill_no=%s (플랜 업그레이드)",
+                    sub.payapp_rebill_no,
+                )
+            except PayAppError as e:
+                logger.warning(
+                    "기존 정기결제 해지 실패: rebill_no=%s err=%s",
+                    sub.payapp_rebill_no, e,
+                )
+
+        price = new_plan.monthly_price
+        goodname = f"턴플로우 {new_plan.display_name} 월간 구독"
+        recvphone = serializer.validated_data.get("phone_number", "")
+
+        try:
+            cycle_day = timezone.now().day
+            expire_date = (timezone.now() + timedelta(days=365 * 3)).strftime(
+                "%Y-%m-%d"
+            )
+            result = PayAppClient.create_rebill(
+                goodname=goodname,
+                goodprice=price,
+                recvphone=recvphone,
+                cycle_day=cycle_day,
+                rebill_expire=expire_date,
+                var1=str(sub.id),
+                var2=new_plan.name,
+            )
+            pay_url = result.get("payurl", "")
+            rebill_no = result.get("rebill_no", "")
+
+            # 플랜은 변경하지 않음! 결제 완료 후 webhook에서 반영
+            sub.payapp_rebill_no = rebill_no or sub.payapp_rebill_no
+            sub.payapp_pay_url = pay_url
+            sub.save(update_fields=[
+                "payapp_rebill_no", "payapp_pay_url", "updated_at",
+            ])
+
+        except PayAppError as e:
+            logger.error("PayApp 결제 요청 실패: %s", e)
+            return Response(
+                {"detail": f"결제 요청 실패: {e}"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        return Response({
+            "detail": "결제 페이지로 이동해주세요.",
+            "pay_url": pay_url,
+            "plan": SubscriptionPlanSerializer(new_plan).data,
+        })
 
 
 class CancelSubscriptionView(APIView):
@@ -498,7 +531,6 @@ if (res.ok) {
                             "id": "a1b2c3d4-0000-0000-0000-000000000002",
                             "plan": {"id": "550e8400-...", "name": "pro", "display_name": "프로"},
                             "status": "cancelled",
-                            "billing_cycle": "monthly",
                             "current_period_end": "2026-05-01T00:00:00Z",
                             "cancelled_at": "2026-04-13T12:00:00Z",
                         },
@@ -530,7 +562,14 @@ if (res.ok) {
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        from django.utils import timezone
+        # PayApp 정기결제 해지
+        if sub.payapp_rebill_no:
+            try:
+                PayAppClient.cancel_rebill(sub.payapp_rebill_no)
+            except PayAppError:
+                logger.warning(
+                    "PayApp 정기결제 해지 실패: rebill_no=%s", sub.payapp_rebill_no
+                )
 
         sub.status = SubscriptionStatus.CANCELLED
         sub.cancelled_at = timezone.now()

@@ -1,5 +1,8 @@
 from django.contrib import admin
-from .models import UsageCounter, SubscriptionPlan, UserSubscription, PaymentHistory, AiTokenBalance, AiTokenLedger
+from .models import (
+    UsageCounter, SubscriptionPlan, UserSubscription, PaymentHistory,
+    AiTokenBalance, AiTokenLedger, PayAppWebhookLog,
+)
 
 
 @admin.register(UsageCounter)
@@ -13,7 +16,7 @@ class UsageCounterAdmin(admin.ModelAdmin):
 
 @admin.register(SubscriptionPlan)
 class SubscriptionPlanAdmin(admin.ModelAdmin):
-    list_display = ["display_name", "name", "monthly_price", "yearly_price", "is_active", "sort_order"]
+    list_display = ["display_name", "name", "monthly_price", "is_active", "sort_order"]
     list_filter = ["is_active"]
     search_fields = ["name", "display_name"]
     readonly_fields = ["id", "created_at", "updated_at"]
@@ -22,18 +25,18 @@ class SubscriptionPlanAdmin(admin.ModelAdmin):
 
 @admin.register(UserSubscription)
 class UserSubscriptionAdmin(admin.ModelAdmin):
-    list_display = ["user", "plan", "status", "billing_cycle", "current_period_start", "current_period_end"]
-    list_filter = ["status", "billing_cycle", "plan"]
-    search_fields = ["user__email"]
+    list_display = ["user", "plan", "status", "payapp_rebill_no", "current_period_start", "current_period_end"]
+    list_filter = ["status", "plan"]
+    search_fields = ["user__email", "payapp_rebill_no"]
     readonly_fields = ["id", "created_at", "updated_at"]
     raw_id_fields = ["user", "plan"]
 
 
 @admin.register(PaymentHistory)
 class PaymentHistoryAdmin(admin.ModelAdmin):
-    list_display = ["user", "amount", "status", "payment_method", "paid_at", "created_at"]
+    list_display = ["user", "amount", "status", "payment_method", "payapp_mul_no", "paid_at", "created_at"]
     list_filter = ["status", "payment_method"]
-    search_fields = ["user__email", "toss_order_id"]
+    search_fields = ["user__email", "payapp_mul_no", "payapp_rebill_no"]
     readonly_fields = ["id", "created_at"]
     raw_id_fields = ["user", "subscription"]
 
@@ -53,3 +56,12 @@ class AiTokenLedgerAdmin(admin.ModelAdmin):
     search_fields = ["user__email", "description"]
     readonly_fields = ["id", "created_at"]
     raw_id_fields = ["user"]
+
+
+@admin.register(PayAppWebhookLog)
+class PayAppWebhookLogAdmin(admin.ModelAdmin):
+    list_display = ["webhook_type", "mul_no", "rebill_no", "pay_state", "processed", "created_at"]
+    list_filter = ["webhook_type", "processed", "pay_state"]
+    search_fields = ["mul_no", "rebill_no"]
+    readonly_fields = ["id", "raw_data", "created_at"]
+    ordering = ["-created_at"]
