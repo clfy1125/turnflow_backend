@@ -95,8 +95,8 @@ def build_prompts(
         job_type: 작업 유형 (bio_remake 등)
         user_input: 프론트에서 받은 사용자 입력
             - concept: 페이지 컨셉 설명
-            - style: 원하는 스타일 (optional)
-            - reference_text: 참고 텍스트 (optional)
+            - existing_blocks: 기존 페이지 블록 (optional, 리메이크 시)
+            - existing_page_meta: 기존 페이지 메타 (optional, 리메이크 시)
     """
     # 1) System prompt — 기존 페이지 리메이크인지 여부에 따라 분기
     existing_blocks = user_input.get("existing_blocks")
@@ -120,20 +120,12 @@ def build_prompts(
 
     # 4) 사용자 입력 조합
     concept = user_input.get("concept", "")
-    style = user_input.get("style", "")
-    reference = user_input.get("reference_text", "")
 
     user_parts = [
         "### [목표]",
         concept if concept else "링크인바이오 페이지를 만들어줘.",
         "",
     ]
-
-    if style:
-        user_parts += [f"### [스타일]\n{style}", ""]
-
-    if reference:
-        user_parts += [f"### [참고 자료]\n{reference}", ""]
 
     # 기존 페이지 리메이크 시 현재 블록 구조 포함
     if is_remake:

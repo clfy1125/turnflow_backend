@@ -117,10 +117,7 @@ AI가 링크인바이오 페이지 JSON을 생성하는 **비동기 작업**을 
 |------|:----:|------|------|
 | `concept` | ✅ | string | 페이지 컨셉 설명 (최대 2000자) |
 | `slug` | ❌ | string | 리메이크할 기존 페이지의 slug. 전달 시 해당 페이지의 블록을 참고하여 AI가 리메이크 |
-| `style` | ❌ | string | 디자인 스타일 힌트 |
-| `reference_text` | ❌ | string | 참고용 텍스트 (브랜드 소개, 상품 목록 등) |
-| `job_type` | ❌ | string | 작업 유형. 기본값 `bio_remake` |
-| `page_id` | ❌ | int | 결과를 적용할 Page ID (선택) |
+
 
 ## 비동기 처리 흐름
 ```
@@ -151,9 +148,9 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
 ## 에러
 | 코드 | 원인 |
 |------|------|
-| 400 | concept 누락, page_id 유효하지 않음 |
+| 400 | concept 누락 |
 | 401 | 인증 실패 |
-| 404 | page_id에 해당하는 페이지 없음 또는 권한 없음 |
+| 404 | slug에 해당하는 페이지 없음 또는 권한 없음 |
         """,
         request=AiJobCreateSerializer,
         responses={
@@ -181,7 +178,7 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
                 ],
             ),
             400: OpenApiResponse(description="유효성 검증 실패"),
-            404: OpenApiResponse(description="page_id에 해당하는 페이지 없음"),
+            404: OpenApiResponse(description="slug에 해당하는 페이지 없음"),
         },
         examples=[
             OpenApiExample(
@@ -198,18 +195,6 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
                 value={
                     "concept": "좀 더 세련되고 모던한 느낌으로 바꿔줘",
                     "slug": "my-page",
-                    "style": "미니멀, 화이트 베이스, 블루 포인트",
-                },
-                request_only=True,
-            ),
-            OpenApiExample(
-                "스타일 + 참고 텍스트",
-                summary="상세 요청",
-                value={
-                    "concept": "인디 밴드 프로필 페이지",
-                    "style": "다크 모드, 그런지 느낌, 빨간 포인트",
-                    "reference_text": "밴드명: BLACK NOISE\n서울 기반 얼터너티브 록\n신보 BLACKOUT 발매",
-                    "page_id": 3,
                 },
                 request_only=True,
             ),
@@ -220,18 +205,8 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
         ser.is_valid(raise_exception=True)
         vd = ser.validated_data
 
-        # page_id 검증
-        page = None
-        page_id = vd.get("page_id")
-        if page_id:
-            page = Page.objects.filter(pk=page_id, user=request.user).first()
-            if not page:
-                return Response(
-                    {"detail": "페이지를 찾을 수 없거나 권한이 없습니다."},
-                    status=status.HTTP_404_NOT_FOUND,
-                )
-
         # slug로 기존 페이지 리메이크
+        page = None
         slug = vd.get("slug", "")
         existing_blocks_data = None
         existing_page_meta = None
@@ -242,9 +217,7 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
                     {"detail": f"slug '{slug}'에 해당하는 페이지를 찾을 수 없거나 권한이 없습니다."},
                     status=status.HTTP_404_NOT_FOUND,
                 )
-            # page를 source_page로 연결 (page_id가 없을 때)
-            if not page:
-                page = source_page
+            page = source_page
 
             # 기존 블록을 JSON으로 직렬화
             blocks = Block.objects.filter(page=source_page).order_by("order")
@@ -266,8 +239,6 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
         # input_payload 구성
         input_payload = {
             "concept": vd["concept"],
-            "style": vd.get("style", ""),
-            "reference_text": vd.get("reference_text", ""),
         }
         if existing_blocks_data is not None:
             input_payload["existing_blocks"] = existing_blocks_data
@@ -277,7 +248,7 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
         job = AiJob.objects.create(
             user=request.user,
             page=page,
-            job_type=vd["job_type"],
+            job_type=AiJob.JobType.BIO_REMAKE,
             input_payload=input_payload,
         )
 
