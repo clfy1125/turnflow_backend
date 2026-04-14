@@ -52,7 +52,7 @@ def run_ai_job(self, job_id: str):
         # ── 1. 프롬프트 준비 ────────────────────────
         job.set_stage(AiJob.Stage.PREPARING_PROMPT, 10, "프롬프트를 구성하고 있습니다.")
 
-        model_name = resolve_model(job.job_type, job.model_tier)
+        model_name = resolve_model(job.job_type)
         job.model_name = model_name
         job.save(update_fields=["model_name", "updated_at"])
 
@@ -92,21 +92,20 @@ def run_ai_job(self, job_id: str):
         job.save()
 
         # 성공 시에만 토큰 차감
-        if job.token_cost > 0:
-            from apps.billing.models import AiTokenBalance
-            from django.db import transaction
+        from apps.billing.models import AiTokenBalance
+        from django.db import transaction
 
-            try:
-                with transaction.atomic():
-                    token_balance = AiTokenBalance.objects.select_for_update().get(
-                        user=job.user,
-                    )
-                    token_balance.deduct(
-                        job.token_cost,
-                        description=f"AI 작업 완료 ({job.model_tier} / {job.id})",
-                    )
-            except (AiTokenBalance.DoesNotExist, ValueError) as e:
-                logger.warning("토큰 차감 실패 (작업은 성공): %s - %s", job_id, e)
+        try:
+            with transaction.atomic():
+                token_balance = AiTokenBalance.objects.select_for_update().get(
+                    user=job.user,
+                )
+                token_balance.deduct(
+                    AiJob.TOKEN_COST,
+                    description=f"AI 페이지 생성 ({job.id})",
+                )
+        except (AiTokenBalance.DoesNotExist, ValueError) as e:
+            logger.warning("토큰 차감 실패 (작업은 성공): %s - %s", job_id, e)
 
         logger.info("AiJob 완료: %s", job_id)
 

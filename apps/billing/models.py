@@ -391,17 +391,17 @@ class AiTokenBalance(models.Model):
 
     @classmethod
     def get_or_create_for_user(cls, user):
-        """유저의 토큰 잔액 가져오기. 없으면 생성 (초기 30 토큰 지급)."""
+        """유저의 토큰 잔액 가져오기. 없으면 생성 (초기 3 토큰 지급 - free 플랜)."""
         obj, created = cls.objects.get_or_create(
             user=user,
-            defaults={"balance": 30},
+            defaults={"balance": 3},
         )
         if created:
             AiTokenLedger.objects.create(
                 user=user,
-                amount=30,
-                balance_after=30,
-                description="신규 가입 토큰 지급",
+                amount=3,
+                balance_after=3,
+                description="신규 가입 토큰 지급 (free 플랜)",
             )
         return obj
 
