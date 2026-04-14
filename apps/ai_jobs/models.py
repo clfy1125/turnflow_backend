@@ -12,6 +12,18 @@ class AiJob(models.Model):
         THEME_GENERATION = "theme_generation", "테마 생성"
         COPY_GENERATION = "copy_generation", "카피 생성"
 
+    class ModelTier(models.TextChoices):
+        BASIC = "basic", "기본 모델"
+        PRO = "pro", "프로 모델"
+        PRO_PLUS = "pro_plus", "프로 플러스 모델"
+
+    # 모델 티어별 토큰 비용
+    TOKEN_COST_MAP = {
+        ModelTier.BASIC: 3,
+        ModelTier.PRO: 100,
+        ModelTier.PRO_PLUS: 500,
+    }
+
     class Status(models.TextChoices):
         QUEUED = "queued", "대기"
         RUNNING = "running", "진행 중"
@@ -46,6 +58,17 @@ class AiJob(models.Model):
         choices=JobType.choices,
         default=JobType.BIO_REMAKE,
         verbose_name="작업 유형",
+    )
+    model_tier = models.CharField(
+        max_length=20,
+        choices=ModelTier.choices,
+        default=ModelTier.BASIC,
+        verbose_name="모델 티어",
+    )
+    token_cost = models.PositiveIntegerField(
+        default=0,
+        verbose_name="토큰 비용",
+        help_text="이 작업에 소모되는 토큰 수 (성공 시에만 차감)",
     )
     status = models.CharField(
         max_length=20,

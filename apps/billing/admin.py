@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import UsageCounter, SubscriptionPlan, UserSubscription, PaymentHistory
+from .models import UsageCounter, SubscriptionPlan, UserSubscription, PaymentHistory, AiTokenBalance, AiTokenLedger
 
 
 @admin.register(UsageCounter)
@@ -36,3 +36,20 @@ class PaymentHistoryAdmin(admin.ModelAdmin):
     search_fields = ["user__email", "toss_order_id"]
     readonly_fields = ["id", "created_at"]
     raw_id_fields = ["user", "subscription"]
+
+
+@admin.register(AiTokenBalance)
+class AiTokenBalanceAdmin(admin.ModelAdmin):
+    list_display = ["user", "balance", "total_used", "updated_at"]
+    search_fields = ["user__email"]
+    readonly_fields = ["id", "updated_at"]
+    raw_id_fields = ["user"]
+
+
+@admin.register(AiTokenLedger)
+class AiTokenLedgerAdmin(admin.ModelAdmin):
+    list_display = ["user", "amount", "balance_after", "description", "created_at"]
+    list_filter = ["created_at"]
+    search_fields = ["user__email", "description"]
+    readonly_fields = ["id", "created_at"]
+    raw_id_fields = ["user"]

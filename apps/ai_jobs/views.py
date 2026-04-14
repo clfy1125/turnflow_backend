@@ -23,6 +23,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.billing.models import AiTokenBalance
 from apps.pages.models import Block, Page
 
 from .models import AiJob
@@ -117,7 +118,12 @@ AI가 링크인바이오 페이지 JSON을 생성하는 **비동기 작업**을 
 |------|:----:|------|------|
 | `concept` | ✅ | string | 페이지 컨셉 설명 (최대 2000자) |
 | `slug` | ❌ | string | 리메이크할 기존 페이지의 slug. 전달 시 해당 페이지의 블록을 참고하여 AI가 리메이크 |
+| `model` | ❌ | string | AI 모델 티어. `basic`(3토큰), `pro`(100토큰, 개발중), `pro_plus`(500토큰, 개발중). 기본값 `basic` |
 
+## 토큰 시스템
+- 작업 생성 시 토큰 잔액을 확인합니다. 부족하면 `402` 에러.
+- 토큰은 **작업 성공 시에만** 차감됩니다. 실패 시 차감되지 않습니다.
+- 신규 가입 시 30 토큰이 지급됩니다.
 
 ## 비동기 처리 흐름
 ```
@@ -205,6 +211,30 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
         ser.is_valid(raise_exception=True)
         vd = ser.validated_data
 
+        # 모델 티어 + 토큰 비용 계산
+        model_tier = vd.get("model", AiJob.ModelTier.BASIC)
+
+        # pro / pro_plus 는 개발 중
+        if model_tier in (AiJob.ModelTier.PRO, AiJob.ModelTier.PRO_PLUS):
+            return Response(
+                {"detail": f"{AiJob.ModelTier(model_tier).label} 모델은 현재 개발 중입니다. 기본 모델을 사용해주세요."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        token_cost = AiJob.TOKEN_COST_MAP.get(model_tier, 3)
+
+        # 토큰 잔액 확인
+        token_balance = AiTokenBalance.get_or_create_for_user(request.user)
+        if not token_balance.has_enough(token_cost):
+            return Response(
+                {
+                    "detail": "AI 토큰이 부족합니다.",
+                    "token_balance": token_balance.balance,
+                    "token_cost": token_cost,
+                },
+                status=status.HTTP_402_PAYMENT_REQUIRED,
+            )
+
         # slug로 기존 페이지 리메이크
         page = None
         slug = vd.get("slug", "")
@@ -249,6 +279,8 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
             user=request.user,
             page=page,
             job_type=AiJob.JobType.BIO_REMAKE,
+            model_tier=model_tier,
+            token_cost=token_cost,
             input_payload=input_payload,
         )
 
@@ -409,3 +441,55 @@ const pollJob = async (jobId: string) => {
                 status=status.HTTP_404_NOT_FOUND,
             )
         return Response(AiJobSerializer(job).data)
+
+
+class AiTokenBalanceView(APIView):
+    """GET  /api/v1/ai/tokens/"""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=[_TAG],
+        summary="내 AI 토큰 잔액 조회",
+        description="""
+## 개요
+현재 로그인한 사용자의 AI 토큰 잔액과 모델별 비용 정보를 반환합니다.
+
+## 응답 필드
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `balance` | int | 현재 토큰 잔액 |
+| `total_used` | int | 총 사용한 토큰 수 |
+| `models` | object | 모델별 티어 정보 (이름, 토큰 비용, 사용 가능 여부) |
+        """,
+        responses={
+            200: OpenApiResponse(
+                description="토큰 잔액",
+                examples=[
+                    OpenApiExample(
+                        "토큰 잔액",
+                        value={
+                            "balance": 27,
+                            "total_used": 3,
+                            "models": {
+                                "basic": {"name": "기본 모델", "cost": 3, "available": True},
+                                "pro": {"name": "프로 모델", "cost": 100, "available": False, "reason": "개발 중"},
+                                "pro_plus": {"name": "프로 플러스 모델", "cost": 500, "available": False, "reason": "개발 중"},
+                            },
+                        },
+                    )
+                ],
+            ),
+        },
+    )
+    def get(self, request):
+        token_balance = AiTokenBalance.get_or_create_for_user(request.user)
+        return Response({
+            "balance": token_balance.balance,
+            "total_used": token_balance.total_used,
+            "models": {
+                "basic": {"name": "기본 모델", "cost": 3, "available": True},
+                "pro": {"name": "프로 모델", "cost": 100, "available": False, "reason": "개발 중"},
+                "pro_plus": {"name": "프로 플러스 모델", "cost": 500, "available": False, "reason": "개발 중"},
+            },
+        })

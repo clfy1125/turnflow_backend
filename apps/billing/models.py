@@ -306,3 +306,140 @@ class PaymentHistory(models.Model):
 
     def __str__(self):
         return f"{self.user.email} - {self.amount}원 ({self.status})"
+
+
+# ──────────────────────────────────────────────
+# AI 토큰 잔액 (AI Token Balance)
+# ──────────────────────────────────────────────
+
+
+class AiTokenBalance(models.Model):
+    """
+    사용자별 AI 토큰 잔액.
+    정기구독 갱신 시 월 토큰이 리셋되고, AI 작업 성공 시 차감된다.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="ai_token_balance",
+    )
+    balance = models.IntegerField(
+        default=0,
+        verbose_name="토큰 잔액",
+        help_text="현재 사용 가능한 AI 토큰 수",
+    )
+    total_used = models.IntegerField(
+        default=0,
+        verbose_name="총 사용량",
+        help_text="서비스 가입 이후 총 사용한 토큰 수",
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "ai_token_balances"
+        verbose_name = "AI 토큰 잔액"
+        verbose_name_plural = "AI 토큰 잔액 목록"
+
+    def __str__(self):
+        return f"{self.user.email} - 잔액: {self.balance}"
+
+    def has_enough(self, cost: int) -> bool:
+        """토큰이 충분한지 확인."""
+        return self.balance >= cost
+
+    def deduct(self, cost: int, description: str = "") -> "AiTokenLedger":
+        """
+        토큰 차감.  balance가 부족하면 ValueError.
+        원자적으로 처리하기 위해 select_for_update()와 함께 사용 권장.
+        """
+        if self.balance < cost:
+            raise ValueError(f"토큰 부족: 잔액 {self.balance}, 필요 {cost}")
+        self.balance -= cost
+        self.total_used += cost
+        self.save(update_fields=["balance", "total_used", "updated_at"])
+        return AiTokenLedger.objects.create(
+            user=self.user,
+            amount=-cost,
+            balance_after=self.balance,
+            description=description,
+        )
+
+    def grant(self, amount: int, description: str = "") -> "AiTokenLedger":
+        """토큰 지급 (구독 갱신, 수동 지급 등)."""
+        self.balance += amount
+        self.save(update_fields=["balance", "updated_at"])
+        return AiTokenLedger.objects.create(
+            user=self.user,
+            amount=amount,
+            balance_after=self.balance,
+            description=description,
+        )
+
+    def reset_to(self, amount: int, description: str = "") -> "AiTokenLedger":
+        """구독 갱신 시 월 토큰으로 리셋."""
+        old_balance = self.balance
+        self.balance = amount
+        self.save(update_fields=["balance", "updated_at"])
+        return AiTokenLedger.objects.create(
+            user=self.user,
+            amount=amount - old_balance,
+            balance_after=self.balance,
+            description=description,
+        )
+
+    @classmethod
+    def get_or_create_for_user(cls, user):
+        """유저의 토큰 잔액 가져오기. 없으면 생성 (초기 30 토큰 지급)."""
+        obj, created = cls.objects.get_or_create(
+            user=user,
+            defaults={"balance": 30},
+        )
+        if created:
+            AiTokenLedger.objects.create(
+                user=user,
+                amount=30,
+                balance_after=30,
+                description="신규 가입 토큰 지급",
+            )
+        return obj
+
+
+class AiTokenLedger(models.Model):
+    """
+    AI 토큰 사용/충전 내역.
+    amount > 0: 충전 (구독 갱신, 수동 지급 등)
+    amount < 0: 차감 (AI 작업 성공)
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="ai_token_ledger",
+    )
+    amount = models.IntegerField(
+        verbose_name="변동량",
+        help_text="양수=충전, 음수=차감",
+    )
+    balance_after = models.IntegerField(
+        verbose_name="변동 후 잔액",
+    )
+    description = models.CharField(
+        max_length=200,
+        blank=True,
+        default="",
+        verbose_name="설명",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "ai_token_ledger"
+        ordering = ["-created_at"]
+        verbose_name = "AI 토큰 내역"
+        verbose_name_plural = "AI 토큰 내역 목록"
+
+    def __str__(self):
+        sign = "+" if self.amount > 0 else ""
+        return f"{self.user.email} {sign}{self.amount} → {self.balance_after}"

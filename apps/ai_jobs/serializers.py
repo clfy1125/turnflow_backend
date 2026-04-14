@@ -17,6 +17,11 @@ class AiJobCreateSerializer(serializers.Serializer):
         max_length=2000,
         help_text="페이지 컨셉 설명. 예: '제품 판매 랜딩 페이지', '밴드 프로필 페이지'",
     )
+    model = serializers.ChoiceField(
+        choices=AiJob.ModelTier.choices,
+        default=AiJob.ModelTier.BASIC,
+        help_text="AI 모델 티어. `basic`(3토큰), `pro`(100토큰, 개발중), `pro_plus`(500토큰, 개발중)",
+    )
 
 
 class AiJobSerializer(serializers.ModelSerializer):
@@ -31,6 +36,8 @@ class AiJobSerializer(serializers.ModelSerializer):
             "progress",
             "message",
             "job_type",
+            "model_tier",
+            "token_cost",
             "model_name",
             "result_json",
             "error_message",
@@ -42,7 +49,7 @@ class AiJobSerializer(serializers.ModelSerializer):
 
 
 class AiJobListSerializer(serializers.ModelSerializer):
-    """GET /api/v1/ai/jobs/ 목록 응답 (result_json 제외하여 가볍게)."""
+    """내 작업 목록 (결과 JSON 제외)."""
 
     class Meta:
         model = AiJob
@@ -53,6 +60,8 @@ class AiJobListSerializer(serializers.ModelSerializer):
             "progress",
             "message",
             "job_type",
+            "model_tier",
+            "token_cost",
             "model_name",
             "error_message",
             "created_at",
