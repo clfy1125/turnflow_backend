@@ -1,0 +1,258 @@
+{
+  "title": "NEON PULSE",
+  "is_public": true,
+  "data": {
+    "design_settings": {
+      "logoStyle": "hidden",
+      "fontFamily": "Pretendard",
+      "buttonColor": "#ff4fd8",
+      "buttonShape": "rounded",
+      "blockBgColor": "#1a1033",
+      "topMenuStyle": "icons",
+      "backgroundColor": "#090014",
+      "backgroundImage": "https://images.unsplash.com/photo-1579546929518-9e396f3cc809",
+      "buttonAnimation": "none",
+      "buttonApplyMode": "partial",
+      "customLogoImage": "",
+      "shareButtonVisible": true,
+      "customColorPickerOpen": "bg",
+      "subscribeButtonVisible": true
+    }
+  },
+  "custom_css": "",
+  "blocks": [
+    {
+      "id": 438,
+      "type": "profile",
+      "order": 1,
+      "data": {
+        "subline": "EDM Producer / DJ / Live Performer",
+        "headline": "NEON PULSE",
+        "font_size": "lg",
+        "avatar_url": "https://images.unsplash.com/photo-1501386761578-eac5c94b800a",
+        "profile_layout": "cover",
+        "cover_image_url": "https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 439,
+      "type": "single_link",
+      "order": 2,
+      "data": {
+        "url": "https://notice",
+        "_type": "notice",
+        "label": "공지",
+        "title": "2026 SEOUL NEON TOUR OPEN",
+        "layout": "small",
+        "content": "04.26 SAT · YES24 LIVE HALL · 티켓 오픈 진행 중",
+        "link_url": "https://neonpulse.com/tickets",
+        "notice_layout": "banner",
+        "custom_bg_color": "#120a24",
+        "custom_text_color": "#ffffff",
+        "custom_button_color": "#00e5ff"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 440,
+      "type": "single_link",
+      "order": 3,
+      "data": {
+        "url": "https://text",
+        "_type": "text",
+        "label": "텍스트",
+        "layout": "small",
+        "content": "네온과 베이스가 뒤섞이는 밤. 새 싱글과 투어, 라이브 클립까지 한 번에 확인하세요.",
+        "headline": "LIVE NOW",
+        "text_size": "md",
+        "text_align": "center",
+        "text_layout": "default",
+        "custom_bg_color": "#0f0820",
+        "custom_text_color": "#f8f7ff"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 441,
+      "type": "single_link",
+      "order": 4,
+      "data": {
+        "url": "https://neonpulse.com/tickets/seoul",
+        "_type": "single_link",
+        "badge": "LIVE,TOUR",
+        "label": "서울 공연 티켓 예매",
+        "layout": "medium",
+        "text_align": "left",
+        "description": "NEON TOUR 2026 · Seoul",
+        "thumbnail_url": "https://images.unsplash.com/photo-1506157786151-b8491531f063",
+        "custom_bg_color": "#1b0f38",
+        "custom_text_color": "#ffffff",
+        "custom_button_color": "#ff4fd8"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 442,
+      "type": "single_link",
+      "order": 5,
+      "data": {
+        "url": "https://open.spotify.com/album/example",
+        "_type": "single_link",
+        "badge": "NEW ALBUM",
+        "label": "신보 앨범 〈After Midnight〉 듣기",
+        "layout": "medium",
+        "text_align": "left",
+        "description": "Spotify / Apple Music / YouTube Music",
+        "thumbnail_url": "https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f",
+        "custom_bg_color": "#120d2c",
+        "custom_text_color": "#ffffff",
+        "custom_button_color": "#00e5ff"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 443,
+      "type": "single_link",
+      "order": 6,
+      "data": {
+        "url": "https://group",
+        "_type": "group_link",
+        "label": "Top Tracks",
+        "links": [
+          {
+            "id": "track-1",
+            "url": "https://open.spotify.com/track/example1",
+            "badge": "single",
+            "title": "Electric Sky",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1501612780327-45045538702b"
+          },
+          {
+            "id": "track-2",
+            "url": "https://open.spotify.com/track/example2",
+            "badge": "new",
+            "title": "After Midnight",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1514525253161-7a46d19cd819"
+          },
+          {
+            "id": "track-3",
+            "url": "https://open.spotify.com/track/example3",
+            "badge": "fan pick",
+            "title": "Neon Heartbeat",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1499364615650-ec38552f4f34"
+          }
+        ],
+        "layout": "small",
+        "is_group": true,
+        "description": "대표 싱글과 최신 릴리즈",
+        "display_mode": "all",
+        "group_layout": "grid-3",
+        "custom_bg_color": "#130b28",
+        "custom_text_color": "#ffffff",
+        "custom_button_color": "#ff4fd8"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 444,
+      "type": "single_link",
+      "order": 7,
+      "data": {
+        "url": "https://spacer",
+        "_type": "spacer",
+        "label": "구분선",
+        "layout": "small",
+        "spacing": 28,
+        "divider_color": "#7b61ff",
+        "divider_style": "zigzag",
+        "divider_width": 1.5
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 445,
+      "type": "single_link",
+      "order": 8,
+      "data": {
+        "url": "https://video",
+        "_type": "video",
+        "label": "동영상",
+        "layout": "small",
+        "autoplay": false,
+        "is_video": true,
+        "video_urls": [
+          "https://www.youtube.com/watch?v=SR_JN20UvqU",
+          "https://www.youtube.com/watch?v=oovbDy30-3s"
+        ],
+        "video_layout": "carousel"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 446,
+      "type": "single_link",
+      "order": 9,
+      "data": {
+        "url": "https://gallery",
+        "_type": "gallery",
+        "label": "갤러리",
+        "images": [
+          "https://images.unsplash.com/photo-1501386761578-eac5c94b800a",
+          "https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f",
+          "https://images.unsplash.com/photo-1516450360452-9312f5e86fc7",
+          "https://images.unsplash.com/photo-1506157786151-b8491531f063"
+        ],
+        "layout": "small",
+        "auto_slide": true,
+        "keep_ratio": true,
+        "gallery_url": "https://neonpulse.com/gallery",
+        "gallery_layout": "carousel",
+        "custom_bg_color": "#140c2b",
+        "custom_text_color": "#ffffff",
+        "custom_button_color": "#00e5ff"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 447,
+      "type": "single_link",
+      "order": 10,
+      "data": {
+        "url": "https://customer",
+        "_type": "customer",
+        "label": "고객정보수집",
+        "layout": "small",
+        "button_text": "알림 받기",
+        "collect_name": true,
+        "collect_email": true,
+        "collect_phone": false,
+        "custom_bg_color": "#1a1033",
+        "custom_text_color": "#ffffff",
+        "customer_headline": "투어 일정 / 신곡 발매 소식 받아보기",
+        "custom_button_color": "#ff4fd8",
+        "customer_description": "이메일을 남겨주시면 가장 먼저 알려드립니다"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 448,
+      "type": "single_link",
+      "order": 11,
+      "data": {
+        "url": "https://social",
+        "_type": "social",
+        "label": "SNS 연결",
+        "layout": "small",
+        "tiktok": "neonpulse.dj",
+        "twitter": "neonpulse_live",
+        "youtube": "neonpulseofficial",
+        "instagram": "neonpulse.official",
+        "is_social": true
+      },
+      "custom_css": ""
+    }
+  ]
+}

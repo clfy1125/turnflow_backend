@@ -1,0 +1,237 @@
+{
+  "title": "",
+  "is_public": true,
+  "data": {
+    "design_settings": {
+      "logoStyle": "hidden",
+      "fontFamily": "Pretendard",
+      "buttonColor": "#ff6fae",
+      "buttonShape": "rounded",
+      "blockBgColor": "",
+      "topMenuStyle": "icons",
+      "backgroundColor": "#fff7fb",
+      "backgroundImage": "",
+      "buttonAnimation": "none",
+      "buttonApplyMode": "partial",
+      "customLogoImage": "",
+      "shareButtonVisible": true,
+      "customColorPickerOpen": "bg",
+      "subscribeButtonVisible": true
+    }
+  },
+  "custom_css": "",
+  "blocks": [
+    {
+      "id": 789,
+      "type": "profile",
+      "order": 1,
+      "data": {
+        "subline": "오늘만 열리는 달콤한 팝업 스토어  ✿ 디저트 · 굿즈 · 예약",
+        "headline": "MOMO POP-UP",
+        "font_size": "sm",
+        "avatar_url": "https://images.unsplash.com/photo-1517248135467-4c7edcad34c4",
+        "profile_layout": "center"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 790,
+      "type": "single_link",
+      "order": 2,
+      "data": {
+        "url": "https://notice",
+        "_type": "notice",
+        "label": "공지",
+        "title": "주말 한정 팝업 오픈 · 사전예약 진행중",
+        "layout": "small",
+        "content": "성수동 팝업 / 오전 11시 ~ 오후 8시 / 한정 수량 소진 시 조기 마감",
+        "link_url": "https://example.com/reserve",
+        "notice_layout": "banner",
+        "custom_bg_color": "#ffe4f1",
+        "custom_text_color": "#7a2954",
+        "custom_button_color": "#ff6fae"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 791,
+      "type": "single_link",
+      "order": 3,
+      "data": {
+        "url": "https://text",
+        "_type": "text",
+        "label": "텍스트",
+        "layout": "small",
+        "content": "귀엽고 폭신한 디저트와 한정 굿즈를 준비했어요",
+        "headline": "MENU",
+        "text_size": "md",
+        "text_align": "center",
+        "text_layout": "default"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 792,
+      "type": "single_link",
+      "order": 4,
+      "data": {
+        "url": "https://group",
+        "_type": "group_link",
+        "label": "팝업 메뉴판",
+        "links": [
+          {
+            "id": "menu-1",
+            "url": "https://example.com/menu/strawberry-milk",
+            "badge": "best,new",
+            "price": "7500",
+            "title": "딸기 우유 푸딩",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1551024601-bec78aea704b",
+            "original_price": "8900"
+          },
+          {
+            "id": "menu-2",
+            "url": "https://example.com/menu/ribbon-cake",
+            "badge": "signature",
+            "price": "9800",
+            "title": "리본 생크림 케이크",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1464306076886-da185f6a9d05",
+            "original_price": "12000"
+          },
+          {
+            "id": "menu-3",
+            "url": "https://example.com/menu/pink-soda",
+            "badge": "limited",
+            "price": "6800",
+            "title": "핑크 크림 소다",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1544145945-f90425340c7e",
+            "original_price": "7900"
+          },
+          {
+            "id": "menu-4",
+            "url": "https://example.com/menu/bear-cookie-set",
+            "badge": "cute",
+            "price": "5900",
+            "title": "곰돌이 쿠키 세트",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1499636136210-6f4ee915583e",
+            "original_price": "6900"
+          }
+        ],
+        "layout": "small",
+        "is_group": true,
+        "description": "인기 메뉴를 먼저 확인해보세요",
+        "display_mode": "all",
+        "group_layout": "grid-2",
+        "custom_bg_color": "#fffafb",
+        "custom_text_color": "#3f2a35",
+        "custom_button_color": "#ffd4e6"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 793,
+      "type": "single_link",
+      "order": 5,
+      "data": {
+        "url": "https://spacer",
+        "_type": "spacer",
+        "label": "구분선",
+        "layout": "small",
+        "spacing": 24,
+        "divider_color": "#f9b6d2",
+        "divider_style": "wave",
+        "divider_width": 2
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 794,
+      "type": "single_link",
+      "order": 6,
+      "data": {
+        "url": "https://example.com/reserve",
+        "_type": "single_link",
+        "label": "🎀 예약하고 방문하기",
+        "layout": "medium",
+        "text_align": "center",
+        "description": "사전 예약 시 웰컴 기프트 증정",
+        "thumbnail_url": "https://images.unsplash.com/photo-1512436991641-6745cdb1723f",
+        "custom_bg_color": "#ffeff6",
+        "custom_text_color": "#6f294d",
+        "custom_button_color": "#ff6fae"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 795,
+      "type": "single_link",
+      "order": 7,
+      "data": {
+        "url": "https://example.com/waiting",
+        "_type": "single_link",
+        "label": "💌 현장 웨이팅 안내",
+        "layout": "small",
+        "text_align": "center",
+        "description": "예약이 마감되면 현장 대기 등록도 가능해요",
+        "custom_bg_color": "#fff8dc",
+        "custom_text_color": "#6a4b1f",
+        "custom_button_color": "#ffd66b"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 796,
+      "type": "single_link",
+      "order": 8,
+      "data": {
+        "url": "https://social",
+        "_type": "social",
+        "label": "SNS 연결",
+        "layout": "small",
+        "tiktok": "",
+        "twitter": "",
+        "youtube": "",
+        "instagram": "momo.popup.official",
+        "is_social": true
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 797,
+      "type": "single_link",
+      "order": 9,
+      "data": {
+        "url": "https://instagram.com/momo.popup.official",
+        "_type": "single_link",
+        "label": "📸 인스타그램에서 신메뉴 보기",
+        "layout": "small",
+        "text_align": "center",
+        "description": "스토리 하이라이트에 실시간 재고와 운영 공지 업로드",
+        "custom_bg_color": "#fdf1f7",
+        "custom_text_color": "#5c2a43",
+        "custom_button_color": "#ffb3d1"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 798,
+      "type": "single_link",
+      "order": 10,
+      "data": {
+        "url": "https://text",
+        "_type": "text",
+        "label": "텍스트",
+        "layout": "small",
+        "content": "서울 성수동 · 11:00 - 20:00\n반려동물 동반 가능 · 포토존 운영",
+        "headline": "OPEN INFO",
+        "text_size": "sm",
+        "text_align": "center",
+        "text_layout": "default"
+      },
+      "custom_css": ""
+    }
+  ]
+}

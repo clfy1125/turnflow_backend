@@ -1,0 +1,324 @@
+{
+  "title": "BLACK NOISE",
+  "is_public": true,
+  "data": {
+    "design_settings": {
+      "logoStyle": "hidden",
+      "fontFamily": "Pretendard",
+      "buttonColor": "#111827",
+      "buttonShape": "rounded",
+      "blockBgColor": "#111111",
+      "topMenuStyle": "icons",
+      "backgroundColor": "#F8F9FA",
+      "backgroundImage": "",
+      "buttonAnimation": "none",
+      "buttonApplyMode": "partial",
+      "customLogoImage": "",
+      "shareButtonVisible": true,
+      "customColorPickerOpen": "blockBg",
+      "subscribeButtonVisible": true
+    }
+  },
+  "custom_css": "",
+  "blocks": [
+    {
+      "id": 217,
+      "type": "profile",
+      "order": 95,
+      "data": {
+        "subline": "서울 기반 얼터너티브 록 밴드",
+        "headline": "BLACK NOISE",
+        "font_size": "lg",
+        "avatar_url": "https://images.unsplash.com/photo-1516280440614-37939bbacd81?q=80&w=800&auto=format&fit=crop",
+        "profile_layout": "cover",
+        "cover_image_url": "https://images.unsplash.com/photo-1506157786151-b8491531f063?q=80&w=1600&auto=format&fit=crop"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 218,
+      "type": "single_link",
+      "order": 96,
+      "data": {
+        "url": "https://notice",
+        "_type": "notice",
+        "label": "공지",
+        "title": "2026 BLACKOUT TOUR 티켓 오픈",
+        "layout": "small",
+        "content": "서울 · 부산 · 대구 공연 예매가 시작되었습니다.",
+        "link_url": "https://example.com/tour",
+        "_styleOpen": true,
+        "notice_layout": "banner",
+        "_saved_bg_color": "#b30000",
+        "custom_bg_color": "#b30000",
+        "_saved_text_color": "#ffffff",
+        "custom_text_color": "#ffffff",
+        "_saved_button_color": "#ffffff",
+        "custom_button_color": "#ffffff",
+        "custom_input_bg_color": "",
+        "custom_sub_text_color": ""
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 219,
+      "type": "single_link",
+      "order": 97,
+      "data": {
+        "url": "https://social",
+        "_type": "social",
+        "label": "SNS 연결",
+        "layout": "small",
+        "tiktok": "blacknoise.band",
+        "twitter": "blacknoise_live",
+        "youtube": "https://youtube.com/@blacknoiseofficial",
+        "instagram": "blacknoise.official",
+        "is_social": true
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 220,
+      "type": "single_link",
+      "order": 98,
+      "data": {
+        "url": "https://text",
+        "_type": "text",
+        "label": "텍스트",
+        "layout": "small",
+        "content": "거친 기타 리프와 어두운 신스, 라이브 에너지로 완성된 5트랙 EP",
+        "headline": "NEW EP — MIDNIGHT RIFF",
+        "text_size": "md",
+        "text_align": "center",
+        "text_layout": "default",
+        "custom_bg_color": "#111111",
+        "custom_text_color": "#f5f5f5",
+        "custom_button_color": "#e11d48"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 221,
+      "type": "single_link",
+      "order": 99,
+      "data": {
+        "url": "https://spacer",
+        "_type": "spacer",
+        "label": "구분선",
+        "layout": "small",
+        "spacing": 24,
+        "divider_color": "#7f1d1d",
+        "divider_style": "zigzag",
+        "divider_width": 2
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 222,
+      "type": "single_link",
+      "order": 100,
+      "data": {
+        "url": "https://example.com/tickets",
+        "_type": "single_link",
+        "badge": "tour,live,hot",
+        "label": "2026 BLACKOUT TOUR 예매하기",
+        "layout": "large",
+        "text_align": "left",
+        "description": "서울 · 부산 · 대구",
+        "thumbnail_url": "https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f?q=80&w=1200&auto=format&fit=crop",
+        "custom_bg_color": "#111111",
+        "custom_text_color": "#ffffff",
+        "custom_button_color": "#dc2626"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 223,
+      "type": "single_link",
+      "order": 101,
+      "data": {
+        "url": "https://group",
+        "_type": "group_link",
+        "label": "Discography",
+        "links": [
+          {
+            "id": "disc-1",
+            "url": "sdfsdfsdfsd",
+            "badge": "new,ep",
+            "title": "MIDNIGHT RIFF",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1470229722913-7c0e2dbbafd3?q=80&w=800&auto=format&fit=crop"
+          },
+          {
+            "id": "disc-2",
+            "url": "https://example.com/album/neon-ashes",
+            "badge": "album",
+            "title": "NEON ASHES",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1507874457470-272b3c8d8ee2?q=80&w=800&auto=format&fit=crop"
+          },
+          {
+            "id": "disc-3",
+            "url": "https://example.com/album/last-echo",
+            "badge": "single",
+            "title": "LAST ECHO",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1501612780327-45045538702b?q=80&w=800&auto=format&fit=crop"
+          }
+        ],
+        "layout": "small",
+        "is_group": true,
+        "description": "",
+        "display_mode": "all",
+        "group_layout": "grid-3",
+        "custom_bg_color": "#0f0f0f",
+        "custom_text_color": "#f3f4f6",
+        "custom_button_color": "#991b1b"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 224,
+      "type": "single_link",
+      "order": 102,
+      "data": {
+        "url": "https://video",
+        "_type": "video",
+        "label": "동영상",
+        "layout": "small",
+        "autoplay": false,
+        "is_video": true,
+        "video_urls": [
+          "https://www.youtube.com/watch?v=example1",
+          "https://www.youtube.com/watch?v=example2"
+        ],
+        "video_layout": "carousel"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 225,
+      "type": "single_link",
+      "order": 103,
+      "data": {
+        "url": "https://gallery",
+        "_type": "gallery",
+        "label": "갤러리",
+        "images": [
+          "https://images.unsplash.com/photo-1503095396549-807759245b35?q=80&w=1200&auto=format&fit=crop",
+          "https://images.unsplash.com/photo-1505740420928-5e560c06d30e?q=80&w=1200&auto=format&fit=crop",
+          "https://images.unsplash.com/photo-1511379938547-c1f69419868d?q=80&w=1200&auto=format&fit=crop"
+        ],
+        "layout": "small",
+        "auto_slide": true,
+        "keep_ratio": true,
+        "gallery_url": "https://example.com/gallery",
+        "gallery_layout": "carousel",
+        "custom_bg_color": "#111111",
+        "custom_text_color": "#ffffff",
+        "custom_button_color": "#ef4444"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 226,
+      "type": "single_link",
+      "order": 104,
+      "data": {
+        "url": "https://music",
+        "_type": "music",
+        "label": "음악",
+        "layout": "small",
+        "content": "Spotify / Apple Music / Melon에서 BLACK NOISE 검색"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 227,
+      "type": "single_link",
+      "order": 105,
+      "data": {
+        "url": "https://group",
+        "_type": "group_link",
+        "label": "Merch",
+        "links": [
+          {
+            "id": "merch-1",
+            "url": "https://example.com/merch/tshirt",
+            "badge": "merch,best",
+            "price": "39000",
+            "title": "BLACKOUT TOUR 티셔츠",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1521572163474-6864f9cf17ab?q=80&w=800&auto=format&fit=crop",
+            "original_price": "49000"
+          },
+          {
+            "id": "merch-2",
+            "url": "https://example.com/merch/poster",
+            "badge": "limited",
+            "price": "18000",
+            "title": "사인 포스터",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1516280030429-27679b3dc9cf?q=80&w=800&auto=format&fit=crop",
+            "original_price": "22000"
+          }
+        ],
+        "layout": "small",
+        "is_group": true,
+        "description": "",
+        "display_mode": "all",
+        "group_layout": "grid-2",
+        "custom_bg_color": "#161616",
+        "custom_text_color": "#ffffff",
+        "custom_button_color": "#b91c1c"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 229,
+      "type": "single_link",
+      "order": 108,
+      "data": {
+        "url": "https://customer",
+        "_type": "customer",
+        "label": "고객정보수집",
+        "layout": "small",
+        "button_text": "알림 신청",
+        "collect_name": true,
+        "collect_email": true,
+        "collect_phone": false,
+        "custom_bg_color": "#111111",
+        "custom_text_color": "#ffffff",
+        "customer_headline": "투어 오픈 알림 받기",
+        "custom_button_color": "#991b1b",
+        "customer_description": "신곡 발매와 공연 일정만 보내드립니다"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 787,
+      "type": "single_link",
+      "order": 109,
+      "data": {
+        "url": "https://inquiry",
+        "_type": "inquiry",
+        "email": "booking@blacknoise.kr",
+        "label": "문의",
+        "layout": "small",
+        "options": [
+          "공연 섭외",
+          "브랜드 협업",
+          "인터뷰 요청"
+        ],
+        "button_text": "문의 보내기",
+        "collect_email": true,
+        "collect_phone": true,
+        "inquiry_title": "공연 / 협업 / 섭외 문의",
+        "custom_bg_color": "#0f0f0f",
+        "custom_text_color": "#f9fafb",
+        "custom_button_color": "#dc2626"
+      },
+      "custom_css": ""
+    }
+  ]
+}

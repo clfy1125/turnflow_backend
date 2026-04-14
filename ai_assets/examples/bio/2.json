@@ -1,0 +1,318 @@
+{
+  "title": "MIDNIGHT DOSIRAK",
+  "is_public": true,
+  "data": {
+    "design_settings": {
+      "logoStyle": "hidden",
+      "fontFamily": "Pretendard",
+      "buttonColor": "#f5f5f5",
+      "buttonShape": "rounded",
+      "blockBgColor": "#111111",
+      "topMenuStyle": "icons",
+      "backgroundColor": "#000000",
+      "backgroundImage": "",
+      "buttonAnimation": "none",
+      "buttonApplyMode": "partial",
+      "customLogoImage": "",
+      "shareButtonVisible": true,
+      "customColorPickerOpen": "bg",
+      "subscribeButtonVisible": true
+    }
+  },
+  "custom_css": "",
+  "blocks": [
+    {
+      "id": 270,
+      "type": "profile",
+      "order": 1,
+      "data": {
+        "subline": "퇴근 후에도 제대로 먹는 도시의 한 끼",
+        "headline": "MIDNIGHT DOSIRAK",
+        "font_size": "lg",
+        "avatar_url": "https://images.unsplash.com/photo-1543332164-6e82f355badc",
+        "profile_layout": "cover",
+        "cover_image_url": "https://images.unsplash.com/photo-1513104890138-7c749659a591"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 271,
+      "type": "single_link",
+      "order": 2,
+      "data": {
+        "url": "https://notice",
+        "_type": "notice",
+        "label": "공지",
+        "title": "오늘 밤 10시 이전 주문 시 새벽 픽업 가능",
+        "layout": "small",
+        "content": "강남·성수·을지로 일부 지역 당일 준비",
+        "link_url": "https://midnightdosirak.com/order",
+        "notice_layout": "banner",
+        "custom_bg_color": "#1a1a1a",
+        "custom_text_color": "#ffffff",
+        "custom_button_color": "#ff6b35"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 272,
+      "type": "single_link",
+      "order": 3,
+      "data": {
+        "url": "https://text",
+        "_type": "text",
+        "label": "텍스트",
+        "layout": "small",
+        "content": "블랙 트러플 스테이크 도시락 · 저온숙성 연어 도시락 · 스파이시 치킨 라이스 박스",
+        "headline": "Tonight’s Signature",
+        "text_size": "md",
+        "text_align": "left",
+        "text_layout": "default",
+        "custom_bg_color": "#0d0d0d",
+        "custom_text_color": "#f5f5f5"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 273,
+      "type": "single_link",
+      "order": 4,
+      "data": {
+        "url": "https://midnightdosirak.com/menu/truffle-steak",
+        "_type": "single_link",
+        "badge": "BEST,한정수량",
+        "label": "블랙 트러플 스테이크 도시락",
+        "price": "18900",
+        "layout": "medium",
+        "text_align": "left",
+        "description": "한정 30개 · 퇴근길 프리미엄 디너박스",
+        "thumbnail_url": "https://images.unsplash.com/photo-1544025162-d76694265947",
+        "original_price": "22900",
+        "custom_bg_color": "#151515",
+        "custom_text_color": "#ffffff",
+        "custom_button_color": "#ff6b35"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 274,
+      "type": "single_link",
+      "order": 5,
+      "data": {
+        "url": "https://midnightdosirak.com/menu/salmon",
+        "_type": "single_link",
+        "badge": "LOW CAL,추천",
+        "label": "저온숙성 연어 도시락",
+        "price": "15900",
+        "layout": "medium",
+        "text_align": "left",
+        "description": "가볍지만 만족감 높은 야식 대용",
+        "thumbnail_url": "https://images.unsplash.com/photo-1467003909585-2f8a72700288",
+        "original_price": "19900",
+        "custom_bg_color": "#151515",
+        "custom_text_color": "#ffffff",
+        "custom_button_color": "#f5f5f5"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 275,
+      "type": "single_link",
+      "order": 6,
+      "data": {
+        "url": "https://group",
+        "_type": "group_link",
+        "label": "오늘의 도시락 라인업",
+        "links": [
+          {
+            "id": "menu-1",
+            "url": "https://midnightdosirak.com/menu/spicy-chicken",
+            "badge": "HOT",
+            "price": "12900",
+            "title": "스파이시 치킨 라이스",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1512058564366-18510be2db19",
+            "original_price": "14900"
+          },
+          {
+            "id": "menu-2",
+            "url": "https://midnightdosirak.com/menu/beef-bulgogi",
+            "badge": "STEADY",
+            "price": "13900",
+            "title": "직화 불고기 도시락",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1504674900247-0877df9cc836",
+            "original_price": "15900"
+          },
+          {
+            "id": "menu-3",
+            "url": "https://midnightdosirak.com/menu/shrimp-cream",
+            "badge": "NEW",
+            "price": "14900",
+            "title": "크림새우 나이트박스",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1565299624946-b28f40a0ae38",
+            "original_price": "16900"
+          },
+          {
+            "id": "menu-4",
+            "url": "https://midnightdosirak.com/menu/vegan-tofu",
+            "badge": "VEGAN",
+            "price": "11900",
+            "title": "비건 두부 스테이크 박스",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1512621776951-a57141f2eefd",
+            "original_price": "13900"
+          }
+        ],
+        "layout": "small",
+        "is_group": true,
+        "description": "원하는 스타일로 바로 선택하세요",
+        "display_mode": "all",
+        "group_layout": "grid-2",
+        "custom_bg_color": "#101010",
+        "custom_text_color": "#f5f5f5",
+        "custom_button_color": "#ff6b35"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 276,
+      "type": "single_link",
+      "order": 7,
+      "data": {
+        "url": "https://spacer",
+        "_type": "spacer",
+        "label": "구분선",
+        "layout": "small",
+        "spacing": 28,
+        "divider_color": "#2c2c2c",
+        "divider_style": "solid",
+        "divider_width": 1
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 277,
+      "type": "single_link",
+      "order": 8,
+      "data": {
+        "url": "https://text",
+        "_type": "text",
+        "label": "텍스트",
+        "layout": "small",
+        "content": "강남역 / 선릉 / 성수 / 을지로 야간 픽업 가능 · 단체 주문은 아래 문의 폼으로 접수",
+        "headline": "Pickup & Delivery",
+        "text_size": "sm",
+        "text_align": "left",
+        "text_layout": "default",
+        "custom_bg_color": "#0d0d0d",
+        "custom_text_color": "#d4d4d4"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 278,
+      "type": "single_link",
+      "order": 9,
+      "data": {
+        "url": "https://gallery",
+        "_type": "gallery",
+        "label": "갤러리",
+        "images": [
+          "https://images.unsplash.com/photo-1515003197210-e0cd71810b5f",
+          "https://images.unsplash.com/photo-1473093295043-cdd812d0e601",
+          "https://images.unsplash.com/photo-1490645935967-10de6ba17061"
+        ],
+        "layout": "small",
+        "auto_slide": true,
+        "keep_ratio": true,
+        "gallery_url": "https://midnightdosirak.com/lookbook",
+        "gallery_layout": "carousel",
+        "custom_bg_color": "#111111",
+        "custom_text_color": "#ffffff",
+        "custom_button_color": "#ff6b35"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 279,
+      "type": "single_link",
+      "order": 10,
+      "data": {
+        "url": "https://customer",
+        "_type": "customer",
+        "label": "고객정보수집",
+        "layout": "small",
+        "button_text": "문의 남기기",
+        "collect_name": true,
+        "collect_email": false,
+        "collect_phone": true,
+        "custom_bg_color": "#171717",
+        "custom_text_color": "#ffffff",
+        "customer_headline": "단체주문 / 촬영 케이터링 문의",
+        "custom_button_color": "#ff6b35",
+        "customer_description": "이름, 연락처를 남겨주시면 가장 빠르게 연락드립니다"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 280,
+      "type": "single_link",
+      "order": 11,
+      "data": {
+        "url": "https://map",
+        "_type": "map",
+        "label": "지도",
+        "layout": "small",
+        "address": "서울특별시 강남구 테헤란로 123",
+        "map_name": "MIDNIGHT DOSIRAK 픽업 스팟",
+        "custom_bg_color": "#111111",
+        "custom_text_color": "#ffffff",
+        "custom_button_color": "#f5f5f5"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 281,
+      "type": "single_link",
+      "order": 12,
+      "data": {
+        "url": "https://social",
+        "_type": "social",
+        "label": "SNS 연결",
+        "layout": "small",
+        "tiktok": "midnight.dosirak",
+        "twitter": "midnightmeal",
+        "youtube": "midnightdosirak",
+        "instagram": "midnight.dosirak",
+        "is_social": true
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 643,
+      "type": "single_link",
+      "order": 13,
+      "data": {
+        "_type": "single_link",
+        "label": "",
+        "layout": "small",
+        "description": " "
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 644,
+      "type": "single_link",
+      "order": 14,
+      "data": {
+        "_type": "single_link",
+        "label": "",
+        "layout": "small",
+        "description": " "
+      },
+      "custom_css": ""
+    }
+  ]
+}

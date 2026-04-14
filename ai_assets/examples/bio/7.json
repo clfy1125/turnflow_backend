@@ -1,0 +1,346 @@
+{
+  "title": "",
+  "is_public": true,
+  "data": {
+    "design_settings": {
+      "logoStyle": "hidden",
+      "fontFamily": "Pretendard",
+      "buttonColor": "#111827",
+      "buttonShape": "rounded",
+      "blockBgColor": "",
+      "topMenuStyle": "icons",
+      "backgroundColor": "#F8F9FA",
+      "backgroundImage": "https://api.turnflow.clfy.ai.kr/media/pages/2026/04/lyrax-vincent-sU4yDdyX1FM-unsplash_R9v5POU.jpg?t=1775637259062",
+      "buttonAnimation": "none",
+      "buttonApplyMode": "partial",
+      "customLogoImage": "",
+      "shareButtonVisible": true,
+      "customColorPickerOpen": "bg",
+      "backgroundImageEnabled": true,
+      "backgroundImageMediaId": 188,
+      "subscribeButtonVisible": true
+    }
+  },
+  "custom_css": "",
+  "blocks": [
+    {
+      "id": 773,
+      "type": "profile",
+      "order": 1,
+      "data": {
+        "subline": "햇살 아래 가장 가벼운 여름 룩",
+        "headline": "Summer Muse",
+        "font_size": "lg",
+        "avatar_url": "https://images.unsplash.com/photo-1496747611176-843222e1e57c?auto=format&fit=crop&w=600&q=80",
+        "profile_layout": "cover",
+        "cover_image_url": "https://images.unsplash.com/photo-1515886657613-9f3515b0c78f?auto=format&fit=crop&w=1400&q=80"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 774,
+      "type": "single_link",
+      "order": 2,
+      "data": {
+        "url": "https://notice",
+        "_type": "notice",
+        "label": "공지",
+        "title": "썸머 컬렉션 오픈 · 전 상품 무료배송",
+        "layout": "small",
+        "content": "가볍고 시원한 여름 신상 업데이트",
+        "link_url": "https://summermuse.example.com/new",
+        "notice_layout": "banner",
+        "custom_bg_color": "#F97316",
+        "custom_text_color": "#FFFFFF",
+        "custom_button_color": "#FFFFFF"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 775,
+      "type": "single_link",
+      "order": 3,
+      "data": {
+        "url": "https://social",
+        "_type": "social",
+        "label": "SNS 연결",
+        "layout": "small",
+        "tiktok": "summermuse.official",
+        "twitter": "summermuse",
+        "youtube": "summermuse",
+        "instagram": "summermuse.official",
+        "is_social": true
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 776,
+      "type": "single_link",
+      "order": 4,
+      "data": {
+        "url": "https://text",
+        "_type": "text",
+        "label": "텍스트",
+        "layout": "small",
+        "content": "바캉스, 데일리, 데이트룩까지 한 번에",
+        "headline": "BEST SUMMER PICKS",
+        "text_size": "md",
+        "text_align": "center",
+        "text_layout": "default"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 777,
+      "type": "single_link",
+      "order": 5,
+      "data": {
+        "url": "https://summermuse.example.com/products/linen-slip-dress",
+        "_type": "single_link",
+        "badge": "best,원피스,summer",
+        "label": "린넨 슬립 드레스",
+        "price": "49000",
+        "layout": "medium",
+        "text_align": "left",
+        "description": "내추럴한 실루엣의 쿨링 린넨 원피스",
+        "thumbnail_url": "https://images.unsplash.com/photo-1512436991641-6745cdb1723f?auto=format&fit=crop&w=900&q=80",
+        "original_price": "69000",
+        "custom_bg_color": "#FFF1E8",
+        "custom_text_color": "#111827",
+        "custom_button_color": "#FFFFFF"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 778,
+      "type": "single_link",
+      "order": 6,
+      "data": {
+        "url": "https://summermuse.example.com/products/crochet-knit-top",
+        "_type": "single_link",
+        "badge": "new,니트탑,휴양지룩",
+        "label": "크로셰 니트 탑",
+        "price": "32000",
+        "layout": "medium",
+        "text_align": "left",
+        "description": "한여름에도 가볍게 입는 포인트 탑",
+        "thumbnail_url": "https://images.unsplash.com/photo-1483985988355-763728e1935b?auto=format&fit=crop&w=900&q=80",
+        "original_price": "45000",
+        "custom_bg_color": "#FFF8F0",
+        "custom_text_color": "#111827",
+        "custom_button_color": "#FFFFFF"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 779,
+      "type": "single_link",
+      "order": 7,
+      "data": {
+        "url": "https://spacer",
+        "_type": "spacer",
+        "label": "구분선",
+        "layout": "small",
+        "spacing": 28,
+        "divider_color": "#FDBA74",
+        "divider_style": "wave",
+        "divider_width": 2
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 780,
+      "type": "single_link",
+      "order": 8,
+      "data": {
+        "url": "https://group",
+        "_type": "group_link",
+        "label": "바캉스 룩",
+        "links": [
+          {
+            "id": "vacay-01",
+            "url": "https://summermuse.example.com/products/sheer-cardigan",
+            "badge": "가디건,여름필수",
+            "price": "29000",
+            "title": "시어 썸머 가디건",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1521572267360-ee0c2909d518?auto=format&fit=crop&w=800&q=80",
+            "original_price": "39000"
+          },
+          {
+            "id": "vacay-02",
+            "url": "https://summermuse.example.com/products/wide-banding-pants",
+            "badge": "팬츠,쿨소재",
+            "price": "35000",
+            "title": "와이드 밴딩 팬츠",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1541099649105-f69ad21f3246?auto=format&fit=crop&w=800&q=80",
+            "original_price": "47000"
+          },
+          {
+            "id": "vacay-03",
+            "url": "https://summermuse.example.com/products/straw-mini-bag",
+            "badge": "가방,포인트",
+            "price": "27000",
+            "title": "스트로 미니백",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1584917865442-de89df76afd3?auto=format&fit=crop&w=800&q=80",
+            "original_price": "36000"
+          },
+          {
+            "id": "vacay-04",
+            "url": "https://summermuse.example.com/products/ribbon-sandals",
+            "badge": "샌들,휴양지",
+            "price": "41000",
+            "title": "리본 스트랩 샌들",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1543163521-1bf539c55dd2?auto=format&fit=crop&w=800&q=80",
+            "original_price": "55000"
+          }
+        ],
+        "layout": "small",
+        "is_group": true,
+        "description": "",
+        "display_mode": "all",
+        "group_layout": "grid-2"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 781,
+      "type": "single_link",
+      "order": 9,
+      "data": {
+        "url": "https://group",
+        "_type": "group_link",
+        "label": "데일리 썸머 룩",
+        "links": [
+          {
+            "id": "daily-01",
+            "url": "https://summermuse.example.com/products/basic-sleeveless",
+            "badge": "daily,basic",
+            "price": "19000",
+            "title": "베이직 슬리브리스",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1434389677669-e08b4cac3105?auto=format&fit=crop&w=800&q=80",
+            "original_price": "25000"
+          },
+          {
+            "id": "daily-02",
+            "url": "https://summermuse.example.com/products/soft-denim-shorts",
+            "badge": "쇼츠,청량",
+            "price": "33000",
+            "title": "소프트 데님 쇼츠",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1503342217505-b0a15ec3261c?auto=format&fit=crop&w=800&q=80",
+            "original_price": "43000"
+          },
+          {
+            "id": "daily-03",
+            "url": "https://summermuse.example.com/products/summer-shirt",
+            "badge": "셔츠,레이어드",
+            "price": "37000",
+            "title": "오버핏 썸머 셔츠",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1529139574466-a303027c1d8b?auto=format&fit=crop&w=800&q=80",
+            "original_price": "49000"
+          }
+        ],
+        "layout": "small",
+        "is_group": true,
+        "description": "",
+        "display_mode": "all",
+        "group_layout": "grid-3"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 782,
+      "type": "single_link",
+      "order": 10,
+      "data": {
+        "url": "https://gallery",
+        "_type": "gallery",
+        "label": "갤러리",
+        "images": [
+          "https://images.unsplash.com/photo-1495385794356-15371f348c31?auto=format&fit=crop&w=1080&q=80",
+          "https://images.unsplash.com/photo-1487412720507-e7ab37603c6f?auto=format&fit=crop&w=1080&q=80",
+          "https://images.unsplash.com/photo-1524504388940-b1c1722653e1?auto=format&fit=crop&w=1080&q=80"
+        ],
+        "layout": "small",
+        "auto_slide": true,
+        "keep_ratio": true,
+        "gallery_url": "https://summermuse.example.com/lookbook",
+        "gallery_layout": "carousel",
+        "custom_bg_color": "#FFFFFF",
+        "custom_text_color": "#111827",
+        "custom_button_color": "#FDBA74"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 783,
+      "type": "single_link",
+      "order": 11,
+      "data": {
+        "url": "https://text",
+        "_type": "text",
+        "label": "텍스트",
+        "layout": "small",
+        "content": "이번 주말 성수 팝업에서 실제 착용감을 만나보세요",
+        "headline": "오프라인 쇼룸",
+        "text_size": "sm",
+        "text_align": "center",
+        "text_layout": "default"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 784,
+      "type": "single_link",
+      "order": 12,
+      "data": {
+        "url": "https://map",
+        "_type": "map",
+        "label": "지도",
+        "layout": "small",
+        "address": "성수동2가, 성동구, 서울특별시, 대한민국",
+        "map_name": "Summer Muse 성수 팝업스토어"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 785,
+      "type": "single_link",
+      "order": 13,
+      "data": {
+        "url": "https://customer",
+        "_type": "customer",
+        "label": "고객정보수집",
+        "layout": "small",
+        "button_text": "쿠폰 받기",
+        "collect_name": true,
+        "collect_email": true,
+        "collect_phone": false,
+        "customer_headline": "10% 할인 쿠폰 받기",
+        "customer_description": "이메일 등록 시 여름 신상과 재입고 소식을 가장 먼저 보내드려요"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 786,
+      "type": "single_link",
+      "order": 14,
+      "data": {
+        "url": "https://contact",
+        "_type": "contact",
+        "label": "연락처",
+        "phone": "01012345678",
+        "layout": "small",
+        "whatsapp": false,
+        "country_code": "+82"
+      },
+      "custom_css": ""
+    }
+  ]
+}

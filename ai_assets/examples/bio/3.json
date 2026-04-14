@@ -1,0 +1,274 @@
+{
+  "title": "NOCTURN GALLERY",
+  "is_public": true,
+  "data": {
+    "design_settings": {
+      "logoStyle": "hidden",
+      "fontFamily": "Pretendard",
+      "buttonColor": "#111111",
+      "buttonShape": "rounded",
+      "blockBgColor": "#f5f3ee",
+      "topMenuStyle": "icons",
+      "backgroundColor": "#ebe7df",
+      "backgroundImage": "",
+      "buttonAnimation": "none",
+      "buttonApplyMode": "partial",
+      "customLogoImage": "",
+      "shareButtonVisible": true,
+      "customColorPickerOpen": "bg",
+      "subscribeButtonVisible": true
+    }
+  },
+  "custom_css": "",
+  "blocks": [
+    {
+      "id": 297,
+      "type": "profile",
+      "order": 1,
+      "data": {
+        "subline": "도시의 밤과 정적을 수집하는 컨템포러리 아트 스페이스",
+        "headline": "NOCTURN GALLERY",
+        "font_size": "lg",
+        "avatar_url": "https://images.unsplash.com/photo-1500530855697-b586d89ba3ee",
+        "profile_layout": "cover",
+        "cover_image_url": "https://images.unsplash.com/photo-1518998053901-5348d3961a04"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 298,
+      "type": "single_link",
+      "order": 2,
+      "data": {
+        "url": "https://notice",
+        "_type": "notice",
+        "label": "공지",
+        "title": "CURRENT EXHIBITION · SILENCE IN CONCRETE",
+        "layout": "small",
+        "content": "2026.04.10 - 2026.06.02 / 화-일 11:00 - 19:00",
+        "link_url": "https://nocturn.gallery/exhibition",
+        "notice_layout": "banner",
+        "custom_bg_color": "#1f1f1f",
+        "custom_text_color": "#ffffff",
+        "custom_button_color": "#c7b8a3"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 299,
+      "type": "single_link",
+      "order": 3,
+      "data": {
+        "url": "https://text",
+        "_type": "text",
+        "label": "텍스트",
+        "layout": "small",
+        "content": "NOCTURN GALLERY는 도시의 풍경, 빛, 소음, 고독을 주제로 동시대 작가들의 작업을 소개합니다. 전시와 아카이브, 영상, 공간 경험을 하나의 흐름으로 연결하는 작은 갤러리입니다.",
+        "headline": "About",
+        "text_size": "md",
+        "text_align": "left",
+        "text_layout": "default",
+        "custom_bg_color": "#f5f3ee",
+        "custom_text_color": "#111111"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 300,
+      "type": "single_link",
+      "order": 4,
+      "data": {
+        "url": "https://gallery",
+        "_type": "gallery",
+        "label": "갤러리",
+        "images": [
+          "https://images.unsplash.com/photo-1501612780327-45045538702b",
+          "https://images.unsplash.com/photo-1460661419201-fd4cecdf8a8b",
+          "https://images.unsplash.com/photo-1500534623283-312aade485b7",
+          "https://images.unsplash.com/photo-1497366754035-f200968a6e72"
+        ],
+        "layout": "small",
+        "auto_slide": false,
+        "keep_ratio": true,
+        "gallery_url": "https://nocturn.gallery/archive",
+        "gallery_layout": "thumbnail",
+        "custom_bg_color": "#ffffff",
+        "custom_text_color": "#111111",
+        "custom_button_color": "#111111"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 301,
+      "type": "single_link",
+      "order": 5,
+      "data": {
+        "url": "https://text",
+        "_type": "text",
+        "label": "텍스트",
+        "layout": "small",
+        "content": "빛이 사라진 뒤에 남는 형태, 보이지 않는 시간의 흔적, 그리고 도시의 빈 공간을 기록한 신작들을 만나보세요.",
+        "headline": "Featured Works",
+        "text_size": "sm",
+        "text_align": "left",
+        "text_layout": "default",
+        "custom_bg_color": "#f5f3ee",
+        "custom_text_color": "#3a3a3a"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 302,
+      "type": "single_link",
+      "order": 6,
+      "data": {
+        "url": "https://group",
+        "_type": "group_link",
+        "label": "Exhibition Highlights",
+        "links": [
+          {
+            "id": "highlight-1",
+            "url": "https://nocturn.gallery/works/1",
+            "badge": "installation",
+            "title": "Concrete Echo",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1517048676732-d65bc937f952"
+          },
+          {
+            "id": "highlight-2",
+            "url": "https://nocturn.gallery/works/2",
+            "badge": "photo",
+            "title": "Midnight Corridor",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1497366811353-6870744d04b2"
+          },
+          {
+            "id": "highlight-3",
+            "url": "https://nocturn.gallery/works/3",
+            "badge": "painting",
+            "title": "Silent Window",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1460661419201-fd4cecdf8a8b"
+          }
+        ],
+        "layout": "small",
+        "is_group": true,
+        "description": "대표 작품 및 섹션 소개",
+        "display_mode": "all",
+        "group_layout": "grid-3",
+        "custom_bg_color": "#ffffff",
+        "custom_text_color": "#111111",
+        "custom_button_color": "#c7b8a3"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 303,
+      "type": "single_link",
+      "order": 7,
+      "data": {
+        "url": "https://spacer",
+        "_type": "spacer",
+        "label": "구분선",
+        "layout": "small",
+        "spacing": 28,
+        "divider_color": "#cfc7ba",
+        "divider_style": "dashed",
+        "divider_width": 1
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 304,
+      "type": "single_link",
+      "order": 8,
+      "data": {
+        "url": "https://video",
+        "_type": "video",
+        "label": "동영상",
+        "layout": "small",
+        "autoplay": false,
+        "is_video": true,
+        "video_urls": [
+          "https://www.youtube.com/watch?v=SR_JN20UvqU"
+        ],
+        "video_layout": "default"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 305,
+      "type": "single_link",
+      "order": 9,
+      "data": {
+        "url": "https://text",
+        "_type": "text",
+        "label": "텍스트",
+        "layout": "small",
+        "content": "서울 마포구의 조용한 골목에 위치한 공간으로, 예약 없이 자유롭게 관람하실 수 있습니다.",
+        "headline": "Visit",
+        "text_size": "sm",
+        "text_align": "left",
+        "text_layout": "default",
+        "custom_bg_color": "#f5f3ee",
+        "custom_text_color": "#111111"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 306,
+      "type": "single_link",
+      "order": 10,
+      "data": {
+        "url": "https://map",
+        "_type": "map",
+        "label": "지도",
+        "layout": "small",
+        "address": "서울특별시 마포구 합정동 391-5",
+        "map_name": "NOCTURN GALLERY",
+        "custom_bg_color": "#ffffff",
+        "custom_text_color": "#111111",
+        "custom_button_color": "#111111"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 307,
+      "type": "single_link",
+      "order": 11,
+      "data": {
+        "url": "https://customer",
+        "_type": "customer",
+        "label": "고객정보수집",
+        "layout": "small",
+        "button_text": "구독하기",
+        "collect_name": true,
+        "collect_email": true,
+        "collect_phone": false,
+        "custom_bg_color": "#1f1f1f",
+        "custom_text_color": "#ffffff",
+        "customer_headline": "오프닝 / 다음 전시 소식 받아보기",
+        "custom_button_color": "#c7b8a3",
+        "customer_description": "이메일을 남겨주시면 전시 오픈과 이벤트 소식을 보내드립니다"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 308,
+      "type": "single_link",
+      "order": 12,
+      "data": {
+        "url": "https://social",
+        "_type": "social",
+        "label": "SNS 연결",
+        "layout": "small",
+        "tiktok": "",
+        "twitter": "nocturn_gallery",
+        "youtube": "nocturngallery",
+        "instagram": "nocturn.gallery",
+        "is_social": true
+      },
+      "custom_css": ""
+    }
+  ]
+}

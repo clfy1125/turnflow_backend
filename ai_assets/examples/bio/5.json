@@ -1,0 +1,264 @@
+{
+  "title": "",
+  "is_public": true,
+  "data": {
+    "design_settings": {
+      "logoStyle": "hidden",
+      "fontFamily": "Pretendard",
+      "buttonColor": "#818CF8",
+      "buttonShape": "rounded",
+      "blockBgColor": "",
+      "topMenuStyle": "icons",
+      "backgroundColor": "#18181B",
+      "backgroundImage": "",
+      "buttonAnimation": "none",
+      "buttonApplyMode": "partial",
+      "customLogoImage": "",
+      "shareButtonVisible": true,
+      "customColorPickerOpen": "bg",
+      "subscribeButtonVisible": true
+    }
+  },
+  "custom_css": "",
+  "blocks": [
+    {
+      "id": 467,
+      "type": "profile",
+      "order": 1,
+      "data": {
+        "subline": "여름의 가벼움, 도시의 감도",
+        "headline": "LUNE SUMMER",
+        "font_size": "lg",
+        "avatar_url": "https://images.unsplash.com/photo-1515886657613-9f3515b0c78f",
+        "profile_layout": "cover",
+        "cover_image_url": "https://images.unsplash.com/photo-1529139574466-a303027c1d8b"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 468,
+      "type": "single_link",
+      "order": 2,
+      "data": {
+        "url": "https://notice",
+        "_type": "notice",
+        "label": "공지",
+        "title": "SUMMER DROP 1 오픈 · 전상품 무료배송",
+        "content": "신상 린넨 셋업과 바캉스 원피스를 가장 먼저 만나보세요",
+        "link_url": "https://example.com/summer-drop",
+        "image_url": "https://images.unsplash.com/photo-1483985988355-763728e1935b",
+        "notice_layout": "banner"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 469,
+      "type": "single_link",
+      "order": 3,
+      "data": {
+        "url": "https://text",
+        "_type": "text",
+        "label": "텍스트",
+        "layout": "small",
+        "content": "가볍고 시원한 소재, 실루엣이 예쁜 여름 인기 아이템만 모았습니다.",
+        "headline": "이번 주 베스트",
+        "text_size": "md",
+        "_styleOpen": true,
+        "text_align": "left",
+        "text_layout": "default",
+        "_saved_bg_color": "#ffffff",
+        "custom_bg_color": "#ffffff",
+        "_saved_text_color": "#111827",
+        "custom_text_color": "#111827",
+        "_saved_button_color": "#8c25f4",
+        "custom_button_color": "#8c25f4",
+        "_saved_sub_text_color": "#6b7280",
+        "custom_input_bg_color": "",
+        "custom_sub_text_color": "#6b7280"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 470,
+      "type": "single_link",
+      "order": 4,
+      "data": {
+        "url": "https://example.com/products/linen-jacket",
+        "_type": "single_link",
+        "badge": "best,linen,set-up",
+        "label": "썸머 린넨 크롭 자켓",
+        "price": "59000",
+        "layout": "medium",
+        "_styleOpen": false,
+        "text_align": "left",
+        "description": "가볍게 걸치기 좋은 데일리 아우터",
+        "thumbnail_url": "https://images.unsplash.com/photo-1483985988355-763728e1935b",
+        "original_price": "79000",
+        "custom_bg_color": "#FFFDFB",
+        "custom_text_color": "#1F2937",
+        "custom_button_color": "#FF8A65"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 471,
+      "type": "single_link",
+      "order": 5,
+      "data": {
+        "url": "https://example.com/products/blue-dress",
+        "_type": "single_link",
+        "badge": "new,vacance,dress",
+        "label": "오션 블루 슬립 원피스",
+        "price": "68000",
+        "layout": "medium",
+        "text_align": "left",
+        "description": "휴양지 무드와 데일리룩 모두 가능한 원피스",
+        "thumbnail_url": "https://images.unsplash.com/photo-1496747611176-843222e1e57c",
+        "original_price": "89000",
+        "custom_bg_color": "#FFFDFB",
+        "custom_text_color": "#1F2937",
+        "custom_button_color": "#FF8A65"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 472,
+      "type": "single_link",
+      "order": 6,
+      "data": {
+        "url": "https://group",
+        "_type": "group_link",
+        "label": "카테고리 셀렉션",
+        "links": [
+          {
+            "id": "cat-1",
+            "url": "https://example.com/category/dresses",
+            "badge": "dress",
+            "price": "39000",
+            "title": "Vacation Dress",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1496747611176-843222e1e57c",
+            "original_price": "59000"
+          },
+          {
+            "id": "cat-2",
+            "url": "https://example.com/category/blouses",
+            "badge": "blouse",
+            "price": "29000",
+            "title": "Airy Blouse",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1483985988355-763728e1935b",
+            "original_price": "45000"
+          },
+          {
+            "id": "cat-3",
+            "url": "https://example.com/category/pants",
+            "badge": "pants",
+            "price": "35000",
+            "title": "Summer Pants",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1529139574466-a303027c1d8b",
+            "original_price": "52000"
+          },
+          {
+            "id": "cat-4",
+            "url": "https://example.com/category/bag",
+            "badge": "acc",
+            "price": "27000",
+            "title": "Beach Bag",
+            "is_enabled": true,
+            "thumbnail_url": "https://images.unsplash.com/photo-1509631179647-0177331693ae",
+            "original_price": "39000"
+          }
+        ],
+        "layout": "small",
+        "is_group": true,
+        "description": "",
+        "display_mode": "all",
+        "group_layout": "grid-2",
+        "custom_bg_color": "#FFFFFF",
+        "custom_text_color": "#111827",
+        "custom_button_color": "#FF8A65"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 473,
+      "type": "single_link",
+      "order": 7,
+      "data": {
+        "url": "https://spacer",
+        "_type": "spacer",
+        "label": "구분선",
+        "layout": "small",
+        "spacing": 28,
+        "divider_color": "#F4C7B8",
+        "divider_style": "wave",
+        "divider_width": 2
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 474,
+      "type": "single_link",
+      "order": 8,
+      "data": {
+        "url": "https://gallery",
+        "_type": "gallery",
+        "label": "갤러리",
+        "images": [
+          "https://images.unsplash.com/photo-1515886657613-9f3515b0c78f",
+          "https://images.unsplash.com/photo-1496747611176-843222e1e57c",
+          "https://images.unsplash.com/photo-1529139574466-a303027c1d8b"
+        ],
+        "layout": "small",
+        "auto_slide": true,
+        "keep_ratio": true,
+        "gallery_url": "https://example.com/lookbook",
+        "gallery_layout": "carousel",
+        "custom_bg_color": "#FFFFFF",
+        "custom_text_color": "#111827",
+        "custom_button_color": "#FFD9CC"
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 475,
+      "type": "single_link",
+      "order": 9,
+      "data": {
+        "url": "https://social",
+        "_type": "social",
+        "label": "SNS 연결",
+        "layout": "small",
+        "tiktok": "lunesummer",
+        "twitter": "lunesummer_official",
+        "youtube": "https://youtube.com/@lunesummer",
+        "instagram": "lune.summer",
+        "is_social": true
+      },
+      "custom_css": ""
+    },
+    {
+      "id": 476,
+      "type": "single_link",
+      "order": 10,
+      "data": {
+        "url": "https://customer",
+        "_type": "customer",
+        "label": "고객정보수집",
+        "layout": "small",
+        "button_text": "쿠폰 받기",
+        "collect_name": true,
+        "collect_email": true,
+        "collect_phone": true,
+        "custom_bg_color": "#FFF1EB",
+        "custom_text_color": "#111827",
+        "customer_headline": "신상 오픈 알림 받기",
+        "custom_button_color": "#FF8A65",
+        "customer_description": "가입 시 여름 시즌 10% 쿠폰을 보내드립니다"
+      },
+      "custom_css": ""
+    }
+  ]
+}

@@ -12,4 +12,5 @@ urlpatterns = [
     path("", include("apps.billing.urls")),
     path("integrations/", include("apps.integrations.urls")),
     path("pages/", include("apps.pages.urls", namespace="pages")),
+    path("ai/", include("apps.ai_jobs.urls", namespace="ai_jobs")),
 ]
