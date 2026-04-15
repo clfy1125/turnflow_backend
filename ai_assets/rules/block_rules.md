@@ -9,19 +9,115 @@
 ```typescript
 interface Block {
   id: number;
-  type: string;            // 아래 15개 타입 중 하나
+  type: string;            // DB 블록 타입. "profile" | "single_link" | "contact" (3개 중 하나)
   order: number;           // 표시 순서 (1부터)
   is_enabled: boolean;     // false면 비표시
-  data: BlockData;         // 타입별 데이터
+  data: BlockData;         // 타입별 데이터. single_link인 경우 data._type으로 서브타입 분기 (아래 참조)
   schedule_enabled?: boolean;
   publish_at?: string;     // ISO 날짜. 이 시각 이후 표시
   hide_at?: string;        // ISO 날짜. 이 시각 이후 숨김
 }
 ```
 
-### 공통 스타일 필드 (모든 블록)
+---
+
+## ⚠️ type vs data._type — 반드시 이해해야 하는 구조
+
+DB에 저장되는 `Block.type`은 **3가지**만 존재합니다 (모델: `BlockType`):
+
+| DB `type` 값 | 설명 |
+|---|---|
+| `profile` | 프로필 블록. `data`에 프로필 필드가 직접 들어감 (`_type` 없음) |
+| `single_link` | **대부분의 블록이 이 타입.** 실제 서브타입은 `data._type`으로 결정 |
+| `contact` | 연락처 블록 |
+
+### data._type — 실제 렌더링을 결정하는 서브타입
+
+`type: "single_link"`인 블록은 `data` 내부의 `_type` 필드로 **어떤 UI를 렌더링할지** 분기합니다.
 
 ```typescript
+// type: "single_link" 블록의 data 구조
+interface SingleLinkBlockData {
+  _type: string;    // 아래 14개 서브타입 중 하나 — 이 값이 실제 렌더링 분기점
+  label: string;    // 블록 라벨 (프론트엔드 편집 UI용)
+  layout: string;   // "small" | "medium" | "large"
+  url: string;      // 블록 URL (서브타입에 따라 의미가 다름)
+  // ... 서브타입별 추가 필드
+}
+```
+
+| `data._type` 값 | 설명 | 문서 내 섹션 |
+|---|---|---|
+| `single_link` | 단일 URL 링크 버튼 | §2 |
+| `group_link` | 여러 링크 그룹 (폴더형) | §3 |
+| `social` | SNS 아이콘 모음 | §4 |
+| `video` | 동영상 임베드 | §5 |
+| `text` | 텍스트 블록 | §6 |
+| `gallery` | 이미지 갤러리 | §7 |
+| `spacer` | 구분선/여백 | §8 |
+| `map` | 지도 | §9 |
+| `notice` | 공지 배너/팝업 | §10 |
+| `inquiry` | 고객문의 폼 | §11 |
+| `customer` | 고객정보 수집 폼 | §12 |
+| `search` | 블록 내 검색 | §13 |
+| `folder` | 하위 블록 컨테이너 | §14 |
+| `schedule` | 일정 캘린더 | §15 |
+
+### 예시: 실제 블록 JSON
+
+```jsonc
+// ✅ profile 블록 — type이 직접 "profile"이며, data에 _type 없음
+{
+  "id": 1,
+  "type": "profile",
+  "order": 1,
+  "data": {
+    "headline": "BLACK NOISE",
+    "subline": "서울 기반 얼터너티브 록 밴드",
+    "avatar_url": "https://...",
+    "profile_layout": "cover"
+  }
+}
+
+// ✅ 공지 블록 — type은 "single_link"이고, data._type이 "notice"
+{
+  "id": 2,
+  "type": "single_link",
+  "order": 2,
+  "data": {
+    "_type": "notice",
+    "label": "공지",
+    "title": "2026 TOUR 티켓 오픈",
+    "content": "서울 · 부산 공연 예매 시작",
+    "notice_layout": "banner",
+    "link_url": "https://example.com/tour"
+  }
+}
+
+// ✅ 갤러리 블록 — type은 "single_link"이고, data._type이 "gallery"
+{
+  "id": 3,
+  "type": "single_link",
+  "order": 3,
+  "data": {
+    "_type": "gallery",
+    "label": "갤러리",
+    "images": ["https://..."],
+    "gallery_layout": "carousel",
+    "auto_slide": true
+  }
+}
+```
+
+> **핵심:** 블록의 `type`이 `"single_link"`이면 반드시 `data._type`을 확인해야 실제 블록 종류를 알 수 있습니다.
+> `type`이 `"profile"`이면 `data._type` 없이 바로 프로필 데이터입니다.
+
+---
+
+### 공통 스타일 필드 (모든 블록의 data 내부)
+
+```typescript
+// data 안에 선택적으로 포함 가능
 custom_bg_color?: string;      // 블록 배경색
 custom_border_color?: string;  // 블록 테두리색
 custom_text_color?: string;    // 블록 텍스트색
@@ -32,17 +128,19 @@ custom_button_color?: string;  // 블록 버튼색
 
 ## 블록 순서 규칙
 
-| 블록 | 위치 |
+| 블록 (`data._type`) | 위치 |
 |------|------|
-| `profile` | 항상 최상단 (1번) |
-| `notice` | profile 바로 아래 (2번) |
+| `profile` (type 자체가 profile) | 항상 최상단 (1번) |
+| `notice` (`_type: "notice"`) | profile 바로 아래 (2번) |
 | 나머지 | 자유 정렬 |
 
 ---
 
-## 15개 블록 타입 스펙
+## 블록 서브타입 상세 스펙 (총 15종: profile 1개 + single_link 서브타입 14개)
 
-### 1. profile
+### 1. profile — `type: "profile"` (DB 타입이 직접 profile)
+
+> ⚠️ 유일하게 `data._type`이 없는 블록. `type` 자체가 `"profile"`입니다.
 
 프로필 소개. 이름, 소개문구, 프로필 사진 표시.
 
@@ -70,7 +168,9 @@ custom_button_color?: string;  // 블록 버튼색
 
 ---
 
-### 2. single_link
+### 2. single_link — `type: "single_link"` + `data._type: "single_link"`
+
+> DB `type`과 `data._type`이 동일하게 `"single_link"`인 경우. 순수한 단일 URL 링크 버튼.
 
 단일 URL 링크 버튼. 클릭 시 해당 URL로 이동.
 
@@ -99,7 +199,7 @@ custom_button_color?: string;  // 블록 버튼색
 
 ---
 
-### 3. group_link
+### 3. group_link — `type: "single_link"` + `data._type: "group_link"`
 
 여러 링크를 폴더처럼 그룹화.
 
@@ -136,7 +236,7 @@ custom_button_color?: string;  // 블록 버튼색
 
 ---
 
-### 4. social
+### 4. social — `type: "single_link"` + `data._type: "social"`
 
 SNS 및 연락처 아이콘 모음. 값이 있는 플랫폼만 아이콘 표시.
 
@@ -171,7 +271,7 @@ SNS 및 연락처 아이콘 모음. 값이 있는 플랫폼만 아이콘 표시.
 
 ---
 
-### 5. video
+### 5. video — `type: "single_link"` + `data._type: "video"`
 
 동영상 임베드. YouTube, TikTok, Vimeo, Dailymotion 지원.
 
@@ -190,7 +290,7 @@ SNS 및 연락처 아이콘 모음. 값이 있는 플랫폼만 아이콘 표시.
 
 ---
 
-### 6. text
+### 6. text — `type: "single_link"` + `data._type: "text"`
 
 텍스트 블록. 대표문구(headline) + 상세문구(content).
 
@@ -212,7 +312,7 @@ SNS 및 연락처 아이콘 모음. 값이 있는 플랫폼만 아이콘 표시.
 
 ---
 
-### 7. gallery
+### 7. gallery — `type: "single_link"` + `data._type: "gallery"`
 
 이미지 갤러리. 최대 10장.
 
@@ -235,7 +335,7 @@ SNS 및 연락처 아이콘 모음. 값이 있는 플랫폼만 아이콘 표시.
 
 ---
 
-### 8. spacer
+### 8. spacer — `type: "single_link"` + `data._type: "spacer"`
 
 구분선 + 여백.
 
@@ -254,7 +354,7 @@ SNS 및 연락처 아이콘 모음. 값이 있는 플랫폼만 아이콘 표시.
 
 ---
 
-### 9. map
+### 9. map — `type: "single_link"` + `data._type: "map"`
 
 지도 블록. 주소 기반 지도 표시.
 
@@ -269,7 +369,7 @@ SNS 및 연락처 아이콘 모음. 값이 있는 플랫폼만 아이콘 표시.
 
 ---
 
-### 10. notice
+### 10. notice — `type: "single_link"` + `data._type: "notice"`
 
 상단 공지 배너 또는 팝업.
 
@@ -289,7 +389,7 @@ SNS 및 연락처 아이콘 모음. 값이 있는 플랫폼만 아이콘 표시.
 
 ---
 
-### 11. inquiry
+### 11. inquiry — `type: "single_link"` + `data._type: "inquiry"`
 
 고객문의 접수 폼.
 
@@ -310,7 +410,7 @@ SNS 및 연락처 아이콘 모음. 값이 있는 플랫폼만 아이콘 표시.
 
 ---
 
-### 12. customer
+### 12. customer — `type: "single_link"` + `data._type: "customer"`
 
 고객정보 수집 폼.
 
@@ -330,7 +430,7 @@ SNS 및 연락처 아이콘 모음. 값이 있는 플랫폼만 아이콘 표시.
 
 ---
 
-### 13. search
+### 13. search — `type: "single_link"` + `data._type: "search"`
 
 페이지 내 블록 검색.
 
@@ -344,7 +444,7 @@ SNS 및 연락처 아이콘 모음. 값이 있는 플랫폼만 아이콘 표시.
 
 ---
 
-### 14. folder
+### 14. folder — `type: "single_link"` + `data._type: "folder"`
 
 다른 블록들을 하위에 포함하는 컨테이너. 토글(접기/펼치기) 또는 팝업 모드.
 
@@ -374,7 +474,7 @@ SNS 및 연락처 아이콘 모음. 값이 있는 플랫폼만 아이콘 표시.
 
 ---
 
-### 15. schedule
+### 15. schedule — `type: "single_link"` + `data._type: "schedule"`
 
 일정 블록. 캘린더 또는 리스트로 일정 표시.
 
