@@ -252,9 +252,17 @@ PayApp은 HTTP 200 + body `SUCCESS`를 기대합니다.
 
         if payment.subscription:
             sub = payment.subscription
-            sub.status = SubscriptionStatus.CANCELLED
+            free_plan = SubscriptionPlan.objects.filter(name="free").first()
+            if free_plan:
+                sub.plan = free_plan
+            sub.status = SubscriptionStatus.ACTIVE
             sub.cancelled_at = timezone.now()
-            sub.save(update_fields=["status", "cancelled_at", "updated_at"])
+            sub.payapp_rebill_no = None
+            sub.payapp_pay_url = None
+            sub.save(update_fields=[
+                "plan", "status", "cancelled_at",
+                "payapp_rebill_no", "payapp_pay_url", "updated_at",
+            ])
 
         logger.info("PayApp 승인취소 처리: mul_no=%s", mul_no)
 
