@@ -14,16 +14,38 @@ import logging
 from datetime import timedelta
 from urllib.parse import urlparse
 
-import requests as http_requests
 from django.core.cache import cache
 from django.db.models import Count, Q
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 
-# ip-api.com 무료 플랜: 분당 45회, 키 불필요
-_IP_API_URL = "http://ip-api.com/json/{ip}?fields=countryCode"
-_IP_CACHE_TTL = 60 * 60 * 24  # 24시간 (같은 IP는 재요청 안 함)
+# ─── GeoIP2 로컬 DB (MaxMind GeoLite2) ───────────────────────
+# ip-api.com 외부 호출 대신 로컬 DB를 사용하여 블로킹 없이 국가 조회
+_geoip_reader = None
+
+def _get_geoip_reader():
+    """GeoIP2 Reader를 lazy-load로 초기화 (싱글턴)."""
+    global _geoip_reader
+    if _geoip_reader is not None:
+        return _geoip_reader
+    try:
+        import geoip2.database
+        import os
+        db_path = os.environ.get(
+            "GEOIP_DB_PATH",
+            "/app/geoip/GeoLite2-Country.mmdb",
+        )
+        if os.path.exists(db_path):
+            _geoip_reader = geoip2.database.Reader(db_path)
+            logger.info("GeoIP2 DB loaded: %s", db_path)
+        else:
+            logger.warning("GeoIP2 DB not found: %s — country lookup disabled", db_path)
+    except ImportError:
+        logger.warning("geoip2 패키지 미설치 — country lookup disabled")
+    except Exception as e:
+        logger.warning("GeoIP2 DB load failed: %s", e)
+    return _geoip_reader
 
 # ─── 상수 ────────────────────────────────────────────────────
 
@@ -138,13 +160,12 @@ def _get_real_ip(request) -> str:
 
 def _lookup_country_by_ip(ip: str) -> str:
     """
-    ip-api.com으로 국가 코드 조회.
-    결과를 24시간 캐시하여 반복 호출 방지.
+    GeoIP2 로컬 DB로 국가 코드 조회.
+    외부 HTTP 호출 없이 메모리에서 즉시 반환 (~0.01ms).
     loopback/private IP는 건너뜀.
     """
     if not ip or ip in ("127.0.0.1", "::1", "localhost"):
         return ""
-    # private 대역 (10.x, 172.16-31.x, 192.168.x) 건너뜀
     import ipaddress
     try:
         if ipaddress.ip_address(ip).is_private:
@@ -152,25 +173,16 @@ def _lookup_country_by_ip(ip: str) -> str:
     except ValueError:
         return ""
 
-    cache_key = f"geoip:{ip}"
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return cached
+    reader = _get_geoip_reader()
+    if reader is None:
+        return ""
 
     try:
-        resp = http_requests.get(
-            _IP_API_URL.format(ip=ip),
-            timeout=1.5,
-        )
-        data = resp.json()
-        code = data.get("countryCode", "").upper().strip()
-        result = code if len(code) == 2 and code.isalpha() else ""
-    except Exception as e:
-        logger.debug("ip-api lookup failed for %s: %s", ip, e)
-        result = ""
-
-    cache.set(cache_key, result, _IP_CACHE_TTL)
-    return result
+        response = reader.country(ip)
+        code = response.country.iso_code or ""
+        return code.upper().strip() if len(code) == 2 and code.isalpha() else ""
+    except Exception:
+        return ""
 
 
 def get_country(request) -> str:

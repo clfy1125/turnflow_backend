@@ -24,7 +24,13 @@ RUN pip install --upgrade pip && \
 
 # 애플리케이션 코드 복사
 COPY . .
-
+# GeoLite2 Country DB 다운로드 (MaxMind 무료 DB)
+RUN mkdir -p /app/geoip && \
+    apt-get update && apt-get install -y --no-install-recommends curl && \
+    curl -sSL -o /tmp/GeoLite2-Country.tar.gz \
+      "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-Country.mmdb" && \
+    mv /tmp/GeoLite2-Country.tar.gz /app/geoip/GeoLite2-Country.mmdb && \
+    rm -rf /var/lib/apt/lists/*
 # 로그 디렉토리 생성
 RUN mkdir -p /app/logs
 
