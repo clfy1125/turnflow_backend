@@ -3,6 +3,7 @@ services:
     image: postgres:16-alpine
     container_name: turnflow_instagram_db
     restart: unless-stopped
+    command: postgres -c max_connections=500
     env_file:
       - .env.production
     environment:
@@ -44,7 +45,7 @@ services:
     command: >
       sh -c "python manage.py collectstatic --noinput &&
              python manage.py migrate --noinput &&
-             gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 3 --timeout 120"
+             gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 60 --timeout 120"
     env_file:
       - .env.production
     environment:
@@ -69,7 +70,7 @@ services:
     image: turnflow_instagram_web
     container_name: turnflow_instagram_celery
     restart: unless-stopped
-    command: celery -A config worker -l info
+    command: celery -A config worker --concurrency=32 -l info
     env_file:
       - .env.production
     environment:
