@@ -224,17 +224,23 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
 
         token_cost = AiJob.TOKEN_COST
 
-        # 토큰 잔액 확인
-        token_balance = AiTokenBalance.get_or_create_for_user(request.user)
-        if not token_balance.has_enough(token_cost):
-            return Response(
-                {
-                    "detail": "AI 토큰이 부족합니다.",
-                    "token_balance": token_balance.balance,
-                    "token_cost": token_cost,
-                },
-                status=status.HTTP_402_PAYMENT_REQUIRED,
-            )
+        # Pro 플랜은 토큰 무제한
+        from apps.billing.subscription_utils import get_user_plan
+        user_plan = get_user_plan(request.user)
+        is_pro = user_plan.name != "free"
+
+        if not is_pro:
+            # 토큰 잔액 확인 (무료 플랜만)
+            token_balance = AiTokenBalance.get_or_create_for_user(request.user)
+            if not token_balance.has_enough(token_cost):
+                return Response(
+                    {
+                        "detail": "AI 토큰이 부족합니다.",
+                        "token_balance": token_balance.balance,
+                        "token_cost": token_cost,
+                    },
+                    status=status.HTTP_402_PAYMENT_REQUIRED,
+                )
 
         # slug로 기존 페이지 리메이크
         page = None

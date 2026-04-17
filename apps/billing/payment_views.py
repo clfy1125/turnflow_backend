@@ -218,10 +218,18 @@ PayApp은 HTTP 200 + body `SUCCESS`를 기대합니다.
         sub.cancelled_at = None
         if rebill_no:
             sub.payapp_rebill_no = rebill_no
+        # 유료 플랜 최초 활성화 시각 기록 (환불 7일 심사용)
+        if sub.plan.name != "free" and not sub.pro_activated_at:
+            sub.pro_activated_at = now
         sub.save(update_fields=[
             "plan", "status", "current_period_start", "current_period_end",
-            "cancelled_at", "payapp_rebill_no", "updated_at",
+            "cancelled_at", "payapp_rebill_no", "pro_activated_at", "updated_at",
         ])
+
+        # 페이지 전체 활성화 (유료 전환 시)
+        if sub.plan.name != "free":
+            from apps.pages.models import Page
+            Page.objects.filter(user=sub.user, is_active=False).update(is_active=True)
 
         # AI 토큰 부여
         monthly_tokens = sub.plan.features.get("monthly_ai_tokens", 0)
@@ -239,7 +247,7 @@ PayApp은 HTTP 200 + body `SUCCESS`를 기대합니다.
 
     @staticmethod
     def _handle_payment_cancelled(data: dict):
-        """pay_state=9,64: 승인취소(환불) 처리."""
+        """pay_state=9,64: 승인취소(환불) 처리 + 전체 다운그레이드 정리."""
         mul_no = data.get("mul_no", "")
         try:
             payment = PaymentHistory.objects.get(payapp_mul_no=mul_no)
@@ -254,15 +262,24 @@ PayApp은 HTTP 200 + body `SUCCESS`를 기대합니다.
             sub = payment.subscription
             free_plan = SubscriptionPlan.objects.filter(name="free").first()
             if free_plan:
-                sub.plan = free_plan
-            sub.status = SubscriptionStatus.ACTIVE
-            sub.cancelled_at = timezone.now()
-            sub.payapp_rebill_no = None
-            sub.payapp_pay_url = None
-            sub.save(update_fields=[
-                "plan", "status", "cancelled_at",
-                "payapp_rebill_no", "payapp_pay_url", "updated_at",
-            ])
+                from .tasks import _downgrade_to_free
+                _downgrade_to_free(sub, free_plan, reason="payment_cancelled")
+
+                # 환불 시 구독 결제로 부여된 AI 토큰 회수
+                token_balance = AiTokenBalance.objects.filter(user=sub.user).first()
+                if token_balance and payment.payapp_rebill_no:
+                    # 해당 결제로 부여된 토큰을 추정하여 차감
+                    from .models import AiTokenLedger
+                    granted = AiTokenLedger.objects.filter(
+                        user=sub.user,
+                        amount__gt=0,
+                        description__contains="구독 결제 토큰 지급",
+                    ).order_by("-created_at").first()
+                    if granted and token_balance.balance >= granted.amount:
+                        token_balance.deduct(
+                            granted.amount,
+                            description=f"환불에 따른 토큰 회수 (mul_no={mul_no})",
+                        )
 
         logger.info("PayApp 승인취소 처리: mul_no=%s", mul_no)
 
@@ -465,8 +482,112 @@ payments.forEach(p => {
 
 
 # ──────────────────────────────────────────────
-# 4) 결제 환불 요청
+# 4) 환불 적격성 확인 + 환불 요청
 # ──────────────────────────────────────────────
+
+REFUND_WINDOW_DAYS = 7  # 환불 가능 기간 (일)
+
+
+def _check_pro_feature_usage(user, sub) -> dict:
+    """
+    프로 기능 사용 여부를 조사하여 환불 적격성을 판단한다.
+    Returns: {"eligible": bool, "reasons": list[str], "details": dict}
+    """
+    from apps.pages.models import Page
+    from .models import AiTokenLedger
+
+    reasons = []
+    details = {}
+
+    # 1) 유료 활성화 후 7일 이내인지
+    if sub.pro_activated_at:
+        days_since = (timezone.now() - sub.pro_activated_at).days
+        details["days_since_activation"] = days_since
+        if days_since > REFUND_WINDOW_DAYS:
+            reasons.append(f"유료 플랜 활성화 후 {REFUND_WINDOW_DAYS}일이 경과했습니다.")
+    else:
+        reasons.append("유료 플랜 활성화 기록이 없습니다.")
+
+    # 2) 페이지 수 조사 (가입 시 1개 → 2개 이상이면 pro 기능 사용)
+    page_count = Page.objects.filter(user=user).count()
+    details["page_count"] = page_count
+    if page_count > 1:
+        reasons.append(f"프로 기능으로 페이지를 {page_count}개 보유 중입니다 (무료는 1개).")
+
+    # 3) 구독 결제 후 부여된 AI 토큰 사용 확인
+    if sub.pro_activated_at:
+        tokens_used = AiTokenLedger.objects.filter(
+            user=user,
+            amount__lt=0,
+            created_at__gte=sub.pro_activated_at,
+        ).count()
+        details["ai_tokens_used_since_pro"] = tokens_used
+        if tokens_used > 0:
+            reasons.append(f"프로 플랜 기간 중 AI 토큰 {tokens_used}회 사용했습니다.")
+
+    # 4) 로고 제거 사용 여부 (logoStyle == "hidden")
+    logo_removed_pages = Page.objects.filter(
+        user=user,
+        data__design_settings__logoStyle="hidden",
+    ).count()
+    details["logo_removed_pages"] = logo_removed_pages
+    if logo_removed_pages > 0:
+        reasons.append(f"로고 제거 기능을 {logo_removed_pages}개 페이지에서 사용했습니다.")
+
+    # 5) 커스텀 CSS 사용 여부
+    css_pages = Page.objects.filter(user=user).exclude(custom_css="").count()
+    details["custom_css_pages"] = css_pages
+    if css_pages > 0:
+        reasons.append(f"커스텀 CSS를 {css_pages}개 페이지에서 사용했습니다.")
+
+    eligible = len(reasons) == 0
+    return {"eligible": eligible, "reasons": reasons, "details": details}
+
+
+class RefundEligibilityView(APIView):
+    """환불 가능 여부 확인"""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["사용자플랜"],
+        summary="환불 가능 여부 확인",
+        description="""
+## 목적
+현재 사용자의 **환불 가능 여부**를 확인합니다.
+프론트엔드에서 환불 버튼 표시 여부를 결정하는 데 사용합니다.
+
+## 환불 가능 조건
+모든 조건을 **동시에** 만족해야 환불 가능:
+1. 유료 플랜 활성화 후 7일 이내
+2. 페이지를 1개만 보유 (추가 생성 안 함)
+3. AI 토큰 미사용 (프로 구독 이후)
+4. 로고 제거 기능 미사용
+5. 커스텀 CSS 미사용
+
+## 응답 필드
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `eligible` | bool | 환불 가능 여부 |
+| `reasons` | array[string] | 환불 불가 사유 목록. 빈 배열이면 환불 가능 |
+| `details` | object | 상세 조사 결과 |
+        """,
+        responses={
+            200: OpenApiResponse(description="환불 가능 여부"),
+            400: OpenApiResponse(description="무료 플랜 사용자"),
+        },
+    )
+    def get(self, request):
+        from .subscription_utils import ensure_subscription
+        sub = ensure_subscription(request.user)
+
+        if sub.plan.name == "free":
+            return Response(
+                {"eligible": False, "reasons": ["무료 플랜 사용자는 환불 대상이 아닙니다."], "details": {}},
+            )
+
+        result = _check_pro_feature_usage(request.user, sub)
+        return Response(result)
 
 
 class RefundPaymentView(APIView):
@@ -480,60 +601,31 @@ class RefundPaymentView(APIView):
         description="""
 ## 목적
 특정 결제건에 대해 **전체 환불**을 요청합니다.
-PayApp `paycancel` API를 통해 결제 승인을 취소합니다.
-
-## 인증
-`Authorization: Bearer <access_token>` 헤더 필수
-
-## 사용 시나리오
-- 설정 > 결제 내역 > 특정 결제 환불 버튼
-
-## 요청 필드
-| 필드 | 필수 | 타입 | 설명 |
-|------|------|------|------|
-| `reason` | 선택 | string | 환불 사유. 기본값: "고객 요청 환불" |
+프로 기능 미사용 + 결제 후 7일 이내인 경우에만 환불 가능합니다.
 
 ## 환불 조건
 | 조건 | 설명 |
 |------|------|
-| 본인 결제만 | 로그인 사용자의 결제건만 환불 가능 |
-| 결제완료 상태만 | `status=paid`인 건만 환불 가능 |
-| PayApp mul_no 필수 | PayApp 결제요청번호가 있어야 PG 환불 가능 |
+| 본인 결제 | 로그인 사용자의 결제건만 |
+| 결제완료(paid) | 상태가 paid인 건만 |
+| 7일 이내 | 유료 플랜 활성화 후 7일 이내 |
+| 프로 기능 미사용 | 페이지 추가 생성, AI 사용, 로고 제거, CSS 편집 없어야 함 |
 
-## 주의사항
-- 결제 승인 후 **D+5일 경과** 또는 **판매자 정산 완료** 시 PG 즉시 취소 불가
-- 환불 성공 시 feedbackurl로도 취소 통보(pay_state=9)가 발생
-
-## 프론트엔드 통합
-```typescript
-const res = await fetch(`/api/v1/billing/payments/${paymentId}/refund/`, {
-  method: 'POST',
-  headers: {
-    'Content-Type': 'application/json',
-    'Authorization': `Bearer ${accessToken}`
-  },
-  body: JSON.stringify({ reason: '서비스 불만족' })
-});
-
-if (res.ok) {
-  alert('환불이 처리되었습니다.');
-}
-```
+## 요청 필드
+| 필드 | 필수 | 타입 | 설명 |
+|------|------|------|------|
+| `reason` | 선택 | string | 환불 사유 |
 
 ## 에러
 | 코드 | 원인 |
 |------|------|
-| 400 | 환불 불가 상태 (이미 환불됨, pending 등) |
-| 401 | 인증 실패 |
-| 404 | 결제건 없음 또는 본인 결제 아님 |
-| 502 | PayApp API 호출 실패 |
+| 400 | 환불 불가 (프로 기능 사용, 7일 초과), 이미 환불됨 |
+| 404 | 결제건 없음 |
+| 502 | PayApp API 오류 |
         """,
         responses={
-            200: OpenApiResponse(
-                response=PaymentHistorySerializer,
-                description="환불 완료된 결제 정보",
-            ),
-            400: OpenApiResponse(description="환불 불가 상태"),
+            200: OpenApiResponse(response=PaymentHistorySerializer, description="환불 완료"),
+            400: OpenApiResponse(description="환불 불가"),
             404: OpenApiResponse(description="결제건 없음"),
             502: OpenApiResponse(description="PayApp API 오류"),
         },
@@ -556,6 +648,21 @@ if (res.ok) {
         if not payment.payapp_mul_no:
             return Response(
                 {"detail": "PayApp 결제 정보가 없어 환불할 수 없습니다."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 프로 기능 사용 여부 확인
+        from .subscription_utils import ensure_subscription
+        sub = ensure_subscription(request.user)
+        usage_check = _check_pro_feature_usage(request.user, sub)
+
+        if not usage_check["eligible"]:
+            return Response(
+                {
+                    "detail": "환불 조건을 충족하지 않습니다.",
+                    "reasons": usage_check["reasons"],
+                    "details": usage_check["details"],
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 

@@ -242,6 +242,20 @@ await api.patch('/api/pages/me/', { is_public: false });
     )
     def patch(self, request):
         page, _ = Page.get_or_create_for_user(request.user)
+
+        # ── 프로 기능 제한: 로고 제거 ──
+        from apps.billing.subscription_utils import check_feature
+        new_data = request.data.get("data")
+        if new_data and isinstance(new_data, dict):
+            new_logo = new_data.get("design_settings", {}).get("logoStyle")
+            if new_logo == "hidden":
+                old_logo = (page.data or {}).get("design_settings", {}).get("logoStyle")
+                if old_logo != "hidden" and not check_feature(request.user, "remove_logo"):
+                    return Response(
+                        {"detail": "로고 제거는 프로 플랜 이상에서 사용 가능합니다."},
+                        status=status.HTTP_403_FORBIDDEN,
+                    )
+
         serializer = PageSerializer(page, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
@@ -330,6 +344,13 @@ export async function getServerSideProps({ params }) {
             page = Page.objects.get(slug=slug)
         except Page.DoesNotExist:
             return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+
+        # 비활성 페이지 접근 차단 (소유자에게도 비활성은 공개 불가)
+        if not page.is_active:
+            if not request.user.is_authenticated or page.user != request.user:
+                return Response(
+                    {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+                )
 
         # 비공개면 소유자만 허용
         if not page.is_public:
@@ -935,6 +956,16 @@ if (page.custom_css) {
     )
     def patch(self, request):
         page, _ = Page.get_or_create_for_user(request.user)
+
+        # ── 프로 기능 제한: 커스텀 CSS ──
+        from apps.billing.subscription_utils import check_feature
+        new_css = request.data.get("custom_css", "")
+        if new_css and not check_feature(request.user, "custom_css"):
+            return Response(
+                {"detail": "커스텀 CSS는 프로 플랜 이상에서 사용 가능합니다."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         serializer = CustomCssSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         page.custom_css = serializer.validated_data["custom_css"]
@@ -1029,6 +1060,16 @@ await api.patch(`/api/v1/pages/me/blocks/${blockId}/css/`, {
         block = Block.objects.filter(pk=pk, page=page).first()
         if not block:
             return Response({"detail": "블록을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+
+        # ── 프로 기능 제한: 커스텀 CSS ──
+        from apps.billing.subscription_utils import check_feature
+        new_css = request.data.get("custom_css", "")
+        if new_css and not check_feature(request.user, "custom_css"):
+            return Response(
+                {"detail": "커스텀 CSS는 프로 플랜 이상에서 사용 가능합니다."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         serializer = CustomCssSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         block.custom_css = serializer.validated_data["custom_css"]

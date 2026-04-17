@@ -264,6 +264,15 @@ const { data: pages } = await api.get('/api/v1/pages/multipages/');
         serializer.is_valid(raise_exception=True)
         vd = serializer.validated_data
 
+        # ── 플랜 페이지 수 제한 ──
+        from apps.billing.subscription_utils import check_limit
+        current_page_count = Page.objects.filter(user=request.user).count()
+        if not check_limit(request.user, "max_pages", current_page_count):
+            return Response(
+                {"detail": "현재 플랜의 최대 페이지 수에 도달했습니다. 업그레이드 후 이용해주세요."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         slug = vd.get("slug") or None
         if not slug:
             from .models import _generate_unique_slug
@@ -410,6 +419,20 @@ class MultiPageDetailView(APIView):
         page = _get_owned_page(request, page_id)
         if not page:
             return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+
+        # ── 프로 기능 제한: 로고 제거 ──
+        from apps.billing.subscription_utils import check_feature
+        new_data = request.data.get("data")
+        if new_data and isinstance(new_data, dict):
+            new_logo = new_data.get("design_settings", {}).get("logoStyle")
+            if new_logo == "hidden":
+                old_logo = (page.data or {}).get("design_settings", {}).get("logoStyle")
+                if old_logo != "hidden" and not check_feature(request.user, "remove_logo"):
+                    return Response(
+                        {"detail": "로고 제거는 프로 플랜 이상에서 사용 가능합니다."},
+                        status=status.HTTP_403_FORBIDDEN,
+                    )
+
         serializer = MultiPageSerializer(page, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
@@ -658,6 +681,16 @@ await api.patch(`/api/v1/pages/multipages/${pageId}/css/`, { custom_css: '' });
         page = _get_owned_page(request, page_id)
         if not page:
             return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+
+        # ── 프로 기능 제한: 커스텀 CSS ──
+        from apps.billing.subscription_utils import check_feature
+        new_css = request.data.get("custom_css", "")
+        if new_css and not check_feature(request.user, "custom_css"):
+            return Response(
+                {"detail": "커스텀 CSS는 프로 플랜 이상에서 사용 가능합니다."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         serializer = CustomCssSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         page.custom_css = serializer.validated_data["custom_css"]
@@ -754,6 +787,16 @@ await api.patch(`/api/v1/pages/multipages/${pageId}/blocks/${blockId}/css/`, {
         block = Block.objects.filter(pk=block_id, page=page).first()
         if not block:
             return Response({"detail": "블록을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+
+        # ── 프로 기능 제한: 커스텀 CSS ──
+        from apps.billing.subscription_utils import check_feature
+        new_css = request.data.get("custom_css", "")
+        if new_css and not check_feature(request.user, "custom_css"):
+            return Response(
+                {"detail": "커스텀 CSS는 프로 플랜 이상에서 사용 가능합니다."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         serializer = CustomCssSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         block.custom_css = serializer.validated_data["custom_css"]

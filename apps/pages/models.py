@@ -45,6 +45,11 @@ class Page(models.Model):
         verbose_name="커스텀 CSS",
         help_text="사용자가 자유롭게 작성하는 CSS. 공개 페이지 렌더링 시 <style> 태그로 주입됩니다.",
     )
+    is_active = models.BooleanField(
+        default=True,
+        verbose_name="활성 상태",
+        help_text="비활성 페이지는 공개 URL로 접근 불가. 다운그레이드 시 플랜 한도에 맞춰 비활성화됩니다.",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

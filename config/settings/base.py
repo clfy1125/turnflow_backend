@@ -254,6 +254,11 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": 60 * 60 * 24,
         "options": {"queue": "billing"},
     },
+    "handle-cancelled-expiry": {
+        "task": "billing.handle_cancelled_expiry",
+        "schedule": 60 * 60 * 24,
+        "options": {"queue": "billing"},
+    },
 }
 
 # PayApp 결제 연동

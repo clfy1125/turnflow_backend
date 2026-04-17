@@ -31,13 +31,27 @@ def ensure_subscription(user):
     return sub
 
 
+def get_effective_plan(user):
+    """
+    User의 현재 실질적으로 적용할 SubscriptionPlan 반환.
+    cancelled 상태여도 current_period_end 전이면 기존 유료 플랜을 반환.
+    """
+    from .models import SubscriptionStatus
+
+    sub = ensure_subscription(user)
+    if sub.status == SubscriptionStatus.CANCELLED:
+        if sub.current_period_end and sub.current_period_end > timezone.now():
+            return sub.plan  # 기간 내 → 유료 기능 유지
+        return get_free_plan()
+    return sub.plan
+
+
 def get_user_plan(user):
     """
     User의 현재 SubscriptionPlan 반환.
     구독이 없으면 Free plan 반환.
     """
-    sub = ensure_subscription(user)
-    return sub.plan
+    return get_effective_plan(user)
 
 
 def check_feature(user, feature_name):

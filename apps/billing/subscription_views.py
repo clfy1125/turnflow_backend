@@ -398,13 +398,13 @@ if (data.pay_url) {
 
         # ── 유료 → Free 다운그레이드 ──
         if new_plan.name == "free":
-            # 기존 정기결제 해지
+            # 정기결제 일시정지 (cancel이 아닌 stop) → 기간 내 재개 가능
             if sub.payapp_rebill_no:
                 try:
-                    PayAppClient.cancel_rebill(sub.payapp_rebill_no)
+                    PayAppClient.pause_rebill(sub.payapp_rebill_no)
                 except PayAppError:
                     logger.warning(
-                        "PayApp 정기결제 해지 실패: rebill_no=%s", sub.payapp_rebill_no
+                        "PayApp 정기결제 일시정지 실패: rebill_no=%s", sub.payapp_rebill_no
                     )
 
             sub.status = SubscriptionStatus.CANCELLED
@@ -562,13 +562,13 @@ if (res.ok) {
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # PayApp 정기결제 해지
+        # 정기결제 일시정지 (rebillStop) — 기간 내 재개 가능
         if sub.payapp_rebill_no:
             try:
-                PayAppClient.cancel_rebill(sub.payapp_rebill_no)
+                PayAppClient.pause_rebill(sub.payapp_rebill_no)
             except PayAppError:
                 logger.warning(
-                    "PayApp 정기결제 해지 실패: rebill_no=%s", sub.payapp_rebill_no
+                    "PayApp 정기결제 일시정지 실패: rebill_no=%s", sub.payapp_rebill_no
                 )
 
         sub.status = SubscriptionStatus.CANCELLED
@@ -576,3 +576,211 @@ if (res.ok) {
         sub.save(update_fields=["status", "cancelled_at", "updated_at"])
 
         return Response(UserSubscriptionSerializer(sub).data)
+
+
+class ResumeSubscriptionView(APIView):
+    """취소(일시정지)된 구독 재개"""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["사용자플랜"],
+        summary="구독 재개",
+        description="""
+## 목적
+취소(일시정지)한 유료 구독을 **재개(rebillStart)** 합니다.
+`current_period_end` 이전에만 재개 가능합니다.
+
+## 동작
+- PayApp `rebillStart` 호출 → 다음 주기부터 자동결제 재개
+- `status`가 `active`로 복원, `cancelled_at`이 초기화됩니다
+
+## 재개 불가 조건
+| 상황 | 응답 코드 | 메시지 |
+|------|-----------|--------|
+| 취소 상태가 아닌 구독 | 400 | "취소된 구독만 재개할 수 있습니다." |
+| 구독 기간 만료 | 400 | "구독 기간이 만료되어 재개할 수 없습니다. 새로 결제해주세요." |
+        """,
+        responses={
+            200: OpenApiResponse(response=UserSubscriptionSerializer, description="재개된 구독 정보"),
+            400: OpenApiResponse(description="재개 불가"),
+            401: OpenApiResponse(description="인증 실패"),
+            502: OpenApiResponse(description="PayApp API 오류"),
+        },
+    )
+    def post(self, request):
+        sub = ensure_subscription(request.user)
+
+        if sub.status != SubscriptionStatus.CANCELLED:
+            return Response(
+                {"detail": "취소된 구독만 재개할 수 있습니다."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 기간 만료 체크
+        if sub.current_period_end and sub.current_period_end <= timezone.now():
+            return Response(
+                {"detail": "구독 기간이 만료되어 재개할 수 없습니다. 새로 결제해주세요."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # PayApp rebillStart
+        if sub.payapp_rebill_no:
+            try:
+                PayAppClient.resume_rebill(sub.payapp_rebill_no)
+            except PayAppError as e:
+                logger.error("PayApp 정기결제 재개 실패: rebill_no=%s err=%s", sub.payapp_rebill_no, e)
+                return Response(
+                    {"detail": f"결제 재개 실패: {e}"},
+                    status=status.HTTP_502_BAD_GATEWAY,
+                )
+
+        sub.status = SubscriptionStatus.ACTIVE
+        sub.cancelled_at = None
+        sub.save(update_fields=["status", "cancelled_at", "updated_at"])
+
+        return Response(UserSubscriptionSerializer(sub).data)
+
+
+class PageActivationView(APIView):
+    """페이지 활성화 조정 (다운그레이드 후 플랜 한도에 맞춰 활성 페이지 선택)"""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["사용자플랜"],
+        summary="활성 페이지 조정 상태 확인",
+        description="""
+## 목적
+현재 사용자의 **페이지 활성화 조정이 필요한지** 확인합니다.
+플랜 최대 페이지 수보다 보유 페이지가 많으면 조정이 필요합니다.
+
+## 응답 필드
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `needs_activation_adjustment` | bool | 조정이 필요한지 여부 |
+| `max_pages` | int | 현재 플랜의 최대 페이지 수 |
+| `total_pages` | int | 보유한 전체 페이지 수 |
+| `active_pages` | int | 현재 활성 페이지 수 |
+| `can_change_today` | bool | 오늘 활성화 변경 가능 여부 (하루 1회) |
+| `pages` | array | 전체 페이지 목록 (id, slug, title, is_active) |
+        """,
+        responses={200: OpenApiResponse(description="활성화 조정 상태")},
+    )
+    def get(self, request):
+        from apps.pages.models import Page
+        from .subscription_utils import get_user_plan
+
+        plan = get_user_plan(request.user)
+        max_pages = plan.features.get("max_pages", 1)
+        if max_pages == -1:
+            max_pages = 999999
+
+        sub = ensure_subscription(request.user)
+        pages = Page.objects.filter(user=request.user).order_by("created_at")
+        total = pages.count()
+        active = pages.filter(is_active=True).count()
+
+        can_change = True
+        if sub.page_activation_changed_at:
+            can_change = (timezone.now() - sub.page_activation_changed_at).days >= 1
+
+        return Response({
+            "needs_activation_adjustment": total > max_pages,
+            "max_pages": max_pages,
+            "total_pages": total,
+            "active_pages": active,
+            "can_change_today": can_change,
+            "pages": [
+                {"id": p.id, "slug": p.slug, "title": p.title, "is_active": p.is_active}
+                for p in pages
+            ],
+        })
+
+    @extend_schema(
+        tags=["사용자플랜"],
+        summary="활성 페이지 선택",
+        description="""
+## 목적
+다운그레이드 후 플랜 한도에 맞춰 **활성화할 페이지를 선택**합니다.
+하루 1회만 변경 가능합니다.
+
+## 요청 필드
+| 필드 | 필수 | 타입 | 설명 |
+|------|------|------|------|
+| `active_page_ids` | ✅ | array[int] | 활성화할 페이지 ID 목록. 플랜 최대 페이지 수 이하 |
+
+## 에러
+| 코드 | 메시지 |
+|------|--------|
+| 400 | 활성 페이지 수가 플랜 한도 초과, 존재하지 않는 페이지 ID, 오늘 이미 변경함 |
+| 403 | 조정이 필요하지 않은 상태 |
+        """,
+        responses={
+            200: OpenApiResponse(description="활성화 변경 완료"),
+            400: OpenApiResponse(description="유효성 검증 실패"),
+        },
+    )
+    def post(self, request):
+        from apps.pages.models import Page
+        from .subscription_utils import get_user_plan
+
+        plan = get_user_plan(request.user)
+        max_pages = plan.features.get("max_pages", 1)
+        if max_pages == -1:
+            return Response(
+                {"detail": "현재 플랜은 페이지 수 제한이 없습니다."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        sub = ensure_subscription(request.user)
+
+        # 하루 1회 제한
+        if sub.page_activation_changed_at:
+            elapsed = (timezone.now() - sub.page_activation_changed_at).total_seconds()
+            if elapsed < 86400:
+                return Response(
+                    {"detail": "페이지 활성화 변경은 하루에 1번만 가능합니다."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        active_page_ids = request.data.get("active_page_ids", [])
+        if not isinstance(active_page_ids, list):
+            return Response(
+                {"detail": "active_page_ids는 배열이어야 합니다."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if len(active_page_ids) > max_pages:
+            return Response(
+                {"detail": f"현재 플랜에서는 최대 {max_pages}개 페이지만 활성화할 수 있습니다."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 사용자의 페이지인지 확인
+        user_pages = Page.objects.filter(user=request.user)
+        valid_ids = set(user_pages.values_list("id", flat=True))
+        invalid = set(active_page_ids) - valid_ids
+        if invalid:
+            return Response(
+                {"detail": f"존재하지 않는 페이지 ID: {list(invalid)}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if len(active_page_ids) == 0:
+            return Response(
+                {"detail": "최소 1개의 페이지를 활성화해야 합니다."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 활성화 적용
+        user_pages.filter(id__in=active_page_ids).update(is_active=True)
+        user_pages.exclude(id__in=active_page_ids).update(is_active=False)
+
+        sub.page_activation_changed_at = timezone.now()
+        sub.save(update_fields=["page_activation_changed_at", "updated_at"])
+
+        return Response({
+            "detail": f"{len(active_page_ids)}개 페이지가 활성화되었습니다.",
+            "active_page_ids": active_page_ids,
+        })

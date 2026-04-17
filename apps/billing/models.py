@@ -242,6 +242,16 @@ class UserSubscription(models.Model):
     )
 
     cancelled_at = models.DateTimeField(null=True, blank=True)
+    page_activation_changed_at = models.DateTimeField(
+        null=True, blank=True,
+        verbose_name="페이지 활성화 변경 일시",
+        help_text="하루 1회 제한용 — 마지막으로 페이지 활성화 조정한 시각",
+    )
+    pro_activated_at = models.DateTimeField(
+        null=True, blank=True,
+        verbose_name="유료 플랜 활성화 일시",
+        help_text="환불 7일 심사용 — 유료 플랜 첫 결제 완료 시각",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -457,16 +467,16 @@ class AiTokenBalance(models.Model):
 
     @classmethod
     def get_or_create_for_user(cls, user):
-        """유저의 토큰 잔액 가져오기. 없으면 생성 (초기 3 토큰 지급 - free 플랜)."""
+        """유저의 토큰 잔액 가져오기. 없으면 생성 (초기 2 토큰 지급 - free 플랜)."""
         obj, created = cls.objects.get_or_create(
             user=user,
-            defaults={"balance": 3},
+            defaults={"balance": 2},
         )
         if created:
             AiTokenLedger.objects.create(
                 user=user,
-                amount=3,
-                balance_after=3,
+                amount=2,
+                balance_after=2,
                 description="신규 가입 토큰 지급 (free 플랜)",
             )
         return obj

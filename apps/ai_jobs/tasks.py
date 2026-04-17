@@ -91,21 +91,24 @@ def run_ai_job(self, job_id: str):
         job.finished_at = timezone.now()
         job.save()
 
-        # 성공 시에만 토큰 차감
+        # 성공 시에만 토큰 차감 (Pro 플랜은 무제한이므로 제외)
         from apps.billing.models import AiTokenBalance
+        from apps.billing.subscription_utils import get_user_plan
         from django.db import transaction
 
-        try:
-            with transaction.atomic():
-                token_balance = AiTokenBalance.objects.select_for_update().get(
-                    user=job.user,
-                )
-                token_balance.deduct(
-                    AiJob.TOKEN_COST,
-                    description=f"AI 페이지 생성 ({job.id})",
-                )
-        except (AiTokenBalance.DoesNotExist, ValueError) as e:
-            logger.warning("토큰 차감 실패 (작업은 성공): %s - %s", job_id, e)
+        user_plan = get_user_plan(job.user)
+        if user_plan.name == "free":
+            try:
+                with transaction.atomic():
+                    token_balance = AiTokenBalance.objects.select_for_update().get(
+                        user=job.user,
+                    )
+                    token_balance.deduct(
+                        AiJob.TOKEN_COST,
+                        description=f"AI 페이지 생성 ({job.id})",
+                    )
+            except (AiTokenBalance.DoesNotExist, ValueError) as e:
+                logger.warning("토큰 차감 실패 (작업은 성공): %s - %s", job_id, e)
 
         logger.info("AiJob 완료: %s", job_id)
 
