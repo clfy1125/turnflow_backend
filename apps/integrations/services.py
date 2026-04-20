@@ -6,102 +6,141 @@ import requests
 from django.conf import settings
 from datetime import datetime, timedelta
 from typing import Dict, Optional
+from urllib.parse import urlencode
 import secrets
 import uuid
 
 
 class InstagramOAuthService:
     """
-    Service for Instagram Graph API OAuth flow (Facebook Login for Instagram Business)
+    Service for Instagram API with Instagram Business Login
 
-    Updated to Graph API v24.0 (Released: October 8, 2025)
+    Ref: https://developers.facebook.com/docs/instagram-platform/instagram-api-with-instagram-login/business-login
     """
 
-    # Facebook OAuth endpoints for Instagram Business API
-    FACEBOOK_VERSION = "v24.0"  # Updated to latest version
-    AUTHORIZE_URL = f"https://www.facebook.com/{FACEBOOK_VERSION}/dialog/oauth"
-    TOKEN_URL = f"https://graph.facebook.com/{FACEBOOK_VERSION}/oauth/access_token"
-    GRAPH_API_BASE = f"https://graph.facebook.com/{FACEBOOK_VERSION}"
+    # Instagram Business Login endpoints (NOT Facebook Login)
+    AUTHORIZE_URL = "https://www.instagram.com/oauth/authorize"
+    TOKEN_URL = "https://api.instagram.com/oauth/access_token"
+    LONG_LIVED_TOKEN_URL = "https://graph.instagram.com/access_token"
+    REFRESH_TOKEN_URL = "https://graph.instagram.com/refresh_access_token"
+    GRAPH_API_BASE = "https://graph.instagram.com"
 
-    # Required scopes for Instagram Business API (v24.0 compatible)
-    # Ref: https://developers.facebook.com/docs/instagram-platform/
+    # Required scopes for Instagram Business Login
+    # Ref: https://developers.facebook.com/docs/instagram-platform/instagram-api-with-instagram-login/business-login
     REQUIRED_SCOPES = [
-        "pages_show_list",  # Required to list Facebook Pages
-        "pages_read_engagement",  # Required to read page info and engagement
-        "instagram_basic",  # Basic Instagram profile and media access
-        "instagram_manage_comments",  # Manage Instagram comments
-        "instagram_manage_messages",  # Manage Instagram Direct Messages
-        # Optional but recommended for advanced features:
-        "business_management",  # For multi-account management
-        # "instagram_content_publish",  # For publishing content
-        # "instagram_manage_insights",  # For insights and analytics
+        "instagram_business_basic",
+        "instagram_business_manage_comments",
+        "instagram_business_manage_messages",
+        # Optional:
+        # "instagram_business_content_publish",
+        # "instagram_business_manage_insights",
     ]
+
+    @classmethod
+    def get_instagram_app_id(cls) -> str:
+        """Get Instagram App ID (from App Dashboard > Instagram > Business Login settings)"""
+        # Prefer INSTAGRAM_APP_ID; fall back to META_APP_ID for backwards compat
+        app_id = getattr(settings, "INSTAGRAM_APP_ID", "") or settings.META_APP_ID
+        return app_id
+
+    @classmethod
+    def get_instagram_app_secret(cls) -> str:
+        """Get Instagram App Secret"""
+        app_secret = getattr(settings, "INSTAGRAM_APP_SECRET", "") or settings.META_APP_SECRET
+        return app_secret
 
     @classmethod
     def get_authorization_url(cls, redirect_uri: str, state: str) -> str:
         """
-        Generate Facebook OAuth authorization URL for Instagram Business
+        Generate Instagram Business Login authorization URL
 
-        Args:
-            redirect_uri: Callback URL after authorization
-            state: CSRF protection state parameter
-
-        Returns:
-            Authorization URL for user redirection (Facebook Login)
+        Uses https://www.instagram.com/oauth/authorize (NOT facebook.com)
         """
         params = {
-            "client_id": settings.META_APP_ID,
+            "client_id": cls.get_instagram_app_id(),
             "redirect_uri": redirect_uri,
             "scope": ",".join(cls.REQUIRED_SCOPES),
             "response_type": "code",
             "state": state,
         }
 
-        query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+        query_string = urlencode(params)
         return f"{cls.AUTHORIZE_URL}?{query_string}"
 
     @classmethod
     def exchange_code_for_token(cls, code: str, redirect_uri: str) -> Dict:
         """
-        Exchange authorization code for Facebook access token
+        Exchange authorization code for short-lived Instagram User access token
 
-        Args:
-            code: Authorization code from callback
-            redirect_uri: Same redirect URI used in authorization
-
-        Returns:
-            Dict with access_token and token_type
+        POST https://api.instagram.com/oauth/access_token
+        Returns: {"data": [{"access_token": "...", "user_id": "...", "permissions": "..."}]}
         """
-        params = {
-            "client_id": settings.META_APP_ID,
-            "client_secret": settings.META_APP_SECRET,
+        data = {
+            "client_id": cls.get_instagram_app_id(),
+            "client_secret": cls.get_instagram_app_secret(),
+            "grant_type": "authorization_code",
             "redirect_uri": redirect_uri,
             "code": code,
         }
 
-        response = requests.get(cls.TOKEN_URL, params=params)
+        response = requests.post(cls.TOKEN_URL, data=data)
         response.raise_for_status()
-        return response.json()
+        result = response.json()
+
+        # Instagram API returns {"data": [{"access_token": ..., "user_id": ..., "permissions": ...}]}
+        if "data" in result and result["data"]:
+            return result["data"][0]
+        return result
 
     @classmethod
     def get_long_lived_token(cls, short_lived_token: str) -> Dict:
         """
         Exchange short-lived token for long-lived token (60 days)
 
-        Args:
-            short_lived_token: Short-lived Facebook access token (1 hour validity)
-
-        Returns:
-            Dict with access_token and expires_in (typically 5184000 seconds = 60 days)
-
-        Note: Long-lived tokens expire after 60 days and must be refreshed
+        GET https://graph.instagram.com/access_token
+          ?grant_type=ig_exchange_token
+          &client_secret=...
+          &access_token=...
         """
-        url = f"{cls.GRAPH_API_BASE}/oauth/access_token"
         params = {
-            "grant_type": "fb_exchange_token",
-            "client_id": settings.META_APP_ID,
-            "client_secret": settings.META_APP_SECRET,
-            "fb_exchange_token": short_lived_token,
+            "grant_type": "ig_exchange_token",
+            "client_secret": cls.get_instagram_app_secret(),
+            "access_token": short_lived_token,
+        }
+
+        response = requests.get(cls.LONG_LIVED_TOKEN_URL, params=params)
+        response.raise_for_status()
+        return response.json()
+
+    @classmethod
+    def refresh_long_lived_token(cls, long_lived_token: str) -> Dict:
+        """
+        Refresh a long-lived token for another 60 days
+
+        GET https://graph.instagram.com/refresh_access_token
+          ?grant_type=ig_refresh_token
+          &access_token=...
+        """
+        params = {
+            "grant_type": "ig_refresh_token",
+            "access_token": long_lived_token,
+        }
+
+        response = requests.get(cls.REFRESH_TOKEN_URL, params=params)
+        response.raise_for_status()
+        return response.json()
+
+    @classmethod
+    def get_account_info(cls, access_token: str) -> Dict:
+        """
+        Get Instagram professional account info for the logged-in user
+
+        GET https://graph.instagram.com/me?fields=user_id,username,name,profile_picture_url,account_type
+        """
+        url = f"{cls.GRAPH_API_BASE}/me"
+        params = {
+            "fields": "user_id,username,name,profile_picture_url,account_type",
+            "access_token": access_token,
         }
 
         response = requests.get(url, params=params)
@@ -109,90 +148,22 @@ class InstagramOAuthService:
         return response.json()
 
     @classmethod
-    def get_instagram_business_account(cls, facebook_page_id: str, access_token: str) -> Dict:
+    def subscribe_to_webhooks(cls, ig_user_id: str, access_token: str, fields: str = "comments,messages") -> Dict:
         """
-        Get Instagram Business Account ID from Facebook Page
+        Enable webhook subscriptions for an Instagram professional account.
 
-        Args:
-            facebook_page_id: Facebook Page ID
-            access_token: Facebook access token with pages_show_list permission
-
-        Returns:
-            Dict with Instagram Business Account info (id, username, etc.)
-
-        Raises:
-            ValueError: If no Instagram Business Account is linked to the Page
+        Must be called per account after OAuth connection.
+        POST https://graph.instagram.com/v25.0/{ig_user_id}/subscribed_apps
+          ?subscribed_fields=comments,messages
+          &access_token=...
         """
-        url = f"{cls.GRAPH_API_BASE}/{facebook_page_id}"
+        url = f"{cls.GRAPH_API_BASE}/{ig_user_id}/subscribed_apps"
         params = {
-            "fields": "instagram_business_account",
+            "subscribed_fields": fields,
             "access_token": access_token,
         }
 
-        try:
-            response = requests.get(url, params=params)
-            response.raise_for_status()
-            data = response.json()
-
-            if "instagram_business_account" not in data:
-                raise ValueError("No Instagram Business Account linked to this Facebook Page")
-
-            return data["instagram_business_account"]
-
-        except requests.exceptions.HTTPError as e:
-            raise ValueError(f"Failed to get Instagram account: {str(e)}")
-        except Exception as e:
-            raise
-
-    @classmethod
-    def get_facebook_pages(cls, access_token: str) -> list:
-        """
-        Get user's Facebook Pages with admin access
-
-        Args:
-            access_token: Facebook access token with pages_show_list permission
-
-        Returns:
-            List of Facebook Pages (each page includes id, name, access_token, etc.)
-
-        Note: Only returns pages where the user has admin, editor, or moderator role
-        """
-        url = f"{cls.GRAPH_API_BASE}/me/accounts"
-        params = {
-            "access_token": access_token,
-        }
-
-        response = requests.get(url, params=params)
-        response.raise_for_status()
-        result = response.json()
-
-        return result.get("data", [])
-
-    @classmethod
-    def get_account_info(cls, instagram_account_id: str, access_token: str) -> Dict:
-        """
-        Get Instagram Business Account information
-
-        Args:
-            instagram_account_id: Instagram Business Account ID
-            access_token: Page access token with instagram_basic permission
-
-        Returns:
-            Dict with account information:
-            - id: Instagram account ID
-            - username: Instagram username
-            - name: Display name
-            - profile_picture_url: Profile picture URL
-
-        Note: Requires instagram_basic permission
-        """
-        url = f"{cls.GRAPH_API_BASE}/{instagram_account_id}"
-        params = {
-            "fields": "id,username,name,profile_picture_url",
-            "access_token": access_token,
-        }
-
-        response = requests.get(url, params=params)
+        response = requests.post(url, params=params)
         response.raise_for_status()
         return response.json()
 
@@ -321,18 +292,25 @@ class MockInstagramProvider:
 
 class InstagramMessagingService:
     """
-    Instagram Messaging API Service (Meta Graph API v24.0)
-    DM 발송 기능 제공
+    Instagram Messaging API Service (Meta Graph API v25.0)
+    Instagram API with Instagram Login 기반 DM 발송 기능 제공
     """
 
-    GRAPH_API_BASE = f"https://graph.facebook.com/v24.0"
+    GRAPH_API_BASE = "https://graph.instagram.com/v25.0"
+
+    @classmethod
+    def _get_headers(cls, access_token: str) -> Dict:
+        return {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
 
     @classmethod
     def send_dm_via_comment(
         cls, ig_user_id: str, comment_id: str, message_text: str, access_token: str
     ) -> Dict:
         """
-        댓글 ID를 통해 DM 발송
+        댓글 ID를 통해 Private Reply DM 발송
 
         Args:
             ig_user_id: Instagram 비즈니스 계정 ID
@@ -351,10 +329,9 @@ class InstagramMessagingService:
         payload = {
             "recipient": {"comment_id": comment_id},
             "message": {"text": message_text},
-            "access_token": access_token,
         }
 
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, headers=cls._get_headers(access_token))
         response.raise_for_status()
 
         return response.json()
@@ -383,10 +360,9 @@ class InstagramMessagingService:
         payload = {
             "recipient": {"id": recipient_id},
             "message": {"text": message_text},
-            "access_token": access_token,
         }
 
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, headers=cls._get_headers(access_token))
         response.raise_for_status()
 
         return response.json()
@@ -483,7 +459,13 @@ class InstagramCommentService:
     Instagram 댓글 관리 서비스
     """
 
-    GRAPH_API_BASE = f"https://graph.facebook.com/v24.0"
+    GRAPH_API_BASE = "https://graph.instagram.com/v25.0"
+
+    @classmethod
+    def _get_headers(cls, access_token: str) -> Dict:
+        return {
+            "Authorization": f"Bearer {access_token}",
+        }
 
     @classmethod
     def hide_comment(cls, comment_id: str, access_token: str) -> Dict:
@@ -502,12 +484,9 @@ class InstagramCommentService:
         """
         url = f"{cls.GRAPH_API_BASE}/{comment_id}"
 
-        params = {
-            "hide": "true",
-            "access_token": access_token,
-        }
+        params = {"hide": "true"}
 
-        response = requests.post(url, params=params)
+        response = requests.post(url, params=params, headers=cls._get_headers(access_token))
         response.raise_for_status()
 
         return response.json()
@@ -526,12 +505,9 @@ class InstagramCommentService:
         """
         url = f"{cls.GRAPH_API_BASE}/{comment_id}"
 
-        params = {
-            "hide": "false",
-            "access_token": access_token,
-        }
+        params = {"hide": "false"}
 
-        response = requests.post(url, params=params)
+        response = requests.post(url, params=params, headers=cls._get_headers(access_token))
         response.raise_for_status()
 
         return response.json()
@@ -550,9 +526,7 @@ class InstagramCommentService:
         """
         url = f"{cls.GRAPH_API_BASE}/{comment_id}"
 
-        params = {"access_token": access_token}
-
-        response = requests.delete(url, params=params)
+        response = requests.delete(url, headers=cls._get_headers(access_token))
         response.raise_for_status()
 
         return response.json()

@@ -34,7 +34,7 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
         처리 결과 딕셔너리
     """
     try:
-        logger.info(f"Processing comment webhook: {webhook_payload}")
+        logger.debug(f"Processing comment webhook: {webhook_payload}")
 
         # Webhook 데이터 파싱
         field = webhook_payload.get("field")
@@ -74,7 +74,7 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
 
         # 스팸으로 판정되면 DM 발송하지 않고 종료
         if spam_check_result.get("is_spam"):
-            logger.info(f"Comment {comment_id} identified as spam, skipping DM")
+            logger.debug(f"Comment {comment_id} identified as spam, skipping DM")
             return spam_check_result
 
         # === 2단계: DM 자동발송 로직 ===
@@ -84,7 +84,7 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
         ).select_related("ig_connection")
 
         if not active_campaigns.exists():
-            logger.info(f"No active campaign found for media_id: {media_id}")
+            logger.debug(f"No active campaign found for media_id: {media_id}")
             return {"status": "skipped", "reason": "No active campaign"}
 
         results = []
@@ -304,10 +304,7 @@ def _process_single_campaign(
             dm_log.mark_as_sent(api_response)
             campaign.increment_sent()
 
-            logger.info(
-                f"DM sent successfully: campaign={campaign.id}, "
-                f"recipient={from_username}, comment={comment_id}"
-            )
+            logger.info(f"DM sent: campaign={campaign.id}, recipient={from_username}")
 
             return {
                 "campaign_id": str(campaign.id),

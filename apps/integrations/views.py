@@ -357,25 +357,26 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                     long_lived_response["access_token"]
                 )
             else:
-                # Production mode - Facebook Login for Instagram Business
+                # Production mode - Instagram Business Login
                 import logging
 
                 logger = logging.getLogger(__name__)
 
-                # 1. Exchange code for Facebook access token
+                # 1. Exchange code for short-lived Instagram User access token
+                # Returns: {"access_token": "...", "user_id": "...", "permissions": "..."}
                 token_response = InstagramOAuthService.exchange_code_for_token(code, redirect_uri)
                 short_lived_token = token_response["access_token"]
+                ig_user_id = token_response.get("user_id", "")
 
                 # 2. Get long-lived token (60 days)
                 long_lived_response = InstagramOAuthService.get_long_lived_token(short_lived_token)
                 access_token = long_lived_response["access_token"]
 
-                # 3. Get Facebook Pages
-
+                # 3. Get Instagram account info directly (no Facebook Pages needed)
                 try:
-                    pages = InstagramOAuthService.get_facebook_pages(access_token)
+                    account_info = InstagramOAuthService.get_account_info(access_token)
                 except Exception as e:
-                    logger.error(f"Exception during get_facebook_pages: {str(e)}")
+                    logger.error(f"Exception during get_account_info: {str(e)}")
 
                     html = f"""
                     <!DOCTYPE html>
@@ -389,16 +390,16 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                         </style>
                     </head>
                     <body>
-                        <h2 class="error">❌ Facebook API 오류</h2>
-                        <p>Facebook API 호출 중 오류가 발생했습니다.</p>
+                        <h2 class="error">❌ Instagram API 오류</h2>
+                        <p>Instagram API 호출 중 오류가 발생했습니다.</p>
                         <p>창이 자동으로 닫힙니다...</p>
                         <script>
                             if (window.opener) {{
                                 window.opener.postMessage({{
                                     type: 'INSTAGRAM_ERROR',
                                     success: false,
-                                    errorCode: 'FACEBOOK_API_ERROR',
-                                    message: 'Facebook API 호출 중 오류가 발생했습니다: {str(e)}'
+                                    errorCode: 'INSTAGRAM_API_ERROR',
+                                    message: 'Instagram API 호출 중 오류가 발생했습니다.'
                                 }}, '*');
                                 setTimeout(() => window.close(), 2000);
                             }}
@@ -408,130 +409,9 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                     """
                     return HttpResponse(html)
 
-                if not pages:
-                    logger.warning("No Facebook Pages found for user")
-                    html = """
-                    <!DOCTYPE html>
-                    <html>
-                    <head>
-                        <meta charset="UTF-8">
-                        <title>Instagram 연동 실패</title>
-                        <style>
-                            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 40px; text-align: center; }
-                            .error { color: #dc3545; }
-                            .guide { margin-top: 20px; padding: 15px; background: #f8f9fa; border-radius: 8px; }
-                        </style>
-                    </head>
-                    <body>
-                        <h2 class="error">❌ Facebook Page가 없습니다</h2>
-                        <p>Instagram Business API를 사용하려면 Facebook Page가 필요합니다.</p>
-                        <div class="guide">
-                            <p><strong>해결 방법:</strong></p>
-                            <p>1. <a href="https://www.facebook.com/pages/create" target="_blank">Facebook Page 만들기</a></p>
-                            <p>2. <a href="https://help.instagram.com/502981923235522" target="_blank">연동 가이드 보기</a></p>
-                        </div>
-                        <p>창이 자동으로 닫힙니다...</p>
-                        <script>
-                            if (window.opener) {
-                                window.opener.postMessage({
-                                    type: 'INSTAGRAM_ERROR',
-                                    success: false,
-                                    errorCode: 'NO_FACEBOOK_PAGE',
-                                    message: 'Facebook Page가 없습니다. Page를 먼저 생성해주세요.'
-                                }, '*');
-                                setTimeout(() => window.close(), 3000);
-                            }
-                        </script>
-                    </body>
-                    </html>
-                    """
-                    return HttpResponse(html)
+                # Use user_id from token response or account_info
+                instagram_account_id = account_info.get("user_id") or ig_user_id or account_info.get("id", "")
 
-                # 4. Get Instagram Business Account from first page
-                # TODO: In production, let user select which page to use
-                instagram_account = None
-                page_access_token = None
-
-                # views.py의 connect_callback 메서드 수정
-                for page in pages:
-                    try:
-                        page_id = page["id"]
-                        page_name = page.get("name", "Unknown")
-                        page_access_token = page["access_token"]
-
-                        logger.info(f"[DEBUG] Checking page: {page_name} (ID: {page_id})")
-
-                        ig_account = InstagramOAuthService.get_instagram_business_account(
-                            page_id, page_access_token
-                        )
-
-                        logger.info(
-                            f"[DEBUG] Instagram account found for page {page_name}: {ig_account}"
-                        )
-                        instagram_account = ig_account
-                        break
-                    except ValueError as ve:
-                        logger.warning(
-                            f"[DEBUG] No Instagram account on page {page_name}: {str(ve)}"
-                        )
-                        continue
-                    except KeyError as ke:
-                        logger.warning(f"[DEBUG] KeyError for page {page_name}: {str(ke)}")
-                        continue
-                    except Exception as e:
-                        # 예상치 못한 에러 로깅
-                        logger.error(
-                            f"[DEBUG] Unexpected error for page {page_name}: {type(e).__name__} - {str(e)}"
-                        )
-                        continue
-
-                if not instagram_account:
-                    logger.warning("No Instagram Business Account linked to Facebook Pages")
-                    html = """
-                    <!DOCTYPE html>
-                    <html>
-                    <head>
-                        <meta charset="UTF-8">
-                        <title>Instagram 연동 실패</title>
-                        <style>
-                            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 40px; text-align: center; }
-                            .error { color: #dc3545; }
-                            .guide { margin-top: 20px; padding: 15px; background: #f8f9fa; border-radius: 8px; }
-                        </style>
-                    </head>
-                    <body>
-                        <h2 class="error">❌ Instagram 비즈니스 계정 미연결</h2>
-                        <p>Facebook Page에 Instagram 비즈니스 계정이 연결되어 있지 않습니다.</p>
-                        <div class="guide">
-                            <p><strong>해결 방법:</strong></p>
-                            <p>1. <a href="https://help.instagram.com/502981923235522" target="_blank">Instagram 비즈니스 계정으로 전환</a></p>
-                            <p>2. <a href="https://www.facebook.com/pages/" target="_blank">Facebook Page 설정에서 Instagram 연결</a></p>
-                        </div>
-                        <p>창이 자동으로 닫힙니다...</p>
-                        <script>
-                            if (window.opener) {
-                                window.opener.postMessage({
-                                    type: 'INSTAGRAM_ERROR',
-                                    success: false,
-                                    errorCode: 'NO_INSTAGRAM_BUSINESS_ACCOUNT',
-                                    message: 'Instagram 비즈니스 계정이 연결되지 않았습니다.'
-                                }, '*');
-                                setTimeout(() => window.close(), 3000);
-                            }
-                        </script>
-                    </body>
-                    </html>
-                    """
-                    return HttpResponse(html)
-
-                # 5. Get Instagram account info
-                instagram_account_id = instagram_account["id"]
-                account_info = InstagramOAuthService.get_account_info(
-                    instagram_account_id, page_access_token
-                )
-
-                # Use page access token for API calls
-                access_token = page_access_token
                 account_info["id"] = instagram_account_id
 
                 # Calculate expiration time
@@ -567,6 +447,17 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 connection.last_verified_at = timezone.now()
                 connection.error_message = ""
                 connection.save()
+
+                # Enable webhook subscriptions for this account (per-account requirement)
+                try:
+                    subscribe_result = InstagramOAuthService.subscribe_to_webhooks(
+                        ig_user_id=instagram_account_id,
+                        access_token=access_token,
+                        fields="comments,messages",
+                    )
+                    logger.debug(f"Webhook subscription result for {instagram_account_id}: {subscribe_result}")
+                except Exception as e:
+                    logger.warning(f"Failed to subscribe webhooks for {instagram_account_id}: {e}")
 
             # Clean up persisted state
             try:
@@ -611,10 +502,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
             return HttpResponse(html)
 
         except Exception as e:
-            import traceback
-
             logger.error(f"Fatal error in connect_callback: {type(e).__name__} - {str(e)}")
-            logger.error(f"Full traceback:\n{traceback.format_exc()}")
 
             html = f"""
             <!DOCTYPE html>
@@ -1589,7 +1477,7 @@ def instagram_webhook(request):
         try:
             # 받은 데이터 파싱
             payload = json.loads(request.body)
-            logger.info(f"Instagram webhook received: {payload}")
+            logger.debug(f"Instagram webhook received: {payload}")
 
             # Meta webhook 구조: {"object": "instagram", "entry": [...]}
             if payload.get("object") != "instagram":
@@ -1607,7 +1495,7 @@ def instagram_webhook(request):
                     field = change.get("field")
                     value = change.get("value", {})
 
-                    logger.info(f"Processing webhook field: {field}")
+                    logger.debug(f"Processing webhook field: {field}")
 
                     # 댓글 이벤트 처리
                     if field == "comments":
@@ -1623,11 +1511,11 @@ def instagram_webhook(request):
 
                         # 비동기 태스크 실행
                         process_comment_and_send_dm.delay(webhook_data)
-                        logger.info(f"Queued DM task for comment: {value.get('id')}")
+                        logger.debug(f"Queued DM task for comment: {value.get('id')}")
 
                     # 다른 이벤트 타입도 필요시 처리
                     elif field in ["mentions", "messages", "messaging_postbacks"]:
-                        logger.info(f"Received {field} event, but not processing yet")
+                        logger.debug(f"Received {field} event, but not processing yet")
 
             return HttpResponse("EVENT_RECEIVED", status=200)
 

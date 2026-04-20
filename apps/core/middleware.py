@@ -37,26 +37,18 @@ class LoggingMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
-        # Log request
-        logger.info(
-            f"Request: {request.method} {request.path}",
-            extra={
-                "request_id": getattr(request, "id", None),
-                "method": request.method,
-                "path": request.path,
-                "user": str(request.user) if hasattr(request, "user") else "Anonymous",
-            },
-        )
-
         response = self.get_response(request)
 
-        # Log response
-        logger.info(
-            f"Response: {response.status_code}",
-            extra={
-                "request_id": getattr(request, "id", None),
-                "status_code": response.status_code,
-            },
-        )
+        # Only log non-2xx responses
+        if response.status_code >= 400:
+            logger.warning(
+                f"{request.method} {request.path} -> {response.status_code}",
+                extra={
+                    "request_id": getattr(request, "id", None),
+                    "method": request.method,
+                    "path": request.path,
+                    "status_code": response.status_code,
+                },
+            )
 
         return response

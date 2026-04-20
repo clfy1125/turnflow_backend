@@ -40,6 +40,9 @@ Dockerfile
 docker-compose.yml
 .dockerignore
 
+# Test data (large folder)
+test/
+
 # Misc
 *.log
 .DS_Store
