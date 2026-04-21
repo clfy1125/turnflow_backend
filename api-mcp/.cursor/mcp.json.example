@@ -4,7 +4,7 @@
       "command": "uvx",
       "args": [
         "--from",
-        "git+https://github.com/YOUR_ORG/api-mcp",
+        "git+https://github.com/clfy1125/turnflow_backend#subdirectory=api-mcp",
         "company-api-mcp"
       ],
       "env": {
