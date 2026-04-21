@@ -1,0 +1,15 @@
+{
+  "servers": {
+    "company-api-docs": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/YOUR_ORG/api-mcp",
+        "company-api-mcp"
+      ],
+      "env": {
+        "OPENAPI_URL": "https://pro-earwig-presently.ngrok-free.app/api/schema/"
+      }
+    }
+  }
+}
