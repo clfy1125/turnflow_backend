@@ -48,3 +48,4 @@ EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
 # Celery - Eager execution for development (optional)
 # CELERY_TASK_ALWAYS_EAGER = True
 # CELERY_TASK_EAGER_PROPAGATES = True
+DATABASES["default"]["CONN_MAX_AGE"] = 0

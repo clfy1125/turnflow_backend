@@ -38,6 +38,7 @@ INSTALLED_APPS = [
     "apps.integrations",
     "apps.pages",
     "apps.ai_jobs",
+    "apps.emails.apps.EmailsConfig",
 ]
 
 MIDDLEWARE = [
@@ -117,10 +118,53 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/5.0/howto/static-files/
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
-STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
+# NOTE: STATICFILES_STORAGE 는 USE_R2=False 인 경우에만 사용.
+# USE_R2=True 인 경우 아래 STORAGES dict 에서 staticfiles 를 함께 지정하므로
+# 두 설정을 동시에 쓰면 Django 가 ImproperlyConfigured 를 던짐.
 
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
+
+# ─────────────────────────────────────────────────────────────
+# Object Storage (Cloudflare R2, S3-compatible)
+# ─────────────────────────────────────────────────────────────
+# USE_R2=True 이면 FileField 기본 스토리지를 R2로 전환.
+# False면 로컬 MEDIA_ROOT 사용 (개발/폴백).
+#
+# 컷오버 절차:
+#   1) rclone sync ./media r2:<bucket>   (라이브 상태에서 1차 복사)
+#   2) 쓰기 잠깐 정지 → 2차 sync
+#   3) USE_R2=True 로 재배포
+#   4) 문제 생기면 USE_R2=False 내리면 즉시 로컬 서빙 복귀
+USE_R2 = config("USE_R2", default=False, cast=bool)
+
+if USE_R2:
+    _R2_ACCOUNT_ID = config("R2_ACCOUNT_ID")
+    _R2_PUBLIC_DOMAIN = config("R2_PUBLIC_DOMAIN")  # 예: media.turnflow.clfy.ai.kr
+    STORAGES = {
+        "default": {
+            "BACKEND": "storages.backends.s3.S3Storage",
+            "OPTIONS": {
+                "bucket_name": config("R2_BUCKET_NAME"),
+                "access_key": config("R2_ACCESS_KEY_ID"),
+                "secret_key": config("R2_SECRET_ACCESS_KEY"),
+                "endpoint_url": f"https://{_R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+                "region_name": "auto",
+                "signature_version": "s3v4",
+                "addressing_style": "path",
+                "default_acl": None,            # R2는 ACL 미지원
+                "querystring_auth": False,      # 퍼블릭 버킷 → 서명 URL 불필요
+                "file_overwrite": False,
+                "custom_domain": _R2_PUBLIC_DOMAIN,
+            },
+        },
+        "staticfiles": {
+            "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+        },
+    }
+    MEDIA_URL = f"https://{_R2_PUBLIC_DOMAIN}/"
+else:
+    STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.0/ref/settings/#default-auto-field
@@ -322,6 +366,29 @@ INSTAGRAM_WEBHOOK_VERIFY_TOKEN = config(
 # Meta App (Facebook Login for Instagram Business)
 META_APP_ID = config("META_APP_ID", default="")
 META_APP_SECRET = config("META_APP_SECRET", default="")
+
+# Resend (Email)
+RESEND_API_KEY = config("RESEND_API_KEY", default="")
+RESEND_FROM_EMAIL = config("RESEND_FROM_EMAIL", default="no-reply@turnflow.clfy.ai.kr")
+RESEND_FROM_NAME = config("RESEND_FROM_NAME", default="TurnFlow")
+
+# Frontend URL (used in email verification / password reset links)
+FRONTEND_URL = config("FRONTEND_URL", default="http://localhost:3000")
+
+# Service metadata (used as default email template variables)
+SERVICE_NAME = config("SERVICE_NAME", default="TurnFlow")
+SUPPORT_EMAIL = config("SUPPORT_EMAIL", default="support@turnflow.clfy.ai.kr")
+
+# Email token lifetimes
+EMAIL_VERIFICATION_TTL_MINUTES = config("EMAIL_VERIFICATION_TTL_MINUTES", default=30, cast=int)
+PASSWORD_RESET_TTL_MINUTES = config("PASSWORD_RESET_TTL_MINUTES", default=60, cast=int)
+
+# Onboarding drip campaign offsets (days after signup)
+ONBOARDING_DRIP_DAYS = [3, 7, 14]
+
+# Welcome + drip toggle. Transactional mails (verification / password reset)
+# are unaffected.  Re-enable later by setting ONBOARDING_ENABLED=True in .env.
+ONBOARDING_ENABLED = config("ONBOARDING_ENABLED", default=False, cast=bool)
 
 # CSRF trusted origins
 # Use a comma-separated env var `CSRF_TRUSTED_ORIGINS`, e.g.

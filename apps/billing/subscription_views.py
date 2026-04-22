@@ -5,6 +5,7 @@ Subscription API views — 구독 관리
 import logging
 from datetime import timedelta
 
+from django.conf import settings
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated, AllowAny
@@ -672,17 +673,18 @@ class PageActivationView(APIView):
         from .subscription_utils import get_user_plan
 
         plan = get_user_plan(request.user)
-        max_pages = plan.features.get("max_pages", 1)
-        if max_pages == -1:
-            max_pages = 999999
+        max_pages_raw = plan.features.get("max_pages", 1)
+        is_unlimited = max_pages_raw == -1
+        max_pages = 999999 if is_unlimited else max_pages_raw
 
         sub = ensure_subscription(request.user)
         pages = Page.objects.filter(user=request.user).order_by("created_at")
         total = pages.count()
         active = pages.filter(is_active=True).count()
 
+        # 무제한 플랜(프로 플러스)은 하루 1회 제한 없음
         can_change = True
-        if sub.page_activation_changed_at:
+        if not is_unlimited and sub.page_activation_changed_at:
             can_change = (timezone.now() - sub.page_activation_changed_at).days >= 1
 
         return Response({
@@ -727,16 +729,12 @@ class PageActivationView(APIView):
 
         plan = get_user_plan(request.user)
         max_pages = plan.features.get("max_pages", 1)
-        if max_pages == -1:
-            return Response(
-                {"detail": "현재 플랜은 페이지 수 제한이 없습니다."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
+        is_unlimited = max_pages == -1
 
         sub = ensure_subscription(request.user)
 
-        # 하루 1회 제한
-        if sub.page_activation_changed_at:
+        # 하루 1회 제한 (무제한 플랜은 제외)
+        if not is_unlimited and sub.page_activation_changed_at:
             elapsed = (timezone.now() - sub.page_activation_changed_at).total_seconds()
             if elapsed < 86400:
                 return Response(
@@ -751,7 +749,7 @@ class PageActivationView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if len(active_page_ids) > max_pages:
+        if not is_unlimited and len(active_page_ids) > max_pages:
             return Response(
                 {"detail": f"현재 플랜에서는 최대 {max_pages}개 페이지만 활성화할 수 있습니다."},
                 status=status.HTTP_400_BAD_REQUEST,

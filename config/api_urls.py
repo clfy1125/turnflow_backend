@@ -13,4 +13,5 @@ urlpatterns = [
     path("integrations/", include("apps.integrations.urls")),
     path("pages/", include("apps.pages.urls", namespace="pages")),
     path("ai/", include("apps.ai_jobs.urls", namespace="ai_jobs")),
+    path("admin/emails/", include("apps.emails.urls_admin", namespace="admin_emails")),
 ]

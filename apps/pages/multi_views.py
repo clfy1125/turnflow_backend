@@ -42,10 +42,11 @@ apps/pages/multi_views.py
   DELETE /api/v1/pages/multipages/{id}/media/{media_id}/    → 미디어 파일 삭제
 """
 
-from datetime import timedelta
+from datetime import date, datetime, timedelta
 
 import json
 
+from django.core.files.base import ContentFile
 from django.db import transaction
 from django.db.models import Case, IntegerField, Q, When
 from django.utils import timezone
@@ -58,10 +59,12 @@ from drf_spectacular.utils import (
 )
 from rest_framework import status
 from rest_framework.parsers import FormParser, MultiPartParser
+from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from .image_pipeline import ImageValidationError, process_upload, sanitize_original
 from .models import Block, ContactInquiry, Page, PageMedia, PageSubscription
 from .multi_serializers import (
     MultiPageCreateSerializer,
@@ -93,12 +96,86 @@ _ALLOWED_MIME_TYPES = frozenset({
 })
 _MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 
+# ── Swagger UI 업로드 UI 노출용 스키마 (multipart/form-data) ─────
+_MEDIA_UPLOAD_REQUEST = {
+    "multipart/form-data": {
+        "type": "object",
+        "required": ["file"],
+        "properties": {
+            "file": {
+                "type": "string",
+                "format": "binary",
+                "description": "편집(크롭) 완료된 최종 이미지. 필수.",
+            },
+            "original_file": {
+                "type": "string",
+                "format": "binary",
+                "description": "편집 전 원본 이미지. 재편집 시 사용. 선택.",
+            },
+            "crop_data": {
+                "type": "string",
+                "description": "크롭 파라미터 JSON 문자열. 선택.",
+            },
+        },
+    }
+}
+_MEDIA_PATCH_REQUEST = {
+    "multipart/form-data": {
+        "type": "object",
+        "properties": {
+            "file": {
+                "type": "string",
+                "format": "binary",
+                "description": "재편집(재크롭) 완료된 새 최종 이미지. 선택.",
+            },
+            "crop_data": {
+                "type": "string",
+                "description": "새 크롭 파라미터 JSON 문자열. 선택.",
+            },
+        },
+    }
+}
+
 _PERIOD_MAP = {"all": None, "6m": 180, "1m": 30, "7d": 7}
 
 
 def _get_owned_page(request, page_id: int) -> Page | None:
     """요청한 사용자가 소유한 Page를 반환. 없거나 권한 없으면 None."""
     return Page.objects.filter(pk=page_id, user=request.user).first()
+
+
+def _resolve_stats_query_range(request) -> tuple[str, int, date | None, date | None]:
+    """
+    통계 조회 범위 파싱.
+    - period가 있으면 period 우선 사용
+    - period가 없고 start_date/end_date가 모두 있으면 커스텀 기간 사용
+    - 둘 다 없으면 기본 7d
+    """
+    period_param = (request.query_params.get("period") or "").strip()
+    start_str = (request.query_params.get("start_date") or "").strip()
+    end_str = (request.query_params.get("end_date") or "").strip()
+
+    if period_param:
+        period_key, days = resolve_period(period_param)
+        return period_key, days, None, None
+
+    if start_str or end_str:
+        if not start_str or not end_str:
+            raise ValidationError({"detail": "start_date와 end_date는 함께 전달해야 합니다. (YYYY-MM-DD)"})
+        try:
+            start_date = datetime.strptime(start_str, "%Y-%m-%d").date()
+            end_date = datetime.strptime(end_str, "%Y-%m-%d").date()
+        except ValueError:
+            raise ValidationError({"detail": "start_date/end_date 형식은 YYYY-MM-DD 이어야 합니다."})
+
+        if start_date > end_date:
+            raise ValidationError({"detail": "start_date는 end_date보다 늦을 수 없습니다."})
+
+        days = (end_date - start_date).days + 1
+        return "custom", days, start_date, end_date
+
+    period_key, days = resolve_period("7d")
+    return period_key, days, None, None
 
 
 # ═════════════════════════════════════════════════════════════
@@ -117,6 +194,10 @@ class MultiPageListView(APIView):
 
 ## 인증
 `Authorization: Bearer <access_token>` 헤더 필수
+
+## 이용 제한
+- Free 플랜 사용자만 호출할 수 있습니다.
+- Free가 아닌 플랜은 403을 반환합니다.
 
 ## 응답 필드
 | 필드 | 타입 | 설명 |
@@ -1177,9 +1258,11 @@ class MultiPageStatsView(APIView):
 | `id` | int | 페이지 ID |
 
 ## 쿼리 파라미터
-| 파라미터 | 기본값 | 허용값 |
-|---------|--------|--------|
-| `period` | `7d` | `7d` `30d` `90d` |
+| 파라미터 | 필수 | 설명 |
+|---------|------|------|
+| `period` | 선택 | `7d` `30d` `90d` 중 하나. 전달 시 이 값이 우선 적용 |
+| `start_date` | 조건부 | `period` 미전달 시 필수. 시작일 (`YYYY-MM-DD`) |
+| `end_date` | 조건부 | `period` 미전달 시 필수. 종료일 (`YYYY-MM-DD`) |
 
 ## 응답 필드
 | 필드 | 타입 | 설명 |
@@ -1203,6 +1286,16 @@ class MultiPageStatsView(APIView):
                 description="조회 기간. `7d`=7일, `30d`=30일, `90d`=90일",
                 required=False, enum=["7d", "30d", "90d"],
             ),
+            OpenApiParameter(
+                name="start_date", type=OpenApiTypes.DATE, location=OpenApiParameter.QUERY,
+                description="커스텀 조회 시작일 (YYYY-MM-DD). period 미전달 시 end_date와 함께 필수",
+                required=False,
+            ),
+            OpenApiParameter(
+                name="end_date", type=OpenApiTypes.DATE, location=OpenApiParameter.QUERY,
+                description="커스텀 조회 종료일 (YYYY-MM-DD). period 미전달 시 start_date와 함께 필수",
+                required=False,
+            ),
         ],
         responses={
             200: OpenApiResponse(response=StatsSummarySerializer, description="통계 요약"),
@@ -1214,8 +1307,8 @@ class MultiPageStatsView(APIView):
         page = _get_owned_page(request, page_id)
         if not page:
             return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
-        period_key, days = resolve_period(request.query_params.get("period", "7d"))
-        data = get_stats_summary(page, days)
+        period_key, days, start_date, end_date = _resolve_stats_query_range(request)
+        data = get_stats_summary(page, days, start_date=start_date, end_date=end_date)
         data["period"] = period_key
         return Response(StatsSummarySerializer(data).data)
 
@@ -1239,9 +1332,11 @@ class MultiStatsChartView(APIView):
 | `id` | int | 페이지 ID |
 
 ## 쿼리 파라미터
-| 파라미터 | 기본값 | 허용값 |
-|---------|--------|--------|
-| `period` | `7d` | `7d` `30d` `90d` |
+| 파라미터 | 필수 | 설명 |
+|---------|------|------|
+| `period` | 선택 | `7d` `30d` `90d` 중 하나. 전달 시 이 값이 우선 적용 |
+| `start_date` | 조건부 | `period` 미전달 시 필수. 시작일 (`YYYY-MM-DD`) |
+| `end_date` | 조건부 | `period` 미전달 시 필수. 종료일 (`YYYY-MM-DD`) |
 
 ## 응답 필드
 | 필드 | 타입 | 설명 |
@@ -1263,6 +1358,16 @@ class MultiStatsChartView(APIView):
                 description="조회 기간. `7d`=7일, `30d`=30일, `90d`=90일",
                 required=False, enum=["7d", "30d", "90d"],
             ),
+            OpenApiParameter(
+                name="start_date", type=OpenApiTypes.DATE, location=OpenApiParameter.QUERY,
+                description="커스텀 조회 시작일 (YYYY-MM-DD). period 미전달 시 end_date와 함께 필수",
+                required=False,
+            ),
+            OpenApiParameter(
+                name="end_date", type=OpenApiTypes.DATE, location=OpenApiParameter.QUERY,
+                description="커스텀 조회 종료일 (YYYY-MM-DD). period 미전달 시 start_date와 함께 필수",
+                required=False,
+            ),
         ],
         responses={
             200: OpenApiResponse(response=ChartDataSerializer, description="날짜별 차트 데이터"),
@@ -1274,8 +1379,8 @@ class MultiStatsChartView(APIView):
         page = _get_owned_page(request, page_id)
         if not page:
             return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
-        period_key, days = resolve_period(request.query_params.get("period", "7d"))
-        data = get_chart_data(page, days)
+        period_key, days, start_date, end_date = _resolve_stats_query_range(request)
+        data = get_chart_data(page, days, start_date=start_date, end_date=end_date)
         data["period"] = period_key
         return Response(ChartDataSerializer(data).data)
 
@@ -1299,9 +1404,11 @@ class MultiStatsBlocksView(APIView):
 | `id` | int | 페이지 ID |
 
 ## 쿼리 파라미터
-| 파라미터 | 기본값 | 허용값 |
-|---------|--------|--------|
-| `period` | `7d` | `7d` `30d` `90d` |
+| 파라미터 | 필수 | 설명 |
+|---------|------|------|
+| `period` | 선택 | `7d` `30d` `90d` 중 하나. 전달 시 이 값이 우선 적용 |
+| `start_date` | 조건부 | `period` 미전달 시 필수. 시작일 (`YYYY-MM-DD`) |
+| `end_date` | 조건부 | `period` 미전달 시 필수. 종료일 (`YYYY-MM-DD`) |
 
 ## 응답 필드
 | 필드 | 타입 | 설명 |
@@ -1326,6 +1433,16 @@ class MultiStatsBlocksView(APIView):
                 description="조회 기간. `7d`=7일, `30d`=30일, `90d`=90일",
                 required=False, enum=["7d", "30d", "90d"],
             ),
+            OpenApiParameter(
+                name="start_date", type=OpenApiTypes.DATE, location=OpenApiParameter.QUERY,
+                description="커스텀 조회 시작일 (YYYY-MM-DD). period 미전달 시 end_date와 함께 필수",
+                required=False,
+            ),
+            OpenApiParameter(
+                name="end_date", type=OpenApiTypes.DATE, location=OpenApiParameter.QUERY,
+                description="커스텀 조회 종료일 (YYYY-MM-DD). period 미전달 시 start_date와 함께 필수",
+                required=False,
+            ),
         ],
         responses={
             200: OpenApiResponse(response=BlockStatsSerializer, description="블록별 클릭 통계"),
@@ -1337,8 +1454,8 @@ class MultiStatsBlocksView(APIView):
         page = _get_owned_page(request, page_id)
         if not page:
             return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
-        period_key, days = resolve_period(request.query_params.get("period", "7d"))
-        blocks = get_block_stats(page, days)
+        period_key, days, start_date, end_date = _resolve_stats_query_range(request)
+        blocks = get_block_stats(page, days, start_date=start_date, end_date=end_date)
         data = {"period": period_key, "blocks": blocks}
         return Response(BlockStatsSerializer(data).data)
 
@@ -1371,9 +1488,11 @@ class MultiStatsLinksView(APIView):
 | `id` | int | 페이지 ID |
 
 ## 쿼리 파라미터
-| 파라미터 | 기본값 | 허용값 |
-|---------|--------|--------|
-| `period` | `7d` | `7d` `30d` `90d` |
+| 파라미터 | 필수 | 설명 |
+|---------|------|------|
+| `period` | 선택 | `7d` `30d` `90d` 중 하나. 전달 시 이 값이 우선 적용 |
+| `start_date` | 조건부 | `period` 미전달 시 필수. 시작일 (`YYYY-MM-DD`) |
+| `end_date` | 조건부 | `period` 미전달 시 필수. 종료일 (`YYYY-MM-DD`) |
 
 ## 응답 필드
 | 필드 | 타입 | 설명 |
@@ -1400,6 +1519,16 @@ class MultiStatsLinksView(APIView):
                 name="period", type=OpenApiTypes.STR, location=OpenApiParameter.QUERY,
                 description="조회 기간. `7d`=7일, `30d`=30일, `90d`=90일",
                 required=False, enum=["7d", "30d", "90d"],
+            ),
+            OpenApiParameter(
+                name="start_date", type=OpenApiTypes.DATE, location=OpenApiParameter.QUERY,
+                description="커스텀 조회 시작일 (YYYY-MM-DD). period 미전달 시 end_date와 함께 필수",
+                required=False,
+            ),
+            OpenApiParameter(
+                name="end_date", type=OpenApiTypes.DATE, location=OpenApiParameter.QUERY,
+                description="커스텀 조회 종료일 (YYYY-MM-DD). period 미전달 시 start_date와 함께 필수",
+                required=False,
             ),
         ],
         responses={
@@ -1463,16 +1592,26 @@ class MultiStatsLinksView(APIView):
                     )
                 ],
             ),
+            403: OpenApiResponse(description="Free 플랜 전용 기능"),
             401: OpenApiResponse(description="인증 실패"),
             404: OpenApiResponse(description="페이지 없음 또는 접근 권한 없음"),
         },
     )
     def get(self, request, page_id: int):
+        from apps.billing.subscription_utils import get_user_plan
+
+        plan = get_user_plan(request.user)
+        if plan.name != "free":
+            return Response(
+                {"detail": "이 기능은 Free 플랜에서만 사용할 수 있습니다."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         page = _get_owned_page(request, page_id)
         if not page:
             return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
-        period_key, days = resolve_period(request.query_params.get("period", "7d"))
-        link_clicks = get_link_stats(page, days)
+        period_key, days, start_date, end_date = _resolve_stats_query_range(request)
+        link_clicks = get_link_stats(page, days, start_date=start_date, end_date=end_date)
         total_clicks = sum(b["clicks"] for b in link_clicks)
         data = {"period": period_key, "total_clicks": total_clicks, "link_clicks": link_clicks}
         return Response(LinkClicksStatsSerializer(data).data)
@@ -2026,7 +2165,7 @@ const { data: media } = await api.post(
 | 401 | 토큰 없음/만료 |
 | 404 | 페이지 없음 또는 접근 권한 없음 |
         """,
-        request=OpenApiTypes.BINARY,
+        request=_MEDIA_UPLOAD_REQUEST,
         responses={
             201: OpenApiResponse(response=PageMediaSerializer, description="업로드 성공"),
             400: OpenApiResponse(
@@ -2064,8 +2203,9 @@ const { data: media } = await api.post(
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # 원본 파일 검증 (선택)
+        # 원본 파일 검증 + EXIF 제거 + 해상도 상한 (선택)
         original_file = request.FILES.get("original_file")
+        original_processed = None
         if original_file:
             orig_mime = original_file.content_type or ""
             if orig_mime not in _ALLOWED_MIME_TYPES:
@@ -2076,6 +2216,13 @@ const { data: media } = await api.post(
             if original_file.size > _MAX_FILE_SIZE_BYTES:
                 return Response(
                     {"original_file": ["파일 크기가 너무 큽니다. 최대 10MB까지 업로드 가능합니다."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            try:
+                original_processed = sanitize_original(original_file)
+            except ImageValidationError as e:
+                return Response(
+                    {"original_file": [str(e)]},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
@@ -2094,14 +2241,30 @@ const { data: media } = await api.post(
             elif isinstance(raw_crop, dict):
                 crop_data = raw_crop
 
+        # 완성본 정제·압축
+        try:
+            processed = process_upload(file)
+        except ImageValidationError as e:
+            return Response(
+                {"file": [str(e)]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         media = PageMedia.objects.create(
             page=page,
-            file=file,
-            original_file=original_file,
+            file=ContentFile(processed.content, name=processed.suggest_filename(file.name)),
+            original_file=(
+                ContentFile(
+                    original_processed.content,
+                    name=original_processed.suggest_filename(original_file.name),
+                )
+                if original_processed
+                else None
+            ),
             crop_data=crop_data,
             original_name=file.name,
-            mime_type=mime_type,
-            size=file.size,
+            mime_type=processed.mime_type,
+            size=processed.size,
         )
         return Response(
             PageMediaSerializer(media, context={"request": request}).data,
@@ -2223,7 +2386,7 @@ await api.patch(
 | 401 | 토큰 없음/만료 |
 | 404 | 페이지 또는 파일 없음 |
         """,
-        request=OpenApiTypes.BINARY,
+        request=_MEDIA_PATCH_REQUEST,
         responses={
             200: OpenApiResponse(response=PageMediaSerializer, description="업데이트된 미디어 파일 정보"),
             400: OpenApiResponse(description="유효성 검증 실패"),
@@ -2253,11 +2416,22 @@ await api.patch(
                     {"file": ["파일 크기가 너무 큽니다. 최대 10MB까지 업로드 가능합니다."]},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+            try:
+                processed = process_upload(new_file)
+            except ImageValidationError as e:
+                return Response(
+                    {"file": [str(e)]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
             if media.file:
                 media.file.delete(save=False)
-            media.file = new_file
-            media.mime_type = mime_type
-            media.size = new_file.size
+            media.file.save(
+                processed.suggest_filename(new_file.name),
+                ContentFile(processed.content),
+                save=False,
+            )
+            media.mime_type = processed.mime_type
+            media.size = processed.size
 
         # crop_data 업데이트 (선택)
         raw_crop = request.data.get("crop_data")

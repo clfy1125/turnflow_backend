@@ -820,17 +820,31 @@ curl -X POST http://localhost:8000/api/v1/auth/google/ \\
 
         name = idinfo.get("name", "")
 
+        from django.utils import timezone
+
         user, created = User.objects.get_or_create(
             email=email,
-            defaults={"full_name": name},
+            defaults={
+                "full_name": name,
+                "is_email_verified": True,
+                "email_verified_at": timezone.now(),
+            },
         )
 
         if created:
             user.set_unusable_password()
             user.save(update_fields=["password"])
-        elif name and not user.full_name:
-            user.full_name = name
-            user.save(update_fields=["full_name"])
+        else:
+            updates = []
+            if name and not user.full_name:
+                user.full_name = name
+                updates.append("full_name")
+            if not user.is_email_verified:
+                user.is_email_verified = True
+                user.email_verified_at = timezone.now()
+                updates += ["is_email_verified", "email_verified_at"]
+            if updates:
+                user.save(update_fields=updates)
 
         refresh = RefreshToken.for_user(user)
 

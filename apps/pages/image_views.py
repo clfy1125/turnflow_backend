@@ -30,12 +30,14 @@ from drf_spectacular.utils import (
     OpenApiTypes,
     extend_schema,
 )
+from django.core.files.base import ContentFile
 from rest_framework import status
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from .image_pipeline import ImageValidationError, process_upload, sanitize_original
 from .models import Page, PageMedia
 from .serializers import PageMediaSerializer
 
@@ -52,6 +54,48 @@ ALLOWED_MIME_TYPES = frozenset(
     }
 )
 MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
+
+# ── Swagger UI 업로드 UI 노출용 스키마 (multipart/form-data) ─────
+# OpenApiTypes.BINARY 는 application/octet-stream 이 되어
+# multipart 필드(`file` 등)를 잡지 못하므로 아래 스키마를 사용.
+_MEDIA_UPLOAD_REQUEST = {
+    "multipart/form-data": {
+        "type": "object",
+        "required": ["file"],
+        "properties": {
+            "file": {
+                "type": "string",
+                "format": "binary",
+                "description": "편집(크롭) 완료된 최종 이미지. 필수.",
+            },
+            "original_file": {
+                "type": "string",
+                "format": "binary",
+                "description": "편집 전 원본 이미지. 재편집 시 편집기 로드용. 선택.",
+            },
+            "crop_data": {
+                "type": "string",
+                "description": "크롭 파라미터 JSON 문자열. 예: `{\"x\":0,\"y\":0,...}`. 선택.",
+            },
+        },
+    }
+}
+_MEDIA_PATCH_REQUEST = {
+    "multipart/form-data": {
+        "type": "object",
+        "properties": {
+            "file": {
+                "type": "string",
+                "format": "binary",
+                "description": "재편집(재크롭) 완료된 새 최종 이미지. 선택.",
+            },
+            "crop_data": {
+                "type": "string",
+                "description": "새 크롭 파라미터 JSON 문자열. 선택.",
+            },
+        },
+    }
+}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -227,7 +271,7 @@ await api.patch(`/api/pages/me/blocks/${blockId}/`, {
 | 400 | crop_data JSON 파싱 실패 | `"crop_data는 유효한 JSON이어야 합니다."` |
 | 401 | 토큰 없음/만료 | — |
 """,
-        request=OpenApiTypes.BINARY,
+        request=_MEDIA_UPLOAD_REQUEST,
         responses={
             201: OpenApiResponse(
                 response=PageMediaSerializer,
@@ -300,8 +344,9 @@ await api.patch(`/api/pages/me/blocks/${blockId}/`, {
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # 원본 파일 검증 (선택)
+        # 원본 파일 검증 + EXIF 제거 + 해상도 상한 (선택)
         original_file = request.FILES.get("original_file")
+        original_processed = None
         if original_file:
             orig_mime = original_file.content_type or ""
             if orig_mime not in ALLOWED_MIME_TYPES:
@@ -312,6 +357,14 @@ await api.patch(`/api/pages/me/blocks/${blockId}/`, {
             if original_file.size > MAX_FILE_SIZE_BYTES:
                 return Response(
                     {"original_file": ["파일 크기가 너무 큽니다. 최대 10MB까지 업로드 가능합니다."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            # EXIF 제거 + 해상도 상한(4096) + 포맷 유지 정제
+            try:
+                original_processed = sanitize_original(original_file)
+            except ImageValidationError as e:
+                return Response(
+                    {"original_file": [str(e)]},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
@@ -330,14 +383,30 @@ await api.patch(`/api/pages/me/blocks/${blockId}/`, {
             elif isinstance(raw_crop, dict):
                 crop_data = raw_crop
 
+        # 완성본은 정제·압축·EXIF 제거 파이프라인 통과
+        try:
+            processed = process_upload(file)
+        except ImageValidationError as e:
+            return Response(
+                {"file": [str(e)]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         media = PageMedia.objects.create(
             page=page,
-            file=file,
-            original_file=original_file,
+            file=ContentFile(processed.content, name=processed.suggest_filename(file.name)),
+            original_file=(
+                ContentFile(
+                    original_processed.content,
+                    name=original_processed.suggest_filename(original_file.name),
+                )
+                if original_processed
+                else None
+            ),
             crop_data=crop_data,
             original_name=file.name,
-            mime_type=mime_type,
-            size=file.size,
+            mime_type=processed.mime_type,
+            size=processed.size,
         )
         return Response(
             PageMediaSerializer(media, context={"request": request}).data,
@@ -511,7 +580,7 @@ const { data: updated } = await api.patch(
                 description="수정할 미디어 파일 ID",
             ),
         ],
-        request=OpenApiTypes.BINARY,
+        request=_MEDIA_PATCH_REQUEST,
         responses={
             200: OpenApiResponse(
                 response=PageMediaSerializer,
@@ -542,12 +611,24 @@ const { data: updated } = await api.patch(
                     {"file": ["파일 크기가 너무 큽니다. 최대 10MB까지 업로드 가능합니다."]},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+            # 정제·압축 파이프라인
+            try:
+                processed = process_upload(new_file)
+            except ImageValidationError as e:
+                return Response(
+                    {"file": [str(e)]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
             # 기존 완성본 파일 스토리지 삭제
             if media.file:
                 media.file.delete(save=False)
-            media.file = new_file
-            media.mime_type = mime_type
-            media.size = new_file.size
+            media.file.save(
+                processed.suggest_filename(new_file.name),
+                ContentFile(processed.content),
+                save=False,
+            )
+            media.mime_type = processed.mime_type
+            media.size = processed.size
 
         # crop_data 업데이트 (선택)
         raw_crop = request.data.get("crop_data")

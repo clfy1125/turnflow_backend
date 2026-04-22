@@ -46,6 +46,17 @@ pre-commit==3.6.0
 # Monitoring & Logging
 django-extensions==3.2.3
 
+# Object Storage (Cloudflare R2, S3-compatible via boto3)
+boto3==1.34.50
+django-storages[s3]==1.14.4
+
+# Email (Resend)
+resend==2.4.0
+
+# Image Pipeline (정제·압축·EXIF 제거·SVG sanitize)
+Pillow==10.4.0
+defusedxml==0.7.1
+
 # Production Server
 gunicorn==21.2.0
 whitenoise==6.6.0

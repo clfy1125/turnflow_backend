@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from datetime import timedelta
+from datetime import date, datetime, time, timedelta
 from urllib.parse import urlparse
 
 from django.core.cache import cache
@@ -217,15 +217,35 @@ def resolve_period(period_str: str) -> tuple[str, int]:
 
 # ─── 집계 쿼리 ────────────────────────────────────────────────
 
-def get_stats_summary(page, days: int) -> dict:
+def _build_window(days: int, start_date: date | None = None, end_date: date | None = None) -> tuple[datetime, datetime | None]:
+    """
+    조회 기간 window를 반환.
+    - 기본: 최근 N일 (since ~ now)
+    - 커스텀: start_date 00:00:00 <= ts < (end_date+1day) 00:00:00
+    """
+    tz = timezone.get_current_timezone()
+    if start_date and end_date:
+        start_at = timezone.make_aware(datetime.combine(start_date, time.min), timezone=tz)
+        end_at = timezone.make_aware(datetime.combine(end_date + timedelta(days=1), time.min), timezone=tz)
+        return start_at, end_at
+
+    since = timezone.now() - timedelta(days=days)
+    return since, None
+
+
+def get_stats_summary(page, days: int, start_date: date | None = None, end_date: date | None = None) -> dict:
     """
     조회수, 클릭수, 클릭율, 유입채널 Top5, 유입국가 Top5 반환.
     """
     from .models import BlockClick, PageView
 
-    since = timezone.now() - timedelta(days=days)
-    views_qs = PageView.objects.filter(page=page, viewed_at__gte=since)
-    clicks_qs = BlockClick.objects.filter(page=page, clicked_at__gte=since)
+    start_at, end_at = _build_window(days, start_date, end_date)
+    if end_at is None:
+        views_qs = PageView.objects.filter(page=page, viewed_at__gte=start_at)
+        clicks_qs = BlockClick.objects.filter(page=page, clicked_at__gte=start_at)
+    else:
+        views_qs = PageView.objects.filter(page=page, viewed_at__gte=start_at, viewed_at__lt=end_at)
+        clicks_qs = BlockClick.objects.filter(page=page, clicked_at__gte=start_at, clicked_at__lt=end_at)
 
     total_views = views_qs.count()
     total_clicks = clicks_qs.count()
@@ -278,7 +298,7 @@ def get_stats_summary(page, days: int) -> dict:
     }
 
 
-def get_chart_data(page, days: int) -> dict:
+def get_chart_data(page, days: int, start_date: date | None = None, end_date: date | None = None) -> dict:
     """
     날짜별 조회수 + 클릭수 시계열 반환.
     labels: ["2026-03-03", ...], views: [120, ...], clicks: [45, ...]
@@ -287,27 +307,37 @@ def get_chart_data(page, days: int) -> dict:
 
     from django.db.models.functions import TruncDate
 
-    since = timezone.now() - timedelta(days=days)
+    start_at, end_at = _build_window(days, start_date, end_date)
+
+    view_filter = Q(page=page, viewed_at__gte=start_at)
+    click_filter = Q(page=page, clicked_at__gte=start_at)
+    if end_at is not None:
+        view_filter &= Q(viewed_at__lt=end_at)
+        click_filter &= Q(clicked_at__lt=end_at)
 
     view_by_date = {
         str(row["date"]): row["count"]
-        for row in PageView.objects.filter(page=page, viewed_at__gte=since)
+        for row in PageView.objects.filter(view_filter)
         .annotate(date=TruncDate("viewed_at"))
         .values("date")
         .annotate(count=Count("id"))
     }
     click_by_date = {
         str(row["date"]): row["count"]
-        for row in BlockClick.objects.filter(page=page, clicked_at__gte=since)
+        for row in BlockClick.objects.filter(click_filter)
         .annotate(date=TruncDate("clicked_at"))
         .values("date")
         .annotate(count=Count("id"))
     }
 
-    labels = [
-        str((timezone.now() - timedelta(days=days - i - 1)).date())
-        for i in range(days)
-    ]
+    if start_date and end_date:
+        total_days = (end_date - start_date).days + 1
+        labels = [str(start_date + timedelta(days=i)) for i in range(total_days)]
+    else:
+        labels = [
+            str((timezone.now() - timedelta(days=days - i - 1)).date())
+            for i in range(days)
+        ]
     return {
         "labels": labels,
         "views": [view_by_date.get(d, 0) for d in labels],
@@ -315,15 +345,22 @@ def get_chart_data(page, days: int) -> dict:
     }
 
 
-def get_block_stats(page, days: int) -> list[dict]:
+def get_block_stats(page, days: int, start_date: date | None = None, end_date: date | None = None) -> list[dict]:
     """블록별 클릭 통계. 클릭 많은 순."""
     from .models import BlockClick
 
-    since = timezone.now() - timedelta(days=days)
-    total_views = page.views.filter(viewed_at__gte=since).count()
+    start_at, end_at = _build_window(days, start_date, end_date)
+    if end_at is None:
+        total_views = page.views.filter(viewed_at__gte=start_at).count()
+    else:
+        total_views = page.views.filter(viewed_at__gte=start_at, viewed_at__lt=end_at).count()
+
+    click_filter = Q(page=page, clicked_at__gte=start_at)
+    if end_at is not None:
+        click_filter &= Q(clicked_at__lt=end_at)
 
     rows = (
-        BlockClick.objects.filter(page=page, clicked_at__gte=since)
+        BlockClick.objects.filter(click_filter)
         .values("block_id", "block__type", "block__data", "block__is_enabled")
         .annotate(clicks=Count("id"))
         .order_by("-clicks")
@@ -351,7 +388,7 @@ def get_block_stats(page, days: int) -> list[dict]:
     return result
 
 
-def get_link_stats(page, days: int) -> list[dict]:
+def get_link_stats(page, days: int, start_date: date | None = None, end_date: date | None = None) -> list[dict]:
     """
     서브링크 단위 클릭 통계.
     link_id가 있는 클릭 → (block_id, link_id) 기준 분리,
@@ -359,11 +396,18 @@ def get_link_stats(page, days: int) -> list[dict]:
     """
     from .models import BlockClick
 
-    since = timezone.now() - timedelta(days=days)
-    total_views = page.views.filter(viewed_at__gte=since).count()
+    start_at, end_at = _build_window(days, start_date, end_date)
+    if end_at is None:
+        total_views = page.views.filter(viewed_at__gte=start_at).count()
+    else:
+        total_views = page.views.filter(viewed_at__gte=start_at, viewed_at__lt=end_at).count()
+
+    click_filter = Q(page=page, clicked_at__gte=start_at)
+    if end_at is not None:
+        click_filter &= Q(clicked_at__lt=end_at)
 
     rows = (
-        BlockClick.objects.filter(page=page, clicked_at__gte=since)
+        BlockClick.objects.filter(click_filter)
         .values("block_id", "link_id", "block__type", "block__data", "block__is_enabled")
         .annotate(clicks=Count("id"))
         .order_by("-clicks")

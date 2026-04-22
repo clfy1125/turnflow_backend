@@ -42,6 +42,8 @@ class User(AbstractUser):
 
     email = models.EmailField(unique=True, verbose_name="Email Address")
     full_name = models.CharField(max_length=255, blank=True, verbose_name="Full Name")
+    is_email_verified = models.BooleanField(default=False, verbose_name="Email Verified")
+    email_verified_at = models.DateTimeField(null=True, blank=True, verbose_name="Email Verified At")
     username = None  # Remove username field
 
     # Override username to use email
