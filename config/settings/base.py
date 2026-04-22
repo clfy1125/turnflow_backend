@@ -386,8 +386,9 @@ PASSWORD_RESET_TTL_MINUTES = config("PASSWORD_RESET_TTL_MINUTES", default=60, ca
 # Onboarding drip campaign offsets (days after signup)
 ONBOARDING_DRIP_DAYS = [3, 7, 14]
 
-# Welcome + drip toggle. Transactional mails (verification / password reset)
-# are unaffected.  Re-enable later by setting ONBOARDING_ENABLED=True in .env.
+# 3/7/14 day drip campaign toggle (marketing-style).
+# Welcome, verification, password reset are transactional and unaffected by this.
+# Re-enable later by setting ONBOARDING_ENABLED=True in .env.
 ONBOARDING_ENABLED = config("ONBOARDING_ENABLED", default=False, cast=bool)
 
 # CSRF trusted origins

@@ -31,14 +31,16 @@ def on_user_created(sender, instance: User, created: bool, **kwargs):
         if not instance.is_email_verified and instance.has_usable_password():
             send_verification_email.delay(instance.id)
 
+        # Welcome email is transactional — fires for every new signup regardless of toggle.
+        send_welcome_email.apply_async(args=[instance.id], countdown=5)
+
+        # 3/7/14 day drip is marketing-style — gated behind ONBOARDING_ENABLED.
         if settings.ONBOARDING_ENABLED:
-            send_welcome_email.apply_async(args=[instance.id], countdown=5)
             schedule_onboarding.delay(instance.id)
-            logger.info("emails.onboarding queued for user=%s", instance.id)
+            logger.info("emails.drip queued for user=%s", instance.id)
         else:
             logger.info(
-                "emails.onboarding disabled via ONBOARDING_ENABLED=False (user=%s)",
-                instance.id,
+                "emails.drip disabled via ONBOARDING_ENABLED=False (user=%s)", instance.id
             )
     except Exception:
         logger.exception("Failed to enqueue onboarding emails for user=%s", instance.id)
