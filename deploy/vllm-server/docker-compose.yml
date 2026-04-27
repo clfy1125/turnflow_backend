@@ -1,0 +1,77 @@
+# /root/vllm-server/docker-compose.yml
+#
+# 변경점 (DeepSeek 도입):
+#   - litellm 서비스에 env_file: .env 추가 → DEEPSEEK_API_KEY 주입
+#
+# 기존 그대로:
+#   - vllm: H100 한 대 점유 + Gemma-4 FP8
+#   - db: LiteLLM 메타DB
+#   - 외부 노출은 litellm-proxy:4000 만 (Caddy 가 llm.clfy.ai.kr 로 프록시)
+
+services:
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: gemma-vllm
+    runtime: nvidia
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    ports:
+      - "8088:8000"
+    environment:
+      - VLLM_USE_TRITON_FLASH_ATTN=0
+      - TORCH_COMPILE_DISABLE=True
+    entrypoint: /bin/sh -c "pip install --upgrade transformers && python3 -m vllm.entrypoints.openai.api_server --host 0.0.0.0 --port 8000 --model RedHatAI/gemma-4-31B-it-FP8-block --tensor-parallel-size 1 --gpu-memory-utilization 0.95 --max-model-len 65536 --kv-cache-dtype fp8 --max-num-seqs 16 --max-num-batched-tokens 16384 --enable-prefix-caching --enforce-eager --trust-remote-code --tool-call-parser gemma4 --reasoning-parser gemma4"
+    networks:
+      - default
+      - turnflow_instagram_net
+
+  db:
+    image: postgres:15
+    container_name: litellm-db
+    restart: always
+    environment:
+      POSTGRES_DB: litellm
+      POSTGRES_USER: litellm_user
+      POSTGRES_PASSWORD: strong_password123
+    volumes:
+      - litellm_data:/var/lib/postgresql/data
+    networks:
+      - default
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: litellm-proxy
+    depends_on:
+      - vllm
+      - db
+    volumes:
+      - ./litellm-config.yaml:/app/config.yaml
+    # ⬇️ 추가: DEEPSEEK_API_KEY 등 외부 프로바이더 키를 .env 에서 주입
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://litellm_user:strong_password123@db:5432/litellm
+      - LITELLM_MASTER_KEY=sk-master-key-admin1234
+    command:
+      - "--config=/app/config.yaml"
+    ports:
+      - "4040:4000"
+    networks:
+      - default
+      - turnflow_instagram_net
+
+volumes:
+  litellm_data:
+
+networks:
+  default:
+  turnflow_instagram_net:
+    external: true

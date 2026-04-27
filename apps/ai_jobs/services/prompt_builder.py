@@ -121,30 +121,16 @@ def build_prompts(
     # 4) 사용자 입력 조합
     concept = user_input.get("concept", "")
 
-    user_parts = [
-        "### [목표]",
-        concept if concept else "링크인바이오 페이지를 만들어줘.",
-        "",
-    ]
+    # ────────────────────────────────────────────────────────
+    # ⚠️ DeepSeek prompt cache 최적화
+    #   prefix가 동일할수록 cache hit이 늘어 입력 비용이 1/5로 떨어진다.
+    #   따라서 고정 컨텐츠(블록 규칙·예시·이미지 규칙·출력 형식)를 먼저 두고,
+    #   가변 컨텐츠(현재 페이지 구조·사용자 목표)는 반드시 맨 뒤에 둔다.
+    #   (vLLM의 --enable-prefix-caching 도 동일한 원리로 동작)
+    # ────────────────────────────────────────────────────────
 
-    # 기존 페이지 리메이크 시 현재 블록 구조 포함
-    if is_remake:
-        existing_page_meta = user_input.get("existing_page_meta", {})
-        page_json = {
-            "title": existing_page_meta.get("title", ""),
-            "is_public": existing_page_meta.get("is_public", True),
-            "data": existing_page_meta.get("data", {}),
-            "blocks": existing_blocks,
-        }
-        user_parts += [
-            "### [현재 페이지 구조 - 리메이크 대상]",
-            "아래는 현재 페이지의 블록 구조입니다. 이 구조를 기반으로 사용자 요청에 맞게 리메이크해주세요.",
-            "기존 링크 URL, 연락처 등 핵심 데이터는 유지하되 디자인·색상·레이아웃·문구를 개선하세요.",
-            f"```json\n{json.dumps(page_json, ensure_ascii=False, indent=2)}\n```",
-            "",
-        ]
-
-    user_parts += [
+    # ── 고정 (캐시 prefix) ─────────────────────────────────
+    fixed_parts: list[str] = [
         "### [이미지 URL 규칙 - 매우 중요!]",
         "- 실제 URL을 넣지 말 것!",
         "- 반드시 {{image:영문_검색어}} 형식으로 작성",
@@ -154,15 +140,38 @@ def build_prompts(
         "  프로필 → {{image:band member portrait}}",
         "",
     ]
-
     if block_rules:
-        user_parts += [f"### [블록 규칙]\n{block_rules}", ""]
-
+        fixed_parts += [f"### [블록 규칙]\n{block_rules}", ""]
     if examples:
-        user_parts += [f"### [예시 JSON]\n{examples}", ""]
+        fixed_parts += [f"### [예시 JSON]\n{examples}", ""]
+    fixed_parts += [
+        "### [출력 형식]",
+        "설명 없이 JSON만 출력",
+        "",
+    ]
 
-    user_parts += ["### [출력]", "설명 없이 JSON만 출력"]
+    # ── 가변 (캐시 경계 아래) ──────────────────────────────
+    variable_parts: list[str] = []
+    if is_remake:
+        existing_page_meta = user_input.get("existing_page_meta", {})
+        page_json = {
+            "title": existing_page_meta.get("title", ""),
+            "is_public": existing_page_meta.get("is_public", True),
+            "data": existing_page_meta.get("data", {}),
+            "blocks": existing_blocks,
+        }
+        variable_parts += [
+            "### [현재 페이지 구조 - 리메이크 대상]",
+            "아래는 현재 페이지의 블록 구조입니다. 이 구조를 기반으로 사용자 요청에 맞게 리메이크해주세요.",
+            "기존 링크 URL, 연락처 등 핵심 데이터는 유지하되 디자인·색상·레이아웃·문구를 개선하세요.",
+            f"```json\n{json.dumps(page_json, ensure_ascii=False, indent=2)}\n```",
+            "",
+        ]
+    variable_parts += [
+        "### [목표]",
+        concept if concept else "링크인바이오 페이지를 만들어줘.",
+    ]
 
-    user_prompt = "\n".join(user_parts)
+    user_prompt = "\n".join(fixed_parts + variable_parts)
 
     return system_prompt, user_prompt

@@ -1,0 +1,24 @@
+model_list:
+  - model_name: gemma-4
+    litellm_params:
+      model: openai/RedHatAI/gemma-4-31B-it-FP8-block
+      api_base: http://vllm:8000/v1
+      api_key: "EMPTY"
+      max_parallel_requests: 10
+
+  - model_name: deepseek
+    litellm_params:
+      model: deepseek/deepseek-v4-flash
+      api_key: os.environ/DEEPSEEK_API_KEY
+      timeout: 600
+
+router_settings:
+  timeout: 150
+  fallbacks:
+    - {"gemma-4": ["deepseek"]}
+  num_retries: 1
+  allowed_fails: 2
+  cooldown_time: 30
+
+general_settings:
+  master_key: sk-master-key-admin1234

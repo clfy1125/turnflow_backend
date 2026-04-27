@@ -13,12 +13,14 @@ class AiJob(models.Model):
         COPY_GENERATION = "copy_generation", "카피 생성"
 
     class LlmModel(models.TextChoices):
-        GEMMA = "gemma", "Gemma (기본)"
+        GEMMA = "gemma", "Gemma (자체 H100, 기본)"
+        DEEPSEEK = "deepseek", "DeepSeek V4-Flash (외부 API, 폴백/오버플로우)"
         GPT5 = "gpt5", "GPT-5.4"
 
-    # LlmModel → 실제 LiteLLM 모델명
+    # LlmModel → 실제 LiteLLM 모델명 (litellm-config.yaml 의 model_name 과 일치해야 함)
     LLM_MODEL_MAP = {
         "gemma": "gemma-4",
+        "deepseek": "deepseek",
         "gpt5": "gpt-5.4",
     }
 
