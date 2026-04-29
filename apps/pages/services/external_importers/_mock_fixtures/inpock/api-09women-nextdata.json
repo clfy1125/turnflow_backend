@@ -1,0 +1,180 @@
+{
+  "props": {
+    "pageProps": {
+      "username": "09women",
+      "userId": 74242,
+      "design": {
+        "title": "09women",
+        "bio": null,
+        "sns_position": "bottom",
+        "layout_type": "cover_top",
+        "profile_alignment": "left",
+        "profile_size": "medium",
+        "profile_image": "",
+        "cover_image": "images/2023/11/24/2023-11-24-1700814496319.webp",
+        "theme": null,
+        "typography": "pretendard",
+        "background_type": null,
+        "background_color": "#ffffff",
+        "background_image": "",
+        "block_shape": "square-rounded",
+        "block_animation": null,
+        "block_shadow": "medium",
+        "block_alignment": "center",
+        "sns": [
+          {
+            "id": 50723,
+            "type": "instagram",
+            "value": "09women_official",
+            "order": 1
+          },
+          {
+            "id": 50724,
+            "type": "youtube",
+            "value": "https://www.youtube.com/channel/UCCF_6wYXwnC76SbJG1WnWQw/about",
+            "order": 2
+          }
+        ],
+        "notice": {
+          "id": 2573,
+          "background_color": "#343434",
+          "text_color": "#ffffff",
+          "contents": ""
+        },
+        "brand_image": null,
+        "brand_url": null,
+        "brand_image_policy": "default",
+        "using_short_link": false,
+        "allow_offers": false,
+        "using_search": false
+      },
+      "blocks": [
+        {
+          "id": 640814,
+          "block_type": "link",
+          "title": "공구우먼 온라인몰♥",
+          "url": "http://www.09women.com/",
+          "image": "images/2023/10/4/2023-10-4-1696395045286.webp",
+          "style": "thumbnail",
+          "button_text": null,
+          "is_cta": false,
+          "stickers": [],
+          "is_open": true,
+          "is_fixation": false,
+          "open_at": null,
+          "open_until": null
+        },
+        {
+          "id": 1470452,
+          "block_type": "link",
+          "title": "[Every, Body] 팔로워 2만명 월드컵 베이비가 알려주는 새내기 코디 꿀팁은!?👚",
+          "url": "https://youtu.be/xDpUe9aDHXo",
+          "image": "https://i.ytimg.com/vi/xDpUe9aDHXo/maxresdefault.jpg",
+          "style": "thumbnail",
+          "button_text": null,
+          "is_cta": false,
+          "stickers": [],
+          "is_open": true,
+          "is_fixation": false,
+          "open_at": null,
+          "open_until": null
+        },
+        {
+          "id": 829989,
+          "block_type": "divider",
+          "divider_type": "one_line",
+          "is_open": true,
+          "is_fixation": false
+        },
+        {
+          "id": 1030469,
+          "block_type": "link",
+          "title": "[ZEROLINE] 제로라인 - 언더웨어",
+          "url": "http://www.09women.com/shop/shopbrand.html?xcode=073&type=Y",
+          "image": "images/2023/8/22/2023-8-22-1692670767749.webp",
+          "style": "thumbnail",
+          "button_text": null,
+          "is_cta": false,
+          "stickers": [],
+          "is_open": true,
+          "is_fixation": false,
+          "open_at": null,
+          "open_until": null
+        },
+        {
+          "id": 1030472,
+          "block_type": "link",
+          "title": "[ZEROFIT] 제로핏 - 피트니스웨어",
+          "url": "http://www.09women.com/shop/shopbrand.html?xcode=024&type=Y",
+          "image": "images/2024/1/11/2024-1-11-1704943752608.webp",
+          "style": "thumbnail",
+          "button_text": null,
+          "is_cta": false,
+          "stickers": [],
+          "is_open": true,
+          "is_fixation": false,
+          "open_at": null,
+          "open_until": null
+        },
+        {
+          "id": 1030476,
+          "block_type": "link",
+          "title": "[ACTIRABLE] 액티러블 - 애슬레져",
+          "url": "http://www.09women.com/shop/shopbrand.html?xcode=016&type=Y",
+          "image": "images/2024/1/11/2024-1-11-1704943467964.webp",
+          "style": "thumbnail",
+          "button_text": null,
+          "is_cta": false,
+          "stickers": [],
+          "is_open": true,
+          "is_fixation": false,
+          "open_at": null,
+          "open_until": null
+        },
+        {
+          "id": 1316732,
+          "block_type": "link",
+          "title": "[MADE] SHOES",
+          "url": "https://www.09women.com/shop/shopbrand.html?xcode=022",
+          "image": "images/2023/10/4/2023-10-4-1696394830960.webp",
+          "style": "thumbnail",
+          "button_text": null,
+          "is_cta": false,
+          "stickers": [],
+          "is_open": true,
+          "is_fixation": false,
+          "open_at": null,
+          "open_until": null
+        },
+        {
+          "id": 1030516,
+          "block_type": "link",
+          "title": "'베리굿미 글루타치온 콜라겐 구미'🍓",
+          "url": "https://www.09women.com/shop/shopbrand.html?xcode=017&type=Y",
+          "image": "images/2023/10/4/2023-10-4-1696394912385.webp",
+          "style": "thumbnail",
+          "button_text": null,
+          "is_cta": false,
+          "stickers": [],
+          "is_open": true,
+          "is_fixation": false,
+          "open_at": null,
+          "open_until": null
+        }
+      ],
+      "isPreview": false,
+      "ipAddress": "211.219.29.236"
+    },
+    "__N_SSP": true
+  },
+  "page": "/[username]",
+  "query": {
+    "username": "09women"
+  },
+  "buildId": "foFPbf-wufMPmqt2gesKY",
+  "assetPrefix": "https://d3f1g377pcunjx.cloudfront.net",
+  "isFallback": false,
+  "isExperimentalCompile": false,
+  "gssp": true,
+  "scriptLoader": []
+}

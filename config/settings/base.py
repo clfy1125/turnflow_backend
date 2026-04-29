@@ -205,6 +205,13 @@ REST_FRAMEWORK = {
     "PAGE_SIZE": 20,
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "EXCEPTION_HANDLER": "apps.core.exceptions.custom_exception_handler",
+    # Throttle 은 글로벌 활성화하지 않음 (다른 뷰 영향 X). 각 View 가 명시적으로
+    # ``throttle_classes = [ScopedRateThrottle]`` + ``throttle_scope = "..."`` 사용.
+    # ``DEFAULT_THROTTLE_RATES`` 에 등록된 scope 만 ScopedRateThrottle 로 동작.
+    "DEFAULT_THROTTLE_RATES": {
+        # 외부 페이지 import 전용 — 사용자별 시간당 30건. 어뷰즈 차단 + 정상 사용 모두 OK.
+        "external_import": "30/hour",
+    },
 }
 
 # DRF Spectacular (OpenAPI/Swagger)
@@ -301,6 +308,11 @@ CELERY_BEAT_SCHEDULE = {
     },
     "handle-cancelled-expiry": {
         "task": "billing.handle_cancelled_expiry",
+        "schedule": 60 * 60 * 24,
+        "options": {"queue": "billing"},
+    },
+    "handle-trial-expiry": {
+        "task": "billing.handle_trial_expiry",
         "schedule": 60 * 60 * 24,
         "options": {"queue": "billing"},
     },

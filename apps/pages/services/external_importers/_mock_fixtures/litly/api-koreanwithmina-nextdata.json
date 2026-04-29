@@ -1,0 +1,358 @@
+{
+  "theme": {
+    "font": {
+      "family": "default"
+    },
+    "logo": {
+      "type": "default",
+      "image": null,
+      "position": "bottom"
+    },
+    "topbar": {
+      "type": "blockShaped"
+    },
+    "buttonColor": "#FFD800",
+    "buttonShape": "fullyRounded",
+    "buttonEffect": "wave",
+    "backgroundColor": "#F5F5F8",
+    "backgroundImage": null,
+    "buttonColorLayout": "default",
+    "customButtonColor": "#FFD800",
+    "savedButtonColors": {
+      "custom": "#FFEBAB",
+      "#DDF2E1": "#B5D6B3",
+      "#F5F5F8": "#FFD800",
+      "#FBEFEA": "#FFD1D1"
+    },
+    "backgroundImageFilter": "dark",
+    "customBackgroundColor": "#FFC756",
+    "customBackgroundImage": null
+  },
+  "blocks": [
+    {
+      "key": "zu0CByP",
+      "url": "https://docs.google.com/forms/d/e/1FAIpQLScZUEDKTYjdj-pd7F9C6VyGPQEZVpFkFuFthLlTLIBX4fA9nQ/viewform?usp=header",
+      "use": true,
+      "form": "smallButton",
+      "tags": [],
+      "type": "link",
+      "image": {
+        "url": "/images/ripQ4jzaMnFBfqY8LckCfPWo1UlBApoO",
+        "mediaId": 2491080
+      },
+      "price": null,
+      "title": "✨20-Day Korean Shadowing Study – Registration",
+      "folded": true,
+      "peerLink": {
+        "key": "lNMCrS2",
+        "url": "",
+        "image": null,
+        "title": ""
+      },
+      "emphasized": true,
+      "bypassQuery": false,
+      "reservation": {
+        "openAt": null,
+        "closeAt": null
+      },
+      "originalPrice": null
+    },
+    {
+      "key": "FmNmC9F",
+      "url": "https://fish-count-31a.notion.site/Enjoy-Korean-1-1-Class-with-Mina-21bf419665c48004a3caf573fbfb6475?pvs=143",
+      "use": true,
+      "form": "largeCard",
+      "type": "link",
+      "image": null,
+      "title": "💻  1:1 Korean Class with Mina",
+      "folded": true,
+      "peerLink": {
+        "key": "jdhdFqX",
+        "url": "",
+        "image": null,
+        "title": ""
+      },
+      "emphasized": false,
+      "bypassQuery": false,
+      "reservation": {
+        "openAt": null,
+        "closeAt": null
+      }
+    },
+    {
+      "key": "niEeca1",
+      "url": "https://fish-count-31a.notion.site/Think-Ink-Korean-October-2025-Crew-27df419665c4804d8a16cc81410804da?pvs=74",
+      "use": false,
+      "form": "smallButton",
+      "type": "link",
+      "image": null,
+      "title": "Sign up for ✍️ Think Ink Korean Writing Study",
+      "folded": true,
+      "peerLink": {
+        "key": "ZNXNMwL",
+        "url": "",
+        "image": null,
+        "title": ""
+      },
+      "emphasized": false,
+      "bypassQuery": false,
+      "reservation": {
+        "openAt": null,
+        "closeAt": null
+      }
+    },
+    {
+      "key": "8Ie0Boe",
+      "url": "https://fish-count-31a.notion.site/Korean-Conversation-Club-with-MINA-234f419665c48005aa03efc4c3885a8d",
+      "use": true,
+      "form": "smallButton",
+      "type": "link",
+      "image": null,
+      "title": "💬 Sign up for Conversation Club",
+      "folded": true,
+      "peerLink": {
+        "key": "l7NwLGO",
+        "url": "",
+        "image": null,
+        "title": ""
+      },
+      "emphasized": false,
+      "bypassQuery": false,
+      "reservation": {
+        "openAt": null,
+        "closeAt": null
+      }
+    },
+    {
+      "key": "xKCrSMa",
+      "url": "https://youtu.be/GrNp-U5MfCE",
+      "use": true,
+      "type": "video",
+      "links": [
+        {
+          "key": "sFPWFVL",
+          "url": "https://www.youtube.com/watch?v=aSLoH_gEGmU&t=277s"
+        }
+      ],
+      "folded": true,
+      "layout": "list",
+      "autoPlay": false,
+      "emphasized": false,
+      "reservation": {
+        "openAt": null,
+        "closeAt": null
+      }
+    },
+    {
+      "key": "MtGLD19",
+      "url": "https://fish-count-31a.notion.site/?pvs=74",
+      "use": false,
+      "form": "smallButton",
+      "type": "link",
+      "image": null,
+      "title": "💬 Check out the Conversation Cl sample",
+      "folded": true,
+      "peerLink": {
+        "key": "hUyNcWB",
+        "url": "",
+        "image": null,
+        "title": ""
+      },
+      "emphasized": false,
+      "bypassQuery": false,
+      "reservation": {
+        "openAt": null,
+        "closeAt": null
+      }
+    },
+    {
+      "key": "VA7H6c1",
+      "url": "https://fish-count-31a.notion.site/Hatch-Hangul-with-Mina-1def419665c48086a499da46d08fea0c",
+      "use": false,
+      "form": "smallButton",
+      "type": "link",
+      "image": null,
+      "title": "📦 Download Hatch Hangul Pack (FREE)",
+      "folded": true,
+      "peerLink": {
+        "key": "lmNVYMC",
+        "url": "",
+        "image": null,
+        "title": ""
+      },
+      "emphasized": false,
+      "bypassQuery": false,
+      "reservation": {
+        "openAt": null,
+        "closeAt": null
+      }
+    },
+    {
+      "key": "uxrsCys",
+      "url": "https://forms.gle/WvBVxP2x7CewPttS7",
+      "use": false,
+      "form": "smallButton",
+      "type": "link",
+      "image": null,
+      "title": "🎧 Apply for Feedback (FREE)",
+      "folded": true,
+      "peerLink": {
+        "key": "57q0feI",
+        "url": "",
+        "image": null,
+        "title": ""
+      },
+      "emphasized": false,
+      "bypassQuery": false,
+      "reservation": {
+        "openAt": null,
+        "closeAt": null
+      }
+    },
+    {
+      "key": "7dCDfjV",
+      "url": "https://www.instagram.com/korean_withmina?igsh=MTh1ZTZnaG5qaW5neg%3D%3D&utm_source=qr",
+      "use": true,
+      "form": "smallButton",
+      "type": "link",
+      "image": null,
+      "title": "Instagram",
+      "folded": true,
+      "peerLink": {
+        "key": "SW6EmjF",
+        "url": "",
+        "image": null,
+        "title": ""
+      },
+      "emphasized": false,
+      "bypassQuery": false,
+      "reservation": {
+        "openAt": null,
+        "closeAt": null
+      }
+    },
+    {
+      "key": "7YXTMed",
+      "url": "https://www.youtube.com/channel/UCYBToQk7WhzdlxGTNK2e8Zw",
+      "use": true,
+      "form": "smallButton",
+      "type": "link",
+      "image": null,
+      "title": "YouTube",
+      "folded": true,
+      "peerLink": {
+        "key": "BfUjJfN",
+        "url": "",
+        "image": null,
+        "title": ""
+      },
+      "emphasized": false,
+      "bypassQuery": false,
+      "reservation": {
+        "openAt": null,
+        "closeAt": null
+      }
+    },
+    {
+      "key": "XxQtQxP",
+      "url": "https://www.tiktok.com/@koreanwitmina?_t=ZS-8zUmdkOJsDl&_r=1",
+      "use": true,
+      "form": "smallButton",
+      "type": "link",
+      "image": null,
+      "title": "TikTok",
+      "folded": true,
+      "peerLink": {
+        "key": "FP1ZARq",
+        "url": "",
+        "image": null,
+        "title": ""
+      },
+      "emphasized": false,
+      "bypassQuery": false,
+      "reservation": {
+        "openAt": null,
+        "closeAt": null
+      }
+    },
+    {
+      "key": "PWm1oEp",
+      "use": true,
+      "body": "🔽 Business inquiries🔽",
+      "font": {
+        "size": "normal"
+      },
+      "type": "text",
+      "align": "center",
+      "title": "💬 Let's Enjoy Korean — together!",
+      "folded": true,
+      "layout": "default",
+      "emphasized": false,
+      "reservation": {
+        "openAt": null,
+        "closeAt": null
+      }
+    },
+    {
+      "key": "3cvrJ8g",
+      "use": true,
+      "type": "sns",
+      "links": [
+        {
+          "key": "SiUHCfg",
+          "type": "email",
+          "value": "learnkoreanwithmina@gmail.com"
+        }
+      ],
+      "folded": true,
+      "emphasized": false,
+      "reservation": {
+        "openAt": null,
+        "closeAt": null
+      }
+    },
+    {
+      "key": "CH9jN2P",
+      "use": false,
+      "type": "schedule",
+      "title": "",
+      "folded": true,
+      "layout": "calendarList",
+      "schedules": [],
+      "emphasized": false,
+      "reservation": {
+        "openAt": null,
+        "closeAt": null
+      }
+    }
+  ],
+  "secret": {
+    "body": "",
+    "image": null,
+    "enabled": false
+  },
+  "profile": {
+    "use": true,
+    "font": {
+      "size": "normal"
+    },
+    "image": {
+      "url": "/images/nrINzMi1xxDaFf3jORMpw8yAPPwmxomS",
+      "mediaId": 1658650
+    },
+    "title": "Korean with mina",
+    "folded": true,
+    "layout": "image",
+    "subtitle": "🏄🏻‍♀️Just enjoy Korean with me\nso you can love what you love even more",
+    "backgroundImage": null,
+    "subscriptionFields": {
+      "email": true,
+      "phone": false
+    }
+  },
+  "certificated": false,
+  "cdnProfileImageUrl": "https://cdn.litt.ly/images/nrINzMi1xxDaFf3jORMpw8yAPPwmxomS",
+  "pageId": 193346,
+  "alias": "koreanwithmina",
+  "referer": null
+}

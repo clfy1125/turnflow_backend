@@ -11,6 +11,9 @@ class AiJob(models.Model):
         BIO_REMAKE = "bio_remake", "바이오 리메이크"
         THEME_GENERATION = "theme_generation", "테마 생성"
         COPY_GENERATION = "copy_generation", "카피 생성"
+        # 외부 서비스(인포크/리틀리/링크트리) 페이지를 비동기로 가져오기.
+        # 이미지 재업로드 옵션이 있어 LLM 호출 없이도 분 단위 작업이 됨 → AiJob 으로 처리.
+        EXTERNAL_IMPORT = "external_import", "외부 페이지 가져오기"
 
     class LlmModel(models.TextChoices):
         GEMMA = "gemma", "Gemma (자체 H100, 기본)"
@@ -35,10 +38,16 @@ class AiJob(models.Model):
 
     class Stage(models.TextChoices):
         QUEUED = "queued", "대기"
+        # LLM 파이프라인 (BIO_REMAKE / THEME_GENERATION / COPY_GENERATION) 단계
         PREPARING_PROMPT = "preparing_prompt", "프롬프트 준비"
         CALLING_MODEL = "calling_model", "모델 호출"
         PARSING_RESPONSE = "parsing_response", "응답 파싱"
         RESOLVING_IMAGES = "resolving_images", "이미지 검색"
+        # 외부 임포트 파이프라인 (EXTERNAL_IMPORT) 단계
+        FETCHING_SOURCE = "fetching_source", "원본 페이지 다운로드"
+        CONVERTING = "converting", "블록 변환"
+        REUPLOADING_IMAGES = "reuploading_images", "이미지 재업로드"
+        CREATING_PAGE = "creating_page", "페이지 생성"
         COMPLETED = "completed", "완료"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

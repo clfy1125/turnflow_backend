@@ -50,6 +50,44 @@ class Page(models.Model):
         verbose_name="활성 상태",
         help_text="비활성 페이지는 공개 URL로 접근 불가. 다운그레이드 시 플랜 한도에 맞춰 비활성화됩니다.",
     )
+
+    # 외부 임포트 추적 — 인포크/리틀리/링크트리에서 가져온 페이지의 출처를 기록.
+    # 자체 생성 페이지는 모두 빈 문자열. 어드민 추적 / 같은 URL 재임포트 감지 /
+    # 컨버터 정확도 분석용. 페이지를 만든 후 수동 편집해도 출처는 그대로 보존.
+    class ImportSource(models.TextChoices):
+        NONE = "", "자체 생성"
+        INPOCK = "inpock", "인포크"
+        LITLY = "litly", "리틀리"
+        LINKTREE = "linktree", "링크트리"
+
+    import_source = models.CharField(
+        max_length=20,
+        blank=True,
+        default="",
+        choices=ImportSource.choices,
+        verbose_name="외부 임포트 소스",
+        help_text="외부에서 임포트했다면 어떤 서비스인지. 자체 생성이면 빈 문자열.",
+    )
+    import_source_slug = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        verbose_name="원본 slug",
+        help_text="외부 서비스에서의 원본 slug (예: 'koreanwithmina').",
+    )
+    import_source_url = models.URLField(
+        max_length=512,
+        blank=True,
+        default="",
+        verbose_name="원본 URL",
+    )
+    imported_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="임포트 일시",
+        help_text="외부에서 임포트한 시점. 자체 생성 페이지면 NULL.",
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

@@ -1,6 +1,6 @@
 from django.urls import path
 
-from .aiviews import AiCloneFromSlugView, AiPageEditView
+from .aiviews import AiCloneFromSlugView, AiImportExternalView, AiPageEditView
 from .image_views import PageMediaDetailView, PageMediaView
 from .multi_views import (
     MultiBlockCustomCssView,
@@ -125,4 +125,6 @@ urlpatterns = [
     path("ai/clone-from-slug/", AiCloneFromSlugView.as_view(), name="ai-clone-from-slug"),
     # 페이지 전체 편집 (1-shot)
     path("ai/@<slug:slug>/", AiPageEditView.as_view(), name="ai-page-edit"),
+    # 외부 서비스(인포크/리틀리/링크트리) 페이지 가져오기
+    path("ai/import-external/", AiImportExternalView.as_view(), name="ai-import-external"),
 ]
