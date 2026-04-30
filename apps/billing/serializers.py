@@ -141,13 +141,75 @@ class PaymentHistorySerializer(serializers.ModelSerializer):
         ]
 
 
+# ──────────────────────────────────────────────
+# 레퍼럴 코드 Serializers
+# ──────────────────────────────────────────────
+
+
+class ReferralCodeRedeemRequestSerializer(serializers.Serializer):
+    """레퍼럴 코드 사용 요청"""
+
+    code = serializers.CharField(
+        max_length=50,
+        help_text="레퍼럴 코드 (대소문자 무시)",
+    )
+
+
+class ReferralCodeValidateResponseSerializer(serializers.Serializer):
+    """레퍼럴 코드 사전 검증 응답"""
+
+    valid = serializers.BooleanField(help_text="사용 가능 여부")
+    reason = serializers.CharField(
+        required=False, allow_blank=True, help_text="사용 불가 사유 (valid=false일 때)"
+    )
+    trial_days = serializers.IntegerField(
+        required=False, help_text="트라이얼 부여 일수 (valid=true일 때)"
+    )
+    plan = SubscriptionPlanSerializer(
+        required=False, help_text="트라이얼로 부여될 플랜 (valid=true일 때)"
+    )
+
+
+class ReferralRedemptionSerializer(serializers.ModelSerializer):
+    """레퍼럴 사용 이력 조회용"""
+
+    referral_code_value = serializers.CharField(source="referral_code.code", read_only=True)
+    plan = SubscriptionPlanSerializer(source="referral_code.target_plan", read_only=True)
+    is_trial_active = serializers.SerializerMethodField()
+
+    class Meta:
+        model = None  # set below
+        fields = [
+            "id",
+            "referral_code_value",
+            "plan",
+            "trial_started_at",
+            "trial_ends_at",
+            "is_trial_active",
+            "converted_to_paid",
+            "converted_at",
+            "created_at",
+        ]
+
+    def get_is_trial_active(self, obj) -> bool:
+        from django.utils import timezone
+
+        return obj.trial_ends_at > timezone.now() and not obj.converted_to_paid
+
+
 # Avoid circular import: set model references after class definition
 def _patch_serializer_models():
-    from .models import SubscriptionPlan, UserSubscription, PaymentHistory
+    from .models import (
+        PaymentHistory,
+        ReferralRedemption,
+        SubscriptionPlan,
+        UserSubscription,
+    )
 
     SubscriptionPlanSerializer.Meta.model = SubscriptionPlan
     UserSubscriptionSerializer.Meta.model = UserSubscription
     PaymentHistorySerializer.Meta.model = PaymentHistory
+    ReferralRedemptionSerializer.Meta.model = ReferralRedemption
 
 
 _patch_serializer_models()

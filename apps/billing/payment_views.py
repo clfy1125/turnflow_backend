@@ -240,6 +240,18 @@ PayApp은 HTTP 200 + body `SUCCESS`를 기대합니다.
                 description=f"{sub.plan.display_name} 구독 결제 토큰 지급",
             )
 
+        # 레퍼럴 트라이얼 → 유료 전환 마킹 (있을 때만)
+        from .models import ReferralRedemption
+
+        try:
+            redemption = ReferralRedemption.objects.select_for_update().get(user=sub.user)
+            if not redemption.converted_to_paid:
+                redemption.converted_to_paid = True
+                redemption.converted_at = now
+                redemption.save(update_fields=["converted_to_paid", "converted_at"])
+        except ReferralRedemption.DoesNotExist:
+            pass
+
         logger.info(
             "PayApp 결제완료 처리: user=%s plan=%s mul_no=%s",
             sub.user.email, sub.plan.name, mul_no,

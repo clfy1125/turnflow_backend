@@ -519,3 +519,133 @@ class AiTokenLedger(models.Model):
     def __str__(self):
         sign = "+" if self.amount > 0 else ""
         return f"{self.user.email} {sign}{self.amount} → {self.balance_after}"
+
+
+# ──────────────────────────────────────────────
+# 레퍼럴 코드 (Referral Code)
+# ──────────────────────────────────────────────
+
+
+class ReferralCode(models.Model):
+    """
+    레퍼럴 코드.
+    사용자가 코드를 입력하면 결제 없이 일정 기간 동안 target_plan 트라이얼을 받는다.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    code = models.CharField(
+        max_length=50,
+        unique=True,
+        verbose_name="코드",
+        help_text="입력 시 대소문자 무시. 저장은 대문자로 정규화.",
+    )
+    description = models.CharField(
+        max_length=200,
+        blank=True,
+        default="",
+        verbose_name="설명",
+    )
+    target_plan = models.ForeignKey(
+        SubscriptionPlan,
+        on_delete=models.PROTECT,
+        related_name="referral_codes",
+        verbose_name="트라이얼 대상 플랜",
+        help_text="레퍼럴 사용 시 일시 부여할 플랜 (보통 pro)",
+    )
+    trial_days = models.PositiveIntegerField(
+        default=30,
+        verbose_name="트라이얼 기간(일)",
+    )
+    is_active = models.BooleanField(default=True, verbose_name="활성")
+    max_uses = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        verbose_name="최대 사용 횟수",
+        help_text="null이면 무제한",
+    )
+    current_uses = models.PositiveIntegerField(
+        default=0,
+        verbose_name="현재 사용 횟수",
+    )
+    valid_from = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="사용 시작 시각",
+    )
+    valid_until = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="사용 종료 시각",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "referral_codes"
+        ordering = ["-created_at"]
+        verbose_name = "레퍼럴 코드"
+        verbose_name_plural = "레퍼럴 코드 목록"
+
+    def __str__(self):
+        return f"{self.code} ({self.trial_days}일 → {self.target_plan.display_name})"
+
+    def save(self, *args, **kwargs):
+        if self.code:
+            self.code = self.code.strip().upper()
+        super().save(*args, **kwargs)
+
+    def is_redeemable(self) -> tuple[bool, str]:
+        """현재 시점에서 사용 가능한지 + 사유 메시지."""
+        if not self.is_active:
+            return False, "비활성화된 코드입니다."
+        now = timezone.now()
+        if self.valid_from and now < self.valid_from:
+            return False, "아직 사용할 수 없는 코드입니다."
+        if self.valid_until and now > self.valid_until:
+            return False, "유효 기간이 만료된 코드입니다."
+        if self.max_uses is not None and self.current_uses >= self.max_uses:
+            return False, "사용 횟수가 모두 소진된 코드입니다."
+        return True, ""
+
+
+class ReferralRedemption(models.Model):
+    """
+    레퍼럴 사용 이력. 1유저당 1회만 사용 가능 (OneToOne).
+    트라이얼이 끝난 뒤 유료 전환 여부도 함께 추적한다.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="referral_redemption",
+        verbose_name="사용자",
+    )
+    referral_code = models.ForeignKey(
+        ReferralCode,
+        on_delete=models.PROTECT,
+        related_name="redemptions",
+        verbose_name="레퍼럴 코드",
+    )
+    trial_started_at = models.DateTimeField(verbose_name="트라이얼 시작")
+    trial_ends_at = models.DateTimeField(verbose_name="트라이얼 종료")
+    converted_to_paid = models.BooleanField(
+        default=False,
+        verbose_name="유료 전환 여부",
+        help_text="트라이얼 후 정기결제 완료 시 True",
+    )
+    converted_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="유료 전환 시각",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "referral_redemptions"
+        ordering = ["-created_at"]
+        verbose_name = "레퍼럴 사용 이력"
+        verbose_name_plural = "레퍼럴 사용 이력 목록"
+
+    def __str__(self):
+        return f"{self.user.email} ← {self.referral_code.code}"

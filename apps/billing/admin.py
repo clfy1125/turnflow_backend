@@ -2,6 +2,7 @@ from django.contrib import admin
 from .models import (
     UsageCounter, SubscriptionPlan, UserSubscription, PaymentHistory,
     AiTokenBalance, AiTokenLedger, PayAppWebhookLog,
+    ReferralCode, ReferralRedemption,
 )
 
 
@@ -64,4 +65,30 @@ class PayAppWebhookLogAdmin(admin.ModelAdmin):
     list_filter = ["webhook_type", "processed", "pay_state"]
     search_fields = ["mul_no", "rebill_no"]
     readonly_fields = ["id", "raw_data", "created_at"]
+    ordering = ["-created_at"]
+
+
+@admin.register(ReferralCode)
+class ReferralCodeAdmin(admin.ModelAdmin):
+    list_display = [
+        "code", "target_plan", "trial_days", "is_active",
+        "current_uses", "max_uses", "valid_from", "valid_until", "created_at",
+    ]
+    list_filter = ["is_active", "target_plan"]
+    search_fields = ["code", "description"]
+    readonly_fields = ["id", "current_uses", "created_at", "updated_at"]
+    raw_id_fields = ["target_plan"]
+    ordering = ["-created_at"]
+
+
+@admin.register(ReferralRedemption)
+class ReferralRedemptionAdmin(admin.ModelAdmin):
+    list_display = [
+        "user", "referral_code", "trial_started_at", "trial_ends_at",
+        "converted_to_paid", "converted_at",
+    ]
+    list_filter = ["converted_to_paid", "referral_code"]
+    search_fields = ["user__email", "referral_code__code"]
+    readonly_fields = ["id", "created_at"]
+    raw_id_fields = ["user", "referral_code"]
     ordering = ["-created_at"]

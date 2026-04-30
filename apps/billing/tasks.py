@@ -4,7 +4,8 @@ Billing Celery tasks — 구독 결제 관련 배치 작업.
 1. check_missed_payments   — 매일 02:00, past_due 구독의 미수금 확인
 2. handle_grace_period_expiry — 매일 03:00, 유예 기간 만료 구독 다운그레이드
 3. handle_cancelled_expiry — 매일 03:30, 취소(일시정지) 구독 기간 만료 다운그레이드
-4. notify_expiring_subscriptions — 매일 09:00, 만료 임박 구독 안내
+4. handle_trial_expiry     — 매일 04:00, 레퍼럴 트라이얼 만료 구독 다운그레이드
+5. notify_expiring_subscriptions — 매일 09:00, 만료 임박 구독 안내
 """
 
 import logging
@@ -77,6 +78,36 @@ def handle_grace_period_expiry():
         _downgrade_to_free(sub, free_plan, reason="grace_period")
         count += 1
 
+    return count
+
+
+@shared_task(name="billing.handle_trial_expiry")
+def handle_trial_expiry():
+    """
+    TRIALING 상태이고 current_period_end가 지난 구독을 무료로 다운그레이드.
+    레퍼럴 트라이얼이 만료된 사용자가 결제 안 했을 때 적용된다.
+    """
+    from .models import SubscriptionStatus, UserSubscription
+    from .subscription_utils import get_free_plan
+
+    now = timezone.now()
+    free_plan = get_free_plan()
+    if not free_plan:
+        logger.error("handle_trial_expiry: free 플랜이 존재하지 않음")
+        return 0
+
+    expired_subs = UserSubscription.objects.filter(
+        status=SubscriptionStatus.TRIALING,
+        current_period_end__lt=now,
+    ).exclude(current_period_end__isnull=True)
+
+    count = 0
+    for sub in expired_subs:
+        _downgrade_to_free(sub, free_plan, reason="trial_expired")
+        count += 1
+
+    if count:
+        logger.info("handle_trial_expiry: %d건 트라이얼 만료 → free 다운그레이드", count)
     return count
 
 

@@ -20,6 +20,11 @@ from .payment_views import (
     RefundEligibilityView,
     RefundPaymentView,
 )
+from .referral_views import (
+    MyReferralRedemptionView,
+    RedeemReferralCodeView,
+    ValidateReferralCodeView,
+)
 
 app_name = "billing"
 
@@ -41,4 +46,20 @@ urlpatterns = router.urls + [
     path("billing/payments/history/", PaymentHistoryView.as_view(), name="payment-history"),
     path("billing/refund-eligibility/", RefundEligibilityView.as_view(), name="refund-eligibility"),
     path("billing/payments/<uuid:payment_id>/refund/", RefundPaymentView.as_view(), name="payment-refund"),
+    # 레퍼럴 (첫달 무료 트라이얼)
+    path(
+        "billing/referral/validate/",
+        ValidateReferralCodeView.as_view(),
+        name="referral-validate",
+    ),
+    path(
+        "billing/referral/redeem/",
+        RedeemReferralCodeView.as_view(),
+        name="referral-redeem",
+    ),
+    path(
+        "billing/referral/my-status/",
+        MyReferralRedemptionView.as_view(),
+        name="referral-my-status",
+    ),
 ]

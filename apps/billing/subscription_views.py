@@ -390,8 +390,8 @@ if (data.pay_url) {
 
         sub = ensure_subscription(request.user)
 
-        # 같은 플랜이면 무시
-        if sub.plan_id == new_plan.id:
+        # 같은 플랜이면 무시 — 단, 트라이얼 중인 사용자가 같은 플랜으로 결제 전환하는 건 허용
+        if sub.plan_id == new_plan.id and sub.status != SubscriptionStatus.TRIALING:
             return Response(
                 {"detail": "이미 동일한 플랜을 사용 중입니다."},
                 status=status.HTTP_400_BAD_REQUEST,
