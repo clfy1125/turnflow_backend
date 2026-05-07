@@ -79,6 +79,20 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
             logger.error(f"Missing required fields in webhook payload: {webhook_payload}")
             return {"status": "error", "reason": "Missing required fields"}
 
+        # ★ Self-comment 가드:
+        # 비즈니스 본인이 자기 게시물에 댓글 → 자기 자신에게 DM 가는 루프 차단.
+        # webhook entry.id 는 connected page 의 IG user id 와 동일.
+        page_ig_user_id = str(webhook_payload.get("entry_id") or "")
+        if (
+            page_ig_user_id
+            and str(from_user_id) == page_ig_user_id
+        ):
+            logger.info(
+                f"Skipping self-comment DM: page={page_ig_user_id} "
+                f"commented on own post (comment_id={comment_id})"
+            )
+            return {"status": "skipped", "reason": "self_comment"}
+
         # 1) 스팸 검사
         spam_result = _check_and_handle_spam(
             comment_id=comment_id,
@@ -153,6 +167,31 @@ def _enqueue_send_dm(
       - gate_status = PENDING(gate 사용 시) / NONE
     """
     ig_conn = campaign.ig_connection
+
+    # ★ Self-DM 가드 (이중 안전망):
+    # 캠페인 owner = 댓글 작성자면 skip. _process_comment_and_send_dm 에서
+    # 1차 차단되지만, 다른 진입점(향후 추가)에서도 안전하게.
+    if str(from_user_id) == str(ig_conn.external_account_id):
+        return {
+            "campaign_id": str(campaign.id),
+            "status": "skipped",
+            "reason": "self_comment",
+        }
+
+    # ★ 동일 수신자 60초 쿨다운: 같은 사람이 단시간에 여러 댓글 달면
+    # idempotency_key 는 comment_id 별로 다르므로 중복 방지 안 됨 → 별도 가드.
+    cooldown_cutoff = timezone.now() - timedelta(seconds=60)
+    recent_to_same_recipient = SentDMLog.objects.filter(
+        campaign=campaign,
+        recipient_user_id=from_user_id,
+        created_at__gte=cooldown_cutoff,
+    ).exists()
+    if recent_to_same_recipient:
+        return {
+            "campaign_id": str(campaign.id),
+            "status": "skipped",
+            "reason": "recipient_cooldown_60s",
+        }
 
     idempotency_key = InstagramMessagingService.build_idempotency_key(
         workspace_id=ig_conn.workspace_id,
@@ -860,6 +899,12 @@ def handle_inbound_message_for_gate(
     """
     if not (page_ig_user_id and sender_user_id):
         return {"status": "skipped", "reason": "missing ids"}
+
+    # ★ Self-message 가드: 비즈니스 owner 본인이 자기 자신에게 메시지를 보낸
+    # 케이스. (실제 페이지 본인은 outbound 가 echo 로 처리되지만, 테스트 환경에서
+    # 동일 계정 inbound 가 잘못 들어올 수 있어 안전망 추가.)
+    if str(sender_user_id) == str(page_ig_user_id):
+        return {"status": "skipped", "reason": "self_message"}
 
     candidates = (
         SentDMLog.objects
