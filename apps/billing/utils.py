@@ -78,7 +78,12 @@ class UsageTracker:
                 workspace=workspace,
                 year=year,
                 month=month,
-                defaults={"comments_collected": 0, "dm_sent": 0},
+                defaults={
+                    "comments_collected": 0,
+                    "dm_sent": 0,
+                    "videos_published": 0,
+                    "comments_moderated": 0,
+                },
             )
 
         plan_limits = PlanLimits.get_all_limits(workspace.plan)
@@ -89,14 +94,20 @@ class UsageTracker:
             "usage": {
                 "comments_collected": counter.comments_collected,
                 "dm_sent": counter.dm_sent,
+                "videos_published": counter.videos_published,
+                "comments_moderated": counter.comments_moderated,
             },
             "limits": {
                 "comments_collected_per_month": plan_limits.get("comments_collected_per_month"),
                 "dm_sent_per_month": plan_limits.get("dm_sent_per_month"),
+                "videos_published_per_month": plan_limits.get("videos_published_per_month"),
+                "comments_moderated_per_month": plan_limits.get("comments_moderated_per_month"),
             },
             "remaining": {
                 "comments_collected": counter.get_remaining("comments_collected"),
                 "dm_sent": counter.get_remaining("dm_sent"),
+                "videos_published": counter.get_remaining("videos_published"),
+                "comments_moderated": counter.get_remaining("comments_moderated"),
             },
         }
 

@@ -28,6 +28,8 @@ class PlanLimits:
         PlanChoices.STARTER: {
             "comments_collected_per_month": 1000,
             "dm_sent_per_month": 100,
+            "videos_published_per_month": 10,
+            "comments_moderated_per_month": 500,
             "workspaces": 1,
             "team_members": 3,
             "automations": 5,
@@ -35,6 +37,8 @@ class PlanLimits:
         PlanChoices.PRO: {
             "comments_collected_per_month": 10000,
             "dm_sent_per_month": 1000,
+            "videos_published_per_month": 100,
+            "comments_moderated_per_month": 10000,
             "workspaces": 5,
             "team_members": 10,
             "automations": 50,
@@ -42,6 +46,8 @@ class PlanLimits:
         PlanChoices.ENTERPRISE: {
             "comments_collected_per_month": -1,  # Unlimited
             "dm_sent_per_month": -1,  # Unlimited
+            "videos_published_per_month": -1,  # Unlimited
+            "comments_moderated_per_month": -1,  # Unlimited
             "workspaces": -1,  # Unlimited
             "team_members": -1,  # Unlimited
             "automations": -1,  # Unlimited
@@ -84,6 +90,8 @@ class UsageCounter(models.Model):
     # Usage metrics
     comments_collected = models.IntegerField(default=0)
     dm_sent = models.IntegerField(default=0)
+    videos_published = models.IntegerField(default=0)
+    comments_moderated = models.IntegerField(default=0)
 
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)
@@ -114,7 +122,12 @@ class UsageCounter(models.Model):
             workspace=workspace,
             year=year,
             month=month,
-            defaults={"comments_collected": 0, "dm_sent": 0},
+            defaults={
+                "comments_collected": 0,
+                "dm_sent": 0,
+                "videos_published": 0,
+                "comments_moderated": 0,
+            },
         )
         return counter
 
@@ -122,7 +135,12 @@ class UsageCounter(models.Model):
         """
         Increment a usage metric
         """
-        if metric not in ["comments_collected", "dm_sent"]:
+        if metric not in [
+            "comments_collected",
+            "dm_sent",
+            "videos_published",
+            "comments_moderated",
+        ]:
             raise ValueError(f"Invalid metric: {metric}")
 
         current_value = getattr(self, metric)
