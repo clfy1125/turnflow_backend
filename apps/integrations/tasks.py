@@ -69,6 +69,7 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
 
         comment_id = value.get("id")
         comment_text = value.get("text", "")
+        parent_id = value.get("parent_id")  # 대댓글이면 부모 comment_id, top-level이면 빈 값
         from_user = value.get("from", {})
         from_user_id = from_user.get("id")
         from_username = from_user.get("username")
@@ -78,6 +79,16 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
         if not all([comment_id, from_user_id, from_username, media_id]):
             logger.error(f"Missing required fields in webhook payload: {webhook_payload}")
             return {"status": "error", "reason": "Missing required fields"}
+
+        # ★ 대댓글(답글) 가드:
+        # 우리 시스템이 게시한 공개 답글이 다시 webhook 으로 들어오면 → DM 무한 루프.
+        # 외부 사용자의 답글 역시 캠페인 트리거 대상이 아님 (top-level 댓글만 트리거).
+        # parent_id 가 있으면 무조건 skip.
+        if parent_id:
+            logger.info(
+                f"Skipping reply (대댓글): comment_id={comment_id} parent={parent_id}"
+            )
+            return {"status": "skipped", "reason": "is_reply"}
 
         # ★ Self-comment 가드:
         # 비즈니스 본인이 자기 게시물에 댓글 → 자기 자신에게 DM 가는 루프 차단.
