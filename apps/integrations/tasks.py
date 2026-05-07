@@ -1,17 +1,47 @@
 """
-Celery tasks for Instagram integration
-DM 자동발송 및 스팸 필터링 비동기 처리
+Instagram 통합 Celery 태스크.
+
+99.9% DM 발송 보증 시스템의 비동기 컴포넌트:
+
+- process_comment_and_send_dm: 댓글 웹훅 → 스팸 검사 → DM 발송 (진입점)
+- send_dm_task:               단일 SentDMLog 행을 ACCEPTED까지 진행 (멱등)
+- reconcile_accepted_dms:     ACCEPTED + 5분/35분 경과 건을 능동 조회로 검증
+- reconcile_stuck_submitting: SUBMITTING 60초+ 정체 건을 안전 재시도
+- dead_letter_alerter:        FAILED_TOKEN/FAILED_NO_TRACE 누적 알림
 """
 
-import logging
-from celery import shared_task
-from django.utils import timezone
-from datetime import datetime
+from __future__ import annotations
 
-from .models import AutoDMCampaign, SentDMLog, IGAccountConnection, SpamFilterConfig, SpamCommentLog
-from .services import InstagramMessagingService, SpamDetectionService, InstagramCommentService
+import logging
+from datetime import timedelta
+
+from celery import shared_task
+from django.db import IntegrityError, transaction
+from django.utils import timezone
+
+from .dm_exceptions import (
+    DMSendError,
+    DMTransientError,
+    exception_to_classification,
+)
+from .models import (
+    AutoDMCampaign,
+    IGAccountConnection,
+    SentDMLog,
+    SpamCommentLog,
+    SpamFilterConfig,
+)
+from .services import (
+    InstagramCommentService,
+    InstagramMediaService,
+    InstagramMessagingService,
+    SpamDetectionService,
+)
 
 logger = logging.getLogger(__name__)
+
+
+# ===== 진입점 =====
 
 
 @shared_task(
@@ -22,39 +52,26 @@ logger = logging.getLogger(__name__)
 )
 def process_comment_and_send_dm(self, webhook_payload: dict):
     """
-    Webhook에서 받은 댓글 데이터 처리:
-    1. 스팸 검사 (스팸 필터 활성화된 경우)
-    2. 스팸이면 댓글 숨김 처리
-    3. 스팸이 아니면 DM 자동 발송 로직 실행
+    댓글 웹훅 이벤트 처리.
 
-    Args:
-        webhook_payload: Instagram webhook payload
-
-    Returns:
-        처리 결과 딕셔너리
+    1) 스팸 검사 (스팸 필터 활성 시)
+    2) 스팸이면 댓글 숨김 처리 후 종료
+    3) 정상이면 매칭되는 활성 캠페인마다 DM 발송 큐에 enqueue
     """
     try:
         logger.debug(f"Processing comment webhook: {webhook_payload}")
 
-        # Webhook 데이터 파싱
         field = webhook_payload.get("field")
         value = webhook_payload.get("value", {})
 
         if field != "comments":
-            logger.warning(f"Unsupported webhook field: {field}")
             return {"status": "skipped", "reason": f"Unsupported field: {field}"}
 
-        # 댓글 정보 추출
         comment_id = value.get("id")
         comment_text = value.get("text", "")
-        parent_id = value.get("parent_id")  # 대댓글인 경우
-
-        # 댓글 작성자 정보
         from_user = value.get("from", {})
         from_user_id = from_user.get("id")
         from_username = from_user.get("username")
-
-        # 미디어 정보
         media = value.get("media", {})
         media_id = media.get("id")
 
@@ -62,8 +79,8 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
             logger.error(f"Missing required fields in webhook payload: {webhook_payload}")
             return {"status": "error", "reason": "Missing required fields"}
 
-        # === 1단계: 스팸 필터 검사 (활성화된 경우) ===
-        spam_check_result = _check_and_handle_spam(
+        # 1) 스팸 검사
+        spam_result = _check_and_handle_spam(
             comment_id=comment_id,
             comment_text=comment_text,
             from_user_id=from_user_id,
@@ -71,39 +88,911 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
             media_id=media_id,
             webhook_payload=webhook_payload,
         )
+        if spam_result.get("is_spam"):
+            return spam_result
 
-        # 스팸으로 판정되면 DM 발송하지 않고 종료
-        if spam_check_result.get("is_spam"):
-            logger.debug(f"Comment {comment_id} identified as spam, skipping DM")
-            return spam_check_result
+        # 2) 활성 캠페인 매칭 (trigger_type + keyword 모두 평가)
+        # webhook 의 entry.id 는 IG user id — 그 계정의 캠페인만 후보
+        ig_user_id = str(webhook_payload.get("entry_id") or "")
+        candidate_qs = (
+            AutoDMCampaign.objects
+            .filter(status=AutoDMCampaign.Status.ACTIVE)
+            .select_related("ig_connection", "ig_connection__workspace")
+        )
+        if ig_user_id:
+            candidate_qs = candidate_qs.filter(
+                ig_connection__external_account_id=ig_user_id
+            )
 
-        # === 2단계: DM 자동발송 로직 ===
-        # 해당 미디어에 대한 활성 캠페인 조회
-        active_campaigns = AutoDMCampaign.objects.filter(
-            media_id=media_id, status=AutoDMCampaign.Status.ACTIVE
-        ).select_related("ig_connection")
+        # trigger_type 평가:
+        #   specific_media (or attached next_media): media_id 일치
+        #   any_media: 모두 통과
+        # next_media 는 attach 후 specific_media 로 자동 전환되므로 여기선 따로 처리 안 함
+        matched_campaigns = []
+        for c in candidate_qs:
+            if c.matches_media(media_id) and c.matches_keyword(comment_text):
+                matched_campaigns.append(c)
 
-        if not active_campaigns.exists():
-            logger.debug(f"No active campaign found for media_id: {media_id}")
-            return {"status": "skipped", "reason": "No active campaign"}
+        if not matched_campaigns:
+            return {"status": "skipped", "reason": "No campaign matched (media/keyword)"}
 
         results = []
-        for campaign in active_campaigns:
-            result = _process_single_campaign(
-                campaign=campaign,
-                comment_id=comment_id,
-                comment_text=comment_text,
-                from_user_id=from_user_id,
-                from_username=from_username,
-                webhook_payload=webhook_payload,
+        for campaign in matched_campaigns:
+            results.append(
+                _enqueue_send_dm(
+                    campaign=campaign,
+                    comment_id=comment_id,
+                    comment_text=comment_text,
+                    from_user_id=from_user_id,
+                    from_username=from_username,
+                    webhook_payload=webhook_payload,
+                )
             )
-            results.append(result)
 
-        return {"status": "completed", "processed_campaigns": len(results), "results": results}
+        return {"status": "queued", "results": results}
 
     except Exception as e:
         logger.exception(f"Error processing comment webhook: {e}")
         raise
+
+
+def _enqueue_send_dm(
+    *,
+    campaign: AutoDMCampaign,
+    comment_id: str,
+    comment_text: str,
+    from_user_id: str,
+    from_username: str,
+    webhook_payload: dict,
+) -> dict:
+    """SentDMLog 행을 멱등하게 INSERT하고 send_dm_task 큐 등록.
+
+    캠페인 설정에 따라:
+      - opening DM 본문 = campaign.get_opening_message() (follow_gate 안내 자동 첨부)
+      - dm_kind = OPENING(gate 사용 시) / STANDALONE
+      - gate_status = PENDING(gate 사용 시) / NONE
+    """
+    ig_conn = campaign.ig_connection
+
+    idempotency_key = InstagramMessagingService.build_idempotency_key(
+        workspace_id=ig_conn.workspace_id,
+        ig_user_id=ig_conn.external_account_id,
+        comment_id=comment_id,
+        campaign_id=campaign.id,
+    )
+
+    # 발송할 본문 + 분류 결정
+    message_body = campaign.get_opening_message()
+    dm_kind = (
+        SentDMLog.DMKind.OPENING
+        if campaign.follow_gate_enabled
+        else SentDMLog.DMKind.STANDALONE
+    )
+    gate_status = (
+        SentDMLog.GateStatus.PENDING
+        if campaign.follow_gate_enabled
+        else SentDMLog.GateStatus.NONE
+    )
+
+    # 시간당 발송 제한 체크
+    if not campaign.can_send_more():
+        try:
+            SentDMLog.objects.create(
+                campaign=campaign,
+                comment_id=comment_id,
+                comment_text=comment_text,
+                recipient_user_id=from_user_id,
+                recipient_username=from_username,
+                message_sent=message_body,
+                status=SentDMLog.Status.SKIPPED,
+                error_message="Hourly send limit reached",
+                idempotency_key=idempotency_key,
+                webhook_payload=webhook_payload,
+                dm_kind=dm_kind,
+                gate_status=SentDMLog.GateStatus.NONE,
+            )
+        except IntegrityError:
+            pass  # 이미 같은 키 존재 → 무시
+        return {
+            "campaign_id": str(campaign.id),
+            "status": "skipped",
+            "reason": "Hourly limit reached",
+        }
+
+    try:
+        with transaction.atomic():
+            log = SentDMLog.objects.create(
+                campaign=campaign,
+                comment_id=comment_id,
+                comment_text=comment_text,
+                recipient_user_id=from_user_id,
+                recipient_username=from_username,
+                message_sent=message_body,
+                status=SentDMLog.Status.QUEUED,
+                idempotency_key=idempotency_key,
+                webhook_payload=webhook_payload,
+                dm_kind=dm_kind,
+                gate_status=gate_status,
+            )
+    except IntegrityError:
+        existing = SentDMLog.objects.filter(idempotency_key=idempotency_key).first()
+        return {
+            "campaign_id": str(campaign.id),
+            "status": "duplicate",
+            "log_id": str(existing.id) if existing else None,
+        }
+
+    send_dm_task.delay(str(log.id))
+    return {
+        "campaign_id": str(campaign.id),
+        "status": "enqueued",
+        "log_id": str(log.id),
+        "dm_kind": dm_kind,
+        "gate_status": gate_status,
+    }
+
+
+# ===== 발송 태스크 (상태머신) =====
+
+
+@shared_task(bind=True, max_retries=5)
+def send_dm_task(self, log_id: str):
+    """
+    단일 SentDMLog 를 SUBMITTING → ACCEPTED 까지 진행.
+
+    멱등성: 이미 ACCEPTED 이상이면 즉시 반환.
+    재시도: transient 에러만 백오프 재시도.
+    """
+    try:
+        log = SentDMLog.objects.select_related(
+            "campaign", "campaign__ig_connection"
+        ).get(id=log_id)
+    except SentDMLog.DoesNotExist:
+        logger.warning(f"SentDMLog {log_id} not found")
+        return {"status": "not_found"}
+
+    # 이미 처리됨
+    if log.status not in (SentDMLog.Status.QUEUED, SentDMLog.Status.SUBMITTING):
+        return {"status": "skipped", "reason": f"already {log.status}"}
+
+    campaign = log.campaign
+    ig_conn = campaign.ig_connection
+
+    if ig_conn.status != IGAccountConnection.Status.ACTIVE:
+        log.mark_failed(
+            status=SentDMLog.Status.FAILED_TOKEN,
+            error_message=f"IG connection not active: {ig_conn.status}",
+        )
+        campaign.increment_failed()
+        return {"status": "failed_token"}
+
+    log.mark_submitting()
+
+    try:
+        result = InstagramMessagingService.send_dm_via_comment(
+            ig_user_id=ig_conn.external_account_id,
+            comment_id=log.comment_id,
+            message_text=log.message_sent,
+            access_token=ig_conn.access_token,
+        )
+    except DMSendError as e:
+        cls = exception_to_classification(e)
+        log.retry_count += 1
+
+        # v3.2: retriable인 transient (RATE_LIMITED)만 재시도
+        if cls.retriable and self.request.retries < self.max_retries:
+            backoff = min(60 * (2 ** self.request.retries), 60 * 60 * 6)  # 최대 6h
+            log.next_retry_at = timezone.now() + timedelta(seconds=backoff)
+            # RATE_LIMITED 상태로 표시 후 재시도 큐에 들어가도록 QUEUED로 회귀
+            log.status = SentDMLog.Status.QUEUED
+            log.save(update_fields=["retry_count", "next_retry_at", "status"])
+            raise self.retry(exc=e, countdown=backoff) from e
+
+        # 모든 FAILED_* (FAILED_TOKEN/FAILED_PARAM/FAILED_WINDOW/FAILED_NO_TRACE)
+        # 또는 RATE_LIMITED 한도 초과 → 즉시 Dead Letter (재시도 중단)
+        log.mark_failed(
+            status=cls.log_status,
+            error_message=str(e),
+            error_code=str(e.code) if e.code is not None else "",
+            error_subcode=str(e.subcode) if e.subcode is not None else "",
+            api_response=e.api_response,
+        )
+        campaign.increment_failed()
+
+        if cls.log_status == SentDMLog.Status.FAILED_TOKEN:
+            ig_conn.mark_as_error(f"DM 발송 중 토큰/세션/권한 오류: {e}")
+
+        return {"status": cls.log_status, "reason": cls.reason}
+
+    # 성공 — ACCEPTED 진입
+    log.mark_accepted(
+        message_id=result["message_id"],
+        api_response=result.get("_raw") or result,
+    )
+    campaign.increment_sent()
+
+    # 5분 후 첫 능동 검증 예약 (echo가 먼저 오면 skip됨)
+    verify_dm_delivery.apply_async(
+        args=[str(log.id)], countdown=300
+    )
+
+    # public_reply_enabled 면 댓글에 공개 답글도 게시 (best-effort)
+    if (
+        campaign.public_reply_enabled
+        and campaign.public_reply_template
+        and log.dm_kind != SentDMLog.DMKind.REWARD  # reward DM 후엔 답글 안 닮
+    ):
+        post_public_reply.delay(str(log.id))
+
+    return {
+        "status": "accepted",
+        "log_id": str(log.id),
+        "message_id": result["message_id"],
+    }
+
+
+# ===== 능동 검증 (단건) =====
+
+
+@shared_task(bind=True, max_retries=3)
+def verify_dm_delivery(self, log_id: str):
+    """
+    GET /{message_id} 로 단건 도착 검증 (v3.2 — 5분/35분 2단계).
+
+    호출 시점:
+        1) ACCEPTED 5분 후 (send_dm_task 가 예약)
+        2) reconcile_accepted_dms 워커가 누락 건에 재호출
+
+    35분 cutoff:
+        ACCEPTED 후 35분이 지나도 echo·Conv API 모두 미발견이면
+        FAILED_NO_TRACE 로 종결 (프론트는 자가 점검 체크리스트 노출).
+    """
+    try:
+        log = SentDMLog.objects.select_related(
+            "campaign__ig_connection"
+        ).get(id=log_id)
+    except SentDMLog.DoesNotExist:
+        return {"status": "not_found"}
+
+    # 이미 도착 확정 / 종결 상태면 skip
+    if log.is_delivered() or log.is_terminal():
+        return {"status": "skipped", "reason": f"already {log.status}"}
+
+    if log.status != SentDMLog.Status.ACCEPTED or not log.meta_message_id:
+        return {"status": "skipped", "reason": "not in ACCEPTED with message_id"}
+
+    ig_conn = log.campaign.ig_connection
+
+    try:
+        message = InstagramMessagingService.fetch_message(
+            message_id=log.meta_message_id,
+            access_token=ig_conn.access_token,
+        )
+    except DMTransientError as e:
+        log.append_verification_log(
+            {"path": "conv_api", "result": "transient_error", "error": str(e)}
+        )
+        raise self.retry(exc=e, countdown=120) from e
+    except DMSendError as e:
+        log.append_verification_log(
+            {"path": "conv_api", "result": "api_error", "error": str(e)}
+        )
+        return {"status": "api_error", "error": str(e)}
+
+    if message is not None:
+        log.append_verification_log(
+            {"path": "conv_api", "result": "found", "message_id": message.get("id")}
+        )
+        log.mark_delivered(via=SentDMLog.VerifiedVia.CONV_API)
+        return {"status": "delivered", "via": "conv_api"}
+
+    # 미발견 — 35분 cutoff 검사
+    age = timezone.now() - (log.accepted_at or log.created_at)
+    log.append_verification_log(
+        {"path": "conv_api", "result": "not_found", "age_seconds": age.total_seconds()}
+    )
+
+    if age.total_seconds() < 35 * 60:
+        # 첫 검증(5분 시점) — 35분 시점까지 한 번 더 예약
+        remaining = max(60, int(35 * 60 - age.total_seconds()))
+        verify_dm_delivery.apply_async(args=[log_id], countdown=remaining)
+        return {"status": "deferred", "next_check_in_seconds": remaining}
+
+    # 35분+ — 도착 확인 실패 종결 (자가 점검 체크리스트 영역)
+    log.mark_failed(
+        status=SentDMLog.Status.FAILED_NO_TRACE,
+        error_message="No echo and not found in Conversations API after 35 minutes",
+    )
+    log.campaign.increment_failed()
+    return {"status": "failed_no_trace"}
+
+
+# ===== Beat 워커 =====
+
+
+@shared_task
+def reconcile_accepted_dms():
+    """
+    ACCEPTED 상태로 5분 이상 머무는 건들을 능동 검증.
+
+    Beat: 1분 주기.
+    """
+    cutoff = timezone.now() - timedelta(minutes=5)
+    queryset = SentDMLog.objects.filter(
+        status=SentDMLog.Status.ACCEPTED,
+        accepted_at__lte=cutoff,
+    ).values_list("id", flat=True)[:200]
+
+    count = 0
+    for log_id in queryset:
+        verify_dm_delivery.delay(str(log_id))
+        count += 1
+
+    if count:
+        logger.info(f"reconcile_accepted_dms: queued {count} verifications")
+    return {"queued": count}
+
+
+@shared_task
+def reconcile_stuck_submitting():
+    """
+    SUBMITTING 상태로 60초 이상 정체된 건을 큐로 되돌림.
+
+    Beat: 30초 주기.
+    """
+    cutoff = timezone.now() - timedelta(seconds=60)
+    qs = SentDMLog.objects.filter(
+        status=SentDMLog.Status.SUBMITTING,
+        submitted_at__lte=cutoff,
+    )
+
+    count = 0
+    for log in qs[:100]:
+        log.status = SentDMLog.Status.QUEUED
+        log.save(update_fields=["status"])
+        send_dm_task.delay(str(log.id))
+        count += 1
+
+    if count:
+        logger.warning(f"reconcile_stuck_submitting: requeued {count} stuck logs")
+    return {"requeued": count}
+
+
+@shared_task
+def dead_letter_alerter():
+    """
+    최근 10분 내 발생한 FAILED_TOKEN/FAILED_NO_TRACE 누적 시 알림.
+
+    Beat: 10분 주기. 운영자가 토큰 만료/도달 안되는 캠페인을 즉시 인지하도록.
+    """
+    window_start = timezone.now() - timedelta(minutes=10)
+
+    token_failures = SentDMLog.objects.filter(
+        status=SentDMLog.Status.FAILED_TOKEN,
+        created_at__gte=window_start,
+    ).count()
+
+    no_trace = SentDMLog.objects.filter(
+        status=SentDMLog.Status.FAILED_NO_TRACE,
+        created_at__gte=window_start,
+    ).count()
+
+    if token_failures > 0 or no_trace > 0:
+        logger.error(
+            "DM dead-letter alert: "
+            f"FAILED_TOKEN={token_failures}, FAILED_NO_TRACE={no_trace} (last 10min)"
+        )
+
+    return {"failed_token": token_failures, "failed_no_trace": no_trace}
+
+
+@shared_task
+def expire_gate_pending():
+    """
+    Opening DM ACCEPTED 후 24시간 내 사용자 답장이 없으면 gate_status=EXPIRED.
+
+    Beat: 1시간 주기.
+    """
+    cutoff = timezone.now() - timedelta(hours=24)
+    qs = SentDMLog.objects.filter(
+        gate_status=SentDMLog.GateStatus.PENDING,
+        accepted_at__lte=cutoff,
+    )
+    count = 0
+    for log in qs[:200]:
+        log.gate_status = SentDMLog.GateStatus.EXPIRED
+        log.save(update_fields=["gate_status"])
+        count += 1
+    if count:
+        logger.info(f"expire_gate_pending: marked {count} as EXPIRED")
+    return {"expired": count}
+
+
+# ===== Phase 2: next_media 폴링 =====
+
+
+def _parse_iso_timestamp(value: str):
+    """Meta가 보내는 ISO8601 timestamp ('2026-05-07T03:14:15+0000') 파싱"""
+    from datetime import datetime as _dt
+
+    if not value:
+        return None
+    # Meta는 종종 "+0000" (콜론 없음) 형식으로 보내므로 보정
+    v = value.replace("+0000", "+00:00").replace("Z", "+00:00")
+    try:
+        return _dt.fromisoformat(v)
+    except ValueError:
+        return None
+
+
+@shared_task
+def snapshot_baseline_for_account(ig_connection_id: str):
+    """
+    next_media 캠페인이 처음 만들어졌거나 last_seen 이 비어있는 IG 계정에 대해,
+    "현재 최신 게시물" 을 baseline 으로 기록.
+
+    이렇게 해야 과거 게시물에 attach 되지 않고, 진짜 "다음 게시물"부터 트리거된다.
+    """
+    try:
+        conn = IGAccountConnection.objects.get(id=ig_connection_id)
+    except IGAccountConnection.DoesNotExist:
+        return {"status": "not_found"}
+
+    if conn.last_seen_media_id:
+        return {"status": "already_snapshotted"}
+    if conn.status != IGAccountConnection.Status.ACTIVE:
+        return {"status": "skipped", "reason": "ig connection not active"}
+
+    try:
+        media_list = InstagramMediaService.list_recent_media(
+            ig_user_id=conn.external_account_id,
+            access_token=conn.access_token,
+            limit=1,
+        )
+    except Exception as e:
+        logger.warning(f"snapshot_baseline_for_account: API failed: {e}")
+        return {"status": "api_error", "error": str(e)}
+
+    if not media_list:
+        # 게시물이 하나도 없는 신규 계정 — 빈 sentinel 로 표시
+        conn.last_polled_at = timezone.now()
+        conn.save(update_fields=["last_polled_at"])
+        return {"status": "no_media"}
+
+    latest = media_list[0]
+    conn.last_seen_media_id = str(latest.get("id") or "")
+    conn.last_seen_media_at = _parse_iso_timestamp(latest.get("timestamp"))
+    conn.last_polled_at = timezone.now()
+    conn.save(
+        update_fields=[
+            "last_seen_media_id",
+            "last_seen_media_at",
+            "last_polled_at",
+        ]
+    )
+    return {"status": "ok", "baseline_media_id": conn.last_seen_media_id}
+
+
+@shared_task
+def poll_new_media_for_next_campaigns():
+    """
+    next_media 트리거 캠페인이 있는 IG 계정에 대해 신규 게시물 발견 시
+    캠페인의 media_id 자동 attach + trigger_type 을 specific_media 로 전환.
+
+    Beat: 5분 주기.
+
+    동작:
+      1. 활성 next_media 캠페인을 가진 ACTIVE IG 계정만 후보
+      2. 각 계정의 최근 게시물 5건 조회
+      3. last_seen_media_id 보다 timestamp 가 더 새로운 미디어가 있으면:
+         - 그 중 가장 오래된(=새 미디어 중 첫번째) 미디어를 골라
+         - 해당 계정의 모든 next_media 캠페인에 attach
+         - last_seen_* 업데이트
+      4. last_seen 이 비어있으면 baseline 만 기록 (기존 게시물에 attach 안 함)
+    """
+    from .models import AutoDMCampaign
+
+    next_campaigns_qs = AutoDMCampaign.objects.filter(
+        trigger_type=AutoDMCampaign.TriggerType.NEXT_MEDIA,
+        status=AutoDMCampaign.Status.ACTIVE,
+        media_id="",
+    ).values_list("ig_connection_id", flat=True).distinct()
+
+    ig_connection_ids = list(next_campaigns_qs)
+    if not ig_connection_ids:
+        return {"polled": 0, "attached": 0}
+
+    polled = 0
+    attached_total = 0
+    skipped_recent = 0
+
+    # 폴링 가드: 같은 계정을 3분 이내에 다시 폴링하지 않도록 (Beat 중복 fire 방어)
+    min_interval = timedelta(minutes=3)
+    now = timezone.now()
+
+    for conn in IGAccountConnection.objects.filter(
+        id__in=ig_connection_ids,
+        status=IGAccountConnection.Status.ACTIVE,
+    ):
+        if conn.last_polled_at and (now - conn.last_polled_at) < min_interval:
+            skipped_recent += 1
+            continue
+
+        polled += 1
+        try:
+            media_list = InstagramMediaService.list_recent_media(
+                ig_user_id=conn.external_account_id,
+                access_token=conn.access_token,
+                limit=5,
+            )
+        except Exception as e:
+            logger.warning(
+                f"poll_new_media: API failed for ig_conn={conn.id}: {e}"
+            )
+            continue
+
+        conn.last_polled_at = timezone.now()
+
+        if not media_list:
+            conn.save(update_fields=["last_polled_at"])
+            continue
+
+        # baseline 미설정 → 현재 최신 미디어를 baseline 으로만 기록
+        if not conn.last_seen_media_id:
+            latest = media_list[0]
+            conn.last_seen_media_id = str(latest.get("id") or "")
+            conn.last_seen_media_at = _parse_iso_timestamp(latest.get("timestamp"))
+            conn.save(
+                update_fields=[
+                    "last_seen_media_id",
+                    "last_seen_media_at",
+                    "last_polled_at",
+                ]
+            )
+            continue
+
+        # baseline 보다 새로운 미디어 추출 (timestamp 또는 id 비교)
+        baseline_ts = conn.last_seen_media_at
+        baseline_id = conn.last_seen_media_id
+
+        new_medias = []
+        for m in media_list:
+            mid = str(m.get("id") or "")
+            mts = _parse_iso_timestamp(m.get("timestamp"))
+            if not mid or mid == baseline_id:
+                continue
+            if baseline_ts and mts and mts <= baseline_ts:
+                continue
+            new_medias.append((mts, mid, m))
+
+        if not new_medias:
+            conn.save(update_fields=["last_polled_at"])
+            continue
+
+        # 가장 오래된 새 미디어부터 처리 (= 진짜 "next" 부터)
+        new_medias.sort(key=lambda x: (x[0] or timezone.now(),))
+
+        attached_for_account = 0
+        for _mts, mid, media_obj in new_medias:
+            # 이 계정의 모든 next_media 캠페인에 attach (한번에 같은 미디어로)
+            updated = AutoDMCampaign.objects.filter(
+                ig_connection_id=conn.id,
+                trigger_type=AutoDMCampaign.TriggerType.NEXT_MEDIA,
+                status=AutoDMCampaign.Status.ACTIVE,
+                media_id="",
+            ).update(
+                media_id=mid,
+                media_url=media_obj.get("permalink") or None,
+                trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
+                updated_at=timezone.now(),
+            )
+            attached_for_account += updated
+            attached_total += updated
+
+            # 한 미디어에 attach 됐으면 나머지 next 캠페인은 더 없음 → loop 탈출
+            if updated == 0:
+                break
+
+            # last_seen 갱신은 마지막(=가장 최신) 미디어로
+        latest_new = new_medias[-1][2]
+        conn.last_seen_media_id = str(latest_new.get("id") or "")
+        conn.last_seen_media_at = _parse_iso_timestamp(
+            latest_new.get("timestamp")
+        )
+        conn.save(
+            update_fields=[
+                "last_seen_media_id",
+                "last_seen_media_at",
+                "last_polled_at",
+            ]
+        )
+
+        if attached_for_account:
+            logger.info(
+                f"poll_new_media: attached {attached_for_account} next_media "
+                f"campaigns on ig_conn={conn.id} to media={mid}"
+            )
+
+    return {
+        "polled": polled,
+        "attached": attached_total,
+        "skipped_recent": skipped_recent,
+    }
+
+
+@shared_task
+def check_polling_anomalies():
+    """
+    next_media 폴링 운영 모니터링 (v3.4).
+
+    Beat: 1시간 주기. 다음 이상 상황 발견 시 logger.warning:
+        - 활성 next_media 캠페인이 있는데 한 번도 폴링되지 않은 IG 계정
+        - 활성 next_media 캠페인이 있는데 마지막 폴링이 15분 이상 전인 IG 계정
+
+    Beat 가 죽었거나, 워커가 task 를 받지 못하거나, 토큰 만료 등의
+    원인으로 폴링이 안 돌고 있는지 빠르게 인지하기 위함.
+    """
+    from .models import AutoDMCampaign
+
+    now = timezone.now()
+    stale_threshold = timedelta(minutes=15)
+
+    # 활성 next_media 캠페인 보유 IG 계정 (media_id 비어있는 것만 = 아직 attach 안됨)
+    pending_ig_ids = (
+        AutoDMCampaign.objects
+        .filter(
+            trigger_type=AutoDMCampaign.TriggerType.NEXT_MEDIA,
+            status=AutoDMCampaign.Status.ACTIVE,
+            media_id="",
+        )
+        .values_list("ig_connection_id", flat=True)
+        .distinct()
+    )
+
+    if not pending_ig_ids:
+        return {"checked": 0, "never_polled": 0, "stale": 0}
+
+    never_polled = []
+    stale = []
+
+    for conn in IGAccountConnection.objects.filter(
+        id__in=list(pending_ig_ids),
+        status=IGAccountConnection.Status.ACTIVE,
+    ).only("id", "external_account_id", "username", "last_polled_at"):
+        if conn.last_polled_at is None:
+            never_polled.append(conn)
+        elif (now - conn.last_polled_at) > stale_threshold:
+            stale.append(conn)
+
+    if never_polled:
+        ids = ", ".join(str(c.id) for c in never_polled[:10])
+        logger.warning(
+            f"check_polling_anomalies: {len(never_polled)} ig_conn never polled "
+            f"despite active next_media campaigns: [{ids}]"
+        )
+    if stale:
+        items = ", ".join(
+            f"{c.id}(last={c.last_polled_at.isoformat()})" for c in stale[:10]
+        )
+        logger.warning(
+            f"check_polling_anomalies: {len(stale)} ig_conn stale (>15min): [{items}]"
+        )
+
+    return {
+        "checked": len(pending_ig_ids),
+        "never_polled": len(never_polled),
+        "stale": len(stale),
+    }
+
+
+# ===== 공개 답글 + Follow-gate =====
+
+
+@shared_task(bind=True, max_retries=3)
+def post_public_reply(self, log_id: str):
+    """
+    DM ACCEPTED 후 댓글에 공개 답글 게시.
+
+    Best-effort — 실패해도 DM 흐름엔 영향 없음.
+    """
+    try:
+        log = SentDMLog.objects.select_related("campaign__ig_connection").get(id=log_id)
+    except SentDMLog.DoesNotExist:
+        return {"status": "not_found"}
+
+    campaign = log.campaign
+    if not campaign.public_reply_enabled or not campaign.public_reply_template:
+        return {"status": "skipped", "reason": "public reply disabled"}
+
+    # 이미 게시했으면 skip
+    if log.public_reply_id:
+        return {"status": "skipped", "reason": "already replied"}
+
+    ig_conn = campaign.ig_connection
+
+    try:
+        result = InstagramCommentService.post_reply(
+            comment_id=log.comment_id,
+            message=campaign.public_reply_template,
+            access_token=ig_conn.access_token,
+        )
+    except Exception as e:
+        logger.warning(
+            f"post_public_reply failed for log={log_id}: {e}; will retry"
+        )
+        try:
+            raise self.retry(exc=e, countdown=60) from e
+        except self.MaxRetriesExceededError:
+            log.append_verification_log(
+                {"path": "public_reply", "result": "failed", "error": str(e)}
+            )
+            return {"status": "failed", "error": str(e)}
+
+    reply_id = (result or {}).get("id", "")
+    log.public_reply_id = reply_id
+    log.public_reply_posted_at = timezone.now()
+    log.save(update_fields=["public_reply_id", "public_reply_posted_at"])
+    log.append_verification_log(
+        {"path": "public_reply", "result": "posted", "reply_id": reply_id}
+    )
+    return {"status": "posted", "reply_id": reply_id}
+
+
+@shared_task
+def handle_inbound_message_for_gate(
+    *,
+    page_ig_user_id: str,
+    sender_user_id: str,
+    message_text: str,
+    message_mid: str = "",
+):
+    """
+    Inbound 메시지(사용자 → 우리)를 받았을 때 Follow-gate 통과 여부 평가.
+
+    매칭 조건:
+        - 동일 ig_user_id 의 SentDMLog 중 sender 와 같은 recipient 가
+          gate_status=PENDING 이고 dm_kind=OPENING 인 가장 최근 항목
+        - campaign.matches_gate_keyword(message_text) 가 True
+
+    매칭 시:
+        - opening 로그의 gate_status = PASSED 로 전환
+        - reward DM 을 send_reward_dm 으로 발송 큐 등록
+    """
+    if not (page_ig_user_id and sender_user_id):
+        return {"status": "skipped", "reason": "missing ids"}
+
+    candidates = (
+        SentDMLog.objects
+        .select_related("campaign__ig_connection")
+        .filter(
+            recipient_user_id=sender_user_id,
+            gate_status=SentDMLog.GateStatus.PENDING,
+            dm_kind=SentDMLog.DMKind.OPENING,
+            campaign__ig_connection__external_account_id=page_ig_user_id,
+        )
+        .order_by("-accepted_at", "-created_at")
+    )
+
+    matched_count = 0
+    for opening_log in candidates[:5]:
+        campaign = opening_log.campaign
+        if not campaign.follow_gate_enabled:
+            continue
+        if not campaign.matches_gate_keyword(message_text):
+            continue
+
+        # gate 통과 — opening 로그 상태 전이
+        opening_log.gate_status = SentDMLog.GateStatus.PASSED
+        opening_log.save(update_fields=["gate_status"])
+        opening_log.append_verification_log(
+            {
+                "path": "gate",
+                "result": "passed",
+                "trigger_text": (message_text or "")[:60],
+                "trigger_mid": message_mid,
+            }
+        )
+
+        # reward DM 발송 큐 등록
+        send_reward_dm.delay(str(opening_log.id))
+        matched_count += 1
+
+    return {"status": "ok", "matched": matched_count}
+
+
+@shared_task(bind=True, max_retries=5)
+def send_reward_dm(self, opening_log_id: str):
+    """
+    Follow-gate 통과 후 본 DM(reward) 을 사용자 IGSID 로 발송.
+
+    24h 메시징 윈도우 내에서만 가능 (사용자가 우리에게 메시지 보낸 직후라 OK).
+    """
+    try:
+        opening = SentDMLog.objects.select_related(
+            "campaign__ig_connection"
+        ).get(id=opening_log_id)
+    except SentDMLog.DoesNotExist:
+        return {"status": "not_found"}
+
+    campaign = opening.campaign
+    if not campaign.reward_message_template:
+        logger.warning(
+            f"send_reward_dm: campaign {campaign.id} has no reward template; skip"
+        )
+        return {"status": "skipped", "reason": "no reward template"}
+
+    ig_conn = campaign.ig_connection
+    if ig_conn.status != IGAccountConnection.Status.ACTIVE:
+        return {"status": "failed_token", "reason": "ig connection not active"}
+
+    # 멱등성 키 — opening 의 idempotency_key 에 ":reward" 접미사
+    idem = f"{opening.idempotency_key}:reward"
+    try:
+        with transaction.atomic():
+            reward_log = SentDMLog.objects.create(
+                campaign=campaign,
+                comment_id=opening.comment_id,
+                comment_text=opening.comment_text,
+                recipient_user_id=opening.recipient_user_id,
+                recipient_username=opening.recipient_username,
+                message_sent=campaign.reward_message_template,
+                status=SentDMLog.Status.SUBMITTING,
+                idempotency_key=idem,
+                webhook_payload=opening.webhook_payload,
+                dm_kind=SentDMLog.DMKind.REWARD,
+                gate_status=SentDMLog.GateStatus.NONE,
+                parent_log=opening,
+            )
+            reward_log.submitted_at = timezone.now()
+            reward_log.save(update_fields=["submitted_at"])
+    except IntegrityError:
+        existing = SentDMLog.objects.filter(idempotency_key=idem).first()
+        return {
+            "status": "duplicate",
+            "reward_log_id": str(existing.id) if existing else None,
+        }
+
+    try:
+        result = InstagramMessagingService.send_dm_via_user_id(
+            ig_user_id=ig_conn.external_account_id,
+            recipient_id=opening.recipient_user_id,
+            message_text=campaign.reward_message_template,
+            access_token=ig_conn.access_token,
+        )
+    except DMSendError as e:
+        cls_info = exception_to_classification(e)
+        if cls_info.retriable and self.request.retries < self.max_retries:
+            backoff = min(60 * (2 ** self.request.retries), 60 * 60)
+            reward_log.next_retry_at = timezone.now() + timedelta(seconds=backoff)
+            reward_log.status = SentDMLog.Status.QUEUED
+            reward_log.save(update_fields=["next_retry_at", "status"])
+            raise self.retry(exc=e, countdown=backoff) from e
+
+        reward_log.mark_failed(
+            status=cls_info.log_status,
+            error_message=str(e),
+            error_code=str(e.code) if e.code is not None else "",
+            error_subcode=str(e.subcode) if e.subcode is not None else "",
+            api_response=e.api_response,
+        )
+        campaign.increment_failed()
+        return {"status": cls_info.log_status, "reason": cls_info.reason}
+
+    reward_log.mark_accepted(
+        message_id=result["message_id"],
+        api_response=result.get("_raw") or result,
+    )
+    campaign.increment_sent()
+    verify_dm_delivery.apply_async(args=[str(reward_log.id)], countdown=300)
+
+    return {
+        "status": "accepted",
+        "reward_log_id": str(reward_log.id),
+        "message_id": result["message_id"],
+    }
+
+
+# ===== 스팸 처리 (기존 로직 보존) =====
 
 
 def _check_and_handle_spam(
@@ -114,39 +1003,23 @@ def _check_and_handle_spam(
     media_id: str,
     webhook_payload: dict,
 ) -> dict:
-    """
-    스팸 검사 및 처리
-
-    Returns:
-        {
-            "is_spam": bool,
-            "status": str,
-            "spam_filter_processed": bool,
-            ...
-        }
-    """
+    """스팸 검사 + 숨김 처리"""
     try:
-        # 미디어를 소유한 Instagram 계정 찾기
-        # webhook의 media_id로 해당 계정 찾기 (실제로는 Instagram API로 조회해야 하지만,
-        # 여기서는 active campaign이 있는 계정을 기준으로 함)
-        campaigns = (
-            AutoDMCampaign.objects.filter(media_id=media_id).select_related("ig_connection").first()
+        campaign = (
+            AutoDMCampaign.objects.filter(media_id=media_id)
+            .select_related("ig_connection")
+            .first()
         )
-
-        if not campaigns:
-            # 캠페인이 없으면 스팸 필터도 적용 안 함
+        if not campaign:
             return {"is_spam": False, "spam_filter_processed": False}
 
-        ig_connection = campaigns.ig_connection
+        ig_connection = campaign.ig_connection
 
-        # 스팸 필터 설정 조회
         try:
             spam_filter = SpamFilterConfig.objects.get(ig_connection=ig_connection)
         except SpamFilterConfig.DoesNotExist:
-            # 스팸 필터 설정이 없으면 패스
             return {"is_spam": False, "spam_filter_processed": False}
 
-        # 스팸 필터가 비활성화되어 있으면 패스
         if not spam_filter.is_active():
             return {
                 "is_spam": False,
@@ -154,21 +1027,15 @@ def _check_and_handle_spam(
                 "reason": "Spam filter inactive",
             }
 
-        # 스팸 검사 수행
-        is_spam, spam_reasons = SpamDetectionService.is_spam(
+        is_spam, reasons = SpamDetectionService.is_spam(
             text=comment_text,
             spam_keywords=spam_filter.spam_keywords,
             check_urls=spam_filter.block_urls,
         )
 
         if not is_spam:
-            # 스팸이 아니면 정상 처리
             return {"is_spam": False, "spam_filter_processed": True}
 
-        # === 스팸으로 판정됨 ===
-        logger.info(f"Spam detected in comment {comment_id}: {spam_reasons}")
-
-        # 스팸 로그 생성
         spam_log = SpamCommentLog.objects.create(
             spam_filter=spam_filter,
             comment_id=comment_id,
@@ -176,177 +1043,36 @@ def _check_and_handle_spam(
             commenter_user_id=from_user_id,
             commenter_username=from_username,
             media_id=media_id,
-            spam_reasons=spam_reasons,
+            spam_reasons=reasons,
             status=SpamCommentLog.Status.DETECTED,
             webhook_payload=webhook_payload,
         )
-
-        # 통계 업데이트
         spam_filter.increment_spam_detected()
 
-        # 댓글 숨김 처리 시도
         try:
             api_response = InstagramCommentService.hide_comment(
                 comment_id=comment_id, access_token=ig_connection.access_token
             )
-
-            # 숨김 처리 성공
             spam_log.mark_as_hidden(api_response)
             spam_filter.increment_hidden()
-
-            logger.info(f"Successfully hidden spam comment {comment_id}")
-
             return {
                 "is_spam": True,
                 "status": "hidden",
                 "spam_filter_processed": True,
-                "spam_reasons": spam_reasons,
+                "spam_reasons": reasons,
                 "spam_log_id": str(spam_log.id),
             }
-
         except Exception as hide_error:
-            # 숨김 처리 실패
-            error_msg = str(hide_error)
-            spam_log.mark_as_failed(error_msg)
-
-            logger.error(f"Failed to hide spam comment {comment_id}: {error_msg}")
-
+            spam_log.mark_as_failed(str(hide_error))
             return {
                 "is_spam": True,
                 "status": "failed_to_hide",
                 "spam_filter_processed": True,
-                "spam_reasons": spam_reasons,
-                "error": error_msg,
+                "spam_reasons": reasons,
+                "error": str(hide_error),
                 "spam_log_id": str(spam_log.id),
             }
 
     except Exception as e:
         logger.exception(f"Error in spam check: {e}")
         return {"is_spam": False, "spam_filter_processed": False, "error": str(e)}
-
-
-def _process_single_campaign(
-    campaign: AutoDMCampaign,
-    comment_id: str,
-    comment_text: str,
-    from_user_id: str,
-    from_username: str,
-    webhook_payload: dict,
-) -> dict:
-    """
-    단일 캠페인에 대한 DM 발송 처리
-
-    Returns:
-        처리 결과
-    """
-    try:
-        # 1. 중복 체크 (이미 DM을 보낸 댓글인지) - 실험용으로 비활성화
-        # existing_log = SentDMLog.objects.filter(campaign=campaign, comment_id=comment_id).first()
-
-        # if existing_log:
-        #     logger.info(f"DM already sent for comment {comment_id} in campaign {campaign.id}")
-        #     return {"campaign_id": str(campaign.id), "status": "skipped", "reason": "Already sent"}
-
-        # 2. 발송 제한 체크 (시간당 최대 발송 수)
-        if not campaign.can_send_more():
-            logger.warning(f"Campaign {campaign.id} reached hourly send limit")
-
-            # 스킵 로그 생성
-            SentDMLog.objects.create(
-                campaign=campaign,
-                comment_id=comment_id,
-                comment_text=comment_text,
-                recipient_user_id=from_user_id,
-                recipient_username=from_username,
-                message_sent=campaign.message_template,
-                status=SentDMLog.Status.SKIPPED,
-                error_message="Hourly send limit reached",
-                webhook_payload=webhook_payload,
-            )
-
-            return {
-                "campaign_id": str(campaign.id),
-                "status": "skipped",
-                "reason": "Hourly limit reached",
-            }
-
-        # 3. 로그 생성 (PENDING 상태)
-        dm_log = SentDMLog.objects.create(
-            campaign=campaign,
-            comment_id=comment_id,
-            comment_text=comment_text,
-            recipient_user_id=from_user_id,
-            recipient_username=from_username,
-            message_sent=campaign.message_template,
-            status=SentDMLog.Status.PENDING,
-            webhook_payload=webhook_payload,
-        )
-
-        # 4. Instagram Connection 확인
-        ig_connection = campaign.ig_connection
-        if ig_connection.status != IGAccountConnection.Status.ACTIVE:
-            error_msg = f"Instagram connection is not active: {ig_connection.status}"
-            logger.error(error_msg)
-            dm_log.mark_as_failed(error_msg)
-            campaign.increment_failed()
-            return {"campaign_id": str(campaign.id), "status": "failed", "reason": error_msg}
-
-        # 5. DM 발송
-        try:
-            api_response = InstagramMessagingService.send_dm_via_comment(
-                ig_user_id=ig_connection.external_account_id,
-                comment_id=comment_id,
-                message_text=campaign.message_template,
-                access_token=ig_connection.access_token,
-            )
-
-            # 6. 성공 처리
-            dm_log.mark_as_sent(api_response)
-            campaign.increment_sent()
-
-            logger.info(f"DM sent: campaign={campaign.id}, recipient={from_username}")
-
-            return {
-                "campaign_id": str(campaign.id),
-                "status": "sent",
-                "recipient": from_username,
-                "message_id": api_response.get("message_id"),
-            }
-
-        except Exception as api_error:
-            # 7. 실패 처리
-            error_msg = str(api_error)
-            error_code = getattr(api_error, "code", "")
-
-            # API 응답에서 에러 정보 추출
-            api_response_data = {}
-            if hasattr(api_error, "response"):
-                try:
-                    api_response_data = api_error.response.json()
-                    error_msg = api_response_data.get("error", {}).get("message", error_msg)
-                    error_code = str(api_response_data.get("error", {}).get("code", error_code))
-                except:
-                    pass
-
-            dm_log.mark_as_failed(error_msg, error_code, api_response_data)
-            campaign.increment_failed()
-
-            logger.error(
-                f"DM send failed: campaign={campaign.id}, "
-                f"recipient={from_username}, error={error_msg}"
-            )
-
-            return {
-                "campaign_id": str(campaign.id),
-                "status": "failed",
-                "reason": error_msg,
-                "error_code": error_code,
-            }
-
-    except Exception as e:
-        logger.exception(f"Error in _process_single_campaign: {e}")
-        return {
-            "campaign_id": str(campaign.id) if campaign else "unknown",
-            "status": "error",
-            "reason": str(e),
-        }

@@ -294,7 +294,7 @@ CELERY_TIMEZONE = TIME_ZONE
 CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutes
 
-# Celery Beat Schedule (정기 결제 관련 배치)
+# Celery Beat Schedule (정기 결제 + DM 발송 보증 워커)
 CELERY_BEAT_SCHEDULE = {
     "check-missed-payments": {
         "task": "billing.check_missed_payments",
@@ -315,6 +315,31 @@ CELERY_BEAT_SCHEDULE = {
         "task": "billing.handle_trial_expiry",
         "schedule": 60 * 60 * 24,
         "options": {"queue": "billing"},
+    },
+    # ===== DM 발송 99.9% 보증 시스템 =====
+    "dm-reconcile-accepted": {
+        "task": "apps.integrations.tasks.reconcile_accepted_dms",
+        "schedule": 60,  # 1분 — ACCEPTED + 5분 경과 건 능동 검증 enqueue
+    },
+    "dm-reconcile-stuck-submitting": {
+        "task": "apps.integrations.tasks.reconcile_stuck_submitting",
+        "schedule": 30,  # 30초 — SUBMITTING 정체 건 재시도
+    },
+    "dm-dead-letter-alerter": {
+        "task": "apps.integrations.tasks.dead_letter_alerter",
+        "schedule": 60 * 10,  # 10분 — 토큰 만료/도착 미확인 누적 알림
+    },
+    "dm-expire-gate-pending": {
+        "task": "apps.integrations.tasks.expire_gate_pending",
+        "schedule": 60 * 60,  # 1시간 — 24h 내 답장 없는 gate 만료 처리
+    },
+    "dm-poll-new-media-for-next-campaigns": {
+        "task": "apps.integrations.tasks.poll_new_media_for_next_campaigns",
+        "schedule": 60 * 5,  # 5분 — next_media 트리거 캠페인용 신규 게시물 폴링
+    },
+    "dm-check-polling-anomalies": {
+        "task": "apps.integrations.tasks.check_polling_anomalies",
+        "schedule": 60 * 60,  # 1시간 — 폴링 안 돌고 있는 계정 감지/알림
     },
 }
 

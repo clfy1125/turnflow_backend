@@ -1095,6 +1095,45 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         )
 
     @extend_schema(
+        summary="캠페인 옵션 가이드 (정적, 인증 불필요)",
+        description="""
+        ## 목적
+        프론트엔드 캠페인 생성/수정 폼의 라디오·토글 옆에 노출할 사용자 안내 문구를
+        한 번에 받아간다.
+
+        ## 응답 구조
+        ```json
+        {
+          "version": "v3.4",
+          "trigger_types": [
+            {"value": "specific_media", "label": "...", "description": "...", "tier": "free"},
+            {"value": "any_media", ..., "tier": "pro"},
+            {"value": "next_media", ..., "notes": ["...", ...]}
+          ],
+          "keyword_modes": [...],
+          "follow_gate": {"headline": "...", "items": [...]},
+          "public_reply": {"headline": "...", "description": "...", "items": [...]}
+        }
+        ```
+
+        ## 인증
+        AllowAny — 정적 가이드라 공개.
+        """,
+        responses={200: OpenApiResponse(description="캠페인 가이드")},
+        tags=["Auto DM"],
+    )
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="guide",
+        permission_classes=[AllowAny],
+    )
+    def guide(self, request):
+        from .campaign_guides import build_campaign_guide
+
+        return Response(build_campaign_guide())
+
+    @extend_schema(
         summary="캠페인 목록 조회",
         description="사용자의 workspace에 속한 모든 Auto DM 캠페인을 조회합니다.",
         responses={200: AutoDMCampaignSerializer(many=True)},
@@ -1266,6 +1305,15 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         campaign.started_at = timezone.now()
         campaign.save()
 
+        # next_media 트리거: baseline 즉시 스냅샷 (과거 게시물 attach 방지)
+        if (
+            campaign.trigger_type == AutoDMCampaign.TriggerType.NEXT_MEDIA
+            and not ig_connection.last_seen_media_id
+        ):
+            from .tasks import snapshot_baseline_for_account
+
+            snapshot_baseline_for_account.delay(str(ig_connection.id))
+
         response_serializer = AutoDMCampaignSerializer(campaign)
         return Response(response_serializer.data, status=status.HTTP_201_CREATED)
 
@@ -1432,6 +1480,118 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
     },
     tags=["Integrations"],
 )
+def _process_messaging_events(entry: dict, logger) -> None:
+    """
+    Instagram Webhook entry.messaging[] 처리.
+
+    Instagram Login API에는 별도의 message_echoes 웹훅 필드가 없고,
+    `messages` 필드 안에서 우리가 보낸 메시지는 message.is_echo=true 로 들어옴.
+
+    처리 신호:
+        - messages + is_echo:true   → SentDMLog ACCEPTED → DELIVERED 승격
+        - messages + sender=우리계정 → 마찬가지 (echo의 또 다른 식별자)
+        - messaging_seen.read.mid    → SentDMLog DELIVERED → READ 승격
+        - messages (사용자→우리)     → 향후 inbound 핸들러용 (현재 로깅만)
+
+    Args:
+        entry: webhook payload의 entry 항목 (id=ig_user_id, time, messaging=[...])
+        logger: 로거
+    """
+    page_ig_user_id = str(entry.get("id") or "")
+    messaging_events = entry.get("messaging") or []
+    if not messaging_events:
+        return
+
+    for ev in messaging_events:
+        sender_id = str((ev.get("sender") or {}).get("id") or "")
+        recipient_id = str((ev.get("recipient") or {}).get("id") or "")
+        message = ev.get("message") or {}
+        read = ev.get("read") or {}
+
+        # ----- messaging_seen (read receipt) -----
+        if read:
+            mid = read.get("mid")
+            if mid:
+                _mark_log_read_by_mid(mid, logger)
+            continue
+
+        # ----- messages -----
+        if not message:
+            continue
+
+        is_echo = bool(message.get("is_echo")) or (
+            page_ig_user_id and sender_id == page_ig_user_id
+        )
+        mid = message.get("mid")
+
+        if is_echo and mid:
+            _mark_log_delivered_by_echo(
+                mid=mid,
+                page_ig_user_id=page_ig_user_id,
+                recipient_user_id=recipient_id,
+                logger=logger,
+            )
+        else:
+            # 사용자 → 우리 (inbound) 메시지 → Follow-gate 평가
+            from .tasks import handle_inbound_message_for_gate
+
+            text = message.get("text", "") or ""
+            handle_inbound_message_for_gate.delay(
+                page_ig_user_id=page_ig_user_id,
+                sender_user_id=sender_id,
+                message_text=text,
+                message_mid=mid or "",
+            )
+            logger.debug(
+                f"Inbound DM queued for gate eval: sender={sender_id}, mid={mid}"
+            )
+
+
+def _mark_log_delivered_by_echo(
+    *, mid: str, page_ig_user_id: str, recipient_user_id: str, logger
+) -> None:
+    """is_echo:true 이벤트의 mid 와 SentDMLog.meta_message_id 매칭 → DELIVERED"""
+    qs = SentDMLog.objects.filter(meta_message_id=mid).select_related(
+        "campaign__ig_connection"
+    )
+    if not qs.exists() and recipient_user_id:
+        # 일부 케이스에서 mid가 echo 단계에서 다르게 발급될 수 있어
+        # recipient + 최근 ACCEPTED 건으로 fallback 매칭
+        qs = SentDMLog.objects.filter(
+            recipient_user_id=recipient_user_id,
+            status=SentDMLog.Status.ACCEPTED,
+            campaign__ig_connection__external_account_id=page_ig_user_id,
+        ).order_by("-accepted_at")[:1]
+
+    matched = 0
+    for log in qs:
+        if log.status == SentDMLog.Status.READ:
+            continue
+        log.append_verification_log({"path": "echo", "result": "matched", "mid": mid})
+        log.mark_delivered(via=SentDMLog.VerifiedVia.ECHO, mid=mid)
+        matched += 1
+
+    if matched == 0:
+        logger.debug(f"Echo received but no matching SentDMLog (mid={mid})")
+    else:
+        logger.info(f"Echo matched {matched} SentDMLog(s) (mid={mid}) → DELIVERED")
+
+
+def _mark_log_read_by_mid(mid: str, logger) -> None:
+    """messaging_seen.read.mid → SentDMLog READ 승격"""
+    logs = SentDMLog.objects.filter(meta_message_id=mid)
+    if not logs.exists():
+        logs = SentDMLog.objects.filter(echo_mid=mid)
+
+    matched = 0
+    for log in logs:
+        log.mark_read()
+        matched += 1
+
+    if matched:
+        logger.info(f"messaging_seen matched {matched} SentDMLog(s) (mid={mid}) → READ")
+
+
 @extend_schema(
     methods=["POST"],
     summary="Instagram Webhook 이벤트 수신 (POST)",
@@ -1513,9 +1673,13 @@ def instagram_webhook(request):
                         process_comment_and_send_dm.delay(webhook_data)
                         logger.debug(f"Queued DM task for comment: {value.get('id')}")
 
-                    # 다른 이벤트 타입도 필요시 처리
-                    elif field in ["mentions", "messages", "messaging_postbacks"]:
+                    elif field in ["mentions", "messaging_postbacks"]:
                         logger.debug(f"Received {field} event, but not processing yet")
+
+                # ★ messages / messaging_seen 처리:
+                # Instagram Login API에서는 별도 message_echoes 필드가 없고
+                # `messages` 필드 안에 is_echo:true 로 우리가 보낸 메시지가 함께 옴.
+                _process_messaging_events(entry, logger)
 
             return HttpResponse("EVENT_RECEIVED", status=200)
 

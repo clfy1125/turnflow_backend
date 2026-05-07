@@ -293,10 +293,13 @@ class MockInstagramProvider:
 class InstagramMessagingService:
     """
     Instagram Messaging API Service (Meta Graph API v25.0)
-    Instagram API with Instagram Login 기반 DM 발송 기능 제공
+    Instagram API with Instagram Login 기반 DM 발송 + 검증 기능 제공.
+
+    99.9% 발송 보증을 위한 능동 검증(GET /{message_id}) 포함.
     """
 
     GRAPH_API_BASE = "https://graph.instagram.com/v25.0"
+    DEFAULT_TIMEOUT = 10  # seconds
 
     @classmethod
     def _get_headers(cls, access_token: str) -> Dict:
@@ -305,67 +308,242 @@ class InstagramMessagingService:
             "Content-Type": "application/json",
         }
 
+    # ===== 멱등성 키 =====
+
+    @staticmethod
+    def build_idempotency_key(
+        *, workspace_id, ig_user_id: str, comment_id: str, campaign_id
+    ) -> str:
+        """
+        중복 발송 차단용 키 생성.
+
+        sha256(workspace:ig:comment:campaign) → 동일 댓글에 동일 캠페인이 여러 번
+        트리거돼도 같은 키가 나오므로 DB UNIQUE 제약으로 중복 차단.
+        """
+        import hashlib
+
+        raw = f"{workspace_id}:{ig_user_id}:{comment_id}:{campaign_id}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    # ===== 발송 =====
+
     @classmethod
     def send_dm_via_comment(
-        cls, ig_user_id: str, comment_id: str, message_text: str, access_token: str
+        cls,
+        ig_user_id: str,
+        comment_id: str,
+        message_text: str,
+        access_token: str,
     ) -> Dict:
         """
-        댓글 ID를 통해 Private Reply DM 발송
-
-        Args:
-            ig_user_id: Instagram 비즈니스 계정 ID
-            comment_id: 댓글 ID (webhook에서 받은 id)
-            message_text: 전송할 메시지 내용
-            access_token: Instagram User Access Token
+        Private Reply DM 발송 (POST /{ig_user_id}/messages, recipient.comment_id 사용)
 
         Returns:
-            API 응답 (성공 시 message_id 포함)
+            {"message_id": "...", "recipient_id": "...", "_raw": {...}}
 
         Raises:
-            requests.exceptions.HTTPError: API 호출 실패 시
+            DMTransientError: 네트워크 타임아웃 / 5xx (재시도 가능)
+            DMTokenError / DMWindowExpiredError / DMInvalidParamError / DMApiError
+            DMAnomalyError: 200인데 message_id 누락
         """
         url = f"{cls.GRAPH_API_BASE}/{ig_user_id}/messages"
-
         payload = {
             "recipient": {"comment_id": comment_id},
             "message": {"text": message_text},
         }
-
-        response = requests.post(url, json=payload, headers=cls._get_headers(access_token))
-        response.raise_for_status()
-
-        return response.json()
+        return cls._post_message(url, payload, access_token)
 
     @classmethod
     def send_dm_via_user_id(
-        cls, ig_user_id: str, recipient_id: str, message_text: str, access_token: str
+        cls,
+        ig_user_id: str,
+        recipient_id: str,
+        message_text: str,
+        access_token: str,
     ) -> Dict:
         """
-        사용자 ID를 통해 DM 발송 (24시간 메시징 윈도우 내에서만 가능)
-
-        Args:
-            ig_user_id: Instagram 비즈니스 계정 ID
-            recipient_id: 수신자 Instagram User ID
-            message_text: 전송할 메시지 내용
-            access_token: Instagram User Access Token
-
-        Returns:
-            API 응답
-
-        Raises:
-            requests.exceptions.HTTPError: API 호출 실패 시
+        사용자 ID 기반 DM 발송 (24h 윈도우 내에서만 허용)
         """
         url = f"{cls.GRAPH_API_BASE}/{ig_user_id}/messages"
-
         payload = {
             "recipient": {"id": recipient_id},
             "message": {"text": message_text},
         }
+        return cls._post_message(url, payload, access_token)
 
-        response = requests.post(url, json=payload, headers=cls._get_headers(access_token))
-        response.raise_for_status()
+    @classmethod
+    def _post_message(cls, url: str, payload: dict, access_token: str) -> Dict:
+        """공통 POST + 응답 강검증 + v3.2 에러 분류
 
-        return response.json()
+        v3.2 매핑 (Meta v25 검증됨):
+            code 10 + subcode in (2534022, 2018278)  → DMWindowExpiredError
+            code in (102, 190, 200)                  → DMTokenError
+                (190의 모든 subcode 458/460/463/467 포함)
+            code == 100                              → DMInvalidParamError
+                (Private Reply 7일 초과 = subcode 2018292 포함)
+            code == 551                              → DMRecipientUnreachableError
+            code in (1, 2, 4, 17, 32, 368, 613) / 5xx → DMTransientError
+            그 외 4xx                                → DMApiError (→ FAILED_NO_TRACE)
+        """
+        from .dm_exceptions import (
+            DMAnomalyError,
+            DMApiError,
+            DMInvalidParamError,
+            DMRecipientUnreachableError,
+            DMTokenError,
+            DMTransientError,
+            DMWindowExpiredError,
+            RETRIABLE_CODES,
+            TOKEN_CODES,
+        )
+
+        try:
+            resp = requests.post(
+                url,
+                json=payload,
+                headers=cls._get_headers(access_token),
+                timeout=cls.DEFAULT_TIMEOUT,
+            )
+        except requests.Timeout as e:
+            raise DMTransientError(f"API timeout: {e}") from e
+        except requests.ConnectionError as e:
+            raise DMTransientError(f"Connection error: {e}") from e
+
+        # 4xx/5xx: 에러 분류
+        if not resp.ok:
+            try:
+                body = resp.json()
+            except ValueError:
+                body = {"error": {"message": resp.text}}
+
+            err = body.get("error", {}) or {}
+            code = err.get("code")
+            subcode = err.get("error_subcode")
+            msg = err.get("message", f"HTTP {resp.status_code}")
+
+            kwargs = dict(
+                status=resp.status_code,
+                code=code,
+                subcode=subcode,
+                api_response=body,
+            )
+
+            # 24h 메시징 윈도우 만료 (subcode 2534022 또는 2018278)
+            if code == 10 and subcode in (2534022, 2018278):
+                raise DMWindowExpiredError(msg, **kwargs)
+            # 토큰 / 세션 / 권한 (190은 모든 subcode 포함)
+            if code in TOKEN_CODES:
+                raise DMTokenError(msg, **kwargs)
+            # 잘못된 파라미터 (Private Reply 7일 초과 포함)
+            if code == 100:
+                raise DMInvalidParamError(msg, **kwargs)
+            # 수신자 도달 불가
+            if code == 551:
+                raise DMRecipientUnreachableError(msg, **kwargs)
+            # rate limit / transient
+            if code in RETRIABLE_CODES:
+                raise DMTransientError(msg, **kwargs)
+            # 5xx
+            if 500 <= resp.status_code < 600:
+                raise DMTransientError(msg, **kwargs)
+            # 그 외 4xx — 분류 불가
+            raise DMApiError(msg, **kwargs)
+
+        # 2xx: 본문 강검증
+        try:
+            body = resp.json()
+        except ValueError as e:
+            raise DMAnomalyError(f"Non-JSON 200 body: {resp.text[:200]}") from e
+
+        message_id = body.get("message_id")
+        recipient_id = body.get("recipient_id")
+
+        if not message_id or not recipient_id:
+            raise DMAnomalyError(
+                f"200 OK but missing fields: {body}",
+                status=resp.status_code,
+                api_response=body,
+            )
+
+        return {
+            "message_id": message_id,
+            "recipient_id": recipient_id,
+            "_raw": body,
+        }
+
+    # ===== 능동 검증: GET /{message_id} =====
+
+    @classmethod
+    def fetch_message(cls, message_id: str, access_token: str) -> Optional[Dict]:
+        """
+        GET /v25.0/{message_id} 로 메시지 단건 조회 (Conversations API).
+
+        99.9% 발송 보증의 2차 안전망. echo 웹훅이 누락된 경우 이 호출이
+        Meta DB에 메시지가 실존하는지를 직접 확인한다.
+
+        Args:
+            message_id: POST /messages 응답의 message_id
+
+        Returns:
+            메시지 객체 (도착 확정), None (Meta가 404 반환 — 미발견)
+
+        Raises:
+            DMTokenError: code 190
+            DMTransientError: 5xx / 네트워크 오류 (재시도 권장)
+            DMApiError: 그 외 4xx
+        """
+        from .dm_exceptions import (
+            DMApiError,
+            DMTokenError,
+            DMTransientError,
+            TOKEN_CODES,
+        )
+
+        if not message_id:
+            return None
+
+        url = f"{cls.GRAPH_API_BASE}/{message_id}"
+        params = {"fields": "id,created_time,from,to,message"}
+
+        try:
+            resp = requests.get(
+                url,
+                params=params,
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=cls.DEFAULT_TIMEOUT,
+            )
+        except requests.Timeout as e:
+            raise DMTransientError(f"fetch_message timeout: {e}") from e
+        except requests.ConnectionError as e:
+            raise DMTransientError(f"fetch_message connection error: {e}") from e
+
+        if resp.status_code == 404:
+            return None
+
+        if not resp.ok:
+            try:
+                body = resp.json()
+            except ValueError:
+                body = {"error": {"message": resp.text}}
+            err = body.get("error", {}) or {}
+            code = err.get("code")
+            msg = err.get("message", f"HTTP {resp.status_code}")
+            kwargs = dict(
+                status=resp.status_code,
+                code=code,
+                subcode=err.get("error_subcode"),
+                api_response=body,
+            )
+            if code in TOKEN_CODES:
+                raise DMTokenError(msg, **kwargs)
+            if 500 <= resp.status_code < 600:
+                raise DMTransientError(msg, **kwargs)
+            raise DMApiError(msg, **kwargs)
+
+        try:
+            return resp.json()
+        except ValueError:
+            return None
 
     @classmethod
     def check_messaging_window(cls, comment_timestamp: datetime) -> bool:
@@ -454,6 +632,45 @@ class SpamDetectionService:
         return False
 
 
+class InstagramMediaService:
+    """
+    Instagram Media 조회 서비스 (v3.4 — next_media 트리거 폴링용).
+
+    GET /v25.0/{ig_user_id}/media?fields=id,timestamp,media_type,caption,permalink
+    """
+
+    GRAPH_API_BASE = "https://graph.instagram.com/v25.0"
+    DEFAULT_TIMEOUT = 10
+
+    @classmethod
+    def list_recent_media(
+        cls,
+        ig_user_id: str,
+        access_token: str,
+        limit: int = 5,
+        fields: str = "id,timestamp,media_type,caption,permalink",
+    ) -> list:
+        """
+        최근 게시물 N건 조회 (timestamp DESC).
+
+        Returns:
+            [{"id": "...", "timestamp": "ISO8601", "media_type": "...", ...}, ...]
+
+        Raises:
+            requests.HTTPError on non-2xx
+        """
+        url = f"{cls.GRAPH_API_BASE}/{ig_user_id}/media"
+        params = {
+            "fields": fields,
+            "limit": limit,
+            "access_token": access_token,
+        }
+        resp = requests.get(url, params=params, timeout=cls.DEFAULT_TIMEOUT)
+        resp.raise_for_status()
+        body = resp.json() or {}
+        return body.get("data", []) or []
+
+
 class InstagramCommentService:
     """
     Instagram 댓글 관리 서비스
@@ -466,6 +683,37 @@ class InstagramCommentService:
         return {
             "Authorization": f"Bearer {access_token}",
         }
+
+    @classmethod
+    def post_reply(cls, comment_id: str, message: str, access_token: str) -> Dict:
+        """
+        댓글에 공개 답글(reply) 게시.
+
+        POST https://graph.instagram.com/v25.0/{ig-comment-id}/replies
+            ?message=...
+
+        Args:
+            comment_id: 답글을 달 부모 댓글 ID
+            message:    답글 내용
+            access_token: Instagram User Access Token
+
+        Returns:
+            {"id": "<reply_id>"} 형태의 응답
+
+        Raises:
+            requests.HTTPError: API 호출 실패 시
+        """
+        url = f"{cls.GRAPH_API_BASE}/{comment_id}/replies"
+        params = {"message": message}
+
+        response = requests.post(
+            url,
+            params=params,
+            headers=cls._get_headers(access_token),
+            timeout=10,
+        )
+        response.raise_for_status()
+        return response.json()
 
     @classmethod
     def hide_comment(cls, comment_id: str, access_token: str) -> Dict:

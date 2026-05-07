@@ -104,6 +104,37 @@ services:
       - redis
       - web
 
+  celery_beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: instagram_backend_web
+    container_name: instagram_backend_celery_beat
+    command: celery -A config beat -l info --pidfile=/tmp/celerybeat.pid
+    environment:
+      - DJANGO_SETTINGS_MODULE=config.settings.local
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-instagram_service}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-postgres}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - SECRET_KEY=${SECRET_KEY:-django-insecure-local-dev-key-change-in-production}
+      - META_APP_ID=${META_APP_ID}
+      - META_APP_SECRET=${META_APP_SECRET}
+      - INSTAGRAM_APP_ID=${INSTAGRAM_APP_ID}
+      - INSTAGRAM_APP_SECRET=${INSTAGRAM_APP_SECRET}
+      - INSTAGRAM_REDIRECT_URI=${INSTAGRAM_REDIRECT_URI}
+      - INSTAGRAM_MOCK_MODE=${INSTAGRAM_MOCK_MODE:-False}
+      - INSTAGRAM_WEBHOOK_VERIFY_TOKEN=${INSTAGRAM_WEBHOOK_VERIFY_TOKEN}
+    volumes:
+      - .:/app
+    depends_on:
+      - db
+      - redis
+      - web
+
 volumes:
   postgres_data:
   redis_data:
