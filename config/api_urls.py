@@ -14,4 +14,6 @@ urlpatterns = [
     path("pages/", include("apps.pages.urls", namespace="pages")),
     path("ai/", include("apps.ai_jobs.urls", namespace="ai_jobs")),
     path("admin/emails/", include("apps.emails.urls_admin", namespace="admin_emails")),
+    path("tiktok/", include("apps.tiktok.urls", namespace="tiktok")),
+    path("youtube/", include("apps.youtube.urls", namespace="youtube")),
 ]

@@ -39,6 +39,8 @@ INSTALLED_APPS = [
     "apps.pages",
     "apps.ai_jobs",
     "apps.emails.apps.EmailsConfig",
+    "apps.tiktok",
+    "apps.youtube",
 ]
 
 MIDDLEWARE = [
@@ -403,6 +405,29 @@ INSTAGRAM_WEBHOOK_VERIFY_TOKEN = config(
 # Meta App (Facebook Login for Instagram Business)
 META_APP_ID = config("META_APP_ID", default="")
 META_APP_SECRET = config("META_APP_SECRET", default="")
+
+# ─────────────────────────────────────────────────────────────
+# TikTok Integration (Content Posting API — developers.tiktok.com)
+# ─────────────────────────────────────────────────────────────
+# Sandbox/audit: 미감사 클라이언트는 모든 게시물이 PRIVATE 강제. 검수 통과 후 PUBLIC 가능.
+TIKTOK_CLIENT_KEY = config("TIKTOK_CLIENT_KEY", default="")
+TIKTOK_CLIENT_SECRET = config("TIKTOK_CLIENT_SECRET", default="")
+TIKTOK_REDIRECT_URI = config("TIKTOK_REDIRECT_URI", default="")
+TIKTOK_MOCK_MODE = config("TIKTOK_MOCK_MODE", default=True, cast=bool)
+# Phase 2 — Business API (business-api.tiktok.com) for organic comment hide/unhide
+TIKTOK_BUSINESS_APP_ID = config("TIKTOK_BUSINESS_APP_ID", default="")
+TIKTOK_BUSINESS_APP_SECRET = config("TIKTOK_BUSINESS_APP_SECRET", default="")
+TIKTOK_BUSINESS_REDIRECT_URI = config("TIKTOK_BUSINESS_REDIRECT_URI", default="")
+
+# ─────────────────────────────────────────────────────────────
+# YouTube / Google OAuth (Data API v3)
+# ─────────────────────────────────────────────────────────────
+# Default daily quota: 10,000 units. videos.insert costs 1,600 units per call.
+GOOGLE_OAUTH_CLIENT_ID = config("GOOGLE_OAUTH_CLIENT_ID", default="")
+GOOGLE_OAUTH_CLIENT_SECRET = config("GOOGLE_OAUTH_CLIENT_SECRET", default="")
+GOOGLE_OAUTH_REDIRECT_URI = config("GOOGLE_OAUTH_REDIRECT_URI", default="")
+YOUTUBE_MOCK_MODE = config("YOUTUBE_MOCK_MODE", default=True, cast=bool)
+YOUTUBE_DAILY_QUOTA = config("YOUTUBE_DAILY_QUOTA", default=10000, cast=int)
 
 # Resend (Email)
 RESEND_API_KEY = config("RESEND_API_KEY", default="")
