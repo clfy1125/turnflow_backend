@@ -1,19 +1,42 @@
 """
-TikTok Content Posting API service layer.
+TikTok Business API service layer.
 
-Refs:
-- https://developers.tiktok.com/doc/login-kit-manage-user-access-tokens
-- https://developers.tiktok.com/doc/content-posting-api-get-started
-- https://developers.tiktok.com/doc/content-posting-api-reference-direct-post
+Reference: https://business-api.tiktok.com/portal/docs
 
-OAuth (v2):
-    Authorize:  https://www.tiktok.com/v2/auth/authorize/
-    Token:      POST https://open.tiktokapis.com/v2/oauth/token/
+OAuth (Business Center / Advertiser)::
 
-Content Posting (Direct Post):
-    POST https://open.tiktokapis.com/v2/post/publish/creator_info/query/
-    POST https://open.tiktokapis.com/v2/post/publish/video/init/
-    POST https://open.tiktokapis.com/v2/post/publish/status/fetch/
+    Authorize: https://business-api.tiktok.com/portal/auth
+               ?app_id=...&state=...&redirect_uri=...
+    Token:     POST https://business-api.tiktok.com/open_api/v1.3/oauth2/access_token/
+               body: {app_id, secret, auth_code}
+    Advertiser
+    discovery: GET  https://business-api.tiktok.com/open_api/v1.3/oauth2/advertiser/get/
+               headers: {Access-Token: <token>}
+
+Ad Comments (scope: ``Ad Comments``)::
+
+    POST /open_api/v1.3/comment/list/                 (filter + paginate)
+    POST /open_api/v1.3/comment/reference/            (ad/creative metadata for a batch)
+    POST /open_api/v1.3/comment/status/update/        (HIDE / SHOW)
+    POST /open_api/v1.3/comment/delete/               (own/brand comments only)
+    POST /open_api/v1.3/comment/post/                 (reply)
+    POST /open_api/v1.3/comment/task/create/          (bulk async job)
+    GET  /open_api/v1.3/comment/task/check/           (job status)
+    GET  /open_api/v1.3/comment/task/download/        (job result URL)
+
+Blocked words (scope: ``Ad Comments``)::
+
+    GET  /open_api/v1.3/blockedword/list/
+    POST /open_api/v1.3/blockedword/check/
+    POST /open_api/v1.3/blockedword/create/
+    POST /open_api/v1.3/blockedword/update/
+    POST /open_api/v1.3/blockedword/delete/
+    POST /open_api/v1.3/blockedword/task/create/
+    GET  /open_api/v1.3/blockedword/task/check/
+    GET  /open_api/v1.3/blockedword/task/download/
+
+All authenticated calls send the access token via the ``Access-Token`` HTTP
+header (not ``Authorization: Bearer ...``).
 """
 
 from __future__ import annotations
@@ -22,20 +45,24 @@ import logging
 import secrets
 import uuid
 from datetime import timedelta
-from typing import Any, Optional
+from typing import Iterable, Optional
 from urllib.parse import urlencode
 
 import requests
 from django.conf import settings
 from django.utils import timezone
 
-from .models import TikTokAccountConnection, TikTokVideoPost
+from .models import TikTokAccountConnection
 
 logger = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Errors
+# ─────────────────────────────────────────────────────────────────────────────
+
 class TikTokAPIError(Exception):
-    """Wraps an unsuccessful TikTok API response."""
+    """Raised on any unsuccessful TikTok Business API response."""
 
     def __init__(self, message: str, code: str = "", response: dict = None):
         self.code = code
@@ -44,393 +71,555 @@ class TikTokAPIError(Exception):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OAuth (Login Kit)
+# OAuth (Business Center)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TikTokOAuthService:
-    """OAuth helpers for ``developers.tiktok.com`` Login Kit (v2)."""
+BUSINESS_BASE = "https://business-api.tiktok.com"
+BUSINESS_API_BASE = f"{BUSINESS_BASE}/open_api/v1.3"
 
-    AUTHORIZE_URL = "https://www.tiktok.com/v2/auth/authorize/"
-    TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
-    REVOKE_URL = "https://open.tiktokapis.com/v2/oauth/revoke/"
-    USER_INFO_URL = "https://open.tiktokapis.com/v2/user/info/"
 
-    REQUIRED_SCOPES = [
-        "user.info.basic",
-        "video.publish",
-        "video.upload",
-    ]
+class TikTokBusinessOAuthService:
+    """OAuth + advertiser discovery against ``business-api.tiktok.com``."""
+
+    AUTHORIZE_URL = f"{BUSINESS_BASE}/portal/auth"
+    TOKEN_URL = f"{BUSINESS_API_BASE}/oauth2/access_token/"
+    ADVERTISER_GET_URL = f"{BUSINESS_API_BASE}/oauth2/advertiser/get/"
 
     @classmethod
-    def _client_key(cls) -> str:
-        return settings.TIKTOK_CLIENT_KEY
+    def _app_id(cls) -> str:
+        return settings.TIKTOK_BUSINESS_APP_ID
 
     @classmethod
-    def _client_secret(cls) -> str:
-        return settings.TIKTOK_CLIENT_SECRET
+    def _app_secret(cls) -> str:
+        return settings.TIKTOK_BUSINESS_APP_SECRET
 
     @classmethod
     def get_authorization_url(cls, redirect_uri: str, state: str) -> str:
         params = {
-            "client_key": cls._client_key(),
-            "scope": ",".join(cls.REQUIRED_SCOPES),
-            "response_type": "code",
-            "redirect_uri": redirect_uri,
+            "app_id": cls._app_id(),
             "state": state,
+            "redirect_uri": redirect_uri,
         }
         return f"{cls.AUTHORIZE_URL}?{urlencode(params)}"
 
     @classmethod
-    def exchange_code_for_token(cls, code: str, redirect_uri: str) -> dict:
+    def exchange_auth_code(cls, auth_code: str) -> dict:
         """
-        Exchange authorization code for an access + refresh token bundle.
+        Exchange ``auth_code`` for an access token.
 
-        Response (on success)::
+        Response (data block)::
 
             {
               "access_token": "...",
-              "expires_in": 86400,
-              "open_id": "...",
-              "refresh_expires_in": 31536000,
-              "refresh_token": "...",
-              "scope": "user.info.basic,video.publish",
-              "token_type": "Bearer"
+              "advertiser_ids": ["1234567890"],
+              "scope": [3, 17]
             }
         """
         body = {
-            "client_key": cls._client_key(),
-            "client_secret": cls._client_secret(),
-            "code": code,
-            "grant_type": "authorization_code",
-            "redirect_uri": redirect_uri,
+            "app_id": cls._app_id(),
+            "secret": cls._app_secret(),
+            "auth_code": auth_code,
         }
-        headers = {"Content-Type": "application/x-www-form-urlencoded", "Cache-Control": "no-cache"}
-        resp = requests.post(cls.TOKEN_URL, data=body, headers=headers, timeout=20)
-        return _raise_or_return(resp, "TIKTOK_TOKEN_EXCHANGE_FAILED")
+        resp = requests.post(
+            cls.TOKEN_URL,
+            json=body,
+            headers={"Content-Type": "application/json"},
+            timeout=20,
+        )
+        return _unwrap(resp, "TIKTOK_TOKEN_EXCHANGE_FAILED")
 
     @classmethod
-    def refresh_access_token(cls, refresh_token: str) -> dict:
-        body = {
-            "client_key": cls._client_key(),
-            "client_secret": cls._client_secret(),
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
+    def get_advertisers(cls, access_token: str) -> list:
+        """List advertisers this token has been granted access to."""
+        params = {
+            "app_id": cls._app_id(),
+            "secret": cls._app_secret(),
         }
-        headers = {"Content-Type": "application/x-www-form-urlencoded", "Cache-Control": "no-cache"}
-        resp = requests.post(cls.TOKEN_URL, data=body, headers=headers, timeout=20)
-        return _raise_or_return(resp, "TIKTOK_TOKEN_REFRESH_FAILED")
-
-    @classmethod
-    def get_user_info(cls, access_token: str) -> dict:
-        params = {"fields": "open_id,union_id,avatar_url,display_name"}
-        headers = {"Authorization": f"Bearer {access_token}"}
-        resp = requests.get(cls.USER_INFO_URL, params=params, headers=headers, timeout=15)
-        data = _raise_or_return(resp, "TIKTOK_USER_INFO_FAILED")
-        # Real response shape: {"data": {"user": {...}}, "error": {...}}
-        return (data.get("data") or {}).get("user", {})
+        headers = {"Access-Token": access_token}
+        resp = requests.get(
+            cls.ADVERTISER_GET_URL, params=params, headers=headers, timeout=15,
+        )
+        data = _unwrap(resp, "TIKTOK_ADVERTISER_GET_FAILED")
+        return data.get("list") or []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Content Posting API
+# Generic request helper
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TikTokContentPostingService:
-    """Direct Post flow for an authorized creator."""
+def _unwrap(resp: requests.Response, error_code: str) -> dict:
+    """
+    TikTok Business API success envelope::
 
-    BASE = "https://open.tiktokapis.com/v2"
-    CREATOR_INFO_URL = f"{BASE}/post/publish/creator_info/query/"
-    VIDEO_INIT_URL = f"{BASE}/post/publish/video/init/"
-    STATUS_FETCH_URL = f"{BASE}/post/publish/status/fetch/"
+        {"code": 0, "message": "OK", "data": {...}, "request_id": "..."}
 
-    @classmethod
-    def query_creator_info(cls, connection: TikTokAccountConnection) -> dict:
-        """
-        Returns allowed privacy levels, max video duration, comment/duet/stitch policy
-        for the authorized creator. **Required** by TikTok before invoking
-        the publish endpoint — the client must show these options to the user.
-        """
-        headers = {
-            "Authorization": f"Bearer {connection.access_token}",
-            "Content-Type": "application/json; charset=UTF-8",
-        }
-        resp = requests.post(cls.CREATOR_INFO_URL, headers=headers, timeout=15)
-        return _raise_or_return(resp, "TIKTOK_CREATOR_INFO_FAILED").get("data", {})
-
-    @classmethod
-    def init_pull_from_url(
-        cls,
-        connection: TikTokAccountConnection,
-        post: TikTokVideoPost,
-    ) -> dict:
-        """
-        Initiate a Direct Post using ``PULL_FROM_URL``. TikTok will fetch the
-        video from the URL itself; we don't have to upload chunks.
-
-        The video URL must be hosted on a domain prefix the developer has
-        verified in the TikTok app dashboard.
-        """
-        body = {
-            "post_info": _post_info_payload(post),
-            "source_info": {
-                "source": "PULL_FROM_URL",
-                "video_url": post.video_url,
-            },
-        }
-        headers = {
-            "Authorization": f"Bearer {connection.access_token}",
-            "Content-Type": "application/json; charset=UTF-8",
-        }
-        resp = requests.post(cls.VIDEO_INIT_URL, json=body, headers=headers, timeout=30)
-        return _raise_or_return(resp, "TIKTOK_VIDEO_INIT_FAILED")
-
-    @classmethod
-    def init_file_upload(
-        cls,
-        connection: TikTokAccountConnection,
-        post: TikTokVideoPost,
-        *,
-        chunk_size: int = 10 * 1024 * 1024,
-    ) -> dict:
-        """
-        Initiate a Direct Post using ``FILE_UPLOAD``. Returns ``upload_url`` to PUT
-        chunks to. Caller is responsible for the actual byte transfer.
-        """
-        total_size = post.video_size_bytes
-        if total_size <= 0:
-            raise TikTokAPIError("video_size_bytes must be set for FILE_UPLOAD", "INVALID_SIZE")
-        # TikTok requires chunk_size between 5MB and 64MB except for the last chunk.
-        chunk_size = max(5 * 1024 * 1024, min(chunk_size, 64 * 1024 * 1024))
-        total_chunk_count = max(1, (total_size + chunk_size - 1) // chunk_size)
-        body = {
-            "post_info": _post_info_payload(post),
-            "source_info": {
-                "source": "FILE_UPLOAD",
-                "video_size": total_size,
-                "chunk_size": chunk_size,
-                "total_chunk_count": total_chunk_count,
-            },
-        }
-        headers = {
-            "Authorization": f"Bearer {connection.access_token}",
-            "Content-Type": "application/json; charset=UTF-8",
-        }
-        resp = requests.post(cls.VIDEO_INIT_URL, json=body, headers=headers, timeout=30)
-        return _raise_or_return(resp, "TIKTOK_VIDEO_INIT_FAILED")
-
-    @classmethod
-    def fetch_status(cls, connection: TikTokAccountConnection, publish_id: str) -> dict:
-        body = {"publish_id": publish_id}
-        headers = {
-            "Authorization": f"Bearer {connection.access_token}",
-            "Content-Type": "application/json; charset=UTF-8",
-        }
-        resp = requests.post(cls.STATUS_FETCH_URL, json=body, headers=headers, timeout=15)
-        return _raise_or_return(resp, "TIKTOK_STATUS_FETCH_FAILED").get("data", {})
-
-
-def _post_info_payload(post: TikTokVideoPost) -> dict:
-    """Build the ``post_info`` block. Caller has already enforced privacy clamping."""
-    return {
-        "title": post.caption[:2200],
-        "privacy_level": post.effective_privacy,
-        "disable_duet": post.disable_duet,
-        "disable_comment": post.disable_comment,
-        "disable_stitch": post.disable_stitch,
-        "video_cover_timestamp_ms": 1000,
-    }
-
-
-def _raise_or_return(resp: requests.Response, error_code: str) -> dict:
-    """Parse JSON, raise TikTokAPIError on TikTok-side ``error.code`` != 'ok'."""
+    Anything else (``code != 0`` or HTTP ≥ 400) is raised as TikTokAPIError.
+    """
     try:
-        data = resp.json()
+        payload = resp.json()
     except ValueError:
         raise TikTokAPIError(
             f"Non-JSON TikTok response (HTTP {resp.status_code}): {resp.text[:500]}",
             error_code,
         )
+    code = payload.get("code")
+    if resp.status_code >= 400 or (code is not None and code != 0):
+        raise TikTokAPIError(
+            payload.get("message") or f"HTTP {resp.status_code}",
+            str(code) if code is not None else error_code,
+            response=payload,
+        )
+    return payload.get("data") or {}
 
-    err = data.get("error") or {}
-    code = (err.get("code") or "").lower()
-    if resp.status_code >= 400 or (code and code != "ok"):
-        msg = err.get("message") or f"HTTP {resp.status_code}"
-        raise TikTokAPIError(msg, code or error_code, response=data)
-    return data
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Privacy clamping (MVP gate)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def effective_privacy_for(connection: TikTokAccountConnection, requested: str) -> str:
-    """
-    Return the privacy level we will actually send to TikTok.
-
-    Until ``connection.is_audited`` is True, TikTok forces every publish to
-    SELF_ONLY. We mirror that on the server side so the user is told upfront
-    instead of being silently overridden later.
-    """
-    if not connection.is_audited:
-        return TikTokVideoPost.Privacy.SELF_ONLY.value
-    return requested
+def _auth_headers(connection: TikTokAccountConnection) -> dict:
+    return {
+        "Access-Token": connection.access_token,
+        "Content-Type": "application/json",
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Mock provider
+# Ad Comments
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TikTokAdCommentService:
+    """Wraps the ``/comment/*`` endpoint family."""
+
+    LIST_URL = f"{BUSINESS_API_BASE}/comment/list/"
+    REFERENCE_URL = f"{BUSINESS_API_BASE}/comment/reference/"
+    STATUS_UPDATE_URL = f"{BUSINESS_API_BASE}/comment/status/update/"
+    DELETE_URL = f"{BUSINESS_API_BASE}/comment/delete/"
+    POST_URL = f"{BUSINESS_API_BASE}/comment/post/"
+    TASK_CREATE_URL = f"{BUSINESS_API_BASE}/comment/task/create/"
+    TASK_CHECK_URL = f"{BUSINESS_API_BASE}/comment/task/check/"
+    TASK_DOWNLOAD_URL = f"{BUSINESS_API_BASE}/comment/task/download/"
+
+    # ── reads ───────────────────────────────────────────────────────────────
+
+    @classmethod
+    def list(
+        cls,
+        connection: TikTokAccountConnection,
+        *,
+        filtering: Optional[dict] = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> dict:
+        body = {
+            "advertiser_id": connection.external_account_id,
+            "page": page,
+            "page_size": page_size,
+        }
+        if filtering:
+            body["filtering"] = filtering
+        resp = requests.post(
+            cls.LIST_URL, json=body, headers=_auth_headers(connection), timeout=20,
+        )
+        return _unwrap(resp, "TIKTOK_COMMENT_LIST_FAILED")
+
+    @classmethod
+    def reference(
+        cls, connection: TikTokAccountConnection, *, comment_ids: Iterable[str]
+    ) -> dict:
+        """Resolve ad/creative metadata for a batch of comment ids."""
+        body = {
+            "advertiser_id": connection.external_account_id,
+            "comment_ids": list(comment_ids),
+        }
+        resp = requests.post(
+            cls.REFERENCE_URL, json=body, headers=_auth_headers(connection), timeout=20,
+        )
+        return _unwrap(resp, "TIKTOK_COMMENT_REFERENCE_FAILED")
+
+    # ── writes ──────────────────────────────────────────────────────────────
+
+    @classmethod
+    def set_status(
+        cls,
+        connection: TikTokAccountConnection,
+        *,
+        comment_ids: Iterable[str],
+        action: str,  # "HIDE" or "SHOW"
+    ) -> dict:
+        if action not in ("HIDE", "SHOW"):
+            raise TikTokAPIError(f"invalid action {action!r}", "INVALID_ACTION")
+        body = {
+            "advertiser_id": connection.external_account_id,
+            "comment_ids": list(comment_ids),
+            "action": action,
+        }
+        resp = requests.post(
+            cls.STATUS_UPDATE_URL,
+            json=body,
+            headers=_auth_headers(connection),
+            timeout=20,
+        )
+        return _unwrap(resp, "TIKTOK_COMMENT_STATUS_UPDATE_FAILED")
+
+    @classmethod
+    def delete(
+        cls, connection: TikTokAccountConnection, *, comment_ids: Iterable[str]
+    ) -> dict:
+        body = {
+            "advertiser_id": connection.external_account_id,
+            "comment_ids": list(comment_ids),
+        }
+        resp = requests.post(
+            cls.DELETE_URL, json=body, headers=_auth_headers(connection), timeout=20,
+        )
+        return _unwrap(resp, "TIKTOK_COMMENT_DELETE_FAILED")
+
+    @classmethod
+    def post_reply(
+        cls,
+        connection: TikTokAccountConnection,
+        *,
+        parent_comment_id: str,
+        text: str,
+    ) -> dict:
+        body = {
+            "advertiser_id": connection.external_account_id,
+            "parent_comment_id": parent_comment_id,
+            "text": text,
+        }
+        resp = requests.post(
+            cls.POST_URL, json=body, headers=_auth_headers(connection), timeout=20,
+        )
+        return _unwrap(resp, "TIKTOK_COMMENT_POST_FAILED")
+
+    # ── bulk async task (large jobs) ────────────────────────────────────────
+
+    @classmethod
+    def task_create(
+        cls,
+        connection: TikTokAccountConnection,
+        *,
+        task_type: str,
+        params: dict,
+    ) -> dict:
+        body = {
+            "advertiser_id": connection.external_account_id,
+            "task_type": task_type,
+            "params": params,
+        }
+        resp = requests.post(
+            cls.TASK_CREATE_URL,
+            json=body,
+            headers=_auth_headers(connection),
+            timeout=20,
+        )
+        return _unwrap(resp, "TIKTOK_COMMENT_TASK_CREATE_FAILED")
+
+    @classmethod
+    def task_check(cls, connection: TikTokAccountConnection, *, task_id: str) -> dict:
+        params = {
+            "advertiser_id": connection.external_account_id,
+            "task_id": task_id,
+        }
+        resp = requests.get(
+            cls.TASK_CHECK_URL,
+            params=params,
+            headers=_auth_headers(connection),
+            timeout=15,
+        )
+        return _unwrap(resp, "TIKTOK_COMMENT_TASK_CHECK_FAILED")
+
+    @classmethod
+    def task_download(cls, connection: TikTokAccountConnection, *, task_id: str) -> dict:
+        params = {
+            "advertiser_id": connection.external_account_id,
+            "task_id": task_id,
+        }
+        resp = requests.get(
+            cls.TASK_DOWNLOAD_URL,
+            params=params,
+            headers=_auth_headers(connection),
+            timeout=15,
+        )
+        return _unwrap(resp, "TIKTOK_COMMENT_TASK_DOWNLOAD_FAILED")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Blocked words
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TikTokBlockedWordService:
+    """Wraps the ``/blockedword/*`` endpoint family."""
+
+    LIST_URL = f"{BUSINESS_API_BASE}/blockedword/list/"
+    CHECK_URL = f"{BUSINESS_API_BASE}/blockedword/check/"
+    CREATE_URL = f"{BUSINESS_API_BASE}/blockedword/create/"
+    UPDATE_URL = f"{BUSINESS_API_BASE}/blockedword/update/"
+    DELETE_URL = f"{BUSINESS_API_BASE}/blockedword/delete/"
+    TASK_CREATE_URL = f"{BUSINESS_API_BASE}/blockedword/task/create/"
+    TASK_CHECK_URL = f"{BUSINESS_API_BASE}/blockedword/task/check/"
+    TASK_DOWNLOAD_URL = f"{BUSINESS_API_BASE}/blockedword/task/download/"
+
+    @classmethod
+    def list(
+        cls,
+        connection: TikTokAccountConnection,
+        *,
+        page: int = 1,
+        page_size: int = 100,
+    ) -> dict:
+        params = {
+            "advertiser_id": connection.external_account_id,
+            "page": page,
+            "page_size": page_size,
+        }
+        resp = requests.get(
+            cls.LIST_URL, params=params, headers=_auth_headers(connection), timeout=15,
+        )
+        return _unwrap(resp, "TIKTOK_BLOCKEDWORD_LIST_FAILED")
+
+    @classmethod
+    def check(
+        cls, connection: TikTokAccountConnection, *, words: Iterable[str]
+    ) -> dict:
+        body = {
+            "advertiser_id": connection.external_account_id,
+            "words": list(words),
+        }
+        resp = requests.post(
+            cls.CHECK_URL, json=body, headers=_auth_headers(connection), timeout=15,
+        )
+        return _unwrap(resp, "TIKTOK_BLOCKEDWORD_CHECK_FAILED")
+
+    @classmethod
+    def create(
+        cls, connection: TikTokAccountConnection, *, words: Iterable[str]
+    ) -> dict:
+        body = {
+            "advertiser_id": connection.external_account_id,
+            "blocked_words": list(words),
+        }
+        resp = requests.post(
+            cls.CREATE_URL, json=body, headers=_auth_headers(connection), timeout=20,
+        )
+        return _unwrap(resp, "TIKTOK_BLOCKEDWORD_CREATE_FAILED")
+
+    @classmethod
+    def update(
+        cls,
+        connection: TikTokAccountConnection,
+        *,
+        items: list,  # [{id: ..., word: ...}, ...]
+    ) -> dict:
+        body = {
+            "advertiser_id": connection.external_account_id,
+            "blocked_words": list(items),
+        }
+        resp = requests.post(
+            cls.UPDATE_URL, json=body, headers=_auth_headers(connection), timeout=20,
+        )
+        return _unwrap(resp, "TIKTOK_BLOCKEDWORD_UPDATE_FAILED")
+
+    @classmethod
+    def delete(
+        cls, connection: TikTokAccountConnection, *, ids: Iterable[str]
+    ) -> dict:
+        body = {
+            "advertiser_id": connection.external_account_id,
+            "ids": list(ids),
+        }
+        resp = requests.post(
+            cls.DELETE_URL, json=body, headers=_auth_headers(connection), timeout=20,
+        )
+        return _unwrap(resp, "TIKTOK_BLOCKEDWORD_DELETE_FAILED")
+
+    # ── bulk tasks ──────────────────────────────────────────────────────────
+
+    @classmethod
+    def task_create(
+        cls, connection: TikTokAccountConnection, *, task_type: str, params: dict
+    ) -> dict:
+        body = {
+            "advertiser_id": connection.external_account_id,
+            "task_type": task_type,
+            "params": params,
+        }
+        resp = requests.post(
+            cls.TASK_CREATE_URL,
+            json=body,
+            headers=_auth_headers(connection),
+            timeout=20,
+        )
+        return _unwrap(resp, "TIKTOK_BLOCKEDWORD_TASK_CREATE_FAILED")
+
+    @classmethod
+    def task_check(cls, connection: TikTokAccountConnection, *, task_id: str) -> dict:
+        params = {
+            "advertiser_id": connection.external_account_id,
+            "task_id": task_id,
+        }
+        resp = requests.get(
+            cls.TASK_CHECK_URL,
+            params=params,
+            headers=_auth_headers(connection),
+            timeout=15,
+        )
+        return _unwrap(resp, "TIKTOK_BLOCKEDWORD_TASK_CHECK_FAILED")
+
+    @classmethod
+    def task_download(cls, connection: TikTokAccountConnection, *, task_id: str) -> dict:
+        params = {
+            "advertiser_id": connection.external_account_id,
+            "task_id": task_id,
+        }
+        resp = requests.get(
+            cls.TASK_DOWNLOAD_URL,
+            params=params,
+            headers=_auth_headers(connection),
+            timeout=15,
+        )
+        return _unwrap(resp, "TIKTOK_BLOCKEDWORD_TASK_DOWNLOAD_FAILED")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mock provider — used when TIKTOK_MOCK_MODE=True
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MockTikTokProvider:
-    """In-process mock for ``TIKTOK_MOCK_MODE=True`` development."""
+    """In-process fake responses for development."""
 
     @staticmethod
     def is_mock_mode() -> bool:
         return getattr(settings, "TIKTOK_MOCK_MODE", True)
 
+    # ── OAuth ───────────────────────────────────────────────────────────────
+
     @staticmethod
     def generate_authorization_url(redirect_uri: str, state: str) -> str:
-        # Loop directly back to our callback with a fake code.
-        params = {"code": f"mock_tiktok_code_{secrets.token_hex(8)}", "state": state}
+        params = {"auth_code": f"mock_tt_code_{secrets.token_hex(8)}", "state": state}
         sep = "&" if "?" in redirect_uri else "?"
         return f"{redirect_uri}{sep}{urlencode(params)}"
 
     @staticmethod
-    def exchange_code_for_token(code: str) -> dict:
+    def exchange_auth_code(auth_code: str) -> dict:
+        adv_id = f"mock_adv_{uuid.uuid4().hex[:14]}"
         return {
             "access_token": f"mock_at_{secrets.token_hex(16)}",
-            "refresh_token": f"mock_rt_{secrets.token_hex(16)}",
-            "expires_in": 86400,
-            "refresh_expires_in": 365 * 24 * 3600,
-            "open_id": f"mock_openid_{uuid.uuid4().hex[:12]}",
-            "scope": ",".join(TikTokOAuthService.REQUIRED_SCOPES),
-            "token_type": "Bearer",
+            "advertiser_ids": [adv_id],
+            "scope": ["AD_COMMENTS", "TIKTOK_ACCOUNTS"],
         }
 
     @staticmethod
-    def get_user_info(access_token: str) -> dict:
-        return {
-            "open_id": f"mock_openid_{access_token[-8:]}",
-            "union_id": f"mock_unionid_{access_token[-6:]}",
-            "display_name": "Mock TikTok Creator",
-            "avatar_url": "https://placehold.co/200x200",
-        }
-
-    @staticmethod
-    def init_publish(post: TikTokVideoPost) -> dict:
-        return {
-            "data": {
-                "publish_id": f"mock_publish_{uuid.uuid4().hex[:16]}",
-                "upload_url": (
-                    "https://mock-upload.tiktokapis.local/upload?id=" + uuid.uuid4().hex
-                    if post.source_type == TikTokVideoPost.SourceType.FILE_UPLOAD
-                    else ""
-                ),
+    def get_advertisers(access_token: str) -> list:
+        return [
+            {
+                "advertiser_id": f"mock_adv_{access_token[-10:]}",
+                "advertiser_name": "Mock Advertiser",
+                "bc_id": f"mock_bc_{access_token[-6:]}",
             }
-        }
+        ]
+
+    # ── Ad Comments ─────────────────────────────────────────────────────────
 
     @staticmethod
-    def fetch_status(publish_id: str, *, force_published: bool = True) -> dict:
-        # MVP: assume mock posts publish almost instantly.
-        return {
-            "publish_id": publish_id,
-            "status": "PUBLISH_COMPLETE" if force_published else "PROCESSING_DOWNLOAD",
-            "publicaly_available_post_id": [f"mock_video_{uuid.uuid4().hex[:14]}"]
-            if force_published
-            else [],
-        }
-
-    @staticmethod
-    def list_comments(video_id: str) -> dict:
+    def list_comments(advertiser_id: str) -> dict:
         seed = uuid.uuid4().hex[:8]
         return {
-            "comments": [
+            "list": [
                 {
-                    "id": f"tc_{seed}_1",
-                    "text": "잘 봤어요!",
-                    "user": {"open_id": "mock_clean_fan", "display_name": "CleanFan"},
-                    "is_hidden": False,
+                    "comment_id": f"tc_{seed}_1",
+                    "ad_id": f"ad_{seed}",
+                    "creative_id": f"cr_{seed}",
+                    "text": "잘 봤어요! 너무 좋은 광고네요.",
+                    "user_id": "mock_clean_fan",
+                    "username": "CleanFan",
+                    "status": "PUBLIC",
                 },
                 {
-                    "id": f"tc_{seed}_2",
-                    "text": "follow me on bit.ly/spam now",
-                    "user": {"open_id": "mock_spammer", "display_name": "Spammer"},
-                    "is_hidden": False,
+                    "comment_id": f"tc_{seed}_2",
+                    "ad_id": f"ad_{seed}",
+                    "creative_id": f"cr_{seed}",
+                    "text": "follow me on bit.ly/spam now!",
+                    "user_id": "mock_spammer",
+                    "username": "Spammer",
+                    "status": "PUBLIC",
                 },
                 {
-                    "id": f"tc_{seed}_3",
+                    "comment_id": f"tc_{seed}_3",
+                    "ad_id": f"ad_{seed}",
+                    "creative_id": f"cr_{seed}",
                     "text": "🔥🔥🔥",
-                    "user": {"open_id": "mock_emoji", "display_name": "EmojiBot"},
-                    "is_hidden": False,
+                    "user_id": "mock_emoji",
+                    "username": "EmojiBot",
+                    "status": "PUBLIC",
                 },
             ],
+            "page_info": {"page": 1, "page_size": 20, "total_number": 3},
         }
 
     @staticmethod
-    def hide_comment(comment_id: str) -> dict:
-        return {"mock": True, "comment_id": comment_id, "is_hidden": True}
+    def set_comment_status(comment_ids: Iterable[str], action: str) -> dict:
+        return {"mock": True, "comment_ids": list(comment_ids), "action": action}
+
+    @staticmethod
+    def delete_comments(comment_ids: Iterable[str]) -> dict:
+        return {"mock": True, "deleted": list(comment_ids)}
+
+    @staticmethod
+    def post_reply(parent_comment_id: str, text: str) -> dict:
+        return {
+            "mock": True,
+            "comment_id": f"reply_{uuid.uuid4().hex[:12]}",
+            "parent_comment_id": parent_comment_id,
+            "text": text,
+        }
+
+    # ── Blocked words ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def list_blocked_words() -> dict:
+        return {
+            "list": [
+                {"id": "bw_mock_1", "word": "스팸"},
+                {"id": "bw_mock_2", "word": "광고"},
+            ],
+            "page_info": {"page": 1, "page_size": 100, "total_number": 2},
+        }
+
+    @staticmethod
+    def check_blocked_words(words: Iterable[str]) -> dict:
+        return {"results": [{"word": w, "blocked": False} for w in words]}
+
+    @staticmethod
+    def create_blocked_words(words: Iterable[str]) -> dict:
+        return {
+            "created": [
+                {"id": f"bw_mock_{uuid.uuid4().hex[:8]}", "word": w}
+                for w in words
+            ]
+        }
+
+    @staticmethod
+    def update_blocked_words(items: list) -> dict:
+        return {"updated": list(items)}
+
+    @staticmethod
+    def delete_blocked_words(ids: Iterable[str]) -> dict:
+        return {"deleted": list(ids)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Organic comment moderation (Business API — Phase 2 placeholder)
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# Real organic-comment hide/unhide for TikTok requires a separate OAuth flow
-# against ``business-api.tiktok.com``. We expose a thin interface here so the
-# rest of the app (ViewSets, tasks) can be written today; Phase 2 swaps the
-# real implementation in once the Business app credentials clear approval.
-
-class TikTokCommentService:
-    """Stubbed wrapper for organic comment moderation."""
-
-    @classmethod
-    def list_comments(cls, connection: TikTokAccountConnection, video_id: str) -> dict:
-        if MockTikTokProvider.is_mock_mode():
-            return MockTikTokProvider.list_comments(video_id)
-        raise TikTokAPIError(
-            "Real TikTok organic comment listing requires Business API OAuth (Phase 2).",
-            "NOT_IMPLEMENTED",
-        )
-
-    @classmethod
-    def hide_comment(cls, connection: TikTokAccountConnection, comment_id: str) -> dict:
-        if MockTikTokProvider.is_mock_mode():
-            return MockTikTokProvider.hide_comment(comment_id)
-        raise TikTokAPIError(
-            "Real TikTok organic comment hide requires Business API OAuth (Phase 2).",
-            "NOT_IMPLEMENTED",
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Token refresh helper
+# Token freshness
 # ─────────────────────────────────────────────────────────────────────────────
 
-def ensure_fresh_token(connection: TikTokAccountConnection, *, leeway_seconds: int = 300) -> bool:
+def ensure_fresh_token(connection: TikTokAccountConnection) -> bool:
     """
-    Refresh the connection's access token if it expires within ``leeway_seconds``.
-    Returns True if a refresh happened.
+    TikTok Business access tokens are typically long-lived (no expiry, unless
+    revoked). If TikTok ever flips on token expiry (``token_expires_at`` set),
+    we currently surface the issue by flipping the connection to ``EXPIRED``
+    rather than auto-refreshing — Business API doesn't expose a standard refresh
+    flow today.
     """
     if not connection.token_expires_at:
         return False
-    if timezone.now() + timedelta(seconds=leeway_seconds) < connection.token_expires_at:
+    if timezone.now() < connection.token_expires_at - timedelta(seconds=60):
         return False
-    if not connection.refresh_token:
-        connection.mark_as_error("Refresh token missing; user must re-authenticate")
-        return False
-
-    if MockTikTokProvider.is_mock_mode():
-        bundle = MockTikTokProvider.exchange_code_for_token("mock_refresh_loop")
-    else:
-        bundle = TikTokOAuthService.refresh_access_token(connection.refresh_token)
-
-    connection.access_token = bundle["access_token"]
-    if bundle.get("refresh_token"):
-        connection.refresh_token = bundle["refresh_token"]
-    if bundle.get("expires_in"):
-        connection.token_expires_at = timezone.now() + timedelta(seconds=bundle["expires_in"])
-    if bundle.get("refresh_expires_in"):
-        connection.refresh_token_expires_at = timezone.now() + timedelta(
-            seconds=bundle["refresh_expires_in"]
-        )
-    connection.status = TikTokAccountConnection.Status.ACTIVE
-    connection.save()
-    return True
+    connection.status = TikTokAccountConnection.Status.EXPIRED
+    connection.save(update_fields=["status", "updated_at"])
+    return False

@@ -407,14 +407,11 @@ META_APP_ID = config("META_APP_ID", default="")
 META_APP_SECRET = config("META_APP_SECRET", default="")
 
 # ─────────────────────────────────────────────────────────────
-# TikTok Integration (Content Posting API — developers.tiktok.com)
+# TikTok Business API (business-api.tiktok.com)
 # ─────────────────────────────────────────────────────────────
-# Sandbox/audit: 미감사 클라이언트는 모든 게시물이 PRIVATE 강제. 검수 통과 후 PUBLIC 가능.
-TIKTOK_CLIENT_KEY = config("TIKTOK_CLIENT_KEY", default="")
-TIKTOK_CLIENT_SECRET = config("TIKTOK_CLIENT_SECRET", default="")
-TIKTOK_REDIRECT_URI = config("TIKTOK_REDIRECT_URI", default="")
+# Scope: Ad Comments + TikTok Accounts. 광고 댓글 list/hide/delete/reply +
+# blockedword 관리. 영상 발행은 지원하지 않음.
 TIKTOK_MOCK_MODE = config("TIKTOK_MOCK_MODE", default=True, cast=bool)
-# Phase 2 — Business API (business-api.tiktok.com) for organic comment hide/unhide
 TIKTOK_BUSINESS_APP_ID = config("TIKTOK_BUSINESS_APP_ID", default="")
 TIKTOK_BUSINESS_APP_SECRET = config("TIKTOK_BUSINESS_APP_SECRET", default="")
 TIKTOK_BUSINESS_REDIRECT_URI = config("TIKTOK_BUSINESS_REDIRECT_URI", default="")

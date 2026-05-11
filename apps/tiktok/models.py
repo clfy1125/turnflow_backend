@@ -1,21 +1,16 @@
 """
 TikTok integration models.
 
-Two distinct TikTok APIs are involved (kept separate intentionally):
+Scope (post video-feature removal): TikTok Business API only.
+Ref: https://business-api.tiktok.com/portal/docs
 
-1. **Content Posting API** (`developers.tiktok.com`, host `open.tiktokapis.com`)
-   - Used for OAuth (Login Kit) + video publishing.
-   - Scopes used here: ``user.info.basic``, ``video.publish``, ``video.upload``.
-   - Until the app passes audit, every published video is forced to ``SELF_ONLY``
-     privacy by TikTok regardless of what the user requests.
+OAuth provider:  business-api.tiktok.com (Business Center / Advertiser auth)
+Used scopes:     Ad Comments + TikTok Accounts
 
-2. **Business API** (`business-api.tiktok.com`) — Phase 2.
-   - Used for organic comment moderation (hide/unhide). Separate OAuth.
-   - Modeled here as ``TikTokBusinessConnection`` but not wired in MVP.
+All comment moderation is performed against an authorized advertiser_id.
 """
 
 import uuid
-from datetime import timedelta
 
 from django.db import models
 from django.utils import timezone
@@ -24,7 +19,13 @@ from apps.integrations.encryption import EncryptedTextField
 
 
 class TikTokAccountConnection(models.Model):
-    """Workspace → TikTok creator account (Content Posting / Login Kit OAuth)."""
+    """
+    Workspace ↔ TikTok Business advertiser connection.
+
+    One OAuth grant from a Business Center owner can authorize multiple
+    advertiser IDs; we store one row per (workspace, advertiser_id) so that
+    permissions and stats are tracked per advertiser.
+    """
 
     class Status(models.TextChoices):
         ACTIVE = "active", "Active"
@@ -58,17 +59,20 @@ class TikTokAccountConnection(models.Model):
         verbose_name="Workspace",
     )
 
-    # TikTok identifies users by ``open_id`` (per-app stable ID).
+    # In the Business API context this is the TikTok advertiser_id.
     external_account_id = models.CharField(
-        max_length=255, verbose_name="TikTok open_id", db_index=True
+        max_length=255, verbose_name="advertiser_id", db_index=True
     )
-    union_id = models.CharField(
-        max_length=255, blank=True, default="", verbose_name="TikTok union_id"
+    bc_id = models.CharField(
+        max_length=255, blank=True, default="", verbose_name="Business Center ID"
     )
-    username = models.CharField(max_length=255, blank=True, verbose_name="Display name")
-    avatar_url = models.URLField(blank=True, default="", verbose_name="Avatar URL")
+    advertiser_name = models.CharField(
+        max_length=255, blank=True, default="", verbose_name="광고 계정명"
+    )
 
-    # Encrypted tokens (Fernet via apps.integrations.encryption)
+    # Encrypted tokens. Business API access tokens are long-lived (no rotation
+    # by default), but we still encrypt at rest and track an expiry hint when
+    # one is returned.
     _encrypted_access_token = models.TextField(verbose_name="Encrypted Access Token")
     access_token = EncryptedTextField("_encrypted_access_token")
     _encrypted_refresh_token = models.TextField(
@@ -77,32 +81,21 @@ class TikTokAccountConnection(models.Model):
     refresh_token = EncryptedTextField("_encrypted_refresh_token")
 
     token_expires_at = models.DateTimeField(null=True, blank=True)
-    refresh_token_expires_at = models.DateTimeField(null=True, blank=True)
 
     scopes = models.JSONField(default=list, verbose_name="Granted scopes")
 
     status = models.CharField(
-        max_length=20, choices=Status.choices, default=Status.ACTIVE, verbose_name="Status"
+        max_length=20, choices=Status.choices, default=Status.ACTIVE,
     )
     last_verified_at = models.DateTimeField(null=True, blank=True)
     error_message = models.TextField(blank=True)
-
-    # Audit gate flag — set True after TikTok lifts the post-visibility restriction.
-    is_audited = models.BooleanField(
-        default=False,
-        help_text=(
-            "False = unaudited TikTok client. Every publish call is forced to "
-            "privacy_level=SELF_ONLY regardless of caller intent."
-        ),
-    )
-
     metadata = models.JSONField(default=dict, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
-        return f"{self.username or self.external_account_id} ({self.workspace.name})"
+        return f"{self.advertiser_name or self.external_account_id} ({self.workspace.name})"
 
     def is_token_expired(self) -> bool:
         if not self.token_expires_at:
@@ -126,7 +119,7 @@ class TikTokAccountConnection(models.Model):
 
 
 class TikTokOAuthState(models.Model):
-    """Short-lived state token for popup OAuth flows (CSRF + workspace pinning)."""
+    """Short-lived state token for the popup OAuth flow (CSRF + workspace pinning)."""
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     state = models.CharField(max_length=255, unique=True, db_index=True)
@@ -134,9 +127,6 @@ class TikTokOAuthState(models.Model):
         "workspace.Workspace",
         on_delete=models.CASCADE,
         related_name="tiktok_oauth_states",
-    )
-    code_verifier = models.CharField(
-        max_length=128, blank=True, default="", help_text="PKCE code_verifier (S256)"
     )
     created_at = models.DateTimeField(auto_now_add=True)
     expires_at = models.DateTimeField()
@@ -153,132 +143,8 @@ class TikTokOAuthState(models.Model):
         return f"TikTokOAuthState(state={self.state[:12]}...)"
 
 
-class TikTokVideoPost(models.Model):
-    """
-    A single video publish request to TikTok Content Posting API.
-
-    State machine:
-        QUEUED → INITIATING → UPLOADING (FILE_UPLOAD only) → PROCESSING → PUBLISHED
-                                                                    \
-                                                                     → FAILED
-    """
-
-    class Status(models.TextChoices):
-        QUEUED = "queued", "큐 대기"
-        INITIATING = "initiating", "TikTok init 호출 중"
-        UPLOADING = "uploading", "파일 업로드 중"
-        PROCESSING = "processing", "TikTok 처리 중"
-        PUBLISHED = "published", "발행 완료"
-        FAILED = "failed", "발행 실패"
-
-    class SourceType(models.TextChoices):
-        FILE_UPLOAD = "FILE_UPLOAD", "FILE_UPLOAD"
-        PULL_FROM_URL = "PULL_FROM_URL", "PULL_FROM_URL"
-
-    # TikTok privacy_level enum (Content Posting API).
-    # Until audited, only SELF_ONLY is honored.
-    class Privacy(models.TextChoices):
-        PUBLIC = "PUBLIC_TO_EVERYONE", "공개"
-        FRIENDS = "MUTUAL_FOLLOW_FRIENDS", "친구만"
-        FOLLOWER = "FOLLOWER_OF_CREATOR", "팔로워만"
-        SELF_ONLY = "SELF_ONLY", "비공개"
-
-    class Meta:
-        db_table = "tiktok_video_posts"
-        verbose_name = "TikTok Video Post"
-        verbose_name_plural = "TikTok Video Posts"
-        ordering = ["-created_at"]
-        indexes = [
-            models.Index(fields=["connection", "status"]),
-            models.Index(fields=["status", "created_at"]),
-            models.Index(fields=["publish_id"]),
-        ]
-
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    connection = models.ForeignKey(
-        TikTokAccountConnection,
-        on_delete=models.CASCADE,
-        related_name="video_posts",
-        verbose_name="TikTok Connection",
-    )
-
-    # User-facing input
-    caption = models.TextField(blank=True, default="", verbose_name="캡션 (마크업/해시태그 포함)")
-    source_type = models.CharField(
-        max_length=20,
-        choices=SourceType.choices,
-        default=SourceType.PULL_FROM_URL,
-    )
-    video_url = models.URLField(
-        blank=True, default="",
-        help_text="PULL_FROM_URL 방식의 원본 영상 URL. TikTok이 직접 fetch.",
-    )
-    video_file_path = models.CharField(
-        max_length=500, blank=True, default="",
-        help_text="FILE_UPLOAD 방식의 서버 로컬/스토리지 경로",
-    )
-    video_size_bytes = models.BigIntegerField(default=0)
-
-    requested_privacy = models.CharField(
-        max_length=30, choices=Privacy.choices, default=Privacy.SELF_ONLY,
-    )
-    effective_privacy = models.CharField(
-        max_length=30, choices=Privacy.choices, default=Privacy.SELF_ONLY,
-        help_text="실제 TikTok에 전달된 privacy. 미감사 시 SELF_ONLY로 강제됨.",
-    )
-    disable_duet = models.BooleanField(default=False)
-    disable_comment = models.BooleanField(default=False)
-    disable_stitch = models.BooleanField(default=False)
-    auto_add_music = models.BooleanField(default=False)
-
-    # TikTok-side identifiers
-    publish_id = models.CharField(max_length=255, blank=True, default="", db_index=True)
-    upload_url = models.URLField(blank=True, default="")
-    tiktok_video_id = models.CharField(max_length=255, blank=True, default="")
-
-    status = models.CharField(
-        max_length=20, choices=Status.choices, default=Status.QUEUED, db_index=True,
-    )
-    fail_reason = models.TextField(blank=True, default="")
-    api_response = models.JSONField(default=dict, blank=True)
-
-    # Retry tracking
-    retry_count = models.IntegerField(default=0)
-    next_check_at = models.DateTimeField(null=True, blank=True)
-
-    # Lifecycle timestamps
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-    initiated_at = models.DateTimeField(null=True, blank=True)
-    uploaded_at = models.DateTimeField(null=True, blank=True)
-    published_at = models.DateTimeField(null=True, blank=True)
-
-    def __str__(self):
-        return f"TikTokPost({self.id}, {self.status})"
-
-    def mark_failed(self, reason: str, response: dict = None):
-        self.status = self.Status.FAILED
-        self.fail_reason = reason[:2000]
-        if response is not None:
-            self.api_response = response
-        self.save(update_fields=["status", "fail_reason", "api_response", "updated_at"])
-
-    def mark_published(self, tiktok_video_id: str = "", response: dict = None):
-        self.status = self.Status.PUBLISHED
-        if tiktok_video_id:
-            self.tiktok_video_id = tiktok_video_id
-        if response is not None:
-            self.api_response = response
-        self.published_at = timezone.now()
-        self.save(
-            update_fields=[
-                "status", "tiktok_video_id", "api_response", "published_at", "updated_at",
-            ]
-        )
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Comment moderation (Phase 1: heuristic detection + Mock; Phase 2: Business API)
+# Spam detection config (heuristic rule knobs — provider-agnostic)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TikTokSpamFilterConfig(models.Model):
@@ -291,8 +157,7 @@ class TikTokSpamFilterConfig(models.Model):
     class Action(models.TextChoices):
         REVIEW = "review", "검토 큐로"
         HIDE = "hide", "숨김"
-        # NOTE: TikTok organic API does **not** allow deleting fan comments.
-        # ``delete`` here is mapped to ``hide`` at moderation time.
+        DELETE = "delete", "삭제"
 
     class Meta:
         db_table = "tiktok_spam_filter_configs"
@@ -326,6 +191,7 @@ class TikTokSpamFilterConfig(models.Model):
     )
     total_spam_detected = models.IntegerField(default=0)
     total_hidden = models.IntegerField(default=0)
+    total_deleted = models.IntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -337,13 +203,14 @@ class TikTokSpamFilterConfig(models.Model):
 
 
 class TikTokCommentLog(models.Model):
-    """A cached comment + moderation outcome."""
+    """A cached ad-comment + moderation outcome (one row per external comment id)."""
 
     class Status(models.TextChoices):
         PENDING = "pending", "대기"
         CLEAN = "clean", "정상"
         DETECTED = "detected", "스팸 감지"
         HIDDEN = "hidden", "숨김 완료"
+        DELETED = "deleted", "삭제 완료"
         REVIEW = "review", "검토 대기"
         FAILED = "failed", "처리 실패"
 
@@ -354,7 +221,7 @@ class TikTokCommentLog(models.Model):
         ordering = ["-created_at"]
         indexes = [
             models.Index(fields=["connection", "status"]),
-            models.Index(fields=["external_video_id"]),
+            models.Index(fields=["ad_id"]),
             models.Index(fields=["external_comment_id"]),
             models.Index(fields=["status", "created_at"]),
         ]
@@ -371,8 +238,14 @@ class TikTokCommentLog(models.Model):
         on_delete=models.CASCADE,
         related_name="comment_logs",
     )
-    external_video_id = models.CharField(max_length=255, db_index=True)
+
+    # Business API context: comments are attached to ads, not organic videos.
+    advertiser_id = models.CharField(max_length=255, blank=True, default="")
+    ad_id = models.CharField(max_length=255, blank=True, default="", db_index=True)
+    creative_id = models.CharField(max_length=255, blank=True, default="")
+    parent_comment_id = models.CharField(max_length=255, blank=True, default="")
     external_comment_id = models.CharField(max_length=255)
+
     commenter_external_id = models.CharField(max_length=255, blank=True, default="")
     commenter_username = models.CharField(max_length=255, blank=True, default="")
     text = models.TextField(blank=True, default="")
@@ -411,6 +284,15 @@ class TikTokCommentLog(models.Model):
             update_fields=["status", "moderated_at", "api_response", "updated_at"],
         )
 
+    def mark_deleted(self, response: dict = None):
+        self.status = self.Status.DELETED
+        self.moderated_at = timezone.now()
+        if response is not None:
+            self.api_response = response
+        self.save(
+            update_fields=["status", "moderated_at", "api_response", "updated_at"],
+        )
+
     def mark_review(self, score: float, reasons: list):
         self.status = self.Status.REVIEW
         self.score = score
@@ -425,3 +307,50 @@ class TikTokCommentLog(models.Model):
         self.save(
             update_fields=["status", "error_message", "api_response", "updated_at"],
         )
+
+
+class TikTokBlockedWord(models.Model):
+    """
+    Per-connection cache of TikTok Business "blockedword" entries.
+
+    TikTok keeps an authoritative list on its side; this table is our local
+    mirror so we can show/diff/sync without round-tripping the API on every
+    request. ``external_id`` is TikTok's internal blockedword id when known.
+    """
+
+    class Meta:
+        db_table = "tiktok_blocked_words"
+        verbose_name = "TikTok Blocked Word"
+        verbose_name_plural = "TikTok Blocked Words"
+        ordering = ["word"]
+        indexes = [
+            models.Index(fields=["connection", "word"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["connection", "word"],
+                name="uniq_tiktok_blockedword_per_connection",
+            ),
+        ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    connection = models.ForeignKey(
+        TikTokAccountConnection,
+        on_delete=models.CASCADE,
+        related_name="blocked_words",
+    )
+    word = models.CharField(max_length=255)
+    external_id = models.CharField(
+        max_length=255, blank=True, default="",
+        help_text="TikTok 측 blockedword id (확인된 경우만)",
+    )
+    is_synced = models.BooleanField(
+        default=False,
+        help_text="False = 로컬에만 있음 / True = TikTok 측에도 반영 완료",
+    )
+    last_synced_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"TikTokBlockedWord({self.word})"
