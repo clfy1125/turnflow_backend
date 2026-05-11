@@ -653,6 +653,9 @@ class InstagramMediaService:
         """
         최근 게시물 N건 조회 (timestamp DESC).
 
+        v3.6: next_media 트리거가 webhook 기반으로 전환되어 일반 발송 흐름에선
+              사용 안 함. baseline 스냅샷 등 보조 용도로 유지.
+
         Returns:
             [{"id": "...", "timestamp": "ISO8601", "media_type": "...", ...}, ...]
 
@@ -669,6 +672,58 @@ class InstagramMediaService:
         resp.raise_for_status()
         body = resp.json() or {}
         return body.get("data", []) or []
+
+    @classmethod
+    def get_media_timestamp(
+        cls, media_id: str, access_token: str
+    ) -> "datetime | None":
+        """
+        단일 미디어의 timestamp 조회 (v3.6 next_media webhook 검증용).
+
+        GET /v25.0/{media-id}?fields=timestamp
+
+        Args:
+            media_id: Instagram 미디어 ID (webhook 의 media.id)
+
+        Returns:
+            datetime (timezone-aware) 또는 None (API 실패/404 시)
+
+        Raises:
+            requests.HTTPError on non-2xx (호출자에서 처리)
+        """
+        if not media_id:
+            return None
+
+        url = f"{cls.GRAPH_API_BASE}/{media_id}"
+        params = {"fields": "timestamp", "access_token": access_token}
+
+        try:
+            resp = requests.get(url, params=params, timeout=cls.DEFAULT_TIMEOUT)
+        except (requests.Timeout, requests.ConnectionError):
+            return None
+
+        if resp.status_code == 404:
+            return None
+        if not resp.ok:
+            return None
+
+        try:
+            body = resp.json() or {}
+        except ValueError:
+            return None
+
+        ts_raw = body.get("timestamp")
+        if not ts_raw:
+            return None
+
+        # Meta 는 "2026-05-07T03:14:15+0000" 형식 (콜론 없음). ISO8601 로 정규화.
+        from datetime import datetime as _dt
+
+        v = ts_raw.replace("+0000", "+00:00").replace("Z", "+00:00")
+        try:
+            return _dt.fromisoformat(v)
+        except ValueError:
+            return None
 
 
 class InstagramCommentService:

@@ -132,11 +132,32 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
         # trigger_type 평가:
         #   specific_media (or attached next_media): media_id 일치
         #   any_media: 모두 통과
-        # next_media 는 attach 후 specific_media 로 자동 전환되므로 여기선 따로 처리 안 함
         matched_campaigns = []
         for c in candidate_qs:
             if c.matches_media(media_id) and c.matches_keyword(comment_text):
                 matched_campaigns.append(c)
+
+        # ★ v3.6 — next_media webhook-based attach
+        # 매칭된 캠페인이 없거나 next_media (media_id="") 캠페인이 있으면
+        # 이 webhook 의 media.id 가 baseline 이후의 "새 게시물"인지 검증 후 attach.
+        unattached_next = list(
+            candidate_qs.filter(
+                trigger_type=AutoDMCampaign.TriggerType.NEXT_MEDIA,
+                media_id="",
+            )
+        )
+        if unattached_next:
+            attached_now = _maybe_attach_next_media_from_webhook(
+                unattached_campaigns=unattached_next,
+                webhook_media_id=media_id,
+                comment_text=comment_text,
+            )
+            if attached_now:
+                # attach 된 캠페인을 매칭 목록에 추가 (중복 방지)
+                existing_ids = {c.id for c in matched_campaigns}
+                for c in attached_now:
+                    if c.id not in existing_ids and c.matches_keyword(comment_text):
+                        matched_campaigns.append(c)
 
         if not matched_campaigns:
             return {"status": "skipped", "reason": "No campaign matched (media/keyword)"}
@@ -159,6 +180,106 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
     except Exception as e:
         logger.exception(f"Error processing comment webhook: {e}")
         raise
+
+
+def _maybe_attach_next_media_from_webhook(
+    *,
+    unattached_campaigns: list,
+    webhook_media_id: str,
+    comment_text: str,
+) -> list:
+    """
+    Webhook 으로 받은 댓글의 media_id 가 "캠페인 생성 이후의 새 게시물"인지
+    검증한 뒤, 맞으면 next_media 캠페인들에 즉시 attach (v3.6).
+
+    검증 룰:
+        1. ig_conn.last_seen_media_id 가 비어있으면 → 첫 사용자 케이스, 무조건 attach
+        2. media_id 가 last_seen_media_id 와 동일 → baseline 게시물, attach 안 함
+        3. GET /v25.0/{media_id}?fields=timestamp 호출
+           - timestamp > last_seen_media_at → 진짜 새 게시물, attach
+           - timestamp <= last_seen_media_at → 옛날 게시물, attach 안 함
+           - API 실패 → 안전하게 attach 안 함 (false negative > 잘못된 attach)
+
+    Returns:
+        attach 된 AutoDMCampaign 인스턴스 리스트 (refresh 된 상태)
+    """
+    if not unattached_campaigns or not webhook_media_id:
+        return []
+
+    # 모든 unattached 캠페인은 같은 IG 계정 소유 (호출자가 보장)
+    ig_conn = unattached_campaigns[0].ig_connection
+
+    # 룰 2: baseline 과 동일 미디어면 skip
+    if (
+        ig_conn.last_seen_media_id
+        and ig_conn.last_seen_media_id == webhook_media_id
+    ):
+        return []
+
+    # baseline 없으면 룰 1: 무조건 attach (첫 사용자)
+    # baseline 있으면 timestamp 비교 필요
+    if ig_conn.last_seen_media_id and ig_conn.last_seen_media_at:
+        try:
+            media_ts = InstagramMediaService.get_media_timestamp(
+                media_id=webhook_media_id,
+                access_token=ig_conn.access_token,
+            )
+        except Exception as e:
+            logger.warning(
+                f"next_media webhook attach: timestamp fetch failed for "
+                f"media={webhook_media_id}: {e}"
+            )
+            return []
+
+        if media_ts is None:
+            logger.warning(
+                f"next_media webhook attach: no timestamp for media={webhook_media_id} "
+                "(API returned no data or 404) — skip"
+            )
+            return []
+
+        if media_ts <= ig_conn.last_seen_media_at:
+            logger.info(
+                f"next_media webhook attach: media={webhook_media_id} is older than "
+                f"baseline ({media_ts.isoformat()} <= "
+                f"{ig_conn.last_seen_media_at.isoformat()}) — skip"
+            )
+            return []
+        new_media_at = media_ts
+    else:
+        # baseline 없음 → 첫 사용 케이스 (확실히 가장 최신 게시물로 간주)
+        new_media_at = timezone.now()
+
+    # ★ Attach: 모든 unattached next_media 캠페인에 media_id 부착 + 트리거 전환
+    updated_count = AutoDMCampaign.objects.filter(
+        id__in=[c.id for c in unattached_campaigns],
+        media_id="",  # 동시성 안전: 이미 다른 webhook 이 attach 했으면 skip
+    ).update(
+        media_id=webhook_media_id,
+        trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
+        updated_at=timezone.now(),
+    )
+
+    # baseline 갱신
+    ig_conn.last_seen_media_id = webhook_media_id
+    ig_conn.last_seen_media_at = new_media_at
+    ig_conn.save(
+        update_fields=["last_seen_media_id", "last_seen_media_at"]
+    )
+
+    if updated_count:
+        logger.info(
+            f"next_media webhook attach: attached {updated_count} campaign(s) "
+            f"on ig_conn={ig_conn.id} to media={webhook_media_id}"
+        )
+
+    # refresh 후 반환 (호출자가 즉시 매칭 사용)
+    return list(
+        AutoDMCampaign.objects.filter(
+            id__in=[c.id for c in unattached_campaigns],
+            media_id=webhook_media_id,
+        ).select_related("ig_connection")
+    )
 
 
 def _enqueue_send_dm(

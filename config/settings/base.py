@@ -331,15 +331,10 @@ CELERY_BEAT_SCHEDULE = {
         "task": "apps.integrations.tasks.dead_letter_alerter",
         "schedule": 60 * 10,  # 10분 — 토큰 만료/도착 미확인 누적 알림
     },
-    # NOTE: dm-expire-gate-pending 은 Follow-gate deprecate (v3.5) 로 제거됨
-    "dm-poll-new-media-for-next-campaigns": {
-        "task": "apps.integrations.tasks.poll_new_media_for_next_campaigns",
-        "schedule": 60 * 5,  # 5분 — next_media 트리거 캠페인용 신규 게시물 폴링
-    },
-    "dm-check-polling-anomalies": {
-        "task": "apps.integrations.tasks.check_polling_anomalies",
-        "schedule": 60 * 60,  # 1시간 — 폴링 안 돌고 있는 계정 감지/알림
-    },
+    # NOTE: 아래는 deprecate (v3.5/v3.6) 로 Beat 에서 제거됨:
+    #   - dm-expire-gate-pending: Follow-gate 가 deprecated 됨
+    #   - dm-poll-new-media-for-next-campaigns: next_media 가 webhook 기반으로 전환
+    #   - dm-check-polling-anomalies: 폴링 자체가 사라져 감시 불필요
 }
 
 # PayApp 결제 연동
