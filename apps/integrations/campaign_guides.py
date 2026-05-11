@@ -118,7 +118,7 @@ PUBLIC_REPLY_GUIDE: Dict = {
 def build_campaign_guide() -> Dict:
     """프론트가 한 번에 받아 갈 수 있는 통합 가이드."""
     return {
-        "version": "v3.4",
+        "version": "v3.5",
         "trigger_types": TRIGGER_TYPE_GUIDE,
         "keyword_modes": KEYWORD_MODE_GUIDE,
         "follow_gate": FOLLOW_GATE_GUIDE,
