@@ -1532,18 +1532,11 @@ def _process_messaging_events(entry: dict, logger) -> None:
                 logger=logger,
             )
         else:
-            # 사용자 → 우리 (inbound) 메시지 → Follow-gate 평가
-            from .tasks import handle_inbound_message_for_gate
-
-            text = message.get("text", "") or ""
-            handle_inbound_message_for_gate.delay(
-                page_ig_user_id=page_ig_user_id,
-                sender_user_id=sender_id,
-                message_text=text,
-                message_mid=mid or "",
-            )
+            # 사용자 → 우리 (inbound) 메시지.
+            # v3.5: Follow-gate deprecated (Meta 한계로 silent 검증 불가) → 로깅만.
+            # 향후 inbound conversation 기능 추가 시 여기서 라우팅.
             logger.debug(
-                f"Inbound DM queued for gate eval: sender={sender_id}, mid={mid}"
+                f"Inbound DM received (no handler): sender={sender_id}, mid={mid}"
             )
 
 

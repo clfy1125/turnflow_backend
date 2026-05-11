@@ -331,10 +331,7 @@ CELERY_BEAT_SCHEDULE = {
         "task": "apps.integrations.tasks.dead_letter_alerter",
         "schedule": 60 * 10,  # 10분 — 토큰 만료/도착 미확인 누적 알림
     },
-    "dm-expire-gate-pending": {
-        "task": "apps.integrations.tasks.expire_gate_pending",
-        "schedule": 60 * 60,  # 1시간 — 24h 내 답장 없는 gate 만료 처리
-    },
+    # NOTE: dm-expire-gate-pending 은 Follow-gate deprecate (v3.5) 로 제거됨
     "dm-poll-new-media-for-next-campaigns": {
         "task": "apps.integrations.tasks.poll_new_media_for_next_campaigns",
         "schedule": 60 * 5,  # 5분 — next_media 트리거 캠페인용 신규 게시물 폴링

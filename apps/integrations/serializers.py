@@ -94,10 +94,13 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
             # 메시지
             "message_template",  # legacy
             "opening_message_template",
-            # 공개 답글
+            # 공개 답글 (v3.5)
             "public_reply_enabled",
-            "public_reply_template",
-            # Follow-gate
+            "public_reply_template",  # legacy 단일
+            "public_reply_templates",  # 신규 리스트
+            "public_reply_batch_size",
+            "public_reply_batch_pause_seconds",
+            # Follow-gate (deprecated)
             "follow_gate_enabled",
             "follow_gate_prompt",
             "reward_message_template",
@@ -187,11 +190,31 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
         help_text="legacy 별칭 — opening_message_template 미사용 시 이 값 사용",
     )
 
-    # 공개 답글
+    # 공개 답글 (v3.5)
     public_reply_enabled = serializers.BooleanField(default=False)
-    public_reply_template = serializers.CharField(required=False, allow_blank=True, default="")
+    public_reply_template = serializers.CharField(
+        required=False, allow_blank=True, default="",
+        help_text="[deprecated] 단일 템플릿. 새 캠페인은 public_reply_templates 사용 권장.",
+    )
+    public_reply_templates = serializers.ListField(
+        child=serializers.CharField(allow_blank=False, max_length=2200),
+        required=False,
+        default=list,
+        help_text=(
+            "공개 답글 템플릿 목록 (1개 이상). 매 답글마다 무작위로 1개 선택. "
+            "Instagram 봇 검사 회피를 위해 최소 3개 이상 다양한 문구 권장."
+        ),
+    )
+    public_reply_batch_size = serializers.IntegerField(
+        default=10, min_value=1, max_value=200,
+        help_text="이 개수만큼 답글 게시 후 쿨다운 적용 (기본 10)",
+    )
+    public_reply_batch_pause_seconds = serializers.IntegerField(
+        default=300, min_value=30, max_value=3600,
+        help_text="배치 도달 후 다음 답글까지 대기 시간 (초, 기본 300)",
+    )
 
-    # Follow-gate
+    # Follow-gate (deprecated — Meta 한계로 silent 검증 불가)
     follow_gate_enabled = serializers.BooleanField(default=False)
     follow_gate_prompt = serializers.CharField(required=False, allow_blank=True, default="")
     reward_message_template = serializers.CharField(required=False, allow_blank=True, default="")
@@ -199,7 +222,7 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
         child=serializers.CharField(max_length=64),
         required=False,
         default=list,
-        help_text="예: ['GO', 'YES', '네']",
+        help_text="[deprecated] Meta API 가 silent 검증을 지원하지 않아 무시됨.",
     )
 
     # 운영
@@ -220,15 +243,25 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
             raise serializers.ValidationError(
                 {"opening_message_template": "opening_message_template 또는 message_template 중 하나는 필수입니다."}
             )
+        # Follow-gate 는 deprecated — 검증만 약하게 유지 (실제 동작 안 함)
         if attrs.get("follow_gate_enabled"):
             if not (attrs.get("reward_message_template") or "").strip():
                 raise serializers.ValidationError(
-                    {"reward_message_template": "Follow-gate 사용 시 reward_message_template 필수"}
+                    {"reward_message_template": "Follow-gate 사용 시 reward_message_template 필수 (단 현재 비활성화 상태)"}
                 )
+        # public_reply: templates(list) 또는 legacy template 중 하나는 비어있지 않아야 함
         if attrs.get("public_reply_enabled"):
-            if not (attrs.get("public_reply_template") or "").strip():
+            tmpls = [t for t in (attrs.get("public_reply_templates") or []) if t and str(t).strip()]
+            legacy = (attrs.get("public_reply_template") or "").strip()
+            if not tmpls and not legacy:
                 raise serializers.ValidationError(
-                    {"public_reply_template": "public_reply_enabled 시 public_reply_template 필수"}
+                    {
+                        "public_reply_templates": (
+                            "public_reply_enabled=true 시 "
+                            "public_reply_templates (또는 legacy public_reply_template) 중 "
+                            "하나 이상 필수"
+                        )
+                    }
                 )
         return attrs
 
@@ -247,8 +280,13 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
             "description",
             "message_template",
             "opening_message_template",
+            # 공개 답글 (v3.5)
             "public_reply_enabled",
             "public_reply_template",
+            "public_reply_templates",
+            "public_reply_batch_size",
+            "public_reply_batch_pause_seconds",
+            # Follow-gate (deprecated)
             "follow_gate_enabled",
             "follow_gate_prompt",
             "reward_message_template",
@@ -268,6 +306,9 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
             "opening_message_template": {"required": False, "allow_blank": True},
             "public_reply_enabled": {"required": False},
             "public_reply_template": {"required": False, "allow_blank": True},
+            "public_reply_templates": {"required": False},
+            "public_reply_batch_size": {"required": False},
+            "public_reply_batch_pause_seconds": {"required": False},
             "follow_gate_enabled": {"required": False},
             "follow_gate_prompt": {"required": False, "allow_blank": True},
             "reward_message_template": {"required": False, "allow_blank": True},

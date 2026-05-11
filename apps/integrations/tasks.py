@@ -212,17 +212,10 @@ def _enqueue_send_dm(
     )
 
     # 발송할 본문 + 분류 결정
+    # v3.5: Follow-gate 는 deprecated (Meta 한계로 검증 불가). 모든 DM 은 STANDALONE.
     message_body = campaign.get_opening_message()
-    dm_kind = (
-        SentDMLog.DMKind.OPENING
-        if campaign.follow_gate_enabled
-        else SentDMLog.DMKind.STANDALONE
-    )
-    gate_status = (
-        SentDMLog.GateStatus.PENDING
-        if campaign.follow_gate_enabled
-        else SentDMLog.GateStatus.NONE
-    )
+    dm_kind = SentDMLog.DMKind.STANDALONE
+    gate_status = SentDMLog.GateStatus.NONE
 
     # 시간당 발송 제한 체크
     if not campaign.can_send_more():
@@ -367,12 +360,23 @@ def send_dm_task(self, log_id: str):
     )
 
     # public_reply_enabled 면 댓글에 공개 답글도 게시 (best-effort)
+    # v3.5: public_reply_templates(list) 또는 legacy public_reply_template 중 하나라도 있으면 OK
+    has_reply_content = bool(
+        (campaign.public_reply_templates or [])
+        or (campaign.public_reply_template or "").strip()
+    )
     if (
         campaign.public_reply_enabled
-        and campaign.public_reply_template
-        and log.dm_kind != SentDMLog.DMKind.REWARD  # reward DM 후엔 답글 안 닮
+        and has_reply_content
+        and log.dm_kind != SentDMLog.DMKind.REWARD
     ):
-        post_public_reply.delay(str(log.id))
+        # 5~15초 지터를 enqueue 시점에서 적용 (Instagram 봇 검사 회피)
+        import random as _r
+
+        post_public_reply.apply_async(
+            args=[str(log.id)],
+            countdown=_r.randint(5, 15),
+        )
 
     return {
         "status": "accepted",
@@ -838,10 +842,16 @@ def check_polling_anomalies():
 # ===== 공개 답글 + Follow-gate =====
 
 
-@shared_task(bind=True, max_retries=3)
+@shared_task(bind=True, max_retries=10)
 def post_public_reply(self, log_id: str):
     """
-    DM ACCEPTED 후 댓글에 공개 답글 게시.
+    DM ACCEPTED 후 댓글에 공개 답글 게시 (v3.5 — 봇 검사 회피).
+
+    동작:
+      1. 템플릿 목록(public_reply_templates)에서 무작위로 1개 선택 — 다양성 확보
+      2. 같은 IG 계정 기준 batch_size 만큼 최근에 게시했으면 batch_pause_seconds 만큼
+         대기 후 재시도 — 짧은 시간 안에 대량 답글 방지 (Instagram 봇 차단 회피)
+      3. 매 답글마다 5~15초 지터 적용 — 일정한 간격 패턴 회피
 
     Best-effort — 실패해도 DM 흐름엔 영향 없음.
     """
@@ -851,19 +861,56 @@ def post_public_reply(self, log_id: str):
         return {"status": "not_found"}
 
     campaign = log.campaign
-    if not campaign.public_reply_enabled or not campaign.public_reply_template:
+
+    # 활성 여부
+    if not campaign.public_reply_enabled:
         return {"status": "skipped", "reason": "public reply disabled"}
 
     # 이미 게시했으면 skip
     if log.public_reply_id:
         return {"status": "skipped", "reason": "already replied"}
 
+    # 템플릿 1개 선택 (list 우선, legacy fallback)
+    template = campaign.pick_public_reply_template()
+    if not template:
+        return {"status": "skipped", "reason": "no template content"}
+
     ig_conn = campaign.ig_connection
 
+    # ★ 배치 카운트 체크 — 같은 IG 계정에서 최근 N건 이상 게시했으면 일시 정지
+    batch_window = max(30, campaign.public_reply_batch_pause_seconds)
+    cutoff = timezone.now() - timedelta(seconds=batch_window)
+    recent_replies = SentDMLog.objects.filter(
+        campaign__ig_connection=ig_conn,
+        public_reply_posted_at__gte=cutoff,
+    ).count()
+
+    if recent_replies >= max(1, campaign.public_reply_batch_size):
+        delay = campaign.public_reply_batch_pause_seconds
+        log.append_verification_log(
+            {
+                "path": "public_reply",
+                "result": "batch_paused",
+                "recent_replies": recent_replies,
+                "batch_size": campaign.public_reply_batch_size,
+                "delay_seconds": delay,
+            }
+        )
+        try:
+            raise self.retry(countdown=delay)
+        except self.MaxRetriesExceededError:
+            log.append_verification_log(
+                {"path": "public_reply", "result": "abandoned_after_batch_pause"}
+            )
+            return {"status": "abandoned", "reason": "max retries after batch pause"}
+
+    # (지터는 enqueue 시점에 이미 적용됨 — send_dm_task 참조)
+
+    # 실제 답글 게시
     try:
         result = InstagramCommentService.post_reply(
             comment_id=log.comment_id,
-            message=campaign.public_reply_template,
+            message=template,
             access_token=ig_conn.access_token,
         )
     except Exception as e:
@@ -883,9 +930,14 @@ def post_public_reply(self, log_id: str):
     log.public_reply_posted_at = timezone.now()
     log.save(update_fields=["public_reply_id", "public_reply_posted_at"])
     log.append_verification_log(
-        {"path": "public_reply", "result": "posted", "reply_id": reply_id}
+        {
+            "path": "public_reply",
+            "result": "posted",
+            "reply_id": reply_id,
+            "template_used": template[:50],
+        }
     )
-    return {"status": "posted", "reply_id": reply_id}
+    return {"status": "posted", "reply_id": reply_id, "template": template[:50]}
 
 
 @shared_task

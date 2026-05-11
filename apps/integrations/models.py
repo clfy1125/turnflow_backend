@@ -284,18 +284,39 @@ class AutoDMCampaign(models.Model):
     public_reply_template = models.TextField(
         blank=True,
         default="",
-        verbose_name="공개 답글 템플릿",
-        help_text="public_reply_enabled=True 일 때 댓글에 게시할 답글 내용",
+        verbose_name="공개 답글 템플릿 (legacy 단일)",
+        help_text=(
+            "[deprecated] 단일 템플릿. 새 캠페인은 public_reply_templates 리스트 사용. "
+            "기존 데이터 호환을 위해 유지."
+        ),
+    )
+    public_reply_templates = models.JSONField(
+        default=list,
+        blank=True,
+        verbose_name="공개 답글 템플릿 목록",
+        help_text=(
+            "댓글마다 무작위로 1개씩 골라 답글로 게시. 봇 검사 회피를 위해 "
+            "최소 3개 이상 다양한 문구 권장. 예: ['DM 드렸어요!', '확인 부탁드려요 :)', "
+            "'안내 보내드렸습니다 🎁']"
+        ),
+    )
+    public_reply_batch_size = models.IntegerField(
+        default=10,
+        verbose_name="공개 답글 배치 크기",
+        help_text="이 개수만큼 답글 게시 후 쿨다운(public_reply_batch_pause_seconds) 적용",
+    )
+    public_reply_batch_pause_seconds = models.IntegerField(
+        default=300,
+        verbose_name="공개 답글 배치 쿨다운 (초)",
+        help_text="배치 크기 도달 시 다음 답글까지 대기 시간 (Instagram 봇 검사 회피)",
     )
 
-    # Follow-gate (DM 보내기 전 팔로우 요청)
+    # Follow-gate (deprecated — Meta API 한계로 silent verify 불가, 답글 신뢰만 가능)
+    # 코드 레벨에선 비활성화. 기존 데이터 호환을 위해 컬럼만 유지.
     follow_gate_enabled = models.BooleanField(
         default=False,
-        verbose_name="Follow-gate 사용",
-        help_text=(
-            "Opening DM에서 팔로우를 요청하고, 사용자가 gate_trigger_keywords 중 "
-            "하나로 답장하면 reward DM 자동 발송. Meta 한계로 실제 팔로우 여부는 검증 불가."
-        ),
+        verbose_name="Follow-gate 사용 (deprecated)",
+        help_text="[deprecated] Meta API 한계로 silent 검증 불가능 — 코드 무시됨.",
     )
     follow_gate_prompt = models.TextField(
         blank=True,
@@ -373,12 +394,28 @@ class AutoDMCampaign(models.Model):
     # ===== 신규 로직 헬퍼 =====
 
     def get_opening_message(self) -> str:
-        """opening DM 본문 — legacy message_template과 호환"""
-        body = self.opening_message_template or self.message_template or ""
-        if self.follow_gate_enabled and self.follow_gate_prompt:
-            sep = "\n\n" if body else ""
-            body = f"{body}{sep}{self.follow_gate_prompt}"
-        return body
+        """DM 본문 — legacy message_template과 호환.
+
+        Follow-gate prompt 첨부는 deprecated (Meta 한계로 검증 불가).
+        """
+        return self.opening_message_template or self.message_template or ""
+
+    def pick_public_reply_template(self) -> str:
+        """공개 답글 템플릿 1개 선택.
+
+        public_reply_templates 리스트에서 무작위 선택. 비어있으면 legacy
+        public_reply_template 사용.
+        """
+        import random
+
+        candidates = [
+            t.strip()
+            for t in (self.public_reply_templates or [])
+            if t and str(t).strip()
+        ]
+        if candidates:
+            return random.choice(candidates)
+        return (self.public_reply_template or "").strip()
 
     def matches_keyword(self, comment_text: str) -> bool:
         """댓글이 키워드 필터에 매칭되는지"""
