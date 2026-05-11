@@ -20,6 +20,7 @@ from .models import IGAccountConnection, AutoDMCampaign, SentDMLog, SpamFilterCo
 from .serializers import (
     IGAccountConnectionSerializer,
     ConnectionStartResponseSerializer,
+    DisconnectResponseSerializer,
     ConnectionCallbackResponseSerializer,
     AutoDMCampaignSerializer,
     AutoDMCampaignCreateSerializer,
@@ -1041,6 +1042,229 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 },
             }
         )
+
+    # ===== v3.8 — Instagram 연동 해제 =====
+
+    @extend_schema(
+        summary="Instagram 연동 해제",
+        description="""
+        ## 목적
+        사용자가 Instagram Business 계정 연동을 자발적으로 해제합니다.
+        모든 후속 자동화(캠페인/DM 발송/웹훅)를 즉시 안전하게 정지하고,
+        암호화 저장된 access_token 을 폐기합니다.
+
+        ## 사용 시나리오
+        - 설정 화면의 "Instagram 연동 끊기" 버튼 클릭
+        - 다른 IG 계정으로 재연동하기 위해 기존 연동 정리
+        - 보안 이슈로 즉시 토큰을 폐기해야 할 때
+
+        ## 동작 (4단계, 멱등성 보장)
+        1. **Webhook 구독 해제 시도** — `DELETE /v25.0/{ig_user_id}/subscribed_apps`
+           (best-effort: 토큰이 이미 무효일 수 있어 실패해도 다음 단계 진행)
+        2. **활성 캠페인 일시정지** — 이 IG 계정 소유의 `status=active` 캠페인 모두 `paused` 로 전환
+        3. **진행 중 DM 정리** — 발송 큐에 남은 SentDMLog (QUEUED/SUBMITTING/ACCEPTED/RATE_LIMITED) 를
+           SKIPPED 로 마킹. 이미 DELIVERED/READ 건은 그대로 보존
+        4. **연동 폐기** — `status=revoked` + 토큰 컬럼 빈 문자열
+
+        ## Meta 측에서 자동으로 일어나는 일
+        - Meta 는 별도 토큰 무효화 API 를 제공하지 않습니다
+        - 우리 DB 에서 토큰을 폐기하면 그 토큰은 더 이상 우리 서버에서 사용되지 않음
+        - 사용자가 Instagram 설정 → "앱 및 웹사이트" 에서 제거할 수도 있음 (그 경우 별도로 deauth callback 수신)
+
+        ## 인증
+        - Bearer JWT 필수
+        - 해당 IG 연동이 속한 workspace 의 멤버여야 함
+
+        ## 응답 (DisconnectResponseSerializer)
+        ```json
+        {
+          "success": true,
+          "ig_connection_id": "uuid",
+          "username": "myshop",
+          "status": "revoked",
+          "campaigns_paused": 3,
+          "logs_cancelled": 12,
+          "webhook_unsubscribed": true,
+          "webhook_error": null,
+          "reason": "user_requested"
+        }
+        ```
+
+        ## 멱등성
+        이미 `revoked` 상태인 연동에 다시 호출해도 안전합니다 (이미 정리된 항목 0건으로 응답).
+
+        ## 재연동
+        해제 후 다시 연결하려면 일반 OAuth 흐름을 처음부터 다시 수행:
+        `POST /api/v1/integrations/instagram/workspaces/{workspace_id}/connect/`
+        """,
+        responses={
+            200: DisconnectResponseSerializer,
+            401: OpenApiResponse(description="인증 실패"),
+            403: OpenApiResponse(description="워크스페이스 멤버 아님"),
+            404: OpenApiResponse(description="해당 IG 연동 없음"),
+        },
+        tags=["Integrations"],
+    )
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="connections/(?P<ig_connection_id>[^/.]+)/disconnect",
+    )
+    def disconnect(self, request, ig_connection_id=None):
+        """Instagram 연동 해제 (자발적)"""
+        try:
+            connection = IGAccountConnection.objects.select_related("workspace").get(
+                id=ig_connection_id
+            )
+        except IGAccountConnection.DoesNotExist:
+            return Response(
+                {
+                    "success": False,
+                    "error": {"code": 404, "message": "IG 연동을 찾을 수 없습니다."},
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if not connection.workspace.memberships.filter(user=request.user).exists():
+            return Response(
+                {
+                    "success": False,
+                    "error": {
+                        "code": 403,
+                        "message": "이 IG 연동이 속한 워크스페이스의 멤버가 아닙니다.",
+                    },
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        report = connection.disconnect(reason="user_requested")
+
+        return Response(
+            {
+                "success": True,
+                "ig_connection_id": str(connection.id),
+                "username": connection.username,
+                "status": connection.status,
+                "campaigns_paused": report["campaigns_paused"],
+                "logs_cancelled": report["logs_cancelled"],
+                "webhook_unsubscribed": report["webhook_unsubscribed"],
+                "webhook_error": report["webhook_error"],
+                "reason": "user_requested",
+            }
+        )
+
+    @extend_schema(
+        summary="Meta Deauthorize Callback (사용자가 IG 설정에서 앱 제거 시)",
+        description="""
+        ## 목적
+        Meta App Dashboard 의 **Deauthorize Callback URL** 로 등록되는 엔드포인트.
+
+        사용자가 Instagram 앱 > 설정 > 계정 센터 > 비즈니스 도구 및 컨트롤 > 비즈니스 통합
+        (또는 Facebook 설정 → 앱 및 웹사이트) 에서 우리 앱을 제거할 때
+        Meta 가 자동으로 POST 호출합니다.
+
+        ## 요청 포맷 (Meta 표준)
+        ```
+        POST /api/v1/integrations/instagram/deauthorize/
+        Content-Type: application/x-www-form-urlencoded
+
+        signed_request=<base64url_signature>.<base64url_payload>
+        ```
+
+        Payload (HMAC-SHA256 검증 후 디코딩):
+        ```json
+        {
+          "algorithm": "HMAC-SHA256",
+          "issued_at": 1715404800,
+          "user_id":   "17841466999619187"
+        }
+        ```
+
+        ## 동작
+        1. `signed_request` 를 app_secret 으로 HMAC-SHA256 검증
+        2. 실패 시 400 + 빈 응답 (보안: 어떤 페이로드가 잘못됐는지 안 알림)
+        3. payload.user_id 와 일치하는 `IGAccountConnection.external_account_id` 조회
+        4. 매칭되는 연동 모두에 대해 `disconnect(reason="meta_deauth")` 실행
+        5. 200 OK 반환 (Meta 는 200 만 받으면 OK)
+
+        ## 인증
+        - **AllowAny** — Meta 가 호출하므로 JWT 없음
+        - 진짜 Meta 인지는 `signed_request` HMAC 으로 검증
+
+        ## 설정 방법 (Meta App Dashboard)
+        1. App Dashboard → Settings → Basic
+        2. "Deauthorize Callback URL" 에 다음 URL 등록:
+           `https://<your-domain>/api/v1/integrations/instagram/deauthorize/`
+        3. 저장 후 활성화
+
+        ## 응답
+        - 200 OK + `{"success": true, "disconnected": N}` (정상)
+        - 400 + `{"error": "invalid signed_request"}` (서명 검증 실패)
+        - Meta 는 200 만 받으면 OK 로 간주
+        """,
+        request={
+            "application/x-www-form-urlencoded": {
+                "type": "object",
+                "properties": {
+                    "signed_request": {
+                        "type": "string",
+                        "description": "<base64url_signature>.<base64url_payload>",
+                    },
+                },
+                "required": ["signed_request"],
+            }
+        },
+        responses={
+            200: OpenApiResponse(description="해제 처리 완료"),
+            400: OpenApiResponse(description="signed_request 검증 실패"),
+        },
+        tags=["Integrations"],
+    )
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="deauthorize",
+        permission_classes=[AllowAny],
+        authentication_classes=[],
+    )
+    def deauthorize(self, request):
+        """Meta Deauthorize Callback — 사용자가 IG 설정에서 앱 제거 시 호출됨"""
+        from .services import InstagramOAuthService
+
+        signed_request = request.data.get("signed_request") or request.POST.get(
+            "signed_request"
+        )
+        if not signed_request:
+            return Response(
+                {"error": "missing signed_request"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        payload = InstagramOAuthService.parse_signed_request(signed_request)
+        if not payload:
+            return Response(
+                {"error": "invalid signed_request"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user_id = str(payload.get("user_id") or "")
+        if not user_id:
+            return Response(
+                {"error": "user_id missing in payload"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 해당 IG user ID 로 연동된 모든 connection (보통 1개) 해제
+        connections = IGAccountConnection.objects.filter(
+            external_account_id=user_id,
+            status=IGAccountConnection.Status.ACTIVE,
+        )
+        disconnected = 0
+        for conn in connections:
+            conn.disconnect(reason="meta_deauth")
+            disconnected += 1
+
+        return Response({"success": True, "disconnected": disconnected})
 
     @extend_schema(
         summary="[개발용] Instagram 게시물 상세 조회",

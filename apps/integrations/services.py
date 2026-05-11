@@ -167,6 +167,99 @@ class InstagramOAuthService:
         response.raise_for_status()
         return response.json()
 
+    @classmethod
+    def unsubscribe_webhooks(cls, ig_user_id: str, access_token: str) -> Dict:
+        """
+        Disable webhook subscriptions for an Instagram professional account.
+
+        Called when user disconnects their account from our app.
+        DELETE https://graph.instagram.com/v25.0/{ig_user_id}/subscribed_apps
+          ?access_token=...
+
+        Returns:
+            API response, typically {"success": true}
+
+        Raises:
+            requests.HTTPError on non-2xx (호출자가 best-effort 처리)
+        """
+        url = f"{cls.GRAPH_API_BASE}/{ig_user_id}/subscribed_apps"
+        params = {"access_token": access_token}
+
+        response = requests.delete(url, params=params, timeout=10)
+        response.raise_for_status()
+        try:
+            return response.json()
+        except ValueError:
+            return {"success": True}
+
+    @classmethod
+    def parse_signed_request(cls, signed_request: str) -> Optional[Dict]:
+        """
+        Meta Deauthorize Callback 의 signed_request 파싱.
+
+        포맷: <signature_base64url>.<payload_base64url>
+        - HMAC-SHA256(app_secret, payload) == signature 검증
+        - payload 는 base64url 디코딩 후 JSON
+
+        Meta가 사용자가 Instagram 설정에서 우리 앱을 제거할 때 POST 호출:
+            Content-Type: application/x-www-form-urlencoded
+            Body: signed_request=<value>
+
+        Returns:
+            검증 통과 시 페이로드 dict (user_id 포함). 실패 시 None.
+
+        Ref: https://developers.facebook.com/docs/games/gamesonfacebook/login#parsingsr
+        """
+        import base64
+        import hashlib
+        import hmac
+        import json as _json
+
+        if not signed_request or "." not in signed_request:
+            return None
+
+        try:
+            encoded_sig, payload = signed_request.split(".", 1)
+        except ValueError:
+            return None
+
+        app_secret = cls.get_instagram_app_secret()
+        if not app_secret:
+            return None
+
+        # base64url decode (Meta 는 padding 생략)
+        def _b64url_decode(data: str) -> bytes:
+            data = data.replace("-", "+").replace("_", "/")
+            data += "=" * ((4 - len(data) % 4) % 4)
+            return base64.b64decode(data)
+
+        try:
+            sig = _b64url_decode(encoded_sig)
+            payload_bytes = _b64url_decode(payload)
+        except Exception:
+            return None
+
+        # HMAC 검증 — payload 의 base64url 문자열 자체에 HMAC
+        expected_sig = hmac.new(
+            app_secret.encode("utf-8"),
+            payload.encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+
+        if not hmac.compare_digest(sig, expected_sig):
+            return None
+
+        try:
+            data = _json.loads(payload_bytes.decode("utf-8"))
+        except Exception:
+            return None
+
+        # algorithm 필드 검증
+        if data.get("algorithm") != "HMAC-SHA256":
+            return None
+
+        return data
+
 
 class MockInstagramProvider:
     """

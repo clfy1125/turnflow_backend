@@ -124,6 +124,95 @@ class IGAccountConnection(models.Model):
         self.error_message = error_message
         self.save(update_fields=["status", "error_message", "updated_at"])
 
+    def disconnect(self, reason: str = "user_requested") -> dict:
+        """
+        IG 계정 연동 해제 — 모든 후속 자동화를 안전하게 정지하고 토큰 폐기.
+
+        호출 시점:
+            - 사용자 자발적 연동 해제 (POST /instagram/{id}/disconnect/)
+            - Meta Deauthorize Callback 수신 (사용자가 IG 설정에서 앱 제거)
+            - 토큰 만료/회수 감지 시 운영자 결정
+
+        수행 작업:
+            1. webhook 구독 해제 시도 (best-effort, 실패해도 진행)
+            2. 이 계정 소유의 활성 캠페인 모두 PAUSED 로 전환
+            3. ACCEPTED/QUEUED/SUBMITTING 상태의 in-flight SentDMLog 를 SKIPPED 로 정리
+            4. status = REVOKED + 토큰 폐기
+
+        Returns:
+            {
+                "campaigns_paused": int,
+                "logs_cancelled":   int,
+                "webhook_unsubscribed": bool,
+                "webhook_error": str | None,
+            }
+        """
+        # 순환 import 방지를 위해 함수 내부 import
+        from .services import InstagramOAuthService
+
+        report = {
+            "campaigns_paused": 0,
+            "logs_cancelled": 0,
+            "webhook_unsubscribed": False,
+            "webhook_error": None,
+        }
+
+        # 1) Webhook 구독 해제 (best-effort)
+        if self.external_account_id and self.status == self.Status.ACTIVE:
+            try:
+                InstagramOAuthService.unsubscribe_webhooks(
+                    ig_user_id=self.external_account_id,
+                    access_token=self.access_token,
+                )
+                report["webhook_unsubscribed"] = True
+            except Exception as e:
+                # 실패해도 disconnect 흐름은 계속 — 토큰이 이미 무효일 수도 있음
+                report["webhook_error"] = str(e)
+
+        # 2) 활성 캠페인 PAUSED 전환
+        from .models import AutoDMCampaign, SentDMLog  # 로컬 import (circular 방지)
+
+        paused = AutoDMCampaign.objects.filter(
+            ig_connection=self,
+            status=AutoDMCampaign.Status.ACTIVE,
+        ).update(
+            status=AutoDMCampaign.Status.PAUSED,
+            updated_at=timezone.now(),
+        )
+        report["campaigns_paused"] = paused
+
+        # 3) in-flight SentDMLog 정리 (이미 발송된 DELIVERED/READ 는 건드리지 않음)
+        in_flight_statuses = (
+            SentDMLog.Status.QUEUED,
+            SentDMLog.Status.SUBMITTING,
+            SentDMLog.Status.ACCEPTED,
+            SentDMLog.Status.RATE_LIMITED,
+        )
+        cancelled = SentDMLog.objects.filter(
+            campaign__ig_connection=self,
+            status__in=in_flight_statuses,
+        ).update(
+            status=SentDMLog.Status.SKIPPED,
+            error_message=f"IG connection disconnected ({reason})",
+        )
+        report["logs_cancelled"] = cancelled
+
+        # 4) status REVOKED + 토큰 폐기
+        self.status = self.Status.REVOKED
+        self.error_message = f"Disconnected: {reason}"
+        # 암호화된 토큰 컬럼을 빈 문자열로 — descriptor 가 자동 처리
+        self.access_token = ""
+        self.save(
+            update_fields=[
+                "status",
+                "error_message",
+                "_encrypted_access_token",
+                "updated_at",
+            ]
+        )
+
+        return report
+
     @classmethod
     def get_active_connection(cls, workspace):
         """Get active connection for workspace"""

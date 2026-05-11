@@ -59,6 +59,27 @@ class ConnectionStartResponseSerializer(serializers.Serializer):
     mode = serializers.CharField()
 
 
+class DisconnectResponseSerializer(serializers.Serializer):
+    """Instagram 연동 해제 응답 (v3.8)"""
+
+    success = serializers.BooleanField(help_text="요청 처리 성공 여부")
+    ig_connection_id = serializers.UUIDField(help_text="해제된 IG 연동 ID")
+    username = serializers.CharField(help_text="해제된 IG 계정 username")
+    status = serializers.CharField(help_text="처리 후 status (revoked)")
+    campaigns_paused = serializers.IntegerField(help_text="일시정지된 활성 캠페인 수")
+    logs_cancelled = serializers.IntegerField(
+        help_text="진행 중이던(in-flight) DM 로그 중 SKIPPED 처리된 수"
+    )
+    webhook_unsubscribed = serializers.BooleanField(
+        help_text="Meta webhook 구독 해제 성공 여부 (best-effort)"
+    )
+    webhook_error = serializers.CharField(
+        allow_null=True, allow_blank=True,
+        help_text="webhook 해제 실패 시 에러 메시지 (실패해도 disconnect 는 진행됨)"
+    )
+    reason = serializers.CharField(help_text="해제 이유 (user_requested / meta_deauth / token_expired 등)")
+
+
 class ConnectionCallbackResponseSerializer(serializers.Serializer):
     """Response for connection callback endpoint"""
 
