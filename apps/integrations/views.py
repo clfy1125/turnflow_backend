@@ -931,6 +931,118 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
             )
 
     @extend_schema(
+        summary="Instagram 현재 활성 Story 목록",
+        description="""
+        ## 목적
+        연동된 Instagram Business 계정의 **현재 활성 Story** 목록을 조회합니다.
+        24시간 이내의 Story 만 반환됩니다 (Meta 정책).
+
+        ## 사용 시나리오
+        - Story 답장 기반 캠페인 (`trigger_type=story_reply`) 생성 시 대상 Story 선택
+        - "현재 올라간 Story" 에 대한 자동화 룰 설정
+
+        ## 인증
+        Bearer JWT 필수 + 해당 workspace 멤버십 필요.
+
+        ## 응답 항목
+        - `id`: Story 고유 ID (캠페인의 `media_id` 로 사용)
+        - `media_type`: IMAGE | VIDEO
+        - `media_url`: 미디어 직접 URL (만료될 수 있음)
+        - `media_product_type`: 항상 "STORY"
+        - `permalink`: 사용자가 클릭해 볼 수 있는 영구 링크
+        - `timestamp`: 게시 시각 (ISO8601)
+        - `caption`: 캡션 텍스트 (있는 경우)
+        - `thumbnail_url`: 썸네일 (VIDEO 인 경우)
+
+        ## 제약
+        - Story 는 24시간 후 자동 삭제 → API 응답에서 사라짐
+        - 캠페인 생성 시 선택한 Story 가 만료되면 그 캠페인은 더 이상 트리거 안 됨
+        """,
+        parameters=[
+            OpenApiParameter(
+                name="workspace_id",
+                location=OpenApiParameter.PATH,
+                description="조회할 워크스페이스의 UUID",
+                required=True,
+                type=str,
+            ),
+        ],
+        responses={
+            200: OpenApiResponse(description="활성 Story 목록"),
+            401: OpenApiResponse(description="인증 실패"),
+            403: OpenApiResponse(description="워크스페이스 멤버 아님"),
+            404: OpenApiResponse(description="활성 IG 계정 없음"),
+            500: OpenApiResponse(description="Instagram API 호출 실패"),
+        },
+        tags=["Integrations"],
+    )
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="workspaces/(?P<workspace_id>[^/.]+)/stories",
+    )
+    def get_stories(self, request, workspace_id=None):
+        """현재 활성 Story 목록 조회"""
+        from .services import InstagramMediaService
+
+        workspace = self.get_workspace(workspace_id)
+
+        connection = IGAccountConnection.objects.filter(
+            workspace=workspace, status="active"
+        ).first()
+
+        if not connection:
+            return Response(
+                {
+                    "success": False,
+                    "error": {
+                        "code": 404,
+                        "message": "연결된 Instagram 계정이 없습니다.",
+                    },
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        try:
+            stories = InstagramMediaService.list_stories(
+                ig_user_id=connection.external_account_id,
+                access_token=connection.access_token,
+            )
+        except requests.exceptions.HTTPError as e:
+            err_body = e.response.json() if e.response is not None else {}
+            return Response(
+                {
+                    "success": False,
+                    "error": {
+                        "code": e.response.status_code if e.response is not None else 500,
+                        "message": "Instagram API 호출 실패",
+                        "details": err_body,
+                    },
+                },
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        except Exception as e:
+            return Response(
+                {
+                    "success": False,
+                    "error": {"code": 500, "message": str(e)},
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        return Response(
+            {
+                "count": len(stories),
+                "data": stories,
+                "connection": {
+                    "id": str(connection.id),
+                    "username": connection.username,
+                    "account_id": connection.external_account_id,
+                },
+            }
+        )
+
+    @extend_schema(
         summary="[개발용] Instagram 게시물 상세 조회",
         description="""
         ## 목적 (개발 전용)
@@ -1533,11 +1645,34 @@ def _process_messaging_events(entry: dict, logger) -> None:
             )
         else:
             # 사용자 → 우리 (inbound) 메시지.
-            # v3.5: Follow-gate deprecated (Meta 한계로 silent 검증 불가) → 로깅만.
-            # 향후 inbound conversation 기능 추가 시 여기서 라우팅.
-            logger.debug(
-                f"Inbound DM received (no handler): sender={sender_id}, mid={mid}"
-            )
+            # v3.7: Story 답장이면 process_story_reply_and_send_dm 로 라우팅.
+            #       그 외 (일반 inbound DM) 은 로깅만.
+            reply_to = message.get("reply_to") or {}
+            story_ref = reply_to.get("story") or {}
+            story_id = str(story_ref.get("id") or "")
+
+            if story_id:
+                from .tasks import process_story_reply_and_send_dm
+
+                process_story_reply_and_send_dm.delay(
+                    {
+                        "page_ig_user_id": page_ig_user_id,
+                        "sender_user_id":  sender_id,
+                        "sender_username": "",  # messages webhook 엔 username 없음
+                        "story_id":        story_id,
+                        "message_mid":     mid or "",
+                        "message_text":    message.get("text", "") or "",
+                        "entry_time":      ev.get("timestamp"),
+                    }
+                )
+                logger.debug(
+                    f"Story reply queued: sender={sender_id}, "
+                    f"story={story_id}, mid={mid}"
+                )
+            else:
+                logger.debug(
+                    f"Inbound DM received (no handler): sender={sender_id}, mid={mid}"
+                )
 
 
 def _mark_log_delivered_by_echo(

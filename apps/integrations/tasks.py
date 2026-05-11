@@ -182,6 +182,182 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
         raise
 
 
+@shared_task(
+    bind=True,
+    autoretry_for=(Exception,),
+    retry_kwargs={"max_retries": 3, "countdown": 60},
+    retry_backoff=True,
+)
+def process_story_reply_and_send_dm(self, payload: dict):
+    """
+    Story 답장 이벤트 처리 (v3.7).
+
+    Story 답장은 댓글이 아니라 messages webhook 으로 옴. payload 구조:
+        {
+            "page_ig_user_id": "...",   # 우리 비즈니스 IG ID
+            "sender_user_id":  "...",   # 답장 보낸 사용자 IGSID
+            "sender_username": "...",   # (선택)
+            "story_id":        "...",   # 답장 대상 Story ID
+            "message_mid":     "...",   # 메시지 ID (idempotency 용)
+            "message_text":    "...",   # 답장 본문
+            "entry_time":      <int>,   # webhook timestamp
+        }
+
+    매칭 룰: trigger_type=STORY_REPLY 이고 media_id=story_id 인 활성 캠페인.
+    keyword_filter 도 동일하게 평가.
+    """
+    page_ig_user_id = str(payload.get("page_ig_user_id") or "")
+    sender_user_id  = str(payload.get("sender_user_id") or "")
+    sender_username = str(payload.get("sender_username") or "")
+    story_id        = str(payload.get("story_id") or "")
+    message_mid     = str(payload.get("message_mid") or "")
+    message_text    = payload.get("message_text") or ""
+
+    if not (page_ig_user_id and sender_user_id and story_id and message_mid):
+        return {"status": "skipped", "reason": "missing required fields"}
+
+    # ★ Self-message 가드: 자기 자신의 메시지 무시
+    if sender_user_id == page_ig_user_id:
+        return {"status": "skipped", "reason": "self_story_reply"}
+
+    candidate_qs = (
+        AutoDMCampaign.objects
+        .filter(
+            status=AutoDMCampaign.Status.ACTIVE,
+            trigger_type=AutoDMCampaign.TriggerType.STORY_REPLY,
+            ig_connection__external_account_id=page_ig_user_id,
+        )
+        .select_related("ig_connection", "ig_connection__workspace")
+    )
+
+    matched_campaigns = []
+    for c in candidate_qs:
+        if c.matches_story(story_id) and c.matches_keyword(message_text):
+            matched_campaigns.append(c)
+
+    if not matched_campaigns:
+        return {"status": "skipped", "reason": "no story_reply campaign matched"}
+
+    results = []
+    for campaign in matched_campaigns:
+        results.append(
+            _enqueue_send_dm_for_story_reply(
+                campaign=campaign,
+                story_id=story_id,
+                message_mid=message_mid,
+                message_text=message_text,
+                sender_user_id=sender_user_id,
+                sender_username=sender_username,
+                payload=payload,
+            )
+        )
+
+    return {"status": "queued", "results": results}
+
+
+def _enqueue_send_dm_for_story_reply(
+    *,
+    campaign: AutoDMCampaign,
+    story_id: str,
+    message_mid: str,
+    message_text: str,
+    sender_user_id: str,
+    sender_username: str,
+    payload: dict,
+) -> dict:
+    """
+    Story 답장 매칭 후 SentDMLog INSERT + send_dm_task 큐 등록.
+
+    idempotency_key = sha256(workspace : ig_user : message_mid : campaign)
+        → 같은 답장(같은 mid) 에 대해 동일 캠페인 중복 발송 차단.
+    """
+    ig_conn = campaign.ig_connection
+
+    # Self-DM 가드
+    if str(sender_user_id) == str(ig_conn.external_account_id):
+        return {
+            "campaign_id": str(campaign.id),
+            "status": "skipped",
+            "reason": "self_story_reply",
+        }
+
+    # 수신자 60초 쿨다운 (동일 사용자가 연속 답장하는 케이스 방어)
+    cooldown_cutoff = timezone.now() - timedelta(seconds=60)
+    recent = SentDMLog.objects.filter(
+        campaign=campaign,
+        recipient_user_id=sender_user_id,
+        created_at__gte=cooldown_cutoff,
+    ).exists()
+    if recent:
+        return {
+            "campaign_id": str(campaign.id),
+            "status": "skipped",
+            "reason": "recipient_cooldown_60s",
+        }
+
+    idempotency_key = InstagramMessagingService.build_idempotency_key(
+        workspace_id=ig_conn.workspace_id,
+        ig_user_id=ig_conn.external_account_id,
+        comment_id=message_mid,  # story 답장은 message_mid 를 trigger ID 로 사용
+        campaign_id=campaign.id,
+    )
+
+    if not campaign.can_send_more():
+        try:
+            SentDMLog.objects.create(
+                campaign=campaign,
+                comment_id="",  # story 답장은 comment_id 없음
+                comment_text=message_text,
+                recipient_user_id=sender_user_id,
+                recipient_username=sender_username,
+                message_sent=campaign.get_opening_message(),
+                status=SentDMLog.Status.SKIPPED,
+                error_message="Hourly send limit reached",
+                idempotency_key=idempotency_key,
+                webhook_payload=payload,
+                dm_kind=SentDMLog.DMKind.STANDALONE,
+                gate_status=SentDMLog.GateStatus.NONE,
+            )
+        except IntegrityError:
+            pass
+        return {
+            "campaign_id": str(campaign.id),
+            "status": "skipped",
+            "reason": "Hourly limit reached",
+        }
+
+    try:
+        with transaction.atomic():
+            log = SentDMLog.objects.create(
+                campaign=campaign,
+                comment_id="",  # ★ Story 답장은 comment_id 없음 (send_dm_task 가 user_id 분기 판단)
+                comment_text=message_text,
+                recipient_user_id=sender_user_id,
+                recipient_username=sender_username,
+                message_sent=campaign.get_opening_message(),
+                status=SentDMLog.Status.QUEUED,
+                idempotency_key=idempotency_key,
+                webhook_payload=payload,
+                dm_kind=SentDMLog.DMKind.STANDALONE,
+                gate_status=SentDMLog.GateStatus.NONE,
+            )
+    except IntegrityError:
+        existing = SentDMLog.objects.filter(idempotency_key=idempotency_key).first()
+        return {
+            "campaign_id": str(campaign.id),
+            "status": "duplicate",
+            "log_id": str(existing.id) if existing else None,
+        }
+
+    send_dm_task.delay(str(log.id))
+    return {
+        "campaign_id": str(campaign.id),
+        "status": "enqueued",
+        "log_id": str(log.id),
+        "trigger": "story_reply",
+    }
+
+
 def _maybe_attach_next_media_from_webhook(
     *,
     unattached_campaigns: list,
@@ -433,12 +609,22 @@ def send_dm_task(self, log_id: str):
     log.mark_submitting()
 
     try:
-        result = InstagramMessagingService.send_dm_via_comment(
-            ig_user_id=ig_conn.external_account_id,
-            comment_id=log.comment_id,
-            message_text=log.message_sent,
-            access_token=ig_conn.access_token,
-        )
+        # ★ Story 답장 캠페인 (comment_id 없음) → user_id 기반 DM (24h 윈도우)
+        # 그 외 (comment 트리거) → Private Reply via comment_id
+        if log.comment_id:
+            result = InstagramMessagingService.send_dm_via_comment(
+                ig_user_id=ig_conn.external_account_id,
+                comment_id=log.comment_id,
+                message_text=log.message_sent,
+                access_token=ig_conn.access_token,
+            )
+        else:
+            result = InstagramMessagingService.send_dm_via_user_id(
+                ig_user_id=ig_conn.external_account_id,
+                recipient_id=log.recipient_user_id,
+                message_text=log.message_sent,
+                access_token=ig_conn.access_token,
+            )
     except DMSendError as e:
         cls = exception_to_classification(e)
         log.retry_count += 1
@@ -482,6 +668,7 @@ def send_dm_task(self, log_id: str):
 
     # public_reply_enabled 면 댓글에 공개 답글도 게시 (best-effort)
     # v3.5: public_reply_templates(list) 또는 legacy public_reply_template 중 하나라도 있으면 OK
+    # v3.7: Story 답장 캠페인 (comment_id 없음) 은 공개 답글 불가능 → skip
     has_reply_content = bool(
         (campaign.public_reply_templates or [])
         or (campaign.public_reply_template or "").strip()
@@ -489,6 +676,7 @@ def send_dm_task(self, log_id: str):
     if (
         campaign.public_reply_enabled
         and has_reply_content
+        and log.comment_id  # Story 답장은 comment_id 없음 → 공개 답글 skip
         and log.dm_kind != SentDMLog.DMKind.REWARD
     ):
         # 5~15초 지터를 enqueue 시점에서 적용 (Instagram 봇 검사 회피)

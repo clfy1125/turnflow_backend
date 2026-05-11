@@ -674,6 +674,37 @@ class InstagramMediaService:
         return body.get("data", []) or []
 
     @classmethod
+    def list_stories(
+        cls,
+        ig_user_id: str,
+        access_token: str,
+        fields: str = (
+            "id,media_type,media_url,media_product_type,"
+            "permalink,timestamp,caption,thumbnail_url"
+        ),
+    ) -> list:
+        """
+        현재 활성 Story 목록 조회 (v3.7).
+
+        GET /v25.0/{ig_user_id}/stories
+
+        Meta 정책: Story는 24시간 동안만 active 상태이며, 만료 후엔
+        이 엔드포인트에서 사라짐.
+
+        Returns:
+            [{"id": "...", "media_type": "IMAGE|VIDEO", "permalink": "...", ...}, ...]
+
+        Raises:
+            requests.HTTPError on non-2xx
+        """
+        url = f"{cls.GRAPH_API_BASE}/{ig_user_id}/stories"
+        params = {"fields": fields, "access_token": access_token}
+        resp = requests.get(url, params=params, timeout=cls.DEFAULT_TIMEOUT)
+        resp.raise_for_status()
+        body = resp.json() or {}
+        return body.get("data", []) or []
+
+    @classmethod
     def get_media_timestamp(
         cls, media_id: str, access_token: str
     ) -> "datetime | None":

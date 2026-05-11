@@ -189,6 +189,7 @@ class AutoDMCampaign(models.Model):
         SPECIFIC_MEDIA = "specific_media", "특정 게시물"
         ANY_MEDIA = "any_media", "모든 게시물"
         NEXT_MEDIA = "next_media", "다음 게시물"
+        STORY_REPLY = "story_reply", "특정 스토리 답장"
 
     class KeywordMode(models.TextChoices):
         ANY = "any", "키워드 중 하나라도 포함"
@@ -434,11 +435,28 @@ class AutoDMCampaign(models.Model):
         return any(k in text_lower for k in keywords_lower)
 
     def matches_media(self, media_id: str) -> bool:
-        """이 캠페인이 해당 media_id 트리거에 매칭되는지"""
+        """
+        이 캠페인이 해당 media_id 트리거(=댓글 webhook)에 매칭되는지.
+
+        STORY_REPLY 캠페인은 댓글 webhook 으로 발화되지 않으므로 항상 False.
+        Story 매칭은 matches_story() 사용.
+        """
+        if self.trigger_type == self.TriggerType.STORY_REPLY:
+            return False
         if self.trigger_type == self.TriggerType.ANY_MEDIA:
             return True
         # specific_media (또는 attach 된 next_media) — media_id 일치 필요
         return bool(self.media_id) and self.media_id == media_id
+
+    def matches_story(self, story_id: str) -> bool:
+        """
+        이 캠페인이 messages webhook 의 reply_to.story.id 에 매칭되는지.
+
+        STORY_REPLY 트리거에서만 True. media_id 에 Story ID 가 저장돼 있어야 함.
+        """
+        if self.trigger_type != self.TriggerType.STORY_REPLY:
+            return False
+        return bool(self.media_id) and self.media_id == story_id
 
     def matches_gate_keyword(self, message_text: str) -> bool:
         """답장 텍스트가 gate 통과 키워드와 매칭되는지"""

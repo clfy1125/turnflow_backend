@@ -36,19 +36,35 @@ TRIGGER_TYPE_GUIDE: List[Dict] = [
         "label": "다음(새) 게시물에 댓글",
         "description": (
             "캠페인 활성화 후 새로 올리는 게시물 1개에 자동으로 적용됩니다. "
-            "한 번 적용된 후에는 'specific_media' 로 자동 전환되며, 그 이후 "
-            "올리는 게시물에는 적용되지 않습니다. 다음 게시물에도 적용하려면 "
-            "새 캠페인을 만들어주세요."
+            "첫 댓글이 도착하는 순간 즉시 attach 되며, 이후엔 'specific_media' "
+            "로 자동 전환됩니다. 다음 게시물에도 적용하려면 새 캠페인을 만들어주세요."
         ),
         "requires": [],
         "tier": "pro",
         "notes": [
-            "최대 5분 정도 지연 후 새 게시물이 인식됩니다.",
-            "캠페인을 만든 시점 이후의 새 게시물부터 적용됩니다 (과거 게시물은 무시).",
+            "v3.6 부터: 첫 댓글 도착 즉시 attach (이전 5분 지연 제거).",
+            "캠페인 생성 이후 작성된 게시물만 적용 (과거 게시물의 첫 댓글은 무시).",
             (
                 "동일 IG 계정에 next 캠페인이 여러 개 있으면 "
                 "모두 같은 신규 게시물에 한 번에 적용됩니다."
             ),
+        ],
+    },
+    {
+        "value": "story_reply",
+        "label": "특정 Story 답장",
+        "description": (
+            "선택한 Story 에 사용자가 메시지(답장)를 보내면 자동 DM을 발송합니다. "
+            "Story 는 24시간만 활성 상태이므로 캠페인은 그 동안만 트리거됩니다."
+        ),
+        "requires": ["media_id"],
+        "tier": "pro",
+        "notes": [
+            "GET /instagram/workspaces/{id}/stories/ 로 현재 활성 Story 목록 조회.",
+            "Story 는 댓글이 아닌 'DM 답장' 으로 받습니다 (messages webhook).",
+            "공개 답글(public_reply) 은 사용 불가합니다 (Story 에 댓글 기능 없음).",
+            "24시간 후 Story 만료되면 더 이상 트리거되지 않습니다.",
+            "발송은 24h 메시징 윈도우 안에서만 가능 (사용자가 답장한 직후).",
         ],
     },
 ]
@@ -118,7 +134,7 @@ PUBLIC_REPLY_GUIDE: Dict = {
 def build_campaign_guide() -> Dict:
     """프론트가 한 번에 받아 갈 수 있는 통합 가이드."""
     return {
-        "version": "v3.5",
+        "version": "v3.7",
         "trigger_types": TRIGGER_TYPE_GUIDE,
         "keyword_modes": KEYWORD_MODE_GUIDE,
         "follow_gate": FOLLOW_GATE_GUIDE,

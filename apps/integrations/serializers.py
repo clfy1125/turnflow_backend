@@ -237,6 +237,19 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
             raise serializers.ValidationError(
                 {"media_id": "trigger_type=specific_media 일 때 media_id 는 필수입니다."}
             )
+        # v3.7: STORY_REPLY 트리거는 media_id 에 Story ID 가 필수
+        if trigger == AutoDMCampaign.TriggerType.STORY_REPLY and not media_id:
+            raise serializers.ValidationError(
+                {"media_id": "trigger_type=story_reply 일 때 media_id 에 대상 Story ID 가 필수입니다."}
+            )
+        # Story 답장 캠페인은 공개 답글 불가능 (Story 에는 댓글 자체가 없음)
+        if (
+            trigger == AutoDMCampaign.TriggerType.STORY_REPLY
+            and attrs.get("public_reply_enabled")
+        ):
+            raise serializers.ValidationError(
+                {"public_reply_enabled": "Story 답장 캠페인은 공개 답글을 사용할 수 없습니다 (Story 에 댓글 기능이 없음)."}
+            )
         opening = (attrs.get("opening_message_template") or "").strip()
         legacy_msg = (attrs.get("message_template") or "").strip()
         if not opening and not legacy_msg:
