@@ -1,22 +1,54 @@
 """
 Billing Celery tasks — 구독 결제 관련 배치 작업.
 
-1. check_missed_payments   — 매일 02:00, past_due 구독의 미수금 확인
-2. handle_grace_period_expiry — 매일 03:00, 유예 기간 만료 구독 다운그레이드
-3. handle_cancelled_expiry — 매일 03:30, 취소(일시정지) 구독 기간 만료 다운그레이드
-4. handle_trial_expiry     — 매일 04:00, 레퍼럴 트라이얼 만료 구독 다운그레이드
-5. notify_expiring_subscriptions — 매일 09:00, 만료 임박 구독 안내
+스케줄(시간 단위로 자주 돌려, 단일 실행 누락/지연 위험을 줄임):
+1. check_missed_payments        — 매시간, current_period_end 지난 active → past_due 전환
+2. handle_grace_period_expiry   — 매시간, 유예 기간(GRACE_PERIOD_DAYS) 만료 구독 다운그레이드
+3. handle_cancelled_expiry      — 매시간, 취소(일시정지) 구독 기간 만료 다운그레이드
+4. handle_trial_expiry          — 매시간, 레퍼럴 트라이얼 만료 구독 다운그레이드
+
+안정성 원칙:
+- 개별 구독 처리를 try/except + transaction.atomic 으로 격리해 한 건 실패가 배치 전체를 막지 않도록 한다.
+- PayApp rebillCancel 호출이 실패하면 다운그레이드를 **보류** 하고 `payapp_rebill_no` 를 유지한다.
+  다음 배치 차수에서 같은 구독을 다시 시도해 PayApp 잔존 정기결제를 만들지 않는다.
+- 실패 건수가 0보다 크면 ERROR 로그를 남겨 모니터링/알림에 노출되게 한다.
 """
 
 import logging
 from datetime import timedelta
 
 from celery import shared_task
+from django.db import transaction
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 
 GRACE_PERIOD_DAYS = 7
+
+
+def _safe_payapp_cancel(rebill_no: str, reason: str) -> bool:
+    """
+    PayApp 정기결제 완전 해지(rebillCancel) 시도.
+    성공 시 True, 실패 시 False 리턴. 실패하면 호출 측은 다운그레이드를 **보류** 해야 한다.
+    """
+    from .payapp_service import PayAppClient, PayAppError
+
+    try:
+        PayAppClient.cancel_rebill(rebill_no)
+        return True
+    except PayAppError as e:
+        logger.warning(
+            "%s: PayApp rebillCancel 실패 rebill_no=%s errno=%s msg=%s",
+            reason, rebill_no, getattr(e, "errno", ""), e,
+        )
+        return False
+
+
+def _log_summary(task_name: str, processed: int, failed: int) -> None:
+    if not processed and not failed:
+        return
+    log = logger.error if failed else logger.info
+    log("%s: processed=%d failed=%d", task_name, processed, failed)
 
 
 @shared_task(name="billing.check_missed_payments")
@@ -26,11 +58,10 @@ def check_missed_payments():
     current_period_end가 지난 active 구독을 past_due로 전환.
     (PayApp failurl이 호출되지 않는 edge case 대비)
     """
-    from .models import UserSubscription, SubscriptionStatus
+    from .models import SubscriptionStatus, UserSubscription
 
     now = timezone.now()
 
-    # current_period_end가 지났는데 여전히 active인 유료 구독
     overdue = UserSubscription.objects.filter(
         status=SubscriptionStatus.ACTIVE,
         current_period_end__lt=now,
@@ -48,37 +79,40 @@ def handle_grace_period_expiry():
     """
     past_due 상태가 GRACE_PERIOD_DAYS일 이상 경과한 구독을 무료로 다운그레이드.
     """
-    from .models import UserSubscription, SubscriptionStatus
+    from .models import SubscriptionStatus, UserSubscription
     from .subscription_utils import get_free_plan
-    from .payapp_service import PayAppClient, PayAppError
 
     cutoff = timezone.now() - timedelta(days=GRACE_PERIOD_DAYS)
     free_plan = get_free_plan()
     if not free_plan:
         logger.error("handle_grace_period_expiry: free 플랜이 존재하지 않음")
-        return 0
+        return {"processed": 0, "failed": 0}
 
     expired_subs = UserSubscription.objects.filter(
         status=SubscriptionStatus.PAST_DUE,
         current_period_end__lt=cutoff,
     )
 
-    count = 0
-    for sub in expired_subs:
-        # PayApp 정기결제 해지 (완전 해지)
-        if sub.payapp_rebill_no:
-            try:
-                PayAppClient.cancel_rebill(sub.payapp_rebill_no)
-            except PayAppError:
-                logger.warning(
-                    "grace_period: PayApp 정기결제 해지 실패 rebill_no=%s",
-                    sub.payapp_rebill_no,
-                )
+    processed, failed = 0, 0
+    for sub in expired_subs.iterator():
+        try:
+            if sub.payapp_rebill_no and not _safe_payapp_cancel(
+                sub.payapp_rebill_no, "grace_period"
+            ):
+                failed += 1
+                continue
 
-        _downgrade_to_free(sub, free_plan, reason="grace_period")
-        count += 1
+            with transaction.atomic():
+                _downgrade_to_free(sub, free_plan, reason="grace_period")
+            processed += 1
+        except Exception:
+            failed += 1
+            logger.exception(
+                "grace_period: sub=%s 처리 중 예기치 못한 오류", sub.id,
+            )
 
-    return count
+    _log_summary("handle_grace_period_expiry", processed, failed)
+    return {"processed": processed, "failed": failed}
 
 
 @shared_task(name="billing.handle_trial_expiry")
@@ -86,6 +120,8 @@ def handle_trial_expiry():
     """
     TRIALING 상태이고 current_period_end가 지난 구독을 무료로 다운그레이드.
     레퍼럴 트라이얼이 만료된 사용자가 결제 안 했을 때 적용된다.
+    트라이얼은 PayApp 정기결제와 연계가 없을 수 있어 rebill 해지 실패 시에도 다운그레이드는 진행한다
+    (단, 실패는 로그로 노출).
     """
     from .models import SubscriptionStatus, UserSubscription
     from .subscription_utils import get_free_plan
@@ -94,38 +130,50 @@ def handle_trial_expiry():
     free_plan = get_free_plan()
     if not free_plan:
         logger.error("handle_trial_expiry: free 플랜이 존재하지 않음")
-        return 0
+        return {"processed": 0, "failed": 0}
 
     expired_subs = UserSubscription.objects.filter(
         status=SubscriptionStatus.TRIALING,
         current_period_end__lt=now,
     ).exclude(current_period_end__isnull=True)
 
-    count = 0
-    for sub in expired_subs:
-        _downgrade_to_free(sub, free_plan, reason="trial_expired")
-        count += 1
+    processed, failed = 0, 0
+    for sub in expired_subs.iterator():
+        try:
+            if sub.payapp_rebill_no:
+                _safe_payapp_cancel(sub.payapp_rebill_no, "trial_expired")
 
-    if count:
-        logger.info("handle_trial_expiry: %d건 트라이얼 만료 → free 다운그레이드", count)
-    return count
+            with transaction.atomic():
+                _downgrade_to_free(sub, free_plan, reason="trial_expired")
+            processed += 1
+        except Exception:
+            failed += 1
+            logger.exception(
+                "trial_expired: sub=%s 처리 중 예기치 못한 오류", sub.id,
+            )
+
+    _log_summary("handle_trial_expiry", processed, failed)
+    return {"processed": processed, "failed": failed}
 
 
 @shared_task(name="billing.handle_cancelled_expiry")
 def handle_cancelled_expiry():
     """
     cancelled(일시정지) 상태이고 current_period_end가 지난 구독을 무료로 다운그레이드.
-    rebillStop로 일시정지된 상태에서 구독 기간이 끝나면 free로 전환.
+    rebillStop으로 일시정지된 상태에서 구독 기간이 끝나면 free로 전환.
+
+    PayApp rebillCancel 실패 시:
+      - 다운그레이드를 **보류** 하고 payapp_rebill_no를 유지한다.
+      - 다음 배치 차수(매시간)에 다시 시도해 PayApp 측에 dangling 정기결제가 남지 않게 한다.
     """
-    from .models import UserSubscription, SubscriptionStatus
+    from .models import SubscriptionStatus, UserSubscription
     from .subscription_utils import get_free_plan
-    from .payapp_service import PayAppClient, PayAppError
 
     now = timezone.now()
     free_plan = get_free_plan()
     if not free_plan:
         logger.error("handle_cancelled_expiry: free 플랜이 존재하지 않음")
-        return 0
+        return {"processed": 0, "failed": 0}
 
     expired_subs = UserSubscription.objects.filter(
         status=SubscriptionStatus.CANCELLED,
@@ -133,22 +181,26 @@ def handle_cancelled_expiry():
         plan__name__in=["pro", "pro_plus"],
     ).exclude(current_period_end__isnull=True)
 
-    count = 0
-    for sub in expired_subs:
-        # 완전 해지 (rebillCancel)
-        if sub.payapp_rebill_no:
-            try:
-                PayAppClient.cancel_rebill(sub.payapp_rebill_no)
-            except PayAppError:
-                logger.warning(
-                    "cancelled_expiry: PayApp 정기결제 해지 실패 rebill_no=%s",
-                    sub.payapp_rebill_no,
-                )
+    processed, failed = 0, 0
+    for sub in expired_subs.iterator():
+        try:
+            if sub.payapp_rebill_no and not _safe_payapp_cancel(
+                sub.payapp_rebill_no, "cancelled_expiry"
+            ):
+                failed += 1
+                continue
 
-        _downgrade_to_free(sub, free_plan, reason="cancelled_expiry")
-        count += 1
+            with transaction.atomic():
+                _downgrade_to_free(sub, free_plan, reason="cancelled_expiry")
+            processed += 1
+        except Exception:
+            failed += 1
+            logger.exception(
+                "cancelled_expiry: sub=%s 처리 중 예기치 못한 오류", sub.id,
+            )
 
-    return count
+    _log_summary("handle_cancelled_expiry", processed, failed)
+    return {"processed": processed, "failed": failed}
 
 
 def _downgrade_to_free(sub, free_plan, reason: str = ""):

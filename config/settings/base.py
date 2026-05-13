@@ -297,25 +297,27 @@ CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutes
 
 # Celery Beat Schedule (정기 결제 + DM 발송 보증 워커)
+# NOTE: 만료 처리 계열은 매시간 실행해 단일 실행 누락/지연 위험을 줄인다.
+#       각 태스크는 멱등하며, PayApp API 실패 시 다음 차수에서 재시도되도록 설계됨(apps/billing/tasks.py 참고).
 CELERY_BEAT_SCHEDULE = {
     "check-missed-payments": {
         "task": "billing.check_missed_payments",
-        "schedule": 60 * 60 * 24,  # 매일 (cron은 django-celery-beat로 전환 가능)
+        "schedule": 60 * 60,  # 매시간
         "options": {"queue": "billing"},
     },
     "handle-grace-period-expiry": {
         "task": "billing.handle_grace_period_expiry",
-        "schedule": 60 * 60 * 24,
+        "schedule": 60 * 60,  # 매시간
         "options": {"queue": "billing"},
     },
     "handle-cancelled-expiry": {
         "task": "billing.handle_cancelled_expiry",
-        "schedule": 60 * 60 * 24,
+        "schedule": 60 * 60,  # 매시간
         "options": {"queue": "billing"},
     },
     "handle-trial-expiry": {
         "task": "billing.handle_trial_expiry",
-        "schedule": 60 * 60 * 24,
+        "schedule": 60 * 60,  # 매시간
         "options": {"queue": "billing"},
     },
     # ===== DM 발송 99.9% 보증 시스템 =====

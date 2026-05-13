@@ -88,6 +88,28 @@ services:
     networks:
       - turnflow_instagram_net
 
+  celery_beat:
+    image: turnflow_instagram_web
+    container_name: turnflow_instagram_celery_beat
+    restart: unless-stopped
+    command: celery -A config beat -l info --pidfile=/tmp/celerybeat.pid
+    env_file:
+      - .env.production
+    environment:
+      - DJANGO_SETTINGS_MODULE=config.settings.prod
+      - DB_HOST=db
+      - DB_PORT=5432
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - turnflow_instagram_logs:/app/logs
+    depends_on:
+      - db
+      - redis
+      - web
+    networks:
+      - turnflow_instagram_net
+
 volumes:
   turnflow_instagram_postgres:
   turnflow_instagram_redis:
