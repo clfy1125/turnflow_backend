@@ -32,6 +32,7 @@ from .models import (
     SpamFilterConfig,
 )
 from .services import (
+    CommentReplyPermanentError,
     InstagramCommentService,
     InstagramMediaService,
     InstagramMessagingService,
@@ -1222,6 +1223,21 @@ def post_public_reply(self, log_id: str):
             message=template,
             access_token=ig_conn.access_token,
         )
+    except CommentReplyPermanentError as e:
+        # 댓글 삭제, 7일 초과, 권한 없음, 토큰 만료 — 재시도 의미 없음
+        logger.info(
+            f"post_public_reply permanent error log={log_id} code={e.code}/{e.subcode}: {e.message}"
+        )
+        log.append_verification_log(
+            {
+                "path": "public_reply",
+                "result": "abandoned_permanent",
+                "error": e.message,
+                "code": e.code,
+                "subcode": e.subcode,
+            }
+        )
+        return {"status": "abandoned", "reason": "permanent", "code": e.code}
     except Exception as e:
         logger.warning(
             f"post_public_reply failed for log={log_id}: {e}; will retry"

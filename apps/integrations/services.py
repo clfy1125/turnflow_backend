@@ -854,6 +854,37 @@ class InstagramMediaService:
             return None
 
 
+class CommentReplyPermanentError(Exception):
+    """
+    공개 답글 게시 영구 실패 — 재시도해도 동일 결과.
+
+    Meta v25 의 `POST /{comment_id}/replies` 호출이 다음 사유로 거부된 경우:
+        - code=100/subcode=33: 댓글 삭제/접근 불가
+        - code=100 (기타):     7일 윈도우 초과 등 잘못된 파라미터
+        - code=190:            토큰 만료
+        - code=200, 10:        권한 / 정책 위반
+
+    `post_public_reply` task 가 이 예외를 잡으면 retry 없이 즉시 종결.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: int | None = None,
+        subcode: int | None = None,
+        status: int | None = None,
+    ):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.subcode = subcode
+        self.status = status
+
+    def __str__(self) -> str:
+        return f"{self.message} (code={self.code} subcode={self.subcode} http={self.status})"
+
+
 class InstagramCommentService:
     """
     Instagram 댓글 관리 서비스
@@ -867,24 +898,27 @@ class InstagramCommentService:
             "Authorization": f"Bearer {access_token}",
         }
 
+    # Meta 가 응답하는 영구 에러 코드 (재시도해도 동일 결과)
+    # code=100 subcode=33: 댓글 삭제됨/접근 불가
+    # code=100 (기타):     잘못된 파라미터 / 7일 윈도우 초과 등
+    # code=200, 10:        권한 / 정책 위반
+    # code=190:            토큰 만료
+    _PERMANENT_REPLY_ERROR_CODES = (100, 190, 200, 10)
+
     @classmethod
     def post_reply(cls, comment_id: str, message: str, access_token: str) -> Dict:
         """
         댓글에 공개 답글(reply) 게시.
 
-        POST https://graph.instagram.com/v25.0/{ig-comment-id}/replies
-            ?message=...
-
-        Args:
-            comment_id: 답글을 달 부모 댓글 ID
-            message:    답글 내용
-            access_token: Instagram User Access Token
+        POST https://graph.instagram.com/v25.0/{ig-comment-id}/replies?message=...
 
         Returns:
             {"id": "<reply_id>"} 형태의 응답
 
         Raises:
-            requests.HTTPError: API 호출 실패 시
+            CommentReplyPermanentError: 재시도해도 동일 결과 — 영구 실패
+                (댓글 삭제, 권한 없음, 토큰 만료, 7일 윈도우 초과 등)
+            requests.HTTPError: 그 외 transient 에러 — 재시도 가능
         """
         url = f"{cls.GRAPH_API_BASE}/{comment_id}/replies"
         params = {"message": message}
@@ -895,8 +929,26 @@ class InstagramCommentService:
             headers=cls._get_headers(access_token),
             timeout=10,
         )
+        if response.ok:
+            return response.json()
+
+        # 4xx — Meta error 본문 파싱해서 영구/일시 분기
+        try:
+            body = response.json()
+        except ValueError:
+            body = {"error": {"message": response.text}}
+        err = (body.get("error") or {}) if isinstance(body, dict) else {}
+        code = err.get("code")
+        subcode = err.get("error_subcode")
+        msg = err.get("message") or f"HTTP {response.status_code}"
+
+        if code in cls._PERMANENT_REPLY_ERROR_CODES:
+            raise CommentReplyPermanentError(
+                msg, code=code, subcode=subcode, status=response.status_code
+            )
+        # 5xx / rate limit 등은 그대로 HTTPError 로 raise → task 가 retry
         response.raise_for_status()
-        return response.json()
+        return response.json()  # unreachable
 
     @classmethod
     def hide_comment(cls, comment_id: str, access_token: str) -> Dict:
