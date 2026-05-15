@@ -38,6 +38,7 @@ INSTALLED_APPS = [
     "apps.integrations",
     "apps.pages",
     "apps.ai_jobs",
+    "apps.insights",
     "apps.emails.apps.EmailsConfig",
     "apps.tiktok",
     "apps.youtube",
@@ -213,6 +214,8 @@ REST_FRAMEWORK = {
     "DEFAULT_THROTTLE_RATES": {
         # 외부 페이지 import 전용 — 사용자별 시간당 30건. 어뷰즈 차단 + 정상 사용 모두 OK.
         "external_import": "30/hour",
+        # 인사이트 강제 동기화 — 사용자별 시간당 5회 (IG quota 보호)
+        "insights_sync": "5/hour",
     },
 }
 
@@ -332,6 +335,26 @@ CELERY_BEAT_SCHEDULE = {
     "dm-dead-letter-alerter": {
         "task": "apps.integrations.tasks.dead_letter_alerter",
         "schedule": 60 * 10,  # 10분 — 토큰 만료/도착 미확인 누적 알림
+    },
+    # ===== Instagram Insights 동기화 =====
+    # 호출량 절감: stale TTL 로 게시물별 재호출 빈도 차등 — 자세한 내용은
+    # apps/insights/models.py 의 IGMedia.insight_stale_ttl() 와
+    # apps/insights/tasks.py 헤더 참조.
+    "insights-sync-active-accounts-media": {
+        "task": "insights.sync_active_accounts_media",
+        "schedule": 60 * 30,  # 30분 — 신규 미디어 메타데이터 감지
+    },
+    "insights-refresh-recent-insights": {
+        "task": "insights.refresh_recent_insights",
+        "schedule": 60 * 30,  # 30분 — 최근 7일 게시물 인사이트
+    },
+    "insights-refresh-old-insights": {
+        "task": "insights.refresh_old_insights",
+        "schedule": 60 * 60 * 24,  # 24시간 — 그 외 게시물 인사이트
+    },
+    "insights-refresh-account-audience": {
+        "task": "insights.refresh_account_audience_insights",
+        "schedule": 60 * 60 * 24,  # 24시간 — 계정 단위 follow_type 도달 분포
     },
     # NOTE: 아래는 deprecate (v3.5/v3.6) 로 Beat 에서 제거됨:
     #   - dm-expire-gate-pending: Follow-gate 가 deprecated 됨
