@@ -1224,7 +1224,7 @@ def post_public_reply(self, log_id: str):
             access_token=ig_conn.access_token,
         )
     except CommentReplyPermanentError as e:
-        # 댓글 삭제, 7일 초과, 권한 없음, 토큰 만료 — 재시도 의미 없음
+        # 댓글 삭제, 7일 초과, 권한 없음, 토큰 만료, Action Block — 재시도 의미 없음
         logger.info(
             f"post_public_reply permanent error log={log_id} code={e.code}/{e.subcode}: {e.message}"
         )
@@ -1237,6 +1237,52 @@ def post_public_reply(self, log_id: str):
                 "subcode": e.subcode,
             }
         )
+
+        # ===== Circuit Breaker =====
+        # 같은 IG 계정에서 10분 안에 영구 에러 3건 이상 누적되면
+        # → 그 계정의 모든 캠페인 public_reply_enabled 자동 OFF.
+        # 인스타 Action Block (code=1) 이 한 번 걸리면 그 시점부터의 모든 답글이
+        # 같은 차단에 묶이는데, 그 사이에 계속 시도하면 차단 기간이 연장됨.
+        # 자동 OFF 로 추가 시도를 막아 차단이 빨리 풀리게 한다.
+        try:
+            ig_conn = log.campaign.ig_connection
+            cutoff = timezone.now() - timedelta(minutes=10)
+            recent_logs = SentDMLog.objects.filter(
+                campaign__ig_connection=ig_conn,
+                created_at__gte=cutoff,
+            ).only("verification_log")
+            permanent_count = sum(
+                1
+                for rl in recent_logs
+                if any(
+                    (ev or {}).get("result") == "abandoned_permanent"
+                    for ev in (rl.verification_log or [])
+                )
+            )
+            CB_THRESHOLD = 3
+            if permanent_count >= CB_THRESHOLD:
+                affected = AutoDMCampaign.objects.filter(
+                    ig_connection=ig_conn,
+                    public_reply_enabled=True,
+                ).update(public_reply_enabled=False)
+                logger.warning(
+                    f"Circuit breaker tripped for {ig_conn.username}: "
+                    f"{permanent_count} permanent errors in 10min "
+                    f"→ disabled public_reply on {affected} campaign(s). "
+                    f"Manual re-enable required after Meta restriction clears."
+                )
+                log.append_verification_log(
+                    {
+                        "path": "public_reply",
+                        "result": "circuit_breaker_tripped",
+                        "recent_permanent": permanent_count,
+                        "affected_campaigns": affected,
+                        "ig_account": ig_conn.username,
+                    }
+                )
+        except Exception:
+            logger.exception("circuit breaker check failed (non-fatal)")
+
         return {"status": "abandoned", "reason": "permanent", "code": e.code}
     except Exception as e:
         logger.warning(

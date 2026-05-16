@@ -899,11 +899,15 @@ class InstagramCommentService:
         }
 
     # Meta 가 응답하는 영구 에러 코드 (재시도해도 동일 결과)
+    # code=1   subcode=4928012/4928011: 활동 차단 (Action Block) — 스팸/봇 의심
+    #          message="We restrict certain activity to protect our community"
+    #          → is_transient=false. 인스타가 IG 계정 단위로 답글 활동 차단.
+    #          몇 시간 ~ 24h 후 자동 해제. 그 사이에 계속 시도하면 차단 연장됨.
     # code=100 subcode=33: 댓글 삭제됨/접근 불가
     # code=100 (기타):     잘못된 파라미터 / 7일 윈도우 초과 등
     # code=200, 10:        권한 / 정책 위반
     # code=190:            토큰 만료
-    _PERMANENT_REPLY_ERROR_CODES = (100, 190, 200, 10)
+    _PERMANENT_REPLY_ERROR_CODES = (1, 100, 190, 200, 10)
 
     @classmethod
     def post_reply(cls, comment_id: str, message: str, access_token: str) -> Dict:
