@@ -78,14 +78,20 @@ def sync_active_accounts_media(self):
 )
 def refresh_recent_insights(self):
     """
-    최근 7일 미디어 인사이트 새로고침 — stale TTL 안 지난 건 자동 skip.
+    최근 7일 게시물 + 한 번도 동기화 안 된 미디어 인사이트 새로고침.
+
+    NOTE (v4.0.2): 단순 published_at 필터는 "오래된 게시물을 가진 신규 연동 계정"
+    의 미디어를 영원히 NULL 로 남기는 버그가 있었음.
+    `insights_last_synced_at IS NULL` OR 가지로 첫 동기화는 항상 처리하도록 보강.
+    stale TTL 통과한 건 sync_media_insights 안에서 skip 되므로 호출 비용 미증가.
     """
     from datetime import timedelta
+    from django.db.models import Q
 
     cutoff = timezone.now() - timedelta(days=7)
     queryset = (
         IGMedia.objects.filter(
-            published_at__gte=cutoff,
+            Q(published_at__gte=cutoff) | Q(insights_last_synced_at__isnull=True),
             account__status=IGAccountConnection.Status.ACTIVE,
         )
         .select_related("account", "insight")
@@ -198,6 +204,100 @@ def refresh_account_audience_insights(self, period_days: int = 30):
     return {"processed": processed, "errors": errors}
 
 
+@shared_task(name="insights.bootstrap_account", bind=True)
+def bootstrap_account(self, account_id: str):
+    """
+    신규 IG 연동 또는 권한 추가 재연동 직후 1회 자동 호출.
+
+    OAuth callback view 에서 IGAccountConnection 저장 직후 enqueue.
+    프론트가 별도로 sync 트리거할 필요 없이, 연동 직후 바로:
+        1) 모든 미디어 메타데이터 동기화
+        2) 모든 미디어 인사이트 동기화 (insights scope 보유 시)
+        3) 계정 단위 청중 인사이트 (follow_type breakdown)
+
+    호출 비용: 계정 1개 + 미디어 N건 기준 약 (N/50 + N + 1) IG API call.
+    예: 미디어 200건 = 4 + 200 + 1 = 205회 호출. 일 1회만 발생.
+    """
+    try:
+        account = IGAccountConnection.objects.get(id=account_id)
+    except IGAccountConnection.DoesNotExist:
+        logger.error("bootstrap_account: account not found %s", account_id)
+        return {"status": "not_found"}
+
+    if account.status != IGAccountConnection.Status.ACTIVE:
+        return {"status": "skipped", "reason": "not active"}
+
+    has_insights_scope = "instagram_business_manage_insights" in (account.scopes or [])
+
+    # 1) 메타데이터 동기화 (insights scope 없어도 가능 - basic 권한)
+    try:
+        meta_res = sync_account_media(account, max_pages=10)
+        logger.info(
+            "bootstrap %s metadata: fetched=%d created=%d",
+            account.username,
+            meta_res.get("fetched", 0),
+            meta_res.get("created", 0),
+        )
+    except InsightsPermissionError as e:
+        logger.warning("bootstrap %s metadata permission: %s", account.username, e)
+        return {"status": "failed", "stage": "metadata", "error": str(e)}
+    except Exception:
+        logger.exception("bootstrap %s metadata failed", account.username)
+        return {"status": "failed", "stage": "metadata"}
+
+    if not has_insights_scope:
+        logger.info(
+            "bootstrap %s: insights scope 없음 — 메타데이터만 동기화하고 종료",
+            account.username,
+        )
+        return {"status": "partial", "reason": "no insights scope", "media": meta_res}
+
+    # 2) 모든 미디어 인사이트 동기화
+    media_qs = IGMedia.objects.filter(account=account).order_by("-published_at")
+    total = media_qs.count()
+    processed = 0
+    errors = 0
+    for media in media_qs.iterator(chunk_size=50):
+        try:
+            sync_media_insights(media, force=True)
+            processed += 1
+        except InsightsTransientError as e:
+            errors += 1
+            logger.warning(
+                "bootstrap %s insight transient media=%s: %s",
+                account.username,
+                media.external_media_id,
+                e,
+            )
+        except Exception:
+            errors += 1
+            logger.exception(
+                "bootstrap %s insight failed media=%s",
+                account.username,
+                media.external_media_id,
+            )
+    logger.info(
+        "bootstrap %s insights: %d/%d processed errors=%d",
+        account.username,
+        processed,
+        total,
+        errors,
+    )
+
+    # 3) 계정 단위 청중 인사이트
+    try:
+        sync_account_audience_insight(account, period_days=30)
+    except Exception:
+        logger.exception("bootstrap %s audience insight failed", account.username)
+
+    return {
+        "status": "succeeded",
+        "media_total": total,
+        "insights_processed": processed,
+        "insights_errors": errors,
+    }
+
+
 @shared_task(name="insights.run_sync_job", bind=True)
 def run_sync_job(self, job_id: str):
     """
@@ -224,10 +324,15 @@ def run_sync_job(self, job_id: str):
         else:
             from datetime import timedelta
 
+            from django.db.models import Q
+
             qs = IGMedia.objects.filter(account=job.account).order_by("-published_at")
             if job.scope == MediaSyncJob.Scope.INSIGHTS_RECENT:
+                # 최근 7일 게시물 OR 한 번도 동기화 안 된 미디어 (= 첫 동기화 보장)
                 cutoff = timezone.now() - timedelta(days=7)
-                qs = qs.filter(published_at__gte=cutoff)
+                qs = qs.filter(
+                    Q(published_at__gte=cutoff) | Q(insights_last_synced_at__isnull=True)
+                )
 
             job.total = qs.count()
             job.save(update_fields=["total"])

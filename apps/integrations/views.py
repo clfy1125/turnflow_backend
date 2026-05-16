@@ -460,6 +460,15 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 except Exception as e:
                     logger.warning(f"Failed to subscribe webhooks for {instagram_account_id}: {e}")
 
+                # 신규 연동/권한 추가 재연동 직후 — 메타데이터 + 모든 인사이트 자동 부트스트랩
+                # (프론트가 별도로 sync 트리거할 필요 없이 즉시 데이터 확보)
+                try:
+                    from apps.insights.tasks import bootstrap_account
+                    bootstrap_account.delay(str(connection.id))
+                    logger.info(f"Enqueued insights bootstrap for {connection.id}")
+                except Exception as e:
+                    logger.warning(f"Failed to enqueue insights bootstrap (non-fatal): {e}")
+
             # Clean up persisted state
             try:
                 state_obj.delete()
