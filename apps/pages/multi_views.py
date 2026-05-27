@@ -1592,21 +1592,11 @@ class MultiStatsLinksView(APIView):
                     )
                 ],
             ),
-            403: OpenApiResponse(description="Free 플랜 전용 기능"),
             401: OpenApiResponse(description="인증 실패"),
             404: OpenApiResponse(description="페이지 없음 또는 접근 권한 없음"),
         },
     )
     def get(self, request, page_id: int):
-        from apps.billing.subscription_utils import get_user_plan
-
-        plan = get_user_plan(request.user)
-        if plan.name != "free":
-            return Response(
-                {"detail": "이 기능은 Free 플랜에서만 사용할 수 있습니다."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
         page = _get_owned_page(request, page_id)
         if not page:
             return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)

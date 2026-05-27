@@ -125,7 +125,13 @@ COMMON_ERROR_RESPONSES = {
         "**필터**: `media_product_type`, `account_id`, `published_after/before`, `has_paid`, `min_reach`, `min_er`.\n"
         "**정렬**: `ordering=-published_at` (기본) / `-insight__engagement_rate` / `-insight__viral_score` / `-insight__reach` 등.\n\n"
         "**신선도**: 각 미디어에 `is_insights_fresh` 가 false 면 곧 자동 동기화 대상. "
-        "사용자가 강제 새로고침을 원하면 POST `/sync-jobs/` 호출."
+        "사용자가 강제 새로고침을 원하면 POST `/sync-jobs/` 호출.\n\n"
+        "**수치 결측 사유 (`metrics_unavailable_reason`)**: `metrics.*` 가 모두 비어있을 때 그 원인을 enum 으로 내려준다.\n"
+        "- `meta_28d_window`: Meta IG Insights 정책상 게시 후 약 28일이 지나면 비공개 — 영구적, 재시도 무의미\n"
+        "- `permission_error`: IG 토큰 권한 부족 (재연동 안내)\n"
+        "- `api_error`: 일시적 Graph API 에러 (다음 sync 에서 재시도)\n"
+        "- `not_synced`: 아직 한 번도 sync 되지 않음\n"
+        "- `null`: 정상 (수치가 채워져 있음)"
     ),
     parameters=[
         WORKSPACE_PATH_PARAM,
@@ -165,6 +171,7 @@ COMMON_ERROR_RESPONSES = {
                         "insights_last_synced_at": "2026-05-14T08:15:00+09:00",
                         "is_insights_fresh": True,
                         "has_paid_data": False,
+                        "metrics_unavailable_reason": None,
                         "metrics": {
                             "reach": 34160,
                             "likes": 1250,

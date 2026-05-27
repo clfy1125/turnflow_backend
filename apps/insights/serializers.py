@@ -11,10 +11,55 @@ Insights API 시리얼라이저.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
+from django.utils import timezone
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from .models import IGAccountInsight, IGMedia, IGMediaInsight, MediaProductType, MediaSyncJob
+
+# Meta IG Insights 정책: 게시 후 ~28일이 지나면 media insights 가 비공개로 전환된다.
+# 정확한 컷오프는 Meta 가 운영적으로 조정 — 안내용 분류에는 28일 기준이 충분.
+META_INSIGHTS_WINDOW_DAYS = 28
+
+_METRICS_UNAVAILABLE_REASONS = (
+    "meta_28d_window",
+    "permission_error",
+    "api_error",
+    "not_synced",
+)
+
+
+def _derive_metrics_unavailable_reason(media: IGMedia) -> str | None:
+    """metrics 가 비어있을 때 그 원인을 enum 코드로 분류.
+
+    프론트가 "왜 도달/좋아요가 -로 보이는지" 를 사용자에게 안내할 수 있도록 한다.
+    실제 수치가 하나라도 채워져 있으면 None 반환.
+    """
+    insight = getattr(media, "insight", None)
+    if insight and (insight.reach or insight.likes or insight.views or insight.total_interactions):
+        return None
+
+    err = (media.insights_sync_error or "").strip()
+    if err.startswith("permission:"):
+        if media.published_at and (
+            timezone.now() - media.published_at
+        ) > timedelta(days=META_INSIGHTS_WINDOW_DAYS):
+            return "meta_28d_window"
+        return "permission_error"
+    if err.startswith("api:"):
+        return "api_error"
+
+    if not media.insights_last_synced_at:
+        return "not_synced"
+
+    # sync 는 끝났는데 수치가 비어있는 케이스 — 28일 정책일 가능성이 가장 큼
+    if media.published_at and (
+        timezone.now() - media.published_at
+    ) > timedelta(days=META_INSIGHTS_WINDOW_DAYS):
+        return "meta_28d_window"
+    return None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -49,6 +94,7 @@ class MediaListItemSerializer(serializers.ModelSerializer):
     metrics = MediaInsightInlineSerializer(source="insight", read_only=True)
     is_insights_fresh = serializers.SerializerMethodField()
     has_paid_data = serializers.SerializerMethodField()
+    metrics_unavailable_reason = serializers.SerializerMethodField()
 
     class Meta:
         model = IGMedia
@@ -68,6 +114,7 @@ class MediaListItemSerializer(serializers.ModelSerializer):
             "is_insights_fresh",
             "has_paid_data",
             "metrics",
+            "metrics_unavailable_reason",
         )
         read_only_fields = fields
 
@@ -77,6 +124,12 @@ class MediaListItemSerializer(serializers.ModelSerializer):
     def get_has_paid_data(self, obj: IGMedia) -> bool:
         ins = getattr(obj, "insight", None)
         return bool(ins and ins.has_paid_data)
+
+    @extend_schema_field(
+        serializers.ChoiceField(choices=list(_METRICS_UNAVAILABLE_REASONS), allow_null=True)
+    )
+    def get_metrics_unavailable_reason(self, obj: IGMedia) -> str | None:
+        return _derive_metrics_unavailable_reason(obj)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -142,6 +195,7 @@ class MediaDetailSerializer(serializers.ModelSerializer):
     reels = serializers.SerializerMethodField()
     carousel_children = serializers.SerializerMethodField()
     paid_available = serializers.SerializerMethodField()
+    metrics_unavailable_reason = serializers.SerializerMethodField()
 
     class Meta:
         model = IGMedia
@@ -158,6 +212,7 @@ class MediaDetailSerializer(serializers.ModelSerializer):
             "duration_seconds",
             "published_at",
             "insights_last_synced_at",
+            "metrics_unavailable_reason",
             "paid_available",
             "total",
             "organic",
@@ -166,6 +221,12 @@ class MediaDetailSerializer(serializers.ModelSerializer):
             "carousel_children",
         )
         read_only_fields = fields
+
+    @extend_schema_field(
+        serializers.ChoiceField(choices=list(_METRICS_UNAVAILABLE_REASONS), allow_null=True)
+    )
+    def get_metrics_unavailable_reason(self, obj: IGMedia) -> str | None:
+        return _derive_metrics_unavailable_reason(obj)
 
     # ----- helpers -----
 

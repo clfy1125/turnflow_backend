@@ -564,17 +564,26 @@ def sync_media_insights(media: IGMedia, *, force: bool = False) -> IGMediaInsigh
             access_token=account.access_token,
         )
     except InsightsPermissionError as e:
+        # 권한/정책 에러도 한 사이클은 끝난 것으로 처리: last_synced_at 을 찍어
+        # is_insights_fresh()=True 로 만들어 TTL 동안 같은 미디어를 재호출하지 않는다.
+        # (Meta 28일 윈도우 만료처럼 영구적인 사유면 매번 호출해도 같은 결과)
         media.insights_sync_error = f"permission: {e}"
-        media.save(update_fields=["insights_sync_error", "updated_at"])
+        media.insights_last_synced_at = timezone.now()
+        media.save(
+            update_fields=["insights_sync_error", "insights_last_synced_at", "updated_at"]
+        )
         # account 자체에도 표시
         account.mark_as_error(f"insights permission error: {e}")
         return None
     except InsightsTransientError:
-        # transient — 다음 주기에 재시도
+        # transient — 다음 주기에 재시도 (last_synced_at 도 의도적으로 갱신하지 않음)
         raise
     except InsightsAPIError as e:
         media.insights_sync_error = f"api: {e}"
-        media.save(update_fields=["insights_sync_error", "updated_at"])
+        media.insights_last_synced_at = timezone.now()
+        media.save(
+            update_fields=["insights_sync_error", "insights_last_synced_at", "updated_at"]
+        )
         return None
 
     # REELS 부가 호출
