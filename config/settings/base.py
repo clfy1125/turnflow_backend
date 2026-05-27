@@ -424,6 +424,16 @@ META_APP_ID = config("META_APP_ID", default="")
 META_APP_SECRET = config("META_APP_SECRET", default="")
 
 # ─────────────────────────────────────────────────────────────
+# Coupang Partners Open API (https://partners.coupang.com)
+# ─────────────────────────────────────────────────────────────
+# 어필리에이트 등록 후 발급되는 ACCESS_KEY/SECRET_KEY 로 HMAC-SHA256 인증.
+# 상품 검색, 가격 조회, 딥링크(어필리에이트 트래킹 URL) 생성에 사용.
+# MOCK 모드: 키 발급 전이거나 로컬 개발 시 외부 호출 없이 더미 응답으로 동작.
+COUPANG_MOCK_MODE = config("COUPANG_MOCK_MODE", default=True, cast=bool)
+COUPANG_PARTNERS_ACCESS_KEY = config("COUPANG_PARTNERS_ACCESS_KEY", default="")
+COUPANG_PARTNERS_SECRET_KEY = config("COUPANG_PARTNERS_SECRET_KEY", default="")
+
+# ─────────────────────────────────────────────────────────────
 # TikTok Business API (business-api.tiktok.com)
 # ─────────────────────────────────────────────────────────────
 # Scope: Ad Comments + TikTok Accounts. 광고 댓글 list/hide/delete/reply +

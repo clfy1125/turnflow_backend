@@ -1,6 +1,7 @@
 from django.urls import path
 
 from .aiviews import AiCloneFromSlugView, AiImportExternalView, AiPageEditView
+from .coupang_views import CoupangLookupView
 from .image_views import PageMediaDetailView, PageMediaView
 from .multi_views import (
     MultiBlockCustomCssView,
@@ -127,4 +128,12 @@ urlpatterns = [
     path("ai/@<slug:slug>/", AiPageEditView.as_view(), name="ai-page-edit"),
     # 외부 서비스(인포크/리틀리/링크트리) 페이지 가져오기
     path("ai/import-external/", AiImportExternalView.as_view(), name="ai-import-external"),
+
+    # ─── 외부 커머스 메타 조회 ───────────────────────────────
+    # 쿠팡 상품 URL → 가격/이미지/딥링크 (Coupang Partners Open API)
+    path(
+        "products/coupang/lookup/",
+        CoupangLookupView.as_view(),
+        name="coupang-lookup",
+    ),
 ]
