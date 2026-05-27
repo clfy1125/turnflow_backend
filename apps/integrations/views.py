@@ -469,6 +469,15 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 except Exception as e:
                     logger.warning(f"Failed to enqueue insights bootstrap (non-fatal): {e}")
 
+                # 프로필 사진 캐싱 — IG CDN URL 은 서명된 일시 URL 이라 만료될 수 있으므로
+                # 연동 즉시 우리 스토리지로 사본을 끌어와서 안정 URL 확보. best-effort.
+                try:
+                    from .tasks import sync_ig_profile_picture
+                    sync_ig_profile_picture.delay(str(connection.id))
+                    logger.info(f"Enqueued profile picture sync for {connection.id}")
+                except Exception as e:
+                    logger.warning(f"Failed to enqueue profile sync (non-fatal): {e}")
+
             # Clean up persisted state
             try:
                 state_obj.delete()
@@ -1163,6 +1172,172 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         )
 
     @extend_schema(
+        summary="Instagram 프로필 사진 최신화",
+        description="""
+        ## 목적
+        IG /me API 를 호출하여 프로필 사진을 최신 상태로 갱신합니다.
+        IG CDN URL 은 서명된 일시 URL 이라 만료될 수 있으므로 우리 R2/로컬 스토리지에
+        사본을 저장하고 안정 URL 을 반환합니다.
+
+        ## 사용 시나리오
+        - 사용자가 인스타에서 프로필 사진을 변경한 후 우리 서비스에 반영하고 싶을 때
+        - 캐시된 이미지가 깨져 보일 때 (CDN 만료 의심)
+        - 정기적으로 (예: 사용자 설정 화면 열 때) 최신화
+
+        ## 인증
+        - Bearer JWT 필수
+        - 해당 IG 연동이 속한 workspace 의 멤버여야 함
+
+        ## 동작 (기본: 비동기)
+        Celery 태스크 `sync_ig_profile_picture` 큐잉 후 즉시 202 응답.
+        백그라운드에서:
+          1) IG /me 호출 → 최신 profile_picture_url 획득
+          2) source URL 이 기존과 같으면 synced_at 만 갱신
+          3) 다르면 다운로드 → 정제 → default_storage 저장 → URL 갱신
+
+        ## 옵션 — 동기 실행 (?sync=1)
+        `?sync=1` 쿼리 파라미터를 붙이면 위 흐름을 인라인으로 실행하고 갱신 결과를 200 응답에 포함.
+        외부 API 호출이 포함되므로 응답이 수 초 걸릴 수 있음. 디버그/관리자용.
+
+        ## 응답 예시 (비동기, 202)
+        ```json
+        {
+          "success": true,
+          "data": {
+            "connection_id": "uuid",
+            "task_queued": true,
+            "message": "프로필 사진 동기화가 큐에 등록되었습니다."
+          }
+        }
+        ```
+
+        ## 응답 예시 (?sync=1, 200)
+        ```json
+        {
+          "success": true,
+          "data": {
+            "connection_id": "uuid",
+            "status": "updated",
+            "profile_picture_url": "https://r2-domain.example/ig_profiles/.../abc.jpg"
+          }
+        }
+        ```
+
+        ## 에러
+        - 401: 인증 실패
+        - 403: 워크스페이스 멤버 아님
+        - 404: 해당 IG 연동 없음
+        - 502: (?sync=1) IG API 호출/이미지 다운로드 실패
+        """,
+        parameters=[
+            OpenApiParameter(
+                name="sync",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="'1' 이면 동기 실행 (디버그). 그 외엔 비동기 큐잉 (기본).",
+            ),
+        ],
+        responses={
+            200: OpenApiResponse(description="동기 실행 성공 (sync=1)"),
+            202: OpenApiResponse(description="비동기 큐잉 성공"),
+            401: OpenApiResponse(description="인증 실패"),
+            403: OpenApiResponse(description="워크스페이스 멤버 아님"),
+            404: OpenApiResponse(description="해당 IG 연동 없음"),
+            502: OpenApiResponse(description="(sync=1) IG API/이미지 다운로드 실패"),
+        },
+        examples=[
+            OpenApiExample(
+                name="JavaScript fetch (비동기)",
+                value=(
+                    "fetch('/api/v1/integrations/instagram/connections/UUID/refresh-profile/', "
+                    "{method: 'POST', headers: {'Authorization': 'Bearer ' + token}})"
+                ),
+                request_only=True,
+            ),
+        ],
+        tags=["Integrations"],
+    )
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="connections/(?P<ig_connection_id>[^/.]+)/refresh-profile",
+    )
+    def refresh_profile(self, request, ig_connection_id=None):
+        """프로필 사진 강제 동기화."""
+        try:
+            connection = IGAccountConnection.objects.select_related("workspace").get(
+                id=ig_connection_id
+            )
+        except IGAccountConnection.DoesNotExist:
+            return Response(
+                {
+                    "success": False,
+                    "error": {"code": 404, "message": "IG 연동을 찾을 수 없습니다."},
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if not connection.workspace.memberships.filter(user=request.user).exists():
+            return Response(
+                {
+                    "success": False,
+                    "error": {
+                        "code": 403,
+                        "message": "이 IG 연동이 속한 워크스페이스의 멤버가 아닙니다.",
+                    },
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        sync_flag = (request.query_params.get("sync") or "").strip() == "1"
+
+        from .tasks import sync_ig_profile_picture
+
+        if sync_flag:
+            # 인라인 실행 — Celery 태스크 함수를 직접 호출
+            try:
+                result = sync_ig_profile_picture.apply(args=[str(connection.id)]).get(
+                    disable_sync_subtasks=False
+                )
+            except Exception as e:  # noqa: BLE001
+                return Response(
+                    {
+                        "success": False,
+                        "error": {"code": 502, "message": f"동기화 실패: {e}"},
+                    },
+                    status=status.HTTP_502_BAD_GATEWAY,
+                )
+            # 최신 DB 값 반영
+            connection.refresh_from_db()
+            return Response(
+                {
+                    "success": True,
+                    "data": {
+                        "connection_id": str(connection.id),
+                        "status": result.get("status") if isinstance(result, dict) else "unknown",
+                        "profile_picture_url": connection.profile_picture_url,
+                        "profile_picture_synced_at": connection.profile_picture_synced_at,
+                    },
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        # 기본: 비동기 큐잉
+        sync_ig_profile_picture.delay(str(connection.id))
+        return Response(
+            {
+                "success": True,
+                "data": {
+                    "connection_id": str(connection.id),
+                    "task_queued": True,
+                    "message": "프로필 사진 동기화가 큐에 등록되었습니다.",
+                },
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+    @extend_schema(
         summary="Meta Deauthorize Callback (사용자가 IG 설정에서 앱 제거 시)",
         description="""
         ## 목적
@@ -1736,15 +1911,35 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
 
     @extend_schema(
         summary="캠페인 발송 로그 조회",
-        description="특정 캠페인의 DM 발송 로그를 조회합니다.",
+        description=(
+            "특정 캠페인의 DM 발송 로그를 조회합니다.\n\n"
+            "**v3.8 기본 동작 (Follow-gate)**: 한 댓글 → opening DM → (선택) 재안내/보상 DM 흐름이 "
+            "여러 SentDMLog 로 기록되는데, 기본적으로 list 응답에는 **opening / standalone 행만** "
+            "노출하여 통계가 부풀려지지 않도록 한다 (= 댓글 1건 = 1 row).\n\n"
+            "각 행의 `follow_passed` 필드로 그 흐름의 팔로우 전환 결과를 한눈에 확인 가능.\n\n"
+            "**전체 흐름(자식 로그 포함)** 을 보려면 `?include_children=true` 쿼리 파라미터 사용."
+        ),
+        parameters=[
+            OpenApiParameter(
+                name="include_children", type=bool, location=OpenApiParameter.QUERY,
+                description="true 면 follow-gate 자식 로그(재안내·보상 DM)까지 모두 반환 (디버깅용).",
+                required=False,
+            ),
+        ],
         responses={200: SentDMLogSerializer(many=True)},
         tags=["Auto DM"],
     )
     @action(detail=True, methods=["get"])
     def logs(self, request, pk=None):
-        """캠페인의 발송 로그 조회"""
+        """캠페인의 발송 로그 조회 (기본: opening/standalone 만 = 1 흐름당 1 row)"""
         campaign = self.get_object()
         logs = campaign.dm_logs.all().order_by("-created_at")
+
+        include_children = str(request.query_params.get("include_children", "")).lower() in (
+            "1", "true", "yes",
+        )
+        if not include_children:
+            logs = logs.filter(parent_log__isnull=True)
 
         # 페이지네이션 적용
         page = self.paginate_queryset(logs)
@@ -1767,8 +1962,12 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         campaign = self.get_object()
 
         # 최근 24시간 통계
+        # v3.8: child log (재안내/보상 DM) 는 통계 부풀림 방지 차원에서 제외 →
+        # opening / standalone 행만 카운트해 "댓글 1건 = 1 row" 와 일치시킨다.
         last_24h = timezone.now() - timedelta(hours=24)
-        recent_logs = campaign.dm_logs.filter(created_at__gte=last_24h)
+        recent_logs = campaign.dm_logs.filter(
+            created_at__gte=last_24h, parent_log__isnull=True
+        )
 
         stats = {
             "total_sent": campaign.total_sent,
@@ -1852,12 +2051,23 @@ def _process_messaging_events(entry: dict, logger) -> None:
         recipient_id = str((ev.get("recipient") or {}).get("id") or "")
         message = ev.get("message") or {}
         read = ev.get("read") or {}
+        postback = ev.get("postback") or {}
 
         # ----- messaging_seen (read receipt) -----
         if read:
             mid = read.get("mid")
             if mid:
                 _mark_log_read_by_mid(mid, logger)
+            continue
+
+        # ----- postback (button click) -----
+        # Meta 가 일부 케이스에선 별도 postback 이벤트로 보낸다.
+        if postback:
+            _maybe_dispatch_follow_gate(
+                payload=str(postback.get("payload") or ""),
+                sender_id=sender_id,
+                logger=logger,
+            )
             continue
 
         # ----- messages -----
@@ -1868,6 +2078,16 @@ def _process_messaging_events(entry: dict, logger) -> None:
             page_ig_user_id and sender_id == page_ig_user_id
         )
         mid = message.get("mid")
+
+        # Follow-gate quick_reply 응답 (사용자 → 우리). is_echo 제외.
+        if not is_echo:
+            qr = message.get("quick_reply") or {}
+            if _maybe_dispatch_follow_gate(
+                payload=str(qr.get("payload") or ""),
+                sender_id=sender_id,
+                logger=logger,
+            ):
+                continue
 
         if is_echo and mid:
             _mark_log_delivered_by_echo(
@@ -1906,6 +2126,35 @@ def _process_messaging_events(entry: dict, logger) -> None:
                 logger.debug(
                     f"Inbound DM received (no handler): sender={sender_id}, mid={mid}"
                 )
+
+
+def _maybe_dispatch_follow_gate(*, payload: str, sender_id: str, logger) -> bool:
+    """quick_reply / postback payload 가 follow-gate 인지 검사 후 Celery 라우팅.
+
+    payload 포맷: "fg:{opening_log_id}"
+
+    Returns:
+        True  — follow-gate 로 인식하고 큐 등록함
+        False — 우리가 처리할 payload 가 아님 (호출부는 평소처럼 진행)
+    """
+    if not payload or not payload.startswith("fg:"):
+        return False
+    if not sender_id:
+        logger.warning("follow-gate postback received but sender_id missing")
+        return True  # 우리 payload 였지만 라우팅 불가 — 평소 흐름 막진 않음
+
+    opening_log_id = payload.split(":", 1)[1].strip()
+    if not opening_log_id:
+        return True
+
+    from .tasks import process_follow_gate_postback
+
+    process_follow_gate_postback.delay(opening_log_id, sender_id)
+    logger.info(
+        "follow-gate postback queued: opening_log=%s igsid=%s",
+        opening_log_id, sender_id,
+    )
+    return True
 
 
 def _mark_log_delivered_by_echo(

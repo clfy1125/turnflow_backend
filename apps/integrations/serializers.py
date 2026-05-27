@@ -2,6 +2,7 @@
 Instagram integration serializers
 """
 
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from .models import AutoDMCampaign, IGAccountConnection, SentDMLog, SpamCommentLog, SpamFilterConfig
@@ -22,7 +23,10 @@ class IGAccountConnectionSerializer(serializers.ModelSerializer):
             "workspace_name",
             "external_account_id",
             "username",
+            "name",
             "account_type",
+            "profile_picture_url",
+            "profile_picture_synced_at",
             "token_expires_at",
             "scopes",
             "status",
@@ -36,7 +40,10 @@ class IGAccountConnectionSerializer(serializers.ModelSerializer):
             "id",
             "external_account_id",
             "username",
+            "name",
             "account_type",
+            "profile_picture_url",
+            "profile_picture_synced_at",
             "token_expires_at",
             "scopes",
             "status",
@@ -121,9 +128,11 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
             "public_reply_templates",  # 신규 리스트
             "public_reply_batch_size",
             "public_reply_batch_pause_seconds",
-            # Follow-gate (deprecated)
+            # Follow-gate (v3.8 — is_user_follow_business silent verify)
             "follow_gate_enabled",
             "follow_gate_prompt",
+            "follow_gate_button_label",
+            "follow_gate_retry_message",
             "reward_message_template",
             "gate_trigger_keywords",
             # 운영
@@ -235,15 +244,39 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
         help_text="배치 도달 후 다음 답글까지 대기 시간 (초, 기본 300)",
     )
 
-    # Follow-gate (deprecated — Meta 한계로 silent 검증 불가)
-    follow_gate_enabled = serializers.BooleanField(default=False)
-    follow_gate_prompt = serializers.CharField(required=False, allow_blank=True, default="")
+    # Follow-gate (v3.8 — is_user_follow_business silent verify)
+    follow_gate_enabled = serializers.BooleanField(
+        default=False,
+        help_text=(
+            "true 면 opening DM 에 '팔로우했어요' quick_reply 버튼이 첨부되고, "
+            "사용자가 클릭 시 IG Profile API 로 팔로우 여부를 확인한 후 "
+            "reward_message_template 을 발송한다. reward_message_template 가 비어 있으면 무시."
+        ),
+    )
+    follow_gate_prompt = serializers.CharField(
+        required=False, allow_blank=True, default="",
+        help_text=(
+            "Opening DM 본문 (게이트 안내 문구). 비우면 기본 문구 사용. "
+            "예: '댓글 남겨주셔서 감사해요! 팔로우도 하셨나요? 버튼을 눌러주세요!'"
+        ),
+    )
+    follow_gate_button_label = serializers.CharField(
+        required=False, allow_blank=True, max_length=20, default="",
+        help_text="버튼 라벨 (Meta 한도 20자). 비우면 '팔로우했어요'.",
+    )
+    follow_gate_retry_message = serializers.CharField(
+        required=False, allow_blank=True, default="",
+        help_text=(
+            "팔로우 미확인 시 재안내 문구. 비우면 시스템 기본 문구 사용. "
+            "재안내 메시지에도 같은 '팔로우했어요' 버튼이 자동 첨부된다."
+        ),
+    )
     reward_message_template = serializers.CharField(required=False, allow_blank=True, default="")
     gate_trigger_keywords = serializers.ListField(
         child=serializers.CharField(max_length=64),
         required=False,
         default=list,
-        help_text="[deprecated] Meta API 가 silent 검증을 지원하지 않아 무시됨.",
+        help_text="postback 미수신 구버전 클라이언트 fallback. 이 키워드 답장도 통과로 간주.",
     )
 
     # 운영
@@ -277,11 +310,16 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
             raise serializers.ValidationError(
                 {"opening_message_template": "opening_message_template 또는 message_template 중 하나는 필수입니다."}
             )
-        # Follow-gate 는 deprecated — 검증만 약하게 유지 (실제 동작 안 함)
+        # Follow-gate 사용 시 reward_message_template 필수
         if attrs.get("follow_gate_enabled"):
             if not (attrs.get("reward_message_template") or "").strip():
                 raise serializers.ValidationError(
-                    {"reward_message_template": "Follow-gate 사용 시 reward_message_template 필수 (단 현재 비활성화 상태)"}
+                    {
+                        "reward_message_template": (
+                            "Follow-gate 사용 시 reward_message_template 필수 "
+                            "(팔로우 확인 후 발송할 본 DM)"
+                        )
+                    }
                 )
         # public_reply: templates(list) 또는 legacy template 중 하나는 비어있지 않아야 함
         if attrs.get("public_reply_enabled"):
@@ -320,9 +358,11 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
             "public_reply_templates",
             "public_reply_batch_size",
             "public_reply_batch_pause_seconds",
-            # Follow-gate (deprecated)
+            # Follow-gate (v3.8)
             "follow_gate_enabled",
             "follow_gate_prompt",
+            "follow_gate_button_label",
+            "follow_gate_retry_message",
             "reward_message_template",
             "gate_trigger_keywords",
             "max_sends_per_hour",
@@ -345,6 +385,8 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
             "public_reply_batch_pause_seconds": {"required": False},
             "follow_gate_enabled": {"required": False},
             "follow_gate_prompt": {"required": False, "allow_blank": True},
+            "follow_gate_button_label": {"required": False, "allow_blank": True},
+            "follow_gate_retry_message": {"required": False, "allow_blank": True},
             "reward_message_template": {"required": False, "allow_blank": True},
             "gate_trigger_keywords": {"required": False},
         }
@@ -359,6 +401,8 @@ class SentDMLogSerializer(serializers.ModelSerializer):
     is_terminal = serializers.SerializerMethodField()
     display_status = serializers.SerializerMethodField()
     frontend_action = serializers.SerializerMethodField()
+    # v3.8: 캠페인 로그 1행 = opening 1건 기준. 그 흐름에서 팔로우 전환됐는지를 한눈에.
+    follow_passed = serializers.SerializerMethodField()
 
     class Meta:
         model = SentDMLog
@@ -407,6 +451,8 @@ class SentDMLogSerializer(serializers.ModelSerializer):
             "parent_log",
             "public_reply_id",
             "public_reply_posted_at",
+            # v3.8: 팔로우 전환 여부 (opening 1행만 보여줄 때 핵심 지표)
+            "follow_passed",
         ]
         read_only_fields = fields  # 모두 읽기 전용
 
@@ -425,6 +471,21 @@ class SentDMLogSerializer(serializers.ModelSerializer):
         from .dm_frontend_actions import build_frontend_action
 
         return build_frontend_action(obj.status)
+
+    @extend_schema_field(serializers.BooleanField(allow_null=True))
+    def get_follow_passed(self, obj):
+        """이 흐름에서 팔로우 전환됐는지 (opening 1행 관점).
+
+        - 게이트 미사용 (dm_kind=standalone)        → null
+        - 게이트 사용 + PASSED                       → true  (reward 발송됨)
+        - 게이트 사용 + PENDING / EXPIRED            → false (아직 또는 실패)
+        - child log (reward/retry) 행 자체           → null (자식 행은 list 에 뜨지 않지만 안전 fallback)
+        """
+        if obj.parent_log_id is not None:
+            return None
+        if obj.dm_kind != SentDMLog.DMKind.OPENING:
+            return None
+        return obj.gate_status == SentDMLog.GateStatus.PASSED
 
 
 _STATUS_DISPLAY = {

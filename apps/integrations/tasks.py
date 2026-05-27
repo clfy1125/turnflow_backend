@@ -510,10 +510,18 @@ def _enqueue_send_dm(
     )
 
     # 발송할 본문 + 분류 결정
-    # v3.5: Follow-gate 는 deprecated (Meta 한계로 검증 불가). 모든 DM 은 STANDALONE.
+    # v3.8: Follow-gate 재활성 (is_user_follow_business 기반 silent verify).
+    # reward_message_template 가 비어 있으면 게이트 의미 없음 → STANDALONE 으로 fallback.
     message_body = campaign.get_opening_message()
-    dm_kind = SentDMLog.DMKind.STANDALONE
-    gate_status = SentDMLog.GateStatus.NONE
+    if (
+        campaign.follow_gate_enabled
+        and (campaign.reward_message_template or "").strip()
+    ):
+        dm_kind = SentDMLog.DMKind.OPENING
+        gate_status = SentDMLog.GateStatus.PENDING
+    else:
+        dm_kind = SentDMLog.DMKind.STANDALONE
+        gate_status = SentDMLog.GateStatus.NONE
 
     # 시간당 발송 제한 체크
     if not campaign.can_send_more():
@@ -609,6 +617,22 @@ def send_dm_task(self, log_id: str):
 
     log.mark_submitting()
 
+    # Follow-gate: opening DM + PENDING 이면 generic template 버튼 첨부.
+    # 사용자가 버튼 클릭 시 webhook 으로 postback payload = "fg:{log_id}" 가 돌아온다.
+    # generic template 으로 보내야 인스타 앱에서 "메시지 박스 안에 버튼" 형태로 보임.
+    buttons = None
+    if (
+        log.dm_kind == SentDMLog.DMKind.OPENING
+        and log.gate_status == SentDMLog.GateStatus.PENDING
+    ):
+        buttons = [
+            {
+                "type": "postback",
+                "title": campaign.get_follow_gate_button_label(),
+                "payload": f"fg:{log.id}",
+            }
+        ]
+
     try:
         # ★ Story 답장 캠페인 (comment_id 없음) → user_id 기반 DM (24h 윈도우)
         # 그 외 (comment 트리거) → Private Reply via comment_id
@@ -618,6 +642,7 @@ def send_dm_task(self, log_id: str):
                 comment_id=log.comment_id,
                 message_text=log.message_sent,
                 access_token=ig_conn.access_token,
+                buttons=buttons,
             )
         else:
             result = InstagramMessagingService.send_dm_via_user_id(
@@ -625,6 +650,7 @@ def send_dm_task(self, log_id: str):
                 recipient_id=log.recipient_user_id,
                 message_text=log.message_sent,
                 access_token=ig_conn.access_token,
+                buttons=buttons,
             )
     except DMSendError as e:
         cls = exception_to_classification(e)
@@ -648,7 +674,11 @@ def send_dm_task(self, log_id: str):
             error_subcode=str(e.subcode) if e.subcode is not None else "",
             api_response=e.api_response,
         )
-        campaign.increment_failed()
+        # v3.8: parent_log 가 있는 child (reward / retry) DM 은 별도 트리거가 아니라
+        # 같은 캠페인-사용자 흐름의 후속 발송이므로 통계 카운터에서 제외.
+        # opening / standalone 만 캠페인 카운트.
+        if log.parent_log_id is None:
+            campaign.increment_failed()
 
         if cls.log_status == SentDMLog.Status.FAILED_TOKEN:
             ig_conn.mark_as_error(f"DM 발송 중 토큰/세션/권한 오류: {e}")
@@ -660,7 +690,9 @@ def send_dm_task(self, log_id: str):
         message_id=result["message_id"],
         api_response=result.get("_raw") or result,
     )
-    campaign.increment_sent()
+    # v3.8: child DM 은 카운트 제외 (위 increment_failed 와 같은 정책)
+    if log.parent_log_id is None:
+        campaign.increment_sent()
 
     # 5분 후 첫 능동 검증 예약 (echo가 먼저 오면 skip됨)
     verify_dm_delivery.apply_async(
@@ -1555,3 +1587,325 @@ def _check_and_handle_spam(
     except Exception as e:
         logger.exception(f"Error in spam check: {e}")
         return {"is_spam": False, "spam_filter_processed": False, "error": str(e)}
+
+
+# ═════════════════════════════════════════════════════════════
+# Follow-gate (v3.8): postback 수신 → IG Profile API 로 팔로우 확인 → 분기
+# ═════════════════════════════════════════════════════════════
+
+
+@shared_task(bind=True, max_retries=3)
+def process_follow_gate_postback(self, opening_log_id: str, igsid: str):
+    """
+    사용자가 opening DM 의 'follow_check' quick_reply 버튼을 눌렀을 때 호출.
+
+    흐름:
+        1) opening SentDMLog 조회 + 게이트 상태 검증 (멱등성)
+        2) IG Profile API: is_user_follow_business 호출
+        3) True  → reward DM 발송 (새 child SentDMLog, dm_kind=REWARD, parent_log 연결)
+                   opening log 의 gate_status 를 PASSED 로 마킹
+        4) False → 재안내 메시지 발송 (새 child SentDMLog, dm_kind=STANDALONE,
+                   parent_log 연결, quick_reply 재첨부) — opening 은 PENDING 유지
+
+    멱등성/스팸 방지:
+        - opening log 가 이미 PASSED 면 즉시 skip
+        - 같은 (campaign, igsid) 30초 쿨다운: 사용자가 미친 듯이 눌러도 한 번만 처리
+    """
+    try:
+        opening = SentDMLog.objects.select_related(
+            "campaign", "campaign__ig_connection"
+        ).get(id=opening_log_id)
+    except SentDMLog.DoesNotExist:
+        logger.warning("follow-gate: opening log %s not found", opening_log_id)
+        return {"status": "not_found"}
+
+    campaign = opening.campaign
+    ig_conn = campaign.ig_connection
+
+    # 이미 게이트 통과한 opening 이면 추가 처리 안 함
+    if opening.gate_status == SentDMLog.GateStatus.PASSED:
+        return {"status": "already_passed", "opening_log_id": str(opening.id)}
+
+    # 게이트 미사용 캠페인의 log 가 잘못 라우팅된 경우
+    if opening.dm_kind != SentDMLog.DMKind.OPENING:
+        return {"status": "skipped", "reason": "not_opening_dm"}
+
+    # 30초 쿨다운 — 사용자가 버튼을 연타해도 한 번만 IG API 호출
+    cooldown_cutoff = timezone.now() - timedelta(seconds=30)
+    recent_followup = SentDMLog.objects.filter(
+        parent_log=opening,
+        created_at__gte=cooldown_cutoff,
+    ).exists()
+    if recent_followup:
+        return {"status": "skipped", "reason": "cooldown_30s"}
+
+    if ig_conn.status != IGAccountConnection.Status.ACTIVE:
+        return {"status": "skipped", "reason": "ig_not_active"}
+
+    # IG Profile API 호출
+    try:
+        is_follow = InstagramMessagingService.check_user_follow_business(
+            igsid=igsid,
+            access_token=ig_conn.access_token,
+        )
+    except DMSendError as e:
+        cls = exception_to_classification(e)
+        if cls.retriable and self.request.retries < self.max_retries:
+            raise self.retry(exc=e, countdown=30) from e
+        logger.warning(
+            "follow-gate: profile check failed (terminal) log=%s err=%s", opening.id, e
+        )
+        return {"status": "failed", "reason": str(e)}
+
+    follow_passed = bool(is_follow)
+    if is_follow is None:
+        # Meta 가 필드를 안 내려준 경우 — 권한/잘못된 IGSID. 보수적으로 미통과 처리.
+        follow_passed = False
+
+    if follow_passed:
+        return _enqueue_reward_dm(opening=opening, igsid=igsid)
+    return _enqueue_follow_retry(opening=opening, igsid=igsid)
+
+
+def _enqueue_reward_dm(*, opening: SentDMLog, igsid: str) -> dict:
+    """Gate 통과 → reward DM 발송 큐에 enqueue."""
+    campaign = opening.campaign
+    reward_body = (campaign.reward_message_template or "").strip()
+    if not reward_body:
+        # 정책상 reward 비어있으면 게이트도 못 켜지지만 안전망
+        opening.gate_status = SentDMLog.GateStatus.PASSED
+        opening.save(update_fields=["gate_status", "sent_at"])
+        return {"status": "passed_no_reward", "opening_log_id": str(opening.id)}
+
+    # reward 는 새 idempotency_key (opening_log_id 를 시드로) — 같은 opening 에서
+    # 두 번 PASSED 처리해도 같은 키가 나와 DB UNIQUE 로 중복 방지.
+    import hashlib
+
+    key_raw = f"reward:{campaign.id}:{opening.id}"
+    idem = hashlib.sha256(key_raw.encode("utf-8")).hexdigest()
+
+    try:
+        with transaction.atomic():
+            reward_log = SentDMLog.objects.create(
+                campaign=campaign,
+                comment_id="",  # reward 는 24h 윈도우 내 user_id 발송
+                comment_text="",
+                recipient_user_id=igsid,
+                recipient_username=opening.recipient_username,
+                message_sent=reward_body,
+                status=SentDMLog.Status.QUEUED,
+                idempotency_key=idem,
+                dm_kind=SentDMLog.DMKind.REWARD,
+                gate_status=SentDMLog.GateStatus.PASSED,
+                parent_log=opening,
+            )
+            # opening 도 PASSED 로 마킹
+            SentDMLog.objects.filter(pk=opening.pk).update(
+                gate_status=SentDMLog.GateStatus.PASSED
+            )
+    except IntegrityError:
+        existing = SentDMLog.objects.filter(idempotency_key=idem).first()
+        return {
+            "status": "duplicate_reward",
+            "opening_log_id": str(opening.id),
+            "reward_log_id": str(existing.id) if existing else None,
+        }
+
+    send_dm_task.delay(str(reward_log.id))
+    return {
+        "status": "reward_enqueued",
+        "opening_log_id": str(opening.id),
+        "reward_log_id": str(reward_log.id),
+    }
+
+
+def _enqueue_follow_retry(*, opening: SentDMLog, igsid: str) -> dict:
+    """Gate 미통과 → 재안내 메시지 + 같은 quick_reply 재첨부.
+
+    매 재시도마다 새 SentDMLog 가 생기지만, parent_log 로 opening 에 묶인다.
+    opening 의 gate_status 는 PENDING 유지 (여전히 통과 대기).
+    재시도 로그도 OPENING + PENDING 으로 만들어 send_dm_task 가 quick_reply 를 첨부하게 한다.
+    """
+    campaign = opening.campaign
+    retry_body = campaign.get_follow_gate_retry_message()
+
+    # 멱등성 키: 같은 opening 의 재시도들은 시각까지 포함해 매번 다르게.
+    # (사용자가 의도적으로 여러 번 누르는 시나리오 = 별도 발송)
+    import hashlib
+
+    key_raw = f"retry:{campaign.id}:{opening.id}:{timezone.now().timestamp():.0f}"
+    idem = hashlib.sha256(key_raw.encode("utf-8")).hexdigest()
+
+    try:
+        with transaction.atomic():
+            retry_log = SentDMLog.objects.create(
+                campaign=campaign,
+                comment_id="",  # 재안내도 user_id 기반 (24h 윈도우 사용자가 방금 상호작용함)
+                comment_text="",
+                recipient_user_id=igsid,
+                recipient_username=opening.recipient_username,
+                message_sent=retry_body,
+                status=SentDMLog.Status.QUEUED,
+                idempotency_key=idem,
+                dm_kind=SentDMLog.DMKind.OPENING,  # quick_reply 다시 붙도록
+                gate_status=SentDMLog.GateStatus.PENDING,
+                parent_log=opening,
+            )
+    except IntegrityError:
+        existing = SentDMLog.objects.filter(idempotency_key=idem).first()
+        return {
+            "status": "duplicate_retry",
+            "opening_log_id": str(opening.id),
+            "retry_log_id": str(existing.id) if existing else None,
+        }
+
+    send_dm_task.delay(str(retry_log.id))
+    return {
+        "status": "retry_enqueued",
+        "opening_log_id": str(opening.id),
+        "retry_log_id": str(retry_log.id),
+    }
+
+
+# ============================================================================
+# 프로필 사진 캐싱 (R2/로컬 default_storage 에 사본 보관)
+# ============================================================================
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=60)
+def sync_ig_profile_picture(self, connection_id: str) -> dict:
+    """IG 프로필 사진을 최신화하여 R2/로컬 default_storage 에 캐싱.
+
+    동작:
+        1) IGAccountConnection 조회 (status=ACTIVE 만)
+        2) IG /me API 호출 → 최신 profile_picture_url + name + username 획득
+        3) source URL 이 기존과 같으면 synced_at 만 갱신 후 종료 (dedup)
+        4) 다르면 fetch_and_store_profile_image() 로 다운로드/정제/저장
+        5) 4개 필드 + name + username 갱신
+        6) 401/403 → connection.mark_as_error + status 표시
+
+    Returns:
+        {"status": "updated"|"unchanged"|"skipped"|"failed", "connection_id": ..., ...}
+    """
+    from .models import IGAccountConnection
+    from .profile_image import ProfileImageFetchError, fetch_and_store_profile_image
+    from .services import InstagramOAuthService, MockInstagramProvider
+
+    try:
+        conn = IGAccountConnection.objects.get(id=connection_id)
+    except IGAccountConnection.DoesNotExist:
+        logger.warning("sync_ig_profile_picture: connection not found id=%s", connection_id)
+        return {"status": "skipped", "reason": "connection_not_found", "connection_id": connection_id}
+
+    if conn.status != IGAccountConnection.Status.ACTIVE:
+        logger.info("sync_ig_profile_picture: skip non-active conn=%s status=%s", conn.id, conn.status)
+        return {"status": "skipped", "reason": f"status_{conn.status}", "connection_id": str(conn.id)}
+
+    token = conn.access_token
+    if not token:
+        logger.warning("sync_ig_profile_picture: no access_token conn=%s", conn.id)
+        return {"status": "skipped", "reason": "no_token", "connection_id": str(conn.id)}
+
+    # Mock 토큰이면 mock account info 사용
+    try:
+        if MockInstagramProvider.is_mock_token(token):
+            account_info = MockInstagramProvider.get_mock_account_info(token)
+        else:
+            account_info = InstagramOAuthService.get_account_info(token)
+    except Exception as e:  # noqa: BLE001
+        # 401/403 → 토큰 만료/회수 가능성 → status 갱신
+        msg = str(e)
+        if "401" in msg or "403" in msg or "OAuthException" in msg:
+            conn.mark_as_error(f"profile sync token error: {msg[:200]}")
+        logger.warning("sync_ig_profile_picture: get_account_info failed conn=%s err=%s", conn.id, e)
+        try:
+            self.retry(exc=e)
+        except self.MaxRetriesExceededError:
+            pass
+        return {"status": "failed", "reason": "get_account_info_failed", "connection_id": str(conn.id)}
+
+    remote_url = (account_info.get("profile_picture_url") or "").strip()
+    new_name = (account_info.get("name") or "").strip()
+    new_username = (account_info.get("username") or "").strip()
+
+    # name/username 은 항상 최신화 (사진 변화와 무관)
+    name_changed = bool(new_name) and new_name != conn.name
+    username_changed = bool(new_username) and new_username != conn.username
+
+    # 소스 URL 동일하면 다운로드 생략
+    if remote_url and remote_url == conn.profile_picture_source_url and conn.profile_picture_url:
+        update_fields = ["profile_picture_synced_at", "updated_at"]
+        conn.profile_picture_synced_at = timezone.now()
+        if name_changed:
+            conn.name = new_name
+            update_fields.append("name")
+        if username_changed:
+            conn.username = new_username
+            update_fields.append("username")
+        conn.save(update_fields=update_fields)
+        return {
+            "status": "unchanged",
+            "connection_id": str(conn.id),
+            "profile_picture_url": conn.profile_picture_url,
+        }
+
+    # 소스 URL 없으면 (mock 등) 사진은 비워두고 메타만 갱신
+    if not remote_url:
+        update_fields = ["profile_picture_synced_at", "updated_at"]
+        conn.profile_picture_synced_at = timezone.now()
+        if name_changed:
+            conn.name = new_name
+            update_fields.append("name")
+        if username_changed:
+            conn.username = new_username
+            update_fields.append("username")
+        conn.save(update_fields=update_fields)
+        return {
+            "status": "skipped",
+            "reason": "no_remote_url",
+            "connection_id": str(conn.id),
+        }
+
+    # 다운로드/저장
+    try:
+        new_cached_url = fetch_and_store_profile_image(remote_url, conn.external_account_id)
+    except ProfileImageFetchError as e:
+        logger.warning("sync_ig_profile_picture: fetch failed conn=%s err=%s", conn.id, e)
+        # 메타라도 갱신
+        update_fields = ["profile_picture_synced_at", "updated_at"]
+        conn.profile_picture_synced_at = timezone.now()
+        if name_changed:
+            conn.name = new_name
+            update_fields.append("name")
+        if username_changed:
+            conn.username = new_username
+            update_fields.append("username")
+        conn.save(update_fields=update_fields)
+        return {"status": "failed", "reason": f"fetch_error: {e}", "connection_id": str(conn.id)}
+
+    # 정상 갱신
+    conn.profile_picture_url = new_cached_url
+    conn.profile_picture_source_url = remote_url
+    conn.profile_picture_synced_at = timezone.now()
+    update_fields = [
+        "profile_picture_url",
+        "profile_picture_source_url",
+        "profile_picture_synced_at",
+        "updated_at",
+    ]
+    if name_changed:
+        conn.name = new_name
+        update_fields.append("name")
+    if username_changed:
+        conn.username = new_username
+        update_fields.append("username")
+    conn.save(update_fields=update_fields)
+
+    logger.info(
+        "sync_ig_profile_picture: updated conn=%s url=%s", conn.id, new_cached_url
+    )
+    return {
+        "status": "updated",
+        "connection_id": str(conn.id),
+        "profile_picture_url": new_cached_url,
+    }

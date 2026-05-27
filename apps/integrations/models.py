@@ -50,9 +50,31 @@ class IGAccountConnection(models.Model):
         max_length=255, verbose_name="Instagram Account ID", db_index=True
     )
     username = models.CharField(max_length=255, verbose_name="Instagram Username", blank=True)
+    name = models.CharField(
+        max_length=255, blank=True, default="",
+        verbose_name="Display Name",
+        help_text="IG /me 응답의 name 필드 (사람이 읽는 표시명)",
+    )
     account_type = models.CharField(
         max_length=50, verbose_name="Account Type", blank=True
     )  # BUSINESS, CREATOR
+
+    # Profile picture — IG CDN URL 은 서명된 일시 URL 로 만료될 수 있으므로
+    # 우리 스토리지(R2/로컬)에 사본을 보관하여 안정 URL 제공.
+    profile_picture_url = models.URLField(
+        max_length=1024, blank=True, default="",
+        verbose_name="Cached Profile Picture URL",
+        help_text="R2/로컬에 캐싱된 안정 URL — 프론트에 노출",
+    )
+    profile_picture_source_url = models.TextField(
+        blank=True, default="",
+        verbose_name="IG Source Profile Picture URL",
+        help_text="IG /me 가 준 원본 URL — 변경 감지/디버그용 (내부)",
+    )
+    profile_picture_synced_at = models.DateTimeField(
+        null=True, blank=True,
+        verbose_name="Profile Picture Last Synced At",
+    )
 
     # OAuth Tokens (encrypted)
     _encrypted_access_token = models.TextField(verbose_name="Encrypted Access Token")
@@ -263,9 +285,12 @@ class AutoDMCampaign(models.Model):
         keyword_filter 가 비어 있으면 모든 댓글 매칭.
         있으면 keyword_mode (any/all/exact) 에 따라 평가.
 
-    Follow-gate (Meta API 한계로 silent verify 불가):
-        opening DM 에서 "팔로우 후 'GO' 답장" 안내 → 사용자가 답장 시 reward DM 발송.
-        gate_trigger_keywords 매칭으로만 검증 가능.
+    Follow-gate (v3.8 — is_user_follow_business 기반 silent verify):
+        opening DM 에 quick_reply 버튼 ("팔로우했어요") 첨부 → 사용자 클릭 시
+        messaging_postbacks 웹훅 → IGSID 로 is_user_follow_business 호출 →
+            true  → reward DM 발송 (PASSED)
+            false → 재안내 메시지 + 버튼 재첨부 (PENDING 유지)
+        gate_trigger_keywords 는 postback 미수신·구버전 클라이언트용 fallback 으로 유지.
     """
 
     class Status(models.TextChoices):
@@ -401,20 +426,39 @@ class AutoDMCampaign(models.Model):
         help_text="배치 크기 도달 시 다음 답글까지 대기 시간 (Instagram 봇 검사 회피)",
     )
 
-    # Follow-gate (deprecated — Meta API 한계로 silent verify 불가, 답글 신뢰만 가능)
-    # 코드 레벨에선 비활성화. 기존 데이터 호환을 위해 컬럼만 유지.
+    # Follow-gate (v3.8 — is_user_follow_business silent verify)
     follow_gate_enabled = models.BooleanField(
         default=False,
-        verbose_name="Follow-gate 사용 (deprecated)",
-        help_text="[deprecated] Meta API 한계로 silent 검증 불가능 — 코드 무시됨.",
+        verbose_name="Follow-gate 사용",
+        help_text=(
+            "활성화 시 opening DM 에 '팔로우했어요' quick_reply 버튼이 추가되고, "
+            "사용자가 버튼 클릭 시 IG Profile API 로 팔로우 여부를 silent 검증한 뒤 "
+            "reward_message_template 을 발송한다."
+        ),
     )
     follow_gate_prompt = models.TextField(
         blank=True,
         default="",
         verbose_name="Follow-gate 안내 문구",
         help_text=(
-            "Opening DM에 추가될 follow 요청 문구. "
-            "예: '@우리계정 팔로우 후 GO 라고 답장해주세요'"
+            "Opening DM 본문에 들어갈 follow 요청 문구. "
+            "예: '댓글 남겨주셔서 감사해요! 팔로우도 하셨나요? 버튼을 눌러주세요!'"
+        ),
+    )
+    follow_gate_button_label = models.CharField(
+        max_length=20,
+        blank=True,
+        default="팔로우했어요",
+        verbose_name="Follow-gate 버튼 텍스트",
+        help_text="quick_reply 버튼 라벨 (Meta 한도 20자). 비우면 '팔로우했어요' 사용.",
+    )
+    follow_gate_retry_message = models.TextField(
+        blank=True,
+        default="",
+        verbose_name="Follow 미확인 시 재안내 메시지",
+        help_text=(
+            "팔로우 체크가 false 로 돌아왔을 때 발송할 안내 문구. 비우면 기본 문구 사용.\n"
+            "예: '앗! 팔로우 확인이 안됐어요 😣 프로필에서 팔로우 후 다시 버튼을 눌러주세요!'"
         ),
     )
     reward_message_template = models.TextField(
@@ -426,8 +470,11 @@ class AutoDMCampaign(models.Model):
     gate_trigger_keywords = models.JSONField(
         default=list,
         blank=True,
-        verbose_name="Gate 통과 키워드",
-        help_text="이 키워드로 답장 시 gate 통과로 간주. 예: ['GO', 'YES', '네']",
+        verbose_name="Gate 통과 키워드 (fallback)",
+        help_text=(
+            "postback 을 못 받는 구버전 클라이언트 fallback. "
+            "이 키워드로 답장 시 gate 통과로 간주. 예: ['GO', 'YES', '네']"
+        ),
     )
 
     # 발송 옵션
@@ -484,11 +531,32 @@ class AutoDMCampaign(models.Model):
     # ===== 신규 로직 헬퍼 =====
 
     def get_opening_message(self) -> str:
-        """DM 본문 — legacy message_template과 호환.
+        """Opening DM 본문.
 
-        Follow-gate prompt 첨부는 deprecated (Meta 한계로 검증 불가).
+        follow_gate_enabled 인 경우 follow_gate_prompt 가 우선 사용된다
+        (= 화면상 "팔로우도 하셨나요?" 안내). 비어 있으면 기본 템플릿으로 fallback.
+        gate 미사용 캠페인은 기존 동작 (opening_message_template / message_template) 유지.
         """
+        if self.follow_gate_enabled:
+            prompt = (self.follow_gate_prompt or "").strip()
+            if prompt:
+                return prompt
         return self.opening_message_template or self.message_template or ""
+
+    # Follow-gate 기본 문구 (필드가 비어있을 때 fallback)
+    DEFAULT_FOLLOW_GATE_PROMPT = "댓글 남겨주셔서 감사해요!\n팔로우도 하셨나요? 버튼을 눌러주세요!"
+    DEFAULT_FOLLOW_GATE_BUTTON = "팔로우했어요"
+    DEFAULT_FOLLOW_GATE_RETRY = (
+        "앗! 팔로우 확인이 안됐어요. 😣\n"
+        "프로필로 이동해 팔로우를 해주시고 다시 버튼을 눌러주세요!"
+    )
+
+    def get_follow_gate_button_label(self) -> str:
+        return (self.follow_gate_button_label or "").strip() or self.DEFAULT_FOLLOW_GATE_BUTTON
+
+    def get_follow_gate_retry_message(self) -> str:
+        """Follow 미확인 시 재안내 문구. 캠페인 설정값 우선, 비면 기본 문구."""
+        return (self.follow_gate_retry_message or "").strip() or self.DEFAULT_FOLLOW_GATE_RETRY
 
     def pick_public_reply_template(self) -> str:
         """공개 답글 템플릿 1개 선택.

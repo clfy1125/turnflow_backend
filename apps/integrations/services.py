@@ -367,10 +367,17 @@ class MockInstagramProvider:
         user_id = f"mock_ig_{uuid.uuid4().hex[:12]}"
         username = f"mock_user_{secrets.token_hex(4)}"
 
+        # Mock profile picture — placehold.co 는 외부 다운로드 가능한 더미 이미지를 제공.
+        # 실제 운영 전환 시 IG 가 준 서명된 CDN URL 로 대체됨.
+        profile_picture_url = f"https://placehold.co/320x320/png?text=@{username}"
+
         return {
             "id": user_id,
+            "user_id": user_id,
             "username": username,
+            "name": f"Mock {username}",
             "account_type": "BUSINESS",
+            "profile_picture_url": profile_picture_url,
         }
 
     @classmethod
@@ -431,22 +438,30 @@ class InstagramMessagingService:
         comment_id: str,
         message_text: str,
         access_token: str,
+        quick_replies: Optional[list] = None,
+        buttons: Optional[list] = None,
     ) -> Dict:
         """
         Private Reply DM 발송 (POST /{ig_user_id}/messages, recipient.comment_id 사용)
 
+        Args:
+            quick_replies: 메시지 하단 inline 옵션. {"title", "payload"} 리스트. 최대 13개.
+            buttons: 메시지 카드(generic template) 내부 postback 버튼.
+                {"title", "payload", "type"=postback} 리스트. 최대 3개.
+                buttons 가 있으면 generic template 포맷으로 전송되어
+                인스타 앱에서 "버튼이 박힌 메시지" 형태로 보인다.
+                quick_replies 와 동시에 지정 시 buttons 우선.
+
         Returns:
             {"message_id": "...", "recipient_id": "...", "_raw": {...}}
-
-        Raises:
-            DMTransientError: 네트워크 타임아웃 / 5xx (재시도 가능)
-            DMTokenError / DMWindowExpiredError / DMInvalidParamError / DMApiError
-            DMAnomalyError: 200인데 message_id 누락
         """
         url = f"{cls.GRAPH_API_BASE}/{ig_user_id}/messages"
+        message = cls._build_message_payload(
+            text=message_text, quick_replies=quick_replies, buttons=buttons
+        )
         payload = {
             "recipient": {"comment_id": comment_id},
-            "message": {"text": message_text},
+            "message": message,
         }
         return cls._post_message(url, payload, access_token)
 
@@ -457,16 +472,174 @@ class InstagramMessagingService:
         recipient_id: str,
         message_text: str,
         access_token: str,
+        quick_replies: Optional[list] = None,
+        buttons: Optional[list] = None,
     ) -> Dict:
-        """
-        사용자 ID 기반 DM 발송 (24h 윈도우 내에서만 허용)
-        """
+        """사용자 ID 기반 DM 발송 (24h 윈도우 내에서만 허용)."""
         url = f"{cls.GRAPH_API_BASE}/{ig_user_id}/messages"
+        message = cls._build_message_payload(
+            text=message_text, quick_replies=quick_replies, buttons=buttons
+        )
         payload = {
             "recipient": {"id": recipient_id},
-            "message": {"text": message_text},
+            "message": message,
         }
         return cls._post_message(url, payload, access_token)
+
+    @classmethod
+    def _build_message_payload(
+        cls,
+        *,
+        text: str,
+        quick_replies: Optional[list] = None,
+        buttons: Optional[list] = None,
+    ) -> Dict:
+        """Meta IG message 페이로드 빌드.
+
+        - buttons 있음 → generic template (카드 + postback 버튼)
+        - quick_replies 있음 → plain text + quick_replies
+        - 둘 다 없음 → plain text
+        """
+        if buttons:
+            norm = cls._normalize_postback_buttons(buttons)
+            if norm:
+                # Meta IG generic: elements[0].title 필수 (80자 한도)
+                title = (text or " ").strip() or " "
+                return {
+                    "attachment": {
+                        "type": "template",
+                        "payload": {
+                            "template_type": "generic",
+                            "elements": [
+                                {
+                                    "title": title[:80],
+                                    "buttons": norm,
+                                }
+                            ],
+                        },
+                    }
+                }
+        message: Dict = {"text": text}
+        if quick_replies:
+            qr = cls._normalize_quick_replies(quick_replies)
+            if qr:
+                message["quick_replies"] = qr
+        return message
+
+    @staticmethod
+    def _normalize_quick_replies(buttons: list) -> list:
+        """Meta v25 quick_replies 스키마로 변환. 최대 13개, title 20자."""
+        out = []
+        for b in buttons[:13]:
+            if not isinstance(b, dict):
+                continue
+            title = str(b.get("title", "")).strip()
+            payload_val = str(b.get("payload", "")).strip()
+            if not title or not payload_val:
+                continue
+            out.append(
+                {
+                    "content_type": b.get("content_type", "text"),
+                    "title": title[:20],
+                    "payload": payload_val[:1000],
+                }
+            )
+        return out
+
+    @staticmethod
+    def _normalize_postback_buttons(buttons: list) -> list:
+        """Meta generic template buttons 스키마로 변환. 최대 3개, title 20자."""
+        out = []
+        for b in buttons[:3]:
+            if not isinstance(b, dict):
+                continue
+            title = str(b.get("title", "")).strip()
+            payload_val = str(b.get("payload", "")).strip()
+            if not title or not payload_val:
+                continue
+            out.append(
+                {
+                    "type": b.get("type", "postback"),
+                    "title": title[:20],
+                    "payload": payload_val[:1000],
+                }
+            )
+        return out
+
+    # ===== Follow-gate: 사용자가 비즈니스 계정을 팔로우 중인지 조회 =====
+
+    @classmethod
+    def check_user_follow_business(
+        cls,
+        igsid: str,
+        access_token: str,
+    ) -> Optional[bool]:
+        """
+        GET /v25.0/{IGSID}?fields=is_user_follow_business
+
+        Meta IG User Profile API. 24h 메시징 윈도우 내인 IGSID(상호작용 이력이 있는
+        사용자)에 한해 호출 가능. 응답의 `is_user_follow_business` 가 true 면
+        해당 사용자는 비즈니스 계정을 팔로우 중.
+
+        Returns:
+            True/False  — Meta 가 명시적으로 응답한 경우
+            None        — 필드 누락(권한 부족) / 호출 자체 실패 (호출부에서 보수적 처리)
+
+        Raises:
+            DMTokenError: code 190 등 토큰 무효 (즉시 처리 중단해야 함)
+            DMTransientError: 5xx / 네트워크 (재시도 가능)
+        """
+        from .dm_exceptions import (
+            DMApiError,
+            DMTokenError,
+            DMTransientError,
+            TOKEN_CODES,
+        )
+
+        if not igsid:
+            return None
+
+        url = f"{cls.GRAPH_API_BASE}/{igsid}"
+        params = {"fields": "is_user_follow_business"}
+
+        try:
+            resp = requests.get(
+                url,
+                params=params,
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=cls.DEFAULT_TIMEOUT,
+            )
+        except requests.Timeout as e:
+            raise DMTransientError(f"check_follow timeout: {e}") from e
+        except requests.ConnectionError as e:
+            raise DMTransientError(f"check_follow connection error: {e}") from e
+
+        if resp.status_code == 404:
+            # IGSID 가 더 이상 유효하지 않음 (사용자 삭제 등) — 보수적으로 None
+            return None
+
+        if not resp.ok:
+            try:
+                body = resp.json()
+            except ValueError:
+                body = {"error": {"message": resp.text}}
+            err = body.get("error", {}) or {}
+            code = err.get("code")
+            msg = err.get("message", f"HTTP {resp.status_code}")
+            if code in TOKEN_CODES:
+                raise DMTokenError(msg, status=resp.status_code, code=code, api_response=body)
+            if 500 <= resp.status_code < 600:
+                raise DMTransientError(msg, status=resp.status_code, code=code, api_response=body)
+            # 그 외 4xx — 권한 부족 / 잘못된 IGSID 등은 None 으로 fallback
+            return None
+
+        try:
+            body = resp.json()
+        except ValueError:
+            return None
+        if "is_user_follow_business" not in body:
+            return None
+        return bool(body.get("is_user_follow_business"))
 
     @classmethod
     def _post_message(cls, url: str, payload: dict, access_token: str) -> Dict:
