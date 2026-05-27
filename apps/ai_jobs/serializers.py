@@ -179,3 +179,130 @@ class AiLlmTryResponseSerializer(serializers.Serializer):
         child=serializers.CharField(),
         help_text="실제 모델에 보낸 프롬프트 ({system, user_head, user_tail}). 디버깅용.",
     )
+
+
+# ── SNS 게시물 카테고리 분류 ────────────────────────────────────
+
+
+class ClassifyPostItemSerializer(serializers.Serializer):
+    """ClassifyPosts 요청 내 게시물 한 건."""
+
+    id = serializers.CharField(
+        max_length=120,
+        help_text="게시물 식별자 (응답 assignments.post_id 와 1:1 매칭). Apify shortCode 또는 임의 ID.",
+    )
+    caption = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+        help_text="게시물 본문/캡션. 길어도 OK — 서버에서 적절히 잘라 LLM에 전달.",
+    )
+    hashtags = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        default=list,
+        help_text="해시태그 (# 제외)",
+    )
+    type = serializers.CharField(
+        required=False, allow_blank=True, default="",
+        help_text="Image / Video / Sidecar 등 게시물 타입",
+    )
+    likes = serializers.IntegerField(required=False, default=0)
+    comments = serializers.IntegerField(required=False, default=0)
+    timestamp = serializers.CharField(required=False, allow_blank=True, default="")
+    thumbnail_url = serializers.URLField(
+        required=False, allow_blank=True, default="",
+        help_text="썸네일 URL. (현재는 텍스트 기반 분류만 — 향후 비전 입력으로 확장 시 사용)",
+    )
+
+
+class ClassifyCategoryItemSerializer(serializers.Serializer):
+    """기존 카테고리 한 건."""
+
+    label = serializers.CharField(max_length=40)
+    description = serializers.CharField(
+        required=False, allow_blank=True, default="",
+        help_text="LLM 이 의미 판단에 쓸 한 줄 설명",
+    )
+
+
+class ClassifyArtistContextSerializer(serializers.Serializer):
+    """작가 컨텍스트 (선택)."""
+
+    name = serializers.CharField(required=False, allow_blank=True, default="")
+    category = serializers.CharField(required=False, allow_blank=True, default="")
+    genre = serializers.CharField(required=False, allow_blank=True, default="")
+    bio = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class ClassifyPostsRequestSerializer(serializers.Serializer):
+    """POST /api/v1/ai/classify-posts/ 요청 바디."""
+
+    posts = ClassifyPostItemSerializer(
+        many=True,
+        min_length=1,
+        max_length=20,
+        help_text="분류할 게시물 배치. 1~20개. 속도-품질 균형은 6~9 권장.",
+    )
+    existing_categories = ClassifyCategoryItemSerializer(
+        many=True, required=False, default=list,
+        help_text="이미 정해진 카테고리 목록. 첫 호출에서는 빈 배열.",
+    )
+    artist_context = ClassifyArtistContextSerializer(
+        required=False, default=dict,
+        help_text="작가 메타 (LLM 이 톤/장르 판단에 활용).",
+    )
+    max_categories = serializers.IntegerField(
+        required=False, default=6, min_value=1, max_value=12,
+        help_text="한 페이지가 가질 카테고리 총 상한. 기본 6.",
+    )
+    model = serializers.ChoiceField(
+        choices=AiJob.LlmModel.choices,
+        default=AiJob.LlmModel.GEMMA,
+        required=False,
+        help_text="LLM 모델. 기본 gemma (자체 호스팅, 무료).",
+    )
+    max_tokens = serializers.IntegerField(
+        required=False, default=2500, min_value=256, max_value=8000,
+    )
+    temperature = serializers.FloatField(
+        required=False, default=0.1, min_value=0.0, max_value=2.0,
+        help_text="결정성 높이려고 기본 0.1.",
+    )
+    use_vision = serializers.BooleanField(
+        required=False, default=True,
+        help_text=(
+            "True 이면 각 post.thumbnail_url 을 ``image_url`` 멀티모달 블록으로 함께 보내,"
+            " LLM 이 이미지 안의 한국어 제목을 읽고 카테고리/제목을 판단한다."
+            " False 면 텍스트(캡션/태그)만으로 분류."
+        ),
+    )
+
+
+class ClassifyAssignmentSerializer(serializers.Serializer):
+    post_id = serializers.CharField()
+    category_label = serializers.CharField()
+    is_new_category = serializers.BooleanField()
+    suggested_title = serializers.CharField()
+    title_source = serializers.ChoiceField(
+        choices=["image", "caption", "fallback"],
+        help_text=(
+            "제목 출처. image=이미지 안 텍스트 사용, caption=캡션에서 추출,"
+            " fallback=카테고리+번호 자동."
+        ),
+        required=False,
+        default="caption",
+    )
+
+
+class ClassifyNewCategorySerializer(serializers.Serializer):
+    label = serializers.CharField()
+    description = serializers.CharField(allow_blank=True)
+
+
+class ClassifyPostsResponseSerializer(serializers.Serializer):
+    model = serializers.CharField()
+    elapsed_seconds = serializers.FloatField()
+    assignments = ClassifyAssignmentSerializer(many=True)
+    new_categories = ClassifyNewCategorySerializer(many=True)
+    usage = AiLlmTryUsageSerializer()

@@ -1,6 +1,7 @@
 from django.urls import path
 
 from .views import (
+    AiClassifyPostsView,
     AiJobDetailView,
     AiJobListCreateView,
     AiJobRollbackView,
@@ -25,5 +26,6 @@ urlpatterns = [
         name="page-job-list",
     ),
     path("test/llm/", AiLlmTryView.as_view(), name="llm-try"),
+    path("classify-posts/", AiClassifyPostsView.as_view(), name="classify-posts"),
     path("tokens/", AiTokenBalanceView.as_view(), name="token-balance"),
 ]

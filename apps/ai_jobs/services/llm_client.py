@@ -118,6 +118,56 @@ def call_llm(
     ).content
 
 
+def call_llm_messages_with_usage(
+    model: str,
+    messages: list[dict],
+    max_tokens: int = 8000,
+    temperature: float = 0.2,
+) -> LlmCallResult:
+    """이미 빌드된 messages 배열을 그대로 LLM 에 보낸다.
+
+    멀티모달(``content`` 가 list[dict])이나 다중 turn 호출에 사용. usage/cost
+    계산은 단일 호출과 동일.
+    """
+    client = _get_client()
+
+    extra_body: dict = {}
+    if model in ("gemma-4",) or model.startswith("openai/"):
+        extra_body = {"skip_special_tokens": False}
+
+    logger.info("LLM 멀티모달 호출 시작: model=%s, msgs=%d, max_tokens=%d",
+                model, len(messages), max_tokens)
+
+    started = time.time()
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        extra_body=extra_body or None,
+    )
+    elapsed = time.time() - started
+
+    content = response.choices[0].message.content or ""
+    usage = _extract_usage(response, model)
+    logger.info(
+        "LLM 멀티모달 응답: model=%s, %d chars, in=%d, out=%d, %.2fs",
+        model,
+        len(content),
+        usage.get("prompt_tokens", 0),
+        usage.get("completion_tokens", 0),
+        elapsed,
+    )
+
+    return LlmCallResult(
+        content=content,
+        model=model,
+        elapsed_seconds=elapsed,
+        **{k: v for k, v in usage.items() if k != "raw_usage"},
+        raw_usage=usage.get("raw_usage", {}),
+    )
+
+
 def call_llm_with_usage(
     model: str,
     system_prompt: str,

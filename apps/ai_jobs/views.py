@@ -42,12 +42,15 @@ from .serializers import (
     AiJobSerializer,
     AiLlmTryRequestSerializer,
     AiLlmTryResponseSerializer,
+    ClassifyPostsRequestSerializer,
+    ClassifyPostsResponseSerializer,
     PageAiJobHistoryItemSerializer,
 )
 from .services.llm_client import call_llm_with_usage
 from .services.model_router import resolve_model
 from .services.page_applier import apply_result_json_to_page
 from .services.parsers import extract_json
+from .services.post_classifier import classify_posts
 from .services.prompt_builder import build_prompts
 from .tasks import run_ai_job
 
@@ -1080,3 +1083,185 @@ class AiTokenBalanceView(APIView):
             "total_used": token_balance.total_used,
             "cost_per_generation": AiJob.TOKEN_COST,
         })
+
+
+class AiClassifyPostsView(APIView):
+    """POST /api/v1/ai/classify-posts/
+
+    SNS 게시물(인스타툰 등) 배치를 LLM 에 보내 카테고리 + 만화 제목으로 분류한다.
+    "한 게시물 = 한 카테고리" 가 보장된다. 첫 호출은 카테고리 0개로 시작하고,
+    이후 호출에서 누적된 카테고리를 ``existing_categories`` 로 넘기면 LLM 이 우선 재사용한다.
+
+    동기 호출이며 토큰 차감 없음 (자체 호스팅 Gemma 기본 사용).
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=[_TAG],
+        summary="SNS 게시물 카테고리 분류 (네이버 웹툰식 아카이브용)",
+        description="""
+## 개요
+인스타툰/SNS 게시물 배치를 LLM에 한 번에 보내, 각 게시물의 **카테고리**와 **만화 제목**
+을 받아옵니다. 작가 페이지를 "네이버 웹툰 목록" 처럼 카테고리별로 정리할 때 사용합니다.
+
+## 핵심 보장
+- **한 게시물 = 한 카테고리.** 응답의 `assignments` 에 각 `post_id` 가 정확히 1회 등장합니다.
+- **기존 카테고리 우선 재사용.** `existing_categories` 와 의미가 맞으면 그 라벨을 재사용하고,
+  안 맞을 때만 `is_new_category=true` 로 신규 카테고리를 추가합니다.
+- 첫 호출은 `existing_categories=[]` 로 시작 (= 0→N 새로 만듦).
+
+## 인증
+`Authorization: Bearer <access_token>` 헤더 필수. 일반 사용자도 사용 가능.
+
+## 속도 / 배치 가이드
+- 한 번에 1~20건 처리. **6~9건 권장** (속도-품질 균형).
+- gemma (자체 호스팅) 는 보통 1~5초. 토큰 차감 없음.
+
+## 요청 필드
+| 필드 | 필수 | 설명 |
+|------|:----:|------|
+| `posts` | ✅ | 분류 대상 게시물 배열. 항목당 `id`(고유키), `caption`, `hashtags`, `likes`, `comments`, `type`, `timestamp`, `thumbnail_url` |
+| `existing_categories` | ❌ | 이미 정해진 카테고리 [{label, description}]. 누적된 카테고리를 넘겨 재사용 유도 |
+| `artist_context` | ❌ | 작가 메타 {name, category, genre, bio}. LLM 톤/장르 판단에 활용 |
+| `max_categories` | ❌ | 한 페이지 카테고리 상한. 기본 6 |
+| `model` | ❌ | `gemma`(기본, 자체 호스팅), `deepseek` |
+| `max_tokens` | ❌ | 기본 2000 |
+| `temperature` | ❌ | 기본 0.1 (결정성 우선) |
+
+## 응답 필드
+| 필드 | 설명 |
+|------|------|
+| `model` | 실제 호출된 LLM 모델명 |
+| `elapsed_seconds` | LLM 호출 소요 시간 |
+| `assignments` | `[{post_id, category_label, is_new_category, suggested_title}]` |
+| `new_categories` | 이번 호출에서 새로 만든 카테고리 `[{label, description}]` |
+| `usage` | 토큰 사용량 (gemma 는 비용 0) |
+
+## 에러
+| 코드 | 원인 |
+|------|------|
+| 400 | 유효성 검증 실패 (posts 비어있음 등) |
+| 401 | 인증 실패 |
+| 502 | LLM 호출 실패 |
+        """,
+        request=ClassifyPostsRequestSerializer,
+        responses={
+            200: OpenApiResponse(
+                response=ClassifyPostsResponseSerializer,
+                description="분류 결과",
+                examples=[
+                    OpenApiExample(
+                        "첫 호출 (카테고리 0개 → 새로 만듦)",
+                        value={
+                            "model": "gemma-4",
+                            "elapsed_seconds": 2.83,
+                            "assignments": [
+                                {
+                                    "post_id": "DXxxx1",
+                                    "category_label": "💌 사연툰",
+                                    "is_new_category": True,
+                                    "suggested_title": "남친 헤어진 썰",
+                                },
+                                {
+                                    "post_id": "DXxxx2",
+                                    "category_label": "🍼 육아툰",
+                                    "is_new_category": True,
+                                    "suggested_title": "첫째의 사춘기",
+                                },
+                            ],
+                            "new_categories": [
+                                {"label": "💌 사연툰", "description": "독자 사연을 만화로 풀어낸 글"},
+                                {"label": "🍼 육아툰", "description": "아이/육아 일상 만화"},
+                            ],
+                            "usage": {
+                                "prompt_tokens": 612,
+                                "completion_tokens": 220,
+                                "total_tokens": 832,
+                                "cache_hit_tokens": 0,
+                                "cache_miss_tokens": 612,
+                                "estimated_cost_usd": 0.0,
+                            },
+                        },
+                    ),
+                ],
+            ),
+            400: OpenApiResponse(description="유효성 검증 실패"),
+            401: OpenApiResponse(description="인증 실패"),
+            502: OpenApiResponse(description="LLM 호출 실패"),
+        },
+        examples=[
+            OpenApiExample(
+                "첫 호출 (빈 카테고리)",
+                value={
+                    "posts": [
+                        {
+                            "id": "DXxxx1",
+                            "caption": "예상하신 분들도 계셨겠죠? 오래 사귄 남친이랑 헤어진 썰",
+                            "hashtags": ["일상툰", "썰툰"],
+                            "likes": 5382,
+                            "comments": 357,
+                            "type": "Sidecar",
+                        }
+                    ],
+                    "existing_categories": [],
+                    "artist_context": {
+                        "name": "쑤기툰",
+                        "category": "일상툰",
+                        "genre": "사연툰/육아툰",
+                        "bio": "세상의 모든 사연을 그립니다",
+                    },
+                    "max_categories": 6,
+                },
+                request_only=True,
+            ),
+        ],
+    )
+    def post(self, request):
+        ser = ClassifyPostsRequestSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        vd = ser.validated_data
+
+        llm_model = vd.get("model", AiJob.LlmModel.GEMMA)
+        if llm_model == AiJob.LlmModel.GPT5:
+            return Response(
+                {"detail": "GPT-5.4 모델은 현재 사용 불가입니다."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        model_name = resolve_model(llm_model)
+
+        try:
+            result = classify_posts(
+                posts=vd["posts"],
+                existing_categories=vd.get("existing_categories") or [],
+                artist_context=vd.get("artist_context") or {},
+                max_categories=vd.get("max_categories", 6),
+                model_name=model_name,
+                max_tokens=vd.get("max_tokens", 2500),
+                temperature=vd.get("temperature", 0.1),
+                use_vision=vd.get("use_vision", True),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return Response(
+                {"detail": "LLM 호출 실패", "error": str(exc)[:500]},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        return Response(
+            {
+                "model": result.model,
+                "elapsed_seconds": round(result.elapsed_seconds, 3),
+                "vision_used": result.vision_used,
+                "assignments": result.assignments,
+                "new_categories": result.new_categories,
+                "usage": {
+                    "prompt_tokens": result.prompt_tokens,
+                    "completion_tokens": result.completion_tokens,
+                    "total_tokens": result.total_tokens,
+                    "cache_hit_tokens": result.cache_hit_tokens,
+                    "cache_miss_tokens": result.cache_miss_tokens,
+                    "estimated_cost_usd": round(result.estimated_cost_usd, 6),
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
