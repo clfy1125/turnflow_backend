@@ -1,7 +1,45 @@
 {
   "permissions": {
     "allow": [
-      "Bash(pip show *)"
+      "Bash(pip show *)",
+      "mcp__payapp-api__list_api_commands",
+      "mcp__payapp-api__get_guide",
+      "mcp__payapp-api__search_guides",
+      "mcp__payapp-api__search_api",
+      "mcp__payapp-api__get_api_detail",
+      "Bash(python *)",
+      "Bash(curl -s -o /dev/null -w \"healthz: %{http_code} \\(%{time_total}s\\)\\\\n\" http://localhost:8000/api/v1/healthz)",
+      "Bash(curl -s -o /dev/null -w \"docs:    %{http_code} \\(%{time_total}s\\)\\\\n\" http://localhost:8000/api/docs/)",
+      "Bash(curl -s -o /dev/null -w \"schema:  %{http_code} \\(%{time_total}s\\)\\\\n\" http://localhost:8000/api/schema/)",
+      "Bash(curl -s -o /dev/null -w \"GET /api/v1/pages/@clone-test-linktree-shakira-e40gof/ → %{http_code}\\\\n\" http://localhost:8000/api/v1/pages/@clone-test-linktree-shakira-e40gof/)",
+      "Bash(curl -s \"http://localhost:8000/api/v1/pages/\" -H \"Accept: application/json\" -o /dev/null -w \"GET /api/v1/pages/ \\(no auth\\) → %{http_code}\\\\n\")",
+      "Bash(curl -sI https://pro-earwig-presently.ngrok-free.app/api/docs/)",
+      "Bash(curl -sI -H \"ngrok-skip-browser-warning: true\" https://pro-earwig-presently.ngrok-free.app/api/docs/)",
+      "Bash(curl -sv -o /dev/null https://pro-earwig-presently.ngrok-free.app/api/docs/)",
+      "Bash(curl -sk -o /dev/null -w \"[no header]    status=%{http_code} type=%{content_type}\\\\n\" https://pro-earwig-presently.ngrok-free.app/api/docs/)",
+      "Bash(curl -sk -H \"ngrok-skip-browser-warning: 1\" -o /dev/null -w \"[skip-warning] status=%{http_code} type=%{content_type}\\\\n\" https://pro-earwig-presently.ngrok-free.app/api/docs/)",
+      "Bash(curl -sk -H \"User-Agent: Chrome/120\" -o /tmp/ngrok_docs.html https://pro-earwig-presently.ngrok-free.app/api/docs/)",
+      "Read(//tmp/**)",
+      "PowerShell(try { $r = Invoke-WebRequest -Uri \"https://pro-earwig-presently.ngrok-free.app/api/docs/\" -Method Head -SkipCertificateCheck -ErrorAction Stop; \"[no hdr] \" + $r.StatusCode + \" \" + $r.Headers[\"Content-Type\"] } catch { \"[no hdr] FAIL: \" + $_.Exception.Message }; try { $r = Invoke-WebRequest -Uri \"https://pro-earwig-presently.ngrok-free.app/api/docs/\" -Method Head -Headers @{\"ngrok-skip-browser-warning\"=\"1\"} -SkipCertificateCheck -ErrorAction Stop; \"[skip-hdr] \" + $r.StatusCode + \" \" + $r.Headers[\"Content-Type\"] } catch { \"[skip-hdr] FAIL: \" + $_.Exception.Message })",
+      "PowerShell([System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12; try { $r = Invoke-WebRequest -Uri \"https://pro-earwig-presently.ngrok-free.app/api/docs/\" -Method Head -ErrorAction Stop; \"[no hdr] \" + $r.StatusCode + \" \" + $r.Headers[\"Content-Type\"] } catch { \"[no hdr] FAIL: \" + $_.Exception.Message }; try { $r = Invoke-WebRequest -Uri \"https://pro-earwig-presently.ngrok-free.app/api/docs/\" -Method Get -Headers @{\"ngrok-skip-browser-warning\"=\"1\"} -ErrorAction Stop; \"[skip-hdr] \" + $r.StatusCode + \" \" + $r.Headers[\"Content-Type\"] + \" len=\" + $r.Content.Length } catch { \"[skip-hdr] FAIL: \" + $_.Exception.Message })",
+      "Bash(where cloudflared *)",
+      "Bash(cloudflared --version)",
+      "Bash(cloudflared tunnel *)",
+      "Bash(tee /tmp/cf_tunnel.log)",
+      "Bash(taskkill //F //IM cloudflared.exe)",
+      "Bash(tee /tmp/cf2.log)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8000/api/v1/healthz)",
+      "WebFetch(domain:developers.tiktok.com)",
+      "WebFetch(domain:business-api.tiktok.com)",
+      "WebFetch(domain:developers.google.com)",
+      "WebFetch(domain:www.sprinklr.com)",
+      "Bash(xargs grep *)",
+      "Bash(docker stop clfy_postgres_db *)",
+      "Bash(curl *)"
     ]
-  }
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "payapp-api"
+  ]
 }

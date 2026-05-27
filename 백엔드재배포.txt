@@ -2,3 +2,9 @@ cd /opt/turnflow_backend
 git pull origin main
 docker compose -f docker-compose.prod.yml --env-file .env.production build
 docker compose -f docker-compose.prod.yml --env-file .env.production up -d
+
+
+cd /opt/turnflow_backend
+git pull origin main
+docker compose -f docker-compose.prod.yml --env-file .env.production build
+docker compose -f docker-compose.prod.yml --env-file .env.production up -d --force-recreate web celery_worker celery_beat

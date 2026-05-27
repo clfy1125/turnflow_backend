@@ -39,6 +39,7 @@ db.sqlite3-journal
 # Testing
 .pytest_cache/
 .coverage
+coverage.xml
 htmlcov/
 .tox/
 
