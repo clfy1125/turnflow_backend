@@ -6,6 +6,8 @@ Base settings - shared across all environments.
 
 import os
 from pathlib import Path
+
+from celery.schedules import crontab
 from decouple import config
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -338,6 +340,13 @@ CELERY_BEAT_SCHEDULE = {
         "task": "apps.integrations.tasks.dead_letter_alerter",
         "schedule": 60 * 10,  # 10분 — 토큰 만료/도착 미확인 누적 알림
     },
+    # ===== IG Long-lived Token 자동 갱신 =====
+    # 매일 KST 09:00 — 만료까지 14일 미만 ACTIVE 연동의 token refresh + Telegram 요약.
+    # Meta 정책: ig_refresh_token 호출 시 60일 신규 발급. 활성 사용자는 사실상 영구 유지.
+    "ig-refresh-tokens-pending-expiry": {
+        "task": "apps.integrations.tasks.refresh_ig_tokens_pending_expiry",
+        "schedule": crontab(hour=9, minute=0),  # CELERY_TIMEZONE=Asia/Seoul 기준
+    },
     # ===== Instagram Insights 동기화 (임시 비활성) =====
     # insights 기능 출시 보류 — Meta IG insights API 호출이 발생하지 않도록 4개 beat 모두 주석 처리.
     # 활성화 시점에 아래 4개를 복원 + INSIGHTS_API_ENABLED=True 로 전환.
@@ -424,6 +433,15 @@ INSTAGRAM_WEBHOOK_VERIFY_TOKEN = config(
 # Meta App (Facebook Login for Instagram Business)
 META_APP_ID = config("META_APP_ID", default="")
 META_APP_SECRET = config("META_APP_SECRET", default="")
+
+# ─────────────────────────────────────────────────────────────
+# Telegram 운영 알림 (토큰 refresh / 장애 등)
+# ─────────────────────────────────────────────────────────────
+# 두 값 모두 비어 있으면 알림 비활성 (개발/로컬 안전).
+# 봇 생성: @BotFather → /newbot → 토큰 발급. chat_id 는 봇과 대화 후
+# https://api.telegram.org/bot<TOKEN>/getUpdates 로 확인.
+TELEGRAM_BOT_TOKEN = config("TELEGRAM_BOT_TOKEN", default="")
+TELEGRAM_CHAT_ID = config("TELEGRAM_CHAT_ID", default="")
 
 # ─────────────────────────────────────────────────────────────
 # Insights API kill-switch

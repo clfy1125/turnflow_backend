@@ -1590,6 +1590,119 @@ def _check_and_handle_spam(
 
 
 # ═════════════════════════════════════════════════════════════
+# IG Long-lived Token 자동 갱신 (KST 09:00 daily)
+# ═════════════════════════════════════════════════════════════
+
+
+@shared_task(bind=True, max_retries=1)
+def refresh_ig_tokens_pending_expiry(self):
+    """만료까지 14일 미만 남은 ACTIVE IG 연동의 long-lived token 을 갱신.
+
+    Meta 정책: ig_refresh_token 호출 시 새로 60일짜리 토큰 발급 (권한 그대로).
+    활성 사용자라면 사실상 영구 유지 — 60일 이상 미사용 계정만 자연 만료.
+    실행 후 Telegram 으로 성공/실패 요약 push (best-effort).
+    """
+    from apps.core.telegram import send_telegram_notification
+
+    cutoff = timezone.now() + timedelta(days=14)
+    candidates = list(
+        IGAccountConnection.objects.filter(
+            status=IGAccountConnection.Status.ACTIVE,
+            token_expires_at__isnull=False,
+            token_expires_at__lte=cutoff,
+        )
+    )
+
+    succeeded: list[dict] = []
+    failed: list[dict] = []
+
+    for conn in candidates:
+        try:
+            result = InstagramOAuthService.refresh_long_lived_token(conn.access_token)
+            new_token = result.get("access_token")
+            if not new_token:
+                raise ValueError(f"refresh response missing access_token: {result}")
+            expires_in = int(result.get("expires_in", 60 * 24 * 3600))  # default 60일
+
+            conn.access_token = new_token  # EncryptedTextField 자동 암호화
+            conn.token_expires_at = timezone.now() + timedelta(seconds=expires_in)
+            conn.last_verified_at = timezone.now()
+            conn.error_message = ""
+            conn.save(
+                update_fields=[
+                    "_encrypted_access_token",
+                    "token_expires_at",
+                    "last_verified_at",
+                    "error_message",
+                    "updated_at",
+                ]
+            )
+            succeeded.append(
+                {
+                    "id": str(conn.id),
+                    "username": conn.username or "(unknown)",
+                    "new_expires_at": conn.token_expires_at.strftime("%Y-%m-%d"),
+                }
+            )
+            logger.info(
+                "IG token refreshed: conn=%s user=@%s new_exp=%s",
+                conn.id, conn.username, conn.token_expires_at,
+            )
+        except Exception as e:
+            logger.exception("IG token refresh failed: conn=%s err=%s", conn.id, e)
+            try:
+                conn.error_message = f"refresh failed: {e}"[:500]
+                conn.save(update_fields=["error_message", "updated_at"])
+            except Exception:
+                pass
+            failed.append(
+                {
+                    "id": str(conn.id),
+                    "username": conn.username or "(unknown)",
+                    "error": str(e)[:200],
+                }
+            )
+
+    message = _build_token_refresh_summary(
+        checked=len(candidates), succeeded=succeeded, failed=failed
+    )
+    send_telegram_notification(message)
+
+    return {
+        "checked": len(candidates),
+        "succeeded": len(succeeded),
+        "failed": len(failed),
+    }
+
+
+def _build_token_refresh_summary(*, checked: int, succeeded: list, failed: list) -> str:
+    """Telegram Markdown 요약 메시지 빌드."""
+    now_kst = timezone.localtime().strftime("%Y-%m-%d %H:%M KST")
+    lines = [
+        f"🔄 *IG Token Refresh* — {now_kst}",
+        "",
+        f"대상: *{checked}*개 (만료 D-14 이내)",
+        f"✅ 성공: *{len(succeeded)}*",
+        f"❌ 실패: *{len(failed)}*",
+    ]
+    if succeeded:
+        lines.append("")
+        lines.append("*Refreshed*")
+        for s in succeeded[:20]:
+            lines.append(f"• @{s['username']} → 다음 만료 `{s['new_expires_at']}`")
+        if len(succeeded) > 20:
+            lines.append(f"… 외 {len(succeeded) - 20}개")
+    if failed:
+        lines.append("")
+        lines.append("*Failed* (재OAuth 안내 필요)")
+        for f in failed[:20]:
+            lines.append(f"• @{f['username']} — `{f['error']}`")
+        if len(failed) > 20:
+            lines.append(f"… 외 {len(failed) - 20}개")
+    return "\n".join(lines)
+
+
+# ═════════════════════════════════════════════════════════════
 # Follow-gate (v3.8): postback 수신 → IG Profile API 로 팔로우 확인 → 분기
 # ═════════════════════════════════════════════════════════════
 
