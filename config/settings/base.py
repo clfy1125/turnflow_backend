@@ -49,6 +49,8 @@ MIDDLEWARE = [
     "whitenoise.middleware.WhiteNoiseMiddleware",
     "apps.core.middleware.RequestIDMiddleware",
     "apps.core.middleware.LoggingMiddleware",
+    # /api/v1/insights/* 전체 503 차단 (INSIGHTS_API_ENABLED=False 일 때만 동작)
+    "apps.insights.middleware.InsightsDisabledMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -336,26 +338,26 @@ CELERY_BEAT_SCHEDULE = {
         "task": "apps.integrations.tasks.dead_letter_alerter",
         "schedule": 60 * 10,  # 10분 — 토큰 만료/도착 미확인 누적 알림
     },
-    # ===== Instagram Insights 동기화 =====
-    # 호출량 절감: stale TTL 로 게시물별 재호출 빈도 차등 — 자세한 내용은
-    # apps/insights/models.py 의 IGMedia.insight_stale_ttl() 와
-    # apps/insights/tasks.py 헤더 참조.
-    "insights-sync-active-accounts-media": {
-        "task": "insights.sync_active_accounts_media",
-        "schedule": 60 * 30,  # 30분 — 신규 미디어 메타데이터 감지
-    },
-    "insights-refresh-recent-insights": {
-        "task": "insights.refresh_recent_insights",
-        "schedule": 60 * 30,  # 30분 — 최근 7일 게시물 인사이트
-    },
-    "insights-refresh-old-insights": {
-        "task": "insights.refresh_old_insights",
-        "schedule": 60 * 60 * 24,  # 24시간 — 그 외 게시물 인사이트
-    },
-    "insights-refresh-account-audience": {
-        "task": "insights.refresh_account_audience_insights",
-        "schedule": 60 * 60 * 24,  # 24시간 — 계정 단위 follow_type 도달 분포
-    },
+    # ===== Instagram Insights 동기화 (임시 비활성) =====
+    # insights 기능 출시 보류 — Meta IG insights API 호출이 발생하지 않도록 4개 beat 모두 주석 처리.
+    # 활성화 시점에 아래 4개를 복원 + INSIGHTS_API_ENABLED=True 로 전환.
+    # 호출량 절감 정책(stale TTL) 은 apps/insights/models.py 의 IGMedia.insight_stale_ttl() 참고.
+    # "insights-sync-active-accounts-media": {
+    #     "task": "insights.sync_active_accounts_media",
+    #     "schedule": 60 * 30,  # 30분 — 신규 미디어 메타데이터 감지
+    # },
+    # "insights-refresh-recent-insights": {
+    #     "task": "insights.refresh_recent_insights",
+    #     "schedule": 60 * 30,  # 30분 — 최근 7일 게시물 인사이트
+    # },
+    # "insights-refresh-old-insights": {
+    #     "task": "insights.refresh_old_insights",
+    #     "schedule": 60 * 60 * 24,  # 24시간 — 그 외 게시물 인사이트
+    # },
+    # "insights-refresh-account-audience": {
+    #     "task": "insights.refresh_account_audience_insights",
+    #     "schedule": 60 * 60 * 24,  # 24시간 — 계정 단위 follow_type 도달 분포
+    # },
     # NOTE: 아래는 deprecate (v3.5/v3.6) 로 Beat 에서 제거됨:
     #   - dm-expire-gate-pending: Follow-gate 가 deprecated 됨
     #   - dm-poll-new-media-for-next-campaigns: next_media 가 webhook 기반으로 전환
@@ -422,6 +424,13 @@ INSTAGRAM_WEBHOOK_VERIFY_TOKEN = config(
 # Meta App (Facebook Login for Instagram Business)
 META_APP_ID = config("META_APP_ID", default="")
 META_APP_SECRET = config("META_APP_SECRET", default="")
+
+# ─────────────────────────────────────────────────────────────
+# Insights API kill-switch
+# ─────────────────────────────────────────────────────────────
+# False (기본) 면 /api/v1/insights/* 전체와 관련 Celery beat 가 비활성.
+# Insights 기능 출시 시 env 로 INSIGHTS_API_ENABLED=True 로 전환.
+INSIGHTS_API_ENABLED = config("INSIGHTS_API_ENABLED", default=False, cast=bool)
 
 # ─────────────────────────────────────────────────────────────
 # Coupang Partners Open API (https://partners.coupang.com)

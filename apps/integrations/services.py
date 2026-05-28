@@ -28,14 +28,13 @@ class InstagramOAuthService:
     # Required scopes for Instagram Business Login
     # Ref: https://developers.facebook.com/docs/instagram-platform/instagram-api-with-instagram-login/business-login
     #
-    # NOTE: insights 권한 추가 (apps.insights 앱).
-    # 기존 계정은 재연동(reconnect) 없이는 insights API 호출이 403 으로 떨어진다.
-    # 프론트에서 신규 권한 누락 계정에 reconnect 배너를 띄우는 동선 필요.
+    # NOTE: insights 권한은 현재 임시 비활성 (apps.insights 기능 출시 보류).
+    # 활성화 시점에 아래 줄 주석 해제 + 기존 계정은 재연동(reconnect) 필요.
     REQUIRED_SCOPES = [
         "instagram_business_basic",
         "instagram_business_manage_comments",
         "instagram_business_manage_messages",
-        "instagram_business_manage_insights",
+        # "instagram_business_manage_insights",  # 임시 비활성 — insights 출시 시 복원
         # Optional:
         # "instagram_business_content_publish",
     ]
