@@ -1,5 +1,7 @@
 from rest_framework import serializers
 
+from apps.pages.models import Page, ReferenceCategory
+
 from .models import AiJob
 
 
@@ -23,6 +25,110 @@ class AiJobCreateSerializer(serializers.Serializer):
         required=False,
         help_text="사용할 AI 모델. `gemma`(기본), `gpt5`(GPT-5.4, 개발 중)",
     )
+    preserve_content = serializers.BooleanField(
+        default=False,
+        required=False,
+        help_text=(
+            "기존 텍스트 콘텐츠 보존 여부. "
+            "False(기본): AI 가 컨셉에 맞게 자유롭게 다시 작성 (극적 변화). "
+            "True: 표현은 다듬을 수 있지만 모든 의미·정보·줄바꿈/공백을 유지. "
+            "기존에 없던 시각 속성(예: 테두리)도 임의로 추가하지 않음."
+        ),
+    )
+    reference_page_slug = serializers.SlugField(
+        max_length=120,
+        required=False,
+        allow_blank=True,
+        default="",
+        help_text=(
+            "Few-shot 예시로 사용할 어드민이 큐레이션한 레퍼런스 페이지의 slug. "
+            "전달 시 해당 페이지(is_reference=True, is_public=True)의 design_settings/블록 구조를 "
+            "AI 에게 디자인 톤 참고 예시로 제공한다. "
+            "비어 있으면 기본 파일 예시 폴백."
+        ),
+    )
+    reference_category_slug = serializers.SlugField(
+        max_length=50,
+        required=False,
+        allow_blank=True,
+        default="",
+        help_text=(
+            "reference_page_slug 가 비어 있을 때만 사용. "
+            "지정 카테고리의 reference_order ASC 첫 페이지를 자동 선택."
+        ),
+    )
+
+    def validate(self, data):
+        ref_slug = (data.get("reference_page_slug") or "").strip()
+        if ref_slug:
+            exists = Page.objects.filter(
+                slug=ref_slug,
+                is_reference=True,
+                is_public=True,
+                is_active=True,
+            ).exists()
+            if not exists:
+                raise serializers.ValidationError({
+                    "reference_page_slug": (
+                        "레퍼런스 페이지를 찾을 수 없거나 활성/공개 상태가 아닙니다."
+                    )
+                })
+        return data
+
+
+class ReferenceCategorySerializer(serializers.ModelSerializer):
+    """`GET /api/v1/ai/categories/` 응답."""
+
+    reference_count = serializers.IntegerField(
+        read_only=True,
+        help_text="이 카테고리에 매핑된 활성 레퍼런스 페이지 수 (is_public + is_reference + snapshot=succeeded).",
+    )
+
+    class Meta:
+        model = ReferenceCategory
+        fields = [
+            "slug",
+            "name",
+            "description",
+            "icon_emoji",
+            "icon_url",
+            "sort_order",
+            "reference_count",
+        ]
+        read_only_fields = fields
+
+
+class ReferencePageListSerializer(serializers.ModelSerializer):
+    """`GET /api/v1/ai/categories/{slug}/references/` 응답 항목."""
+
+    reference_snapshot_url = serializers.SerializerMethodField()
+    effective_title = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Page
+        fields = [
+            "slug",
+            "title",
+            "effective_title",
+            "reference_title",
+            "reference_description",
+            "reference_order",
+            "reference_snapshot_url",
+            "reference_snapshot_updated_at",
+        ]
+        read_only_fields = fields
+
+    def get_reference_snapshot_url(self, obj: Page):
+        if not obj.reference_snapshot:
+            return None
+        url = obj.reference_snapshot.url
+        request = self.context.get("request")
+        if request is not None and url.startswith("/"):
+            return request.build_absolute_uri(url)
+        return url
+
+    def get_effective_title(self, obj: Page) -> str:
+        return (obj.reference_title or "").strip() or obj.title
 
 
 class AiJobSerializer(serializers.ModelSerializer):

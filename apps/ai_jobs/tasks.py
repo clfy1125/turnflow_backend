@@ -34,9 +34,12 @@ def run_ai_job(self, job_id: str):
     from .models import AiJob
     from .services.prompt_builder import build_prompts
     from .services.llm_client import call_llm
+    from .services.mode_router import FULL_RESTYLE_CHUNK_SIZE, chunk_blocks
     from .services.model_router import resolve_model
     from .services.parsers import extract_json
     from .services.image_resolver import resolve_images
+    from .services.placeholder import thaw_placeholders
+    from .services.style_patcher import merge_full_restyle, merge_style_only
 
     try:
         job = AiJob.objects.get(pk=job_id)
@@ -56,26 +59,144 @@ def run_ai_job(self, job_id: str):
         job.model_name = model_name
         job.save(update_fields=["model_name", "updated_at"])
 
-        system_prompt, user_prompt = build_prompts(
-            job_type=job.job_type,
-            user_input=job.input_payload,
-        )
-        job.resolved_prompt = f"[SYSTEM]\n{system_prompt}\n\n[USER]\n{user_prompt}"
-        job.save(update_fields=["resolved_prompt", "updated_at"])
-
-        # ── 2. LLM 호출 ────────────────────────────
-        job.set_stage(AiJob.Stage.CALLING_MODEL, 30, "AI가 페이지를 생성하고 있습니다.")
-
-        raw_response = call_llm(
-            model=model_name,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
+        # ── 2-3. LLM 호출 + 파싱 ────────────────────
+        # full_restyle 모드 + 블록이 chunk 크기 초과면 분할 호출.
+        input_payload = job.input_payload or {}
+        frozen_blocks = input_payload.get("existing_blocks") or []
+        is_chunked_full = (
+            job.mode == AiJob.Mode.FULL_RESTYLE
+            and len(frozen_blocks) > FULL_RESTYLE_CHUNK_SIZE
         )
 
-        # ── 3. JSON 파싱 ───────────────────────────
-        job.set_stage(AiJob.Stage.PARSING_RESPONSE, 70, "생성 결과를 분석하고 있습니다.")
+        if is_chunked_full:
+            chunks = chunk_blocks(frozen_blocks, size=FULL_RESTYLE_CHUNK_SIZE)
+            total_chunks = len(chunks)
+            all_blocks_out: list[dict] = []
+            first_page: dict = {}
+            fixed_ds: dict | None = None
 
-        result_data = extract_json(raw_response)
+            for idx, chunk in enumerate(chunks):
+                sub_payload = dict(input_payload)
+                sub_payload["existing_blocks"] = chunk
+                sub_payload["_chunk_idx"] = idx
+                sub_payload["_total_chunks"] = total_chunks
+                if fixed_ds:
+                    sub_payload["_fixed_design_settings"] = fixed_ds
+
+                sys_p, user_p = build_prompts(
+                    job_type=job.job_type,
+                    user_input=sub_payload,
+                    mode=job.mode,
+                )
+                # 첫 chunk 의 프롬프트만 디버깅용으로 저장 — 토큰 부담 방지.
+                if idx == 0:
+                    job.resolved_prompt = f"[SYSTEM]\n{sys_p}\n\n[USER]\n{user_p}"
+                    job.save(update_fields=["resolved_prompt", "updated_at"])
+
+                # progress: 30 ~ 70 사이를 chunk 갯수로 분할.
+                chunk_progress = 30 + int(40 * (idx + 1) / total_chunks)
+                job.set_stage(
+                    AiJob.Stage.CALLING_MODEL,
+                    chunk_progress,
+                    f"AI 분할 호출 ({idx + 1}/{total_chunks})...",
+                )
+
+                raw_chunk = call_llm(
+                    model=model_name,
+                    system_prompt=sys_p,
+                    user_prompt=user_p,
+                )
+                try:
+                    parsed_chunk = extract_json(raw_chunk)
+                except ValueError as e:
+                    logger.warning(
+                        "AiJob %s chunk %d JSON 파싱 실패: %s (raw_len=%d). "
+                        "이 chunk 의 baseline 블록을 변경 없이 결과에 보존.",
+                        job_id, idx, e, len(raw_chunk),
+                    )
+                    # 안전망: chunk 블록 데이터 유실 방지.
+                    # id 만 넣어 두면 merge_full_restyle 가 existing_by_id 매칭으로
+                    # baseline.data 를 그대로 사용한다 (디자인 변경 없음, 데이터 유지).
+                    for fb in chunk:
+                        all_blocks_out.append({
+                            "id": fb.get("id"),
+                            "type": fb.get("type"),
+                            "_type": (fb.get("data") or {}).get("_type") or fb.get("type"),
+                            "order": fb.get("order"),
+                            "is_enabled": fb.get("is_enabled", True),
+                            "data": {},
+                        })
+                    continue
+
+                if idx == 0 and isinstance(parsed_chunk, dict):
+                    # AI 가 page 객체로 감싸거나 최상위에 평평하게 응답할 수 있음 — 둘 다 처리.
+                    page_part = parsed_chunk.get("page")
+                    if not (isinstance(page_part, dict) and page_part):
+                        # 평평한 형식 — 최상위에서 직접 추출
+                        flat_keys = ("title", "is_public", "data", "custom_css")
+                        page_part = {k: parsed_chunk[k] for k in flat_keys if k in parsed_chunk}
+                    if isinstance(page_part, dict) and page_part:
+                        first_page = page_part
+                        ds = (page_part.get("data") or {}).get("design_settings")
+                        if isinstance(ds, dict) and ds:
+                            fixed_ds = ds
+
+                chunk_blocks_out = (
+                    parsed_chunk.get("blocks") if isinstance(parsed_chunk, dict) else None
+                )
+                if isinstance(chunk_blocks_out, list):
+                    all_blocks_out.extend(chunk_blocks_out)
+
+            job.set_stage(
+                AiJob.Stage.PARSING_RESPONSE,
+                70,
+                f"{total_chunks} 개 응답을 합치는 중...",
+            )
+            result_data = {"page": first_page, "blocks": all_blocks_out}
+
+        else:
+            # ── 단일 호출 (기존 흐름) ──
+            system_prompt, user_prompt = build_prompts(
+                job_type=job.job_type,
+                user_input=job.input_payload,
+                mode=job.mode,
+            )
+            job.resolved_prompt = f"[SYSTEM]\n{system_prompt}\n\n[USER]\n{user_prompt}"
+            job.save(update_fields=["resolved_prompt", "updated_at"])
+
+            job.set_stage(AiJob.Stage.CALLING_MODEL, 30, "AI가 페이지를 생성하고 있습니다.")
+
+            raw_response = call_llm(
+                model=model_name,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
+
+            job.set_stage(AiJob.Stage.PARSING_RESPONSE, 70, "생성 결과를 분석하고 있습니다.")
+            result_data = extract_json(raw_response)
+
+        # ── 3.5 placeholder 복원 + style patch 머지 ──
+        # mode 가 있는 리뉴얼 작업은 기존 콘텐츠를 보존한 채 LLM 스타일 패치만 적용.
+        input_payload = job.input_payload or {}
+        placeholder_map = input_payload.get("_placeholder_map") or {}
+        if placeholder_map:
+            result_data = thaw_placeholders(result_data, placeholder_map, drop_unknown=True)
+
+        baseline_meta = input_payload.get("_baseline_page_meta")
+        baseline_blocks = input_payload.get("_baseline_blocks")
+        if job.mode == AiJob.Mode.FULL_RESTYLE and baseline_meta is not None:
+            result_data = merge_full_restyle(
+                existing_page_meta=baseline_meta,
+                existing_blocks=baseline_blocks or [],
+                llm_response=result_data if isinstance(result_data, dict) else {},
+                preserve_content=input_payload.get("preserve_content", False),
+            )
+        elif job.mode == AiJob.Mode.STYLE_ONLY and baseline_meta is not None:
+            result_data = merge_style_only(
+                existing_page_meta=baseline_meta,
+                existing_blocks=baseline_blocks or [],
+                llm_response=result_data if isinstance(result_data, dict) else {},
+            )
 
         # ── 4. 이미지 치환 ──────────────────────────
         job.set_stage(AiJob.Stage.RESOLVING_IMAGES, 85, "이미지를 검색하고 있습니다.")

@@ -88,12 +88,93 @@ class Page(models.Model):
         help_text="외부에서 임포트한 시점. 자체 생성 페이지면 NULL.",
     )
 
+    # ── AI Few-shot 레퍼런스 메타 ─────────────────────────────
+    # 어드민이 큐레이션한 공개 페이지를 카테고리별로 분류하면,
+    # 사용자가 AI 페이지 생성 시 카테고리→레퍼런스 선택을 거쳐
+    # 해당 페이지의 데이터(title/data/blocks/custom_css)가 LLM Few-shot 예시로 사용된다.
+    is_reference = models.BooleanField(
+        default=False,
+        db_index=True,
+        verbose_name="AI 레퍼런스 대상",
+        help_text="True 이면 카테고리 내 AI 레퍼런스 후보로 노출. 어드민만 토글 가능.",
+    )
+    reference_category = models.ForeignKey(
+        "pages.ReferenceCategory",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="reference_pages",
+        verbose_name="레퍼런스 카테고리",
+    )
+    reference_order = models.PositiveIntegerField(
+        default=0,
+        verbose_name="카테고리 내 정렬 순서",
+    )
+    reference_title = models.CharField(
+        max_length=120,
+        blank=True,
+        default="",
+        verbose_name="레퍼런스 표시명",
+        help_text="비어 있으면 page.title 사용.",
+    )
+    reference_description = models.TextField(
+        blank=True,
+        default="",
+        verbose_name="레퍼런스 설명",
+        help_text="이 페이지가 어떤 스타일/용도인지 사용자 안내용 한두 줄.",
+    )
+    reference_snapshot = models.ImageField(
+        upload_to="pages/snapshots/%Y/%m/",
+        null=True,
+        blank=True,
+        verbose_name="모바일 미리보기 스냅샷",
+        help_text="Playwright Headless 캡쳐 → WebP. R2/로컬 STORAGES default 사용.",
+    )
+    reference_snapshot_updated_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="스냅샷 마지막 갱신 시각",
+    )
+    reference_snapshot_job_id = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        verbose_name="스냅샷 캡쳐 작업 ID",
+        help_text="Celery task id. 폴링용. 빈 문자열이면 진행 중 아님.",
+    )
+
+    class SnapshotStatus(models.TextChoices):
+        NONE = "", "-"
+        PENDING = "pending", "대기 중"
+        RUNNING = "running", "진행 중"
+        SUCCEEDED = "succeeded", "완료"
+        FAILED = "failed", "실패"
+
+    reference_snapshot_status = models.CharField(
+        max_length=20,
+        blank=True,
+        default="",
+        choices=SnapshotStatus.choices,
+        verbose_name="스냅샷 상태",
+    )
+    reference_snapshot_error = models.TextField(
+        blank=True,
+        default="",
+        verbose_name="스냅샷 실패 메시지",
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         verbose_name = "페이지"
         verbose_name_plural = "페이지 목록"
+        indexes = [
+            models.Index(
+                fields=["is_reference", "reference_category", "reference_order"],
+                name="page_ref_browse_idx",
+            ),
+        ]
 
     def __str__(self):
         return f"{self.slug} ({self.user})"
@@ -439,3 +520,130 @@ class PageMedia(models.Model):
         if self.original_file:
             self.original_file.delete(save=False)
         super().delete(*args, **kwargs)
+
+
+# ─────────────────────────────────────────────────────────────
+# 페이지 스냅샷 (AI 편집 롤백용)
+# ─────────────────────────────────────────────────────────────
+
+class PageSnapshot(models.Model):
+    """AI 편집의 원본 ↔ 최신 작업물 토글을 위한 2슬롯 스냅샷.
+
+    페이지당 다음 두 reason 슬롯이 각각 최대 1건씩 존재한다:
+      - ``AI_EDIT`` — AI 첫 호출 직전의 원본. 한 번 생성되면 영구 유지.
+      - ``LATEST_AI_RESULT`` — 가장 최근 AI 편집 직후의 결과. AI 호출마다 upsert.
+
+    사용자는 두 스냅샷 사이를 자유롭게 ``restore`` 로 왔다갔다 할 수 있고,
+    restore 는 어느 쪽도 지우지 않는다.
+    """
+
+    class Reason(models.TextChoices):
+        AI_EDIT = "ai_edit", "AI 편집 직전 원본"
+        LATEST_AI_RESULT = "latest_ai_result", "최신 AI 작업물"
+
+    page = models.ForeignKey(
+        Page,
+        on_delete=models.CASCADE,
+        related_name="snapshots",
+        verbose_name="페이지",
+    )
+    reason = models.CharField(
+        max_length=30,
+        choices=Reason.choices,
+        verbose_name="생성 사유",
+        help_text="어떤 작업 직전에 떠둔 스냅샷인지.",
+    )
+    snapshot = models.JSONField(
+        verbose_name="스냅샷 데이터",
+        help_text=(
+            "페이지 + 블록 전체 상태. 스키마: "
+            "{\"page\": {title, is_public, data, custom_css}, "
+            "\"blocks\": [{id, type, order, is_enabled, data, custom_css, "
+            "schedule_enabled, publish_at, hide_at}, ...]}"
+        ),
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        verbose_name="생성자",
+        help_text="스냅샷을 발생시킨 사용자 (페이지 소유자와 다를 수 있음).",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        verbose_name = "페이지 스냅샷"
+        verbose_name_plural = "페이지 스냅샷 목록"
+        ordering = ["-created_at"]
+        # 페이지당 reason 별 최대 1건 — 원본 슬롯과 최신 작업물 슬롯 보장
+        unique_together = [("page", "reason")]
+        indexes = [
+            models.Index(fields=["page", "-created_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.page.slug} / {self.get_reason_display()} @ {self.created_at:%Y-%m-%d %H:%M}"
+
+
+# ─────────────────────────────────────────────────────────────
+# AI 레퍼런스 카테고리
+# ─────────────────────────────────────────────────────────────
+
+class ReferenceCategory(models.Model):
+    """AI 페이지 생성 시 사용자가 선택할 수 있는 레퍼런스 카테고리.
+
+    어드민이 동적으로 CRUD. is_active=False 면 공개 API에서 제외.
+    Page.reference_category 가 이 모델을 가리키며, 카테고리 삭제 시
+    Page.reference_category=NULL (페이지는 보존).
+    """
+
+    name = models.CharField(
+        max_length=80,
+        verbose_name="카테고리 한글명",
+        help_text="유저에게 노출. 예: '프로필 링크', '브로슈어/팜플렛'",
+    )
+    slug = models.SlugField(
+        max_length=50,
+        unique=True,
+        verbose_name="영문 슬러그",
+        help_text="URL/API 경로에 사용. 소문자/하이픈만. 예: 'profile-link'",
+    )
+    description = models.TextField(blank=True, default="", verbose_name="설명")
+    icon_emoji = models.CharField(
+        max_length=8,
+        blank=True,
+        default="",
+        verbose_name="아이콘 이모지",
+        help_text="예: '🎵'. icon_url 이 있으면 그게 우선.",
+    )
+    icon_url = models.URLField(
+        max_length=512,
+        blank=True,
+        default="",
+        verbose_name="아이콘 이미지 URL",
+    )
+    sort_order = models.PositiveIntegerField(
+        default=0,
+        db_index=True,
+        verbose_name="정렬 순서 (ASC)",
+    )
+    is_active = models.BooleanField(
+        default=True,
+        db_index=True,
+        verbose_name="공개 API 노출 여부",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "AI 레퍼런스 카테고리"
+        verbose_name_plural = "AI 레퍼런스 카테고리 목록"
+        ordering = ["sort_order", "id"]
+        indexes = [
+            models.Index(fields=["is_active", "sort_order"]),
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({self.slug})"

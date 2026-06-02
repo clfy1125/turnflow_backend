@@ -28,6 +28,7 @@ result_json 스키마 (LLM 출력 + few-shot 예시 기반):
 from __future__ import annotations
 
 from django.db import transaction
+from django.utils.dateparse import parse_datetime
 
 from apps.pages.models import Block, Page
 from apps.pages.validators import validate_block_data
@@ -39,6 +40,15 @@ _PAGE_META_FIELDS = ("title", "is_public", "data", "custom_css")
 def _block_type(raw: dict) -> str | None:
     """block dict에서 타입 키를 꺼낸다. 프롬프트별로 `type` / `_type` 혼용될 수 있음."""
     return raw.get("type") or raw.get("_type")
+
+
+def _coerce_dt(value):
+    """ISO 문자열은 datetime 으로, datetime 은 그대로, 그 외는 None."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        return parse_datetime(value)
+    return value
 
 
 @transaction.atomic
@@ -86,8 +96,8 @@ def apply_result_json_to_page(page: Page, result_json: dict) -> Page:
                 data=raw.get("data") or {},
                 custom_css=raw.get("custom_css", ""),
                 schedule_enabled=raw.get("schedule_enabled", False),
-                publish_at=raw.get("publish_at"),
-                hide_at=raw.get("hide_at"),
+                publish_at=_coerce_dt(raw.get("publish_at")),
+                hide_at=_coerce_dt(raw.get("hide_at")),
             )
         )
     if not new_blocks:

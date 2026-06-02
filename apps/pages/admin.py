@@ -6,8 +6,10 @@ from .models import (
     ContactInquiry,
     Page,
     PageMedia,
+    PageSnapshot,
     PageSubscription,
     PageView,
+    ReferenceCategory,
 )
 
 
@@ -20,11 +22,84 @@ class BlockInline(admin.TabularInline):
 
 @admin.register(Page)
 class PageAdmin(admin.ModelAdmin):
-    list_display = ["slug", "user", "title", "is_public", "created_at"]
-    list_filter = ["is_public"]
-    search_fields = ["slug", "user__email", "title"]
-    readonly_fields = ["created_at", "updated_at"]
+    list_display = [
+        "slug",
+        "user",
+        "title",
+        "is_public",
+        "is_reference",
+        "reference_category",
+        "reference_snapshot_status",
+        "created_at",
+    ]
+    list_filter = [
+        "is_public",
+        "is_reference",
+        "reference_category",
+        "reference_snapshot_status",
+    ]
+    search_fields = ["slug", "user__email", "title", "reference_title"]
+    readonly_fields = [
+        "created_at",
+        "updated_at",
+        "reference_snapshot_updated_at",
+        "reference_snapshot_job_id",
+        "reference_snapshot_status",
+        "reference_snapshot_error",
+    ]
     inlines = [BlockInline]
+    fieldsets = [
+        (
+            None,
+            {
+                "fields": [
+                    "user",
+                    "slug",
+                    "title",
+                    "is_public",
+                    "is_active",
+                    "data",
+                    "custom_css",
+                ]
+            },
+        ),
+        (
+            "외부 임포트",
+            {
+                "classes": ["collapse"],
+                "fields": [
+                    "import_source",
+                    "import_source_slug",
+                    "import_source_url",
+                    "imported_at",
+                ],
+            },
+        ),
+        (
+            "AI 레퍼런스",
+            {
+                "fields": [
+                    "is_reference",
+                    "reference_category",
+                    "reference_order",
+                    "reference_title",
+                    "reference_description",
+                    "reference_snapshot",
+                    "reference_snapshot_status",
+                    "reference_snapshot_updated_at",
+                    "reference_snapshot_job_id",
+                    "reference_snapshot_error",
+                ],
+            },
+        ),
+        (
+            "메타",
+            {
+                "classes": ["collapse"],
+                "fields": ["created_at", "updated_at"],
+            },
+        ),
+    ]
 
 
 @admin.register(Block)
@@ -88,3 +163,26 @@ class PageMediaAdmin(admin.ModelAdmin):
     readonly_fields = ["created_at"]
     date_hierarchy = "created_at"
     ordering = ["-created_at"]
+
+
+@admin.register(PageSnapshot)
+class PageSnapshotAdmin(admin.ModelAdmin):
+    list_display = ["id", "page", "reason", "created_by", "created_at"]
+    list_filter = ["reason", "created_at"]
+    search_fields = ["page__slug", "created_by__email"]
+    readonly_fields = ["page", "reason", "snapshot", "created_by", "created_at"]
+    date_hierarchy = "created_at"
+    ordering = ["-created_at"]
+
+
+# ─── AI 레퍼런스 카테고리 ─────────────────────────────────────
+
+@admin.register(ReferenceCategory)
+class ReferenceCategoryAdmin(admin.ModelAdmin):
+    list_display = ["sort_order", "slug", "name", "icon_emoji", "is_active", "updated_at"]
+    list_display_links = ["slug", "name"]
+    list_filter = ["is_active"]
+    list_editable = ["sort_order", "is_active"]
+    search_fields = ["slug", "name"]
+    readonly_fields = ["created_at", "updated_at"]
+    ordering = ["sort_order", "id"]

@@ -20,6 +20,12 @@ class AiJob(models.Model):
         DEEPSEEK = "deepseek", "DeepSeek V4-Flash (외부 API, 폴백/오버플로우)"
         GPT5 = "gpt5", "GPT-5.4"
 
+    class Mode(models.TextChoices):
+        # 빈 문자열(LEGACY)은 구 bio_remake 방식 — DB 에 이미 쌓인 result_json 호환용.
+        LEGACY = "", "(구) 전체 재생성"
+        FULL_RESTYLE = "full_restyle", "스타일 패치 + 구조 변경"
+        STYLE_ONLY = "style_only", "스타일 패치만 (콘텐츠 보존)"
+
     # LlmModel → 실제 LiteLLM 모델명 (litellm-config.yaml 의 model_name 과 일치해야 함)
     LLM_MODEL_MAP = {
         "gemma": "gemma-4",
@@ -76,6 +82,17 @@ class AiJob(models.Model):
         choices=LlmModel.choices,
         default=LlmModel.GEMMA,
         verbose_name="LLM 모델",
+    )
+    mode = models.CharField(
+        max_length=20,
+        choices=Mode.choices,
+        blank=True,
+        default=Mode.LEGACY,
+        verbose_name="리뉴얼 모드",
+        help_text=(
+            "bio_remake 작업 한정. 빈 문자열 = 구 방식(전체 재생성, 호환용). "
+            "full_restyle = 스타일/순서/추가삭제. style_only = 스타일만 패치."
+        ),
     )
     status = models.CharField(
         max_length=20,

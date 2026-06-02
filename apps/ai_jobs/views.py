@@ -32,7 +32,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.billing.models import AiTokenBalance
-from apps.pages.models import Block, Page
+from apps.pages.models import Block, Page, ReferenceCategory
 
 from .models import AiJob
 from .serializers import (
@@ -45,11 +45,15 @@ from .serializers import (
     ClassifyPostsRequestSerializer,
     ClassifyPostsResponseSerializer,
     PageAiJobHistoryItemSerializer,
+    ReferenceCategorySerializer,
+    ReferencePageListSerializer,
 )
 from .services.llm_client import call_llm_with_usage
+from .services.mode_router import sample_blocks, select_mode
 from .services.model_router import resolve_model
 from .services.page_applier import apply_result_json_to_page
 from .services.parsers import extract_json
+from .services.placeholder import freeze_placeholders
 from .services.post_classifier import classify_posts
 from .services.prompt_builder import build_prompts
 from .tasks import run_ai_job
@@ -269,8 +273,14 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
         # slug로 기존 페이지 리메이크
         page = None
         slug = vd.get("slug", "")
-        existing_blocks_data = None
-        existing_page_meta = None
+        baseline_blocks = None        # placeholder freeze 안 된 원본 — 적용 단계에서 사용.
+        baseline_page_meta = None
+        frozen_blocks = None          # LLM 입력용 (placeholder 치환됨).
+        frozen_page_meta = None
+        sampled_for_llm = None        # style_only 모드 샘플.
+        placeholder_map: dict[str, str] = {}
+        mode = ""
+
         if slug:
             source_page = Page.objects.filter(slug=slug, user=request.user).first()
             if not source_page:
@@ -280,30 +290,82 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
                 )
             page = source_page
 
-            # 기존 블록을 JSON으로 직렬화
+            # 기존 블록을 JSON으로 직렬화 — id 포함 (스타일 패치 매칭 키).
             blocks = Block.objects.filter(page=source_page).order_by("order")
-            existing_blocks_data = [
+            baseline_blocks = [
                 {
-                    "_type": b.type,
+                    "id": b.id,
+                    "type": b.type,
                     "order": b.order,
                     "is_enabled": b.is_enabled,
                     "data": b.data,
+                    "custom_css": b.custom_css,
+                    "schedule_enabled": b.schedule_enabled,
+                    "publish_at": b.publish_at.isoformat() if b.publish_at else None,
+                    "hide_at": b.hide_at.isoformat() if b.hide_at else None,
                 }
                 for b in blocks
             ]
-            existing_page_meta = {
+            baseline_page_meta = {
                 "title": source_page.title,
                 "is_public": source_page.is_public,
                 "data": source_page.data,
+                "custom_css": source_page.custom_css,
             }
 
+            mode = select_mode(baseline_blocks)
+
+            # LLM 입력용 placeholder freeze.
+            frozen_payload, placeholder_map = freeze_placeholders({
+                "page_meta": baseline_page_meta,
+                "blocks": baseline_blocks,
+            })
+            frozen_page_meta = frozen_payload["page_meta"]
+            frozen_blocks = frozen_payload["blocks"]
+
+            if mode == "style_only":
+                sampled_for_llm = sample_blocks(frozen_blocks)
+
+        # 레퍼런스 페이지 결정 — 명시 slug 우선, 없으면 category 의 첫 페이지 자동 선택.
+        reference_page_slug = (vd.get("reference_page_slug") or "").strip()
+        if not reference_page_slug:
+            ref_cat_slug = (vd.get("reference_category_slug") or "").strip()
+            if ref_cat_slug:
+                first_ref = (
+                    Page.objects
+                    .filter(
+                        reference_category__slug=ref_cat_slug,
+                        reference_category__is_active=True,
+                        is_reference=True,
+                        is_public=True,
+                        is_active=True,
+                    )
+                    .order_by("reference_order", "id")
+                    .values_list("slug", flat=True)
+                    .first()
+                )
+                if first_ref:
+                    reference_page_slug = first_ref
+
         # input_payload 구성
-        input_payload = {
+        input_payload: dict = {
             "concept": vd["concept"],
+            "mode": mode,
+            "preserve_content": vd.get("preserve_content", False),
+            "reference_page_slug": reference_page_slug,
         }
-        if existing_blocks_data is not None:
-            input_payload["existing_blocks"] = existing_blocks_data
-            input_payload["existing_page_meta"] = existing_page_meta
+        if baseline_blocks is not None:
+            input_payload["existing_page_meta"] = frozen_page_meta
+            if mode == "style_only":
+                input_payload["sample_blocks"] = sampled_for_llm or []
+                input_payload["all_block_ids"] = [b["id"] for b in baseline_blocks if b.get("id") is not None]
+            else:
+                input_payload["existing_blocks"] = frozen_blocks
+
+            # 적용 단계에서 사용하는 보존 데이터. 언더스코어 prefix 로 LLM 입력에서 분리.
+            input_payload["_baseline_blocks"] = baseline_blocks
+            input_payload["_baseline_page_meta"] = baseline_page_meta
+            input_payload["_placeholder_map"] = placeholder_map
 
         # AiJob 생성
         job = AiJob.objects.create(
@@ -311,6 +373,7 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
             page=page,
             job_type=AiJob.JobType.BIO_REMAKE,
             llm_model=llm_model,
+            mode=mode,
             input_payload=input_payload,
         )
 
@@ -1264,4 +1327,167 @@ class AiClassifyPostsView(APIView):
                 },
             },
             status=status.HTTP_200_OK,
+        )
+
+
+# ─────────────────────────────────────────────────────────────
+# AI 레퍼런스 카테고리 / 페이지 공개 조회
+# ─────────────────────────────────────────────────────────────
+
+_TAG_REF = "AI 레퍼런스 카테고리"
+
+
+class ReferenceCategoryListView(APIView):
+    """GET /api/v1/ai/categories/
+
+    AI 페이지 생성 전 카테고리 선택 UI 에서 사용. is_active=True 카테고리만,
+    sort_order ASC. 페이지네이션 없음 — 카테고리는 적음 (수십 개).
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=[_TAG_REF],
+        summary="AI 레퍼런스 카테고리 목록 조회",
+        description="""
+## 개요
+AI 페이지 생성 흐름에서 사용자가 가장 먼저 보는 카테고리 목록입니다.
+어드민이 비활성(is_active=False) 처리한 카테고리는 제외되며, 각 카테고리에는
+**노출 가능한 레퍼런스 페이지 수**(`reference_count`)가 함께 반환됩니다.
+
+프론트는 `reference_count == 0` 인 카테고리를 "준비 중"으로 회색 처리하거나 숨길 수 있습니다.
+
+## 인증
+`Authorization: Bearer <access_token>` 필수.
+
+## 응답
+sort_order ASC 정렬된 카테고리 배열. 페이지네이션 없음.
+        """,
+        responses={
+            200: ReferenceCategorySerializer(many=True),
+            401: OpenApiResponse(description="인증 누락/만료"),
+        },
+        examples=[
+            OpenApiExample(
+                "응답 예시",
+                value=[
+                    {
+                        "slug": "profile-link",
+                        "name": "프로필 링크",
+                        "description": "",
+                        "icon_emoji": "🌐",
+                        "icon_url": "",
+                        "sort_order": 1,
+                        "reference_count": 5,
+                    },
+                    {
+                        "slug": "invitation",
+                        "name": "모바일 초대장",
+                        "description": "",
+                        "icon_emoji": "💌",
+                        "icon_url": "",
+                        "sort_order": 8,
+                        "reference_count": 0,
+                    },
+                ],
+                response_only=True,
+            )
+        ],
+    )
+    def get(self, request):
+        from django.db.models import Count, Q
+
+        qs = (
+            ReferenceCategory.objects
+            .filter(is_active=True)
+            .annotate(
+                reference_count=Count(
+                    "reference_pages",
+                    filter=Q(
+                        reference_pages__is_reference=True,
+                        reference_pages__is_public=True,
+                        reference_pages__is_active=True,
+                        reference_pages__reference_snapshot_status="succeeded",
+                    ),
+                )
+            )
+            .order_by("sort_order", "id")
+        )
+        return Response(
+            ReferenceCategorySerializer(qs, many=True, context={"request": request}).data
+        )
+
+
+class ReferenceCategoryPagesView(APIView):
+    """GET /api/v1/ai/categories/{slug}/references/
+
+    카테고리 안의 레퍼런스 페이지 목록.  is_public + is_reference +
+    snapshot=succeeded 필터.  reference_order ASC.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=[_TAG_REF],
+        summary="카테고리 내 레퍼런스 페이지 목록 조회",
+        description="""
+## 개요
+지정 카테고리에 속한 AI 레퍼런스 페이지를 반환합니다. 사용자는 이 중 하나를 골라
+`POST /api/v1/ai/jobs/` 의 `reference_page_slug` 로 전달하면, 해당 페이지의 디자인/블록 구조가
+LLM Few-shot 예시로 사용됩니다.
+
+## 필터링 기준 (모두 만족)
+1. 카테고리가 활성(is_active=True)
+2. 페이지가 공개(is_public=True) + 활성(is_active=True)
+3. is_reference=True 로 어드민이 큐레이션한 페이지
+4. 스냅샷 캡쳐가 `succeeded` 상태 (썸네일 표시 가능)
+
+## 경로 파라미터
+- `slug`: 카테고리 영문 슬러그 (예: `profile-link`)
+
+## 응답 필드
+- `slug`: 페이지의 공개 슬러그 → `reference_page_slug` 로 그대로 전달
+- `effective_title`: reference_title 우선, 없으면 page.title
+- `reference_snapshot_url`: 모바일 미리보기 WebP URL (절대 URL)
+        """,
+        parameters=[
+            OpenApiParameter("slug", str, OpenApiParameter.PATH, required=True),
+        ],
+        responses={
+            200: ReferencePageListSerializer(many=True),
+            401: OpenApiResponse(description="인증 누락/만료"),
+            404: OpenApiResponse(description="카테고리 없음 또는 비활성"),
+        },
+    )
+    def get(self, request, slug):
+        try:
+            category = ReferenceCategory.objects.get(slug=slug, is_active=True)
+        except ReferenceCategory.DoesNotExist:
+            return Response(
+                {
+                    "success": False,
+                    "error": {
+                        "code": 404,
+                        "message": f"카테고리 '{slug}' 가 존재하지 않거나 비활성 상태입니다.",
+                        "details": {"slug": slug},
+                    },
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        pages = (
+            Page.objects
+            .filter(
+                is_reference=True,
+                reference_category=category,
+                is_public=True,
+                is_active=True,
+                reference_snapshot_status=Page.SnapshotStatus.SUCCEEDED,
+            )
+            .order_by("reference_order", "id")
+        )
+        return Response(
+            ReferencePageListSerializer(
+                pages, many=True, context={"request": request}
+            ).data
         )

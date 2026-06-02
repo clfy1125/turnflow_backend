@@ -172,6 +172,18 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
 class AutoDMCampaignCreateSerializer(serializers.Serializer):
     """Auto DM Campaign 생성 (v3.3)"""
 
+    # 멀티 IG 계정: 이 캠페인이 어느 IG connection 에 묶일지 명시.
+    # 미지정 시 workspace 의 첫 활성 connection 사용 (backward compat).
+    ig_connection_id = serializers.UUIDField(
+        required=False,
+        allow_null=True,
+        help_text=(
+            "캠페인을 연결할 IG 계정 connection 의 UUID. 워크스페이스에 여러 IG "
+            "계정이 연동된 경우 필수에 준하게 지정해야 의도한 계정에 캠페인이 묶인다. "
+            "미지정 시 첫 번째 활성 connection 으로 fallback (backward compat)."
+        ),
+    )
+
     # 트리거
     trigger_type = serializers.ChoiceField(
         choices=AutoDMCampaign.TriggerType.choices,

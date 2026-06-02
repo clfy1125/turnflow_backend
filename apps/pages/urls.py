@@ -1,6 +1,12 @@
 from django.urls import path
 
-from .aiviews import AiCloneFromSlugView, AiImportExternalView, AiPageEditView
+from .aiviews import (
+    AiCloneFromSlugView,
+    AiImportExternalView,
+    AiPageEditView,
+    AiPageSnapshotListView,
+    AiPageSnapshotRestoreView,
+)
 from .coupang_views import CoupangLookupView
 from .image_views import PageMediaDetailView, PageMediaView
 from .multi_views import (
@@ -124,8 +130,19 @@ urlpatterns = [
     # ─── AI 도구 전용 API ─────────────────────────────────────
     # 슬러그로 페이지 복사
     path("ai/clone-from-slug/", AiCloneFromSlugView.as_view(), name="ai-clone-from-slug"),
-    # 페이지 전체 편집 (1-shot)
+    # 페이지 전체 편집 (1-shot) — 변경 직전 상태는 자동으로 PageSnapshot 에 보관
     path("ai/@<slug:slug>/", AiPageEditView.as_view(), name="ai-page-edit"),
+    # 페이지 스냅샷 목록 / 롤백 — restore 직전 현재 상태도 자동으로 한 번 더 보관됨
+    path(
+        "ai/@<slug:slug>/snapshots/",
+        AiPageSnapshotListView.as_view(),
+        name="ai-page-snapshot-list",
+    ),
+    path(
+        "ai/@<slug:slug>/snapshots/<int:snapshot_id>/restore/",
+        AiPageSnapshotRestoreView.as_view(),
+        name="ai-page-snapshot-restore",
+    ),
     # 외부 서비스(인포크/리틀리/링크트리) 페이지 가져오기
     path("ai/import-external/", AiImportExternalView.as_view(), name="ai-import-external"),
 

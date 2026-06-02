@@ -50,6 +50,30 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
             raise PermissionDenied("You are not a member of this workspace")
         return workspace
 
+    def resolve_ig_connection(self, workspace, ig_connection_id: str | None):
+        """
+        멀티 IG 계정: 쿼리 파라미터 ig_connection_id 로 활성 IG 계정 1개 선택.
+        미지정 시 워크스페이스의 첫 활성 connection 반환 (backward compat).
+
+        Returns: IGAccountConnection 또는 None.
+        Raises: PermissionDenied — 다른 워크스페이스의 connection 을 지정한 경우.
+        """
+        from django.core.exceptions import ValidationError
+        from rest_framework.exceptions import PermissionDenied
+
+        if not ig_connection_id:
+            return IGAccountConnection.objects.filter(
+                workspace=workspace, status="active"
+            ).first()
+
+        try:
+            connection = IGAccountConnection.objects.get(id=ig_connection_id)
+        except (IGAccountConnection.DoesNotExist, ValidationError, ValueError, TypeError):
+            return None
+        if connection.workspace_id != workspace.id:
+            raise PermissionDenied("이 IG 계정은 해당 워크스페이스에 속하지 않습니다.")
+        return connection
+
     @extend_schema(
         summary="Instagram 연동 시작",
         description="""
@@ -859,6 +883,17 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 description="페이지네이션 커서 (다음 페이지 조회 시 사용)",
                 required=False,
             ),
+            OpenApiParameter(
+                name="ig_connection_id",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description=(
+                    "조회할 IG 계정 connection UUID. 워크스페이스에 여러 IG 계정이 "
+                    "연동돼 있을 때 특정 계정의 게시물만 조회. 미지정 시 첫 번째 "
+                    "활성 connection 사용 (backward compat)."
+                ),
+                required=False,
+            ),
         ],
         tags=["개발 전용"],
     )
@@ -876,11 +911,10 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         # Query parameters
         limit = min(int(request.query_params.get("limit", 10)), 50)  # 최대 50개
         after = request.query_params.get("after", None)
+        ig_connection_id = request.query_params.get("ig_connection_id")
 
-        # 연결된 Instagram 계정 찾기
-        connection = IGAccountConnection.objects.filter(
-            workspace=workspace, status="active"
-        ).first()
+        # 연결된 Instagram 계정 찾기 (멀티 IG: 쿼리로 지정 가능, 미지정 시 첫 활성)
+        connection = self.resolve_ig_connection(workspace, ig_connection_id)
 
         if not connection:
             return Response(
@@ -918,12 +952,14 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                     "paging": data.get("paging", {}),
                     "count": len(data.get("data", [])),
                     "connection": {
+                        "id": str(connection.id),
                         "username": connection.username,
                         "account_id": connection.external_account_id,
                     },
                     "query": {
                         "limit": limit,
                         "after": after,
+                        "ig_connection_id": ig_connection_id,
                     },
                 }
             )
@@ -985,6 +1021,17 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 required=True,
                 type=str,
             ),
+            OpenApiParameter(
+                name="ig_connection_id",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description=(
+                    "조회할 IG 계정 connection UUID. 워크스페이스에 여러 IG 계정이 "
+                    "연동돼 있을 때 특정 계정의 Story 만 조회. 미지정 시 첫 번째 "
+                    "활성 connection 사용 (backward compat)."
+                ),
+                required=False,
+            ),
         ],
         responses={
             200: OpenApiResponse(description="활성 Story 목록"),
@@ -1005,10 +1052,8 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         from .services import InstagramMediaService
 
         workspace = self.get_workspace(workspace_id)
-
-        connection = IGAccountConnection.objects.filter(
-            workspace=workspace, status="active"
-        ).first()
+        ig_connection_id = request.query_params.get("ig_connection_id")
+        connection = self.resolve_ig_connection(workspace, ig_connection_id)
 
         if not connection:
             return Response(
@@ -1604,15 +1649,24 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
     serializer_class = AutoDMCampaignSerializer
 
     def get_queryset(self):
-        """사용자의 workspace에 속한 캠페인만 조회"""
-        # 사용자가 속한 workspace들의 Instagram 연결 조회
+        """사용자의 workspace에 속한 캠페인만 조회.
+
+        멀티 IG 계정: ?ig_connection_id=<uuid> 로 특정 IG 계정의 캠페인만 필터.
+        다른 사용자의 connection 을 지정해도 user_workspaces 필터 때문에 결과 비어있음.
+        """
         user_workspaces = Workspace.objects.filter(memberships__user=self.request.user)
 
-        return (
+        qs = (
             AutoDMCampaign.objects.filter(ig_connection__workspace__in=user_workspaces)
             .select_related("ig_connection")
             .order_by("-created_at")
         )
+
+        ig_connection_id = self.request.query_params.get("ig_connection_id")
+        if ig_connection_id:
+            qs = qs.filter(ig_connection_id=ig_connection_id)
+
+        return qs
 
     @extend_schema(
         summary="캠페인 옵션 가이드 (정적, 인증 불필요)",
@@ -1655,7 +1709,21 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
 
     @extend_schema(
         summary="캠페인 목록 조회",
-        description="사용자의 workspace에 속한 모든 Auto DM 캠페인을 조회합니다.",
+        description=(
+            "사용자의 workspace 에 속한 모든 Auto DM 캠페인을 조회합니다.\n\n"
+            "**멀티 IG 계정**: 한 워크스페이스에 여러 IG 계정이 연동된 경우 "
+            "`?ig_connection_id=<uuid>` 로 특정 계정의 캠페인만 필터링할 수 있습니다. "
+            "권한이 없는 connection ID 를 지정하면 빈 리스트가 반환됩니다."
+        ),
+        parameters=[
+            OpenApiParameter(
+                name="ig_connection_id",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description="특정 IG 계정의 캠페인만 필터링 (UUID)",
+                required=False,
+            ),
+        ],
         responses={200: AutoDMCampaignSerializer(many=True)},
         tags=["Auto DM"],
     )
@@ -1808,13 +1876,35 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         except Workspace.DoesNotExist:
             return Response({"error": "Workspace not found"}, status=status.HTTP_404_NOT_FOUND)
 
-        # 활성화된 Instagram 연결 확인
-        ig_connection = IGAccountConnection.get_active_connection(workspace)
-        if not ig_connection:
-            return Response(
-                {"error": "No active Instagram connection found for this workspace"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        # 멀티 IG: body 의 ig_connection_id 가 우선, 미지정 시 첫 활성 connection 사용.
+        # validated_data 에 같은 이름의 필드가 남아 있으면 ORM create() 가 충돌하니
+        # 먼저 pop 해서 분리한다.
+        ig_connection_id = serializer.validated_data.pop("ig_connection_id", None)
+        if ig_connection_id:
+            try:
+                ig_connection = IGAccountConnection.objects.get(id=ig_connection_id)
+            except IGAccountConnection.DoesNotExist:
+                return Response(
+                    {"error": "Instagram connection not found"},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            if ig_connection.workspace_id != workspace.id:
+                return Response(
+                    {"error": "이 IG 계정은 해당 워크스페이스에 속하지 않습니다."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            if ig_connection.status != IGAccountConnection.Status.ACTIVE:
+                return Response(
+                    {"error": "지정한 IG 계정 연동이 활성 상태가 아닙니다."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        else:
+            ig_connection = IGAccountConnection.get_active_connection(workspace)
+            if not ig_connection:
+                return Response(
+                    {"error": "No active Instagram connection found for this workspace"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         # 캠페인 생성
         campaign = AutoDMCampaign.objects.create(

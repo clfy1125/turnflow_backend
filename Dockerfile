@@ -11,16 +11,39 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # 시스템 의존성 설치
+# Playwright Chromium 의존성: libnss3, libnspr4, libatk*, libcups2, libdrm2, libxkbcommon0,
+# libxcomposite1, libxdamage1, libxfixes3, libxrandr2, libgbm1, libpango-1.0-0, libcairo2,
+# libasound2, fonts-noto-cjk (한국어 페이지 렌더링용)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     postgresql-client \
     libpq-dev \
+    libnss3 \
+    libnspr4 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libpango-1.0-0 \
+    libcairo2 \
+    libasound2 \
+    fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
 # Python 의존성 설치
 COPY requirements.txt .
 RUN pip install --upgrade pip && \
     pip install -r requirements.txt
+
+# Playwright Chromium 바이너리 설치 (~150MB)
+# 이미지 크기 증가하지만 web/celery 단일 이미지 유지로 운영 단순.
+RUN python -m playwright install chromium
 
 # 애플리케이션 코드 복사
 COPY . .

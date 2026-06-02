@@ -1,8 +1,9 @@
-"""
-프롬프트 조립.
+"""프롬프트 조립.
 
-룰셋(md) + few-shot 예시(json) + 사용자 입력을 합쳐
-system / user 메시지를 생성한다.
+룰셋(md) + few-shot 예시(json) + 사용자 입력을 합쳐 system / user 메시지를 생성한다.
+
+bio_remake 작업은 두 모드(``full_restyle`` / ``style_only``) 로 분기.
+구 방식(legacy) 은 slug 없이 새 페이지를 생성하는 경우에만 사용된다.
 """
 
 import json
@@ -40,6 +41,58 @@ def _load_examples(category: str, max_count: int = 4) -> str:
     return "\n".join(parts)
 
 
+def _load_example_from_db(reference_page_slug: str) -> str:
+    """DB 의 레퍼런스 페이지 1건을 ai_assets/examples/bio/N.json 와 동일 포맷의
+    JSON 문자열로 반환.
+
+    반환 형식 — ``_load_examples()`` 와 동일한 ``\\n--- {label} ---\\n{json}`` prefix.
+    페이지가 없거나 비공개/비활성/is_reference 가 아니면 빈 문자열 (폴백 트리거).
+    """
+    from apps.pages.models import Block, Page  # 순환 import 방지 — 함수 안에서 import
+
+    page = (
+        Page.objects
+        .filter(
+            slug=reference_page_slug,
+            is_reference=True,
+            is_public=True,
+            is_active=True,
+        )
+        .first()
+    )
+    if not page:
+        logger.warning(
+            "레퍼런스 페이지 로드 실패 (없음/비공개/비활성): %s",
+            reference_page_slug,
+        )
+        return ""
+
+    blocks_qs = (
+        Block.objects
+        .filter(page=page)
+        .order_by("order")
+        .values("id", "type", "order", "is_enabled", "data", "custom_css")
+    )
+    payload = {
+        "title": page.title,
+        "is_public": page.is_public,
+        "data": page.data,
+        "custom_css": page.custom_css,
+        "blocks": [
+            {
+                "id": b["id"],
+                "type": b["type"],
+                "order": b["order"],
+                "data": b["data"],
+                "custom_css": b["custom_css"],
+            }
+            for b in blocks_qs
+        ],
+    }
+    label = f"reference-page-{reference_page_slug}.json"
+    return f"\n--- {label} ---\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
+
+
 # ─── job_type별 시스템 프롬프트 ───────────────────────────────
 
 # job_type → examples 디렉토리 이름 매핑
@@ -50,6 +103,7 @@ _EXAMPLE_DIR_MAP: dict[str, str] = {
 }
 
 _SYSTEM_PROMPTS: dict[str, str] = {
+    # 새 페이지 생성 (slug 없음) — 구 방식 유지.
     "bio_remake": (
         "너는 단순한 JSON 생성기가 아니라, "
         "브랜드 컨셉을 해석하고 색감, 레이아웃, 이미지까지 설계하는 최고 수준의 프로덕트 디자이너이자 프론트엔드 아키텍트다.\n\n"
@@ -66,20 +120,60 @@ _SYSTEM_PROMPTS: dict[str, str] = {
         "- 이미지 URL은 {{image:검색키워드}} 형식으로만 작성한다 (예: {{image:jpop band concert}}).\n"
         "- 절대 설명하지 말고 JSON 코드만 출력한다."
     ),
-    "bio_remake_with_existing": (
-        "너는 기존 링크인바이오 페이지를 사용자의 요청에 맞게 리메이크하는 최고 수준의 프로덕트 디자이너이자 프론트엔드 아키텍트다.\n\n"
-        "너에게는 기존 페이지의 블록 구조가 JSON으로 주어진다. 이 기존 구조를 기반으로:\n"
-        "1. 사용자의 요청(컨셉, 스타일)에 맞게 디자인과 구조를 개선한다.\n"
-        "2. 기존 콘텐츠(텍스트, 링크 URL 등)는 최대한 유지하되, 디자인·레이아웃·색상·문구를 새롭게 바꾼다.\n"
-        "3. 불필요한 블록은 제거하고, 필요하면 새 블록을 추가할 수 있다.\n"
-        "4. 이미지가 필요한 블록에는 {{image:영문_키워드}} 형식으로 이미지 검색어를 넣는다.\n\n"
-        "중요 규칙:\n"
-        "- 반드시 우리 블록 규칙을 100% 준수해야 한다.\n"
-        "- 모든 블록에는 _type을 정확히 넣어야 한다.\n"
-        "- 기존 링크 URL, 연락처 등 핵심 데이터는 절대 임의 변경하지 말고 그대로 유지한다.\n"
-        "- 디자인은 하나의 브랜드처럼 일관된 색감을 유지해야 한다.\n"
-        "- 이미지 URL은 {{image:검색키워드}} 형식으로만 작성한다.\n"
-        "- 절대 설명하지 말고 JSON 코드만 출력한다."
+    # 기존 페이지 리메이크 — 모드별 분기.
+    "bio_remake_full_restyle": (
+        "너는 기존 링크인바이오 페이지의 디자인을 리뉴얼하는 프로덕트 디자이너다.\n\n"
+        "[엄격한 제약]\n"
+        "- 기존 블록의 콘텐츠(URL, 이미지, 텍스트)는 절대 변경하지 마라.\n"
+        "- URL/이미지는 [URL_n] / [IMG_n] / [VIDEO_n] / [CONTACT_n] 같은 placeholder 토큰으로\n"
+        "  주어진다. 응답에 그대로 echo 하거나 생략하면 백엔드가 원본으로 복원한다.\n"
+        "  새 URL/이미지 텍스트를 생성하지 마라 — 환각된 placeholder 는 빈 문자열로 떨어진다.\n"
+        "- _type 은 절대 변경하지 마라. 기존 블록은 id 로 매칭된다.\n\n"
+        "[허용된 변경]\n"
+        "- 페이지 design_settings (배경/버튼/폰트/색상 등) 전체 교체.\n"
+        "- 각 블록의 스타일/세팅 (custom_bg_color, layout, *_layout, text_align 등) 변경.\n"
+        "- 블록 순서 재배치 (order 1 부터).\n"
+        "- 디자인 흐름상 필요한 새 블록 추가 — ``_new: true`` 표시. 새 블록의 텍스트 콘텐츠\n"
+        "  (label, content 등) 는 직접 작성 가능하지만 URL/이미지는 비워둔다.\n"
+        "  새 이미지 블록은 {{image:검색키워드}} placeholder 사용 가능.\n"
+        "- 불필요한 기존 블록은 응답에서 누락하면 삭제된다.\n\n"
+        "[출력 형식]\n"
+        "오직 JSON 만 출력. 설명 금지.\n"
+        '{ "page": {"title": ..., "is_public": ..., "data": {"design_settings": {...}}, "custom_css": "..."},\n'
+        '  "blocks": [{"id": 123, "_type": "single_link", "order": 1, "data": {...스타일...}}, ...] }'
+    ),
+    "bio_remake_style_only": (
+        "너는 큰 링크인바이오 페이지의 디자인 톤만 새롭게 입히는 디자이너다.\n\n"
+        "[엄격한 제약]\n"
+        "- 페이지 콘텐츠는 절대 만지지 마라. 블록 추가/삭제/순서변경/타입변경 금지.\n"
+        "- 너에게는 페이지의 일부 블록만 샘플로 보인다 (처음 몇 개 + 중간 + 끝 + 각 _type 1개).\n"
+        "  그러나 응답은 ``block_styles`` 객체 하나로 ``*`` 글로벌 + ``<subtype>`` 별 +\n"
+        "  ``_by_id`` 개별 override 만 출력한다.\n"
+        "- 화이트리스트에 없는 키를 응답에 넣어도 백엔드가 무시한다.\n\n"
+        "[허용된 변경 — 화이트리스트]\n"
+        "공통: custom_bg_color, custom_border_color, custom_text_color, custom_button_color\n"
+        "profile: profile_layout, font_size\n"
+        "single_link: layout, text_align\n"
+        "group_link: group_layout, display_mode, text_align\n"
+        "social: custom_icon_color\n"
+        "video: video_layout, autoplay\n"
+        "text: text_layout, text_align, text_size, custom_sub_text_color\n"
+        "gallery: gallery_layout, auto_slide, keep_ratio\n"
+        "spacer: divider_style, divider_width, divider_color, spacing\n"
+        "notice: notice_layout\n"
+        "customer: custom_input_bg_color\n"
+        "folder: folder_icon, folder_icon_color, is_collapsed_default, folder_display_mode,\n"
+        "        text_align, folder_toggle_bg, folder_popup_bg, folder_popup_text, folder_popup_accent\n"
+        "schedule: schedule_layout\n\n"
+        "[페이지 레벨] page.data.design_settings 전체 교체, page.custom_css 교체 가능. title/is_public 은 무시됨.\n\n"
+        "[출력 형식]\n"
+        "오직 JSON 만 출력. 설명 금지.\n"
+        '{ "page": {"data": {"design_settings": {...}}, "custom_css": "..."},\n'
+        '  "block_styles": {\n'
+        '    "*": {"custom_bg_color": "#...", "custom_text_color": "#..."},\n'
+        '    "single_link": {"layout": "wide"},\n'
+        '    "_by_id": {"217": {"custom_button_color": "#..."}}\n'
+        '  } }'
     ),
 }
 
@@ -87,6 +181,7 @@ _SYSTEM_PROMPTS: dict[str, str] = {
 def build_prompts(
     job_type: str,
     user_input: dict,
+    mode: str | None = None,
 ) -> tuple[str, str]:
     """
     (system_prompt, user_prompt) 튜플을 반환한다.
@@ -95,55 +190,101 @@ def build_prompts(
         job_type: 작업 유형 (bio_remake 등)
         user_input: 프론트에서 받은 사용자 입력
             - concept: 페이지 컨셉 설명
-            - existing_blocks: 기존 페이지 블록 (optional, 리메이크 시)
-            - existing_page_meta: 기존 페이지 메타 (optional, 리메이크 시)
+            - existing_blocks: 기존 페이지 블록 (optional, 리메이크 시). placeholder 가 freeze 된 상태.
+            - existing_page_meta: 기존 페이지 메타 (optional, 리메이크 시).
+            - sample_blocks: style_only 모드에서 샘플링된 블록 (optional).
+            - all_block_ids: style_only 모드에서 전체 블록 id 목록 (optional).
+        mode: ``""``(legacy) | ``"full_restyle"`` | ``"style_only"``.
+              ``None`` 이면 ``user_input.get("mode", "")`` 로 보강.
     """
-    # 1) System prompt — 기존 페이지 리메이크인지 여부에 따라 분기
-    existing_blocks = user_input.get("existing_blocks")
-    is_remake = existing_blocks is not None
+    if mode is None:
+        mode = user_input.get("mode") or ""
 
-    if is_remake:
-        system_key = f"{job_type}_with_existing"
+    is_remake = bool(user_input.get("existing_blocks") or user_input.get("sample_blocks"))
+
+    # 1) System prompt
+    if is_remake and mode == "full_restyle":
+        system_file = _read_asset(f"prompts/{job_type}/system_restyle_full.md")
+        fallback = _SYSTEM_PROMPTS.get("bio_remake_full_restyle", _SYSTEM_PROMPTS["bio_remake"])
+    elif is_remake and mode == "style_only":
+        system_file = _read_asset(f"prompts/{job_type}/system_restyle_style_only.md")
+        fallback = _SYSTEM_PROMPTS.get("bio_remake_style_only", _SYSTEM_PROMPTS["bio_remake"])
+    elif is_remake:
+        # mode 미지정 + remake → legacy 호환 (구 system_remake.md)
         system_file = _read_asset(f"prompts/{job_type}/system_remake.md")
+        fallback = _SYSTEM_PROMPTS.get("bio_remake_with_existing") or _SYSTEM_PROMPTS["bio_remake"]
     else:
-        system_key = job_type
         system_file = _read_asset(f"prompts/{job_type}/system.md")
+        fallback = _SYSTEM_PROMPTS.get(job_type, _SYSTEM_PROMPTS["bio_remake"])
 
-    system_prompt = system_file if system_file else _SYSTEM_PROMPTS.get(system_key, _SYSTEM_PROMPTS["bio_remake"])
+    system_prompt = system_file if system_file else fallback
 
     # 2) 블록 규칙 로드
     block_rules = _read_asset("rules/block_rules.md")
 
-    # 3) few-shot 예시 로드
+    # 3) few-shot 예시
+    # - 새 페이지 생성: 출력 형식 학습용 4개 (예시 그대로 출력해도 OK).
+    # - full_restyle: 디자인 톤(색 팔레트·레이아웃·블록 조합) 참고용 2개. 출력 형식은 위 스키마.
+    # - style_only: 대형 페이지 — 토큰 절감 우선이라 예시 미포함.
+    # - reference_page_slug 가 있으면 DB 의 어드민 큐레이션 페이지 1건을 우선 사용.
     example_dir = _EXAMPLE_DIR_MAP.get(job_type, "bio")
-    examples = _load_examples(example_dir, max_count=4)
+    reference_page_slug = (user_input.get("reference_page_slug") or "").strip()
+
+    if mode == "style_only":
+        examples = ""
+    elif reference_page_slug:
+        examples = _load_example_from_db(reference_page_slug)
+        if not examples:
+            # DB 로드 실패 (페이지가 사라졌거나 비활성/비공개 전환됨) → 파일 폴백
+            logger.info(
+                "reference_page_slug=%s 로드 실패 — 파일 예시로 폴백",
+                reference_page_slug,
+            )
+            examples = _load_examples(
+                example_dir, max_count=2 if is_remake else 4
+            )
+    elif is_remake:
+        examples = _load_examples(example_dir, max_count=2)
+    else:
+        examples = _load_examples(example_dir, max_count=4)
 
     # 4) 사용자 입력 조합
     concept = user_input.get("concept", "")
 
     # ────────────────────────────────────────────────────────
-    # ⚠️ DeepSeek prompt cache 최적화
-    #   prefix가 동일할수록 cache hit이 늘어 입력 비용이 1/5로 떨어진다.
-    #   따라서 고정 컨텐츠(블록 규칙·예시·이미지 규칙·출력 형식)를 먼저 두고,
-    #   가변 컨텐츠(현재 페이지 구조·사용자 목표)는 반드시 맨 뒤에 둔다.
-    #   (vLLM의 --enable-prefix-caching 도 동일한 원리로 동작)
+    # DeepSeek prompt cache 최적화 — 고정 prefix 먼저, 가변부 나중.
     # ────────────────────────────────────────────────────────
 
     # ── 고정 (캐시 prefix) ─────────────────────────────────
-    fixed_parts: list[str] = [
-        "### [이미지 URL 규칙 - 매우 중요!]",
-        "- 실제 URL을 넣지 말 것!",
-        "- 반드시 {{image:영문_검색어}} 형식으로 작성",
-        "- 예시:",
-        "  배너 이미지 → {{image:jpop band stage concert}}",
-        "  앨범 커버 → {{image:music album cover aesthetic}}",
-        "  프로필 → {{image:band member portrait}}",
-        "",
-    ]
+    fixed_parts: list[str] = []
+    if not is_remake:
+        # 새 페이지 생성에만 이미지 키워드 규칙 필요.
+        fixed_parts += [
+            "### [이미지 URL 규칙 - 매우 중요!]",
+            "- 실제 URL을 넣지 말 것!",
+            "- 반드시 {{image:영문_검색어}} 형식으로 작성",
+            "- 예시:",
+            "  배너 이미지 → {{image:jpop band stage concert}}",
+            "  앨범 커버 → {{image:music album cover aesthetic}}",
+            "  프로필 → {{image:band member portrait}}",
+            "",
+        ]
     if block_rules:
         fixed_parts += [f"### [블록 규칙]\n{block_rules}", ""]
     if examples:
-        fixed_parts += [f"### [예시 JSON]\n{examples}", ""]
+        if is_remake:
+            # 리메이크 모드는 출력 스키마가 예시와 다르다 — 디자인 톤만 참고하라고 명시.
+            fixed_parts += [
+                "### [디자인 톤 참고용 예시 페이지 — 출력 형식 모방 금지]",
+                "(아래는 잘 디자인된 페이지의 전체 JSON 예시다. "
+                "색 팔레트·design_settings·블록별 layout 조합·문구 톤·_type 선택을 참고하라. "
+                "단 출력은 시스템 프롬프트의 스키마(스타일 패치)를 따라야 하며, "
+                "이 예시 JSON 의 풀 구조를 그대로 출력하면 안 된다.)",
+                examples,
+                "",
+            ]
+        else:
+            fixed_parts += [f"### [예시 JSON]\n{examples}", ""]
     fixed_parts += [
         "### [출력 형식]",
         "설명 없이 JSON만 출력",
@@ -152,13 +293,135 @@ def build_prompts(
 
     # ── 가변 (캐시 경계 아래) ──────────────────────────────
     variable_parts: list[str] = []
-    if is_remake:
-        existing_page_meta = user_input.get("existing_page_meta", {})
+    if is_remake and mode == "full_restyle":
+        existing_page_meta = user_input.get("existing_page_meta", {}) or {}
+        existing_blocks = user_input.get("existing_blocks") or []
+        # chunked 호출 컨텍스트 — None 이면 단일 호출.
+        chunk_idx = user_input.get("_chunk_idx")
+        total_chunks = user_input.get("_total_chunks")
+        fixed_ds = user_input.get("_fixed_design_settings")
+        is_chunked = isinstance(chunk_idx, int) and isinstance(total_chunks, int) and total_chunks > 1
+
+        if is_chunked:
+            if chunk_idx == 0:
+                # 첫 chunk — design_settings + page.custom_css 를 결정한다.
+                variable_parts += [
+                    f"### [페이지 분할 처리 — chunk {chunk_idx + 1}/{total_chunks}]",
+                    "이 페이지는 너무 커서 LLM 호출을 여러 번에 나눠 처리합니다.",
+                    "당신은 **첫 chunk** 입니다. 책임:",
+                    "  1) **응답 JSON 최상위에 `page` 키 반드시 포함**. `page.data.design_settings` 전부 채우고 `page.custom_css` 도 비워두지 마라 (body 배경 그래디언트 한 줄 이상). 후속 chunk 들이 이 톤을 따라야 한다.",
+                    "  2) 이 chunk 의 블록 스타일/텍스트 패치.",
+                    "응답 형식은 단일 호출과 동일 — `{\"page\": {...}, \"blocks\": [...]}`. **`page` 키 누락은 금지**.",
+                    "",
+                ]
+            else:
+                variable_parts += [
+                    f"### [페이지 분할 처리 — chunk {chunk_idx + 1}/{total_chunks}]",
+                    "이 페이지는 너무 커서 LLM 호출을 여러 번에 나눠 처리합니다.",
+                    f"당신은 chunk {chunk_idx + 1} 입니다 — design_settings 는 첫 chunk 가 이미 확정했습니다.",
+                    "**그 톤을 그대로 유지**하며 이 chunk 의 블록 스타일/텍스트 패치만 출력하세요.",
+                    "응답의 ``page`` 키는 생략하거나 빈 객체로 두세요 — 백엔드가 첫 chunk 의 페이지 메타를 사용합니다.",
+                    "",
+                ]
+                if isinstance(fixed_ds, dict) and fixed_ds:
+                    variable_parts += [
+                        "### [확정된 design_settings — 동일 톤 유지]",
+                        f"```json\n{json.dumps(fixed_ds, ensure_ascii=False, indent=2)}\n```",
+                        "",
+                    ]
+
+        chunk_label = (
+            f" (chunk {chunk_idx + 1}/{total_chunks})"
+            if is_chunked else ""
+        )
         page_json = {
             "title": existing_page_meta.get("title", ""),
             "is_public": existing_page_meta.get("is_public", True),
             "data": existing_page_meta.get("data", {}),
             "blocks": existing_blocks,
+        }
+
+        # ───── 텍스트 정책 + 디자인 정책을 명확히 분리해서 명시 ─────
+        # 이렇게 분리하지 않으면 AI 가 "보존 모드" 신호를 디자인까지 보수적으로 해석한다.
+        preserve_content = user_input.get("preserve_content", False)
+        if preserve_content:
+            text_policy = [
+                "### [텍스트 콘텐츠 — 보존]",
+                "- 기존 텍스트(content, headline, label, subline, description, title 등) 의 **모든 의미·정보·뉘앙스를 유지**하라.",
+                "- 표현은 컨셉에 맞게 다듬을 수 있지만 **정보가 빠져선 안 된다**. 압축은 가독성 향상 목적으로만.",
+                "- **줄바꿈(\\n)·공백·들여쓰기·문단 구조를 그대로 유지**하라. 한 줄로 합치거나 공백을 지우지 마라.",
+                "",
+            ]
+        else:
+            text_policy = [
+                "### [텍스트 콘텐츠 — 자유 작성]",
+                "- 텍스트(label, headline, content 등) 를 컨셉에 맞게 자유롭게 다시 써도 된다.",
+                "- 단 핵심 실데이터(URL/이미지/연락처) 는 placeholder 로 보호되므로 그 부분은 유지.",
+                "",
+            ]
+
+        design_policy = [
+            "### [디자인 — 극적 변화 권장 / CSS 필수 작성]",
+            "텍스트와는 별개로 **시각적 정체성은 컨셉에 맞게 완전히 새로 설계**하라. 보수적으로 가지 마라.",
+            "",
+            "**디자인은 다음 3 가지 레이어가 모두 채워질 때 완성된다 — 셋 다 반드시 작성**:",
+            "1. ``page.data.design_settings`` (전체 교체) — 배경·버튼색·폰트·강조색.",
+            "2. ``page.custom_css`` (**비워두지 마라**) — 페이지 전역 톤의 마지막 한 끗. body 배경 그래디언트/패턴, font-feature-settings, 전역 typography 같은 한두 줄로도 충분. 빈 문자열로 응답하면 백엔드가 무시한다.",
+            "   예: ``body{background:radial-gradient(circle at 50% 0%,#1a0033,#0a0a14);font-feature-settings:'ss01';}``",
+            "3. 각 블록의 ``custom_css`` — box-shadow, border-radius, backdrop-filter, gradient text, hover 효과 등. 한 블록이 그냥 색만 바뀌는 게 아니라 카드 자체가 변해야 한다.",
+            "",
+            "추가로:",
+            "- 블록 색(``custom_bg_color``, ``custom_text_color``, ``custom_button_color``) 컨셉에 맞게 과감히.",
+            "- ``*_layout`` 적극 다양화 (``layout: large``, ``gallery_layout: carousel`` 등).",
+            "",
+            "**유일한 시각 자제 항목**: 기존 블록에 ``custom_border_color`` 가 없었으면 새로 넣지 마라. ``text_layout: \"plain\"`` 인 블록은 ``default`` 로 바꾸지 마라 (백엔드가 막는다). 그 외 모든 시각 변화는 자유.",
+            "",
+            "### [블록 무리 — 같은 디자인 통일]",
+            "**연속된 같은 _type 블록 무리(2개 이상)는 같은 시각 디자인을 가져야 한다.** 같은 기능을 가진 카드가 각기 다른 톤이면 페이지가 어수선해진다.",
+            "- 예: ``single_link/single_link`` 4개가 연속이면 4개 모두 동일한 ``custom_bg_color``·``custom_text_color``·``custom_button_color``·``custom_css`` 사용.",
+            "- 무리 간 구분은 spacer / divider 블록으로 — 무리 안의 개별 차이로 X.",
+            "- 백엔드가 후처리로 연속 무리의 시각 스타일을 첫 블록 기준으로 강제 통일한다. AI 가 다양화해도 무시되니 처음부터 통일해서 응답하라.",
+            "",
+            "**쇼케이스(``layout: \"large\"``) 남발 금지**: large 카드는 강조 전용이다. 같은 _type 그룹 안에서 large 는 **첫 블록 한 개만** 허용 — 나머지는 ``small``. 백엔드가 그룹 안 2번째 이후 large 를 small 로 강제 강등한다.",
+            "",
+        ]
+        variable_parts += text_policy + design_policy
+
+        variable_parts += [
+            f"### [현재 페이지 — full_restyle 대상{chunk_label}]",
+            "URL/이미지/연락처는 placeholder([URL_n]/[IMG_n]/[VIDEO_n]/[CONTACT_n]) 로 주어집니다 — 그대로 echo 또는 생략.",
+            "필요하면 ``_new: true`` 로 새 블록 추가, 응답에서 누락하면 그 블록은 삭제됩니다.",
+            f"```json\n{json.dumps(page_json, ensure_ascii=False, indent=2)}\n```",
+            "",
+        ]
+    elif is_remake and mode == "style_only":
+        existing_page_meta = user_input.get("existing_page_meta", {}) or {}
+        sample = user_input.get("sample_blocks") or []
+        all_ids = user_input.get("all_block_ids") or []
+        snapshot = {
+            "page": {
+                "title": existing_page_meta.get("title", ""),
+                "data": existing_page_meta.get("data", {}),
+            },
+            "sample_blocks": sample,
+            "all_block_ids": all_ids,
+        }
+        variable_parts += [
+            "### [현재 페이지 — style_only 대상 (대형 페이지)]",
+            "전체 블록은 너무 길어 보내지 않습니다. 처음/중간/끝 일부 블록과 _type별 대표 1개를 샘플로 제공합니다.",
+            "응답은 ``block_styles`` 만 — 글로벌 / subtype 별 / _by_id 개별 override.",
+            "구조(순서/추가/삭제/타입) 는 절대 바꿀 수 없습니다.",
+            f"```json\n{json.dumps(snapshot, ensure_ascii=False, indent=2)}\n```",
+            "",
+        ]
+    elif is_remake:
+        # legacy 호환 — 구 bio_remake_with_existing.
+        existing_page_meta = user_input.get("existing_page_meta", {}) or {}
+        page_json = {
+            "title": existing_page_meta.get("title", ""),
+            "is_public": existing_page_meta.get("is_public", True),
+            "data": existing_page_meta.get("data", {}),
+            "blocks": user_input.get("existing_blocks") or [],
         }
         variable_parts += [
             "### [현재 페이지 구조 - 리메이크 대상]",
@@ -167,6 +430,7 @@ def build_prompts(
             f"```json\n{json.dumps(page_json, ensure_ascii=False, indent=2)}\n```",
             "",
         ]
+
     variable_parts += [
         "### [목표]",
         concept if concept else "링크인바이오 페이지를 만들어줘.",

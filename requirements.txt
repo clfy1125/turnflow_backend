@@ -60,6 +60,10 @@ resend==2.4.0
 Pillow==10.4.0
 defusedxml==0.7.1
 
+# Headless 브라우저 캡쳐 (AI 레퍼런스 페이지 스냅샷)
+# 컨테이너 빌드 시 `python -m playwright install chromium` 이 실행되어 Chromium 바이너리도 함께 설치된다.
+playwright==1.45.0
+
 # Production Server
 gunicorn==21.2.0
 whitenoise==6.6.0

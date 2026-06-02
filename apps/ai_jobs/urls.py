@@ -8,6 +8,8 @@ from .views import (
     AiLlmTryView,
     AiTokenBalanceView,
     PageAiJobListView,
+    ReferenceCategoryListView,
+    ReferenceCategoryPagesView,
 )
 
 app_name = "ai_jobs"
@@ -28,4 +30,11 @@ urlpatterns = [
     path("test/llm/", AiLlmTryView.as_view(), name="llm-try"),
     path("classify-posts/", AiClassifyPostsView.as_view(), name="classify-posts"),
     path("tokens/", AiTokenBalanceView.as_view(), name="token-balance"),
+    # AI 레퍼런스 카테고리 & 페이지 조회 (공개)
+    path("categories/", ReferenceCategoryListView.as_view(), name="ref-category-list"),
+    path(
+        "categories/<slug:slug>/references/",
+        ReferenceCategoryPagesView.as_view(),
+        name="ref-category-pages",
+    ),
 ]

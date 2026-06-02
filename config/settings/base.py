@@ -303,6 +303,12 @@ CELERY_TIMEZONE = TIME_ZONE
 CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutes
 
+# 기능별 큐 라우팅 — 메모리 spike 큰 태스크 격리 가능.
+# 별도 worker 미실행 시에도 기본 worker 가 모든 큐를 consume 하므로 호환됨.
+CELERY_TASK_ROUTES = {
+    "pages.capture_reference_snapshot": {"queue": "snapshot"},
+}
+
 # Celery Beat Schedule (정기 결제 + DM 발송 보증 워커)
 # NOTE: 만료 처리 계열은 매시간 실행해 단일 실행 누락/지연 위험을 줄인다.
 #       각 태스크는 멱등하며, PayApp API 실패 시 다음 차수에서 재시도되도록 설계됨(apps/billing/tasks.py 참고).
@@ -487,6 +493,11 @@ RESEND_FROM_NAME = config("RESEND_FROM_NAME", default="TurnFlow")
 
 # Frontend URL (used in email verification / password reset links)
 FRONTEND_URL = config("FRONTEND_URL", default="http://localhost:3000")
+
+# AI 레퍼런스 페이지 스냅샷 캡쳐 대상 (Playwright headless Chromium).
+# 실서버: https://turnflow.link, 개발: ngrok 도메인.
+# 미지정 시 FRONTEND_URL 로 폴백.
+SNAPSHOT_BASE_URL = config("SNAPSHOT_BASE_URL", default=FRONTEND_URL)
 
 # Service metadata (used as default email template variables)
 SERVICE_NAME = config("SERVICE_NAME", default="TurnFlow")
