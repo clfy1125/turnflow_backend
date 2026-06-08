@@ -3,6 +3,14 @@
 .env.local
 .env.production
 
+# Backup secrets & artifacts (GATE-0) — *.example 템플릿은 추적 유지(이름이 달라 매칭 안 됨)
+.env.backup
+.deploy.prev
+/backups/
+*.dump.gpg
+*.sql.gz.gpg
+deploy/backups/pgbackrest.conf
+
 # Python
 __pycache__/
 *.py[cod]
