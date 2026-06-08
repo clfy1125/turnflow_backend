@@ -15,6 +15,7 @@ model_list:
 router_settings:
   timeout: 150
   fallbacks:
+    - {"deepseek": ["gemma-4"]}
     - {"gemma-4": ["deepseek"]}
   num_retries: 1
   allowed_fails: 2

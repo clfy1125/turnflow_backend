@@ -17,6 +17,9 @@ AI 작업 생성 / 조회 / 페이지별 이력 / 롤백 API.
   GET    /api/v1/ai/tokens/                    → 내 AI 토큰 잔액
 """
 
+from django.core.files.base import ContentFile
+from django.db import transaction
+from django.utils import timezone
 from drf_spectacular.utils import (
     OpenApiExample,
     OpenApiParameter,
@@ -24,17 +27,19 @@ from drf_spectacular.utils import (
     OpenApiTypes,
     extend_schema,
 )
-from django.utils import timezone
 from rest_framework import status
 from rest_framework.exceptions import ValidationError as DRFValidationError
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.billing.models import AiTokenBalance
+from apps.pages.image_pipeline import ImageValidationError, process_upload
+from apps.pages.image_views import ALLOWED_MIME_TYPES, MAX_FILE_SIZE_BYTES
 from apps.pages.models import Block, Page, ReferenceCategory
 
-from .models import AiJob
+from .models import AiJob, AiSourceImage
 from .serializers import (
     AiJobCreateSerializer,
     AiJobListSerializer,
@@ -42,6 +47,7 @@ from .serializers import (
     AiJobSerializer,
     AiLlmTryRequestSerializer,
     AiLlmTryResponseSerializer,
+    AiSourceImageSerializer,
     ClassifyPostsRequestSerializer,
     ClassifyPostsResponseSerializer,
     PageAiJobHistoryItemSerializer,
@@ -146,7 +152,13 @@ AI가 링크인바이오 페이지 JSON을 생성하는 **비동기 작업**을 
 |------|:----:|------|------|
 | `concept` | ✅ | string | 페이지 컨셉 설명 (최대 2000자) |
 | `slug` | ❌ | string | 리메이크할 기존 페이지의 slug. 전달 시 해당 페이지의 블록을 참고하여 AI가 리메이크 |
-| `model` | ❌ | string | AI 모델 선택. `gemma`(기본), `gpt5`(GPT-5.4, 개발 중). 기본값 `gemma` |
+| `model` | ❌ | string | AI 모델 선택. `deepseek`(기본), `gemma`(자체 호스팅), `gpt5`(개발 중) |
+| `image_ids` | ❌ | uuid[] | 새 페이지 생성 시 사용할 업로드 이미지 id (최대 10). `POST /api/v1/ai/source-images/` 로 먼저 업로드. AI가 라벨링 후 사용 가능한 이미지를 페이지에 배치 (slug 리메이크 시 무시) |
+
+## 이미지 기반 생성 (새 버전)
+1. `POST /api/v1/ai/source-images/` 로 이미지 1~10장 업로드 → `id` 목록 수신
+2. 이 엔드포인트에 `concept` + `image_ids` 전달
+3. AI가 먼저 이미지를 라벨링(콘텐츠/컨셉 판별 + 요약)한 뒤, 사용 가능한 이미지를 페이지 블록에 배치
 
 ## 토큰 시스템
 - 1회 생성당 **1토큰** 소모 (모델 무관)
@@ -171,6 +183,7 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
 | stage | progress | 설명 |
 |-------|----------|------|
 | `queued` | 0 | 대기 중 |
+| `labeling_images` | 8 | (이미지 업로드 시) 업로드 이미지 분석 중 |
 | `preparing_prompt` | 10 | 프롬프트 구성 중 |
 | `calling_model` | 30 | AI 모델 호출 중 (가장 오래 걸림) |
 | `parsing_response` | 70 | 결과 분석 중 |
@@ -233,6 +246,18 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
                 },
                 request_only=True,
             ),
+            OpenApiExample(
+                "이미지 기반 새 페이지 생성",
+                summary="업로드한 이미지 id를 함께 전달 (AI가 라벨링 후 배치)",
+                value={
+                    "concept": "직접 찍은 사진으로 만드는 디저트 카페 소개 페이지",
+                    "image_ids": [
+                        "550e8400-e29b-41d4-a716-446655440000",
+                        "550e8400-e29b-41d4-a716-446655440001",
+                    ],
+                },
+                request_only=True,
+            ),
         ],
     )
     def post(self, request):
@@ -241,12 +266,14 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
         vd = ser.validated_data
 
         # 모델 선택
-        llm_model = vd.get("model", AiJob.LlmModel.GEMMA)
+        llm_model = vd.get("model", AiJob.LlmModel.DEEPSEEK)
 
-        # gpt5 는 개발 중. (deepseek 은 사용 가능)
+        # gpt5 는 개발 중. (deepseek / gemma 는 사용 가능)
         if llm_model == AiJob.LlmModel.GPT5:
             return Response(
-                {"detail": "GPT-5.4 모델은 현재 개발 중입니다. 기본 모델(gemma)을 사용해주세요."},
+                {
+                    "detail": "GPT-5.4 모델은 현재 개발 중입니다. 기본 모델(deepseek)을 사용해주세요."
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -254,6 +281,7 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
 
         # Pro 플랜은 토큰 무제한
         from apps.billing.subscription_utils import get_user_plan
+
         user_plan = get_user_plan(request.user)
         is_pro = user_plan.name != "free"
 
@@ -273,11 +301,11 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
         # slug로 기존 페이지 리메이크
         page = None
         slug = vd.get("slug", "")
-        baseline_blocks = None        # placeholder freeze 안 된 원본 — 적용 단계에서 사용.
+        baseline_blocks = None  # placeholder freeze 안 된 원본 — 적용 단계에서 사용.
         baseline_page_meta = None
-        frozen_blocks = None          # LLM 입력용 (placeholder 치환됨).
+        frozen_blocks = None  # LLM 입력용 (placeholder 치환됨).
         frozen_page_meta = None
-        sampled_for_llm = None        # style_only 모드 샘플.
+        sampled_for_llm = None  # style_only 모드 샘플.
         placeholder_map: dict[str, str] = {}
         mode = ""
 
@@ -285,7 +313,9 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
             source_page = Page.objects.filter(slug=slug, user=request.user).first()
             if not source_page:
                 return Response(
-                    {"detail": f"slug '{slug}'에 해당하는 페이지를 찾을 수 없거나 권한이 없습니다."},
+                    {
+                        "detail": f"slug '{slug}'에 해당하는 페이지를 찾을 수 없거나 권한이 없습니다."
+                    },
                     status=status.HTTP_404_NOT_FOUND,
                 )
             page = source_page
@@ -316,36 +346,21 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
             mode = select_mode(baseline_blocks)
 
             # LLM 입력용 placeholder freeze.
-            frozen_payload, placeholder_map = freeze_placeholders({
-                "page_meta": baseline_page_meta,
-                "blocks": baseline_blocks,
-            })
+            frozen_payload, placeholder_map = freeze_placeholders(
+                {
+                    "page_meta": baseline_page_meta,
+                    "blocks": baseline_blocks,
+                }
+            )
             frozen_page_meta = frozen_payload["page_meta"]
             frozen_blocks = frozen_payload["blocks"]
 
             if mode == "style_only":
                 sampled_for_llm = sample_blocks(frozen_blocks)
 
-        # 레퍼런스 페이지 결정 — 명시 slug 우선, 없으면 category 의 첫 페이지 자동 선택.
+        # 레퍼런스 페이지는 사용자가 명시한 slug 만 사용한다.
+        # 미지정 시 카테고리 첫 페이지를 자동 주입하지 않고 레퍼런스 없이 진행한다.
         reference_page_slug = (vd.get("reference_page_slug") or "").strip()
-        if not reference_page_slug:
-            ref_cat_slug = (vd.get("reference_category_slug") or "").strip()
-            if ref_cat_slug:
-                first_ref = (
-                    Page.objects
-                    .filter(
-                        reference_category__slug=ref_cat_slug,
-                        reference_category__is_active=True,
-                        is_reference=True,
-                        is_public=True,
-                        is_active=True,
-                    )
-                    .order_by("reference_order", "id")
-                    .values_list("slug", flat=True)
-                    .first()
-                )
-                if first_ref:
-                    reference_page_slug = first_ref
 
         # input_payload 구성
         input_payload: dict = {
@@ -358,7 +373,9 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
             input_payload["existing_page_meta"] = frozen_page_meta
             if mode == "style_only":
                 input_payload["sample_blocks"] = sampled_for_llm or []
-                input_payload["all_block_ids"] = [b["id"] for b in baseline_blocks if b.get("id") is not None]
+                input_payload["all_block_ids"] = [
+                    b["id"] for b in baseline_blocks if b.get("id") is not None
+                ]
             else:
                 input_payload["existing_blocks"] = frozen_blocks
 
@@ -366,6 +383,27 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
             input_payload["_baseline_blocks"] = baseline_blocks
             input_payload["_baseline_page_meta"] = baseline_page_meta
             input_payload["_placeholder_map"] = placeholder_map
+
+        # 사용자 업로드 이미지 (새 페이지 생성 시에만 — 리메이크는 기존 이미지 placeholder 보호).
+        source_images = []
+        raw_image_ids = vd.get("image_ids") or []
+        if raw_image_ids and not slug:
+            source_images = list(
+                AiSourceImage.objects.filter(
+                    id__in=raw_image_ids,
+                    user=request.user,
+                    job__isnull=True,
+                )
+            )
+            if len(source_images) != len({str(i) for i in raw_image_ids}):
+                return Response(
+                    {"detail": "이미지를 찾을 수 없거나 이미 다른 작업에 사용되었습니다."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            # 요청 순서 보존 → {{user_image:N}} 인덱스 안정화
+            order = {str(i): n for n, i in enumerate(raw_image_ids)}
+            source_images.sort(key=lambda im: order.get(str(im.id), 0))
+            input_payload["source_image_ids"] = [str(im.id) for im in source_images]
 
         # AiJob 생성
         job = AiJob.objects.create(
@@ -377,12 +415,177 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
             input_payload=input_payload,
         )
 
+        # 업로드 이미지를 이 작업에 연결 (1 작업당 1회만 소비되도록 job 채움).
+        if source_images:
+            AiSourceImage.objects.filter(id__in=[im.id for im in source_images]).update(job=job)
+
         # Celery 태스크 enqueue
         run_ai_job.delay(str(job.id))
 
         return Response(
             AiJobSerializer(job).data,
             status=status.HTTP_202_ACCEPTED,
+        )
+
+
+class _UploadFileError(Exception):
+    """업로드 배치 중 한 파일 정제 실패 — 전체 롤백 트리거용 내부 예외."""
+
+
+_SOURCE_IMAGE_UPLOAD_REQUEST = {
+    "multipart/form-data": {
+        "type": "object",
+        "required": ["files"],
+        "properties": {
+            "files": {
+                "type": "array",
+                "items": {"type": "string", "format": "binary"},
+                "description": "업로드할 이미지 파일 1~10장. 같은 키 `files` 로 여러 개 전송.",
+            },
+        },
+    }
+}
+
+_MAX_SOURCE_IMAGES = 10
+
+
+class AiSourceImageUploadView(APIView):
+    """POST  /api/v1/ai/source-images/  — AI 생성에 쓸 이미지 배치 업로드."""
+
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
+
+    @extend_schema(
+        tags=[_TAG],
+        summary="AI 소스 이미지 업로드 (최대 10장)",
+        description="""
+## 개요
+AI 페이지 생성에 사용할 이미지를 **한 번에 1~10장** 업로드합니다.
+업로드만 수행하며(라벨링/배치는 생성 단계에서), 반환된 `id` 들을
+`POST /api/v1/ai/jobs/` 의 `image_ids` 로 전달하면 AI 가 라벨링 후 페이지에 배치합니다.
+
+이미지는 서버에서 자동으로 EXIF 제거 + 2048px 다운스케일 + JPEG/WebP 압축됩니다.
+
+## 인증
+`Authorization: Bearer <access_token>` 헤더 필수
+
+## 요청 (multipart/form-data)
+| 필드 | 타입 | 필수 | 설명 |
+|------|------|------|------|
+| `files` | file[] | ✅ | 이미지 1~10장. 같은 키 `files` 로 여러 개 전송 |
+
+- 허용 형식: jpeg, png, gif, webp, svg, bmp, tiff
+- 파일당 최대 10MB
+
+## 응답
+업로드된 이미지 객체 배열. 각 객체의 `id` 를 생성 요청 `image_ids` 에 사용.
+
+## 흐름
+```javascript
+// 1) 업로드
+const fd = new FormData();
+files.forEach(f => fd.append("files", f));
+const up = await api.post("/api/v1/ai/source-images/", fd);  // 201
+const imageIds = up.data.map(x => x.id);
+
+// 2) 생성 (이미지 라벨링 → 배치 자동)
+await api.post("/api/v1/ai/jobs/", { concept: "디저트 카페 소개 페이지", image_ids: imageIds });
+```
+
+## 에러
+| 코드 | 원인 |
+|------|------|
+| 400 | 파일 없음 / 11장 이상 / 지원하지 않는 형식 / 10MB 초과 / 손상된 이미지 |
+| 401 | 인증 실패 |
+        """,
+        request=_SOURCE_IMAGE_UPLOAD_REQUEST,
+        responses={
+            201: OpenApiResponse(
+                response=AiSourceImageSerializer(many=True),
+                description="업로드된 이미지 목록",
+                examples=[
+                    OpenApiExample(
+                        "Success",
+                        value=[
+                            {
+                                "id": "550e8400-e29b-41d4-a716-446655440000",
+                                "url": "https://media.example.com/ai_source_images/2026/06/ab12.jpg",
+                                "mime_type": "image/jpeg",
+                                "size": 320512,
+                                "size_display": "313.0 KB",
+                                "width": 1440,
+                                "height": 1920,
+                                "original_name": "cake.jpg",
+                                "created_at": "2026-06-04T18:00:00+09:00",
+                            }
+                        ],
+                    )
+                ],
+            ),
+            400: OpenApiResponse(description="잘못된 요청 (파일 수/형식/크기)"),
+            401: OpenApiResponse(description="인증 실패"),
+        },
+    )
+    def post(self, request):
+        files = request.FILES.getlist("files")
+        if not files:
+            return Response(
+                {"files": ["이미지 파일을 1장 이상 첨부해 주세요."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if len(files) > _MAX_SOURCE_IMAGES:
+            return Response(
+                {"files": [f"한 번에 최대 {_MAX_SOURCE_IMAGES}장까지 업로드할 수 있습니다."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 먼저 전수 검증 (하나라도 실패하면 아무것도 저장하지 않음).
+        for f in files:
+            mime_type = f.content_type or ""
+            if mime_type not in ALLOWED_MIME_TYPES:
+                return Response(
+                    {"files": [f"지원하지 않는 파일 형식입니다: {f.name}"]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if f.size > MAX_FILE_SIZE_BYTES:
+                return Response(
+                    {"files": [f"파일이 너무 큽니다(최대 10MB): {f.name}"]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        created = []
+        try:
+            with transaction.atomic():
+                for f in files:
+                    try:
+                        processed = process_upload(f)
+                    except ImageValidationError as e:
+                        # 트랜잭션 롤백 + 이미 저장된 스토리지 파일 정리
+                        raise _UploadFileError(f"{f.name}: {e}") from e
+                    img = AiSourceImage.objects.create(
+                        user=request.user,
+                        file=ContentFile(
+                            processed.content, name=processed.suggest_filename(f.name)
+                        ),
+                        mime_type=processed.mime_type,
+                        size=processed.size,
+                        width=processed.width,
+                        height=processed.height,
+                        original_name=f.name or "",
+                    )
+                    created.append(img)
+        except _UploadFileError as e:
+            # 스토리지는 트랜잭션 대상이 아니므로 직접 정리
+            for img in created:
+                img.file.delete(save=False)
+            return Response(
+                {"files": [str(e)]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response(
+            AiSourceImageSerializer(created, many=True, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
         )
 
 
@@ -674,10 +877,7 @@ class PageAiJobListView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        jobs = (
-            AiJob.objects.filter(user=request.user, page=page)
-            .order_by("-created_at")[:100]
-        )
+        jobs = AiJob.objects.filter(user=request.user, page=page).order_by("-created_at")[:100]
         return Response(PageAiJobHistoryItemSerializer(jobs, many=True).data)
 
 
@@ -975,7 +1175,11 @@ class AiLlmTryView(APIView):
                                 "cache_miss_tokens": 143,
                                 "estimated_cost_usd": 0.000924,
                             },
-                            "prompt_preview": {"system": "...", "user_head": "...", "user_tail": "..."},
+                            "prompt_preview": {
+                                "system": "...",
+                                "user_head": "...",
+                                "user_tail": "...",
+                            },
                         },
                     ),
                 ],
@@ -1028,7 +1232,9 @@ class AiLlmTryView(APIView):
             source_page = Page.objects.filter(slug=slug, user=request.user).first()
             if source_page is None:
                 return Response(
-                    {"detail": f"slug '{slug}'에 해당하는 페이지를 찾을 수 없거나 권한이 없습니다."},
+                    {
+                        "detail": f"slug '{slug}'에 해당하는 페이지를 찾을 수 없거나 권한이 없습니다."
+                    },
                     status=status.HTTP_400_BAD_REQUEST,
                 )
             blocks = Block.objects.filter(page=source_page).order_by("order")
@@ -1141,11 +1347,13 @@ class AiTokenBalanceView(APIView):
     )
     def get(self, request):
         token_balance = AiTokenBalance.get_or_create_for_user(request.user)
-        return Response({
-            "balance": token_balance.balance,
-            "total_used": token_balance.total_used,
-            "cost_per_generation": AiJob.TOKEN_COST,
-        })
+        return Response(
+            {
+                "balance": token_balance.balance,
+                "total_used": token_balance.total_used,
+                "cost_per_generation": AiJob.TOKEN_COST,
+            }
+        )
 
 
 class AiClassifyPostsView(APIView):
@@ -1234,7 +1442,10 @@ class AiClassifyPostsView(APIView):
                                 },
                             ],
                             "new_categories": [
-                                {"label": "💌 사연툰", "description": "독자 사연을 만화로 풀어낸 글"},
+                                {
+                                    "label": "💌 사연툰",
+                                    "description": "독자 사연을 만화로 풀어낸 글",
+                                },
                                 {"label": "🍼 육아툰", "description": "아이/육아 일상 만화"},
                             ],
                             "usage": {
@@ -1285,7 +1496,7 @@ class AiClassifyPostsView(APIView):
         ser.is_valid(raise_exception=True)
         vd = ser.validated_data
 
-        llm_model = vd.get("model", AiJob.LlmModel.GEMMA)
+        llm_model = vd.get("model", AiJob.LlmModel.DEEPSEEK)
         if llm_model == AiJob.LlmModel.GPT5:
             return Response(
                 {"detail": "GPT-5.4 모델은 현재 사용 불가입니다."},
@@ -1398,8 +1609,7 @@ sort_order ASC 정렬된 카테고리 배열. 페이지네이션 없음.
         from django.db.models import Count, Q
 
         qs = (
-            ReferenceCategory.objects
-            .filter(is_active=True)
+            ReferenceCategory.objects.filter(is_active=True)
             .annotate(
                 reference_count=Count(
                     "reference_pages",
@@ -1475,19 +1685,13 @@ LLM Few-shot 예시로 사용됩니다.
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        pages = (
-            Page.objects
-            .filter(
-                is_reference=True,
-                reference_category=category,
-                is_public=True,
-                is_active=True,
-                reference_snapshot_status=Page.SnapshotStatus.SUCCEEDED,
-            )
-            .order_by("reference_order", "id")
-        )
+        pages = Page.objects.filter(
+            is_reference=True,
+            reference_category=category,
+            is_public=True,
+            is_active=True,
+            reference_snapshot_status=Page.SnapshotStatus.SUCCEEDED,
+        ).order_by("reference_order", "id")
         return Response(
-            ReferencePageListSerializer(
-                pages, many=True, context={"request": request}
-            ).data
+            ReferencePageListSerializer(pages, many=True, context={"request": request}).data
         )

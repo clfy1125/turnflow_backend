@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import json
-from typing import Any
 
 # ─────────────────────────────────────────────────────────────
 # 임계값 — 두 조건 AND 일 때만 full_restyle.
@@ -17,8 +16,8 @@ from typing import Any
 # Chunked 처리 — 단일 호출 한 번에 8k 토큰 출력 한계가 있어 큰 페이지는 LLM 을 여러 번
 # 호출해서 합친다. 첫 호출이 design_settings + page.custom_css 를 결정하고, 후속 호출은
 # 그 톤을 system 에 주입받아 자신의 chunk 블록만 패치한다.
-FULL_RESTYLE_MAX_BLOCKS = 45         # 총 최대 — 초과시 style_only 로 폴백.
-FULL_RESTYLE_CHUNK_SIZE = 15         # chunk 당 블록 수. 한 호출 안전 마진.
+FULL_RESTYLE_MAX_BLOCKS = 45  # 총 최대 — 초과시 style_only 로 폴백.
+FULL_RESTYLE_CHUNK_SIZE = 15  # chunk 당 블록 수. 한 호출 안전 마진.
 # chunk 1개가 ~10k char 가정. 3 chunk → 30k. 안전망용 컷.
 FULL_RESTYLE_MAX_CONTENT_CHARS = 90_000
 

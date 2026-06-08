@@ -54,7 +54,8 @@ turnflow_backend/
 │   ├── billing/                # 요금제/구독/PayApp 결제 + Celery 정기 배치
 │   ├── integrations/           # Instagram OAuth/토큰 암호화(encryption.py)/Webhook
 │   ├── pages/                  # 페이지/게시물/DM 관련 뷰 (multi_views, image_views, stats, aiviews)
-│   └── ai_jobs/                # LLM 작업 큐 + services(llm_client, model_router, prompt_builder)
+│   ├── ai_jobs/                # LLM 작업 큐 + services(llm_client, model_router, prompt_builder)
+│   └── admin_api/              # 백오피스(어드민) 전용 API — 신원/대시보드/회원/워크스페이스/페이지/자동DM 모니터링 (serializers/, views/ 패키지 + AdminActionLog 감사로그). 마운트: /api/v1/admin/
 ├── config/                     # Django 프로젝트 설정
 │   ├── settings/               # base.py / local.py / prod.py
 │   ├── urls.py                 # 루트 URL (admin, api/v1, swagger, redoc)

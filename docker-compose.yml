@@ -76,7 +76,8 @@ services:
       dockerfile: Dockerfile
     image: instagram_backend_web
     container_name: instagram_backend_celery
-    command: celery -A config worker -l info
+    # -Q: 기본 celery + snapshot(pages.capture_reference_snapshot) + billing(정기 배치) 큐 소비.
+    command: celery -A config worker -l info -Q celery,snapshot,billing
     environment:
       - DJANGO_SETTINGS_MODULE=config.settings.local
       - DB_HOST=db

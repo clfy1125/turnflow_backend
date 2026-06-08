@@ -33,7 +33,6 @@ from django.utils.dateparse import parse_datetime
 from apps.pages.models import Block, Page
 from apps.pages.validators import validate_block_data
 
-
 _PAGE_META_FIELDS = ("title", "is_public", "data", "custom_css")
 
 
@@ -107,7 +106,7 @@ def apply_result_json_to_page(page: Page, result_json: dict) -> Page:
 
     # ── child_block_ids 재매핑 (폴더/토글 블록) ──────────
     id_map: dict[int, int] = {}
-    for old_id, new_block in zip(old_ids, created):
+    for old_id, new_block in zip(old_ids, created, strict=False):
         if old_id is not None:
             id_map[old_id] = new_block.id
     if not id_map:

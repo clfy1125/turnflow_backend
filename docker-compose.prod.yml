@@ -70,7 +70,8 @@ services:
     image: turnflow_instagram_web
     container_name: turnflow_instagram_celery
     restart: unless-stopped
-    command: celery -A config worker --concurrency=48 --prefetch-multiplier=1 -l info
+    # -Q: 기본 celery + snapshot(pages.capture_reference_snapshot) + billing(정기 배치) 큐 소비.
+    command: celery -A config worker --concurrency=48 --prefetch-multiplier=1 -l info -Q celery,snapshot,billing
     env_file:
       - .env.production
     environment:

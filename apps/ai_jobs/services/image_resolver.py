@@ -34,6 +34,8 @@ logger = logging.getLogger(__name__)
 _PIXABAY_API_KEY = config("PIXABAY_API_KEY", default="")
 _PIXABAY_URL = "https://pixabay.com/api/"
 _IMAGE_PATTERN = re.compile(r"\{\{image:([^}]+)\}\}")
+# 사용자 업로드 이미지 플레이스홀더. N = image_catalog 의 usable 이미지 번호(1-based).
+_USER_IMAGE_PATTERN = re.compile(r"\{\{user_image:(\d+)\}\}")
 
 # 다운로드 제한 (Pixabay webformatURL 은 보통 1~2MB 수준)
 _MAX_DOWNLOAD_BYTES = 15 * 1024 * 1024  # 15MB
@@ -48,21 +50,38 @@ _HOSTED_PREFIX = "ai_images"
 # ─────────────────────────────────────────────────────────────
 
 
-def resolve_images(data: dict) -> dict:
+def resolve_images(data: dict, *, user_image_urls: dict[str, str] | None = None) -> dict:
     """
-    JSON dict를 문자열화 → ``{{image:keyword}}`` 를 서비스 내부 URL로 치환 → dict 복원.
+    JSON dict를 문자열화 → 플레이스홀더를 실제 URL로 치환 → dict 복원.
+
+    1) ``{{user_image:N}}`` → 사용자가 업로드한 이미지 URL (``user_image_urls`` 매핑).
+       매핑에 없는 N(모델 할루시네이션)은 빈 문자열로 치환 — 출력에 플레이스홀더가 남지 않게.
+    2) ``{{image:keyword}}`` → Pixabay 검색 후 재호스팅 URL (기존 동작).
+
+    Args:
+        user_image_urls: ``{"1": "https://.../a.jpg", "2": "..."}`` 형태. None 이면 (1) 스킵.
     """
     json_str = json.dumps(data, ensure_ascii=False)
+
+    # 1) 사용자 업로드 이미지 먼저 치환.
+    user_image_urls = user_image_urls or {}
+    user_indices = set(_USER_IMAGE_PATTERN.findall(json_str))
+    if user_indices:
+        logger.info("사용자 이미지 플레이스홀더 %d종 발견, 치환 시작", len(user_indices))
+        for n in user_indices:
+            url = user_image_urls.get(str(n), "")
+            if not url:
+                logger.warning("{{user_image:%s}} 에 매핑된 URL 없음 → 빈 값으로 제거", n)
+            json_str = json_str.replace("{{user_image:" + n + "}}", url)
+
+    # 2) Pixabay 키워드 치환 (기존).
     keywords = set(_IMAGE_PATTERN.findall(json_str))
-    if not keywords:
-        return data
-
-    logger.info("이미지 키워드 %d개 발견, 검색/재호스팅 시작", len(keywords))
-
-    for keyword in keywords:
-        final_url = _resolve_one(keyword)
-        placeholder = "{{image:" + keyword + "}}"
-        json_str = json_str.replace(placeholder, final_url)
+    if keywords:
+        logger.info("이미지 키워드 %d개 발견, 검색/재호스팅 시작", len(keywords))
+        for keyword in keywords:
+            final_url = _resolve_one(keyword)
+            placeholder = "{{image:" + keyword + "}}"
+            json_str = json_str.replace(placeholder, final_url)
 
     return json.loads(json_str)
 

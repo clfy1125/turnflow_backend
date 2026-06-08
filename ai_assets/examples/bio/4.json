@@ -67,7 +67,7 @@
         "headline": "LIVE NOW",
         "text_size": "md",
         "text_align": "center",
-        "text_layout": "default",
+        "text_layout": "plain",
         "custom_bg_color": "#0f0820",
         "custom_text_color": "#f8f7ff"
       },
@@ -207,7 +207,7 @@
         ],
         "layout": "small",
         "auto_slide": true,
-        "keep_ratio": true,
+        "keep_ratio": false,
         "gallery_url": "https://neonpulse.com/gallery",
         "gallery_layout": "carousel",
         "custom_bg_color": "#140c2b",

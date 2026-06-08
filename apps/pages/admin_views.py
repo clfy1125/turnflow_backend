@@ -185,6 +185,7 @@ class AdminReferenceCategoryDetailView(generics.RetrieveUpdateDestroyAPIView):
 class AdminReferencePageListView(generics.ListAPIView):
     permission_classes = [IsAdminUser]
     serializer_class = AdminReferencePageSerializer
+    search_fields = ["title", "slug", "user__email"]
 
     def get_queryset(self):
         qs = Page.objects.select_related("user", "reference_category")

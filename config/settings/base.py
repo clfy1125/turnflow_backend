@@ -44,6 +44,7 @@ INSTALLED_APPS = [
     "apps.emails.apps.EmailsConfig",
     "apps.tiktok",
     "apps.youtube",
+    "apps.admin_api",
 ]
 
 MIDDLEWARE = [
@@ -220,6 +221,8 @@ REST_FRAMEWORK = {
         "external_import": "30/hour",
         # 인사이트 강제 동기화 — 사용자별 시간당 5회 (IG quota 보호)
         "insights_sync": "5/hour",
+        # 외부 링크 메타 조회 — 사용자별 분당 60회 (인터랙티브 붙여넣기 UX + SSRF 어뷰즈 방어)
+        "link_meta": "60/min",
     },
 }
 
@@ -465,6 +468,21 @@ INSIGHTS_API_ENABLED = config("INSIGHTS_API_ENABLED", default=False, cast=bool)
 COUPANG_MOCK_MODE = config("COUPANG_MOCK_MODE", default=True, cast=bool)
 COUPANG_PARTNERS_ACCESS_KEY = config("COUPANG_PARTNERS_ACCESS_KEY", default="")
 COUPANG_PARTNERS_SECRET_KEY = config("COUPANG_PARTNERS_SECRET_KEY", default="")
+
+# ─────────────────────────────────────────────────────────────
+# 외부 링크 메타 스크랩 (link/fetch-meta) — anti-bot 폴백
+# ─────────────────────────────────────────────────────────────
+# 오늘의집·네이버 스마트스토어 등 Akamai/WAF 로 서버 직접 fetch 가 막히는 사이트는
+# 외부 스크랩 서비스(residential IP + 렌더링)로만 메타를 가져올 수 있다.
+# PROVIDER 미설정 시 폴백 비활성 — 차단 사이트는 빈 {} 응답(=수동 입력).
+# 직접 fetch 가 실패할 때만 호출하므로 유료 호출은 최소화된다.
+LINK_SCRAPER_PROVIDER = config("LINK_SCRAPER_PROVIDER", default="")  # scraperapi | scrapingbee
+LINK_SCRAPER_API_KEY = config("LINK_SCRAPER_API_KEY", default="")
+LINK_SCRAPER_RENDER_JS = config("LINK_SCRAPER_RENDER_JS", default=True, cast=bool)
+LINK_SCRAPER_COUNTRY = config("LINK_SCRAPER_COUNTRY", default="")  # 예: kr (플랜 지원 시)
+LINK_SCRAPER_TIMEOUT = config("LINK_SCRAPER_TIMEOUT", default=20, cast=int)  # read timeout(초)
+# provider 별 프리미엄/스텔스 플래그 (Akamai 우회용). 예: "premium=true,stealth_proxy=true"
+LINK_SCRAPER_EXTRA_PARAMS = config("LINK_SCRAPER_EXTRA_PARAMS", default="")
 
 # ─────────────────────────────────────────────────────────────
 # TikTok Business API (business-api.tiktok.com)

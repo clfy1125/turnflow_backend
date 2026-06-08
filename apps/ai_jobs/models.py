@@ -16,8 +16,8 @@ class AiJob(models.Model):
         EXTERNAL_IMPORT = "external_import", "외부 페이지 가져오기"
 
     class LlmModel(models.TextChoices):
-        GEMMA = "gemma", "Gemma (자체 H100, 기본)"
-        DEEPSEEK = "deepseek", "DeepSeek V4-Flash (외부 API, 폴백/오버플로우)"
+        GEMMA = "gemma", "Gemma (자체 H100, 폴백/오버플로우)"
+        DEEPSEEK = "deepseek", "DeepSeek V4-Flash (외부 API, 기본)"
         GPT5 = "gpt5", "GPT-5.4"
 
     class Mode(models.TextChoices):
@@ -45,6 +45,8 @@ class AiJob(models.Model):
     class Stage(models.TextChoices):
         QUEUED = "queued", "대기"
         # LLM 파이프라인 (BIO_REMAKE / THEME_GENERATION / COPY_GENERATION) 단계
+        # 사용자 업로드 이미지가 있는 새-생성 작업의 선행 단계.
+        LABELING_IMAGES = "labeling_images", "이미지 분석"
         PREPARING_PROMPT = "preparing_prompt", "프롬프트 준비"
         CALLING_MODEL = "calling_model", "모델 호출"
         PARSING_RESPONSE = "parsing_response", "응답 파싱"
@@ -80,7 +82,7 @@ class AiJob(models.Model):
     llm_model = models.CharField(
         max_length=20,
         choices=LlmModel.choices,
-        default=LlmModel.GEMMA,
+        default=LlmModel.DEEPSEEK,
         verbose_name="LLM 모델",
     )
     mode = models.CharField(
@@ -173,3 +175,82 @@ class AiJob(models.Model):
         if message:
             self.message = message
         self.save(update_fields=["stage", "progress", "message", "updated_at"])
+
+
+class AiSourceImage(models.Model):
+    """AI 새-페이지 생성에 사용할 사용자 업로드 이미지.
+
+    기존 ``pages.PageMedia`` 는 ``page`` FK 가 필수라 "아직 페이지가 없는" 새-생성
+    시점에 쓸 수 없고, 멀티페이지 환경에서 무관한 페이지를 오염시킨다. 그래서 페이지에
+    묶이지 않는 경량 모델을 따로 둔다.
+
+    흐름:
+        1) ``POST /api/v1/ai/source-images/`` 로 업로드 → ``job=None`` 으로 생성
+        2) ``POST /api/v1/ai/jobs/`` 에 ``image_ids`` 전달 → 해당 AiJob 으로 연결(``job`` 채움)
+        3) Celery 라벨링 단계가 비전 LLM 으로 ``usable``/``role``/``summary`` 등을 채움
+    """
+
+    class Role(models.TextChoices):
+        # 페이지에 실제로 배치할 콘텐츠 이미지.
+        CONTENT = "content", "콘텐츠(페이지 배치)"
+        # 분위기/색감 참고만 하고 배치하지 않는 컨셉 이미지.
+        CONCEPT = "concept", "컨셉(참고용)"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="ai_source_images",
+        verbose_name="사용자",
+    )
+    job = models.ForeignKey(
+        "AiJob",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="source_images",
+        verbose_name="연결된 작업",
+        help_text="업로드 시점엔 비어 있고, 생성 작업 생성 시 연결된다.",
+    )
+
+    # ── 파일 ──
+    file = models.FileField(upload_to="ai_source_images/%Y/%m/", verbose_name="이미지")
+    mime_type = models.CharField(max_length=100, blank=True, default="")
+    size = models.PositiveIntegerField(default=0, verbose_name="크기(byte)")
+    width = models.PositiveIntegerField(null=True, blank=True)
+    height = models.PositiveIntegerField(null=True, blank=True)
+    original_name = models.CharField(max_length=500, blank=True, default="")
+    # 동일 이미지 재라벨 방지용 콘텐츠 해시(sha256). 선택 최적화.
+    content_hash = models.CharField(max_length=64, blank=True, default="", db_index=True)
+
+    # ── 라벨링 결과 (라벨 캐시 겸용) ──
+    labeled = models.BooleanField(default=False, verbose_name="라벨링 완료")
+    usable = models.BooleanField(default=False, verbose_name="페이지 사용 가능")
+    role = models.CharField(
+        max_length=20, choices=Role.choices, blank=True, default="", verbose_name="용도"
+    )
+    summary = models.TextField(blank=True, default="", verbose_name="이미지 요약")
+    suggested_use = models.CharField(max_length=200, blank=True, default="")
+    quality_flags = models.JSONField(
+        default=dict,
+        blank=True,
+        verbose_name="품질 플래그",
+        help_text="{blurry, low_res, has_text, nsfw}",
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        verbose_name = "AI 소스 이미지"
+        verbose_name_plural = "AI 소스 이미지 목록"
+        ordering = ["created_at"]  # 업로드 순서 보존 → {{user_image:N}} 인덱스 안정화
+        indexes = [models.Index(fields=["user", "created_at"])]
+
+    def __str__(self):
+        return f"AiSourceImage({self.id}) {self.role or 'unlabeled'} ({self.user})"
+
+    def delete(self, *args, **kwargs):
+        """DB 삭제 시 스토리지 파일도 함께 제거 (PageMedia.delete 패턴)."""
+        if self.file:
+            self.file.delete(save=False)
+        super().delete(*args, **kwargs)

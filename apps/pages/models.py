@@ -163,6 +163,27 @@ class Page(models.Model):
         verbose_name="스냅샷 실패 메시지",
     )
 
+    # ── AI 스냅샷 활성 슬롯 포인터 ────────────────────────────
+    # 라이브 페이지가 "지금 어느 스냅샷 상태와 동일한지"를 가리키는 포인터.
+    #   - AI 1-shot 편집 직후 → latest_ai_result 스냅샷
+    #   - 스냅샷 복원 직후    → 복원에 사용한 스냅샷
+    #   - 사용자가 블록/디자인을 직접 편집해 저장 → NULL (라이브가 어느 슬롯과도 불일치)
+    # GET .../snapshots/ 의 is_current 계산에 사용. 가리키던 스냅샷이 지워지면
+    # on_delete=SET_NULL 로 자동 NULL. PageSnapshot 은 같은 파일 하단에 정의돼
+    # 있어 문자열 참조로 forward reference.
+    current_snapshot = models.ForeignKey(
+        "pages.PageSnapshot",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        verbose_name="현재 활성 스냅샷",
+        help_text=(
+            "라이브 페이지가 현재 일치하는 스냅샷. AI 편집/복원 직후 설정되고, "
+            "사용자가 직접 편집하면 NULL 로 초기화된다."
+        ),
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -187,6 +208,18 @@ class Page(models.Model):
             return page, False
         slug = _generate_unique_slug(user.username)
         return cls.objects.create(user=user, slug=slug, is_public=False), True
+
+    def detach_snapshot_pointer(self):
+        """사용자가 블록/디자인을 직접 편집해 라이브가 어느 스냅샷과도 일치하지
+        않게 됐을 때 활성 슬롯 포인터를 해제한다.
+
+        AI 편집/복원 외의 모든 일반 편집 경로(블록 생성/수정/삭제/재정렬, 페이지
+        메타·CSS 수정)에서 호출한다. 이미 NULL 이면 DB 쓰기 없이 즉시 반환하므로
+        AI 스냅샷이 없는 대다수 페이지에서는 사실상 무비용이다.
+        """
+        if self.current_snapshot_id is not None:
+            self.current_snapshot_id = None
+            self.save(update_fields=["current_snapshot", "updated_at"])
 
 
 class Block(models.Model):

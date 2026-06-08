@@ -20,21 +20,39 @@ from typing import Any
 # ─────────────────────────────────────────────────────────────
 
 # 카테고리별 키 (placeholder prefix)
-_URL_KEYS: frozenset[str] = frozenset({
-    "url", "link_url", "gallery_url",
-})
-_IMG_KEYS: frozenset[str] = frozenset({
-    "image_url", "thumbnail_url", "avatar_url", "cover_image_url", "bgImage",
-})
-_VIDEO_LIST_KEYS: frozenset[str] = frozenset({
-    "video_urls",
-})
-_IMG_LIST_KEYS: frozenset[str] = frozenset({
-    "images",
-})
-_CONTACT_KEYS: frozenset[str] = frozenset({
-    "phone", "email", "whatsapp",
-})
+_URL_KEYS: frozenset[str] = frozenset(
+    {
+        "url",
+        "link_url",
+        "gallery_url",
+    }
+)
+_IMG_KEYS: frozenset[str] = frozenset(
+    {
+        "image_url",
+        "thumbnail_url",
+        "avatar_url",
+        "cover_image_url",
+        "bgImage",
+    }
+)
+_VIDEO_LIST_KEYS: frozenset[str] = frozenset(
+    {
+        "video_urls",
+    }
+)
+_IMG_LIST_KEYS: frozenset[str] = frozenset(
+    {
+        "images",
+    }
+)
+_CONTACT_KEYS: frozenset[str] = frozenset(
+    {
+        "phone",
+        "email",
+        "whatsapp",
+    }
+)
 
 # placeholder 패턴: 토큰 prefix → 카테고리
 _TOKEN_PATTERN = re.compile(r"^\[(URL|IMG|VIDEO|CONTACT)_(\d+)\]$")
@@ -104,8 +122,11 @@ def freeze_placeholders(payload: Any) -> tuple[Any, dict[str, str]]:
             return out
         if isinstance(value, list):
             return [
-                _allocate(list_prefix, item) if (list_prefix and isinstance(item, str) and item.strip())
-                else _convert(item)
+                (
+                    _allocate(list_prefix, item)
+                    if (list_prefix and isinstance(item, str) and item.strip())
+                    else _convert(item)
+                )
                 for item in value
             ]
         return value

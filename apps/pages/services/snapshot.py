@@ -101,6 +101,9 @@ def capture_page_snapshot(slug: str) -> SnapshotResult:
                     viewport=MOBILE_VIEWPORT,
                     device_scale_factor=DEVICE_SCALE_FACTOR,
                     user_agent=USER_AGENT,
+                    # ngrok 터널을 SNAPSHOT_BASE_URL 로 쓰는 개발 환경에서
+                    # 브라우저 경고 인터스티셜 대신 실제 페이지를 받기 위함.
+                    extra_http_headers={"ngrok-skip-browser-warning": "true"},
                 )
                 page = context.new_page()
                 page.set_default_timeout(TOTAL_TIMEOUT_MS)

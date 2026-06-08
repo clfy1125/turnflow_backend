@@ -197,6 +197,8 @@ custom_button_color?: string;  // 블록 버튼색
 
 **가격:** `price` 표시, `original_price`가 있으면 취소선으로 할인 전 가격 표시.
 
+> ⚠️ **URL 규칙 (모든 url·*_url 필드 공통, 위반 시 저장 거부):** `url`·`thumbnail_url` 등 모든 URL 필드는 **실제 `http(s)://` URL** 만 넣어라. 진짜 URL을 모르면 **`#` 나 `https://example.com` 같은 가짜/플레이스홀더를 절대 쓰지 말고**, 해당 키를 **빈 문자열 `""` 로 두거나 생략**하라. (`#` 같은 값은 서버 검증에서 거부되어 페이지가 통째로 저장되지 않는다.)
+
 ---
 
 ### 3. group_link — `type: "single_link"` + `data._type: "group_link"`
@@ -231,6 +233,8 @@ custom_button_color?: string;  // 블록 버튼색
 - `grid-3` — 3열 그리드
 - `carousel-1` — 캐러셀 (아이템 75% 너비)
 - `carousel-2` — 캐러셀 (아이템 48% 너비)
+
+> ⚠️ **썸네일 & 레이아웃:** `grid-2`/`grid-3`/`carousel-1`/`carousel-2` 는 **항목마다 썸네일 이미지를 보여주는** 레이아웃이다. 이 레이아웃을 쓰려면 **모든 `links` 항목에 `thumbnail_url`**(실제 이미지나 `{{image:영문키워드}}`)을 채워야 한다. 썸네일을 줄 수 없으면(예: 단순 카테고리/메뉴 링크) **`group_layout: "list"` 를 써라.** 썸네일 없는 grid/carousel 은 빈 이미지 박스만 떠서 보기 싫다. (썸네일 없는 grid/carousel 은 자동으로 list 로 강등된다.)
 
 **display_mode:** `collapse`이면 처음 2개만 표시 + "더보기" 버튼.
 
@@ -310,6 +314,8 @@ SNS 및 연락처 아이콘 모음. 값이 있는 플랫폼만 아이콘 표시.
 - `default` — 카드 형태 (배경 + 테두리)
 - `toggle` — 접기/펼치기. headline 클릭 시 content 토글
 
+> 💡 **디자인 권장**: 텍스트 블록은 대부분 `plain`(테두리·배경 없음)이 더 깔끔하고 예쁘다. 카드로 강조해야 할 분명한 이유가 없으면 `text_layout: "plain"` 을 기본으로 써라. 또한 **한 블록에 문장이 많아질수록 안 예쁘다 — 짧고 간결하게**(헤드라인 한 줄, 본문 1~3문장) 쓰고, 긴 내용은 압축하거나 여러 블록으로 나눠라.
+
 ---
 
 ### 7. gallery — `type: "single_link"` + `data._type: "gallery"`
@@ -322,7 +328,7 @@ SNS 및 연락처 아이콘 모음. 값이 있는 플랫폼만 아이콘 표시.
   "gallery_layout": "single | carousel | list | thumbnail | free",
   "gallery_url": "클릭 시 이동 URL (선택)",
   "auto_slide": false,
-  "keep_ratio": true
+  "keep_ratio": false
 }
 ```
 
@@ -332,6 +338,8 @@ SNS 및 연락처 아이콘 모음. 값이 있는 플랫폼만 아이콘 표시.
 - `list` — 세로 나열
 - `thumbnail` — 작은 그리드 썸네일
 - `free` — 자유 배치
+
+> 💡 **디자인 권장**: 갤러리는 대부분 `keep_ratio: false`(비율 유지 끔 — 이미지를 칸에 꽉 채워 crop)가 더 예쁘게 정렬된다. 특별한 이유가 없으면 `keep_ratio: false` 를 기본으로 써라.
 
 ---
 
@@ -510,16 +518,60 @@ SNS 및 연락처 아이콘 모음. 값이 있는 플랫폼만 아이콘 표시.
 
 ```typescript
 interface DesignSettings {
-  theme: string;              // 테마명
-  bgColor: string;            // 배경색
-  textColor: string;          // 텍스트색
-  buttonColor: string;        // 버튼색
-  buttonTextColor: string;    // 버튼 텍스트색
-  buttonStyle: 'filled' | 'outline' | 'soft';
-  buttonRadius: number;       // 0~30
-  fontFamily: string;         // 웹폰트명
-  bgImage?: string;           // 배경 이미지 URL
-  bgImageOpacity?: number;    // 0~1
-  ctaColor?: string;          // 강조색 (일정 D-day 등에 사용)
+  backgroundColor: string;       // 페이지 전체 배경색
+  frameBackgroundColor: string;  // 프레임/베젤 배경색 — 보통 backgroundColor 와 동일하게 (아래 설명)
+  backgroundImage?: string;      // 배경 이미지 URL
+  blockBgColor: string;          // 카드/블록 기본 배경색 (빈 문자열이면 흰 카드)
+  buttonColor: string;           // 버튼색
+  buttonShape: 'rounded' | 'pill' | 'square';
+  buttonApplyMode?: 'partial' | 'full';
+  fontFamily: string;            // 아래 "폰트(fontFamily) 정책"의 5개 값만 허용
+  topMenuStyle: string;          // 상단 메뉴 스타일 (예: "icons")
+  logoStyle?: string;            // 예: "hidden"
+  customLogoImage?: string;
+  // 일부 컨셉 한정 보조: ctaColor(강조색), buttonTextColor 등 — 위 키가 1순위.
 }
 ```
+
+> ⚠️ **키 이름 주의**: 위 키 이름을 **정확히 그대로** 써라. `bgColor`/`textColor`/`bgImage` 같은 옛 이름은 렌더되지 않는다.
+
+### frameBackgroundColor — 프레임/베젤 배경
+페이지가 모바일 프레임 안에 렌더될 때 프레임(베젤) 영역의 배경색. **`backgroundColor` 와 같은 값으로 채우면** 배경과 프레임이 하나로 이어져 통일감이 생긴다. 비워두면 베젤이 기본색으로 남아 배경과 따로 놀아 어색하다. → 색 컨셉을 잡을 땐 `backgroundColor` 와 `frameBackgroundColor` 를 **둘 다** 채워라.
+
+### 히어로 패턴 — `cover_bg`
+강한 첫인상을 주려면 profile 블록을 `profile_layout: "cover_bg"` 로 만들고 `cover_image_url` 에 대표 이미지(작품/제품/배너/인물)를 넣어 **풀블리드 배경 히어로**로 쓴다. (profile 블록 상세는 §1 참조.) 작은 원형 아바타(`center`)보다 임팩트가 크다.
+
+### custom_css — 1급 디자인 레이어 (page + block)
+색만으로 부족한 "마지막 한 끗"은 `custom_css` 로 완성한다. **page 와 block 둘 다 raw CSS 문자열**을 받고 공개 페이지에서 `<style>` 로 주입된다.
+- `page.custom_css` — body 전역 톤. 예: `body{background:linear-gradient(180deg,#451FFF,#2d12b3);}`
+- 블록 `custom_css` — 카드 그림자/라운드/backdrop/그래디언트 텍스트/hover. 예: `.block{box-shadow:0 12px 40px -12px rgba(0,0,0,.25);border-radius:20px;}`
+- 단 **깨끗함 > 화려함**. 과한 네온/그래디언트 텍스트 남발 금지.
+
+### 색 조합 & 대비 — ⚠️ 가독성 필수
+페이지 맥락(업종/무드) + 주요색 + 배경색(backgroundColor) + 카드색(blockBgColor) + 텍스트색 + 버튼색(buttonColor)을 **하나의 조화로운 팔레트**로 함께 설계한다. 특히 **텍스트색과 카드색은 페이지 배경 위에서 또렷이 읽히도록 충분한 명도 대비**를 확보하라.
+- 어두운 배경 → 밝은 텍스트(예: bg `#0b0b14` + text `#f5f5f5`).  밝은 배경/카드 → 어두운 텍스트.
+- 배경과 비슷한 톤의 텍스트/버튼(예: 남색 배경에 남색 버튼)은 안 보이므로 금지.
+- 버튼색(buttonColor)은 배경·카드와 또렷이 구분되는 강조색으로.
+
+---
+
+## 폰트(fontFamily) 정책 — ⚠️ 반드시 준수
+
+`design_settings.fontFamily` 에는 **아래 5개 값만** 쓸 수 있다. 서비스에 탑재된 웹폰트가 이게 전부다.
+
+| fontFamily 값 (정확히 이대로) | 표시명 | 성격 | 사용 |
+|---|---|---|---|
+| `Pretendard` | Pretendard | 모던 산세리프 | **기본 · 최우선 권장** |
+| `Noto Sans KR` | Noto Sans | 보편 산세리프 | **기본 · 권장** |
+| `IBM Plex Sans KR` | IBM Plex | 또박또박·중립·테크 | 컨셉 필요시만 |
+| `Nanum Gothic` | 나눔고딕 | 친근한 고딕 | 컨셉 필요시만 |
+| `Nanum Myeongjo` | 나눔명조 | **유일한 명조(세리프)** | 컨셉 필요시만 |
+
+**규칙:**
+1. **기본값은 `Pretendard`** 다. 거의 모든 페이지는 `Pretendard` 또는 `Noto Sans KR` 를 쓴다 — 이게 안전하고 가독성이 가장 좋다.
+2. 나머지 3개(`IBM Plex Sans KR` / `Nanum Gothic` / `Nanum Myeongjo`)는 **컨셉상 분명한 이유가 있을 때만** 쓴다:
+   - 고급·전통·에디토리얼·세리프 감성 → `Nanum Myeongjo`
+   - 또박또박·중립·엔지니어링/테크 → `IBM Plex Sans KR`
+   - 둥글고 친근한 고딕 → `Nanum Gothic`
+3. **위 5개 외의 폰트명은 절대 쓰지 마라** (예: `Gmarket Sans`, `Noto Serif KR`, `Montserrat`, `Roboto` 등). 탑재돼 있지 않아 렌더링되지 않고 시스템 기본 폰트로 폴백된다.
+4. **모노스페이스 폰트는 제공되지 않는다.** "사이버/코드" 같은 느낌이 필요하면 폰트가 아니라 `custom_css`(letter-spacing, text-transform: uppercase, font-feature-settings 등)로 표현하라.

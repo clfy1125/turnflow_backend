@@ -1,4 +1,5 @@
 """prompt_builder 의 신규 `_load_example_from_db` + `build_prompts` 분기 테스트."""
+
 from __future__ import annotations
 
 import json
@@ -23,25 +24,30 @@ def user(db):
 
 @pytest.fixture
 def category(db):
-    return ReferenceCategory.objects.create(
-        slug="cafe", name="카페", sort_order=1, is_active=True
-    )
+    return ReferenceCategory.objects.create(slug="cafe", name="카페", sort_order=1, is_active=True)
 
 
 @pytest.fixture
 def ref_page_with_blocks(db, user, category):
     page = Page.objects.create(
-        user=user, slug="cafe-ref", title="감성 카페",
-        is_public=True, is_reference=True,
+        user=user,
+        slug="cafe-ref",
+        title="감성 카페",
+        is_public=True,
+        is_reference=True,
         reference_category=category,
         data={"design_settings": {"backgroundColor": "#fff"}},
     )
     Block.objects.create(
-        page=page, type="profile", order=1,
+        page=page,
+        type="profile",
+        order=1,
         data={"headline": "감성 카페", "subline": "since 2024"},
     )
     Block.objects.create(
-        page=page, type="single_link", order=2,
+        page=page,
+        type="single_link",
+        order=2,
         data={"label": "메뉴", "url": "https://menu"},
     )
     return page
@@ -65,14 +71,20 @@ class TestLoadExampleFromDb:
 
     def test_private_page_returns_empty(self, db, user, category):
         Page.objects.create(
-            user=user, slug="priv-ref", is_public=False, is_reference=True,
+            user=user,
+            slug="priv-ref",
+            is_public=False,
+            is_reference=True,
             reference_category=category,
         )
         assert _load_example_from_db("priv-ref") == ""
 
     def test_not_is_reference_returns_empty(self, db, user, category):
         Page.objects.create(
-            user=user, slug="just-public", is_public=True, is_reference=False,
+            user=user,
+            slug="just-public",
+            is_public=True,
+            is_reference=False,
             reference_category=category,
         )
         assert _load_example_from_db("just-public") == ""

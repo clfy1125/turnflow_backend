@@ -259,6 +259,8 @@ await api.patch('/api/pages/me/', { is_public: false });
         serializer = PageSerializer(page, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
+        # 사용자 직접 편집 → 라이브가 스냅샷과 달라졌으므로 활성 슬롯 포인터 해제
+        page.detach_snapshot_pointer()
         return Response(serializer.data)
 
 
@@ -487,6 +489,8 @@ class BlockListCreateView(APIView):
         serializer = BlockSerializer(data=request.data, context={"page": page})
         serializer.is_valid(raise_exception=True)
         serializer.save()
+        # 블록 추가 → 라이브가 스냅샷과 달라졌으므로 활성 슬롯 포인터 해제
+        page.detach_snapshot_pointer()
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
@@ -579,6 +583,8 @@ await api.patch(`/api/pages/me/blocks/${blockId}/`, {
         serializer = BlockSerializer(block, data=request.data, partial=True, context={"page": page})
         serializer.is_valid(raise_exception=True)
         serializer.save()
+        # 블록 수정 → 라이브가 스냅샷과 달라졌으므로 해당 블록 페이지의 활성 슬롯 포인터 해제
+        block.page.detach_snapshot_pointer()
         return Response(serializer.data)
 
     @extend_schema(tags=["페이지 서비스"],
@@ -610,7 +616,10 @@ await api.patch(`/api/pages/me/blocks/${blockId}/`, {
         block = self._get_block(request, pk)
         if not block:
             return Response({"detail": "블록을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+        page = block.page
         block.delete()
+        # 블록 삭제 → 라이브가 스냅샷과 달라졌으므로 활성 슬롯 포인터 해제
+        page.detach_snapshot_pointer()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -696,6 +705,8 @@ const handleDragEnd = async (reorderedBlocks: Block[]) => {
                 order=Case(*cases, output_field=IntegerField())
             )
 
+        # 블록 재정렬 → 라이브가 스냅샷과 달라졌으므로 활성 슬롯 포인터 해제
+        page.detach_snapshot_pointer()
         updated = page.blocks.order_by("order")
         return Response(BlockSerializer(updated, many=True).data)
 
@@ -970,6 +981,8 @@ if (page.custom_css) {
         serializer.is_valid(raise_exception=True)
         page.custom_css = serializer.validated_data["custom_css"]
         page.save(update_fields=["custom_css", "updated_at"])
+        # 사용자 직접 편집 → 라이브가 스냅샷과 달라졌으므로 활성 슬롯 포인터 해제
+        page.detach_snapshot_pointer()
         return Response(PageSerializer(page).data)
 
 
@@ -1074,6 +1087,8 @@ await api.patch(`/api/v1/pages/me/blocks/${blockId}/css/`, {
         serializer.is_valid(raise_exception=True)
         block.custom_css = serializer.validated_data["custom_css"]
         block.save(update_fields=["custom_css", "updated_at"])
+        # 블록 직접 편집 → 라이브가 스냅샷과 달라졌으므로 활성 슬롯 포인터 해제
+        page.detach_snapshot_pointer()
         return Response(BlockSerializer(block).data)
 
 

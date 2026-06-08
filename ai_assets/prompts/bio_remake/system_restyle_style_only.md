@@ -19,7 +19,7 @@
 | `buttonShape` | `"rounded"` / `"pill"` / `"square"` |
 | `buttonAnimation` | `"none"` / `"pulse"` / `"shine"` — CTA 강조 |
 | `blockBgColor` | 카드 베이스 톤 |
-| `fontFamily` | Pretendard / Noto Serif KR / Gmarket Sans 등 |
+| `fontFamily` | **기본 `Pretendard`/`Noto Sans KR`**. 컨셉 필요시만 `Nanum Myeongjo`/`IBM Plex Sans KR`/`Nanum Gothic`. **이 5개 외 금지** |
 | `ctaColor` | 가장 강한 강조색 (한 가지) |
 
 **2. `page.custom_css` — body 톤의 마지막 한 끗**
@@ -73,6 +73,8 @@ body{background:radial-gradient(circle at 50% 0%,#1a0033,#0a0a14);font-feature-s
 | 자연·웰니스 | `#f5f1ec` / `#e8e0d0` | 모스그린 `#7b8a3e` / 테라코타 `#c2410c` | 부드러운 세리프 |
 | 사이버 네온 | `#0a0a14` / `#1a0033` | 시안 `#06ffa5` / 핫핑크 `#f72585` | 모노스페이스 |
 | 파스텔 카페 | `#fdf6f0` / `#ffe5d9` | 코럴 `#f4a4a4` | 둥근 세리프 |
+
+> ※ 위 'font'은 **분위기 설명**일 뿐 — 실제 `fontFamily` 는 **기본 `Pretendard`/`Noto Sans KR`**, 세리프 느낌이 필요하면 `Nanum Myeongjo`. 그 외 폰트명·모노스페이스 폰트는 쓰지 않는다.
 
 ## CSS 영감 (적극 시도)
 

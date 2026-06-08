@@ -2,7 +2,7 @@ from rest_framework import serializers
 
 from apps.pages.models import Page, ReferenceCategory
 
-from .models import AiJob
+from .models import AiJob, AiSourceImage
 
 
 class AiJobCreateSerializer(serializers.Serializer):
@@ -21,9 +21,9 @@ class AiJobCreateSerializer(serializers.Serializer):
     )
     model = serializers.ChoiceField(
         choices=AiJob.LlmModel.choices,
-        default=AiJob.LlmModel.GEMMA,
+        default=AiJob.LlmModel.DEEPSEEK,
         required=False,
-        help_text="사용할 AI 모델. `gemma`(기본), `gpt5`(GPT-5.4, 개발 중)",
+        help_text="사용할 AI 모델. `deepseek`(기본), `gemma`(자체 호스팅), `gpt5`(GPT-5.4, 개발 중)",
     )
     preserve_content = serializers.BooleanField(
         default=False,
@@ -47,14 +47,15 @@ class AiJobCreateSerializer(serializers.Serializer):
             "비어 있으면 기본 파일 예시 폴백."
         ),
     )
-    reference_category_slug = serializers.SlugField(
-        max_length=50,
+    image_ids = serializers.ListField(
+        child=serializers.UUIDField(),
         required=False,
-        allow_blank=True,
-        default="",
+        default=list,
+        max_length=10,
         help_text=(
-            "reference_page_slug 가 비어 있을 때만 사용. "
-            "지정 카테고리의 reference_order ASC 첫 페이지를 자동 선택."
+            "POST /api/v1/ai/source-images/ 로 먼저 업로드한 이미지 id 목록 (최대 10). "
+            "전달하면 AI 가 라벨링 후 사용 가능한 이미지를 페이지에 배치한다. "
+            "slug(리메이크)와 함께 쓰면 무시된다 — 새 페이지 생성 시에만 적용."
         ),
     )
 
@@ -68,12 +69,56 @@ class AiJobCreateSerializer(serializers.Serializer):
                 is_active=True,
             ).exists()
             if not exists:
-                raise serializers.ValidationError({
-                    "reference_page_slug": (
-                        "레퍼런스 페이지를 찾을 수 없거나 활성/공개 상태가 아닙니다."
-                    )
-                })
+                raise serializers.ValidationError(
+                    {
+                        "reference_page_slug": (
+                            "레퍼런스 페이지를 찾을 수 없거나 활성/공개 상태가 아닙니다."
+                        )
+                    }
+                )
         return data
+
+
+class AiSourceImageSerializer(serializers.ModelSerializer):
+    """POST /api/v1/ai/source-images/ 업로드 응답 (업로드된 이미지 1건)."""
+
+    url = serializers.SerializerMethodField(
+        help_text="업로드된 이미지 URL. (라벨링/배치 전 단계 — 표시·미리보기용)"
+    )
+    size_display = serializers.SerializerMethodField(
+        help_text="사람이 읽기 좋은 파일 크기 (예: 320.5 KB)"
+    )
+
+    class Meta:
+        model = AiSourceImage
+        fields = [
+            "id",
+            "url",
+            "mime_type",
+            "size",
+            "size_display",
+            "width",
+            "height",
+            "original_name",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+    def get_url(self, obj) -> str:
+        request = self.context.get("request")
+        if not obj.file:
+            return ""
+        if request:
+            return request.build_absolute_uri(obj.file.url)
+        return obj.file.url
+
+    def get_size_display(self, obj) -> str:
+        size = obj.size or 0
+        if size < 1024:
+            return f"{size} B"
+        if size < 1024 * 1024:
+            return f"{size / 1024:.1f} KB"
+        return f"{size / (1024 * 1024):.1f} MB"
 
 
 class ReferenceCategorySerializer(serializers.ModelSerializer):
@@ -310,14 +355,18 @@ class ClassifyPostItemSerializer(serializers.Serializer):
         help_text="해시태그 (# 제외)",
     )
     type = serializers.CharField(
-        required=False, allow_blank=True, default="",
+        required=False,
+        allow_blank=True,
+        default="",
         help_text="Image / Video / Sidecar 등 게시물 타입",
     )
     likes = serializers.IntegerField(required=False, default=0)
     comments = serializers.IntegerField(required=False, default=0)
     timestamp = serializers.CharField(required=False, allow_blank=True, default="")
     thumbnail_url = serializers.URLField(
-        required=False, allow_blank=True, default="",
+        required=False,
+        allow_blank=True,
+        default="",
         help_text="썸네일 URL. (현재는 텍스트 기반 분류만 — 향후 비전 입력으로 확장 시 사용)",
     )
 
@@ -327,7 +376,9 @@ class ClassifyCategoryItemSerializer(serializers.Serializer):
 
     label = serializers.CharField(max_length=40)
     description = serializers.CharField(
-        required=False, allow_blank=True, default="",
+        required=False,
+        allow_blank=True,
+        default="",
         help_text="LLM 이 의미 판단에 쓸 한 줄 설명",
     )
 
@@ -351,32 +402,45 @@ class ClassifyPostsRequestSerializer(serializers.Serializer):
         help_text="분류할 게시물 배치. 1~20개. 속도-품질 균형은 6~9 권장.",
     )
     existing_categories = ClassifyCategoryItemSerializer(
-        many=True, required=False, default=list,
+        many=True,
+        required=False,
+        default=list,
         help_text="이미 정해진 카테고리 목록. 첫 호출에서는 빈 배열.",
     )
     artist_context = ClassifyArtistContextSerializer(
-        required=False, default=dict,
+        required=False,
+        default=dict,
         help_text="작가 메타 (LLM 이 톤/장르 판단에 활용).",
     )
     max_categories = serializers.IntegerField(
-        required=False, default=6, min_value=1, max_value=12,
+        required=False,
+        default=6,
+        min_value=1,
+        max_value=12,
         help_text="한 페이지가 가질 카테고리 총 상한. 기본 6.",
     )
     model = serializers.ChoiceField(
         choices=AiJob.LlmModel.choices,
-        default=AiJob.LlmModel.GEMMA,
+        default=AiJob.LlmModel.DEEPSEEK,
         required=False,
-        help_text="LLM 모델. 기본 gemma (자체 호스팅, 무료).",
+        help_text="LLM 모델. 기본 deepseek (외부 API). gemma(자체 호스팅, 무료)도 선택 가능.",
     )
     max_tokens = serializers.IntegerField(
-        required=False, default=2500, min_value=256, max_value=8000,
+        required=False,
+        default=2500,
+        min_value=256,
+        max_value=8000,
     )
     temperature = serializers.FloatField(
-        required=False, default=0.1, min_value=0.0, max_value=2.0,
+        required=False,
+        default=0.1,
+        min_value=0.0,
+        max_value=2.0,
         help_text="결정성 높이려고 기본 0.1.",
     )
     use_vision = serializers.BooleanField(
-        required=False, default=True,
+        required=False,
+        default=True,
         help_text=(
             "True 이면 각 post.thumbnail_url 을 ``image_url`` 멀티모달 블록으로 함께 보내,"
             " LLM 이 이미지 안의 한국어 제목을 읽고 카테고리/제목을 판단한다."

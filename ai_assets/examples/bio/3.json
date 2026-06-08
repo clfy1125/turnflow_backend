@@ -67,7 +67,7 @@
         "headline": "About",
         "text_size": "md",
         "text_align": "left",
-        "text_layout": "default",
+        "text_layout": "plain",
         "custom_bg_color": "#f5f3ee",
         "custom_text_color": "#111111"
       },
@@ -89,7 +89,7 @@
         ],
         "layout": "small",
         "auto_slide": false,
-        "keep_ratio": true,
+        "keep_ratio": false,
         "gallery_url": "https://nocturn.gallery/archive",
         "gallery_layout": "thumbnail",
         "custom_bg_color": "#ffffff",
@@ -111,7 +111,7 @@
         "headline": "Featured Works",
         "text_size": "sm",
         "text_align": "left",
-        "text_layout": "default",
+        "text_layout": "plain",
         "custom_bg_color": "#f5f3ee",
         "custom_text_color": "#3a3a3a"
       },
@@ -209,7 +209,7 @@
         "headline": "Visit",
         "text_size": "sm",
         "text_align": "left",
-        "text_layout": "default",
+        "text_layout": "plain",
         "custom_bg_color": "#f5f3ee",
         "custom_text_color": "#111111"
       },

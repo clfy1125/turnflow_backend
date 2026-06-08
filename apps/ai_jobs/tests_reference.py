@@ -1,4 +1,5 @@
-"""AI Job 생성 시 reference_page_slug / reference_category_slug 처리 테스트."""
+"""AI Job 생성 시 reference_page_slug 처리 테스트."""
+
 from __future__ import annotations
 
 import pytest
@@ -50,8 +51,11 @@ def category(db):
 @pytest.fixture
 def ref_page(db, user, category):
     return Page.objects.create(
-        user=user, slug="great-ref", title="좋은 레퍼런스",
-        is_public=True, is_reference=True,
+        user=user,
+        slug="great-ref",
+        title="좋은 레퍼런스",
+        is_public=True,
+        is_reference=True,
         reference_category=category,
         reference_order=1,
         reference_snapshot_status="succeeded",
@@ -80,13 +84,9 @@ class TestAiJobCreateWithReference:
         )
         assert res.status_code == 400
 
-    def test_reference_slug_but_not_is_reference_returns_400(
-        self, auth_client, user
-    ):
+    def test_reference_slug_but_not_is_reference_returns_400(self, auth_client, user):
         # 공개 페이지지만 is_reference=False 인 경우.
-        Page.objects.create(
-            user=user, slug="not-curated", is_public=True, is_reference=False
-        )
+        Page.objects.create(user=user, slug="not-curated", is_public=True, is_reference=False)
         res = auth_client.post(
             "/api/v1/ai/jobs/",
             {"concept": "X", "reference_page_slug": "not-curated"},
@@ -94,16 +94,9 @@ class TestAiJobCreateWithReference:
         )
         assert res.status_code == 400
 
-    def test_with_category_slug_picks_first_page(
-        self, auth_client, ref_page, user, category
-    ):
-        # 같은 카테고리에 reference_order=2 의 다른 페이지를 만들어두고
-        # category_slug 만 보내면 order=1 인 ref_page 가 선택되어야 함.
-        Page.objects.create(
-            user=user, slug="second-ref", is_public=True, is_reference=True,
-            reference_category=category, reference_order=2,
-            reference_snapshot_status="succeeded",
-        )
+    def test_category_slug_no_longer_auto_picks(self, auth_client, ref_page, user, category):
+        # 유저가 reference_page_slug 를 명시하지 않으면, 카테고리에 큐레이션된
+        # 레퍼런스 페이지가 있어도 자동 주입하지 않고 레퍼런스 없이 진행한다.
         res = auth_client.post(
             "/api/v1/ai/jobs/",
             {"concept": "X", "reference_category_slug": category.slug},
@@ -111,7 +104,7 @@ class TestAiJobCreateWithReference:
         )
         assert res.status_code == 202
         job = AiJob.objects.latest("created_at")
-        assert job.input_payload["reference_page_slug"] == ref_page.slug
+        assert job.input_payload["reference_page_slug"] == ""
 
     def test_without_reference_works_with_fallback(self, auth_client):
         res = auth_client.post(

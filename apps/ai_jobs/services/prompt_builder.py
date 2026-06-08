@@ -8,7 +8,6 @@ bio_remake 작업은 두 모드(``full_restyle`` / ``style_only``) 로 분기.
 
 import json
 import logging
-import os
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -50,16 +49,12 @@ def _load_example_from_db(reference_page_slug: str) -> str:
     """
     from apps.pages.models import Block, Page  # 순환 import 방지 — 함수 안에서 import
 
-    page = (
-        Page.objects
-        .filter(
-            slug=reference_page_slug,
-            is_reference=True,
-            is_public=True,
-            is_active=True,
-        )
-        .first()
-    )
+    page = Page.objects.filter(
+        slug=reference_page_slug,
+        is_reference=True,
+        is_public=True,
+        is_active=True,
+    ).first()
     if not page:
         logger.warning(
             "레퍼런스 페이지 로드 실패 (없음/비공개/비활성): %s",
@@ -68,8 +63,7 @@ def _load_example_from_db(reference_page_slug: str) -> str:
         return ""
 
     blocks_qs = (
-        Block.objects
-        .filter(page=page)
+        Block.objects.filter(page=page)
         .order_by("order")
         .values("id", "type", "order", "is_enabled", "data", "custom_css")
     )
@@ -173,7 +167,7 @@ _SYSTEM_PROMPTS: dict[str, str] = {
         '    "*": {"custom_bg_color": "#...", "custom_text_color": "#..."},\n'
         '    "single_link": {"layout": "wide"},\n'
         '    "_by_id": {"217": {"custom_button_color": "#..."}}\n'
-        '  } }'
+        "  } }"
     ),
 }
 
@@ -230,6 +224,7 @@ def build_prompts(
     example_dir = _EXAMPLE_DIR_MAP.get(job_type, "bio")
     reference_page_slug = (user_input.get("reference_page_slug") or "").strip()
 
+    using_reference = False
     if mode == "style_only":
         examples = ""
     elif reference_page_slug:
@@ -240,9 +235,9 @@ def build_prompts(
                 "reference_page_slug=%s 로드 실패 — 파일 예시로 폴백",
                 reference_page_slug,
             )
-            examples = _load_examples(
-                example_dir, max_count=2 if is_remake else 4
-            )
+            examples = _load_examples(example_dir, max_count=2 if is_remake else 4)
+        else:
+            using_reference = True
     elif is_remake:
         examples = _load_examples(example_dir, max_count=2)
     else:
@@ -267,6 +262,27 @@ def build_prompts(
             "  배너 이미지 → {{image:jpop band stage concert}}",
             "  앨범 커버 → {{image:music album cover aesthetic}}",
             "  프로필 → {{image:band member portrait}}",
+            "",
+            "### [사용자 업로드 이미지 규칙]",
+            "- 아래 [목표] 위에 [사용 가능한 사용자 이미지] 목록이 주어지면, 그 이미지를 "
+            "{{user_image:N}} 형식으로 해당 블록의 image_url 에 배치한다 (N = 목록의 번호).",
+            "- 목록에 있는 사용자 이미지는 가능한 한 **모두 활용**하고, 각 이미지의 추천 위치를 우선 따른다.",
+            "- 사용자 이미지로 채우지 못하는 자리에만 {{image:키워드}}(Pixabay) 를 쓴다.",
+            "- **[사용 가능한 사용자 이미지] 목록이 없으면 {{user_image:N}} 을 절대 쓰지 말고 "
+            "{{image:키워드}} 만 사용한다.**",
+            "",
+            "### [디자인 정책 — 새 페이지]",
+            "좋은 결과는 아래 4개 레이어가 일관될 때 나온다:",
+            "1. design_settings: backgroundColor 와 frameBackgroundColor 를 **둘 다** 채우고 보통 "
+            "같은 베이스 색(참고 이미지 배경색)으로 맞춘다. blockBgColor·buttonColor·fontFamily 도 같은 팔레트로.",
+            "2. 히어로: 대표 비주얼(작품/제품/배너/인물)이 있으면 profile 을 "
+            'profile_layout: "cover_bg" + cover_image_url 로 풀블리드 히어로로 만든다.',
+            '3. 카드 위계: 핵심 CTA 한 개만 layout: "large", 나머지 small/medium. '
+            "같은 _type 무리는 같은 톤(색)으로 통일.",
+            "4. custom_css 적극 활용: page.custom_css 를 비워두지 말고 body 배경 그래디언트를 넣고, "
+            "강조 카드엔 은은한 box-shadow/border-radius 를 준다. 단 깨끗함 > 화려함"
+            "(과한 네온/그래디언트 텍스트 남발 금지).",
+            "색은 비슷한 색으로 바꾸지 말고 추출 팔레트의 #hex 를 그대로 써라. 일관성과 깨끗함이 화려함보다 중요.",
             "",
         ]
     if block_rules:
@@ -300,7 +316,9 @@ def build_prompts(
         chunk_idx = user_input.get("_chunk_idx")
         total_chunks = user_input.get("_total_chunks")
         fixed_ds = user_input.get("_fixed_design_settings")
-        is_chunked = isinstance(chunk_idx, int) and isinstance(total_chunks, int) and total_chunks > 1
+        is_chunked = (
+            isinstance(chunk_idx, int) and isinstance(total_chunks, int) and total_chunks > 1
+        )
 
         if is_chunked:
             if chunk_idx == 0:
@@ -311,7 +329,7 @@ def build_prompts(
                     "당신은 **첫 chunk** 입니다. 책임:",
                     "  1) **응답 JSON 최상위에 `page` 키 반드시 포함**. `page.data.design_settings` 전부 채우고 `page.custom_css` 도 비워두지 마라 (body 배경 그래디언트 한 줄 이상). 후속 chunk 들이 이 톤을 따라야 한다.",
                     "  2) 이 chunk 의 블록 스타일/텍스트 패치.",
-                    "응답 형식은 단일 호출과 동일 — `{\"page\": {...}, \"blocks\": [...]}`. **`page` 키 누락은 금지**.",
+                    '응답 형식은 단일 호출과 동일 — `{"page": {...}, "blocks": [...]}`. **`page` 키 누락은 금지**.',
                     "",
                 ]
             else:
@@ -330,10 +348,7 @@ def build_prompts(
                         "",
                     ]
 
-        chunk_label = (
-            f" (chunk {chunk_idx + 1}/{total_chunks})"
-            if is_chunked else ""
-        )
+        chunk_label = f" (chunk {chunk_idx + 1}/{total_chunks})" if is_chunked else ""
         page_json = {
             "title": existing_page_meta.get("title", ""),
             "is_public": existing_page_meta.get("is_public", True),
@@ -374,7 +389,7 @@ def build_prompts(
             "- 블록 색(``custom_bg_color``, ``custom_text_color``, ``custom_button_color``) 컨셉에 맞게 과감히.",
             "- ``*_layout`` 적극 다양화 (``layout: large``, ``gallery_layout: carousel`` 등).",
             "",
-            "**유일한 시각 자제 항목**: 기존 블록에 ``custom_border_color`` 가 없었으면 새로 넣지 마라. ``text_layout: \"plain\"`` 인 블록은 ``default`` 로 바꾸지 마라 (백엔드가 막는다). 그 외 모든 시각 변화는 자유.",
+            '**유일한 시각 자제 항목**: 기존 블록에 ``custom_border_color`` 가 없었으면 새로 넣지 마라. ``text_layout: "plain"`` 인 블록은 ``default`` 로 바꾸지 마라 (백엔드가 막는다). 그 외 모든 시각 변화는 자유.',
             "",
             "### [블록 무리 — 같은 디자인 통일]",
             "**연속된 같은 _type 블록 무리(2개 이상)는 같은 시각 디자인을 가져야 한다.** 같은 기능을 가진 카드가 각기 다른 톤이면 페이지가 어수선해진다.",
@@ -382,7 +397,7 @@ def build_prompts(
             "- 무리 간 구분은 spacer / divider 블록으로 — 무리 안의 개별 차이로 X.",
             "- 백엔드가 후처리로 연속 무리의 시각 스타일을 첫 블록 기준으로 강제 통일한다. AI 가 다양화해도 무시되니 처음부터 통일해서 응답하라.",
             "",
-            "**쇼케이스(``layout: \"large\"``) 남발 금지**: large 카드는 강조 전용이다. 같은 _type 그룹 안에서 large 는 **첫 블록 한 개만** 허용 — 나머지는 ``small``. 백엔드가 그룹 안 2번째 이후 large 를 small 로 강제 강등한다.",
+            '**쇼케이스(``layout: "large"``) 남발 금지**: large 카드는 강조 전용이다. 같은 _type 그룹 안에서 large 는 **첫 블록 한 개만** 허용 — 나머지는 ``small``. 백엔드가 그룹 안 2번째 이후 large 를 small 로 강제 강등한다.',
             "",
         ]
         variable_parts += text_policy + design_policy
@@ -431,9 +446,112 @@ def build_prompts(
             "",
         ]
 
+    # 사용자 업로드 이미지 카탈로그 (라벨링 단계가 채운 image_catalog). 새-생성 한정.
+    # 캐시 프리픽스 무결성을 위해 요청별로 달라지는 이 내용은 반드시 가변부에 둔다.
+    if not is_remake:
+        image_catalog = user_input.get("image_catalog") or {}
+        usable = image_catalog.get("usable") or []
+        mood_notes = (image_catalog.get("mood_notes") or "").strip()
+        if usable:
+            lines = ["### [사용 가능한 사용자 이미지 — 반드시 활용]"]
+            for item in usable:
+                n = item.get("n")
+                summary = (item.get("summary") or "").strip() or "(요약 없음)"
+                use = (item.get("suggested_use") or "general").strip()
+                lines.append(f"{n}. {{{{user_image:{n}}}}} — 요약: {summary} · 추천 위치: {use}")
+            lines.append(
+                "(위 번호를 {{user_image:N}} 형식으로 적절한 블록의 image_url 에 배치하라.)"
+            )
+            lines.append("")
+            variable_parts += lines
+        if mood_notes:
+            variable_parts += [
+                "### [컨셉 이미지에서 읽은 디자인 방향 — 사이트 성격까지 반영]",
+                "(사용자가 올린 컨셉/참고 이미지를 분석한 디자인 방향이다. 이 이미지들은 페이지에 "
+                "배치하지 말되, **색감뿐 아니라 사이트 성격·업종 느낌·레이아웃/구성 스타일·브랜드 톤을 "
+                "이 방향에 맞춰** 전체 디자인과 블록 구성을 설계하라.)",
+                mood_notes,
+                "",
+            ]
+        # 비전 라벨러가 이미지에서 직접 읽은 색(#hex). prose(mood_notes)보다 구체적이라
+        # design_settings 색을 이 값에 맞추라고 명시 — 색감 재현 정확도를 높이는 핵심.
+        palette = image_catalog.get("palette") or {}
+        if palette:
+            plines = [
+                "### [이미지에서 추출한 색 팔레트 — design_settings 에 우선 반영]",
+                "(참고 이미지에서 실제로 읽은 색이다. 위 디자인 방향 설명보다 **이 구체 색값(#hex)을 우선**해 "
+                "design_settings 의 backgroundColor·frameBackgroundColor·카드·텍스트·버튼색을 이 값에 맞춰라.)",
+            ]
+            label_map = [
+                ("background", "배경 (backgroundColor)"),
+                ("surface", "카드/블록 배경 (blockBgColor)"),
+                ("text", "텍스트 (textColor)"),
+                ("accent", "버튼·강조 (buttonColor / ctaColor)"),
+            ]
+            for key, label in label_map:
+                if palette.get(key):
+                    plines.append(f"- {label}: {palette[key]}")
+            if palette.get("background"):
+                plines.append(
+                    f"- 프레임/베젤 (frameBackgroundColor): {palette['background']}"
+                    "  ← backgroundColor 와 동일하게"
+                )
+            if palette.get("brightness"):
+                plines.append(f"- 전체 밝기: {palette['brightness']}")
+            if palette.get("dominant_colors"):
+                plines.append(f"- 이미지 주요 색: {', '.join(palette['dominant_colors'])}")
+            plines.append("")
+            variable_parts += plines
+
+        # 레퍼런스 스크린샷에서 읽은 구조 — 히어로/블록순서/카드스타일을 원본에 맞춘다.
+        structure = image_catalog.get("structure") or {}
+        if structure:
+            slines = ["### [참고 이미지에서 읽은 구조 — 블록 구성/순서를 이에 맞춰라]"]
+            hero = structure.get("hero")
+            if hero:
+                hero_map = {
+                    "cover": '풀블리드 커버 히어로 (profile_layout: "cover_bg" + cover_image_url)',
+                    "avatar": "원형 프로필 중심 (profile_layout: center/left)",
+                    "none": "별도 히어로 없음",
+                }
+                slines.append(f"- 히어로: {hero_map.get(hero, hero)}")
+            if structure.get("card_style"):
+                slines.append(f"- 카드 스타일: {structure['card_style']}")
+            if structure.get("block_order"):
+                slines.append(
+                    "- 관찰된 섹션 순서(위→아래): "
+                    + " → ".join(structure["block_order"])
+                    + " (이 흐름을 최대한 따르되 사용자 콘텐츠에 맞게 보정)"
+                )
+            slines.append("")
+            variable_parts += slines
+
+        # 참고 이미지에서 읽은 실제 글자(OCR) — 페이지 콘텐츠로 활용.
+        text_content = image_catalog.get("text_content") or {}
+        if text_content:
+            tlines = [
+                "### [참고 이미지에서 읽은 실제 텍스트 — 페이지 콘텐츠로 활용]",
+                "(아래는 참고 이미지에 실제로 적혀 있던 문구다. 이 내용을 페이지의 실제 콘텐츠로 써라: "
+                "title→프로필 headline, tagline→subline, buttons→CTA 버튼 라벨, items→카드/링크 제목. "
+                "필요한 짧은 보조 설명은 새로 작성 가능하되 위 문구는 최대한 살려라.)",
+            ]
+            if text_content.get("title"):
+                tlines.append(f"- 제목: {text_content['title']}")
+            if text_content.get("tagline"):
+                tlines.append(f"- 슬로건: {text_content['tagline']}")
+            if text_content.get("buttons"):
+                tlines.append("- 버튼: " + " / ".join(text_content["buttons"]))
+            if text_content.get("items"):
+                tlines.append("- 항목: " + " / ".join(text_content["items"]))
+            tlines.append("")
+            variable_parts += tlines
+
+    goal_text = concept if concept else "링크인바이오 페이지를 만들어줘."
+    if using_reference:
+        goal_text = f"위 예시 레퍼런스 페이지와 비슷한 느낌으로 만들어줘.\n{goal_text}"
     variable_parts += [
         "### [목표]",
-        concept if concept else "링크인바이오 페이지를 만들어줘.",
+        goal_text,
     ]
 
     user_prompt = "\n".join(fixed_parts + variable_parts)

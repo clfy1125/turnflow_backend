@@ -10,6 +10,7 @@
       "blockBgColor": "#111111",
       "topMenuStyle": "icons",
       "backgroundColor": "#000000",
+      "frameBackgroundColor": "#000000",
       "backgroundImage": "",
       "buttonAnimation": "none",
       "buttonApplyMode": "partial",
@@ -19,7 +20,7 @@
       "subscribeButtonVisible": true
     }
   },
-  "custom_css": "",
+  "custom_css": "body{background:radial-gradient(circle at 50% 0%,#1a1a1a,#000000);}",
   "blocks": [
     {
       "id": 270,
@@ -30,7 +31,7 @@
         "headline": "MIDNIGHT DOSIRAK",
         "font_size": "lg",
         "avatar_url": "https://images.unsplash.com/photo-1543332164-6e82f355badc",
-        "profile_layout": "cover",
+        "profile_layout": "cover_bg",
         "cover_image_url": "https://images.unsplash.com/photo-1513104890138-7c749659a591"
       },
       "custom_css": ""
@@ -67,7 +68,7 @@
         "headline": "Tonight’s Signature",
         "text_size": "md",
         "text_align": "left",
-        "text_layout": "default",
+        "text_layout": "plain",
         "custom_bg_color": "#0d0d0d",
         "custom_text_color": "#f5f5f5"
       },
@@ -205,7 +206,7 @@
         "headline": "Pickup & Delivery",
         "text_size": "sm",
         "text_align": "left",
-        "text_layout": "default",
+        "text_layout": "plain",
         "custom_bg_color": "#0d0d0d",
         "custom_text_color": "#d4d4d4"
       },
@@ -226,7 +227,7 @@
         ],
         "layout": "small",
         "auto_slide": true,
-        "keep_ratio": true,
+        "keep_ratio": false,
         "gallery_url": "https://midnightdosirak.com/lookbook",
         "gallery_layout": "carousel",
         "custom_bg_color": "#111111",

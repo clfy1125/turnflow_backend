@@ -188,7 +188,9 @@ def _merge_page_meta(
                 continue
             val = response_page[field]
             # AI 가 빈 css 를 보낸 경우 무시 (기존 보존).
-            if field == "custom_css" and (val is None or (isinstance(val, str) and not val.strip())):
+            if field == "custom_css" and (
+                val is None or (isinstance(val, str) and not val.strip())
+            ):
                 continue
             merged[field] = val
 
@@ -200,11 +202,10 @@ def _merge_page_meta(
             bg = ds.get("backgroundColor")
             if isinstance(bg, str) and bg.strip():
                 # 단순 body 배경 + 기본 typography 한 줄.
-                merged["custom_css"] = (
-                    f"body{{background:{bg};font-feature-settings:'ss01';}}"
-                )
+                merged["custom_css"] = f"body{{background:{bg};font-feature-settings:'ss01';}}"
                 logger.info(
-                    "_merge_page_meta: page.custom_css fallback 자동 생성 (bg=%s)", bg,
+                    "_merge_page_meta: page.custom_css fallback 자동 생성 (bg=%s)",
+                    bg,
                 )
     return merged
 
@@ -220,14 +221,16 @@ _VISUAL_KEYS_GUARDED = frozenset({"custom_border_color"})
 
 # 블록 무리(연속된 같은 subtype) 내에서 강제로 통일할 시각 키.
 # 같은 기능의 연속 블록이 각기 다른 톤으로 나오는 것은 나쁜 디자인 습관 — 첫 블록 기준으로 통일.
-_GROUP_UNIFORM_DATA_KEYS = frozenset({
-    "custom_bg_color",
-    "custom_border_color",
-    "custom_text_color",
-    "custom_button_color",
-    "layout",
-    "text_align",
-})
+_GROUP_UNIFORM_DATA_KEYS = frozenset(
+    {
+        "custom_bg_color",
+        "custom_border_color",
+        "custom_text_color",
+        "custom_button_color",
+        "layout",
+        "text_align",
+    }
+)
 
 
 def _full_subtype(b: dict) -> str:
@@ -311,7 +314,9 @@ def merge_full_restyle(
     response_blocks = llm_response.get("blocks") if isinstance(llm_response, dict) else None
 
     merged_meta = _merge_page_meta(
-        existing_page_meta, response_page, preserve_content=preserve_content,
+        existing_page_meta,
+        response_page,
+        preserve_content=preserve_content,
     )
 
     # 기존 블록을 id 로 매핑
@@ -356,17 +361,19 @@ def merge_full_restyle(
                         full_patch.pop("text_layout", None)
 
             base_data.update(full_patch)
-            merged_blocks.append({
-                "id": bid,
-                "type": base.get("type"),
-                "order": order,
-                "is_enabled": raw.get("is_enabled", base.get("is_enabled", True)),
-                "data": base_data,
-                "custom_css": raw.get("custom_css", base.get("custom_css", "")),
-                "schedule_enabled": base.get("schedule_enabled", False),
-                "publish_at": base.get("publish_at"),
-                "hide_at": base.get("hide_at"),
-            })
+            merged_blocks.append(
+                {
+                    "id": bid,
+                    "type": base.get("type"),
+                    "order": order,
+                    "is_enabled": raw.get("is_enabled", base.get("is_enabled", True)),
+                    "data": base_data,
+                    "custom_css": raw.get("custom_css", base.get("custom_css", "")),
+                    "schedule_enabled": base.get("schedule_enabled", False),
+                    "publish_at": base.get("publish_at"),
+                    "hide_at": base.get("hide_at"),
+                }
+            )
             continue
 
         # ── 새 블록 생성 ──
@@ -414,16 +421,18 @@ def merge_full_restyle(
                 new_data[k] = v
             # URL/이미지 필드는 무시 (새 블록은 URL 비어둠 — 사용자가 추후 입력).
 
-        merged_blocks.append({
-            "type": db_type,
-            "order": order,
-            "is_enabled": raw.get("is_enabled", True),
-            "data": new_data,
-            "custom_css": raw.get("custom_css", ""),
-            "schedule_enabled": False,
-            "publish_at": None,
-            "hide_at": None,
-        })
+        merged_blocks.append(
+            {
+                "type": db_type,
+                "order": order,
+                "is_enabled": raw.get("is_enabled", True),
+                "data": new_data,
+                "custom_css": raw.get("custom_css", ""),
+                "schedule_enabled": False,
+                "publish_at": None,
+                "hide_at": None,
+            }
+        )
 
     # order 정규화 — 1 부터 순차 (충돌 방지).
     for idx, b in enumerate(merged_blocks):
@@ -438,6 +447,7 @@ def merge_full_restyle(
 # ─────────────────────────────────────────────────────────────
 # style_only 머지
 # ─────────────────────────────────────────────────────────────
+
 
 def merge_style_only(
     *,
@@ -510,17 +520,19 @@ def merge_style_only(
             if css is not None:
                 merged_css = css
 
-        merged_blocks.append({
-            "id": bid,
-            "type": b.get("type"),
-            "order": b.get("order"),
-            "is_enabled": b.get("is_enabled", True),
-            "data": base_data,
-            "custom_css": merged_css,
-            "schedule_enabled": b.get("schedule_enabled", False),
-            "publish_at": b.get("publish_at"),
-            "hide_at": b.get("hide_at"),
-        })
+        merged_blocks.append(
+            {
+                "id": bid,
+                "type": b.get("type"),
+                "order": b.get("order"),
+                "is_enabled": b.get("is_enabled", True),
+                "data": base_data,
+                "custom_css": merged_css,
+                "schedule_enabled": b.get("schedule_enabled", False),
+                "publish_at": b.get("publish_at"),
+                "hide_at": b.get("hide_at"),
+            }
+        )
 
     # 그룹 통일 — 연속된 같은 subtype 블록 무리는 동일 시각 스타일.
     merged_blocks = _enforce_group_uniformity(merged_blocks)

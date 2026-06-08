@@ -105,6 +105,9 @@ def _upsert_latest_ai_result(page: Page, user) -> PageSnapshot:
 
     AI 호출마다 갱신되므로 사용자가 원본으로 돌아간 뒤에도 ``restore`` 로
     가장 최근 작업물로 다시 돌아갈 수 있다.
+
+    편집 직후의 라이브 = 최신 작업물이므로 ``page.current_snapshot`` 을 이
+    슬롯으로 갱신해 ``is_current`` 가 latest_ai_result 를 가리키게 한다.
     """
     snap, _ = PageSnapshot.objects.update_or_create(
         page=page,
@@ -114,6 +117,8 @@ def _upsert_latest_ai_result(page: Page, user) -> PageSnapshot:
             "created_by": user if (user and user.is_authenticated) else None,
         },
     )
+    page.current_snapshot = snap
+    page.save(update_fields=["current_snapshot", "updated_at"])
     return snap
 
 
@@ -1157,6 +1162,13 @@ class AiPageSnapshotItemSerializer(serializers.Serializer):
     blocks_count = serializers.IntegerField(help_text="스냅샷에 포함된 블록 수.")
     created_by_id = serializers.IntegerField(allow_null=True, help_text="스냅샷 생성자 User ID. 사용자 삭제 시 NULL.")
     created_at = serializers.DateTimeField(help_text="스냅샷 생성 시각 (UTC).")
+    is_current = serializers.BooleanField(
+        help_text=(
+            "현재 라이브 페이지가 이 스냅샷 상태와 일치하는지 여부. "
+            "정상 상태에서 true 는 최대 1건이며, 사용자가 복원 후 직접 편집하면 "
+            "두 슬롯 모두 false 가 될 수 있다(0건도 정상)."
+        ),
+    )
 
 
 class AiPageSnapshotListResponseSerializer(serializers.Serializer):
@@ -1201,11 +1213,26 @@ class AiPageSnapshotListView(APIView):
 | 필드 | 설명 |
 |------|------|
 | `id` | 스냅샷 ID. restore 시 path 파라미터로 사용 |
-| `reason` | `ai_edit` \| `ai_import_renewal` \| `restore` \| `manual` |
+| `reason` | `ai_edit`(원본) \| `latest_ai_result`(최신 작업물) |
 | `reason_display` | 사유 한국어 표시 |
 | `blocks_count` | 스냅샷에 포함된 블록 수 |
 | `created_by_id` | 스냅샷 생성자 User ID (사용자 삭제 시 NULL) |
 | `created_at` | 스냅샷 생성 시각 (UTC) |
+| `is_current` | 현재 라이브 페이지가 이 스냅샷 상태와 일치하는지 (배지 표시용) |
+
+## `is_current` 판정 규칙
+서버는 페이지에 활성 슬롯 포인터(`Page.current_snapshot`)를 두고 다음 시점에 갱신합니다:
+
+| 이벤트 | 포인터 |
+|--------|--------|
+| AI 1-shot 편집 (`POST .../@{slug}/`) | `latest_ai_result` 슬롯 |
+| 스냅샷 복원 (`POST .../restore/`) | 복원에 사용한 스냅샷 |
+| 그 외 일반 편집(블록·디자인 직접 수정/저장) | NULL 로 초기화 |
+| 가리키던 스냅샷 삭제 | NULL (SET_NULL) |
+
+`is_current = (snapshot.id == page.current_snapshot_id)` 로 계산합니다.
+- 정상 상태에서 `true` 는 **최대 1건**.
+- 복원 후 사용자가 직접 편집하면 두 슬롯 모두 `false`(0건) — 정상이며 배지를 표시하지 않습니다.
 
 ## 에러
 | 코드 | 원인 |
@@ -1227,7 +1254,7 @@ class AiPageSnapshotListView(APIView):
                 description="스냅샷 목록 (최대 2건: 원본 + 최신 AI 작업물)",
                 examples=[
                     OpenApiExample(
-                        "AI 편집 1회 이후 — 원본 + 최신 작업물",
+                        "AI 편집 직후 — 라이브 = 최신 작업물 (latest_ai_result 가 현재)",
                         value={
                             "snapshots": [
                                 {
@@ -1237,6 +1264,7 @@ class AiPageSnapshotListView(APIView):
                                     "blocks_count": 7,
                                     "created_by_id": 7,
                                     "created_at": "2026-06-01T10:30:05Z",
+                                    "is_current": True,
                                 },
                                 {
                                     "id": 42,
@@ -1245,6 +1273,33 @@ class AiPageSnapshotListView(APIView):
                                     "blocks_count": 5,
                                     "created_by_id": 7,
                                     "created_at": "2026-06-01T10:30:00Z",
+                                    "is_current": False,
+                                },
+                            ]
+                        },
+                        response_only=True,
+                    ),
+                    OpenApiExample(
+                        "복원 후 직접 편집함 — 어느 슬롯과도 불일치 (현재 0건)",
+                        value={
+                            "snapshots": [
+                                {
+                                    "id": 43,
+                                    "reason": "latest_ai_result",
+                                    "reason_display": "최신 AI 작업물",
+                                    "blocks_count": 7,
+                                    "created_by_id": 7,
+                                    "created_at": "2026-06-01T10:30:05Z",
+                                    "is_current": False,
+                                },
+                                {
+                                    "id": 42,
+                                    "reason": "ai_edit",
+                                    "reason_display": "AI 편집 직전 원본",
+                                    "blocks_count": 5,
+                                    "created_by_id": 7,
+                                    "created_at": "2026-06-01T10:30:00Z",
+                                    "is_current": False,
                                 },
                             ]
                         },
@@ -1277,6 +1332,7 @@ class AiPageSnapshotListView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
+        current_id = page.current_snapshot_id
         items = []
         for snap in page.snapshots.all():
             blocks = (snap.snapshot or {}).get("blocks") or []
@@ -1287,6 +1343,7 @@ class AiPageSnapshotListView(APIView):
                 "blocks_count": len(blocks),
                 "created_by_id": snap.created_by_id,
                 "created_at": snap.created_at,
+                "is_current": snap.id == current_id,
             })
         return Response({"snapshots": items}, status=status.HTTP_200_OK)
 
@@ -1326,7 +1383,15 @@ class AiPageSnapshotRestoreView(APIView):
 없음.
 
 ## 응답
-복원이 완료된 페이지 정보 (`PageSerializer`).
+복원이 완료된 페이지 정보 (`PageSerializer`) + 활성 슬롯 정보:
+
+| 필드 | 설명 |
+|------|------|
+| `current_snapshot_id` | 복원 후 라이브가 가리키는 스냅샷 ID (= 방금 복원한 스냅샷) |
+| `current_reason` | 그 스냅샷의 `reason` (`ai_edit` \| `latest_ai_result`) |
+
+이 두 필드로 프론트는 재조회 없이 즉시 `is_current` 배지를 갱신할 수 있습니다.
+(목록 재조회 시 `GET .../snapshots/` 의 `is_current` 와 일치합니다.)
 
 ## 에러
 | 코드 | 원인 |
@@ -1365,6 +1430,8 @@ class AiPageSnapshotRestoreView(APIView):
                             "custom_css": "",
                             "created_at": "2026-04-01T00:00:00Z",
                             "updated_at": "2026-06-01T10:35:00Z",
+                            "current_snapshot_id": 42,
+                            "current_reason": "ai_edit",
                         },
                         response_only=True,
                     ),
@@ -1400,8 +1467,16 @@ class AiPageSnapshotRestoreView(APIView):
 
         # 원본 스냅샷은 restore 후에도 삭제하지 않음 — 페이지당 영구 보관 (1개)
         _restore_from_snapshot(page, snap)
+        # 복원 직후 라이브 = 이 스냅샷 상태 → 활성 슬롯 포인터를 이 스냅샷으로.
+        page.current_snapshot = snap
+        page.save(update_fields=["current_snapshot", "updated_at"])
         page.refresh_from_db()
-        return Response(PageSerializer(page).data, status=status.HTTP_200_OK)
+
+        # 프론트가 재조회 없이 즉시 배지를 갱신할 수 있도록 활성 슬롯 정보를 동봉.
+        data = PageSerializer(page).data
+        data["current_snapshot_id"] = snap.id
+        data["current_reason"] = snap.reason
+        return Response(data, status=status.HTTP_200_OK)
 
 
 def _err_response(code: int, message: str, details: dict | None = None):

@@ -46,13 +46,16 @@ class SubscriptionPlanListView(APIView):
 - 로그인 전 요금제 안내
 - 업그레이드 모달에서 플랜 목록 표시
 
-## 플랜 구조
+## 플랜 구조 (운영 DB 기준 · 가변)
 
 | 플랜 | name | 월 요금 | 주요 기능 |
 |------|------|---------|-----------||
 | 무료 | `free` | 0원 | 페이지 3개 제한 |
-| 프로 | `pro` | 9,900원 | 무제한 페이지, AI 생성, 로고 삭제 |
-| 프로 플러스 | `pro_plus` | 19,900원 | 프로 + 커스텀 CSS |
+| 프로 | `pro` | 14,900원 | 무제한 페이지, AI 생성, 로고 삭제 |
+
+> 플랜 집합은 **DB-driven(가변)** 입니다 — 프론트는 이 목록을 fetch 해 렌더하고 값을 하드코딩하지 마세요.
+> 본 엔드포인트는 **활성(is_active=True) 플랜만** 반환합니다. 운영용 `admin`(관리자) 플랜은
+> 비활성이라 여기 나오지 않습니다. 비활성 포함 전체 목록이 필요하면(어드민) `GET /api/v1/admin/subscription-plans/`.
 
 ## 응답 필드 설명
 | 필드 | 타입 | 설명 |
@@ -92,31 +95,33 @@ plans.forEach(plan => {
                 description="활성 플랜 목록 (sort_order 오름차순)",
                 examples=[
                     OpenApiExample(
-                        "플랜 목록",
+                        "플랜 목록 (활성 플랜만)",
                         value=[
                             {
                                 "id": "550e8400-e29b-41d4-a716-446655440001",
                                 "name": "free",
                                 "display_name": "무료",
                                 "monthly_price": 0,
-                                "features": {"max_pages": 3, "ai_generation": False, "remove_logo": False, "custom_css": False},
+                                "features": {
+                                    "max_pages": 3,
+                                    "ai_generation": False,
+                                    "remove_logo": False,
+                                    "custom_css": False,
+                                },
                                 "sort_order": 0,
                             },
                             {
                                 "id": "550e8400-e29b-41d4-a716-446655440002",
                                 "name": "pro",
                                 "display_name": "프로",
-                                "monthly_price": 9900,
-                                "features": {"max_pages": -1, "ai_generation": True, "remove_logo": True, "custom_css": False},
+                                "monthly_price": 14900,
+                                "features": {
+                                    "max_pages": -1,
+                                    "ai_generation": True,
+                                    "remove_logo": True,
+                                    "custom_css": False,
+                                },
                                 "sort_order": 1,
-                            },
-                            {
-                                "id": "550e8400-e29b-41d4-a716-446655440003",
-                                "name": "pro_plus",
-                                "display_name": "프로 플러스",
-                                "monthly_price": 19900,
-                                "features": {"max_pages": -1, "ai_generation": True, "remove_logo": True, "custom_css": True},
-                                "sort_order": 2,
                             },
                         ],
                     )
@@ -216,7 +221,12 @@ if (subscription.status === 'cancelled') {
                                 "name": "free",
                                 "display_name": "무료",
                                 "monthly_price": 0,
-                                "features": {"max_pages": 3, "ai_generation": False, "remove_logo": False, "custom_css": False},
+                                "features": {
+                                    "max_pages": 3,
+                                    "ai_generation": False,
+                                    "remove_logo": False,
+                                    "custom_css": False,
+                                },
                                 "sort_order": 0,
                             },
                             "plan_id": "550e8400-e29b-41d4-a716-446655440001",
@@ -237,7 +247,12 @@ if (subscription.status === 'cancelled') {
                                 "name": "pro",
                                 "display_name": "프로",
                                 "monthly_price": 9900,
-                                "features": {"max_pages": -1, "ai_generation": True, "remove_logo": True, "custom_css": False},
+                                "features": {
+                                    "max_pages": -1,
+                                    "ai_generation": True,
+                                    "remove_logo": True,
+                                    "custom_css": False,
+                                },
                                 "sort_order": 1,
                             },
                             "plan_id": "550e8400-e29b-41d4-a716-446655440002",
@@ -425,7 +440,8 @@ if (data.pay_url) {
             except PayAppError as e:
                 logger.warning(
                     "기존 정기결제 해지 실패: rebill_no=%s err=%s",
-                    sub.payapp_rebill_no, e,
+                    sub.payapp_rebill_no,
+                    e,
                 )
 
         price = new_plan.monthly_price
@@ -434,9 +450,7 @@ if (data.pay_url) {
 
         try:
             cycle_day = timezone.now().day
-            expire_date = (timezone.now() + timedelta(days=365 * 3)).strftime(
-                "%Y-%m-%d"
-            )
+            expire_date = (timezone.now() + timedelta(days=365 * 3)).strftime("%Y-%m-%d")
             result = PayAppClient.create_rebill(
                 goodname=goodname,
                 goodprice=price,
@@ -452,9 +466,13 @@ if (data.pay_url) {
             # 플랜은 변경하지 않음! 결제 완료 후 webhook에서 반영
             sub.payapp_rebill_no = rebill_no or sub.payapp_rebill_no
             sub.payapp_pay_url = pay_url
-            sub.save(update_fields=[
-                "payapp_rebill_no", "payapp_pay_url", "updated_at",
-            ])
+            sub.save(
+                update_fields=[
+                    "payapp_rebill_no",
+                    "payapp_pay_url",
+                    "updated_at",
+                ]
+            )
 
         except PayAppError as e:
             logger.error("PayApp 결제 요청 실패: %s", e)
@@ -463,11 +481,13 @@ if (data.pay_url) {
                 status=status.HTTP_502_BAD_GATEWAY,
             )
 
-        return Response({
-            "detail": "결제 페이지로 이동해주세요.",
-            "pay_url": pay_url,
-            "plan": SubscriptionPlanSerializer(new_plan).data,
-        })
+        return Response(
+            {
+                "detail": "결제 페이지로 이동해주세요.",
+                "pay_url": pay_url,
+                "plan": SubscriptionPlanSerializer(new_plan).data,
+            }
+        )
 
 
 class CancelSubscriptionView(APIView):
@@ -541,7 +561,9 @@ if (res.ok) {
             400: OpenApiResponse(
                 description="취소 불가",
                 examples=[
-                    OpenApiExample("무료 플랜", value={"detail": "무료 플랜은 취소할 수 없습니다."}),
+                    OpenApiExample(
+                        "무료 플랜", value={"detail": "무료 플랜은 취소할 수 없습니다."}
+                    ),
                     OpenApiExample("이미 취소됨", value={"detail": "이미 취소된 구독입니다."}),
                 ],
             ),
@@ -568,9 +590,7 @@ if (res.ok) {
             try:
                 PayAppClient.pause_rebill(sub.payapp_rebill_no)
             except PayAppError:
-                logger.warning(
-                    "PayApp 정기결제 일시정지 실패: rebill_no=%s", sub.payapp_rebill_no
-                )
+                logger.warning("PayApp 정기결제 일시정지 실패: rebill_no=%s", sub.payapp_rebill_no)
 
         sub.status = SubscriptionStatus.CANCELLED
         sub.cancelled_at = timezone.now()
@@ -603,7 +623,9 @@ class ResumeSubscriptionView(APIView):
 | 구독 기간 만료 | 400 | "구독 기간이 만료되어 재개할 수 없습니다. 새로 결제해주세요." |
         """,
         responses={
-            200: OpenApiResponse(response=UserSubscriptionSerializer, description="재개된 구독 정보"),
+            200: OpenApiResponse(
+                response=UserSubscriptionSerializer, description="재개된 구독 정보"
+            ),
             400: OpenApiResponse(description="재개 불가"),
             401: OpenApiResponse(description="인증 실패"),
             502: OpenApiResponse(description="PayApp API 오류"),
@@ -630,7 +652,9 @@ class ResumeSubscriptionView(APIView):
             try:
                 PayAppClient.resume_rebill(sub.payapp_rebill_no)
             except PayAppError as e:
-                logger.error("PayApp 정기결제 재개 실패: rebill_no=%s err=%s", sub.payapp_rebill_no, e)
+                logger.error(
+                    "PayApp 정기결제 재개 실패: rebill_no=%s err=%s", sub.payapp_rebill_no, e
+                )
                 return Response(
                     {"detail": f"결제 재개 실패: {e}"},
                     status=status.HTTP_502_BAD_GATEWAY,
@@ -687,17 +711,19 @@ class PageActivationView(APIView):
         if not is_unlimited and sub.page_activation_changed_at:
             can_change = (timezone.now() - sub.page_activation_changed_at).days >= 1
 
-        return Response({
-            "needs_activation_adjustment": total > max_pages,
-            "max_pages": max_pages,
-            "total_pages": total,
-            "active_pages": active,
-            "can_change_today": can_change,
-            "pages": [
-                {"id": p.id, "slug": p.slug, "title": p.title, "is_active": p.is_active}
-                for p in pages
-            ],
-        })
+        return Response(
+            {
+                "needs_activation_adjustment": total > max_pages,
+                "max_pages": max_pages,
+                "total_pages": total,
+                "active_pages": active,
+                "can_change_today": can_change,
+                "pages": [
+                    {"id": p.id, "slug": p.slug, "title": p.title, "is_active": p.is_active}
+                    for p in pages
+                ],
+            }
+        )
 
     @extend_schema(
         tags=["사용자플랜"],
@@ -778,7 +804,9 @@ class PageActivationView(APIView):
         sub.page_activation_changed_at = timezone.now()
         sub.save(update_fields=["page_activation_changed_at", "updated_at"])
 
-        return Response({
-            "detail": f"{len(active_page_ids)}개 페이지가 활성화되었습니다.",
-            "active_page_ids": active_page_ids,
-        })
+        return Response(
+            {
+                "detail": f"{len(active_page_ids)}개 페이지가 활성화되었습니다.",
+                "active_page_ids": active_page_ids,
+            }
+        )
