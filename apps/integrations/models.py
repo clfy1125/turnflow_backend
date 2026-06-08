@@ -519,14 +519,20 @@ class AutoDMCampaign(models.Model):
         return recent_sends < self.max_sends_per_hour
 
     def increment_sent(self):
-        """발송 카운트 증가"""
-        self.total_sent += 1
-        self.save(update_fields=["total_sent", "updated_at"])
+        """발송 카운트 증가 (원자적 — 고동시성에서 lost update 방지)."""
+        from django.db.models import F
+
+        type(self).objects.filter(pk=self.pk).update(
+            total_sent=F("total_sent") + 1, updated_at=timezone.now()
+        )
 
     def increment_failed(self):
-        """실패 카운트 증가"""
-        self.total_failed += 1
-        self.save(update_fields=["total_failed", "updated_at"])
+        """실패 카운트 증가 (원자적)."""
+        from django.db.models import F
+
+        type(self).objects.filter(pk=self.pk).update(
+            total_failed=F("total_failed") + 1, updated_at=timezone.now()
+        )
 
     # ===== 신규 로직 헬퍼 =====
 

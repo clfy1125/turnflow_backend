@@ -1,0 +1,227 @@
+# STAGING — prod 하드닝 스택을 "동작 검증 + 처리량 측정" 용으로 미러링 (스케일 다운).
+# 실 prod 와 완전 격리: 컨테이너명 turnflow_staging_*, 네트워크 turnflow_staging_net,
+# 볼륨 turnflow_staging_*, 포트 1xxxx, 별도 테스트 DB. 같은 박스에서 prod 와 동시에 떠도 충돌 없음.
+#
+# 기동:
+#   docker compose -p turnflow_staging -f docker-compose.staging.yml --env-file .env.staging up -d --build
+# 부하 측정:
+#   docker compose -p turnflow_staging -f docker-compose.staging.yml --env-file .env.staging \
+#     run --rm celery_dm python manage.py loadtest_dm --seed
+#   ... run --rm celery_dm python manage.py loadtest_dm --count 5000 --concurrency 200
+# 정리:
+#   docker compose -p turnflow_staging -f docker-compose.staging.yml down -v
+#
+# INSTAGRAM_MOCK_MODE=True 로 두면 실제 Meta 호출 없이 서버측 처리량(Celery 동시성+PgBouncer+DB)을 측정.
+# → API 승인 전에도 "잘 동작하는지 + 얼마나 빠른지" 안전하게 실험 가능.
+
+x-app-image: &app_image "turnflow_staging_web:latest"
+
+x-app-env: &app_env
+  DJANGO_SETTINGS_MODULE: config.settings.local   # staging 은 forgiving 한 local 설정 + prod 토폴로지
+  DB_HOST: pgbouncer
+  DB_PORT: "6432"
+  DB_CONN_MAX_AGE: "0"
+  DB_DISABLE_SERVER_SIDE_CURSORS: "True"
+  DB_CONN_HEALTH_CHECKS: "False"
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  WEBHOOK_ASYNC_MESSAGING: "True"
+  INSTAGRAM_MOCK_MODE: "True"
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: turnflow_staging_db
+    restart: unless-stopped
+    command: postgres -c max_connections=120 -c shared_buffers=1GB -c effective_cache_size=3GB
+    environment:
+      POSTGRES_DB: ${DB_NAME:-instagram_service}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    volumes:
+      - turnflow_staging_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits: { cpus: "4", memory: 4G }
+    networks: [turnflow_staging_net]
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: turnflow_staging_pgbouncer
+    restart: unless-stopped
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      DB_NAME: ${DB_NAME:-instagram_service}
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: "500"
+      DEFAULT_POOL_SIZE: "20"
+      MIN_POOL_SIZE: "5"
+      SERVER_RESET_QUERY: DISCARD ALL
+      AUTH_TYPE: scram-sha-256
+      LISTEN_PORT: "6432"
+    depends_on:
+      db: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U ${DB_USER:-postgres} || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [turnflow_staging_net]
+
+  redis:
+    image: redis:7-alpine
+    container_name: turnflow_staging_redis
+    restart: unless-stopped
+    command: redis-server --appendonly no --maxmemory 1gb --maxmemory-policy noeviction
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [turnflow_staging_net]
+
+  # 마이그레이션 one-shot (db 직결, 한 번 실행 후 종료) — 다른 서비스가 완료를 기다림.
+  migrate:
+    build: { context: ., dockerfile: Dockerfile }
+    image: *app_image
+    container_name: turnflow_staging_migrate
+    command: sh -c "python manage.py migrate --noinput"
+    env_file: [.env.staging]
+    environment:
+      <<: *app_env
+      DB_HOST: db          # 마이그레이션은 PgBouncer 우회(session) — db 직결
+      DB_PORT: "5432"
+    depends_on:
+      db: { condition: service_healthy }
+    restart: "no"
+    networks: [turnflow_staging_net]
+
+  web_webhook:
+    image: *app_image
+    container_name: turnflow_staging_web_webhook
+    restart: unless-stopped
+    command: >
+      gunicorn config.wsgi:application --bind 0.0.0.0:8000
+      --worker-class gthread --workers 2 --threads 4
+      --timeout 10 --graceful-timeout 5 --keep-alive 5 --backlog 256
+      --worker-tmp-dir /dev/shm --access-logfile - --error-logfile -
+    env_file: [.env.staging]
+    environment: *app_env
+    ports: ["127.0.0.1:18001:8000"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      pgbouncer: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 2G }
+    networks: [turnflow_staging_net]
+
+  web_dashboard:
+    image: *app_image
+    container_name: turnflow_staging_web_dashboard
+    restart: unless-stopped
+    command: >
+      gunicorn config.wsgi:application --bind 0.0.0.0:8000
+      --worker-class gthread --workers 2 --threads 4
+      --timeout 30 --keep-alive 5 --backlog 256
+      --worker-tmp-dir /dev/shm --access-logfile - --error-logfile -
+    env_file: [.env.staging]
+    environment: *app_env
+    ports: ["127.0.0.1:18002:8000"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      pgbouncer: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 2G }
+    networks: [turnflow_staging_net]
+
+  web_external:
+    image: *app_image
+    container_name: turnflow_staging_web_external
+    restart: unless-stopped
+    command: >
+      gunicorn config.wsgi:application --bind 0.0.0.0:8000
+      --worker-class gthread --workers 2 --threads 8
+      --timeout 30 --keep-alive 5 --backlog 128
+      --worker-tmp-dir /dev/shm --access-logfile - --error-logfile -
+    env_file: [.env.staging]
+    environment: *app_env
+    ports: ["127.0.0.1:18003:8000"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      pgbouncer: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 2G }
+    networks: [turnflow_staging_net]
+
+  # DM 발송 (threads 풀, prod 100 → staging 50 으로 축소)
+  celery_dm:
+    image: *app_image
+    container_name: turnflow_staging_celery_dm
+    restart: unless-stopped
+    command: celery -A config worker --pool=threads --concurrency=50 --prefetch-multiplier=1 -l info -Q dm_send
+    env_file: [.env.staging]
+    environment: *app_env
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      pgbouncer: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "3", memory: 3G }
+    networks: [turnflow_staging_net]
+
+  # 웹훅 후속(delivered/read) + 검증
+  celery_followup:
+    image: *app_image
+    container_name: turnflow_staging_celery_followup
+    restart: unless-stopped
+    command: celery -A config worker --pool=threads --concurrency=30 --prefetch-multiplier=1 -l info -Q webhook_followup,verify
+    env_file: [.env.staging]
+    environment: *app_env
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      pgbouncer: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 2G }
+    networks: [turnflow_staging_net]
+
+  # 기본 + snapshot + billing (prefork, 잔여 큐 소비 — orphan 방지)
+  celery_default:
+    image: *app_image
+    container_name: turnflow_staging_celery_default
+    restart: unless-stopped
+    command: celery -A config worker --concurrency=2 --prefetch-multiplier=1 -l info -Q celery,snapshot,billing
+    env_file: [.env.staging]
+    environment: *app_env
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      pgbouncer: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 2G }
+    networks: [turnflow_staging_net]
+
+volumes:
+  turnflow_staging_postgres:
+
+networks:
+  turnflow_staging_net:
+    name: turnflow_staging_net
+    driver: bridge

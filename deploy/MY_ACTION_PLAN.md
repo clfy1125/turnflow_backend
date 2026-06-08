@@ -27,6 +27,12 @@
 ## 0단계 — 승인과 무관하게 "지금" 해도 되는 것 (권장: 먼저 해두기)
 백업·보안은 DM 트래픽과 무관하므로 API 승인 전에 미리 해두면 좋다.
 
+### 0-Z. (선택) 스테이징에서 하드닝 동작/처리량 검증 — Meta 호출 없음(mock)
+- [ ] `docker compose -p turnflow_staging -f docker-compose.staging.yml --env-file .env.staging up -d --build`
+- [ ] `loadtest_dm --seed` → `loadtest_dm --count 5000` 로 **DM/s 처리량 측정** (가이드: [STAGING_LOADTEST.md](./STAGING_LOADTEST.md))
+- [ ] threads vs prefork 비교로 "얼마나 빨라졌나" 숫자 확인 + PgBouncer 커넥션 수렴 확인
+- [ ] 끝나면 `down -v` 로 정리 (실 prod 와 격리되어 충돌 없음)
+
 ### 0-A. 백업 (GATE-0) — 데이터 손실 방어, 최우선
 - [ ] R2 에 미디어와 **분리된 버킷** `turnflow-db-backups` + **스코프 토큰** 생성
 - [ ] gpg 백업 키페어 생성 → **공개키만** 서버에 import (개인키는 박스 밖 보관)

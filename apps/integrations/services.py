@@ -698,6 +698,17 @@ class InstagramMessagingService:
             TOKEN_CODES,
         )
 
+        # Mock 모드: DEBUG=True + INSTAGRAM_MOCK_MODE=True 일 때만 (prod 는 DEBUG=False 라 절대 미동작).
+        # 실제 Meta 호출 없이 가짜 message_id 반환 — 로컬/스테이징 DM 파이프라인 테스트·부하측정용.
+        # (프로젝트 지침: INSTAGRAM_MOCK_MODE 로 발송 경로도 분기해야 함 — 기존 누락 보완.)
+        if cls._is_mock():
+            rcpt = payload.get("recipient", {}) or {}
+            return {
+                "message_id": f"mock_mid_{secrets.token_hex(8)}",
+                "recipient_id": rcpt.get("comment_id") or rcpt.get("id") or "mock_recipient",
+                "_raw": {"mock": True},
+            }
+
         try:
             resp = get_http_session().post(
                 url,
