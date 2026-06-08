@@ -1,9 +1,42 @@
+# Production stack — hardened for the influencer surge (target ~10-20K DM/min).
+#
+# Topology:
+#   Caddy(host) ── /webhook* ──► web_webhook  :8001  (gthread 4x4, t/o 10)
+#               ── /api,/admin ► web_dashboard :8002  (gthread 12x4, t/o 30)
+#               ── external-IO ► web_external  :8003  (gthread 4x16, t/o 30)
+#   app ──► pgbouncer:6432 (transaction pool) ──► db:5432
+#   celery: dm (threads) / followup (threads) / default (prefork) / billing (prefork) / beat
+#
+# Migrations are GATED (RUN_MIGRATIONS not set here) — deploy.sh runs them once.
+# Rollback: redeploy main (checkpoint) compose, or set APP_IMAGE to the previous tag. See deploy/scripts/.
+
+x-app-image: &app_image "${APP_IMAGE:-turnflow_instagram_web:latest}"
+
+x-app-env: &app_env
+  DJANGO_SETTINGS_MODULE: config.settings.prod
+  DB_HOST: pgbouncer          # app talks to PgBouncer, NOT db directly
+  DB_PORT: "6432"
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+
 services:
   db:
     image: postgres:16-alpine
     container_name: turnflow_instagram_db
     restart: unless-stopped
-    command: postgres -c max_connections=800
+    # PG tuning + reduced max_connections (PgBouncer multiplexes, so 300 is ample).
+    # NOTE: changing this command recreates db (one restart) — do it in a maintenance window.
+    command: >
+      postgres
+      -c max_connections=300
+      -c shared_buffers=8GB
+      -c effective_cache_size=24GB
+      -c work_mem=32MB
+      -c maintenance_work_mem=512MB
+      -c wal_buffers=64MB
+      -c checkpoint_completion_target=0.9
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
     env_file:
       - .env.production
     environment:
@@ -17,6 +50,41 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits: { cpus: "16", memory: 48G }
+    networks:
+      - turnflow_instagram_net
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: turnflow_instagram_pgbouncer
+    restart: unless-stopped
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME:-instagram_service}
+      POOL_MODE: transaction          # required for high client counts; Django uses DISABLE_SERVER_SIDE_CURSORS
+      MAX_CLIENT_CONN: "2000"         # web threads + celery threads connect here
+      DEFAULT_POOL_SIZE: "40"         # actual server-side conns to db (well under max_connections=300)
+      MIN_POOL_SIZE: "10"
+      RESERVE_POOL_SIZE: "10"
+      SERVER_RESET_QUERY: DISCARD ALL
+      AUTH_TYPE: scram-sha-256
+      LISTEN_PORT: "6432"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U ${DB_USER:-postgres} || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 512M }
     networks:
       - turnflow_instagram_net
 
@@ -24,7 +92,9 @@ services:
     image: redis:7-alpine
     container_name: turnflow_instagram_redis
     restart: unless-stopped
-    command: redis-server --appendonly yes
+    # noeviction (NOT allkeys-lru): redis is the Celery broker (/0); evicting keys would drop queued tasks.
+    # maxmemory is a host-OOM guard only.
+    command: redis-server --appendonly yes --maxmemory 8gb --maxmemory-policy noeviction
     volumes:
       - turnflow_instagram_redis:/data
     healthcheck:
@@ -32,82 +102,207 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
+    deploy:
+      resources:
+        limits: { cpus: "4", memory: 10G }
     networks:
       - turnflow_instagram_net
 
-  web:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: turnflow_instagram_web
-    container_name: turnflow_instagram_web
+  # ── Tier 1: webhook (fast, fail-fast; just EventInbox insert + enqueue) ──
+  web_webhook:
+    build: { context: ., dockerfile: Dockerfile }
+    image: *app_image
+    container_name: turnflow_instagram_web_webhook
     restart: unless-stopped
     command: >
-      sh -c "python manage.py collectstatic --noinput &&
-             python manage.py migrate --noinput &&
-             gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 200 --threads 4 --timeout 120 --backlog 2048 --worker-connections 1000"
-    env_file:
-      - .env.production
-    environment:
-      - DJANGO_SETTINGS_MODULE=config.settings.prod
-      - DB_HOST=db
-      - DB_PORT=5432
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
+      gunicorn config.wsgi:application --bind 0.0.0.0:8000
+      --worker-class gthread --workers 4 --threads 4
+      --timeout 10 --graceful-timeout 5 --keep-alive 5 --backlog 512
+      --max-requests 5000 --max-requests-jitter 500
+      --worker-tmp-dir /dev/shm
+      --access-logfile - --error-logfile -
+    env_file: [.env.production]
+    environment: *app_env
+    ports:
+      - "127.0.0.1:8001:8000"   # host Caddy → webhook tier
     volumes:
       - turnflow_instagram_static:/app/staticfiles
       - turnflow_instagram_media:/app/media
       - turnflow_instagram_logs:/app/logs
     depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      pgbouncer: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/healthz',timeout=4).status==200 else 1)\""]
+      interval: 15s
+      timeout: 6s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits: { cpus: "4", memory: 4G }
     networks:
       - turnflow_instagram_net
 
-  celery_worker:
-    image: turnflow_instagram_web
-    container_name: turnflow_instagram_celery
+  # ── Tier 2: dashboard / API ──
+  web_dashboard:
+    image: *app_image
+    container_name: turnflow_instagram_web_dashboard
     restart: unless-stopped
-    # -Q: 기본 celery + snapshot(pages.capture_reference_snapshot) + billing(정기 배치) 큐 소비.
-    command: celery -A config worker --concurrency=48 --prefetch-multiplier=1 -l info -Q celery,snapshot,billing
-    env_file:
-      - .env.production
-    environment:
-      - DJANGO_SETTINGS_MODULE=config.settings.prod
-      - DB_HOST=db
-      - DB_PORT=5432
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
+    command: >
+      gunicorn config.wsgi:application --bind 0.0.0.0:8000
+      --worker-class gthread --workers 12 --threads 4
+      --timeout 30 --graceful-timeout 30 --keep-alive 5 --backlog 512
+      --max-requests 5000 --max-requests-jitter 500
+      --worker-tmp-dir /dev/shm
+      --access-logfile - --error-logfile -
+    env_file: [.env.production]
+    environment: *app_env
+    ports:
+      - "127.0.0.1:8002:8000"   # host Caddy → dashboard/API tier (default)
+    volumes:
+      - turnflow_instagram_static:/app/staticfiles
+      - turnflow_instagram_media:/app/media
+      - turnflow_instagram_logs:/app/logs
+    depends_on:
+      pgbouncer: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/healthz',timeout=4).status==200 else 1)\""]
+      interval: 15s
+      timeout: 6s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits: { cpus: "12", memory: 12G }
+    networks:
+      - turnflow_instagram_net
+
+  # ── Tier 3: external-IO isolation (link_meta, Graph proxy, importers, dev test endpoints) ──
+  web_external:
+    image: *app_image
+    container_name: turnflow_instagram_web_external
+    restart: unless-stopped
+    command: >
+      gunicorn config.wsgi:application --bind 0.0.0.0:8000
+      --worker-class gthread --workers 4 --threads 16
+      --timeout 30 --graceful-timeout 15 --keep-alive 5 --backlog 256
+      --max-requests 2000 --max-requests-jitter 200
+      --worker-tmp-dir /dev/shm
+      --access-logfile - --error-logfile -
+    env_file: [.env.production]
+    environment: *app_env
+    ports:
+      - "127.0.0.1:8003:8000"   # host Caddy → external-IO tier
+    volumes:
+      - turnflow_instagram_static:/app/staticfiles
+      - turnflow_instagram_media:/app/media
+      - turnflow_instagram_logs:/app/logs
+    depends_on:
+      pgbouncer: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/healthz',timeout=4).status==200 else 1)\""]
+      interval: 15s
+      timeout: 6s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits: { cpus: "4", memory: 6G }
+    networks:
+      - turnflow_instagram_net
+
+  # ── Celery: DM send (I/O-bound → threads pool; high concurrency for ~333 DM/s) ──
+  # Scale horizontally: docker compose -f docker-compose.prod.yml up -d --scale celery_dm=3
+  celery_dm:
+    image: *app_image
+    restart: unless-stopped
+    command: celery -A config worker --pool=threads --concurrency=100 --prefetch-multiplier=1 -l info -Q dm_send
+    env_file: [.env.production]
+    environment: *app_env
     volumes:
       - turnflow_instagram_logs:/app/logs
     depends_on:
-      - db
-      - redis
-      - web
+      pgbouncer: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "6", memory: 8G }
+    networks:
+      - turnflow_instagram_net
+
+  # ── Celery: webhook follow-up (delivered/read UPDATEs) + verification (I/O-bound) ──
+  celery_followup:
+    image: *app_image
+    restart: unless-stopped
+    command: celery -A config worker --pool=threads --concurrency=80 --prefetch-multiplier=1 -l info -Q webhook_followup,verify
+    env_file: [.env.production]
+    environment: *app_env
+    volumes:
+      - turnflow_instagram_logs:/app/logs
+    depends_on:
+      pgbouncer: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "4", memory: 6G }
+    networks:
+      - turnflow_instagram_net
+
+  # ── Celery: default + snapshot (Playwright is heavy → prefork, low concurrency, isolated) ──
+  celery_default:
+    image: *app_image
+    container_name: turnflow_instagram_celery
+    restart: unless-stopped
+    command: celery -A config worker --concurrency=8 --prefetch-multiplier=1 -l info -Q celery,snapshot
+    env_file: [.env.production]
+    environment: *app_env
+    volumes:
+      - turnflow_instagram_logs:/app/logs
+    depends_on:
+      pgbouncer: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "8", memory: 12G }
+    networks:
+      - turnflow_instagram_net
+
+  # ── Celery: billing batches + backup health-check (low rate, isolated) ──
+  celery_billing:
+    image: *app_image
+    restart: unless-stopped
+    command: celery -A config worker --concurrency=4 --prefetch-multiplier=1 -l info -Q billing
+    env_file: [.env.production]
+    environment: *app_env
+    volumes:
+      - turnflow_instagram_logs:/app/logs
+    depends_on:
+      pgbouncer: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 4G }
     networks:
       - turnflow_instagram_net
 
   celery_beat:
-    image: turnflow_instagram_web
+    image: *app_image
     container_name: turnflow_instagram_celery_beat
     restart: unless-stopped
     command: celery -A config beat -l info --pidfile=/tmp/celerybeat.pid
-    env_file:
-      - .env.production
-    environment:
-      - DJANGO_SETTINGS_MODULE=config.settings.prod
-      - DB_HOST=db
-      - DB_PORT=5432
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
+    env_file: [.env.production]
+    environment: *app_env
     volumes:
       - turnflow_instagram_logs:/app/logs
     depends_on:
-      - db
-      - redis
-      - web
+      pgbouncer: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 1G }
     networks:
       - turnflow_instagram_net
 

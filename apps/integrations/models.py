@@ -718,6 +718,12 @@ class SentDMLog(models.Model):
             models.Index(fields=["status", "accepted_at"]),  # reconcile worker
             models.Index(fields=["meta_message_id"]),  # echo 매칭
             models.Index(fields=["next_retry_at"]),  # 재시도 워커
+            # P2a: echo fallback 매칭(recipient_user_id + status, 최근 accepted 순) seqscan 방지.
+            # 0019 마이그레이션에서 CREATE INDEX CONCURRENTLY 로 생성.
+            models.Index(
+                fields=["recipient_user_id", "status", "-accepted_at"],
+                name="dm_log_recipient_status_idx",
+            ),
         ]
         # idempotency_key uniqueness는 필드 자체의 unique=True 로 표현
 
@@ -1118,3 +1124,36 @@ class SpamCommentLog(models.Model):
         if api_response:
             self.api_response = api_response
         self.save(update_fields=["status", "error_message", "api_response"])
+
+
+class EventInbox(models.Model):
+    """웹훅 이벤트 멱등성 장부 (P2b).
+
+    Meta 는 동일 웹훅을 재전송할 수 있고, 3-tier 전환으로 webhook 동시성이 올라가면
+    echo/read 이벤트가 여러 워커에 동시 도달해 같은 SentDMLog row 를 락 없이 UPDATE 하는
+    레이스가 발생한다. 이 테이블에 ``event_key`` 를 UNIQUE 로 멱등 INSERT(ON CONFLICT DO NOTHING)
+    해서 "최초 1회"만 후속 처리(process_messaging_event)를 enqueue 한다.
+
+    event_key 포맷: ``"{event_type}:{mid}"``  (예: ``"echo:abc123"``, ``"read:abc123"``)
+    """
+
+    EVENT_ECHO = "echo"
+    EVENT_READ = "read"
+
+    event_key = models.CharField(max_length=255, unique=True, verbose_name="이벤트 키")
+    event_type = models.CharField(max_length=32, verbose_name="이벤트 타입")
+    payload = models.JSONField(default=dict, blank=True, verbose_name="이벤트 페이로드")
+    received_at = models.DateTimeField(auto_now_add=True, verbose_name="수신 시각")
+    processed_at = models.DateTimeField(null=True, blank=True, verbose_name="처리 완료 시각")
+
+    class Meta:
+        db_table = "webhook_event_inbox"
+        verbose_name = "Webhook Event Inbox"
+        verbose_name_plural = "Webhook Event Inbox"
+        indexes = [
+            models.Index(fields=["processed_at"], name="webhook_eve_process_idx"),
+            models.Index(fields=["received_at"], name="webhook_eve_receive_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.event_key} ({'done' if self.processed_at else 'pending'})"

@@ -1,0 +1,15 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: node          # host: CPU/RAM/disk/NETWORK (bandwidth)
+    static_configs: [{ targets: ["node_exporter:9100"] }]
+  - job_name: cadvisor      # per-container CPU/RAM
+    static_configs: [{ targets: ["cadvisor:8080"] }]
+  - job_name: postgres      # connections/locks/write rate/WAL
+    static_configs: [{ targets: ["postgres_exporter:9187"] }]
+  - job_name: redis         # queue depth / memory
+    static_configs: [{ targets: ["redis_exporter:9121"] }]
+  - job_name: prometheus
+    static_configs: [{ targets: ["localhost:9090"] }]

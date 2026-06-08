@@ -1,0 +1,37 @@
+# GATE-0 / Layer 2 — pgBackRest config for WAL archiving + PITR to Cloudflare R2.
+# Install at /etc/pgbackrest/pgbackrest.conf on the host. Chosen over wal-g for
+# integrated backup+WAL+retention+verification (`pgbackrest check`) in one tool.
+#
+# RPO ≈ seconds–minutes (archive_timeout=60 ships a partial segment each minute).
+# RTO ≈ tens of minutes (restore last base backup + replay WAL to target time/LSN).
+#
+# pg1-path must match the postgres data dir. With the postgres:16-alpine container
+# and named volume turnflow_instagram_postgres, the host path is typically:
+#   /var/lib/docker/volumes/turnflow_instagram_postgres/_data
+# Run pgBackRest on the HOST against that path (the simplest single-box setup).
+
+[global]
+repo1-type=s3
+repo1-s3-endpoint=__R2_ACCOUNT_ID__.r2.cloudflarestorage.com
+repo1-s3-bucket=turnflow-db-backups
+repo1-s3-region=auto
+repo1-s3-uri-style=path
+repo1-s3-key=__SCOPED_DB_BACKUP_KEY__
+repo1-s3-key-secret=__SCOPED_DB_BACKUP_SECRET__
+repo1-path=/pgbackrest
+# Client-side encryption — R2 stores only ciphertext (matches PGBACKREST_CIPHER_PASS in .env.backup).
+repo1-cipher-type=aes-256-cbc
+repo1-cipher-pass=__LONG_RANDOM_PASSPHRASE__
+repo1-retention-full=2
+repo1-retention-diff=6
+process-max=4
+compress-type=zst
+compress-level=3
+start-fast=y
+log-level-console=info
+log-level-file=detail
+
+[turnflow]
+pg1-path=/var/lib/docker/volumes/turnflow_instagram_postgres/_data
+pg1-port=5432
+# pg1-socket-path or pg1-host/pg1-user as needed if running pgBackRest outside the container.

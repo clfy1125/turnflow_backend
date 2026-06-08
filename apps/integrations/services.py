@@ -2,11 +2,43 @@
 Instagram OAuth and Mock Provider services
 """
 
+import threading
+
 import requests
 from django.conf import settings
 from datetime import datetime, timedelta
+from requests.adapters import HTTPAdapter
 from typing import Dict, Optional
 from urllib.parse import urlencode
+from urllib3.util.retry import Retry
+
+# ── P3b: Meta Graph API 호출용 커넥션 풀 재사용 세션 ──
+# 매 DM 발송마다 새 TCP+TLS 핸드셰이크를 만들지 않게 모듈 단위 Session 을 공유한다.
+# 고동시성(초당 수백 발송)에서 핸드셰이크 CPU + ephemeral 포트 고갈(TIME_WAIT)을 줄인다.
+# Retry 는 connect 만(read=0) — 요청 전송 후 재시도하지 않으므로 POST 중복 발송 위험 없음.
+# urllib3 PoolManager 는 thread-safe → Celery threads 풀에서 안전, prefork 는 프로세스별 1개.
+_http_session: Optional[requests.Session] = None
+_http_session_lock = threading.Lock()
+
+
+def get_http_session() -> requests.Session:
+    global _http_session
+    if _http_session is None:
+        with _http_session_lock:
+            if _http_session is None:
+                s = requests.Session()
+                adapter = HTTPAdapter(
+                    pool_connections=64,
+                    pool_maxsize=256,
+                    max_retries=Retry(
+                        total=2, connect=2, read=0, redirect=0,
+                        backoff_factor=0.2, status_forcelist=(),
+                    ),
+                )
+                s.mount("https://", adapter)
+                s.mount("http://", adapter)
+                _http_session = s
+    return _http_session
 import secrets
 import uuid
 
@@ -602,7 +634,7 @@ class InstagramMessagingService:
         params = {"fields": "is_user_follow_business"}
 
         try:
-            resp = requests.get(
+            resp = get_http_session().get(
                 url,
                 params=params,
                 headers={"Authorization": f"Bearer {access_token}"},
@@ -667,7 +699,7 @@ class InstagramMessagingService:
         )
 
         try:
-            resp = requests.post(
+            resp = get_http_session().post(
                 url,
                 json=payload,
                 headers=cls._get_headers(access_token),
@@ -775,7 +807,7 @@ class InstagramMessagingService:
         params = {"fields": "id,created_time,from,to,message"}
 
         try:
-            resp = requests.get(
+            resp = get_http_session().get(
                 url,
                 params=params,
                 headers={"Authorization": f"Bearer {access_token}"},

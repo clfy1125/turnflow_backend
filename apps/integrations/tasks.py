@@ -26,6 +26,7 @@ from .dm_exceptions import (
 )
 from .models import (
     AutoDMCampaign,
+    EventInbox,
     IGAccountConnection,
     SentDMLog,
     SpamCommentLog,
@@ -2022,3 +2023,96 @@ def sync_ig_profile_picture(self, connection_id: str) -> dict:
         "connection_id": str(conn.id),
         "profile_picture_url": new_cached_url,
     }
+
+
+# ===== P2d: 웹훅 메시징 이벤트 비동기 처리 (echo→DELIVERED / read→READ) =====
+#
+# 기존엔 instagram_webhook 가 _process_messaging_events 안에서 mark_delivered/mark_read 를
+# row-lock·멱등성 없이 INLINE 으로 수행 → Meta 재전송 시 동시 UPDATE 레이스.
+# 이제 webhook 핸들러는 EventInbox 에 멱등 INSERT 만 하고 200 을 즉시 반환하며,
+# 실제 UPDATE 는 이 태스크가 select_for_update() 로 직렬화해서 처리한다.
+
+
+def _apply_echo_delivered(*, mid: str, page_ig_user_id: str, recipient_user_id: str) -> int:
+    """is_echo mid → SentDMLog DELIVERED 승격 (select_for_update 로 레이스 제거)."""
+    matched = 0
+    with transaction.atomic():
+        qs = (
+            SentDMLog.objects.select_for_update()
+            .filter(meta_message_id=mid)
+            .select_related("campaign__ig_connection")
+        )
+        logs = list(qs)
+        if not logs and recipient_user_id:
+            # mid 가 echo 단계에서 다르게 발급될 수 있어 recipient + 최근 ACCEPTED 로 fallback.
+            # dm_log_recipient_status_idx (0019) 가 이 쿼리를 인덱스 스캔으로 처리.
+            logs = list(
+                SentDMLog.objects.select_for_update()
+                .filter(
+                    recipient_user_id=recipient_user_id,
+                    status=SentDMLog.Status.ACCEPTED,
+                    campaign__ig_connection__external_account_id=page_ig_user_id,
+                )
+                .order_by("-accepted_at")[:1]
+            )
+        for log in logs:
+            if log.status == SentDMLog.Status.READ:
+                continue
+            log.append_verification_log({"path": "echo", "result": "matched", "mid": mid})
+            log.mark_delivered(via=SentDMLog.VerifiedVia.ECHO, mid=mid)
+            matched += 1
+    return matched
+
+
+def _apply_read(*, mid: str) -> int:
+    """messaging_seen mid → SentDMLog READ 승격 (select_for_update)."""
+    matched = 0
+    with transaction.atomic():
+        logs = list(SentDMLog.objects.select_for_update().filter(meta_message_id=mid))
+        if not logs:
+            logs = list(SentDMLog.objects.select_for_update().filter(echo_mid=mid))
+        for log in logs:
+            log.mark_read()
+            matched += 1
+    return matched
+
+
+@shared_task(
+    bind=True,
+    autoretry_for=(Exception,),
+    retry_kwargs={"max_retries": 5, "countdown": 10},
+    retry_backoff=True,
+)
+def process_messaging_event(self, event_key: str):
+    """EventInbox 1건을 소비해 SentDMLog 상태를 갱신 (멱등).
+
+    EventInbox.event_key 가 이미 UNIQUE 로 중복을 막고, 여기서 processed_at 으로 재처리도 막는다.
+    실패하면 재시도되며, EventInbox 행은 남아 있어 reconcile 워커의 능동 검증이 안전망이 된다.
+    """
+    try:
+        evt = EventInbox.objects.get(event_key=event_key)
+    except EventInbox.DoesNotExist:
+        logger.warning("process_messaging_event: missing EventInbox %s", event_key)
+        return {"status": "missing"}
+
+    if evt.processed_at:
+        return {"status": "already_processed"}
+
+    data = evt.payload or {}
+    mid = data.get("mid") or ""
+    matched = 0
+    if evt.event_type == EventInbox.EVENT_ECHO and mid:
+        matched = _apply_echo_delivered(
+            mid=mid,
+            page_ig_user_id=data.get("page_ig_user_id", ""),
+            recipient_user_id=data.get("recipient_user_id", ""),
+        )
+    elif evt.event_type == EventInbox.EVENT_READ and mid:
+        matched = _apply_read(mid=mid)
+
+    evt.processed_at = timezone.now()
+    evt.save(update_fields=["processed_at"])
+    logger.info(
+        "process_messaging_event %s: matched=%s", event_key, matched
+    )
+    return {"status": "ok", "matched": matched}

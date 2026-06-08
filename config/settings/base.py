@@ -93,8 +93,15 @@ DATABASES = {
         "PASSWORD": config("DB_PASSWORD", default="postgres"),
         "HOST": config("DB_HOST", default="localhost"),
         "PORT": config("DB_PORT", default="5432"),
-        "CONN_MAX_AGE": 600,
-        "CONN_HEALTH_CHECKS": True,
+        # PgBouncer transaction-pool 사용 시 반드시 CONN_MAX_AGE=0 (영속 커넥션 금지) +
+        # DISABLE_SERVER_SIDE_CURSORS=True (transaction pooling 은 named cursor 미지원).
+        # prod(.env.production): DB_HOST=pgbouncer / DB_PORT=6432 / DB_CONN_MAX_AGE=0 / DB_DISABLE_SERVER_SIDE_CURSORS=True
+        # 마이그레이션 one-shot 은 db:5432 직결(session pool) 로 실행 — deploy.sh 참고.
+        "CONN_MAX_AGE": config("DB_CONN_MAX_AGE", default=0, cast=int),
+        "CONN_HEALTH_CHECKS": config("DB_CONN_HEALTH_CHECKS", default=True, cast=bool),
+        "DISABLE_SERVER_SIDE_CURSORS": config(
+            "DB_DISABLE_SERVER_SIDE_CURSORS", default=False, cast=bool
+        ),
     }
 }
 
@@ -306,10 +313,23 @@ CELERY_TIMEZONE = TIME_ZONE
 CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutes
 
-# 기능별 큐 라우팅 — 메모리 spike 큰 태스크 격리 가능.
-# 별도 worker 미실행 시에도 기본 worker 가 모든 큐를 consume 하므로 호환됨.
+# 기능별 큐 라우팅 (P3a) — SLA/부하 격리. 각 큐는 docker-compose.prod.yml 의 전용 워커가 consume:
+#   dm_send → celery_dm(threads) · webhook_followup,verify → celery_followup(threads)
+#   celery,snapshot → celery_default(prefork) · billing → celery_billing(prefork)
+# 단일 워커 환경(로컬/레거시)에서도 기본 worker 가 모든 큐를 consume 하면 호환됨.
+# ⚠️ 라우팅된 큐를 consume 하는 워커가 없으면 태스크가 영원히 적체된다 — 워커 구성과 항상 일치시킬 것.
 CELERY_TASK_ROUTES = {
     "pages.capture_reference_snapshot": {"queue": "snapshot"},
+    # DM 외부 발송 (I/O-bound, 고동시성)
+    "apps.integrations.tasks.send_dm_task": {"queue": "dm_send"},
+    "apps.integrations.tasks.post_public_reply": {"queue": "dm_send"},
+    # 댓글 처리 + 웹훅 delivered/read 후속 UPDATE
+    "apps.integrations.tasks.process_comment_and_send_dm": {"queue": "webhook_followup"},
+    "apps.integrations.tasks.process_messaging_event": {"queue": "webhook_followup"},
+    # 도착 검증
+    "apps.integrations.tasks.verify_dm_delivery": {"queue": "verify"},
+    # 정기 결제 배치
+    "billing.*": {"queue": "billing"},
 }
 
 # Celery Beat Schedule (정기 결제 + DM 발송 보증 워커)
@@ -348,6 +368,14 @@ CELERY_BEAT_SCHEDULE = {
     "dm-dead-letter-alerter": {
         "task": "apps.integrations.tasks.dead_letter_alerter",
         "schedule": 60 * 10,  # 10분 — 토큰 만료/도착 미확인 누적 알림
+    },
+    # ===== GATE-0 백업 관측 =====
+    # 실제 백업은 호스트 cron(deploy/backups/pg_backup.sh + pgBackRest)에서 수행.
+    # 이 beat 는 연속 WAL 아카이빙 상태만 감시(pg_stat_archiver) → 실패/지연 시 Telegram.
+    "backup-health-check": {
+        "task": "apps.core.tasks.backup_health_check",
+        "schedule": 60 * 30,  # 30분
+        "options": {"queue": "billing"},
     },
     # ===== IG Long-lived Token 자동 갱신 =====
     # 매일 KST 09:00 — 만료까지 14일 미만 ACTIVE 연동의 token refresh + Telegram 요약.
@@ -442,6 +470,11 @@ INSTAGRAM_WEBHOOK_VERIFY_TOKEN = config(
 # Meta App (Facebook Login for Instagram Business)
 META_APP_ID = config("META_APP_ID", default="")
 META_APP_SECRET = config("META_APP_SECRET", default="")
+
+# P2c — 웹훅 echo/read 이벤트를 EventInbox 멱등 INSERT + Celery(webhook_followup) 비동기 처리.
+# True(기본): 동시 UPDATE 레이스 제거 + webhook 응답 빨라짐.
+# False: 레거시 inline 처리로 즉시 롤백 (코드 재배포 없이 env 만으로).
+WEBHOOK_ASYNC_MESSAGING = config("WEBHOOK_ASYNC_MESSAGING", default=True, cast=bool)
 
 # ─────────────────────────────────────────────────────────────
 # Telegram 운영 알림 (토큰 refresh / 장애 등)

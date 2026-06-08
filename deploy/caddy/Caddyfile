@@ -1,0 +1,57 @@
+# Host Caddy — TurnFlow reverse proxy. Lives on the host (NOT built by compose).
+# Apply: copy to the server's Caddyfile (e.g. /etc/caddy/Caddyfile), then `caddy reload`.
+#
+# P4a: SLA-tiered routing — webhook(8001) / external-IO(8003) / everything else(8002).
+# P1a: lock down the LiteLLM endpoint (was protected only by a weak guessable master key).
+#
+# Rollback to single-pool (pre-cutover): point every api route at 127.0.0.1:8002 (or the
+# legacy single web port) and `caddy reload` (~2s). Keep this block commented below.
+
+api.turnflow.clfy.ai.kr {
+	encode zstd gzip
+
+	# ── Tier 1: Instagram webhook — fast path, fail-fast. ──
+	@webhook path /api/v1/integrations/instagram/webhook /api/v1/integrations/instagram/webhook/*
+	handle @webhook {
+		reverse_proxy 127.0.0.1:8001
+	}
+
+	# ── Tier 3: external-IO isolation (link meta scrape, Graph proxy/test, importers, AI views). ──
+	# ⚠️ Verify these prefixes against config/api_urls.py + apps/pages/link_urls.py and adjust.
+	@external {
+		path /api/v1/pages/link/*
+		path /api/v1/pages/*/fetch-meta*
+		path /api/v1/pages/importers/*
+		path /api/v1/pages/aiviews/*
+		path /api/v1/integrations/instagram/*/test*
+	}
+	handle @external {
+		reverse_proxy 127.0.0.1:8003
+	}
+
+	# ── Tier 2: dashboard / API / admin (default). ──
+	handle {
+		reverse_proxy 127.0.0.1:8002
+	}
+}
+
+# ── LiteLLM proxy — lock down (P1a). ──
+# The master key was weak/guessable and this host is public. ACTIONS:
+#   1) Rotate LLM_API_KEY to a strong random value (deploy/vllm-server/.env + LiteLLM config).
+#   2) Restrict to known callers. Uncomment ONE of the layers below.
+llm.clfy.ai.kr {
+	encode zstd gzip
+
+	# Option A — IP allowlist (defense-in-depth). Put your app server / known client IPs here.
+	# @blocked not remote_ip 1.2.3.4 5.6.7.8 127.0.0.1
+	# handle @blocked {
+	# 	respond "Forbidden" 403
+	# }
+
+	# Option B — extra HTTP basic-auth in front of LiteLLM (generate: caddy hash-password).
+	# basic_auth {
+	# 	turnflow <bcrypt-hash>
+	# }
+
+	reverse_proxy 127.0.0.1:4040
+}

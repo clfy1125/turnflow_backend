@@ -16,7 +16,7 @@ import secrets
 
 from apps.workspace.models import Workspace
 from apps.workspace.permissions import IsWorkspaceMember
-from .models import IGAccountConnection, AutoDMCampaign, SentDMLog, SpamFilterConfig, SpamCommentLog, IGOAuthState
+from .models import IGAccountConnection, AutoDMCampaign, EventInbox, SentDMLog, SpamFilterConfig, SpamCommentLog, IGOAuthState
 from .serializers import (
     IGAccountConnectionSerializer,
     ConnectionStartResponseSerializer,
@@ -2114,6 +2114,43 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
     },
     tags=["Integrations"],
 )
+def _enqueue_messaging_event(event_type: str, mid: str, payload: dict, logger) -> None:
+    """P2c — 웹훅 echo/read 를 EventInbox 에 멱등 INSERT 후 최초 1회만 Celery enqueue.
+
+    Meta 재전송/동시 도달은 event_key UNIQUE 로 흡수되어 한 번만 후속 처리된다.
+    이렇게 하면 webhook 응답 critical path 의 PG 쓰기가 INLINE UPDATE 2~4회 → 가벼운 INSERT 1회로 줄고,
+    실제 SentDMLog UPDATE 는 process_messaging_event 가 select_for_update 로 직렬화 처리한다.
+
+    WEBHOOK_ASYNC_MESSAGING=False 면 레거시 inline 경로로 폴백(즉시 롤백 가능).
+    """
+    if not getattr(settings, "WEBHOOK_ASYNC_MESSAGING", True):
+        if event_type == EventInbox.EVENT_ECHO:
+            _mark_log_delivered_by_echo(
+                mid=mid,
+                page_ig_user_id=payload.get("page_ig_user_id", ""),
+                recipient_user_id=payload.get("recipient_user_id", ""),
+                logger=logger,
+            )
+        else:
+            _mark_log_read_by_mid(mid, logger)
+        return
+
+    from django.db import IntegrityError
+
+    from .tasks import process_messaging_event
+
+    key = f"{event_type}:{mid}"
+    try:
+        _, created = EventInbox.objects.get_or_create(
+            event_key=key,
+            defaults={"event_type": event_type, "payload": payload},
+        )
+    except IntegrityError:
+        created = False  # 동시 INSERT 레이스의 패자 — 이미 등록됨
+    if created:
+        process_messaging_event.delay(key)
+
+
 def _process_messaging_events(entry: dict, logger) -> None:
     """
     Instagram Webhook entry.messaging[] 처리.
@@ -2147,7 +2184,9 @@ def _process_messaging_events(entry: dict, logger) -> None:
         if read:
             mid = read.get("mid")
             if mid:
-                _mark_log_read_by_mid(mid, logger)
+                _enqueue_messaging_event(
+                    EventInbox.EVENT_READ, mid, {"mid": mid}, logger
+                )
             continue
 
         # ----- postback (button click) -----
@@ -2180,11 +2219,15 @@ def _process_messaging_events(entry: dict, logger) -> None:
                 continue
 
         if is_echo and mid:
-            _mark_log_delivered_by_echo(
-                mid=mid,
-                page_ig_user_id=page_ig_user_id,
-                recipient_user_id=recipient_id,
-                logger=logger,
+            _enqueue_messaging_event(
+                EventInbox.EVENT_ECHO,
+                mid,
+                {
+                    "mid": mid,
+                    "page_ig_user_id": page_ig_user_id,
+                    "recipient_user_id": recipient_id,
+                },
+                logger,
             )
         else:
             # 사용자 → 우리 (inbound) 메시지.
