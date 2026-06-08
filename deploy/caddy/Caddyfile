@@ -1,23 +1,36 @@
-# Host Caddy — TurnFlow reverse proxy. Lives on the host (NOT built by compose).
-# Apply: copy to the server's Caddyfile (e.g. /etc/caddy/Caddyfile), then `caddy reload`.
+# Host Caddy — TurnFlow reverse proxy.
 #
-# P4a: SLA-tiered routing — webhook(8001) / external-IO(8003) / everything else(8002).
-# P1a: lock down the LiteLLM endpoint (was protected only by a weak guessable master key).
+# ⚠️ 이 Caddy 는 **컨테이너** 로, turnflow_instagram_net 네트워크에 붙어 있다:
+#   docker run -d --name caddy --restart unless-stopped -p 80:80 -p 443:443 \
+#     -v /root/caddy:/etc/caddy -v caddy_data:/data -v caddy_config:/config \
+#     --network turnflow_instagram_net caddy
+# 따라서 업스트림은 **Docker DNS 서비스 이름:컨테이너포트** 로 지정한다 (127.0.0.1 은 Caddy 자신!).
 #
-# Rollback to single-pool (pre-cutover): point every api route at 127.0.0.1:8002 (or the
-# legacy single web port) and `caddy reload` (~2s). Keep this block commented below.
+# 적용:  이 파일을 /root/caddy/Caddyfile 로 복사 후
+#        docker exec -w /etc/caddy caddy caddy reload --config /etc/caddy/Caddyfile   (무중단 reload, ~2s)
+#
+# P4a: SLA 3-tier 라우팅 (web_webhook / web_external / web_dashboard, 모두 컨테이너 포트 8000).
+# P1a: llm.clfy 잠금.
+#
+# 롤백(컷오버 취소): 3개 핸들을 옛 단일 업스트림으로 되돌리고 reload. 아래 [LEGACY] 블록 참고.
 
 api.turnflow.clfy.ai.kr {
 	encode zstd gzip
 
-	# ── Tier 1: Instagram webhook — fast path, fail-fast. ──
+	# ── Tier 1: Instagram webhook (fast path) ──
 	@webhook path /api/v1/integrations/instagram/webhook /api/v1/integrations/instagram/webhook/*
 	handle @webhook {
-		reverse_proxy 127.0.0.1:8001
+		reverse_proxy web_webhook:8000 {
+			transport http {
+				keepalive 30s
+				keepalive_idle_conns 512
+				max_conns_per_host 0
+			}
+		}
 	}
 
-	# ── Tier 3: external-IO isolation (link meta scrape, Graph proxy/test, importers, AI views). ──
-	# ⚠️ Verify these prefixes against config/api_urls.py + apps/pages/link_urls.py and adjust.
+	# ── Tier 3: external-IO 격리 (link 메타 스크랩, Graph proxy/test, importers, AI views) ──
+	# ⚠️ prefix 는 config/api_urls.py + apps/pages/link_urls.py 와 대조해 조정할 것.
 	@external {
 		path /api/v1/pages/link/*
 		path /api/v1/pages/*/fetch-meta*
@@ -26,32 +39,53 @@ api.turnflow.clfy.ai.kr {
 		path /api/v1/integrations/instagram/*/test*
 	}
 	handle @external {
-		reverse_proxy 127.0.0.1:8003
+		reverse_proxy web_external:8000 {
+			transport http {
+				keepalive 30s
+				keepalive_idle_conns 256
+				max_conns_per_host 0
+			}
+		}
 	}
 
-	# ── Tier 2: dashboard / API / admin (default). ──
+	# ── Tier 2: dashboard / API / admin (default) ──
 	handle {
-		reverse_proxy 127.0.0.1:8002
+		reverse_proxy web_dashboard:8000 {
+			transport http {
+				keepalive 30s
+				keepalive_idle_conns 512
+				max_conns_per_host 0
+			}
+		}
 	}
 }
 
-# ── LiteLLM proxy — lock down (P1a). ──
-# The master key was weak/guessable and this host is public. ACTIONS:
-#   1) Rotate LLM_API_KEY to a strong random value (deploy/vllm-server/.env + LiteLLM config).
-#   2) Restrict to known callers. Uncomment ONE of the layers below.
+# ── LiteLLM proxy — 잠금(P1a). 약한 마스터키(sk-master-key-admin1234) 회전 + 아래 한 겹 추가 ──
 llm.clfy.ai.kr {
 	encode zstd gzip
 
-	# Option A — IP allowlist (defense-in-depth). Put your app server / known client IPs here.
-	# @blocked not remote_ip 1.2.3.4 5.6.7.8 127.0.0.1
+	# Option A — IP 허용목록(권장, defense-in-depth). 앱 서버/알려진 클라이언트 IP 만 허용.
+	# @blocked not remote_ip 1.2.3.4 5.6.7.8
 	# handle @blocked {
 	# 	respond "Forbidden" 403
 	# }
 
-	# Option B — extra HTTP basic-auth in front of LiteLLM (generate: caddy hash-password).
+	# Option B — LiteLLM 앞단 basic-auth (생성: docker exec caddy caddy hash-password).
 	# basic_auth {
 	# 	turnflow <bcrypt-hash>
 	# }
 
-	reverse_proxy 127.0.0.1:4040
+	reverse_proxy litellm-proxy:4000
 }
+
+# ── netdata 등 호스트 모니터 (기존 그대로 유지) ──
+monitor.clfy.ai.kr {
+	reverse_proxy 172.19.0.1:19999
+}
+
+# ── [LEGACY] 컷오버 전/롤백용 단일 업스트림. 위 api 블록 대신 이걸로 바꾸고 reload 하면 즉시 원복.
+# api.turnflow.clfy.ai.kr {
+# 	reverse_proxy turnflow_instagram_web:8000 {
+# 		transport http { keepalive 30s; keepalive_idle_conns 512; max_conns_per_host 0 }
+# 	}
+# }

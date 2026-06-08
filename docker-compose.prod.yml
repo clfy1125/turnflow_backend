@@ -124,7 +124,8 @@ services:
     env_file: [.env.production]
     environment: *app_env
     ports:
-      - "127.0.0.1:8001:8000"   # host Caddy → webhook tier
+      # Caddy(컨테이너)는 네트워크 DNS(web_webhook:8000)로 접속 — 이 포트는 호스트 디버깅/스모크 테스트용.
+      - "127.0.0.1:8001:8000"
     volumes:
       - turnflow_instagram_static:/app/staticfiles
       - turnflow_instagram_media:/app/media
@@ -159,7 +160,7 @@ services:
     env_file: [.env.production]
     environment: *app_env
     ports:
-      - "127.0.0.1:8002:8000"   # host Caddy → dashboard/API tier (default)
+      - "127.0.0.1:8002:8000"   # 호스트 디버깅용 (Caddy 는 web_dashboard:8000 으로 접속)
     volumes:
       - turnflow_instagram_static:/app/staticfiles
       - turnflow_instagram_media:/app/media
@@ -194,7 +195,7 @@ services:
     env_file: [.env.production]
     environment: *app_env
     ports:
-      - "127.0.0.1:8003:8000"   # host Caddy → external-IO tier
+      - "127.0.0.1:8003:8000"   # 호스트 디버깅용 (Caddy 는 web_external:8000 으로 접속)
     volumes:
       - turnflow_instagram_static:/app/staticfiles
       - turnflow_instagram_media:/app/media
