@@ -10,6 +10,8 @@ import json
 import logging
 from pathlib import Path
 
+from . import category_profiles as _cat
+
 logger = logging.getLogger(__name__)
 
 # ai_assets 디렉토리 경로
@@ -196,6 +198,9 @@ def build_prompts(
 
     is_remake = bool(user_input.get("existing_blocks") or user_input.get("sample_blocks"))
 
+    # 새-페이지 생성: 카테고리 결정(명시 category 우선, 없으면 concept 추론).
+    new_category = None if is_remake else _cat.resolve_category(user_input)
+
     # 1) System prompt
     if is_remake and mode == "full_restyle":
         system_file = _read_asset(f"prompts/{job_type}/system_restyle_full.md")
@@ -223,6 +228,10 @@ def build_prompts(
     # - reference_page_slug 가 있으면 DB 의 어드민 큐레이션 페이지 1건을 우선 사용.
     example_dir = _EXAMPLE_DIR_MAP.get(job_type, "bio")
     reference_page_slug = (user_input.get("reference_page_slug") or "").strip()
+    # 명시 레퍼런스가 없으면 카테고리 기본 레퍼런스(예: invitation → @wedding)로 폴백.
+    # 검증된 실페이지 디자인을 그대로 학습시키는 게 카테고리 레시피 텍스트보다 강력하다.
+    if not reference_page_slug and new_category:
+        reference_page_slug = (_cat.get_profile(new_category).get("reference_slug") or "").strip()
 
     using_reference = False
     if mode == "style_only":
@@ -241,7 +250,8 @@ def build_prompts(
     elif is_remake:
         examples = _load_examples(example_dir, max_count=2)
     else:
-        examples = _load_examples(example_dir, max_count=4)
+        # 새-페이지: 형식·블록 다양성 학습용 2개만(다크 음악 예시 4개 → 테마 모방 유발했음).
+        examples = _load_examples(example_dir, max_count=2)
 
     # 4) 사용자 입력 조합
     concept = user_input.get("concept", "")
@@ -262,6 +272,8 @@ def build_prompts(
             "  배너 이미지 → {{image:jpop band stage concert}}",
             "  앨범 커버 → {{image:music album cover aesthetic}}",
             "  프로필 → {{image:band member portrait}}",
+            "- 키워드는 **구체적이고 컨셉과 관련**되게(주제·인물·제품이 분명히 보이게). "
+            "빈 방·바닥·무의미한 풍경 금지. 블록마다 키워드를 다르게 해 같은 사진이 반복되지 않게 하라.",
             "",
             "### [사용자 업로드 이미지 규칙]",
             "- 아래 [목표] 위에 [사용 가능한 사용자 이미지] 목록이 주어지면, 그 이미지를 "
@@ -271,20 +283,25 @@ def build_prompts(
             "- **[사용 가능한 사용자 이미지] 목록이 없으면 {{user_image:N}} 을 절대 쓰지 말고 "
             "{{image:키워드}} 만 사용한다.**",
             "",
-            "### [디자인 정책 — 새 페이지]",
-            "좋은 결과는 아래 4개 레이어가 일관될 때 나온다:",
-            "1. design_settings: backgroundColor 와 frameBackgroundColor 를 **둘 다** 채우고 보통 "
-            "같은 베이스 색(참고 이미지 배경색)으로 맞춘다. blockBgColor·buttonColor·fontFamily 도 같은 팔레트로.",
-            "2. 히어로: 대표 비주얼(작품/제품/배너/인물)이 있으면 profile 을 "
-            'profile_layout: "cover_bg" + cover_image_url 로 풀블리드 히어로로 만든다.',
-            '3. 카드 위계: 핵심 CTA 한 개만 layout: "large", 나머지 small/medium. '
-            "같은 _type 무리는 같은 톤(색)으로 통일.",
-            "4. custom_css 적극 활용: page.custom_css 를 비워두지 말고 body 배경 그래디언트를 넣고, "
-            "강조 카드엔 은은한 box-shadow/border-radius 를 준다. 단 깨끗함 > 화려함"
-            "(과한 네온/그래디언트 텍스트 남발 금지).",
-            "색은 비슷한 색으로 바꾸지 말고 추출 팔레트의 #hex 를 그대로 써라. 일관성과 깨끗함이 화려함보다 중요.",
+            "### [디자인 체크리스트 — 새 페이지 (시스템 규칙 요약)]",
+            "- 색은 4개 토큰만: backgroundColor(분명히 밝거나 어둡게, 중간톤 금지) = frameBackgroundColor, "
+            "blockBgColor(카드, 배경과 살짝 다른 명도), buttonColor(단 하나의 강조색). "
+            "**textColor 는 넣지 마라 — 본문 글자색은 배경 대비로 자동 결정된다.**",
+            "- 아래 추출 팔레트 #hex 가 주어지면 그대로 사용(비슷한 색으로 바꾸지 마라). 전체 3~4색.",
+            "- 대표 비주얼은 profile cover_bg 히어로로. 메뉴/상품은 group_link + 썸네일. "
+            '**주요 전환 CTA(카톡 문의/무료체험/예약/주문) 딱 1개는 layout:"medium"(스탠다드)+badge**, '
+            "쇼케이스(large)는 이미지가 핵심인 대표 1개만, 나머지 링크는 small. 같은 _type 무리는 같은 톤으로 통일.",
+            "- page.custom_css 를 비우지 말 것(은은한 배경 그래디언트 한 줄). 깨끗함 > 화려함(네온/무지개 금지).",
+            "- single_link 의 url 은 비우지 말고 그럴듯한 https URL 을 넣어라(빈 url 은 렌더되지 않음).",
+            "- 이미지 슬롯(profile cover_image_url/avatar_url, gallery images, **group_link links 의 "
+            "모든 항목 thumbnail_url — list 레이아웃 포함**, 쇼케이스 single_link thumbnail)은 "
+            "**절대 비우지 말고** {{image:키워드}} 로 채워라. 빈 이미지=깨진 화면. "
+            "(예외: 후기 리스트('이름 ★★★★★')와 텍스트 가격표만 썸네일 생략 가능.)",
             "",
         ]
+        # 카테고리 레시피(섹션 구성·한국 실서비스·카피 톤·레이아웃 전략) 주입.
+        if new_category:
+            fixed_parts += [_cat.build_recipe_prompt(new_category)]
     if block_rules:
         fixed_parts += [f"### [블록 규칙]\n{block_rules}", ""]
     if examples:
@@ -300,7 +317,14 @@ def build_prompts(
                 "",
             ]
         else:
-            fixed_parts += [f"### [예시 JSON]\n{examples}", ""]
+            fixed_parts += [
+                "### [예시 JSON — 출력 형식·블록 다양성 참고용 (테마 모방 금지)]",
+                "(아래는 JSON 출력 형식과 블록 구성의 다양성을 보여주는 예시다. "
+                "**색/업종/다크테마/문구를 그대로 따라하지 마라** — 색·구성·카피·레이아웃은 위 "
+                "[카테고리 레시피] 를 따르고, 여기서는 _type 종류·필드 채우는 법·블록 풍부함만 참고하라.)",
+                examples,
+                "",
+            ]
     fixed_parts += [
         "### [출력 형식]",
         "설명 없이 JSON만 출력",
@@ -478,28 +502,22 @@ def build_prompts(
         palette = image_catalog.get("palette") or {}
         if palette:
             plines = [
-                "### [이미지에서 추출한 색 팔레트 — design_settings 에 우선 반영]",
-                "(참고 이미지에서 실제로 읽은 색이다. 위 디자인 방향 설명보다 **이 구체 색값(#hex)을 우선**해 "
-                "design_settings 의 backgroundColor·frameBackgroundColor·카드·텍스트·버튼색을 이 값에 맞춰라.)",
+                "### [이미지에서 추출한 색 팔레트 — 이 #hex 를 그대로 design_settings 에 써라]",
+                "(이미지 픽셀에서 결정적으로 추출한 실제 색이다. 무드 설명보다 **이 구체 #hex 를 최우선**하고, "
+                "비슷한 색으로 바꾸지 마라. 본문 글자색은 배경 대비로 자동 결정되니 textColor 는 넣지 않는다.)",
             ]
             label_map = [
-                ("background", "배경 (backgroundColor)"),
-                ("surface", "카드/블록 배경 (blockBgColor)"),
-                ("text", "텍스트 (textColor)"),
-                ("accent", "버튼·강조 (buttonColor / ctaColor)"),
+                ("background", "backgroundColor (= frameBackgroundColor 동일값)"),
+                ("surface", "blockBgColor (카드 배경)"),
+                ("accent", "buttonColor (단 하나의 강조색 — 버튼/소셜/뱃지)"),
             ]
             for key, label in label_map:
                 if palette.get(key):
                     plines.append(f"- {label}: {palette[key]}")
-            if palette.get("background"):
-                plines.append(
-                    f"- 프레임/베젤 (frameBackgroundColor): {palette['background']}"
-                    "  ← backgroundColor 와 동일하게"
-                )
             if palette.get("brightness"):
-                plines.append(f"- 전체 밝기: {palette['brightness']}")
+                plines.append(f"- 전체 밝기: {palette['brightness']} (배경을 이 방향으로 분명하게)")
             if palette.get("dominant_colors"):
-                plines.append(f"- 이미지 주요 색: {', '.join(palette['dominant_colors'])}")
+                plines.append(f"- 이미지 주요 색(참고): {', '.join(palette['dominant_colors'])}")
             plines.append("")
             variable_parts += plines
 

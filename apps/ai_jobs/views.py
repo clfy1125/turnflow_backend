@@ -151,11 +151,21 @@ AI가 링크인바이오 페이지 JSON을 생성하는 **비동기 작업**을 
 | 필드 | 필수 | 타입 | 설명 |
 |------|:----:|------|------|
 | `concept` | ✅ | string | 페이지 컨셉 설명 (최대 2000자) |
+| `category` | ❌ | string | **새 페이지 생성 시 명시 권장.** 카테고리별 전용 레시피(섹션 구성·카피 톤·이미지 전략·디자인 변형)가 적용됨. 허용값은 `GET /api/v1/ai/categories/` 의 슬러그: `profile-link`·`digital-card`·`landing`·`portfolio`·`brochure`·`space-booking`·`group-buy`·`invitation`·`affiliate`·`commission`·`promotion`. 비우면 concept 에서 자동 추론 |
 | `slug` | ❌ | string | 리메이크할 기존 페이지의 slug. 전달 시 해당 페이지의 블록을 참고하여 AI가 리메이크 |
 | `model` | ❌ | string | AI 모델 선택. `deepseek`(기본), `gemma`(자체 호스팅), `gpt5`(개발 중) |
 | `image_ids` | ❌ | uuid[] | 새 페이지 생성 시 사용할 업로드 이미지 id (최대 10). `POST /api/v1/ai/source-images/` 로 먼저 업로드. AI가 라벨링 후 사용 가능한 이미지를 페이지에 배치 (slug 리메이크 시 무시) |
+| `reference_page_slug` | ❌ | string | 디자인 톤 few-shot 레퍼런스 페이지 slug (`GET /api/v1/ai/categories/{slug}/references/` 에서 선택). 비우면 카테고리 기본 레퍼런스(예: invitation → 검증된 청첩장 디자인) 자동 적용 |
 
-## 이미지 기반 생성 (새 버전)
+## 새 페이지 생성 품질 파이프라인 (2026-06 개선)
+백엔드가 생성 결과를 자동 보정하므로 프론트는 추가 처리 없이 `result_json` 을 그대로 쓰면 됩니다:
+- **카테고리 레시피**: 11종 카테고리별 섹션 구성/한국 실서비스 링크(네이버 예약·카톡 채널 등)/카피 톤
+- **이미지 보장**: 모든 이미지 슬롯(히어로/아바타/갤러리/그룹링크 썸네일)을 Pixabay + 비전 검수로 채움 — 빈 이미지 없음
+- **카드 크기 정책**: 보조 링크 small, 주요 전환 CTA 1개 medium(스탠다드), 쇼케이스 large 1개 자동 강제
+- **디자인 킷**: 카테고리별 카드 라운드/그림자/등장 애니메이션 CSS 자동 주입 (`page.custom_css`)
+- **가독성 가드**: WCAG 대비 보정, 긴 텍스트 토글 접기, 후기는 "아이디 ★ 한줄평" 토글 형식
+
+## 이미지 기반 생성
 1. `POST /api/v1/ai/source-images/` 로 이미지 1~10장 업로드 → `id` 목록 수신
 2. 이 엔드포인트에 `concept` + `image_ids` 전달
 3. AI가 먼저 이미지를 라벨링(콘텐츠/컨셉 판별 + 요약)한 뒤, 사용 가능한 이미지를 페이지 블록에 배치
@@ -234,6 +244,15 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
                 summary="컨셉만 전달 (새 페이지 생성)",
                 value={
                     "concept": "제품 판매 링크 여러 개 모여있는 랜딩 페이지",
+                },
+                request_only=True,
+            ),
+            OpenApiExample(
+                "카테고리 명시 생성 (권장)",
+                summary="카테고리 선택 UI 값과 함께 전달 — 전용 레시피 적용",
+                value={
+                    "concept": "성수동 모임공간 '레이어드' 대여. 시간당 요금, 네이버 예약, 주차 안내.",
+                    "category": "space-booking",
                 },
                 request_only=True,
             ),
@@ -368,6 +387,8 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
             "mode": mode,
             "preserve_content": vd.get("preserve_content", False),
             "reference_page_slug": reference_page_slug,
+            # 새 페이지 생성용 카테고리(레시피 키로 정규화됨). 리메이크에선 무시된다.
+            "category": vd.get("category", ""),
         }
         if baseline_blocks is not None:
             input_payload["existing_page_meta"] = frozen_page_meta

@@ -112,14 +112,119 @@ def _label_source_images(job, source_ids: list, input_payload: dict) -> dict:
         result.model,
         result.elapsed_seconds,
     )
+
+    # 팔레트는 VLM 이 추정한 #hex 보다 **이미지 픽셀에서 결정적으로 추출**한 값을 우선한다
+    # (VLM 은 정확한 hex 를 못 읽고 drift 함). 컨셉/무드 이미지가 있으면 그걸 디자인 영감으로
+    # 우선 사용하고, 없으면 콘텐츠 이미지에서 추출. 실패하면 VLM 팔레트로 폴백.
+    palette = _deterministic_palette(imgs, result.labels) or (result.palette or {})
+
     return {
         "usable": usable_catalog,
         "mood_notes": result.mood_notes or "",
         "url_by_n": url_by_n,
-        "palette": result.palette or {},
+        "palette": palette,
         "structure": result.structure or {},
         "text_content": result.text_content or {},
     }
+
+
+def _deterministic_palette(imgs: list, labels: dict) -> dict:
+    """업로드 이미지 바이트에서 결정적으로 팔레트 추출 (k-means).
+
+    컨셉(concept) 역할 이미지를 디자인 영감으로 우선, 없으면 사용가능 콘텐츠, 그것도 없으면
+    전체. 각 이미지의 dominant 색을 합쳐 design_settings 역할색(배경/카드/강조)을 추천한다.
+    실패/Pillow 없음 → 빈 dict (호출자가 VLM 팔레트로 폴백).
+    """
+    from .services import color_utils as C
+
+    def _role(im):
+        lab = labels.get(str(im.id))
+        return getattr(lab, "role", "") if lab else ""
+
+    def _usable(im):
+        lab = labels.get(str(im.id))
+        return bool(getattr(lab, "usable", False)) if lab else False
+
+    concept = [im for im in imgs if _role(im) == "concept"]
+    content = [im for im in imgs if _role(im) == "content" and _usable(im)]
+    chosen = concept or content or list(imgs)
+
+    per_image: list[dict] = []
+    for im in chosen[:6]:  # 과한 IO 방지
+        try:
+            with im.file.open("rb") as fh:
+                raw = fh.read()
+        except Exception:  # noqa: BLE001
+            continue
+        dom = C.extract_dominant(raw, k=6)
+        if dom:
+            per_image.append({"dominant_colors": [h for h, _ in dom]})
+
+    if not per_image:
+        return {}
+    return C.merge_palettes(per_image)
+
+
+def _maybe_visual_refine(job, result_data: dict, input_payload: dict, palette: dict) -> dict:
+    """(opt-in) 새-페이지 result_json 을 렌더 스크린샷 비평으로 1~2회 보정.
+
+    새-생성 작업은 아직 페이지가 없으므로, 사용자별 **숨김 프리뷰 페이지**에 후보를 적용하고
+    ``capture_page_snapshot`` 으로 렌더 → 비전 비평 → 디자인 패치를 적용한다. 모든 실패는
+    비치명적 — 원본 result_data 를 그대로 반환한다. (settings.SNAPSHOT_BASE_URL 이 실제 렌더
+    가능한 프론트를 가리켜야 한다.)
+    """
+    import io
+
+    from django.conf import settings as S
+    from PIL import Image
+
+    from apps.pages.models import Page
+    from apps.pages.services.snapshot import capture_page_snapshot
+
+    from .services.page_applier import apply_result_json_to_page
+    from .services.vision_critic import refine_result_json
+
+    try:
+        slug = f"_ai-preview-{job.user_id}"
+        preview, _ = Page.objects.get_or_create(
+            slug=slug,
+            defaults={
+                "user_id": job.user_id,
+                "title": "(AI 미리보기)",
+                "is_public": True,
+                "is_active": True,
+            },
+        )
+        if preview.user_id != job.user_id:
+            return result_data  # 안전: 슬러그 충돌 시 건드리지 않음
+        if not (preview.is_public and preview.is_active):
+            preview.is_public = True
+            preview.is_active = True
+            preview.save(update_fields=["is_public", "is_active"])
+
+        def render_png() -> bytes:
+            snap = capture_page_snapshot(slug)
+            im = Image.open(io.BytesIO(snap.content_file.read())).convert("RGB")
+            buf = io.BytesIO()
+            im.save(buf, "PNG")
+            return buf.getvalue()
+
+        has_imgs = bool((input_payload.get("image_catalog") or {}).get("usable"))
+        refined, rlog = refine_result_json(
+            result_data,
+            render_png=render_png,
+            apply_fn=lambda rj: apply_result_json_to_page(preview, rj),
+            concept=input_payload.get("concept", ""),
+            has_user_images=has_imgs,
+            palette=palette,
+            max_cycles=getattr(S, "AI_VISUAL_REFINE_CYCLES", 1),
+            model=getattr(S, "AI_CRITIC_MODEL", "gemma-4"),
+        )
+        logger.info("AiJob %s 스크린샷 비평 보정: %s", job.id, rlog)
+        return refined
+    except Exception:  # noqa: BLE001
+        logger.warning("AiJob %s 스크린샷 비평 보정 실패 — 원본 유지", job.id, exc_info=True)
+        return result_data
 
 
 # acks_late + reject_on_worker_lost: 워커가 LLM 호출 도중 재시작(warm shutdown)/크래시로
@@ -330,15 +435,71 @@ def run_ai_job(self, job_id: str):
         # ── 4. 이미지 치환 ──────────────────────────
         job.set_stage(AiJob.Stage.RESOLVING_IMAGES, 85, "이미지를 검색하고 있습니다.")
 
+        # 새-페이지 한정: 카테고리 결정 + 빈 이미지 슬롯(빈 cover/avatar/gallery/grid 썸네일)에
+        # {{image:키워드}} 주입. **resolve 이전**에 해야 곧이어 도는 resolve 가 실제 사진으로 채운다.
+        is_new_page = not input_payload.get("_baseline_page_meta")
+        category: str | None = None
+        if is_new_page:
+            from .services.category_profiles import resolve_category
+            from .services.design_guard import enforce_compact_links
+            from .services.image_guard import ensure_image_placeholders
+
+            category = resolve_category(input_payload)
+            # 큰 카드 남발 방지(컴팩트 우선) → 그 다음 빈 이미지 슬롯 보강(최종 레이아웃 기준).
+            result_data = enforce_compact_links(result_data)
+            result_data = ensure_image_placeholders(
+                result_data, category, input_payload.get("concept", "")
+            )
+
         # {{user_image:N}} → 업로드 이미지 URL, {{image:키워드}} → Pixabay (image_catalog 있을 때만 전자)
         user_image_urls = (input_payload.get("image_catalog") or {}).get("url_by_n")
         result_data = resolve_images(result_data, user_image_urls=user_image_urls)
 
+        # ── 4.4.5 이미지 2차 보강(refill) — 새-페이지 한정 ──
+        # 비전 게이트 거부/검색 실패로 빈 슬롯("")이 남으면(아바타 placeholder 아이콘,
+        # 썸네일 빠진 그룹링크, 휑한 갤러리의 주범) **다른 키워드(salt 오프셋)** 로 placeholder
+        # 를 다시 심고 한 번 더 resolve 한다. 추가 비용은 실패 슬롯 수만큼만.
+        if is_new_page and category:
+            result_data = ensure_image_placeholders(
+                result_data, category, input_payload.get("concept", ""), salt=1
+            )
+            result_data = resolve_images(result_data, user_image_urls=user_image_urls)
+
         # ── 4.5 결과 정화 ───────────────────────────
         # LLM 이 만든 가짜 URL("#" 등)은 페이지 검증기에서 거부되어 저장 자체가 400 으로
         # 실패한다. 또 썸네일 없는 그룹링크 grid/carousel 은 빈 이미지 박스로 렌더된다.
-        # 저장 직전에 한 번 정화해 두 문제를 모두 막는다.
-        result_data = sanitize_result_json(result_data)
+        # 긴 텍스트도 통제(청첩장/커미션만 예외). 저장 직전에 한 번 정화해 막는다.
+        long_text_ok = False
+        if is_new_page and category:
+            from .services.category_profiles import is_long_text_category
+
+            long_text_ok = is_long_text_category(category)
+        result_data = sanitize_result_json(
+            result_data, long_text_ok=long_text_ok, drop_fabricated_video=is_new_page
+        )
+
+        # ── 4.6 디자인 가드 (새-페이지 생성 한정) ──────────
+        # 슬롭 보라(#8c25f4) 교체 · WCAG 대비 보정 · muddy 방지 등. 리메이크는 style_patcher
+        # 가 따로 처리하므로 baseline 이 있으면(=리메이크) 건너뛴다.
+        if is_new_page:
+            from .services.design_guard import enforce_design_quality
+
+            palette = (input_payload.get("image_catalog") or {}).get("palette") or {}
+            result_data = enforce_design_quality(result_data, palette=palette)
+
+            # ── 4.7 (opt-in) 스크린샷 비평 보정 루프 ──────────
+            # settings.AI_VISUAL_REFINE 가 켜져 있을 때만. 실패는 비치명적(원본 유지).
+            from django.conf import settings as _settings
+
+            if getattr(_settings, "AI_VISUAL_REFINE", False):
+                job.set_stage(AiJob.Stage.RESOLVING_IMAGES, 90, "디자인을 스크린샷으로 점검 중...")
+                result_data = _maybe_visual_refine(job, result_data, input_payload, palette)
+
+            # 디자인 킷(page custom_css) 주입 — 카드 라운드/그림자/강조/등장 애니메이션 등.
+            # 비주얼 리파인이 custom_css 를 덮을 수 있으므로 **맨 마지막**에 적용.
+            from .services.design_css import enhance_page_css
+
+            result_data = enhance_page_css(result_data, category or "generic")
 
         # ── 5. 완료 + 토큰 차감 ──────────────────────
         job.result_json = result_data

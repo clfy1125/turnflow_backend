@@ -1,0 +1,379 @@
+"""새-페이지 result_json 의 디자인 품질을 코드로 보정(가드).
+
+생성 모델은 (1) 'AI 슬롭' 기본색(보라 #8c25f4), (2) 배경↔카드 명도차 부족(muddy),
+(3) 블록 custom 색의 대비 미달(어두운 카드에 어두운 글씨 → 안 보임) 같은 값을 자주 만든다.
+스키마는 유효해도 **값 품질**은 별개라, 저장 직전에 한 번 보정한다.
+
+프론트 렌더러(``PublicLinkPage.tsx`` / ``useBlockColors.ts``)의 실제 색 결정 로직을
+``color_utils`` 로 포팅해 "렌더 후 보일 색"을 예측하고, WCAG 4.5:1 미달만 최소 침습으로 고친다.
+
+리메이크(full_restyle/style_only)는 ``style_patcher`` 가 따로 처리하므로 건드리지 않는다.
+이 모듈은 **새-페이지 생성 결과 전용**.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from . import color_utils as C
+
+logger = logging.getLogger(__name__)
+
+# WCAG AA — 본문 4.5:1, 큰 글씨 3:1. 보수적으로 본문 기준 사용.
+MIN_CONTRAST = 4.5
+LARGE_MIN_CONTRAST = 3.0
+# 배경↔카드 최소 명도차 (muddy 방지)
+MIN_BG_CARD_SPREAD = 0.05
+
+
+def _get_design_settings(result: dict) -> dict | None:
+    """result_json 에서 design_settings dict 를 찾는다 (data.design_settings 우선)."""
+    data = result.get("data")
+    if isinstance(data, dict) and isinstance(data.get("design_settings"), dict):
+        return data["design_settings"]
+    if isinstance(result.get("design_settings"), dict):
+        return result["design_settings"]
+    return None
+
+
+def _predicted_page_text(bg: str) -> str:
+    """렌더러가 backgroundColor 위에 깔 페이지 텍스트색 (isDarkBg 분기 포팅)."""
+    return "#FFFFFF" if C.contrast_text(bg) == "#FFFFFF" else "#0f172a"
+
+
+def _fix_bg_text_contrast(bg: str) -> str:
+    """배경이 중간톤이라 자동 텍스트색과 대비가 부족하면 배경 명도를 한쪽으로 밀어 보정."""
+    txt = _predicted_page_text(bg)
+    if C.wcag_contrast(bg, txt) >= MIN_CONTRAST:
+        return bg
+    dark_bg = C.contrast_text(bg) == "#FFFFFF"  # 흰 글씨가 깔린다 = 어두운 배경
+    step = -0.05 if dark_bg else 0.05  # 어두운 배경은 더 어둡게, 밝은 배경은 더 밝게
+    cur = bg
+    for _ in range(12):
+        cur = C.adjust_lightness(cur, step)
+        if C.wcag_contrast(cur, _predicted_page_text(cur)) >= MIN_CONTRAST:
+            return cur
+    return cur
+
+
+def _card_defaults(ds: dict) -> tuple[str, str]:
+    """design_settings 기준 카드 기본 (bg, text) 예측 — 블록이 custom 안 줄 때 값."""
+    bg = ds.get("backgroundColor") or C.DEFAULT_BG
+    is_dark = C.contrast_text(bg) == "#FFFFFF"
+    block_bg = (ds.get("blockBgColor") or "").strip()
+    if C.is_hex(block_bg):
+        # 카드 글씨는 blockBgColor 대비로 결정됨(렌더러 포팅)
+        card_text = "#ffffff" if C.contrast_text(block_bg) == "#FFFFFF" else "#111827"
+        return block_bg, card_text
+    # blockBgColor 미설정: 다크면 반투명 흰(거의 흰 글씨), 라이트면 흰 카드(어두운 글씨)
+    if is_dark:
+        return "#2b2b33", "#FFFFFF"  # 반투명 흰 카드 ~ 어두운 톤 근사
+    return "#ffffff", "#0f172a"
+
+
+def enforce_design_quality(result: dict, palette: dict | None = None) -> dict:
+    """새-페이지 result_json 을 in-place 보정하고 같은 객체 반환.
+
+    Args:
+        result: LLM 생성 결과 (data.design_settings + blocks).
+        palette: (선택) 결정적 추출 팔레트 — 슬롭색 교체 시 accent 후보로 사용.
+    """
+    if not isinstance(result, dict):
+        return result
+
+    report: dict[str, int] = {
+        "slop_color_replaced": 0,
+        "frame_bg_filled": 0,
+        "bg_text_fixed": 0,
+        "bg_card_spread_fixed": 0,
+        "block_contrast_fixed": 0,
+        "block_bg_spread_fixed": 0,
+        "pure_black_softened": 0,
+        "hero_image_promoted": 0,
+        "hero_downgraded": 0,
+    }
+
+    ds = _get_design_settings(result)
+    if ds is not None:
+        _guard_design_settings(ds, palette, report)
+
+    blocks = result.get("blocks")
+    if isinstance(blocks, list):
+        _fix_empty_hero(blocks, report)
+        if ds is not None:
+            for b in blocks:
+                if isinstance(b, dict):
+                    _guard_block_colors(b, ds, report)
+
+    if any(report.values()):
+        logger.info("design_guard 보정: %s", {k: v for k, v in report.items() if v})
+    return result
+
+
+def _is_profile(block: dict) -> bool:
+    return block.get("type") == "profile" or (block.get("data") or {}).get("_type") == "profile"
+
+
+# 연락/예약/주문/채널 류 보조 버튼 — 큰 카드로 공간 낭비하면 안 됨. 기본 small.
+_COMPACT_HINTS = (
+    "카카오",
+    "카톡",
+    "kakao",
+    "pf.kakao",
+    "문의",
+    "상담",
+    "예약",
+    "naver.me",
+    "booking",
+    "채널",
+    "신청",
+    "구독",
+    "알림",
+    "디엠",
+    " dm",
+    "dm ",
+    "전화",
+    "톡",
+    "오픈채팅",
+    "송금",
+    "입금",
+    "계좌",
+    "다운로드",
+    "이력서",
+    "resume",
+)
+
+# 페이지의 **주요 전환 CTA** — 비즈니스 직결 소통/전환 창구는 한 줄짜리 컴팩트보다
+# medium(에디터 명칭 '스탠다드')가 적합하다(사용자 피드백: 카톡 문의하기·무료 체험시작).
+# 쇼케이스(large)는 과하고, 첫 매칭 1개만 스탠다드로 승격한다.
+_PRIMARY_CTA_HINTS = (
+    "문의",
+    "상담",
+    "체험",
+    "예약",
+    "주문",
+    "신청",
+    "구매",
+    "시작하기",
+    "시작",
+    "kakao",
+    "카톡",
+    "카카오",
+)
+
+
+def _looks_compact(data: dict) -> bool:
+    text = " ".join(
+        str(data.get(k) or "") for k in ("label", "url", "description", "badge")
+    ).lower()
+    return any(h in text for h in _COMPACT_HINTS)
+
+
+def _looks_primary_cta(data: dict) -> bool:
+    text = str(data.get("label") or "").lower()
+    return any(h in text for h in _PRIMARY_CTA_HINTS)
+
+
+def enforce_compact_links(result: dict, max_showcase: int = 1) -> dict:
+    """링크 카드 크기 정책 보정 — 사용자 핵심 피드백 반영.
+
+    정책 3단계:
+    1. **주요 전환 CTA 1개는 medium(스탠다드)** — 카톡 문의/무료체험/예약 같은 전환 버튼은
+       페이지에서 가장 중요한 소통 창구라 한 줄(small)로 묻히면 안 되고, 쇼케이스(large)는
+       과하다. 문서 순서상 첫 매칭 1개를 medium 으로 승격(이미 large 면 medium 으로 강등).
+    2. 그 외 연락/예약/주문/채널 류 보조 버튼은 small (큰 카드 공간 낭비 금지).
+    3. **상품 카드 medium 은 허용** — 썸네일이나 가격이 있는 medium 은 상품 진열이라
+       여러 개여도 자연스럽다(레퍼런스 @none-21 패턴, 사용자 피드백). 강등하지 않는다.
+    4. 비주얼 쇼케이스(large)와 맨몸 medium(썸네일·가격 없음)은 페이지당
+       ``max_showcase`` 개 — 초과분은 small 로 강등.
+    (group_link 그리드는 상품 진열이라 별개 — 손대지 않는다.)
+    """
+    if not isinstance(result, dict):
+        return result
+    blocks = result.get("blocks")
+    if not isinstance(blocks, list):
+        return result
+
+    report = {"primary_cta_standard": 0, "forced_small_contact": 0, "demoted_excess_showcase": 0}
+    showcase_used = 0
+    primary_used = False
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        d = b.get("data")
+        if not isinstance(d, dict) or d.get("_type") != "single_link":
+            continue
+        layout = d.get("layout")
+
+        # 1) 주요 전환 CTA — 첫 1개를 medium(스탠다드)로. 모델이 CTA 에 붙인 {{image:..}}
+        # 스톡 썸네일은 떼어낸다(카톡 문의에 엉뚱한 제품사진이 붙는 사고 — 텍스트형이 깔끔).
+        # 사용자 업로드({{user_image:N}})나 실제 URL 은 의도가 분명하니 존중.
+        if not primary_used and _looks_primary_cta(d):
+            primary_used = True
+            if layout != "medium":
+                d["layout"] = "medium"
+                report["primary_cta_standard"] += 1
+            thumb = str(d.get("thumbnail_url") or "")
+            if thumb.startswith("{{image:"):
+                d["thumbnail_url"] = ""
+            continue
+
+        if layout not in ("large", "medium"):
+            continue
+        # 2) 보조 연락/예약 류 — small.
+        if _looks_compact(d):
+            d["layout"] = "small"
+            report["forced_small_contact"] += 1
+            continue
+        # 3) 상품성 medium(썸네일 또는 가격 보유)은 진열 카드 — 여러 개 허용.
+        has_thumb = bool(str(d.get("thumbnail_url") or "").strip())
+        has_price = bool(str(d.get("price") or "").strip())
+        if layout == "medium" and (has_thumb or has_price):
+            continue
+        # 4) 쇼케이스 쿼터 (large + 맨몸 medium).
+        if showcase_used < max_showcase:
+            showcase_used += 1  # 첫 쇼케이스는 유지
+        else:
+            d["layout"] = "small"
+            report["demoted_excess_showcase"] += 1
+
+    if any(report.values()):
+        logger.info("compact_links 보정: %s", {k: v for k, v in report.items() if v})
+    return result
+
+
+def _first_body_image(blocks: list, exclude: dict) -> str:
+    """본문 블록들에서 첫 실제(http) 이미지 URL 을 찾는다 (히어로로 승격할 후보).
+
+    갤러리 이미지를 가장 먼저(여러 장 중 1장 빌리는 게 자연스러움), 그다음 썸네일/이미지/링크 썸네일.
+    """
+
+    def _ok(u) -> bool:
+        return isinstance(u, str) and u.strip().startswith("http")
+
+    # 1순위: gallery images
+    for b in blocks:
+        if b is exclude or not isinstance(b, dict):
+            continue
+        imgs = (b.get("data") or {}).get("images")
+        if isinstance(imgs, list):
+            for u in imgs:
+                if _ok(u):
+                    return u.strip()
+    # 2순위: 블록 썸네일/이미지, 그룹링크 항목 썸네일
+    for b in blocks:
+        if b is exclude or not isinstance(b, dict):
+            continue
+        d = b.get("data") or {}
+        for k in ("thumbnail_url", "image_url"):
+            if _ok(d.get(k)):
+                return d[k].strip()
+        links = d.get("links")
+        if isinstance(links, list):
+            for ln in links:
+                if isinstance(ln, dict) and _ok(ln.get("thumbnail_url")):
+                    return ln["thumbnail_url"].strip()
+    return ""
+
+
+def _fix_empty_hero(blocks: list, report: dict) -> None:
+    """profile 이 cover/cover_bg 인데 cover_image_url 이 비면 빈 회색 히어로가 렌더된다.
+
+    → 본문의 실제 이미지를 히어로로 승격하고, 마땅한 이미지가 없으면 레이아웃을 center 로 낮춰
+    빈 커버 플레이스홀더를 없앤다. (텍스트-only 컨셉에서 모델이 cover_bg 만 고르고 이미지를 안
+    채우는 흔한 케이스 방어.)
+    """
+    profile = next((b for b in blocks if isinstance(b, dict) and _is_profile(b)), None)
+    if profile is None:
+        return
+    d = profile.get("data")
+    if not isinstance(d, dict):
+        return
+    layout = d.get("profile_layout") or d.get("layout")
+    if layout not in ("cover", "cover_bg"):
+        return
+    if (d.get("cover_image_url") or "").strip():
+        return  # 이미 커버 있음
+
+    cand = _first_body_image(blocks, exclude=profile)
+    if cand:
+        d["cover_image_url"] = cand
+        report["hero_image_promoted"] += 1
+    else:
+        d["profile_layout"] = "center"
+        report["hero_downgraded"] += 1
+
+
+def _guard_design_settings(ds: dict, palette: dict | None, report: dict) -> None:
+    bg = (ds.get("backgroundColor") or "").strip()
+    if not C.is_hex(bg):
+        bg = C.DEFAULT_BG
+        ds["backgroundColor"] = bg
+
+    # 1) 슬롭 보라 buttonColor 교체 (모델이 안 정했거나 기본 보라면)
+    btn = (ds.get("buttonColor") or "").strip()
+    if not C.is_hex(btn) or btn.lower() == C.SLOP_PURPLE.lower():
+        accent = (palette or {}).get("accent")
+        ds["buttonColor"] = accent if C.is_hex(accent or "") else "#111827"
+        report["slop_color_replaced"] += 1
+
+    # 2) 배경 중간톤 → 자동 페이지 텍스트 대비 보정
+    fixed_bg = _fix_bg_text_contrast(bg)
+    if fixed_bg != bg:
+        ds["backgroundColor"] = fixed_bg
+        bg = fixed_bg
+        report["bg_text_fixed"] += 1
+
+    # 3) frameBackgroundColor 비었으면 backgroundColor 와 동일하게
+    frame = (ds.get("frameBackgroundColor") or "").strip()
+    if not C.is_hex(frame):
+        ds["frameBackgroundColor"] = bg
+        report["frame_bg_filled"] += 1
+
+    # 4) 배경↔카드 명도차 부족(muddy) → 카드 명도 조정
+    card = (ds.get("blockBgColor") or "").strip()
+    if C.is_hex(card):
+        spread = abs(C.lightness(card) - C.lightness(bg))
+        if spread < MIN_BG_CARD_SPREAD:
+            is_dark = C.contrast_text(bg) == "#FFFFFF"
+            # 라이트 배경이면 카드를 더 밝게(흰쪽), 다크면 더 밝게(떠 보이게)
+            ds["blockBgColor"] = C.adjust_lightness(card, 0.07 if not is_dark else 0.06)
+            report["bg_card_spread_fixed"] += 1
+
+
+def _guard_block_colors(block: dict, ds: dict, report: dict) -> None:
+    data = block.get("data")
+    if not isinstance(data, dict):
+        return
+
+    default_card_bg, default_card_text = _card_defaults(ds)
+
+    cb = (data.get("custom_bg_color") or "").strip()
+    ct = (data.get("custom_text_color") or "").strip()
+
+    # 블록 custom 카드색이 페이지 배경에 동화(명도차 부족)되면 카드 경계가 사라져
+    # 단조롭다(사용자 피드백: promo 메뉴 블록색=배경색). 명도를 한쪽으로 밀어 분리.
+    page_bg = (ds.get("backgroundColor") or "").strip()
+    if C.is_hex(cb) and C.is_hex(page_bg):
+        if abs(C.lightness(cb) - C.lightness(page_bg)) < MIN_BG_CARD_SPREAD:
+            is_dark = C.contrast_text(page_bg) == "#FFFFFF"
+            cb = C.adjust_lightness(cb, 0.07 if is_dark else -0.07)
+            data["custom_bg_color"] = cb
+            report["block_bg_spread_fixed"] += 1
+
+    eff_bg = cb if C.is_hex(cb) else default_card_bg
+    eff_text = ct if C.is_hex(ct) else default_card_text
+
+    # 순수 검정 글씨는 부드럽게
+    if C.is_hex(ct) and ct.lower() in ("#000", "#000000"):
+        data["custom_text_color"] = C.SOFT_BLACK
+        ct = C.SOFT_BLACK
+        eff_text = C.SOFT_BLACK
+        report["pure_black_softened"] += 1
+
+    # 카드 글씨 대비 미달 → 글씨색을 카드 대비로 강제(가장 안전)
+    if C.wcag_contrast(eff_bg, eff_text) < MIN_CONTRAST:
+        data["custom_text_color"] = C.contrast_text(eff_bg)
+        report["block_contrast_fixed"] += 1
+
+    # 버튼색 대비는 렌더러가 자동(contrast_text(buttonColor))이라 안전 — 손대지 않음.

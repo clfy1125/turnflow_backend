@@ -49,3 +49,10 @@ EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
 # CELERY_TASK_ALWAYS_EAGER = True
 # CELERY_TASK_EAGER_PROPAGATES = True
 DATABASES["default"]["CONN_MAX_AGE"] = 0
+
+# 리버스 프록시(Cloudflare Tunnel / ngrok) 뒤에서 dev 서버에 접속할 때:
+# 엣지가 TLS 를 종단하고 origin 으로는 평문 HTTP 로 전달하므로, X-Forwarded-Proto 를 신뢰해야
+# request.is_secure()/scheme 이 https 로 잡힌다. (없으면 https 로 연 Swagger/Browsable API 의
+# 절대 URL 이 http 로 생성돼 mixed-content/CSRF 문제 발생.) 직접 localhost:8000 접속엔 이 헤더가
+# 없어 영향 없음. prod.py 는 이미 동일 설정 보유. dev 박스라 헤더 스푸핑 위험은 무시 가능.
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")

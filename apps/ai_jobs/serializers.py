@@ -35,6 +35,20 @@ class AiJobCreateSerializer(serializers.Serializer):
             "기존에 없던 시각 속성(예: 테두리)도 임의로 추가하지 않음."
         ),
     )
+    category = serializers.CharField(
+        max_length=40,
+        required=False,
+        allow_blank=True,
+        default="",
+        help_text=(
+            "페이지 카테고리 (새 페이지 생성 시 — **명시 권장**). 카테고리별 전용 레시피"
+            "(섹션 구성·카피 톤·이미지 전략·디자인 변형)가 적용되어 품질이 크게 올라간다. "
+            "허용값: `GET /api/v1/ai/categories/` 의 슬러그(`profile-link`/`digital-card`/`landing`/"
+            "`portfolio`/`brochure`/`space-booking`/`group-buy`/`invitation`/`affiliate`/"
+            "`commission`/`promotion`) 또는 내부 키(`profile`/`bizcard`/`rental`/`groupbuy`/`promo` 등). "
+            "비우면 concept 문구에서 자동 추론. 리메이크(slug 전달)에서는 무시."
+        ),
+    )
     reference_page_slug = serializers.SlugField(
         max_length=120,
         required=False,
@@ -44,7 +58,8 @@ class AiJobCreateSerializer(serializers.Serializer):
             "Few-shot 예시로 사용할 어드민이 큐레이션한 레퍼런스 페이지의 slug. "
             "전달 시 해당 페이지(is_reference=True, is_public=True)의 design_settings/블록 구조를 "
             "AI 에게 디자인 톤 참고 예시로 제공한다. "
-            "비어 있으면 기본 파일 예시 폴백."
+            "비어 있으면 카테고리 기본 레퍼런스(예: invitation → @wedding)로 자동 폴백, "
+            "그것도 없으면 기본 파일 예시."
         ),
     )
     image_ids = serializers.ListField(
@@ -60,6 +75,22 @@ class AiJobCreateSerializer(serializers.Serializer):
     )
 
     def validate(self, data):
+        cat = (data.get("category") or "").strip()
+        if cat:
+            from .services.category_profiles import normalize_category
+
+            normalized = normalize_category(cat)
+            if not normalized:
+                raise serializers.ValidationError(
+                    {
+                        "category": (
+                            "알 수 없는 카테고리입니다. GET /api/v1/ai/categories/ 의 "
+                            "슬러그 중 하나를 보내세요."
+                        )
+                    }
+                )
+            data["category"] = normalized
+
         ref_slug = (data.get("reference_page_slug") or "").strip()
         if ref_slug:
             exists = Page.objects.filter(

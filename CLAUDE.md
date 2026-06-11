@@ -304,9 +304,11 @@ make test-cov                             # HTML 커버리지 리포트
 저장소 내 문서:
 - `프로젝트 지침서.md` — 제품 요구사항 원본 (이 파일의 상위)
 - `README.md` — 일반 개발자용 셋업 가이드
+- `AI_PAGE_GENERATION_GUIDE.md` — AI 페이지 생성 API 프론트엔드 연동 가이드 (4단계 흐름 + category 파라미터)
 - `INSTAGRAM_OAUTH_FLOW.md` — IG OAuth 플로우
 - `INSTAGRAM_TEST_GUIDE.md` — IG 테스트 가이드
-- `NGROK_INSTAGRAM_SETUP.md` — ngrok로 IG 콜백 받는 법
+- `CLOUDFLARE_TUNNEL_SETUP.md` — 개발 서버 공개(고정 URL `dev-api.turnflow.link`) Cloudflare Tunnel 셋업 (ngrok 대체)
+- `NGROK_INSTAGRAM_SETUP.md` — ngrok로 IG 콜백 받는 법 (Cloudflare Tunnel 로 이전 권장)
 - `STEP1~5_COMPLETION.md` — 단계별 완료 보고서
 - `개인정보처리방침_변호사_전달자료.md`, `이용약관_변호사_전달자료.md` — 법무 자료 (수정 금지, 요청 시에만)
 - `api-mcp/README.md` — 사내 API 문서 검색 MCP 서버

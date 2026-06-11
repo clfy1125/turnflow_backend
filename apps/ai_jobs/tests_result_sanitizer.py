@@ -9,14 +9,16 @@
 
 from __future__ import annotations
 
-from .services.result_sanitizer import sanitize_result_json
+from .services.result_sanitizer import _LINK_URL_PLACEHOLDER, sanitize_result_json
 
 
 class TestUrlCleaning:
-    def test_hash_url_becomes_empty(self):
+    def test_hash_url_on_single_link_filled_with_placeholder(self):
+        # single_link 의 "#"은 정화로 ""가 되지만, 빈 url single_link 는 프론트가 렌더를
+        # 스킵하므로 placeholder 로 채워 최소한 보이게 한다.
         data = {"blocks": [{"type": "single_link", "data": {"_type": "single_link", "url": "#"}}]}
         out = sanitize_result_json(data)
-        assert out["blocks"][0]["data"]["url"] == ""
+        assert out["blocks"][0]["data"]["url"] == _LINK_URL_PLACEHOLDER
 
     def test_valid_https_url_preserved(self):
         data = {"blocks": [{"data": {"url": "https://example.com/x"}}]}
@@ -60,6 +62,7 @@ class TestUrlCleaning:
         assert links[1]["url"] == "https://ok.com"
 
     def test_empty_string_stays_empty(self):
+        # _type 없는(순수 single_link 아님) 블록은 채우지 않음.
         data = {"blocks": [{"data": {"url": ""}}]}
         out = sanitize_result_json(data)
         assert out["blocks"][0]["data"]["url"] == ""
@@ -68,6 +71,35 @@ class TestUrlCleaning:
         data = {"blocks": [{"data": {"url": None}}]}
         out = sanitize_result_json(data)
         assert out["blocks"][0]["data"]["url"] is None
+
+
+class TestSingleLinkUrlFill:
+    def test_empty_single_link_url_filled(self):
+        data = {"blocks": [{"type": "single_link", "data": {"_type": "single_link", "url": ""}}]}
+        out = sanitize_result_json(data)
+        assert out["blocks"][0]["data"]["url"] == _LINK_URL_PLACEHOLDER
+
+    def test_missing_single_link_url_filled(self):
+        data = {"blocks": [{"type": "single_link", "data": {"_type": "single_link"}}]}
+        out = sanitize_result_json(data)
+        assert out["blocks"][0]["data"]["url"] == _LINK_URL_PLACEHOLDER
+
+    def test_valid_single_link_url_preserved(self):
+        data = {
+            "blocks": [
+                {"type": "single_link", "data": {"_type": "single_link", "url": "https://ok.com"}}
+            ]
+        }
+        out = sanitize_result_json(data)
+        assert out["blocks"][0]["data"]["url"] == "https://ok.com"
+
+    def test_non_single_link_subtypes_not_filled(self):
+        # social/video/text 등은 url 을 다르게 쓰므로 채우지 않는다.
+        # (gallery 는 빈 이미지면 블록째 제거되므로 별도 테스트에서 다룬다.)
+        for sub in ("social", "video", "text", "spacer", "map"):
+            data = {"blocks": [{"type": "single_link", "data": {"_type": sub}}]}
+            out = sanitize_result_json(data)
+            assert "url" not in out["blocks"][0]["data"] or not out["blocks"][0]["data"].get("url")
 
 
 class TestNonUrlFieldsUntouched:
@@ -207,6 +239,191 @@ class TestGroupLayoutDowngrade:
         assert d["group_layout"] == "list"
 
 
+class TestTextCap:
+    def _text(self, content, headline="", layout="plain"):
+        d = {"_type": "text", "content": content, "text_layout": layout}
+        if headline:
+            d["headline"] = headline
+        return {"blocks": [{"type": "single_link", "data": d}]}
+
+    def test_long_text_with_headline_collapsed_to_toggle(self):
+        out = sanitize_result_json(self._text("가" * 200, headline="안내"))
+        assert out["blocks"][0]["data"]["text_layout"] == "toggle"
+        # 내용은 보존(접기만)
+        assert len(out["blocks"][0]["data"]["content"]) == 200
+
+    def test_long_text_without_headline_trimmed(self):
+        out = sanitize_result_json(self._text("가" * 200))
+        c = out["blocks"][0]["data"]["content"]
+        assert len(c) < 200 and c.endswith("…")
+
+    def test_short_text_untouched(self):
+        out = sanitize_result_json(self._text("짧은 한 줄 소개입니다.", headline="소개"))
+        assert out["blocks"][0]["data"]["text_layout"] == "plain"
+        assert out["blocks"][0]["data"]["content"] == "짧은 한 줄 소개입니다."
+
+    def test_long_text_ok_preserves_layout(self):
+        # 청첩장/커미션: 긴 문단 허용 → 접지도 자르지도 않음.
+        out = sanitize_result_json(self._text("가" * 300, headline="인사말"), long_text_ok=True)
+        assert out["blocks"][0]["data"]["text_layout"] == "plain"
+        assert len(out["blocks"][0]["data"]["content"]) == 300
+
+    def test_subline_capped(self):
+        data = {"blocks": [{"type": "profile", "data": {"subline": "소" * 80, "headline": "이름"}}]}
+        out = sanitize_result_json(data)
+        assert len(out["blocks"][0]["data"]["subline"]) <= 46
+
+    def test_hard_max_even_when_long_ok(self):
+        out = sanitize_result_json(self._text("가" * 900, headline="x"), long_text_ok=True)
+        assert len(out["blocks"][0]["data"]["content"]) <= 801
+
+
+class TestVideoDrop:
+    def test_video_dropped_when_flag_set(self):
+        data = {
+            "blocks": [
+                {"type": "single_link", "data": {"_type": "text", "content": "hi"}},
+                {
+                    "type": "single_link",
+                    "data": {
+                        "_type": "video",
+                        "video_urls": ["https://youtube.com/watch?v=example"],
+                    },
+                },
+            ]
+        }
+        out = sanitize_result_json(data, drop_fabricated_video=True)
+        subs = [(b.get("data") or {}).get("_type") for b in out["blocks"]]
+        assert "video" not in subs
+        assert "text" in subs
+
+    def test_video_kept_by_default(self):
+        data = {
+            "blocks": [{"type": "single_link", "data": {"_type": "video", "video_urls": ["x"]}}]
+        }
+        out = sanitize_result_json(data)
+        assert (out["blocks"][0]["data"]).get("_type") == "video"
+
+
+class TestLayoutNormalize:
+    def test_gallery_carousel_to_thumbnail(self):
+        data = {
+            "blocks": [
+                {
+                    "type": "single_link",
+                    "data": {
+                        "_type": "gallery",
+                        "gallery_layout": "carousel",
+                        "images": ["https://a/1.jpg", "https://a/2.jpg", "https://a/3.jpg"],
+                    },
+                }
+            ]
+        }
+        out = sanitize_result_json(data)
+        assert out["blocks"][0]["data"]["gallery_layout"] == "thumbnail"
+
+    def test_single_image_gallery_kept(self):
+        data = {
+            "blocks": [
+                {
+                    "type": "single_link",
+                    "data": {
+                        "_type": "gallery",
+                        "gallery_layout": "single",
+                        "images": ["https://a/1.jpg"],
+                    },
+                }
+            ]
+        }
+        out = sanitize_result_json(data)
+        assert out["blocks"][0]["data"]["gallery_layout"] == "single"
+
+    def test_group_carousel_with_thumbs_to_grid2(self):
+        data = {
+            "blocks": [
+                {
+                    "type": "single_link",
+                    "data": {
+                        "_type": "group_link",
+                        "group_layout": "carousel-1",
+                        "links": [
+                            {
+                                "url": "https://a",
+                                "thumbnail_url": "https://a/t.jpg",
+                                "is_enabled": True,
+                            },
+                            {
+                                "url": "https://b",
+                                "thumbnail_url": "https://b/t.jpg",
+                                "is_enabled": True,
+                            },
+                        ],
+                    },
+                }
+            ]
+        }
+        out = sanitize_result_json(data)
+        assert out["blocks"][0]["data"]["group_layout"] == "grid-2"
+
+    def test_group_carousel_without_thumbs_to_list(self):
+        data = {
+            "blocks": [
+                {
+                    "type": "single_link",
+                    "data": {
+                        "_type": "group_link",
+                        "group_layout": "carousel-2",
+                        "links": [
+                            {"url": "https://a", "is_enabled": True},
+                        ],
+                    },
+                }
+            ]
+        }
+        out = sanitize_result_json(data)
+        assert out["blocks"][0]["data"]["group_layout"] == "list"
+
+    def test_empty_gallery_dropped(self):
+        data = {
+            "blocks": [
+                {"type": "single_link", "data": {"_type": "text", "content": "x"}},
+                {"type": "single_link", "data": {"_type": "gallery", "images": ["", "#"]}},
+            ]
+        }
+        out = sanitize_result_json(data)
+        subs = [(b.get("data") or {}).get("_type") for b in out["blocks"]]
+        assert "gallery" not in subs and "text" in subs
+
+    def test_gallery_with_valid_image_kept(self):
+        data = {
+            "blocks": [
+                {
+                    "type": "single_link",
+                    "data": {"_type": "gallery", "images": ["https://a/1.jpg", ""]},
+                }
+            ]
+        }
+        out = sanitize_result_json(data)
+        assert (out["blocks"][0]["data"]).get("_type") == "gallery"
+
+    def test_imageless_large_card_demoted_to_small(self):
+        data = {
+            "blocks": [
+                {
+                    "type": "single_link",
+                    "data": {
+                        "_type": "single_link",
+                        "layout": "large",
+                        "thumbnail_url": "",
+                        "url": "https://x.com",
+                    },
+                }
+            ]
+        }
+        out = sanitize_result_json(data)
+        assert out["blocks"][0]["data"]["layout"] == "small"
+
+
 class TestRobustness:
     def test_non_dict_returned_as_is(self):
         assert sanitize_result_json(None) is None
@@ -230,7 +447,9 @@ class TestRobustness:
             ],
         }
         out = sanitize_result_json(data)
-        assert out["blocks"][0]["data"]["url"] == ""
-        assert out["blocks"][1]["data"]["url"] == ""
+        # 순수 single_link 두 개는 placeholder 로 채워져 렌더 가능해진다.
+        assert out["blocks"][0]["data"]["url"] == _LINK_URL_PLACEHOLDER
+        assert out["blocks"][1]["data"]["url"] == _LINK_URL_PLACEHOLDER
+        # group_link 내부 링크는 채우지 않음(빈 항목은 렌더 시 자연 처리) → 그대로 "".
         assert out["blocks"][2]["data"]["links"][0]["url"] == ""
         assert out["blocks"][2]["data"]["group_layout"] == "list"

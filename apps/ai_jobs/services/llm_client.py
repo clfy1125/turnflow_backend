@@ -200,7 +200,7 @@ def call_llm(
     model: str,
     system_prompt: str,
     user_prompt: str,
-    max_tokens: int = 8000,
+    max_tokens: int = 12000,
     temperature: float = 0.2,
 ) -> str:
     """
@@ -258,7 +258,7 @@ def call_llm_with_usage(
     model: str,
     system_prompt: str,
     user_prompt: str,
-    max_tokens: int = 8000,
+    max_tokens: int = 12000,
     temperature: float = 0.2,
 ) -> LlmCallResult:
     """

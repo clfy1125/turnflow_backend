@@ -296,6 +296,7 @@ class Block(models.Model):
 # 통계 모델
 # ─────────────────────────────────────────────────────────────
 
+
 class PageView(models.Model):
     """공개 페이지 조회 이벤트. 방문자가 페이지를 열 때 1건 기록."""
 
@@ -379,6 +380,7 @@ class BlockClick(models.Model):
 # 문의 모델
 # ─────────────────────────────────────────────────────────────
 
+
 class ContactInquiry(models.Model):
     """페이지 방문자가 페이지 관리자에게 보내는 문의."""
 
@@ -440,6 +442,7 @@ class ContactInquiry(models.Model):
 # 구독 모델
 # ─────────────────────────────────────────────────────────────
 
+
 class PageSubscription(models.Model):
     """페이지 방문자가 페이지 관리자의 구독 폼을 통해 등록하는 구독자."""
 
@@ -498,6 +501,7 @@ class PageSubscription(models.Model):
 # ─────────────────────────────────────────────────────────────
 # 미디어 파일 모델
 # ─────────────────────────────────────────────────────────────
+
 
 class PageMedia(models.Model):
     """페이지 관리자가 업로드한 이미지/파일. block.data 의 URL 필드에서 참조."""
@@ -559,20 +563,32 @@ class PageMedia(models.Model):
 # 페이지 스냅샷 (AI 편집 롤백용)
 # ─────────────────────────────────────────────────────────────
 
+
 class PageSnapshot(models.Model):
-    """AI 편집의 원본 ↔ 최신 작업물 토글을 위한 2슬롯 스냅샷.
+    """AI 편집/복원 이력을 담는 페이지 변경 기록 (bounded history).
 
-    페이지당 다음 두 reason 슬롯이 각각 최대 1건씩 존재한다:
-      - ``AI_EDIT`` — AI 첫 호출 직전의 원본. 한 번 생성되면 영구 유지.
-      - ``LATEST_AI_RESULT`` — 가장 최근 AI 편집 직후의 결과. AI 호출마다 upsert.
+    페이지당 여러 건이 시간순으로 쌓이며, ``apps.pages.aiviews`` 의 헬퍼들이
+    다음 시점마다 한 건씩 INSERT 한다 (덮어쓰기 X):
+      - ``AI_EDIT`` — AI 첫 호출 직전의 원본. 페이지당 한 번만 생성되고 영구 유지
+        (트리밍 대상에서 제외 = 항상 맨 처음으로 되돌릴 수 있는 앵커).
+      - ``AI_RESULT`` — AI 편집(1-shot 적용) 직후의 작업물. AI 적용마다 새로 쌓인다.
+      - ``RESTORE`` — 스냅샷 복원 직전의 라이브 상태. 복원으로 덮어쓰기 전에 보관해
+        "롤백의 롤백" 을 가능하게 한다.
 
-    사용자는 두 스냅샷 사이를 자유롭게 ``restore`` 로 왔다갔다 할 수 있고,
-    restore 는 어느 쪽도 지우지 않는다.
+    보관 한도는 ``aiviews.MAX_SNAPSHOTS_PER_PAGE`` (기본 10) — 초과 시 오래된 것부터
+    삭제하되 원본(``AI_EDIT``)과 현재 활성 스냅샷(``Page.current_snapshot``)은 보존.
+    페이지 삭제 시 CASCADE.
+
+    ``LATEST_AI_RESULT`` 는 0022 이전 데이터의 reason 값으로 남아 있을 수 있어
+    choices 에 유지한다 (신규 생성은 ``AI_RESULT`` 사용).
     """
 
     class Reason(models.TextChoices):
         AI_EDIT = "ai_edit", "AI 편집 직전 원본"
-        LATEST_AI_RESULT = "latest_ai_result", "최신 AI 작업물"
+        AI_RESULT = "ai_result", "AI 작업물"
+        RESTORE = "restore", "복원 직전 상태"
+        # 레거시 — 0022 이전에 생성된 단일 슬롯 작업물. 신규 생성 금지, 표시/복원만.
+        LATEST_AI_RESULT = "latest_ai_result", "AI 작업물"
 
     page = models.ForeignKey(
         Page,
@@ -590,8 +606,8 @@ class PageSnapshot(models.Model):
         verbose_name="스냅샷 데이터",
         help_text=(
             "페이지 + 블록 전체 상태. 스키마: "
-            "{\"page\": {title, is_public, data, custom_css}, "
-            "\"blocks\": [{id, type, order, is_enabled, data, custom_css, "
+            '{"page": {title, is_public, data, custom_css}, '
+            '"blocks": [{id, type, order, is_enabled, data, custom_css, '
             "schedule_enabled, publish_at, hide_at}, ...]}"
         ),
     )
@@ -610,8 +626,8 @@ class PageSnapshot(models.Model):
         verbose_name = "페이지 스냅샷"
         verbose_name_plural = "페이지 스냅샷 목록"
         ordering = ["-created_at"]
-        # 페이지당 reason 별 최대 1건 — 원본 슬롯과 최신 작업물 슬롯 보장
-        unique_together = [("page", "reason")]
+        # bounded history — 페이지당 여러 건이 시간순으로 쌓인다. (reason 별 unique 아님:
+        # 0016 에서 넣었던 (page, reason) unique 는 0022 에서 제거 = 이력 보관 가능.)
         indexes = [
             models.Index(fields=["page", "-created_at"]),
         ]
@@ -623,6 +639,7 @@ class PageSnapshot(models.Model):
 # ─────────────────────────────────────────────────────────────
 # AI 레퍼런스 카테고리
 # ─────────────────────────────────────────────────────────────
+
 
 class ReferenceCategory(models.Model):
     """AI 페이지 생성 시 사용자가 선택할 수 있는 레퍼런스 카테고리.

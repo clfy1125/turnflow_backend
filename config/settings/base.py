@@ -4,7 +4,6 @@ Django settings for Instagram Service Backend project.
 Base settings - shared across all environments.
 """
 
-import os
 from pathlib import Path
 
 from celery.schedules import crontab
@@ -167,8 +166,8 @@ if USE_R2:
                 "region_name": "auto",
                 "signature_version": "s3v4",
                 "addressing_style": "path",
-                "default_acl": None,            # R2는 ACL 미지원
-                "querystring_auth": False,      # 퍼블릭 버킷 → 서명 URL 불필요
+                "default_acl": None,  # R2는 ACL 미지원
+                "querystring_auth": False,  # 퍼블릭 버킷 → 서명 URL 불필요
                 "file_overwrite": False,
                 "custom_domain": _R2_PUBLIC_DOMAIN,
             },
@@ -549,6 +548,21 @@ FRONTEND_URL = config("FRONTEND_URL", default="http://localhost:3000")
 # 실서버: https://turnflow.link, 개발: ngrok 도메인.
 # 미지정 시 FRONTEND_URL 로 폴백.
 SNAPSHOT_BASE_URL = config("SNAPSHOT_BASE_URL", default=FRONTEND_URL)
+
+# ── AI 페이지 생성 — 스크린샷 비평 보정 루프 ──────────────────────
+# True 면 새-페이지 생성 후 렌더 스크린샷을 비전 모델로 비평해 디자인(색/CSS)을 1~2회 보정한다.
+# 기본 ON. 단 렌더+비전 호출로 페이지당 +20~40s 지연이 있으니, 지연이 부담되면(또는 운영에서
+# 프리미엄 티어 한정으로 쓰려면) AI_VISUAL_REFINE=False 로 끌 수 있다. 켜려면 SNAPSHOT_BASE_URL
+# 이 실제 렌더 가능한 프론트(예: app.turnflow.link)를 가리켜야 한다.
+AI_VISUAL_REFINE = config("AI_VISUAL_REFINE", default=True, cast=bool)
+AI_VISUAL_REFINE_CYCLES = config("AI_VISUAL_REFINE_CYCLES", default=1, cast=int)
+# 비평기 모델 — 생성기와 다른 독립 모델 권장(비전 필수). 무료 자체호스팅 gemma-4 기본.
+AI_CRITIC_MODEL = config("AI_CRITIC_MODEL", default="gemma-4")
+
+# 이미지 관련도 게이트: Pixabay 후보 N장을 비전 모델에 보여 키워드에 맞는 1장을 고르거나(없으면 거부→
+# 중립 placeholder). 키워드와 무관한 스톡(말벌·풍경·엉뚱한 사물)이 박히는 문제 차단. 키워드당 비전 1콜.
+AI_IMAGE_VLM_RERANK = config("AI_IMAGE_VLM_RERANK", default=True, cast=bool)
+AI_IMAGE_VLM_MODEL = config("AI_IMAGE_VLM_MODEL", default="gemma-4")
 
 # Service metadata (used as default email template variables)
 SERVICE_NAME = config("SERVICE_NAME", default="TurnFlow")

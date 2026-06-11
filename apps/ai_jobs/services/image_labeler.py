@@ -135,26 +135,30 @@ def _image_url_block(img: dict) -> dict | None:
     """이미지 한 장을 OpenAI ``image_url`` content 블록으로 변환.
 
     img: {"id", "url", "storage_name", "mime"}
-    공개 http(s) URL 이면 패스스루, 아니면 스토리지에서 바이트를 읽어 base64 data-URI.
+
+    **base64 우선** — 자체호스팅 vLLM(gemma-4)은 image_url 의 원격 URL 을 호스트에 따라
+    fetch 못 하기도 한다(R2/Pixabay 는 OK, wikimedia 등은 NO_IMAGE). base64 data-URI 는
+    호스트 의존이 없고 서버 fetch 왕복도 없어 더 빠르고 견고하다(이미지 토큰은 크기 무관 고정).
+    스토리지 읽기에 실패할 때만 공개 http(s) URL 패스스루로 폴백한다.
     실패하면 None (해당 이미지는 비전 입력에서 빠지지만 텍스트로는 남는다).
     """
+    storage_name = img.get("storage_name") or ""
+    if storage_name:
+        try:
+            with default_storage.open(storage_name, "rb") as fh:
+                raw = fh.read()
+            mime = img.get("mime") or "image/jpeg"
+            b64 = base64.b64encode(raw).decode("ascii")
+            return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "라벨링: 스토리지 읽기 실패 (%s): %s → URL 패스스루 폴백", storage_name, exc
+            )
+
     url = (img.get("url") or "").strip()
     if url.startswith("http"):
         return {"type": "image_url", "image_url": {"url": url}}
-
-    # 로컬/비공개 — base64 data-URI 폴백
-    storage_name = img.get("storage_name") or ""
-    if not storage_name:
-        return None
-    try:
-        with default_storage.open(storage_name, "rb") as fh:
-            raw = fh.read()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("라벨링: 이미지 바이트 읽기 실패 (%s): %s", storage_name, exc)
-        return None
-    mime = img.get("mime") or "image/jpeg"
-    b64 = base64.b64encode(raw).decode("ascii")
-    return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
+    return None
 
 
 def _build_messages(images: list[dict], concept: str) -> tuple[list[dict], int]:
