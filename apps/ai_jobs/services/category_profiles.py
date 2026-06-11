@@ -44,9 +44,12 @@ CATEGORY_PROFILES: dict[str, dict] = {
             "프로필 헤더(center/left 아바타 + 닉네임 + 한 줄 소개)",
             "SNS 아이콘 줄(인스타/유튜브/틱톡)",
             "고정 공지 배너(진행 중 이벤트/공구)",
+            "검색 블록(search — 콘텐츠가 많은 페이지라 필수, 공지 바로 아래)",
             "대표 CTA 1개(가장 밀고 싶은 링크 — small)",
             "인기 콘텐츠 갤러리(gallery thumbnail — 6장 이상)",
-            "카테고리별 묶음 링크(group_link list, small)",
+            "**콘텐츠 카테고리 묶음 — folder(toggle) 사용**: '🎬 콘텐츠 모아보기' folder 안에 "
+            "임시 id 를 단 single_link 들을 child_block_ids 로 묶어라(공통 규칙 12 예시 참조). "
+            "묶을 게 2~3개뿐이면 group_link list 로 대체 가능",
             "추천템/공구 링크(small 여러 개)",
             "협업·협찬 문의 폼(customer/inquiry — small)",
         ],
@@ -291,8 +294,9 @@ CATEGORY_PROFILES: dict[str, dict] = {
         "sections": [
             "상품 대표사진 히어로(cover_bg) + 공구 타이틀",
             "할인 강조 배너(notice: 정가→공구가, 할인율)",
-            "마감 D-day + 이번 주 공구 일정(text — '⏰ 6/15(월) OPEN → 6/18(목) 마감 → "
-            "6/22(월) 일괄 배송' 처럼 일정 흐름을 줄로: 일정 관리해주는 공구 페이지 느낌)",
+            '**공구 일정 — schedule 블록 필수**(`_type:"schedule"`, `schedule_layout:"list"`): '
+            "OPEN/마감/배송을 schedule_items 항목으로(각각 title·start_date·end_date, 컨셉의 실제 "
+            "날짜만 — D-day 뱃지가 자동으로 붙는다). calendar 레이아웃 금지",
             "주문 CTA(네이버폼/스마트스토어 — **medium 스탠다드**: 핵심 전환 버튼)",
             "**코너별 진열**: '🔥 이번 공구 BEST' 같은 이모지 섹션 헤더(text default) 아래 "
             "대표 상품 single_link medium 2~3개(썸네일+가격+취소선) → spacer 구분선 → 다음 코너. "
@@ -399,7 +403,9 @@ CATEGORY_PROFILES: dict[str, dict] = {
             "추천 상품을 **작은 링크 여러 개로**: group_link `list`/`grid-2` — **모든 항목 "
             "thumbnail_url 필수**(상품 사진이 보여야 구매한다). single_link `small`(썸네일 포함) 다수. "
             "구매 사이트는 작은 링크를 많이 보여주는 게 정석 — 큰 카드 남발 금지.",
-            "카테고리 구분(스킨케어/메이크업/헤어) — group_link(항목 썸네일 필수)",
+            "카테고리 구분(스킨케어/메이크업/헤어) — 코너가 3개 이상이니 **각 코너를 "
+            "folder(toggle)** 로 묶어라(하위 상품 블록들에 임시 id → child_block_ids 참조, "
+            "공통 규칙 12 예시). folder 라벨 예: '🧴 스킨케어 추천 모아보기'",
             "이달의 강조 1개(single_link large + thumbnail — **딱 하나만**, 이벤트/특가 상품)",
             "내돈내산 후기(text toggle 1개 — 아이디 ★ 한줄평 5~6개)",
         ],
@@ -747,15 +753,23 @@ def build_recipe_prompt(category: str, include_mood: bool = True) -> str:
         "🌙 심야 12,000원/시간'). 빈 줄로 문단을 나누고, headline 에 핵심을 담아라."
     )
     lines.append(
-        "12. **유틸리티 블록도 적재적소에** (쓸 이유가 있을 때만 — 억지 금지):\n"
+        "12. **유틸리티 블록 활용 (섹션에 명시된 카테고리는 필수)**:\n"
         "    - **search**: 블록이 16개 이상으로 길어지면 profile(과 notice) 바로 아래에 검색 블록 "
         '1개(`_type:"search"`, search_placeholder 는 페이지 성격에 맞게).\n'
-        "    - **folder**: 같은 성격의 링크/코너가 4개 이상이면 folder(toggle)로 묶어 깔끔하게 — "
-        "하위 블록들에 임시 정수 `id`(예: 101, 102)를 주고 folder 의 `child_block_ids: [101,102]` 로 "
-        "참조하라(백엔드가 실제 ID 로 재매핑). 라벨은 '📚 전체 메뉴 보기' 처럼 내용을 약속하게.\n"
+        "    - **folder**: 같은 성격의 링크/코너가 3개 이상이면 folder(toggle)로 묶어라. "
+        "**작성법(이 형식을 그대로)** — 하위 블록들에 임시 정수 id 를 달고 folder 가 참조:\n"
+        '      {"id": 901, "type": "single_link", "order": 5, "data": {"_type": "single_link", '
+        '"label": "수분 크림", "url": "https://...", "thumbnail_url": "{{image:moisturizer jar}}"}}\n'
+        '      {"id": 902, "type": "single_link", "order": 6, "data": {"_type": "single_link", '
+        '"label": "토너", "url": "https://...", "thumbnail_url": "{{image:toner bottle}}"}}\n'
+        '      {"type": "single_link", "order": 7, "data": {"_type": "folder", '
+        '"label": "🧴 스킨케어 모아보기", "child_block_ids": [901, 902], '
+        '"folder_display_mode": "toggle", "is_collapsed_default": false}}\n'
+        "      (백엔드가 임시 id 를 실제 ID 로 재매핑하고, 하위 블록은 폴더 안에만 렌더된다.)\n"
         "    - **schedule**: 공구 일정·행사·오픈 일정처럼 **실제 날짜가 컨셉에 있으면** schedule 블록 "
-        '사용 가능. 단 **`schedule_layout:"list"` 만**(calendar 는 현재 달만 보여 미래 일정이 '
-        "가려진다). 날짜는 컨셉에 적힌 실제 날짜만 — 임의 창작 금지."
+        '사용(`schedule_layout:"list"` 만 — calendar 는 현재 달만 보여 미래 일정이 가려진다). '
+        'schedule_items 항목 형식: {"id": "uuid", "title": "공구 OPEN", "start_date": "2026-06-15", '
+        '"end_date": "2026-06-15"}. 날짜는 컨셉에 적힌 실제 날짜만 — 임의 창작 금지.'
     )
     lines.append("")
     return "\n".join(lines)
