@@ -297,3 +297,37 @@ class TestPlainTextPageBgContrast:
         bd = out["blocks"][0]["data"]
         eff_text = bd.get("custom_text_color") or "#111827"
         assert C.wcag_contrast("#1f2430", eff_text) >= 4.5
+
+
+class TestPalettePin:
+    def test_model_drift_snapped_back(self):
+        # 시안 로열바이올렛(#3b18e0)인데 모델이 검은 네이비로 민 사고(2026-06-11) — 핀으로 복원.
+        r = {
+            "data": {
+                "design_settings": {
+                    "backgroundColor": "#1A1A2E",
+                    "blockBgColor": "#4f2ee9",
+                    "buttonColor": "#FFD700",
+                }
+            },
+            "blocks": [],
+        }
+        pal = {"background": "#3b18e0", "surface": "#3b18e0", "accent": "#FFD700"}
+        out = enforce_design_quality(r, palette=pal, pin_palette=True)
+        ds = out["data"]["design_settings"]
+        assert ds["backgroundColor"] == "#3b18e0"
+        assert ds["frameBackgroundColor"] == "#3b18e0"
+        assert ds["buttonColor"] == "#FFD700"
+
+    def test_pin_off_keeps_model_colors(self):
+        r = {
+            "data": {
+                "design_settings": {
+                    "backgroundColor": "#1A1A2E",
+                    "buttonColor": "#FFD700",
+                }
+            },
+            "blocks": [],
+        }
+        out = enforce_design_quality(r, palette={"background": "#3b18e0"}, pin_palette=False)
+        assert out["data"]["design_settings"]["backgroundColor"] == "#1A1A2E"

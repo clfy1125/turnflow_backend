@@ -72,7 +72,10 @@ def _card_defaults(ds: dict) -> tuple[str, str]:
 
 
 def enforce_design_quality(
-    result: dict, palette: dict | None = None, fix_hero: bool = True
+    result: dict,
+    palette: dict | None = None,
+    fix_hero: bool = True,
+    pin_palette: bool = False,
 ) -> dict:
     """result_json 을 in-place 보정하고 같은 객체 반환.
 
@@ -81,6 +84,11 @@ def enforce_design_quality(
         palette: (선택) 결정적 추출 팔레트 — 슬롭색 교체 시 accent 후보로 사용.
         fix_hero: 빈 커버 히어로 승격/강등 보정 여부. **리메이크는 False** —
             사용자의 기존 프로필 레이아웃/이미지 선택을 존중한다(색 대비 보정만 수행).
+        pin_palette: True 면 design_settings 의 배경/카드/버튼색을 **팔레트 값으로 강제
+            스냅**한다(모델이 바꿨어도 되돌림). 컨셉 이미지가 디자인을 주도할 때 사용 —
+            프롬프트의 "정확한 #hex" 지시를 모델이 밝기 지시와 충돌시키며 무시하는 사고
+            (시안 로열바이올렛 → 결과 검은네이비, 2026-06-11) 를 코드로 차단한다.
+            스냅 후에도 WCAG 대비 가드는 그대로 적용된다(가독성 우선).
     """
     if not isinstance(result, dict):
         return result
@@ -92,6 +100,7 @@ def enforce_design_quality(
         "bg_card_spread_fixed": 0,
         "block_contrast_fixed": 0,
         "block_bg_spread_fixed": 0,
+        "palette_pinned": 0,
         "pure_black_softened": 0,
         "hero_image_promoted": 0,
         "hero_downgraded": 0,
@@ -99,6 +108,8 @@ def enforce_design_quality(
 
     ds = _get_design_settings(result)
     if ds is not None:
+        if pin_palette and palette:
+            _pin_palette(ds, palette, report)
         _guard_design_settings(ds, palette, report)
 
     blocks = result.get("blocks")
@@ -307,6 +318,22 @@ def _fix_empty_hero(blocks: list, report: dict) -> None:
     else:
         d["profile_layout"] = "center"
         report["hero_downgraded"] += 1
+
+
+def _pin_palette(ds: dict, palette: dict, report: dict) -> None:
+    """컨셉 이미지 팔레트를 design_settings 에 강제 스냅(모델의 임의 변경 되돌림)."""
+    bg = (palette.get("background") or "").strip()
+    if C.is_hex(bg):
+        if (ds.get("backgroundColor") or "").strip().lower() != bg.lower():
+            report["palette_pinned"] += 1
+        ds["backgroundColor"] = bg
+        ds["frameBackgroundColor"] = bg
+    surface = (palette.get("surface") or "").strip()
+    if C.is_hex(surface):
+        ds["blockBgColor"] = surface
+    accent = (palette.get("accent") or "").strip()
+    if C.is_hex(accent):
+        ds["buttonColor"] = accent
 
 
 def _guard_design_settings(ds: dict, palette: dict | None, report: dict) -> None:

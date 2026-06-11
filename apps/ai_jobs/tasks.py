@@ -527,9 +527,13 @@ def run_ai_job(self, job_id: str):
         # 슬롭 보라(#8c25f4) 교체 · WCAG 대비 보정 · muddy 방지 등.
         if is_new_page:
             from .services.design_guard import enforce_design_quality
+            from .services.prompt_builder import resolve_design_lead
 
             palette = (input_payload.get("image_catalog") or {}).get("palette") or {}
-            result_data = enforce_design_quality(result_data, palette=palette)
+            # 컨셉 이미지가 디자인 주도권을 가지면 팔레트를 **코드로 고정**(pin) —
+            # 모델이 밝기 지시와 충돌시키며 hex 를 무시하는 사고 차단.
+            pin = resolve_design_lead(input_payload) == "concept_image"
+            result_data = enforce_design_quality(result_data, palette=palette, pin_palette=pin)
 
             # ── 4.7 (opt-in) 스크린샷 비평 보정 루프 — 새-페이지 한정 ──
             # settings.AI_VISUAL_REFINE 가 켜져 있을 때만. 실패는 비치명적(원본 유지).
@@ -538,6 +542,11 @@ def run_ai_job(self, job_id: str):
             if getattr(_settings, "AI_VISUAL_REFINE", False):
                 job.set_stage(AiJob.Stage.RESOLVING_IMAGES, 90, "디자인을 스크린샷으로 점검 중...")
                 result_data = _maybe_visual_refine(job, result_data, input_payload, palette)
+                if pin:
+                    # 비평 패치가 배경/버튼색을 갈아끼웠어도 컨셉 팔레트로 재고정.
+                    result_data = enforce_design_quality(
+                        result_data, palette=palette, pin_palette=True
+                    )
 
             # 디자인 킷(page custom_css) 주입 — 카드 라운드/그림자/강조/등장 애니메이션 등.
             # 비주얼 리파인이 custom_css 를 덮을 수 있으므로 **맨 마지막**에 적용.

@@ -634,7 +634,11 @@ def build_prompts(
                 if palette.get(key):
                     plines.append(f"- {label}: {palette[key]}")
             if palette.get("brightness"):
-                plines.append(f"- 전체 밝기: {palette['brightness']} (배경을 이 방향으로 분명하게)")
+                plines.append(
+                    f"- 전체 밝기: {palette['brightness']} (참고용 — backgroundColor 는 위 #hex "
+                    "**그대로**. 더 어둡게/밝게 변형 금지. 체크리스트의 '분명히 밝거나 어둡게' "
+                    "지시보다 이 #hex 가 우선이다)"
+                )
             if palette.get("dominant_colors"):
                 plines.append(f"- 이미지 주요 색(참고): {', '.join(palette['dominant_colors'])}")
             plines.append("")
