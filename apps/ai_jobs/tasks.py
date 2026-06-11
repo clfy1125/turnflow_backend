@@ -113,10 +113,14 @@ def _label_source_images(job, source_ids: list, input_payload: dict) -> dict:
         result.elapsed_seconds,
     )
 
-    # 팔레트는 VLM 이 추정한 #hex 보다 **이미지 픽셀에서 결정적으로 추출**한 값을 우선한다
-    # (VLM 은 정확한 hex 를 못 읽고 drift 함). 컨셉/무드 이미지가 있으면 그걸 디자인 영감으로
-    # 우선 사용하고, 없으면 콘텐츠 이미지에서 추출. 실패하면 VLM 팔레트로 폴백.
-    palette = _deterministic_palette(imgs, result.labels) or (result.palette or {})
+    # 팔레트 = VLM(역할 분류 정확) × 픽셀 추출(hex 정확) 하이브리드.
+    # VLM 의 역할별 색을 픽셀 클러스터 최근접 hex 로 스냅한다 — 결정적 추출만 쓰면
+    # 시안 스크린샷에서 흰 카드를 배경으로 오분류하고, VLM 만 쓰면 hex 가 drift 한다.
+    from .services import color_utils as _C
+
+    palette = _C.reconcile_palette(
+        result.palette or {}, _deterministic_palette(imgs, result.labels) or {}
+    )
 
     return {
         "usable": usable_catalog,

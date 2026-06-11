@@ -226,6 +226,58 @@ def build_palette(dominant: list[tuple[str, float]]) -> dict:
     }
 
 
+def color_distance(a: str, b: str) -> float:
+    """두 #hex 의 RGB 유클리드 거리. 파싱 실패 시 큰 값."""
+    ra, rb = parse_hex(a), parse_hex(b)
+    if ra is None or rb is None:
+        return 1e9
+    return sum((x - y) ** 2 for x, y in zip(ra, rb)) ** 0.5
+
+
+def nearest_hex(pool: list[str], target: str, max_dist: float = 110.0) -> str:
+    """``pool``(실제 픽셀 클러스터)에서 ``target`` 과 가장 가까운 hex 를 고른다.
+
+    가장 가까운 것도 ``max_dist`` 보다 멀면(풀에 그 계열 색이 아예 없음 — 예: 노랑 액센트가
+    면적이 작아 클러스터에 안 잡힘) target 을 그대로 쓴다.
+    """
+    best, best_d = target, max_dist
+    for hx in pool:
+        d = color_distance(hx, target)
+        if d < best_d:
+            best, best_d = hx, d
+    return best
+
+
+def reconcile_palette(vlm: dict, det: dict) -> dict:
+    """VLM 팔레트(역할 분류는 정확, hex 는 drift)와 결정적 팔레트(hex 는 정확, 역할
+    분류가 틀림)를 결합한다.
+
+    배경(2026-06-11 실사고): 페이지 디자인 시안 스크린샷에서 k-means 휴리스틱이 흰 카드
+    영역을 background 로, 실제 딥 바이올렛 배경을 accent 로 오분류 → "이 #hex 가 유일한
+    기준" 지시와 결합되어 시안과 정반대(흰 배경) 결과가 나왔다.
+
+    규칙: **역할별 색은 VLM 의 판단을 채택**하되, 그 hex 를 실제 픽셀 클러스터
+    (det.dominant_colors)의 최근접 색으로 스냅해 hex drift 를 보정한다. VLM 이 비어 있으면
+    결정적 팔레트 그대로(기존 동작).
+    """
+    if not isinstance(vlm, dict) or not vlm:
+        return det or {}
+    det = det if isinstance(det, dict) else {}
+    pool = [h for h in (det.get("dominant_colors") or []) if is_hex(h)]
+    out = dict(det)
+    for role in ("background", "surface", "accent", "text"):
+        v = (vlm.get(role) or "").strip()
+        if is_hex(v):
+            out[role] = nearest_hex(pool, v) if pool else v
+    if vlm.get("brightness") in ("dark", "light"):
+        out["brightness"] = vlm["brightness"]
+    if not out.get("dominant_colors"):
+        cand = [h for h in (vlm.get("dominant_colors") or []) if is_hex(h)]
+        if cand:
+            out["dominant_colors"] = cand
+    return out
+
+
 def merge_palettes(palettes: list[dict]) -> dict:
     """여러 이미지의 dominant 를 합쳐 하나의 팔레트 추천으로.
 

@@ -98,3 +98,40 @@ class TestPaletteExtraction:
 
     def test_extract_dominant_bad_bytes(self):
         assert C.extract_dominant(b"not an image") == []
+
+
+class TestReconcilePalette:
+    def test_mockup_misclassification_fixed(self):
+        # 2026-06-11 실사고: 시안 스크린샷에서 k-means 가 흰 카드를 background 로 오분류.
+        # VLM 은 역할을 맞게 봤지만 hex 가 drift → VLM 역할 + 픽셀 최근접 스냅으로 보정.
+        from .services.color_utils import reconcile_palette
+
+        det = {
+            "background": "#f5f5f7",  # 오분류(흰 카드)
+            "accent": "#3b18e0",
+            "brightness": "light",
+            "dominant_colors": ["#3b18e0", "#2b159e", "#b0bb80", "#6b718d", "#553daf"],
+        }
+        vlm = {
+            "background": "#4a2fd9",  # VLM: 배경은 딥 바이올렛 (hex 는 근사치)
+            "accent": "#e8ff2a",  # VLM: 네온 옐로 포인트
+            "brightness": "dark",
+        }
+        out = reconcile_palette(vlm, det)
+        # 배경: VLM 역할 판단 → 픽셀 풀 최근접(#3b18e0 또는 #553daf 계열 보라)으로 스냅
+        assert out["background"] in ("#3b18e0", "#553daf", "#2b159e")
+        assert out["brightness"] == "dark"
+        # 노랑은 풀에 없음(면적 작아 클러스터 미포함) → VLM hex 유지
+        assert out["accent"] == "#e8ff2a"
+
+    def test_empty_vlm_falls_back_to_det(self):
+        from .services.color_utils import reconcile_palette
+
+        det = {"background": "#111111", "dominant_colors": ["#111111"]}
+        assert reconcile_palette({}, det) == det
+
+    def test_empty_det_uses_vlm_as_is(self):
+        from .services.color_utils import reconcile_palette
+
+        out = reconcile_palette({"background": "#0b132b", "brightness": "dark"}, {})
+        assert out["background"] == "#0b132b" and out["brightness"] == "dark"
