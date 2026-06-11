@@ -46,6 +46,7 @@ CATEGORY_PROFILES: dict[str, dict] = {
             "고정 공지 배너(진행 중 이벤트/공구)",
             "검색 블록(search — 콘텐츠가 많은 페이지라 필수, 공지 바로 아래)",
             "대표 CTA 1개(가장 밀고 싶은 링크 — small)",
+            "최근 영상 1개(video 블록 — 유저가 자기 영상으로 교체할 자리)",
             "인기 콘텐츠 갤러리(gallery thumbnail — 6장 이상)",
             "**콘텐츠 카테고리 묶음 — folder(toggle) 사용**: '🎬 콘텐츠 모아보기' folder 안에 "
             "임시 id 를 단 single_link 들을 child_block_ids 로 묶어라(공통 규칙 12 예시 참조). "
@@ -730,9 +731,11 @@ def build_recipe_prompt(category: str, include_mood: bool = True) -> str:
         "'korean' 같은 국적/인종 한정어도 검색 실패의 주범이니 빼라."
     )
     lines.append(
-        "7. **영상(video) 블록은 [목표] 컨셉에 실제 영상 URL(youtube/youtu.be/tiktok/vimeo)이 "
-        "주어진 경우에만** — 그 URL 을 `video_urls` 에 그대로 넣어라(다른 URL 창작 절대 금지: "
-        "환각 URL 은 깨진 임베드가 되어 백엔드가 자동 제거한다). 컨셉에 영상 URL 이 없으면 video 금지."
+        "7. **영상(video) 블록 — 영상이 어울리는 비즈니스(크리에이터/공연/강의/홍보 등)면 1개 넣어라**. "
+        "생성 페이지는 유저가 고쳐 쓰는 **스캐폴드**다 — 영상 자리가 잡혀 있어야 유저가 자기 영상으로 "
+        "교체한다. [목표] 컨셉에 실제 영상 URL(youtube/youtu.be/tiktok/vimeo)이 있으면 **그 URL 을 "
+        "그대로** `video_urls` 에 넣고, 없으면 그럴듯한 유튜브 URL 형식(예: "
+        "`https://youtube.com/watch?v=...`) placeholder 1개만 — 유저 교체용 자리다."
     )
     lines.append(
         "8. **정확한 한국어**: 오타·띄어쓰기 오류 금지(예: '바로'를 '비로', '점심시간'을 '정심시간'으로 쓰지 마라). "

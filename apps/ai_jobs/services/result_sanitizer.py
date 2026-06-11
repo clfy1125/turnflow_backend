@@ -265,19 +265,19 @@ def extract_video_urls(text: str) -> set[str]:
     return {m.rstrip(".,;") for m in _VIDEO_URL_RE.findall(text)}
 
 
-def _drop_fabricated_video_blocks(
+def _normalize_video_blocks(
     result: dict, stats: dict, allowed_video_urls: set[str] | None = None
 ) -> None:
-    """새-페이지 생성에서 **환각 video 블록**을 제거한다.
+    """video 블록을 **유지**하며 URL 만 정리한다.
 
-    생성 모델은 실제 유튜브 URL 을 알 수 없어 가짜/플레이스홀더 URL 을 만든다
-    (Rick Astley, watch?v=example ...). 그 결과 "재생할 수 없음" 에러박스가 떠
-    페이지 신뢰도를 망친다. 깨진 임베드보다 **없는 게 낫다.**
+    정책 변경(2026-06-11, 사용자 결정): 생성 페이지는 유저가 고쳐 쓰는 **스캐폴드**다 —
+    영상 자리가 잡혀 있어야 유저가 자기 영상으로 교체한다. 환각 URL 이어도 블록을
+    제거하지 않는다(임베드가 깨져 보여도 자리가 있는 게 낫다).
 
-    단, **사용자가 컨셉에 직접 넣은 영상 URL**(``allowed_video_urls``)은 진짜이므로
-    그 URL 만 쓰는 video 블록은 허용한다 — 허용 외 URL 이 섞이면 그 URL 만 떼고,
-    남는 URL 이 없으면 블록을 제거.
-    (리메이크는 사용자 실제 영상이라 건드리지 않는다 — 호출부에서 drop_fabricated_video=False.)
+    하는 일:
+      - 컨셉에 실제 영상 URL(``allowed_video_urls``)이 있으면 그 URL 을 **맨 앞으로** 승격.
+      - http/https 로 정규화 불가한 값(`#` 등)만 제거(페이지 저장 400 방지).
+      - URL 이 하나도 안 남은 video 블록만 제거(렌더할 게 없음).
     """
     blocks = result.get("blocks")
     if not isinstance(blocks, list):
@@ -288,13 +288,20 @@ def _drop_fabricated_video_blocks(
         d = (b.get("data") or {}) if isinstance(b, dict) else {}
         if isinstance(b, dict) and d.get("_type") == "video":
             urls = d.get("video_urls") if isinstance(d.get("video_urls"), list) else []
-            ok_urls = [u for u in urls if isinstance(u, str) and u.strip() in allowed]
-            if ok_urls:
-                d["video_urls"] = ok_urls
-                kept.append(b)
+            cleaned = []
+            for u in urls:
+                if not isinstance(u, str):
+                    continue
+                cu = _clean_url(u)
+                if cu:
+                    cleaned.append(cu)
+            # 컨셉의 실제 영상 URL 우선(있으면 맨 앞 — 진짜가 placeholder 보다 먼저 보이게).
+            real = [u for u in allowed if u not in cleaned]
+            cleaned = real + cleaned
+            if not cleaned:
+                stats["video_dropped"] += 1
                 continue
-            stats["video_dropped"] += 1
-            continue
+            d["video_urls"] = cleaned
         kept.append(b)
     result["blocks"] = kept
 
@@ -407,8 +414,9 @@ def sanitize_result_json(
         "zero_price_stripped": 0,
     }
     if drop_fabricated_video:
-        # drop_fabricated_video=True 는 새-페이지 생성 경로 — 폼 중복 정리도 같이.
-        _drop_fabricated_video_blocks(result, stats, allowed_video_urls)
+        # drop_fabricated_video=True 는 새-페이지 생성 경로 — video URL 정리 + 폼 중복 정리.
+        # (이름과 달리 이제 video 블록은 유지한다 — 스캐폴드 정책, 함수 docstring 참조.)
+        _normalize_video_blocks(result, stats, allowed_video_urls)
         _dedup_form_blocks(result, stats)
     _walk(result, stats)
     _drop_empty_galleries(result, stats)

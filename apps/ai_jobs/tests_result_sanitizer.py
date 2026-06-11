@@ -279,7 +279,8 @@ class TestTextCap:
 
 
 class TestVideoDrop:
-    def test_video_dropped_when_flag_set(self):
+    def test_video_kept_as_scaffold_when_flag_set(self):
+        # 정책 변경(2026-06-11): 새-페이지에서도 video 는 스캐폴드로 유지(URL 정리만).
         data = {
             "blocks": [
                 {"type": "single_link", "data": {"_type": "text", "content": "hi"}},
@@ -294,7 +295,7 @@ class TestVideoDrop:
         }
         out = sanitize_result_json(data, drop_fabricated_video=True)
         subs = [(b.get("data") or {}).get("_type") for b in out["blocks"]]
-        assert "video" not in subs
+        assert "video" in subs
         assert "text" in subs
 
     def test_video_kept_by_default(self):
@@ -455,30 +456,38 @@ class TestRobustness:
         assert out["blocks"][2]["data"]["group_layout"] == "list"
 
 
-class TestVideoAllowList:
+class TestVideoScaffold:
+    """video 블록은 스캐폴드로 **유지**한다(2026-06-11 정책: 유저가 자기 영상으로 교체)."""
+
     def _video(self, urls):
         return {"type": "single_link", "data": {"_type": "video", "video_urls": urls}}
 
-    def test_concept_video_url_kept(self):
+    def test_concept_video_url_promoted_first(self):
         from .services.result_sanitizer import extract_video_urls
 
         concept = "내 채널 https://youtube.com/watch?v=abc123 영상을 보여줘"
         allowed = extract_video_urls(concept)
-        data = {"blocks": [self._video(["https://youtube.com/watch?v=abc123"])]}
+        data = {"blocks": [self._video(["https://youtube.com/watch?v=fake99"])]}
         out = sanitize_result_json(data, drop_fabricated_video=True, allowed_video_urls=allowed)
-        assert len(out["blocks"]) == 1
-        assert out["blocks"][0]["data"]["video_urls"] == ["https://youtube.com/watch?v=abc123"]
+        urls = out["blocks"][0]["data"]["video_urls"]
+        # 컨셉의 진짜 URL 이 맨 앞, 모델 placeholder 는 뒤에 보존(교체용 자리).
+        assert urls[0] == "https://youtube.com/watch?v=abc123"
+        assert "https://youtube.com/watch?v=fake99" in urls
 
-    def test_fabricated_video_dropped(self):
+    def test_fabricated_video_kept_as_scaffold(self):
         data = {"blocks": [self._video(["https://youtube.com/watch?v=hallucinated"])]}
         out = sanitize_result_json(data, drop_fabricated_video=True, allowed_video_urls=set())
-        assert out["blocks"] == []
+        assert len(out["blocks"]) == 1  # 더 이상 드롭하지 않는다
 
-    def test_mixed_urls_filtered_to_allowed(self):
-        allowed = {"https://youtu.be/real1"}
-        data = {"blocks": [self._video(["https://youtu.be/real1", "https://youtu.be/fake2"])]}
-        out = sanitize_result_json(data, drop_fabricated_video=True, allowed_video_urls=allowed)
-        assert out["blocks"][0]["data"]["video_urls"] == ["https://youtu.be/real1"]
+    def test_invalid_scheme_url_removed(self):
+        data = {"blocks": [self._video(["#", "javascript:x", "https://youtu.be/ok1"])]}
+        out = sanitize_result_json(data, drop_fabricated_video=True, allowed_video_urls=set())
+        assert out["blocks"][0]["data"]["video_urls"] == ["https://youtu.be/ok1"]
+
+    def test_video_with_no_valid_urls_dropped(self):
+        data = {"blocks": [self._video(["#"])]}
+        out = sanitize_result_json(data, drop_fabricated_video=True, allowed_video_urls=set())
+        assert out["blocks"] == []
 
     def test_remake_videos_untouched(self):
         data = {"blocks": [self._video(["https://youtu.be/user-real"])]}
