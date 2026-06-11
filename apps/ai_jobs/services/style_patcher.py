@@ -295,6 +295,27 @@ def _is_image_placeholder(v) -> bool:
     return isinstance(v, str) and (v.startswith("{{user_image:") or v.startswith("{{image:"))
 
 
+_NEW_LINK_ITEM_KEYS = {"title", "description", "url", "price", "original_price", "badge", "is_enabled"}
+
+
+def _sanitize_new_group_links(items) -> list[dict]:
+    """``_new`` group_link 의 links 배열 정화 — 텍스트/URL 필드 + placeholder 썸네일만 통과.
+
+    (url 은 sanitizer 가 http/https 정규화하므로 여기선 문자열만 받는다. 썸네일은
+    placeholder 가 아니면 버려 환각 raw URL 을 차단.)
+    """
+    out: list[dict] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        ln = {k: it[k] for k in _NEW_LINK_ITEM_KEYS if k in it}
+        if _is_image_placeholder(it.get("thumbnail_url")):
+            ln["thumbnail_url"] = it["thumbnail_url"]
+        if ln.get("title") or ln.get("url"):
+            out.append(ln)
+    return out
+
+
 def _placeholder_image_value(key: str, value):
     """``_new`` 블록의 이미지 필드에서 **placeholder 만** 통과시킨다.
 
@@ -361,6 +382,14 @@ def merge_full_restyle(
         bid = raw.get("id") if not is_new else None
         order = raw.get("order") or (i + 1)
         response_data = raw.get("data") or {}
+        if not response_data:
+            # 모델이 data 래퍼 없이 평평하게 응답하는 경우가 흔하다
+            # ({"_new":true,"_type":"text","headline":...}) — 최상위에서 필드 추출.
+            # (이게 없으면 _new 블록이 전부 '빈 데이터'로 누락돼 페이지가 붕괴한다.)
+            _meta_keys = {"id", "_new", "type", "_type", "order", "is_enabled", "custom_css"}
+            response_data = {k: v for k, v in raw.items() if k not in _meta_keys}
+            if raw.get("_type"):
+                response_data["_type"] = raw["_type"]
 
         if not is_new and isinstance(bid, int) and bid in existing_by_id:
             # ── 기존 블록 패치 ─────────────────────────
@@ -381,6 +410,15 @@ def merge_full_restyle(
                 if subtype == "text" and base_data.get("text_layout") == "plain":
                     if full_patch.get("text_layout") not in (None, "plain"):
                         full_patch.pop("text_layout", None)
+
+            # 이미지 제안 채택(안전 규칙): 모델이 placeholder({{image:}}/{{user_image:}})를
+            # 보낸 이미지 필드는 **base 의 그 슬롯이 비어 있을 때만** 채운다 — 기존 사용자
+            # 이미지를 placeholder 로 덮어쓰는 사고를 차단하면서, 비어 있던 아바타/커버는
+            # 리뉴얼에서 채워지게 한다.
+            for _ik in _IMAGE_FIELD_KEYS:
+                _pv = response_data.get(_ik)
+                if _is_image_placeholder(_pv) and not str(base_data.get(_ik) or "").strip():
+                    full_patch[_ik] = _pv
 
             base_data.update(full_patch)
             merged_blocks.append(
@@ -411,11 +449,10 @@ def merge_full_restyle(
             subtype = raw_subtype or raw_type or "single_link"
             new_data = {"_type": subtype}
 
-        # ── 안전망: _new single_link/single_link 는 url 이 필수인데 신규 블록은
-        # url placeholder 가 없어 빈 채로 들어간다. AI 가 spacer/notice/customer/
-        # inquiry 의도였는데 _type 을 잘못 분류한 경우가 많음. 라벨/콘텐츠가 있으면
-        # text 블록으로 fallback, 없으면 그 블록 자체를 누락시킨다.
-        if subtype == "single_link":
+        # ── 안전망: _new single_link 가 url 없이 오면 렌더가 통째로 스킵된다.
+        # url 이 있으면 정상 단일링크로 받고(아래 화이트리스트 루프에서 통과),
+        # url 이 없는데 라벨/콘텐츠만 있으면 text 로 fallback, 둘 다 없으면 누락.
+        if subtype == "single_link" and not str(response_data.get("url") or "").strip():
             has_text = bool(
                 (response_data.get("label") or "").strip()
                 or (response_data.get("description") or "").strip()
@@ -446,6 +483,15 @@ def merge_full_restyle(
                 # 사용자가 리뉴얼에 첨부한 이미지를 새 갤러리/썸네일 블록으로 배치하는 경로.
                 # 환각 raw URL 은 여전히 차단(placeholder 가 아니면 버림).
                 new_data[k] = _placeholder_image_value(k, v)
+            elif subtype == "group_link" and k == "links" and isinstance(v, list):
+                # 새 그룹링크의 항목들 — 텍스트/URL/가격 + placeholder 썸네일만 통과.
+                links = _sanitize_new_group_links(v)
+                if links:
+                    new_data[k] = links
+            elif subtype == "single_link" and k == "url" and isinstance(v, str) and v.strip():
+                # 새 단일링크의 url — 빈 url 은 렌더 스킵되므로 그럴듯한 값을 받아준다
+                # (sanitizer 가 http/https 정규화·placeholder 채움으로 마무리).
+                new_data[k] = v.strip()
             # 그 외 URL 필드는 무시 (새 블록은 URL 비어둠 — 사용자가 추후 입력).
 
         merged_blocks.append(

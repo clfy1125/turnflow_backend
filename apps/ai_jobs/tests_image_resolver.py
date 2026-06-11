@@ -115,16 +115,26 @@ class TestVlmGate:
         out = resolve_images(data)
         assert out["blocks"][0]["data"]["a"] == "https://r2/2.jpg"
 
-    def test_vlm_reject_all_falls_back_to_first(self, monkeypatch):
+    def test_vlm_reject_all_returns_empty(self, monkeypatch):
         import apps.ai_jobs.services.image_resolver as ir
 
         self._patch_common(ir, monkeypatch)
-        # 일반 게이트는 전부 거부(0), force 최종 선택은 2번 후보를 고르는 시나리오.
-        monkeypatch.setattr(ir, "_vlm_pick_index", lambda kw, urls, force=False: 2 if force else 0)
+        # 단일 호출 게이트가 "전부 무관(0)" — 최근접 선택까지 포함된 판단이므로 빈 슬롯.
+        monkeypatch.setattr(ir, "_vlm_pick_index", lambda kw, urls: 0)
         data = {"blocks": [{"data": {"a": "{{image:obscure thing}}"}}]}
         out = resolve_images(data)
-        # 사용자 피드백: 빈 슬롯이 다소 어긋난 사진보다 나쁘다 — 최근접 후보 강제 채택
-        assert out["blocks"][0]["data"]["a"] == "https://r2/2.jpg"
+        assert out["blocks"][0]["data"]["a"] == ""
+
+    def test_hosting_failure_falls_back_to_external_url(self, monkeypatch):
+        import apps.ai_jobs.services.image_resolver as ir
+
+        self._patch_common(ir, monkeypatch)
+        monkeypatch.setattr(ir, "_vlm_pick_index", lambda kw, urls: 1)
+        # 다운로드가 전부 실패해도 빈 슬롯 대신 선택 후보의 외부 URL 폴백.
+        monkeypatch.setattr(ir, "_host_candidate", lambda pid, purl, kw, used: None)
+        data = {"blocks": [{"data": {"a": "{{image:cafe}}"}}]}
+        out = resolve_images(data)
+        assert out["blocks"][0]["data"]["a"] == "https://px/1.jpg"
 
     def test_vlm_fallback_keeps_order(self, monkeypatch):
         import apps.ai_jobs.services.image_resolver as ir

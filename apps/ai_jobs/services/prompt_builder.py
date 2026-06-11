@@ -426,6 +426,36 @@ def build_prompts(
         ]
         variable_parts += text_policy + design_policy
 
+        # ── 전체 다시 작성(rewrite) = 새 페이지를 설계하듯 — 풍성함 목표 + 카테고리 레시피 ──
+        # (이게 없으면 모델이 기존 블록 재스타일에 그쳐 결과가 빈약하다. preserve 모드는
+        # 내용 보존이 우선이라 제외 — 디자인 정책만으로 충분.)
+        if not preserve_content:
+            _infer_bits = [concept, str(existing_page_meta.get("title") or "")]
+            for _b in existing_blocks[:10]:
+                _d = _b.get("data") or {}
+                for _k in ("headline", "label", "content", "subline"):
+                    _v = _d.get(_k)
+                    if isinstance(_v, str) and _v:
+                        _infer_bits.append(_v[:120])
+            remake_category = _cat.resolve_category({"concept": " ".join(_infer_bits)[:800]})
+            target_blocks = max(len(existing_blocks) + 6, 14)
+            variable_parts += [
+                "### [전체 다시 작성 — 새 페이지 설계 수준으로 보강 (핵심)]",
+                f"기존 블록 재스타일에 **그치지 마라**. 새 페이지를 만들 듯 페이지 전체를 다시 설계하고, "
+                f"부족한 섹션을 ``_new: true`` 블록으로 적극 보강해 **최종 {target_blocks}개 이상**이 되게 하라. "
+                "기존 블록 몇 개에 색만 입힌 결과는 실패다.",
+                "**응답 JSON 에는 `page` 와 `blocks` 배열을 반드시 모두 포함하라 — `blocks` 가 없는 "
+                "응답은 실패로 간주된다.**",
+                "- **섹션 리듬**: 이모지 섹션 헤더(text, text_layout:\"default\", headline 한 줄) → 내용 블록들 → spacer 구분선.",
+                "- **비주얼 보강**: 새 gallery 블록(images 에 {{image:영문 구체 키워드}} 4장+) — 업종 분위기를 보여줄 것.",
+                "- **후기 보강**: text toggle 1개(headline \"💬 실제 후기\", content 에 `아이디 ★★★★★\\n한줄평` 5~6개, 실명 금지).",
+                "- **누락 섹션 보강**: SNS(social), 지도(map — 오프라인 업장이면), 이용안내/FAQ(text toggle), "
+                "가격 안내(text plain) 등 아래 카테고리 레시피의 섹션을 참고해 채워라.",
+                "- 새 group_link 도 가능: links 항목에 title/url(그럴듯한 실제형)/price/badge + thumbnail_url 은 {{image:키워드}}.",
+                "",
+                _cat.build_recipe_prompt(remake_category),
+            ]
+
         # 사용자가 리뉴얼에 첨부한 이미지 — 새 블록으로 배치하게 안내.
         # (기존 블록 이미지는 placeholder freeze 로 보호되므로 건드리지 않는다.)
         remake_catalog = user_input.get("image_catalog") or {}
@@ -442,9 +472,10 @@ def build_prompts(
                 rlines.append(f"{n}. {{{{user_image:{n}}}}} — 요약: {summary} · 추천 위치: {use}")
             rlines += [
                 "배치 방법: ``_new: true`` 새 블록의 이미지 슬롯에 {{user_image:N}} 토큰으로.",
-                "- 여러 장이면 새 gallery 블록(images 배열에 {{user_image:N}} 나열, "
-                'gallery_layout:"thumbnail") 권장.',
-                "- 1~2장이면 새 single_link large 의 thumbnail_url 또는 gallery.",
+                "- **목록의 모든 {{user_image:N}} 을 빠짐없이 배치하라 — 1장도 누락 금지.** "
+                "기본은 새 gallery 블록(images 배열에 전부 나열, gallery_layout:\"thumbnail\") + "
+                "필요시 1장을 profile cover_image_url 로도 활용.",
+                "- '시술 사진'·'매장 사진' 같은 섹션 헤더를 만들었으면 **바로 아래에 그 gallery** 가 와야 한다(라벨-블록 일치).",
                 "- 기존 블록의 [IMG_n] placeholder 는 그대로 두고, 새 블록에만 배치한다.",
                 "",
             ]

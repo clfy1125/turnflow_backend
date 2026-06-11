@@ -140,12 +140,26 @@ def _looks_price_table(enabled_links: list[dict]) -> bool:
     return pricey * 2 >= len(enabled_links)
 
 
-def _guard_profile(profile: dict, prof: dict, hero_kw: _Cycler, report: dict) -> None:
+def _guard_profile(
+    profile: dict, prof: dict, hero_kw: _Cycler, report: dict, force: bool = True
+) -> None:
     d = profile.get("data")
     if not isinstance(d, dict):
         return
     layout = d.get("profile_layout") or d.get("layout") or "center"
     strategy = prof.get("hero", "avatar")
+
+    if not force:
+        # 리메이크: 사용자의 현재 레이아웃을 존중 — 레이아웃 강제/기존 이미지 제거 없이
+        # **빈 슬롯만** 채운다(빈 커버 회색 띠 / placeholder 아바타 방지).
+        # cover 레이아웃도 아바타를 함께 렌더하므로 둘 다 검사한다.
+        if layout in _COVER_LAYOUTS and _empty(d.get("cover_image_url")):
+            d["cover_image_url"] = _ph(hero_kw.next())
+            report["cover_filled"] += 1
+        if _empty(d.get("avatar_url")):
+            d["avatar_url"] = _ph(hero_kw.next())
+            report["avatar_filled"] += 1
+        return
 
     if strategy == "cover":
         # cover 전략: cover_bg 로 통일 + 커버 이미지 보장.
@@ -210,7 +224,11 @@ def _guard_block_images(data: dict, gallery_kw: _Cycler, thumb_kw: _Cycler, repo
 
 
 def ensure_image_placeholders(
-    result: dict, category: str, concept: str = "", salt: int = 0
+    result: dict,
+    category: str,
+    concept: str = "",
+    salt: int = 0,
+    force_hero_strategy: bool = True,
 ) -> dict:
     """빈 이미지 슬롯에 카테고리 키워드 placeholder 를 심는다 (in-place, 같은 객체 반환).
 
@@ -246,7 +264,7 @@ def ensure_image_placeholders(
                 if not isinstance(b, dict):
                     continue
                 if _is_profile(b):
-                    _guard_profile(b, prof, hero_kw, report)
+                    _guard_profile(b, prof, hero_kw, report, force=force_hero_strategy)
                     continue
                 d = b.get("data")
                 if isinstance(d, dict):

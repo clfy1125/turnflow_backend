@@ -97,17 +97,16 @@ def resolve_images(data: dict, *, user_image_urls: dict[str, str] | None = None)
 # ─────────────────────────────────────────────────────────────
 
 
-def _vlm_pick_index(keyword: str, urls: list[str], force: bool = False) -> int:
+def _vlm_pick_index(keyword: str, urls: list[str]) -> int:
     """비전 모델에게 후보 사진들을 보여주고 키워드에 가장 맞는 번호(1..N)를 고르게 한다.
 
-    Args:
-        force: True 면 "적합 없음(0)" 을 허용하지 않고 **가장 덜 어긋난 1장**을 반드시
-            고르게 한다 — 더블 거부 후 최종 폴백용(사용자 피드백: 빈 슬롯 < 어긋난 사진.
-            단 맹목적 1순위보다는 그나마 가까운 걸 고르는 게 곤충/엉뚱한 사진 사고를 줄인다).
+    **키워드당 단 1회 호출** — 기존의 1라운드→2라운드→최근접 강제(최대 3회)는 비전 서버
+    부하 시 이미지 단계가 분 단위로 늘어지는 주범이었다. 한 번에 "정확 일치 > 최근접 >
+    전부 무관일 때만 0" 을 판단시킨다.
 
     Returns:
-        1..N  → 그 후보가 적합(앞으로 당겨 채택)
-        0     → 적합한 후보 없음(거부 → 호출부가 다음 라운드/폴백 진행)
+        1..N  → 그 후보 채택
+        0     → 전부 무관(곤충/엉뚱한 사물 수준) → 빈 슬롯(가드/refill 이 정리)
         -1    → 비전 미사용/실패 → 기존 순서대로 진행(폴백)
     """
     if not urls:
@@ -115,27 +114,16 @@ def _vlm_pick_index(keyword: str, urls: list[str], force: bool = False) -> int:
     from .llm_client import call_llm_messages_with_usage  # 지연 import(순환 방지)
 
     model = getattr(settings, "AI_IMAGE_VLM_MODEL", "gemma-4")
-    if force:
-        instruction = (
-            f"키워드: '{keyword.replace('_', ' ')}'\n"
-            f"아래 {len(urls)}장 중 이 키워드의 주제와 **가장 가까운(가장 덜 어긋난) 1장**의 "
-            "번호를 **반드시** 골라라. 완벽히 일치하지 않아도 된다 — 분위기/카테고리가 통하는 "
-            "사진이면 OK. 단 곤충·벌레·전혀 무관한 동물/사물이 주인공인 사진만은 피하라. "
-            "키워드가 일러스트/그림/캐릭터/아트(illustration·drawing·character·art·anime) 류면 "
-            "실사 사진보다 일러스트·그림을 우선하라. "
-            "0 출력 금지. **숫자 하나만** 출력."
-        )
-    else:
-        instruction = (
-            f"키워드: '{keyword.replace('_', ' ')}'\n"
-            f"아래 {len(urls)}장 중, 이 키워드가 가리키는 **실제 사물/주제가 또렷이 주인공으로** "
-            "보이는 사진 1장의 번호를 골라라. 키워드와 다른 사물/유사하지만 다른 제품/엉뚱한 풍경·곤충·"
-            "무관한 인물이면 고르지 마라(예: 토너 키워드에 와인잔, 세럼에 물병, 라떼에 견과류는 부적합). "
-            "딱 맞는 게 없으면 억지로 고르지 말고 **0**. (빈 이미지가 엉뚱한 이미지보다 낫다.) "
-            "키워드가 일러스트/그림/캐릭터/드로잉/아트(illustration·drawing·character·art·anime) 류면 "
-            "**실제 일러스트·그림만 적합**하고 실사 사진은 전부 0. "
-            "**숫자 하나만** 출력."
-        )
+    instruction = (
+        f"키워드: '{keyword.replace('_', ' ')}'\n"
+        f"아래 {len(urls)}장 중 1장을 골라라. 우선순위:\n"
+        "1) 키워드의 **실제 사물/주제가 또렷이 주인공**인 사진이 있으면 그 번호.\n"
+        "2) 없으면 **주제/분위기가 가장 가까운(덜 어긋난) 1장** — 완벽하지 않아도 된다.\n"
+        "3) **모든 후보가 완전히 무관**(곤충·벌레·전혀 다른 사물이 주인공)할 때만 0.\n"
+        "키워드가 일러스트/그림/캐릭터/아트(illustration·drawing·character·art·anime) 류면 "
+        "실사 사진보다 일러스트·그림을 우선하고, 일러스트가 하나도 없으면 0. "
+        "**숫자 하나만** 출력."
+    )
     content: list[dict] = [{"type": "text", "text": instruction}]
     for i, u in enumerate(urls, 1):
         content.append({"type": "text", "text": f"[{i}]"})
@@ -162,10 +150,33 @@ def _vlm_pick_index(keyword: str, urls: list[str], force: bool = False) -> int:
         return -1
 
 
+# Pixabay 다운로드 429(레이트리밋) 서킷브레이커 — 한 번 걸리면 일정 시간 재호스팅을 생략하고
+# 외부 URL 을 그대로 쓴다(요청 폭주 방지 + 이미지 단계 수 분 지연 방지).
+_RATE_LIMIT_COOLDOWN_S = 180.0
+_rate_limited_until = 0.0
+
+
 def _host_candidate(pid: int, purl: str, keyword: str, used: dict) -> str | None:
     """후보 1장을 다운로드/정제/R2 재호스팅. 중복(해시)이면 None. 실패 시 외부 URL/None."""
+    global _rate_limited_until
+    import time as _time
+
+    if _time.time() < _rate_limited_until:
+        # 쿨다운 중 — 재호스팅 생략, Pixabay 외부 URL 직사용(렌더는 정상).
+        used["pixabay_ids"].add(pid)
+        return purl
     try:
         raw = _download(purl)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 429:
+            _rate_limited_until = _time.time() + _RATE_LIMIT_COOLDOWN_S
+            logger.warning(
+                "Pixabay 429 — %ds 쿨다운 시작, 외부 URL 폴백", int(_RATE_LIMIT_COOLDOWN_S)
+            )
+            used["pixabay_ids"].add(pid)
+            return purl
+        logger.warning("이미지 다운로드 실패 (%s): %s", purl, exc)
+        return None
     except Exception as exc:  # noqa: BLE001
         logger.warning("이미지 다운로드 실패 (%s): %s", purl, exc)
         return None
@@ -199,37 +210,28 @@ def _resolve_one(keyword: str, used: dict | None = None) -> str:
     ordered = [c for c in candidates if c[0] not in used["pixabay_ids"]] or list(candidates)
 
     if getattr(settings, "AI_IMAGE_VLM_RERANK", True):
-        topk = ordered[:_VLM_TOPK]
+        # 키워드당 **비전 1회** — 상위 8장을 한 번에 심사("정확 일치 > 최근접 > 전부 무관 0").
+        topk = ordered[: _VLM_TOPK * 2]
         idx = _vlm_pick_index(keyword, [u for _pid, u in topk])
         if idx == 0:
-            # 상위 후보 전부 부적합 → **같은 키워드로 다음 후보 묶음을 한 번 더** 심사한다.
-            # (범용 키워드로 갈아끼우면 '딸기잼 → 파프리카' 같은 주제 이탈이 생긴다 — 주제 유지가 우선.)
-            nextk = ordered[_VLM_TOPK : _VLM_TOPK * 2]
-            idx2 = _vlm_pick_index(keyword, [u for _pid, u in nextk]) if nextk else 0
-            if 1 <= idx2 <= len(nextk):
-                chosen = nextk[idx2 - 1]
-                ordered = [chosen] + [c for c in ordered if c is not chosen]
-            else:
-                # 2라운드도 거부 → 빈 슬롯 대신 사진을 쓴다(사용자 피드백: 빈 슬롯이 더 나쁨).
-                # 단 맹목적 1순위는 곤충/엉뚱한 사진 사고가 나므로, VLM 에게 **가장 덜 어긋난
-                # 1장**을 강제로 고르게 한다(force). 그 호출마저 실패하면 1순위 폴백.
-                pool = ordered[: _VLM_TOPK * 2]
-                idx3 = _vlm_pick_index(keyword, [u for _pid, u in pool], force=True)
-                if 1 <= idx3 <= len(pool):
-                    chosen = pool[idx3 - 1]
-                    ordered = [chosen] + [c for c in ordered if c is not chosen]
-                    logger.info("VLM: '%s' 더블 거부 — 최근접 후보(%d) 강제 채택", keyword, idx3)
-                else:
-                    logger.info("VLM: '%s' 더블 거부 — 관련도 1순위 폴백 채택", keyword)
-        elif 1 <= idx <= len(topk):
+            logger.info("VLM: '%s' 후보 전부 무관 → 빈 슬롯", keyword)
+            return ""
+        if 1 <= idx <= len(topk):
             chosen = topk[idx - 1]
             ordered = [chosen] + [c for c in ordered if c is not chosen]
 
-    for pid, purl in ordered:
+    # 재호스팅은 최대 3개 후보만 시도 — 다운로드 장애(429 등) 시 20개를 끝까지 도는 게
+    # 이미지 단계가 분 단위로 늘어지던 주범. 실패하면 선택 후보의 외부 URL 로 폴백(빈 슬롯 X).
+    for pid, purl in ordered[:3]:
         hosted = _host_candidate(pid, purl, keyword, used)
         if hosted:
             return hosted
-    return ""  # 다운로드/재호스팅 전부 실패 → 빈 슬롯(깨진 외부URL/회색박스 노출 안 함)
+    if ordered:
+        pid, purl = ordered[0]
+        used["pixabay_ids"].add(pid)
+        logger.info("이미지 재호스팅 3회 실패: '%s' → 외부 URL 폴백", keyword)
+        return purl
+    return ""
 
 
 def _search_pixabay_candidates(keyword: str, n: int = 20) -> list[tuple[int, str]]:
@@ -322,7 +324,7 @@ def _rank_by_relevance(hits: list, query: str) -> list[tuple[int, str]]:
 
 
 def _download(url: str) -> bytes:
-    """원격 이미지 다운로드. 크기 상한 초과 시 예외."""
+    """원격 이미지 다운로드. 크기 상한 초과 시 예외. (429 대응은 _host_candidate 서킷브레이커가 담당.)"""
     with httpx.stream("GET", url, timeout=_DOWNLOAD_TIMEOUT, follow_redirects=True) as r:
         r.raise_for_status()
         buf = io.BytesIO()

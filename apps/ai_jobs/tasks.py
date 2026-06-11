@@ -409,6 +409,19 @@ def run_ai_job(self, job_id: str):
             job.set_stage(AiJob.Stage.PARSING_RESPONSE, 70, "생성 결과를 분석하고 있습니다.")
             result_data = extract_json(raw_response)
 
+            # deepseek 가 가끔 page 메타만 내고 blocks 배열을 통째로 생략한다(짧은 게으른
+            # 응답 — 잘림 아님). 그대로 머지하면 "디자인만 바뀐 척"이 되므로 1회 재호출.
+            if job.mode and not isinstance(result_data.get("blocks"), list):
+                logger.warning("AiJob %s: 응답에 blocks 배열 없음 — 1회 재호출", job_id)
+                raw_response = call_llm(
+                    model=model_name,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt
+                    + "\n\n(중요: 직전 응답에 `blocks` 배열이 빠져 있었다. 이번에는 반드시 "
+                    "`page` 와 `blocks` 를 모두 포함한 완전한 JSON 을 출력하라.)",
+                )
+                result_data = extract_json(raw_response)
+
         # ── 3.5 placeholder 복원 + style patch 머지 ──
         # mode 가 있는 리뉴얼 작업은 기존 콘텐츠를 보존한 채 LLM 스타일 패치만 적용.
         input_payload = job.input_payload or {}
@@ -449,6 +462,25 @@ def run_ai_job(self, job_id: str):
             result_data = enforce_compact_links(result_data)
             result_data = ensure_image_placeholders(
                 result_data, category, input_payload.get("concept", "")
+            )
+        elif job.mode == AiJob.Mode.FULL_RESTYLE and not input_payload.get(
+            "preserve_content", False
+        ):
+            # 리메이크 '전체 다시 작성' — 새 페이지 수준 보강. 프롬프트가 추가한 _new
+            # 갤러리/그룹링크의 {{image:}} 와 빈 히어로 슬롯을 resolve 이전에 채우고,
+            # 카드 크기 정책(보조 small/CTA medium/쇼케이스 1개)도 동일 적용.
+            # force_hero_strategy=False: 사용자의 프로필 레이아웃/기존 이미지는 존중.
+            from .services.category_profiles import resolve_category
+            from .services.design_guard import enforce_compact_links
+            from .services.image_guard import ensure_image_placeholders
+
+            category = resolve_category(input_payload)
+            result_data = enforce_compact_links(result_data)
+            result_data = ensure_image_placeholders(
+                result_data,
+                category,
+                input_payload.get("concept", ""),
+                force_hero_strategy=False,
             )
 
         # {{user_image:N}} → 업로드 이미지 URL, {{image:키워드}} → Pixabay (image_catalog 있을 때만 전자)
