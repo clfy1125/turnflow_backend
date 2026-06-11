@@ -711,7 +711,9 @@ def build_recipe_prompt(category: str) -> str:
         "'korean' 같은 국적/인종 한정어도 검색 실패의 주범이니 빼라."
     )
     lines.append(
-        "7. **영상(video) 블록은 쓰지 마라** — 실제 유튜브 링크가 없어 깨진 임베드가 된다(백엔드가 자동 제거)."
+        "7. **영상(video) 블록은 [목표] 컨셉에 실제 영상 URL(youtube/youtu.be/tiktok/vimeo)이 "
+        "주어진 경우에만** — 그 URL 을 `video_urls` 에 그대로 넣어라(다른 URL 창작 절대 금지: "
+        "환각 URL 은 깨진 임베드가 되어 백엔드가 자동 제거한다). 컨셉에 영상 URL 이 없으면 video 금지."
     )
     lines.append(
         "8. **정확한 한국어**: 오타·띄어쓰기 오류 금지(예: '바로'를 '비로', '점심시간'을 '정심시간'으로 쓰지 마라). "
@@ -730,6 +732,17 @@ def build_recipe_prompt(category: str) -> str:
         "11. **text 블록 가독성 설계**: 마크다운(`**볼드**`)·HTML 은 렌더되지 않는다 — 굵게 만들 수 "
         "없으니 **이모지 1개 + 줄바꿈 + 짧은 줄** 로 구조를 만들어라(예: '⏰ 평일 15,000원/시간\\n"
         "🌙 심야 12,000원/시간'). 빈 줄로 문단을 나누고, headline 에 핵심을 담아라."
+    )
+    lines.append(
+        "12. **유틸리티 블록도 적재적소에** (쓸 이유가 있을 때만 — 억지 금지):\n"
+        "    - **search**: 블록이 16개 이상으로 길어지면 profile(과 notice) 바로 아래에 검색 블록 "
+        '1개(`_type:"search"`, search_placeholder 는 페이지 성격에 맞게).\n'
+        "    - **folder**: 같은 성격의 링크/코너가 4개 이상이면 folder(toggle)로 묶어 깔끔하게 — "
+        "하위 블록들에 임시 정수 `id`(예: 101, 102)를 주고 folder 의 `child_block_ids: [101,102]` 로 "
+        "참조하라(백엔드가 실제 ID 로 재매핑). 라벨은 '📚 전체 메뉴 보기' 처럼 내용을 약속하게.\n"
+        "    - **schedule**: 공구 일정·행사·오픈 일정처럼 **실제 날짜가 컨셉에 있으면** schedule 블록 "
+        '사용 가능. 단 **`schedule_layout:"list"` 만**(calendar 는 현재 달만 보여 미래 일정이 '
+        "가려진다). 날짜는 컨셉에 적힌 실제 날짜만 — 임의 창작 금지."
     )
     lines.append("")
     return "\n".join(lines)

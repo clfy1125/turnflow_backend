@@ -474,20 +474,28 @@ def run_ai_job(self, job_id: str):
             from .services.category_profiles import is_long_text_category
 
             long_text_ok = is_long_text_category(category)
+        # 컨셉에 사용자가 직접 넣은 영상 URL 은 진짜 영상 — video 블록 허용(그 외 환각 URL 은 제거).
+        from .services.result_sanitizer import extract_video_urls
+
+        allowed_video = (
+            extract_video_urls(input_payload.get("concept", "")) if is_new_page else None
+        )
         result_data = sanitize_result_json(
-            result_data, long_text_ok=long_text_ok, drop_fabricated_video=is_new_page
+            result_data,
+            long_text_ok=long_text_ok,
+            drop_fabricated_video=is_new_page,
+            allowed_video_urls=allowed_video,
         )
 
-        # ── 4.6 디자인 가드 (새-페이지 생성 한정) ──────────
-        # 슬롭 보라(#8c25f4) 교체 · WCAG 대비 보정 · muddy 방지 등. 리메이크는 style_patcher
-        # 가 따로 처리하므로 baseline 이 있으면(=리메이크) 건너뛴다.
+        # ── 4.6 디자인 가드 ──────────
+        # 슬롭 보라(#8c25f4) 교체 · WCAG 대비 보정 · muddy 방지 등.
         if is_new_page:
             from .services.design_guard import enforce_design_quality
 
             palette = (input_payload.get("image_catalog") or {}).get("palette") or {}
             result_data = enforce_design_quality(result_data, palette=palette)
 
-            # ── 4.7 (opt-in) 스크린샷 비평 보정 루프 ──────────
+            # ── 4.7 (opt-in) 스크린샷 비평 보정 루프 — 새-페이지 한정 ──
             # settings.AI_VISUAL_REFINE 가 켜져 있을 때만. 실패는 비치명적(원본 유지).
             from django.conf import settings as _settings
 
@@ -500,6 +508,20 @@ def run_ai_job(self, job_id: str):
             from .services.design_css import enhance_page_css
 
             result_data = enhance_page_css(result_data, category or "generic")
+        else:
+            # 리메이크: 구조/콘텐츠는 style_patcher 가 보존·머지했고, 여기선 **시각 품질만**
+            # 새-페이지 수준으로 끌어올린다 — ① WCAG 대비/슬롭색/muddy 보정(히어로 보정은
+            # 사용자 레이아웃 존중 차원에서 제외) ② 디자인 킷 CSS(카드 라운드/그림자/등장
+            # 애니메이션). 카테고리는 컨셉+페이지 텍스트에서 추론.
+            from .services.category_profiles import resolve_category as _resolve_cat
+            from .services.design_css import enhance_page_css as _enhance_css
+            from .services.design_guard import enforce_design_quality as _edq
+
+            # fix_hero=True: 모델이 cover_bg 로 바꾸고 이미지를 안 채우면 빈 회색 띠가 뜬다 —
+            # 본문의 실제 이미지를 승격하거나 center 로 강등(콘텐츠 변경 아님, 깨짐 방지).
+            result_data = _edq(result_data, palette={}, fix_hero=True)
+            _remake_cat = _resolve_cat(input_payload)
+            result_data = _enhance_css(result_data, _remake_cat or "generic")
 
         # ── 5. 완료 + 토큰 차감 ──────────────────────
         job.result_json = result_data

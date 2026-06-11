@@ -70,7 +70,8 @@ class AiJobCreateSerializer(serializers.Serializer):
         help_text=(
             "POST /api/v1/ai/source-images/ 로 먼저 업로드한 이미지 id 목록 (최대 10). "
             "전달하면 AI 가 라벨링 후 사용 가능한 이미지를 페이지에 배치한다. "
-            "slug(리메이크)와 함께 쓰면 무시된다 — 새 페이지 생성 시에만 적용."
+            "새 페이지 생성과 리메이크(full_restyle) 모두 지원 — 리메이크에선 기존 이미지는 "
+            "보존되고 첨부 이미지가 새 블록(갤러리/쇼케이스)으로 추가된다. style_only 모드는 미지원."
         ),
     )
 

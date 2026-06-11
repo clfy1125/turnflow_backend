@@ -453,3 +453,34 @@ class TestRobustness:
         # group_link 내부 링크는 채우지 않음(빈 항목은 렌더 시 자연 처리) → 그대로 "".
         assert out["blocks"][2]["data"]["links"][0]["url"] == ""
         assert out["blocks"][2]["data"]["group_layout"] == "list"
+
+
+class TestVideoAllowList:
+    def _video(self, urls):
+        return {"type": "single_link", "data": {"_type": "video", "video_urls": urls}}
+
+    def test_concept_video_url_kept(self):
+        from .services.result_sanitizer import extract_video_urls
+
+        concept = "내 채널 https://youtube.com/watch?v=abc123 영상을 보여줘"
+        allowed = extract_video_urls(concept)
+        data = {"blocks": [self._video(["https://youtube.com/watch?v=abc123"])]}
+        out = sanitize_result_json(data, drop_fabricated_video=True, allowed_video_urls=allowed)
+        assert len(out["blocks"]) == 1
+        assert out["blocks"][0]["data"]["video_urls"] == ["https://youtube.com/watch?v=abc123"]
+
+    def test_fabricated_video_dropped(self):
+        data = {"blocks": [self._video(["https://youtube.com/watch?v=hallucinated"])]}
+        out = sanitize_result_json(data, drop_fabricated_video=True, allowed_video_urls=set())
+        assert out["blocks"] == []
+
+    def test_mixed_urls_filtered_to_allowed(self):
+        allowed = {"https://youtu.be/real1"}
+        data = {"blocks": [self._video(["https://youtu.be/real1", "https://youtu.be/fake2"])]}
+        out = sanitize_result_json(data, drop_fabricated_video=True, allowed_video_urls=allowed)
+        assert out["blocks"][0]["data"]["video_urls"] == ["https://youtu.be/real1"]
+
+    def test_remake_videos_untouched(self):
+        data = {"blocks": [self._video(["https://youtu.be/user-real"])]}
+        out = sanitize_result_json(data, drop_fabricated_video=False)
+        assert len(out["blocks"]) == 1

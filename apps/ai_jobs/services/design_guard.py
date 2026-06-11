@@ -71,12 +71,16 @@ def _card_defaults(ds: dict) -> tuple[str, str]:
     return "#ffffff", "#0f172a"
 
 
-def enforce_design_quality(result: dict, palette: dict | None = None) -> dict:
-    """새-페이지 result_json 을 in-place 보정하고 같은 객체 반환.
+def enforce_design_quality(
+    result: dict, palette: dict | None = None, fix_hero: bool = True
+) -> dict:
+    """result_json 을 in-place 보정하고 같은 객체 반환.
 
     Args:
         result: LLM 생성 결과 (data.design_settings + blocks).
         palette: (선택) 결정적 추출 팔레트 — 슬롭색 교체 시 accent 후보로 사용.
+        fix_hero: 빈 커버 히어로 승격/강등 보정 여부. **리메이크는 False** —
+            사용자의 기존 프로필 레이아웃/이미지 선택을 존중한다(색 대비 보정만 수행).
     """
     if not isinstance(result, dict):
         return result
@@ -99,7 +103,8 @@ def enforce_design_quality(result: dict, palette: dict | None = None) -> dict:
 
     blocks = result.get("blocks")
     if isinstance(blocks, list):
-        _fix_empty_hero(blocks, report)
+        if fix_hero:
+            _fix_empty_hero(blocks, report)
         if ds is not None:
             for b in blocks:
                 if isinstance(b, dict):
@@ -361,7 +366,14 @@ def _guard_block_colors(block: dict, ds: dict, report: dict) -> None:
             data["custom_bg_color"] = cb
             report["block_bg_spread_fixed"] += 1
 
-    eff_bg = cb if C.is_hex(cb) else default_card_bg
+    # plain 텍스트 블록은 카드 없이 **페이지 배경 위에 직접** 렌더된다 — 대비 기준이
+    # 카드가 아니라 page backgroundColor 다(베이지 배경 + 흰 글씨 사고의 원인).
+    # 미지정 text_layout 의 프론트 기본값은 default(boxed) — **명시적 plain 만** 해당.
+    is_plain_text = data.get("_type") == "text" and data.get("text_layout") == "plain"
+    if is_plain_text and C.is_hex(page_bg):
+        eff_bg = page_bg
+    else:
+        eff_bg = cb if C.is_hex(cb) else default_card_bg
     eff_text = ct if C.is_hex(ct) else default_card_text
 
     # 순수 검정 글씨는 부드럽게
@@ -371,9 +383,16 @@ def _guard_block_colors(block: dict, ds: dict, report: dict) -> None:
         eff_text = C.SOFT_BLACK
         report["pure_black_softened"] += 1
 
-    # 카드 글씨 대비 미달 → 글씨색을 카드 대비로 강제(가장 안전)
-    if C.wcag_contrast(eff_bg, eff_text) < MIN_CONTRAST:
+    # 글씨 대비 미달 → 글씨색을 실제 배경 대비로 강제(가장 안전).
+    # 단 plain 텍스트가 custom 색 없이 자동 색을 쓰는 경우는 렌더러가 알아서 잡으므로 패스.
+    if C.wcag_contrast(eff_bg, eff_text) < MIN_CONTRAST and (not is_plain_text or C.is_hex(ct)):
         data["custom_text_color"] = C.contrast_text(eff_bg)
+        report["block_contrast_fixed"] += 1
+
+    # 보조 텍스트색(custom_sub_text_color)도 같은 배경 위 — 함께 검사.
+    sub_ct = (data.get("custom_sub_text_color") or "").strip()
+    if C.is_hex(sub_ct) and C.wcag_contrast(eff_bg, sub_ct) < LARGE_MIN_CONTRAST:
+        data["custom_sub_text_color"] = C.contrast_text(eff_bg)
         report["block_contrast_fixed"] += 1
 
     # 버튼색 대비는 렌더러가 자동(contrast_text(buttonColor))이라 안전 — 손대지 않음.

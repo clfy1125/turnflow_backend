@@ -154,7 +154,7 @@ AI가 링크인바이오 페이지 JSON을 생성하는 **비동기 작업**을 
 | `category` | ❌ | string | **새 페이지 생성 시 명시 권장.** 카테고리별 전용 레시피(섹션 구성·카피 톤·이미지 전략·디자인 변형)가 적용됨. 허용값은 `GET /api/v1/ai/categories/` 의 슬러그: `profile-link`·`digital-card`·`landing`·`portfolio`·`brochure`·`space-booking`·`group-buy`·`invitation`·`affiliate`·`commission`·`promotion`. 비우면 concept 에서 자동 추론 |
 | `slug` | ❌ | string | 리메이크할 기존 페이지의 slug. 전달 시 해당 페이지의 블록을 참고하여 AI가 리메이크 |
 | `model` | ❌ | string | AI 모델 선택. `deepseek`(기본), `gemma`(자체 호스팅), `gpt5`(개발 중) |
-| `image_ids` | ❌ | uuid[] | 새 페이지 생성 시 사용할 업로드 이미지 id (최대 10). `POST /api/v1/ai/source-images/` 로 먼저 업로드. AI가 라벨링 후 사용 가능한 이미지를 페이지에 배치 (slug 리메이크 시 무시) |
+| `image_ids` | ❌ | uuid[] | 업로드 이미지 id (최대 10, `POST /api/v1/ai/source-images/` 로 먼저 업로드). AI가 라벨링 후 페이지에 배치. **새 페이지 생성과 리메이크 모두 지원** — 리메이크에선 기존 이미지 보존 + 첨부 이미지가 새 갤러리/쇼케이스 블록으로 추가 (style_only 모드 제외) |
 | `reference_page_slug` | ❌ | string | 디자인 톤 few-shot 레퍼런스 페이지 slug (`GET /api/v1/ai/categories/{slug}/references/` 에서 선택). 비우면 카테고리 기본 레퍼런스(예: invitation → 검증된 청첩장 디자인) 자동 적용 |
 
 ## 새 페이지 생성 품질 파이프라인 (2026-06 개선)
@@ -405,10 +405,12 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
             input_payload["_baseline_page_meta"] = baseline_page_meta
             input_payload["_placeholder_map"] = placeholder_map
 
-        # 사용자 업로드 이미지 (새 페이지 생성 시에만 — 리메이크는 기존 이미지 placeholder 보호).
+        # 사용자 업로드 이미지 — 새 페이지 생성과 리메이크 모두 지원.
+        # (리메이크에선 기존 이미지가 placeholder freeze 로 보호되고, 첨부 이미지는
+        # 새 블록({{user_image:N}})으로 배치된다. style_only 는 구조 변경 불가라 제외.)
         source_images = []
         raw_image_ids = vd.get("image_ids") or []
-        if raw_image_ids and not slug:
+        if raw_image_ids and mode != "style_only":
             source_images = list(
                 AiSourceImage.objects.filter(
                     id__in=raw_image_ids,

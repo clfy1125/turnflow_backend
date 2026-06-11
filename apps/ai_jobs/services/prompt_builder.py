@@ -426,10 +426,44 @@ def build_prompts(
         ]
         variable_parts += text_policy + design_policy
 
+        # 사용자가 리뉴얼에 첨부한 이미지 — 새 블록으로 배치하게 안내.
+        # (기존 블록 이미지는 placeholder freeze 로 보호되므로 건드리지 않는다.)
+        remake_catalog = user_input.get("image_catalog") or {}
+        remake_usable = remake_catalog.get("usable") or []
+        if remake_usable:
+            rlines = [
+                "### [사용자가 첨부한 이미지 — 새 블록으로 반드시 배치]",
+                "(리뉴얼하면서 사용자가 올린 이미지다. **가능한 한 모두** 페이지에 배치하라.)",
+            ]
+            for item in remake_usable:
+                n = item.get("n")
+                summary = (item.get("summary") or "").strip() or "(요약 없음)"
+                use = (item.get("suggested_use") or "general").strip()
+                rlines.append(f"{n}. {{{{user_image:{n}}}}} — 요약: {summary} · 추천 위치: {use}")
+            rlines += [
+                "배치 방법: ``_new: true`` 새 블록의 이미지 슬롯에 {{user_image:N}} 토큰으로.",
+                "- 여러 장이면 새 gallery 블록(images 배열에 {{user_image:N}} 나열, "
+                'gallery_layout:"thumbnail") 권장.',
+                "- 1~2장이면 새 single_link large 의 thumbnail_url 또는 gallery.",
+                "- 기존 블록의 [IMG_n] placeholder 는 그대로 두고, 새 블록에만 배치한다.",
+                "",
+            ]
+            remake_mood = (remake_catalog.get("mood_notes") or "").strip()
+            if remake_mood:
+                rlines += [
+                    "### [첨부 이미지에서 읽은 디자인 방향]",
+                    remake_mood,
+                    "",
+                ]
+            variable_parts += rlines
+
         variable_parts += [
             f"### [현재 페이지 — full_restyle 대상{chunk_label}]",
             "URL/이미지/연락처는 placeholder([URL_n]/[IMG_n]/[VIDEO_n]/[CONTACT_n]) 로 주어집니다 — 그대로 echo 또는 생략.",
             "필요하면 ``_new: true`` 로 새 블록 추가, 응답에서 누락하면 그 블록은 삭제됩니다.",
+            "새 블록은 text/gallery/single_link/spacer 위주로 — **customer/inquiry 폼은 새로 만들지 마라**"
+            "(입력칸 라벨이 영어로 떠 어색하다. 문의 유도가 필요하면 카카오톡 채널 등 외부 링크 small 로). "
+            "profile 을 cover/cover_bg 로 바꿀 거면 cover_image_url 을 채울 수 있을 때만(빈 커버=회색 띠).",
             f"```json\n{json.dumps(page_json, ensure_ascii=False, indent=2)}\n```",
             "",
         ]

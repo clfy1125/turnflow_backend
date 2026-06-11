@@ -249,3 +249,51 @@ class TestRobustness:
     def test_no_design_settings_no_crash(self):
         assert enforce_design_quality({"blocks": []}) == {"blocks": []}
         assert enforce_design_quality(None) is None
+
+
+class TestPlainTextPageBgContrast:
+    def test_plain_text_white_on_light_page_bg_fixed(self):
+        # 리메이크 1회차 실사고: 베이지 페이지 배경 + plain 텍스트 흰 글씨 → 안 보임.
+        # plain 은 카드 없이 페이지 배경 위에 직접 렌더되므로 page bg 기준으로 보정해야 한다.
+        r = {
+            "data": {
+                "design_settings": {
+                    "backgroundColor": "#f5f0eb",
+                    "blockBgColor": "#ffffff",
+                    "buttonColor": "#8b5e3c",
+                }
+            },
+            "blocks": [
+                {
+                    "type": "single_link",
+                    "data": {
+                        "_type": "text",
+                        "text_layout": "plain",
+                        "custom_text_color": "#ffffff",
+                        "content": "본문",
+                    },
+                }
+            ],
+        }
+        out = enforce_design_quality(r)
+        fixed = out["blocks"][0]["data"]["custom_text_color"]
+        assert C.wcag_contrast("#f5f0eb", fixed) >= 4.5
+
+    def test_boxed_text_still_checked_against_card(self):
+        # 명시 plain 이 아니면(default boxed) 기존처럼 카드 배경 기준.
+        r = {
+            "data": {
+                "design_settings": {
+                    "backgroundColor": "#ffffff",
+                    "blockBgColor": "#ffffff",
+                    "buttonColor": "#111827",
+                }
+            },
+            "blocks": [
+                {"type": "single_link", "data": {"_type": "text", "custom_bg_color": "#1f2430"}}
+            ],
+        }
+        out = enforce_design_quality(r)
+        bd = out["blocks"][0]["data"]
+        eff_text = bd.get("custom_text_color") or "#111827"
+        assert C.wcag_contrast("#1f2430", eff_text) >= 4.5

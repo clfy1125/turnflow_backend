@@ -288,6 +288,28 @@ def _enforce_group_uniformity(blocks: list[dict]) -> list[dict]:
     return blocks
 
 
+_IMAGE_FIELD_KEYS = {"thumbnail_url", "image_url", "cover_image_url", "avatar_url"}
+
+
+def _is_image_placeholder(v) -> bool:
+    return isinstance(v, str) and (v.startswith("{{user_image:") or v.startswith("{{image:"))
+
+
+def _placeholder_image_value(key: str, value):
+    """``_new`` 블록의 이미지 필드에서 **placeholder 만** 통과시킨다.
+
+    Returns:
+        통과시킬 값(문자열 또는 placeholder 만 남긴 리스트). 해당 없으면 ``None``.
+    """
+    if key in _IMAGE_FIELD_KEYS and _is_image_placeholder(value):
+        return value
+    if key == "images" and isinstance(value, list):
+        kept = [x for x in value if _is_image_placeholder(x)]
+        if kept:
+            return kept
+    return None
+
+
 def merge_full_restyle(
     *,
     existing_page_meta: dict,
@@ -419,7 +441,12 @@ def merge_full_restyle(
                 continue
             if k in allowed_style or k in allowed_content:
                 new_data[k] = v
-            # URL/이미지 필드는 무시 (새 블록은 URL 비어둠 — 사용자가 추후 입력).
+            elif _placeholder_image_value(k, v) is not None:
+                # 이미지 placeholder({{user_image:N}}/{{image:키워드}})만 통과 —
+                # 사용자가 리뉴얼에 첨부한 이미지를 새 갤러리/썸네일 블록으로 배치하는 경로.
+                # 환각 raw URL 은 여전히 차단(placeholder 가 아니면 버림).
+                new_data[k] = _placeholder_image_value(k, v)
+            # 그 외 URL 필드는 무시 (새 블록은 URL 비어둠 — 사용자가 추후 입력).
 
         merged_blocks.append(
             {
