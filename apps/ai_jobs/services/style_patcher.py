@@ -295,7 +295,15 @@ def _is_image_placeholder(v) -> bool:
     return isinstance(v, str) and (v.startswith("{{user_image:") or v.startswith("{{image:"))
 
 
-_NEW_LINK_ITEM_KEYS = {"title", "description", "url", "price", "original_price", "badge", "is_enabled"}
+_NEW_LINK_ITEM_KEYS = {
+    "title",
+    "description",
+    "url",
+    "price",
+    "original_price",
+    "badge",
+    "is_enabled",
+}
 
 
 def _sanitize_new_group_links(items) -> list[dict]:

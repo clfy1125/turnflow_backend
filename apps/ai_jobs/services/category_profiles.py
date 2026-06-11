@@ -622,8 +622,15 @@ def hero_strategy(category: str) -> str:
     return get_profile(category).get("hero", "avatar")
 
 
-def build_recipe_prompt(category: str) -> str:
-    """카테고리 레시피를 프롬프트 섹션 문자열로 렌더한다(새-페이지 생성용)."""
+def build_recipe_prompt(category: str, include_mood: bool = True) -> str:
+    """카테고리 레시피를 프롬프트 섹션 문자열로 렌더한다(새-페이지 생성용).
+
+    Args:
+        include_mood: False 면 무드/색 지시를 뺀다 — 컨셉 이미지 팔레트나 레퍼런스
+            템플릿이 디자인 주도권을 가질 때, 레시피의 기본 색 취향(크림/베이지 등)이
+            그것과 경쟁해 "맨날 비슷한 색감"이 되는 문제를 막는다. 구조(섹션)·카피·
+            이미지 전략은 그대로 유지.
+    """
     p = get_profile(category)
     hero_line = (
         "프로필 히어로는 **cover_bg + cover_image_url(대표 이미지)** 로 강한 첫인상을."
@@ -635,9 +642,15 @@ def build_recipe_prompt(category: str) -> str:
         if p["long_text"]
         else "**모든 텍스트는 짧고 스캔 가능하게** — 헤드라인 1줄 + 본문 1~2문장. 긴 문단 금지(특히 about/이용안내는 불릿·짧은 줄로)."
     )
-    lines = [
-        f"### [카테고리 레시피 — {p['label']}]",
-        f"- 무드/색: {p['mood']}",
+    lines = [f"### [카테고리 레시피 — {p['label']}]"]
+    if include_mood:
+        lines.append(f"- 무드/색: {p['mood']}")
+    else:
+        lines.append(
+            "- 무드/색: **이 레시피가 정하지 않는다** — 위/아래에 주어진 팔레트(컨셉 이미지 "
+            "추출 #hex) 또는 레퍼런스 페이지의 색을 그대로 따르라."
+        )
+    lines += [
         f"- 프로필 레이아웃: {hero_line}",
         "- 꼭 들어가야 할 섹션(위→아래, 컨셉에 맞게 가감):",
     ]

@@ -89,7 +89,11 @@ class TestPixabayDedup:
 
 
 class TestVlmGate:
+    """게이트는 기본 OFF(AI_IMAGE_VLM_RERANK=False) — 테스트는 명시적으로 켜고 검증한다."""
+
     def _patch_common(self, ir, monkeypatch):
+        # 게이트는 이제 기본 OFF — 게이트 로직 자체를 검증하는 테스트라 명시적으로 켠다.
+        monkeypatch.setattr(ir.settings, "AI_IMAGE_VLM_RERANK", True, raising=False)
         monkeypatch.setattr(
             ir,
             "_search_pixabay_candidates",

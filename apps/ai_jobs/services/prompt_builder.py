@@ -174,6 +174,29 @@ _SYSTEM_PROMPTS: dict[str, str] = {
 }
 
 
+def resolve_design_lead(user_input: dict) -> str:
+    """새-페이지 생성에서 **디자인 주도권**을 누가 갖는지 결정한다 (프롬프트 전략 라우터).
+
+    세 소스(카테고리 레시피 무드 / 컨셉 이미지 팔레트 / 레퍼런스 템플릿)를 동시에 주입하면
+    서로 경쟁해 "뭘 줘도 비슷한 색감"이 된다(사용자 피드백). 우선순위로 하나만 주도하게 한다:
+
+    - ``template``      — 사용자가 레퍼런스 페이지를 명시 → 그 페이지가 디자인의 단일 기준.
+    - ``concept_image`` — 업로드 이미지에서 팔레트/무드가 추출됨 → 이미지가 색·톤의 단일 기준.
+    - ``recipe``        — 그 외 기본 → 카테고리 레시피 무드 사용.
+
+    (별도 LLM 라우터는 불필요 — 신호가 이미 구조화돼 있다: 명시 슬러그, 라벨링 비전이
+    추출한 palette/mood_notes.)
+    """
+    if (user_input.get("reference_page_slug") or "").strip():
+        return "template"
+    catalog = user_input.get("image_catalog") or {}
+    if (catalog.get("palette") or {}).get("background") or (
+        catalog.get("mood_notes") or ""
+    ).strip():
+        return "concept_image"
+    return "recipe"
+
+
 def build_prompts(
     job_type: str,
     user_input: dict,
@@ -228,10 +251,17 @@ def build_prompts(
     # - reference_page_slug 가 있으면 DB 의 어드민 큐레이션 페이지 1건을 우선 사용.
     example_dir = _EXAMPLE_DIR_MAP.get(job_type, "bio")
     reference_page_slug = (user_input.get("reference_page_slug") or "").strip()
+
+    # 새-페이지: 디자인 주도권 라우팅 (template > concept_image > recipe).
+    design_lead = "" if is_remake else resolve_design_lead(user_input)
+
     # 명시 레퍼런스가 없으면 카테고리 기본 레퍼런스(예: invitation → @wedding)로 폴백.
-    # 검증된 실페이지 디자인을 그대로 학습시키는 게 카테고리 레시피 텍스트보다 강력하다.
-    if not reference_page_slug and new_category:
+    # 단 **recipe 모드일 때만** — 컨셉 이미지가 주도할 때 레퍼런스까지 끼어들면 색감이
+    # 레퍼런스 쪽으로 끌려가 "이미지를 줘도 비슷하게 나오는" 문제가 된다.
+    if not reference_page_slug and new_category and design_lead != "concept_image":
         reference_page_slug = (_cat.get_profile(new_category).get("reference_slug") or "").strip()
+        if reference_page_slug:
+            design_lead = "template"
 
     using_reference = False
     if mode == "style_only":
@@ -252,6 +282,20 @@ def build_prompts(
     else:
         # 새-페이지: 형식·블록 다양성 학습용 2개만(다크 음악 예시 4개 → 테마 모방 유발했음).
         examples = _load_examples(example_dir, max_count=2)
+
+    # 레퍼런스 로드 실패 시 template 주도권 해제 → 남은 신호로 재라우팅.
+    if design_lead == "template" and not using_reference:
+        catalog_sig = user_input.get("image_catalog") or {}
+        design_lead = (
+            "concept_image"
+            if (
+                (catalog_sig.get("palette") or {}).get("background")
+                or catalog_sig.get("mood_notes")
+            )
+            else "recipe"
+        )
+    if not is_remake:
+        logger.info("prompt design_lead=%s (category=%s)", design_lead, new_category)
 
     # 4) 사용자 입력 조합
     concept = user_input.get("concept", "")
@@ -300,8 +344,11 @@ def build_prompts(
             "",
         ]
         # 카테고리 레시피(섹션 구성·한국 실서비스·카피 톤·레이아웃 전략) 주입.
+        # 무드/색 지시는 recipe 주도일 때만 — template/concept_image 주도면 색은 그쪽이 결정.
         if new_category:
-            fixed_parts += [_cat.build_recipe_prompt(new_category)]
+            fixed_parts += [
+                _cat.build_recipe_prompt(new_category, include_mood=(design_lead == "recipe"))
+            ]
     if block_rules:
         fixed_parts += [f"### [블록 규칙]\n{block_rules}", ""]
     if examples:
@@ -446,9 +493,9 @@ def build_prompts(
                 "기존 블록 몇 개에 색만 입힌 결과는 실패다.",
                 "**응답 JSON 에는 `page` 와 `blocks` 배열을 반드시 모두 포함하라 — `blocks` 가 없는 "
                 "응답은 실패로 간주된다.**",
-                "- **섹션 리듬**: 이모지 섹션 헤더(text, text_layout:\"default\", headline 한 줄) → 내용 블록들 → spacer 구분선.",
+                '- **섹션 리듬**: 이모지 섹션 헤더(text, text_layout:"default", headline 한 줄) → 내용 블록들 → spacer 구분선.',
                 "- **비주얼 보강**: 새 gallery 블록(images 에 {{image:영문 구체 키워드}} 4장+) — 업종 분위기를 보여줄 것.",
-                "- **후기 보강**: text toggle 1개(headline \"💬 실제 후기\", content 에 `아이디 ★★★★★\\n한줄평` 5~6개, 실명 금지).",
+                '- **후기 보강**: text toggle 1개(headline "💬 실제 후기", content 에 `아이디 ★★★★★\\n한줄평` 5~6개, 실명 금지).',
                 "- **누락 섹션 보강**: SNS(social), 지도(map — 오프라인 업장이면), 이용안내/FAQ(text toggle), "
                 "가격 안내(text plain) 등 아래 카테고리 레시피의 섹션을 참고해 채워라.",
                 "- 새 group_link 도 가능: links 항목에 title/url(그럴듯한 실제형)/price/badge + thumbnail_url 은 {{image:키워드}}.",
@@ -473,7 +520,7 @@ def build_prompts(
             rlines += [
                 "배치 방법: ``_new: true`` 새 블록의 이미지 슬롯에 {{user_image:N}} 토큰으로.",
                 "- **목록의 모든 {{user_image:N}} 을 빠짐없이 배치하라 — 1장도 누락 금지.** "
-                "기본은 새 gallery 블록(images 배열에 전부 나열, gallery_layout:\"thumbnail\") + "
+                '기본은 새 gallery 블록(images 배열에 전부 나열, gallery_layout:"thumbnail") + '
                 "필요시 1장을 profile cover_image_url 로도 활용.",
                 "- '시술 사진'·'매장 사진' 같은 섹션 헤더를 만들었으면 **바로 아래에 그 gallery** 가 와야 한다(라벨-블록 일치).",
                 "- 기존 블록의 [IMG_n] placeholder 는 그대로 두고, 새 블록에만 배치한다.",
@@ -571,6 +618,13 @@ def build_prompts(
                 "(이미지 픽셀에서 결정적으로 추출한 실제 색이다. 무드 설명보다 **이 구체 #hex 를 최우선**하고, "
                 "비슷한 색으로 바꾸지 마라. 본문 글자색은 배경 대비로 자동 결정되니 textColor 는 넣지 않는다.)",
             ]
+            if design_lead == "concept_image":
+                plines.append(
+                    "**⚠️ 이 팔레트가 이 페이지 디자인의 유일한 색 기준이다** — 카테고리의 통상적 "
+                    "색 취향(크림/베이지/파스텔 등)이나 예시 페이지의 색은 전부 무시하고, 배경/카드/"
+                    "버튼/custom_css 그래디언트까지 모두 이 #hex 계열로만 설계하라. 사용자가 이미지를 "
+                    "올린 이유는 **이 색감을 원해서**다."
+                )
             label_map = [
                 ("background", "backgroundColor (= frameBackgroundColor 동일값)"),
                 ("surface", "blockBgColor (카드 배경)"),
@@ -631,7 +685,11 @@ def build_prompts(
 
     goal_text = concept if concept else "링크인바이오 페이지를 만들어줘."
     if using_reference:
-        goal_text = f"위 예시 레퍼런스 페이지와 비슷한 느낌으로 만들어줘.\n{goal_text}"
+        goal_text = (
+            "위 레퍼런스 페이지가 **디자인의 유일한 기준**이다 — design_settings 색, 카드 스타일, "
+            "폰트, 블록 구성 흐름을 레퍼런스 그대로 따라 하되, 콘텐츠(문구/링크/이미지 키워드)만 "
+            f"아래 목표에 맞게 바꿔라.\n{goal_text}"
+        )
     variable_parts += [
         "### [목표]",
         goal_text,

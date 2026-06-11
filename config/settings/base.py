@@ -559,9 +559,10 @@ AI_VISUAL_REFINE_CYCLES = config("AI_VISUAL_REFINE_CYCLES", default=1, cast=int)
 # 비평기 모델 — 생성기와 다른 독립 모델 권장(비전 필수). 무료 자체호스팅 gemma-4 기본.
 AI_CRITIC_MODEL = config("AI_CRITIC_MODEL", default="gemma-4")
 
-# 이미지 관련도 게이트: Pixabay 후보 N장을 비전 모델에 보여 키워드에 맞는 1장을 고르거나(없으면 거부→
-# 중립 placeholder). 키워드와 무관한 스톡(말벌·풍경·엉뚱한 사물)이 박히는 문제 차단. 키워드당 비전 1콜.
-AI_IMAGE_VLM_RERANK = config("AI_IMAGE_VLM_RERANK", default=True, cast=bool)
+# 이미지 관련도 게이트: Pixabay 후보 N장을 비전 모델에 보여 키워드에 맞는 1장을 고르는 옵션.
+# 키워드당 비전 1콜이 이미지 단계 지연의 주범이라 **기본 OFF**(검색 1순위 그대로 사용) —
+# 무관한 스톡이 간헐 혼입되는 트레이드오프는 감수(사용자 결정 2026-06-11). 필요 시 env 로 재활성화.
+AI_IMAGE_VLM_RERANK = config("AI_IMAGE_VLM_RERANK", default=False, cast=bool)
 AI_IMAGE_VLM_MODEL = config("AI_IMAGE_VLM_MODEL", default="gemma-4")
 
 # Service metadata (used as default email template variables)
