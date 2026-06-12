@@ -411,7 +411,21 @@ def run_ai_job(self, job_id: str):
             )
 
             job.set_stage(AiJob.Stage.PARSING_RESPONSE, 70, "생성 결과를 분석하고 있습니다.")
-            result_data = extract_json(raw_response)
+            try:
+                result_data = extract_json(raw_response)
+            except ValueError:
+                # deepseek 가 가끔 JSON 이 아닌/깨진 응답을 낸다 — celery 재시도(라벨링부터
+                # 전부 재실행)까지 가지 않게 **그 자리에서 강화 지시로 1회 재호출**.
+                logger.warning("AiJob %s: JSON 파싱 실패 — 강화 지시로 1회 재호출", job_id)
+                raw_response = call_llm(
+                    model=model_name,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt
+                    + "\n\n(중요: 직전 응답은 JSON 파싱에 실패했다. 코드펜스·설명·주석 없이 "
+                    "**유효한 JSON 객체 하나만** 출력하라. 모든 문자열은 닫고, 마지막 항목 뒤 "
+                    "쉼표를 넣지 마라.)",
+                )
+                result_data = extract_json(raw_response)
 
             # deepseek 가 가끔 page 메타만 내고 blocks 배열을 통째로 생략한다(짧은 게으른
             # 응답 — 잘림 아님). 그대로 머지하면 "디자인만 바뀐 척"이 되므로 1회 재호출.
@@ -574,6 +588,7 @@ def run_ai_job(self, job_id: str):
         job.stage = AiJob.Stage.COMPLETED
         job.progress = 100
         job.message = "페이지 생성이 완료되었습니다."
+        job.error_message = ""  # 재시도 끝에 성공한 경우 이전 시도의 에러 잔존 방지
         job.finished_at = timezone.now()
         job.save()
 
@@ -600,12 +615,23 @@ def run_ai_job(self, job_id: str):
         logger.info("AiJob 완료: %s", job_id)
 
     except Exception as exc:
-        job.status = AiJob.Status.FAILED
-        job.error_message = str(exc)[:1000]
-        job.message = "생성 중 오류가 발생했습니다."
-        job.finished_at = timezone.now()
-        job.save()
-        logger.exception("AiJob 실패: %s", job_id)
+        # autoretry 가 남아 있으면 **FAILED 를 찍지 않는다** — 1~2초 폴링 중인 프론트가
+        # 재시도 사이의 failed 순간을 목격하고 에러 UI 로 중단하는 사고 방지
+        # (2026-06-12: 1차 JSON 파싱 실패 → 재시도 성공인데 프론트는 실패로 렌더).
+        max_retries = (self.retry_kwargs or {}).get("max_retries", 1)
+        will_retry = getattr(self.request, "retries", 0) < max_retries
+        if will_retry:
+            job.status = AiJob.Status.RUNNING
+            job.message = "일시적인 오류가 발생해 자동으로 다시 시도하고 있습니다..."
+            job.save(update_fields=["status", "message", "updated_at"])
+            logger.warning("AiJob 일시 실패(자동 재시도 예정): %s — %s", job_id, exc)
+        else:
+            job.status = AiJob.Status.FAILED
+            job.error_message = str(exc)[:1000]
+            job.message = "생성 중 오류가 발생했습니다."
+            job.finished_at = timezone.now()
+            job.save()
+            logger.exception("AiJob 실패(최종): %s", job_id)
         raise
 
 
