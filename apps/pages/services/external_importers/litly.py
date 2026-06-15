@@ -28,6 +28,8 @@ import urllib.request
 from datetime import datetime
 from typing import Any, Iterable, Optional
 
+from social_registry import SOCIAL_FIELD_IDS, map_social_type, normalize_social_value
+
 
 # ──────────────────────────────────────────────────────────────────────
 # 상수 / 매핑 테이블
@@ -193,50 +195,10 @@ PROFILE_LAYOUT = {
     'portrait': 'cover_bg',
 }
 
-# TurnflowLink social 블록이 네이티브로 지원하는 키
-SOCIAL_KEYS = {'instagram', 'youtube', 'twitter', 'tiktok', 'phone', 'email'}
+# social 블록 키 집합 / 타입→id 매핑 / 값 정규화는 공용 ``social_registry`` 모듈에 있음
+# (인포크·링크트리 컨버터와 동일 레지스트리 공유). 여기서는 import 해서 쓴다.
 
-# 핸들 → URL 변환 패턴. Litt.ly 는 핸들만 들어와도 자동 라우팅하지만 Turnflow social
-# 블록은 block.data[key] 를 href 에 그대로 박아 핸들이면 링크가 안 동작 → 컨버터에서
-# URL 로 정규화한다.
-SOCIAL_HANDLE_URL_PATTERN = {
-    'instagram': 'https://instagram.com/{}',
-    'youtube': 'https://youtube.com/@{}',
-    'twitter': 'https://twitter.com/{}',
-    'tiktok': 'https://tiktok.com/@{}',
-}
-
-
-_KNOWN_SNS_HOSTS = (
-    'instagram.com', 'twitter.com', 'x.com', 'tiktok.com', 'youtube.com',
-    'youtu.be', 'facebook.com', 'fb.com', 'pinterest.com', 'snapchat.com',
-    'linkedin.com', 'github.com', 'spotify.com', 'soundcloud.com',
-    'twitch.tv', 'vimeo.com', 'tumblr.com', 'reddit.com', 'threads.net',
-    'naver.com', 'blog.naver.com', 'cafe.naver.com', 'tistory.com',
-    'brunch.co.kr', 'medium.com', 'discord.gg', 'discord.com', 'telegram.org',
-    't.me', 'whatsapp.com', 'wa.me', 'line.me',
-)
-
-
-def _normalize_social_value(sns_type: str, v: str) -> str:
-    """핸들 형식 값을 풀 URL 로 변환. 이미 URL/email/phone 이면 그대로 반환.
-    값이 ``twitter.com/handle`` 처럼 알려진 SNS 호스트로 시작하면 ``https://`` 만
-    prepend (이중 호스트 방지). 그 외(예: ``solar._.b`` 같은 점 포함 핸들) 은 플랫폼
-    패턴으로 정규화."""
-    v = (v or '').strip()
-    if v.startswith(('http://', 'https://', 'mailto:', 'tel:')):
-        return v
-    if sns_type in ('email', 'phone'):
-        return v  # 렌더러가 mailto:/tel: 자동 prepend
-    if v.startswith('@'):
-        v = v[1:]
-    vl = v.lower()
-    if any(vl.startswith(h + '/') or vl == h for h in _KNOWN_SNS_HOSTS):
-        return 'https://' + v
-    pattern = SOCIAL_HANDLE_URL_PATTERN.get(sns_type)
-    return pattern.format(v) if pattern else v
-
-# 위 외의 Litt.ly SNS 타입은 single_link 버튼으로 풀어낼 때 라벨로 사용
+# 레지스트리에 없어 single_link 버튼으로 풀어내는 타입의 라벨
 SNS_FALLBACK_LABELS = {
     'homepage': '홈페이지',
     'naverblog': '네이버 블로그',
@@ -574,10 +536,10 @@ def convert_product_link(b: dict) -> dict:
 
 
 def convert_sns(b: dict) -> list[dict]:
-    """instagram/youtube/twitter/tiktok/phone/email은 `social` 블록에, 나머지
-    플랫폼(naverblog, facebook, kakaotalk, ...)은 각각 single_link 버튼으로 풀어낸다.
-    비어있는 social chip 을 보내지 않기 위해, 네이티브 지원 플랫폼이 하나도 없으면
-    social 블록은 아예 생략한다."""
+    """TurnflowLink social 블록이 지원하는 플랫폼(인스타·유튜브·카카오톡·네이버블로그·
+    페북·틱톡·라인·텔레그램·디스코드·트위치 등 30여종, ``social_registry`` 참고)은 한
+    `social` 블록에 모아 담고, 레지스트리에 없는 타입(medium, spotify 등)만 각각
+    single_link 버튼으로 풀어낸다. 네이티브 플랫폼이 하나도 없으면 social 블록은 생략."""
     data: dict[str, Any] = {
         'label': 'SNS 연결',
         'layout': 'small',
@@ -589,8 +551,9 @@ def convert_sns(b: dict) -> list[dict]:
         val = (link.get('value') or '').strip()
         if not _is_valid_sns_value(key, val):
             continue
-        if key in SOCIAL_KEYS:
-            data[key] = _normalize_social_value(key, val)
+        field_id = map_social_type(key)
+        if field_id:
+            data[field_id] = normalize_social_value(field_id, val)
         else:
             label = SNS_FALLBACK_LABELS.get(key) or (key.capitalize() if isinstance(key, str) else '링크')
             fallbacks.append(_compact({
@@ -604,7 +567,7 @@ def convert_sns(b: dict) -> list[dict]:
                 '_synthesized': 'sns_fallback',
             }))
     out: list[dict[str, Any]] = []
-    if any(k in data for k in SOCIAL_KEYS):
+    if any(k in data for k in SOCIAL_FIELD_IDS):
         out.append(_wrap_single_link('social', _compact(data)))
     for fb in fallbacks:
         if fb.get('url'):
@@ -612,33 +575,9 @@ def convert_sns(b: dict) -> list[dict]:
     return out
 
 
-def convert_contact(b: dict) -> dict:
-    """TurnflowLink 렌더러에 전용 contact UI 가 아직 없어서 placeholder로 떨어지지만,
-    라벨 "연락처" + phone/email 데이터는 보존해둔다. (tel:/mailto: URL은 API가 400을 냄)"""
-    phone: Optional[str] = None
-    email: Optional[str] = None
-    country_code: Optional[str] = None
-    for link in b.get('links') or []:
-        t = link.get('type')
-        v = (link.get('value') or '').strip()
-        if not v:
-            continue
-        if t == 'phone':
-            if v.startswith('+'):
-                country_code, phone = _split_country_code(v)
-            else:
-                phone = v
-        elif t == 'email':
-            email = v
-    data = _compact({
-        'label': '연락처',
-        'layout': 'small',
-        'phone': phone,
-        'email': email,
-        'country_code': country_code,
-        'whatsapp': False,
-    })
-    return _wrap_single_link('contact', data)
+# Litt.ly ``contact`` 블록(phone/email)은 별도 컨버터가 없다 — convert_blocks 의 social
+# 머지 단계에서 sns 블록과 합쳐져 social 블록의 phone/email 아이콘(tel:/mailto:)으로 흡수된다.
+# (TurnflowLink 에 contact 블록 타입이 없어 단독으로 두면 죽은 "연락처" placeholder 가 됨.)
 
 
 def convert_subscription(b: dict) -> dict:
@@ -850,7 +789,7 @@ BLOCK_CONVERTERS = {
     'link': convert_link,
     'productLink': convert_product_link,
     'sns': convert_sns,
-    'contact': convert_contact,
+    # 'contact' 는 컨버터 없음 — social 머지로 흡수 (convert_blocks 참고)
     'subscription': convert_subscription,
     'video': convert_video,
     'text': convert_text,
@@ -872,16 +811,21 @@ BLOCK_CONVERTERS = {
 
 def convert_blocks(blocks: list) -> tuple[list, list]:
     """raw Litt.ly blocks[] → TurnflowLink 블록 리스트 + 스킵된 타입 리스트."""
-    # 사용자가 sns 블록을 여러 개로 쪼개놓은 경우(예: podonia 는 ig+yt / ig / blog 3개)
-    # 그대로 변환하면 같은 플랫폼(instagram 등) 이 2번 떠 버림. Litt.ly 는 정렬상 한 번
-    # 만 보이도록 머지 → 첫 번째 sns 블록 자리에 합치고 나머지는 제거.
-    sns_indices = [i for i, b in enumerate(blocks) if b.get('type') == 'sns' and b.get('use', True)]
+    # 사용자가 sns 블록을 여러 개로 쪼개놓거나(예: podonia 는 ig+yt / ig / blog 3개) 별도
+    # ``contact`` 블록(phone/email)을 둔 경우를 한 social 블록으로 머지한다. 이유:
+    #  - 같은 플랫폼(instagram 등)이 2번 뜨는 것 방지
+    #  - TurnflowLink 에 contact 블록이 없어 그대로 두면 죽은 "연락처" placeholder 버튼이 됨.
+    #    contact 의 phone/email 은 social 블록이 네이티브 지원(tel:/mailto:)하므로 아이콘으로 흡수.
+    # → 첫 social 소스(sns|contact) 자리에 합치고 나머지는 제거. (단독 sns 는 그대로 둠.)
+    social_indices = [i for i, b in enumerate(blocks)
+                      if b.get('type') in ('sns', 'contact') and b.get('use', True)]
+    has_contact = any(blocks[i].get('type') == 'contact' for i in social_indices)
     merged_blocks = list(blocks)
-    if len(sns_indices) > 1:
-        first_idx = sns_indices[0]
+    if len(social_indices) > 1 or has_contact:
+        first_idx = social_indices[0]
         seen_types: set = set()
         merged_links: list = []
-        for idx in sns_indices:
+        for idx in social_indices:
             for link in blocks[idx].get('links') or []:
                 t = (link.get('type') or '').strip()
                 v = (link.get('value') or '').strip()
@@ -891,12 +835,10 @@ def convert_blocks(blocks: list) -> tuple[list, list]:
                     continue  # 같은 플랫폼 중복 제거
                 seen_types.add(t)
                 merged_links.append(link)
-        # 첫 sns 블록의 links 를 머지된 리스트로 교체
-        merged_first = dict(blocks[first_idx])
-        merged_first['links'] = merged_links
-        merged_blocks[first_idx] = merged_first
-        # 나머지 sns 블록은 use=False 로 스킵
-        for idx in sns_indices[1:]:
+        # 첫 social 소스 자리에 머지 — contact 가 첫 블록이어도 type='sns' 로 바꿔 social 로 변환.
+        merged_blocks[first_idx] = dict(blocks[first_idx], type='sns', links=merged_links)
+        # 나머지 social 소스 블록(sns/contact)은 use=False 로 스킵
+        for idx in social_indices[1:]:
             merged_blocks[idx] = dict(blocks[idx], use=False)
 
     out: list[dict] = []
@@ -978,30 +920,42 @@ def convert(payload: dict, slug_override: Optional[str] = None) -> dict:
     #    재현하기 위해 블록별 ``custom_*`` 필드를 박는다.
     btn_color = (theme.get('buttonColor') or theme.get('customButtonColor') or '').strip()
     inverted = theme.get('buttonColorLayout') == 'inverted'
+    # 페이지 bg 위에 카드 없이 직접 얹히는 요소(plain 텍스트·구분선·social 아이콘·sns
+    # fallback)의 대비색. 어두운 배경에 검정을 박으면 글씨가 안 보임 (예: traiv_iseong,
+    # bg=#151E28 위 검정 본문). 배경 명도에 맞춰 흰/검정 자동 반전 — 밝은 배경(기본 #F5F5F8
+    # 등)은 검정 그대로라 기존 동작과 동일.
+    page_bg = (theme.get('backgroundColor') or theme.get('customBackgroundColor') or '').strip()
+    bg_img_present = bool(_image_url(theme.get('backgroundImage')))
+    bg_filter = (theme.get('backgroundImageFilter') or '').lower()
+    if bg_img_present and bg_filter in ('dark', 'light'):
+        # 배경 이미지에 dark/light 필터가 걸린 경우 그 힌트가 실제 backdrop 명도 — 우선 적용.
+        on_page_color = '#FFFFFF' if bg_filter == 'dark' else '#000000'
+    else:
+        on_page_color = '#FFFFFF' if _is_dark_color(page_bg) else '#000000'
     for blk in out_blocks:
         if blk.get('type') == 'profile':
             continue
         d = blk.get('data') or {}
         sub = d.get('_type') or ''
-        # social 블록: 아이콘 색을 검정(Litt.ly 디폴트 톤)으로. TurnflowLink 디폴트는 회색.
+        # social 블록: 아이콘 색을 페이지 대비색으로 (어두운 배경=흰 아이콘). TurnflowLink
+        # 디폴트는 회색이라 밝은/어두운 양쪽에서 잘 안 보임.
         if sub == 'social':
-            d.setdefault('custom_icon_color', '#000000')
+            d.setdefault('custom_icon_color', on_page_color)
             continue
         # spacer 블록: Litt.ly 원본에 구분선 색 필드가 없음 — 페이지 bg 위에 잘 보이게
-        # 검정으로 고정. (이전엔 회색/흰색 시도했지만 잘 안 보임)
+        # 대비색 고정 (어두운 배경에선 흰 선, 밝은 배경에선 검은 선).
         if sub == 'spacer':
-            d.setdefault('divider_color', '#000000')
+            d.setdefault('divider_color', on_page_color)
             continue
-        # text 블록: 본문이 페이지 bg 위에 떠야 잘 읽히게 검정으로 박음. Litt.ly 원본도
-        # 본문은 검정. 카드형(text_layout != plain) 인 경우엔 inverted 색칠로 떨어져
-        # 흰 글씨가 됨.
+        # text 블록: 본문이 페이지 bg 위에 직접 떠서 대비색으로 박아야 읽힘. 카드형
+        # (text_layout != plain) 인 경우엔 아래 inverted 색칠로 떨어짐.
         if sub == 'text' and (d.get('text_layout') or 'plain') == 'plain':
-            d.setdefault('custom_text_color', '#000000')
+            d.setdefault('custom_text_color', on_page_color)
             continue
         # 자동 생성된 SNS fallback single_link (원본에 없는 블록) → 글로벌 페이지 bg 따라감.
-        # custom_bg_color 안 박고, 텍스트 색만 페이지 컨트라스트(검정)로 박아 가독성 확보.
+        # custom_bg_color 안 박고, 텍스트 색만 페이지 대비색으로 박아 가독성 확보.
         if d.pop('_synthesized', None) == 'sns_fallback':
-            d.setdefault('custom_text_color', '#000000')
+            d.setdefault('custom_text_color', on_page_color)
             continue
         # inverted 모드: 카드형 블록 (single_link, group_link, customer, inquiry, video,
         # gallery 카드, text-card, donation 등) = buttonColor 배경 + contrast 텍스트.

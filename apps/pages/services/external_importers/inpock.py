@@ -14,6 +14,13 @@
 참조: docs/sources/inpock/spec.json (매핑 계약서)
       ../TurnflowLink/src/app/pages/link/{api.ts,constants.ts,link-types.ts} (타겟 스키마)
 """
+# ── 동기화 메모 (SYNC.md 참고) ──────────────────────────────────────────
+# 이 파일은 TurnflowLinkCopy ``src/convert.py`` 를 벤더링했으나 **selective port** 다
+# (litly/linktree 처럼 verbatim 이 아님): 공용 ``social_registry`` SNS 매핑만 가져오고,
+# 업스트림 main 의 ``/api/r/`` 추적링크 즉시(eager) 해석(resolve_inpock_redirect /
+# preresolve_inpock_links / NetworkDownError)은 **의도적으로 제외**한다(대량 복사 시 inpock
+# IP밴 위험 — 출시는 lazy ``/r/{id}`` 백엔드 구조로 별도 진행). 업스트림 동기화 시 이 파일은
+# 자동 덮어쓰기 금지 — 변경분만 손으로 검토·반영하고 ``_sync.lock.json`` 의 ref 를 갱신한다.
 from __future__ import annotations
 
 import argparse
@@ -26,6 +33,8 @@ import sys
 import urllib.request
 from datetime import datetime
 from typing import Any, Optional
+
+from social_registry import map_social_type, normalize_social_value
 
 
 def _darken_inpock_bg(hex_color: str) -> str:
@@ -151,33 +160,8 @@ def _map_block_alignment(v: Optional[str]) -> str:
     return 'left'
 
 
-SNS_TYPE_TO_FIELD = {
-    # 인포크 type → TurnflowLink social field (실제 지원: instagram/youtube/twitter/tiktok/phone/email).
-    # facebook, naver_blog는 TurnflowLink에 필드 없음 → 드랍.
-    'instagram': 'instagram',
-    'youtube': 'youtube',
-    'tiktok': 'tiktok',
-}
-
-
-def _sns_value_to_url(sns_type: str, value: str) -> str:
-    """인포크 SNS value(username 또는 URL)를 TurnflowLink가 href로 바로 쓸 수 있는 full URL로 정규화.
-    TurnflowLink SocialBlock은 block.data[s]를 그대로 <a href>에 넣기 때문에 username만 넣으면
-    상대경로가 되어 localhost:3000/xxx로 가는 버그 발생 (2026-04-23 09women 검증에서 확인)."""
-    v = (value or '').strip()
-    if not v:
-        return ''
-    if v.startswith(('http://', 'https://')):
-        return v
-    # username만 들어온 경우 플랫폼별 canonical URL
-    if sns_type == 'instagram':
-        return f'https://www.instagram.com/{v.lstrip("@")}/'
-    if sns_type == 'tiktok':
-        return f'https://www.tiktok.com/@{v.lstrip("@")}'
-    if sns_type == 'youtube':
-        # 유튜브는 인포크가 전체 URL을 저장하도록 가이드함 — 혹시 username만 있으면 channel 링크 시도
-        return f'https://www.youtube.com/@{v.lstrip("@")}'
-    return v
+# 인포크 SNS type→id 매핑 / 값 정규화(username→full URL, 09women 상대경로 버그 회피)는
+# 공용 ``social_registry`` 모듈로 이동 — 리틀리·링크트리와 동일 레지스트리 공유.
 
 # ──────────────────────────────────────────────────────────────────────
 # 유틸
@@ -417,31 +401,46 @@ def make_search_block(using_search: Any) -> Optional[dict]:
     return {'type': 'single_link', 'data': data}
 
 
-def make_social_block(sns_list: list) -> Optional[dict]:
+def make_social_block(sns_list: list) -> tuple[Optional[dict], list[dict]]:
+    """인포크 design.sns[] → (social 블록, 폴백 single_link 리스트).
+
+    TurnflowLink social 블록이 지원하는 플랫폼(인스타·유튜브·틱톡·페북·네이버블로그 등
+    30여종, ``social_registry``)은 한 social 블록에 모은다. 인포크 ``blog`` 타입은 거의
+    네이버블로그 URL 이라 ``naver_blog`` 로 넣되, 비-네이버 블로그(예: blog.toss.im)는
+    일반 블로그 버튼으로 보존. 레지스트리에 없는 타입은 드랍(인포크 기존 정책)."""
     if not sns_list:
-        return None
+        return None, []
     data: dict[str, Any] = {
         '_type': 'social',
-        'instagram': '', 'youtube': '', 'twitter': '', 'tiktok': '',
         'is_social': True,
         'url': 'https://social',
         'label': 'SNS 연결',
         'layout': 'small',
     }
-    # 지원되는 인포크 SNS type만 매핑 (facebook, naver_blog 등은 TurnflowLink에 대응 없음 → 드랍)
+    fallbacks: list[dict] = []
     any_set = False
     for sns in sns_list:
         t = sns.get('type')
-        field = SNS_TYPE_TO_FIELD.get(t)
+        val = (sns.get('value') or '').strip()
+        if not val:
+            continue
+        if t == 'blog':
+            # 네이버 호스트면 social 의 naver_blog 아이콘으로, 그 외 일반 블로그는 버튼.
+            if 'blog.naver' in val or 'naver.com' in val:
+                field = 'naver_blog'
+            else:
+                blk = make_blog_link_block(val, title='블로그')
+                if blk:
+                    fallbacks.append(blk)
+                continue
+        else:
+            field = map_social_type(t)
         if not field:
             continue
-        full_url = _sns_value_to_url(t, sns.get('value', ''))
-        if full_url:
-            data[field] = full_url
-            any_set = True
-    if not any_set:
-        return None
-    return {'type': 'single_link', 'data': data}
+        data[field] = normalize_social_value(field, val)
+        any_set = True
+    social = {'type': 'single_link', 'data': data} if any_set else None
+    return social, fallbacks
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -793,15 +792,11 @@ def convert(nextdata: dict, slug_override: Optional[str] = None) -> dict:
     converted, skipped = convert_blocks(blocks, asset_prefix)
     out_blocks.extend(converted)
 
-    # 5. blog SNS → 별도 single_link 블록 (TurnflowLink social 미지원 타입)
-    for sns in design.get('sns') or []:
-        if sns.get('type') == 'blog' and sns.get('value'):
-            blog_block = make_blog_link_block(sns['value'])
-            if blog_block:
-                out_blocks.append(blog_block)
-
-    # 6. social (sns[] 비어있지 않으면 — 마지막에 추가해 인포크의 sns_position='bottom' 기본과 맞춤)
-    social = make_social_block(design.get('sns') or [])
+    # 5+6. social — 지원 플랫폼은 한 social 블록에 모으고, 비-네이버 일반 블로그만 별도
+    # 버튼으로 보존. (이전엔 facebook/naver_blog 를 드랍하고 blog 를 항상 버튼으로 뺐음)
+    # 마지막에 추가해 인포크의 sns_position='bottom' 기본과 맞춤.
+    social, social_fallbacks = make_social_block(design.get('sns') or [])
+    out_blocks.extend(social_fallbacks)
     if social:
         out_blocks.append(social)
 

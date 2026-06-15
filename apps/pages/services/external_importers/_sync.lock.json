@@ -1,0 +1,31 @@
+{
+  "upstream": "https://github.com/Changus99/TurnflowLinkCopy.git",
+  "note": "벤더링된 변환기가 마지막으로 동기화/검토된 업스트림 ref. scripts/sync_importers.py 가 읽고 쓴다. 사람이 직접 편집하지 말 것 — SYNC.md 참고.",
+  "files": {
+    "social_registry.py": {
+      "upstream": "src/social_registry.py",
+      "mode": "verbatim",
+      "ref": "53fea162358d6eafde5138cb21c1f8be4065328d",
+      "synced": "2026-06-15"
+    },
+    "litly.py": {
+      "upstream": "src/convert_litly.py",
+      "mode": "verbatim",
+      "ref": "53fea162358d6eafde5138cb21c1f8be4065328d",
+      "synced": "2026-06-15"
+    },
+    "linktree.py": {
+      "upstream": "src/convert_linktree.py",
+      "mode": "verbatim",
+      "ref": "53fea162358d6eafde5138cb21c1f8be4065328d",
+      "synced": "2026-06-15"
+    },
+    "inpock.py": {
+      "upstream": "src/convert.py",
+      "mode": "selective",
+      "ref": "53fea162358d6eafde5138cb21c1f8be4065328d",
+      "synced": "2026-06-15",
+      "excludes": "/api/r/ eager resolution (resolve_inpock_redirect / preresolve_inpock_links / NetworkDownError). ref 는 '검토 완료 지점'일 뿐 content-equal 이 아님."
+    }
+  }
+}

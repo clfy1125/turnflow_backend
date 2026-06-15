@@ -1,4 +1,7 @@
-.PHONY: help build up down logs shell test migrate makemigrations createsuperuser clean lint format
+.PHONY: help build up down logs shell test migrate makemigrations createsuperuser clean lint format sync-importers
+
+LINKCOPY_REPO ?= ../../TurnflowLinkCopy
+REF ?= origin/main
 
 help:  ## 사용 가능한 명령어 목록 표시
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -66,6 +69,9 @@ clean:  ## Python 캐시 파일 삭제
 	find . -type f -name "*.pyc" -delete 2>/dev/null || true
 	find . -type f -name "*.pyo" -delete 2>/dev/null || true
 	find . -type d -name "*.egg-info" -exec rm -rf {} + 2>/dev/null || true
+
+sync-importers:  ## 외부 임포터 변환기 업스트림 동기화 (dry-run; APPLY=1 로 적용). REF=, LINKCOPY_REPO= 로 override
+	python scripts/sync_importers.py --repo "$(LINKCOPY_REPO)" --ref "$(REF)" $(if $(APPLY),--apply,)
 
 restart:  ## 서비스 재시작
 	docker compose restart

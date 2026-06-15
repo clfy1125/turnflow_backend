@@ -1,9 +1,13 @@
+# 벤더링된 외부 임포터 변환기 — 업스트림(TurnflowLinkCopy)과 byte-identical 유지.
+# whitespace/eof 훅도 손대면 안 됨 (SYNC.md). black/isort/ruff/flake8 제외는 pyproject/.flake8 참고.
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.5.0
     hooks:
       - id: trailing-whitespace
+        exclude: '^apps/pages/services/external_importers/(litly|linktree|inpock|social_registry)\.py$'
       - id: end-of-file-fixer
+        exclude: '^apps/pages/services/external_importers/(litly|linktree|inpock|social_registry)\.py$'
       - id: check-yaml
       - id: check-added-large-files
       - id: check-json
@@ -22,7 +26,9 @@ repos:
     rev: 5.13.2
     hooks:
       - id: isort
-        args: ["--profile", "black", "--line-length", "100"]
+        # --filter-files: isort 가 명시 전달된 파일에도 pyproject 의 skip/extend_skip 을 적용
+        # (벤더링된 변환기 보호 — SYNC.md). 없으면 명시 파일엔 skip 이 무시됨.
+        args: ["--profile", "black", "--line-length", "100", "--filter-files"]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.1.15

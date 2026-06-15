@@ -30,6 +30,8 @@ import sys
 import urllib.request
 from typing import Any, Iterable, Optional
 
+from social_registry import SOCIAL_FIELD_IDS, map_social_type, normalize_social_value
+
 
 # ──────────────────────────────────────────────────────────────────────
 # 상수 / 매핑 테이블
@@ -86,40 +88,20 @@ CORNER_STYLE_SHAPE = {
     'SHARP': 'square',
 }
 
-# TurnflowLink 지원 SNS 필드 (social 블록에 네이티브 렌더)
-SOCIAL_KEYS = {'instagram', 'youtube', 'twitter', 'tiktok', 'phone', 'email'}
+# 네이티브 지원 SNS 필드 집합 / 타입→id 매핑 / 값 정규화는 공용 ``social_registry`` 에 있음.
+# (인포크·리틀리 컨버터와 동일 레지스트리 공유 — 30여종 플랫폼이 social 블록에 네이티브 렌더.)
 
-# Linktree socialLinks[].type → 우리 social 필드 / 폴백 라벨
-SNS_TYPE_MAP = {
-    'INSTAGRAM': ('instagram', None),
-    'YOUTUBE': ('youtube', None),
-    'TIKTOK': ('tiktok', None),
-    'TWITTER': ('twitter', None),
-    'X': ('twitter', None),           # Linktree는 X를 TWITTER와 분리해서 저장
-    'FACEBOOK': (None, 'Facebook'),
-    'SPOTIFY': (None, 'Spotify'),
-    'APPLE_MUSIC': (None, 'Apple Music'),
-    'SOUNDCLOUD': (None, 'SoundCloud'),
-    'SNAPCHAT': (None, 'Snapchat'),
-    'PINTEREST': (None, 'Pinterest'),
-    'LINKEDIN': (None, 'LinkedIn'),
-    'DISCORD': (None, 'Discord'),
-    'TWITCH': (None, 'Twitch'),
-    'VIMEO': (None, 'Vimeo'),
-    'THREADS': (None, 'Threads'),
-    'BLUESKY': (None, 'Bluesky'),
-    'REDDIT': (None, 'Reddit'),
-    'TUMBLR': (None, 'Tumblr'),
-    'CLUBHOUSE': (None, 'Clubhouse'),
-    'WHATSAPP': (None, 'WhatsApp'),
-    'TELEGRAM': (None, 'Telegram'),
-    'EMAIL': ('email', None),
-    'EMAIL_ADDRESS': ('email', None),
-    'PHONE': ('phone', None),
-    'PHONE_NUMBER': ('phone', None),
-    'PHONE_CALL': ('phone', None),
-    'WEBSITE': (None, '홈페이지'),
-    'BLOG': (None, '블로그'),
+# 레지스트리에 없어 single_link 버튼으로 떨구는 Linktree 타입의 폴백 라벨.
+SNS_FALLBACK_LABELS = {
+    'SPOTIFY': 'Spotify',
+    'APPLE_MUSIC': 'Apple Music',
+    'SOUNDCLOUD': 'SoundCloud',
+    'VIMEO': 'Vimeo',
+    'BLUESKY': 'Bluesky',
+    'REDDIT': 'Reddit',
+    'TUMBLR': 'Tumblr',
+    'CLUBHOUSE': 'Clubhouse',
+    'BLOG': '블로그',
 }
 
 # 통화 중 '센트(하위단위)' 개념 없는 ISO 4217 코드 — ``price`` 원값을 그대로 표시.
@@ -446,10 +428,11 @@ def make_social_blocks(social_links: list) -> list[dict]:
         url = (sl.get('url') or '').strip()
         if not url:
             continue
-        native, label = SNS_TYPE_MAP.get(t, (None, t.capitalize()))
-        if native:
-            data[native] = url
+        field_id = map_social_type(t)
+        if field_id:
+            data[field_id] = normalize_social_value(field_id, url)
         else:
+            label = SNS_FALLBACK_LABELS.get(t) or t.capitalize()
             fallbacks.append(_compact({
                 'url': normalize_link_url(url),
                 'label': label or '링크',
@@ -459,7 +442,7 @@ def make_social_blocks(social_links: list) -> list[dict]:
                 'text_align': 'center',
             }))
     out: list[dict] = []
-    if any(k in data for k in SOCIAL_KEYS):
+    if any(k in data for k in SOCIAL_FIELD_IDS):
         out.append(_wrap_single_link('social', _compact(data)))
     for fb in fallbacks:
         if fb.get('url'):

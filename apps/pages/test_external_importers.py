@@ -11,8 +11,6 @@ apps/pages/test_external_importers.py
 
 from __future__ import annotations
 
-import os
-
 import pytest
 from django.contrib.auth import get_user_model
 from rest_framework.test import APIClient
@@ -20,7 +18,6 @@ from rest_framework.test import APIClient
 from apps.pages.models import Block, Page
 from apps.pages.services.external_importers import (
     SOURCES,
-    EmptyPageError,
     UnsupportedSourceError,
     detect_source,
     import_from_url,
@@ -220,14 +217,11 @@ class TestImportExternalView:
         r1 = auth_client.post(IMPORT_URL, {"url": url}, format="json")
         assert r1.status_code == 201
         # 2회: 같은 URL → 재임포트 충돌이 동작하므로 force=true 로 우회
-        r2 = auth_client.post(
-            IMPORT_URL, {"url": url, "force": True}, format="json"
-        )
+        r2 = auth_client.post(IMPORT_URL, {"url": url, "force": True}, format="json")
         assert r2.status_code == 201
         # 테스트 DB 가 dev 와 공유되어 다른 페이지가 섞일 수 있으므로 우리가 만든 것만 좁혀서 검사
         my_slugs = list(
-            Page.objects.filter(user=user, import_source_url=url)
-            .values_list("slug", flat=True)
+            Page.objects.filter(user=user, import_source_url=url).values_list("slug", flat=True)
         )
         assert len(my_slugs) == 2
         assert len(my_slugs) == len(set(my_slugs))  # 두 slug 모두 고유
@@ -264,14 +258,14 @@ class TestReimportConflict:
         assert details["reason"] == "ALREADY_IMPORTED"
         assert details["existing_page"]["id"] == first_id
 
-    def test_force_true_bypasses_conflict(self, mock_mode, auth_client):
+    def test_force_true_bypasses_conflict(self, mock_mode, auth_client, user):
         url = "https://litt.ly/koreanwithmina"
         auth_client.post(IMPORT_URL, {"url": url}, format="json")
-        r2 = auth_client.post(
-            IMPORT_URL, {"url": url, "force": True}, format="json"
-        )
+        r2 = auth_client.post(IMPORT_URL, {"url": url, "force": True}, format="json")
         assert r2.status_code == 201
-        assert Page.objects.filter(import_source_url=url).count() == 2
+        # 테스트 DB 가 dev 와 공유되어 다른 페이지가 섞일 수 있으므로 우리 유저 것만 좁혀 검사
+        # ([test-db-not-clean] — 집계는 user 스코프/델타로 단언).
+        assert Page.objects.filter(user=user, import_source_url=url).count() == 2
 
     def test_other_user_can_import_same_url(self, mock_mode, auth_client, db):
         """재임포트 충돌은 사용자별 — 다른 유저는 같은 URL 임포트 가능."""
@@ -279,7 +273,8 @@ class TestReimportConflict:
         auth_client.post(IMPORT_URL, {"url": url}, format="json")
 
         other = User.objects.create_user(
-            email="other@example.com", password="Pass1234!",
+            email="other@example.com",
+            password="Pass1234!",
         )
         other_client = APIClient()
         other_client.force_authenticate(user=other)
@@ -291,9 +286,7 @@ class TestReimportConflict:
 class TestAsyncMode:
     """``async_mode=true`` 는 AiJob 만 만들고 202 반환. Celery 가 task 픽업."""
 
-    def test_async_returns_202_and_creates_aijob(
-        self, mock_mode, auth_client, monkeypatch
-    ):
+    def test_async_returns_202_and_creates_aijob(self, mock_mode, auth_client, monkeypatch):
         # Celery delay 호출만 캡처 (실제 워커 안 띄움)
         from apps.ai_jobs import tasks as t
 
@@ -447,10 +440,15 @@ class TestReuploadHelpers:
         )
         assert n == 3  # avatar + 2 in gallery
         assert blocks[0]["data"]["avatar_url"] == "/m/x"
-        assert blocks[1]["data"]["images"] == ["/m/y", "https://c"] or blocks[1]["data"]["images"] == [
-            "https://c",
-            "/m/y",
-        ] or blocks[1]["data"]["images"] == ["/m/x", "/m/y", "https://c"]
+        assert (
+            blocks[1]["data"]["images"] == ["/m/y", "https://c"]
+            or blocks[1]["data"]["images"]
+            == [
+                "https://c",
+                "/m/y",
+            ]
+            or blocks[1]["data"]["images"] == ["/m/x", "/m/y", "https://c"]
+        )
         # 정확히는 순서 보존:
         assert blocks[1]["data"]["images"] == ["/m/x", "/m/y", "https://c"]
 
@@ -466,3 +464,255 @@ class TestReuploadHelpers:
         assert d["succeeded"] == 2
         assert d["failed"] == 1
         assert d["failures"][0]["url"] == "http://x.com/img1.jpg"
+
+
+# ─────────────────────────────────────────────────────────────
+# social_registry (인포크/리틀리/링크트리 공용 SNS 레지스트리) — 단위
+# ─────────────────────────────────────────────────────────────
+
+
+class TestSocialRegistry:
+    def test_map_social_type_aliases(self):
+        from apps.pages.services.external_importers import social_registry as sr
+
+        # 대소문자/구분자 무시 — 'NAVER_BLOG'/'naverblog'/'naver blog' 모두 같은 id
+        assert sr.map_social_type("NAVER_BLOG") == "naver_blog"
+        assert sr.map_social_type("naverblog") == "naver_blog"
+        assert sr.map_social_type("naver blog") == "naver_blog"
+        assert sr.map_social_type("kakaotalk") == "kakao_talk"
+        assert sr.map_social_type("x") == "twitter"  # legacy 데이터 키 보존
+        # 미지원/빈 값은 None (호출부에서 single_link 폴백)
+        assert sr.map_social_type("myspace") is None
+        assert sr.map_social_type("") is None
+        assert sr.map_social_type(None) is None
+
+    def test_field_ids_cover_expanded_platforms(self):
+        from apps.pages.services.external_importers import social_registry as sr
+
+        # 프론트 registry.ts 와 1:1 — 확장 플랫폼이 키 집합에 있어야 함
+        for fid in ("instagram", "kakao_talk", "naver_blog", "line", "discord", "twitch"):
+            assert fid in sr.SOCIAL_FIELD_IDS
+        assert len(sr.SOCIAL_FIELD_IDS) >= 30
+
+    def test_normalize_social_value(self):
+        from apps.pages.services.external_importers import social_registry as sr
+
+        # 핸들 → full URL
+        assert sr.normalize_social_value("instagram", "@foo") == "https://www.instagram.com/foo/"
+        assert sr.normalize_social_value("instagram", "foo") == "https://www.instagram.com/foo/"
+        # 도메인스러운 값 → https prepend
+        assert (
+            sr.normalize_social_value("naver_blog", "blog.naver.com/foo")
+            == "https://blog.naver.com/foo"
+        )
+        # 이미 URL 이면 그대로
+        assert (
+            sr.normalize_social_value("tiktok", "https://www.tiktok.com/@bar")
+            == "https://www.tiktok.com/@bar"
+        )
+        # email/phone 은 raw (렌더러가 mailto:/tel: 조립)
+        assert sr.normalize_social_value("email", "mailto:a@b.com") == "a@b.com"
+        assert sr.normalize_social_value("email", "a@b.com") == "a@b.com"
+        assert sr.normalize_social_value("phone", "tel:+8210") == "+8210"
+
+
+# ─────────────────────────────────────────────────────────────
+# litly 변환 — contact 병합 / 확장 SNS / 배경 대비색
+# ─────────────────────────────────────────────────────────────
+
+
+def _litly_payload(blocks, theme=None):
+    return {
+        "alias": "tester",
+        "profile": {"name": "Tester", "headline": "hello"},
+        "theme": theme or {"backgroundColor": "#F5F5F8"},
+        "blocks": blocks,
+    }
+
+
+def _first_social(body):
+    socials = [b for b in body["blocks"] if (b.get("data") or {}).get("_type") == "social"]
+    return socials[0] if socials else None
+
+
+class TestLitlyConvertSocial:
+    def test_contact_merges_into_social_no_dead_block(self):
+        from apps.pages.services.external_importers import litly
+
+        body = litly.convert(
+            _litly_payload(
+                [
+                    {
+                        "type": "sns",
+                        "use": True,
+                        "links": [{"type": "instagram", "value": "https://instagram.com/foo"}],
+                    },
+                    {
+                        "type": "contact",
+                        "use": True,
+                        "links": [
+                            {"type": "phone", "value": "+821012345678"},
+                            {"type": "email", "value": "test@example.com"},
+                        ],
+                    },
+                ]
+            )
+        )
+        # 죽은 contact 블록이 생기면 안 됨
+        assert all(b.get("type") != "contact" for b in body["blocks"])
+        soc = _first_social(body)
+        assert soc is not None
+        data = soc["data"]
+        assert data.get("instagram")
+        assert data.get("phone") == "+821012345678"
+        assert data.get("email") == "test@example.com"
+
+    def test_contact_only_becomes_social(self):
+        from apps.pages.services.external_importers import litly
+
+        body = litly.convert(
+            _litly_payload(
+                [
+                    {
+                        "type": "contact",
+                        "use": True,
+                        "links": [{"type": "email", "value": "solo@example.com"}],
+                    }
+                ]
+            )
+        )
+        assert all(b.get("type") != "contact" for b in body["blocks"])
+        soc = _first_social(body)
+        assert soc is not None
+        assert soc["data"].get("email") == "solo@example.com"
+
+    def test_expanded_sns_fields_preserved(self):
+        from apps.pages.services.external_importers import litly
+
+        body = litly.convert(
+            _litly_payload(
+                [
+                    {
+                        "type": "sns",
+                        "use": True,
+                        "links": [
+                            {"type": "kakaotalk", "value": "https://pf.kakao.com/abc"},
+                            {"type": "naverblog", "value": "https://blog.naver.com/foo"},
+                            {"type": "line", "value": "https://line.me/ti/p/xyz"},
+                        ],
+                    }
+                ]
+            )
+        )
+        soc = _first_social(body)
+        assert soc is not None
+        data = soc["data"]
+        # 확장 SNS id 가 flat 키로 보존 (드랍 X)
+        assert data.get("kakao_talk")
+        assert data.get("naver_blog")
+        assert data.get("line")
+
+    def test_unsupported_sns_becomes_fallback_button(self):
+        from apps.pages.services.external_importers import litly
+
+        body = litly.convert(
+            _litly_payload(
+                [
+                    {
+                        "type": "sns",
+                        "use": True,
+                        "links": [
+                            {"type": "instagram", "value": "https://instagram.com/foo"},
+                            {"type": "medium", "value": "https://medium.com/@foo"},
+                        ],
+                    }
+                ]
+            )
+        )
+        soc = _first_social(body)
+        assert soc is not None
+        # medium 은 레지스트리에 없어 social 키에 안 들어감
+        assert "medium" not in soc["data"]
+        # 대신 별도 single_link 버튼(fallback)으로 보존
+        labels = [
+            (b.get("data") or {}).get("label", "")
+            for b in body["blocks"]
+            if (b.get("data") or {}).get("_type") == "single_link"
+        ]
+        assert any("medium" in lbl.lower() for lbl in labels)
+
+    def test_dark_background_contrast_white_icons(self):
+        from apps.pages.services.external_importers import litly
+
+        body = litly.convert(
+            _litly_payload(
+                [
+                    {
+                        "type": "sns",
+                        "use": True,
+                        "links": [{"type": "instagram", "value": "https://instagram.com/foo"}],
+                    }
+                ],
+                theme={"backgroundColor": "#151E28"},  # 어두운 배경
+            )
+        )
+        soc = _first_social(body)
+        assert soc is not None
+        assert soc["data"].get("custom_icon_color") == "#FFFFFF"
+
+    def test_light_background_contrast_black_icons(self):
+        from apps.pages.services.external_importers import litly
+
+        body = litly.convert(
+            _litly_payload(
+                [
+                    {
+                        "type": "sns",
+                        "use": True,
+                        "links": [{"type": "instagram", "value": "https://instagram.com/foo"}],
+                    }
+                ],
+                theme={"backgroundColor": "#FFFFFF"},  # 밝은 배경
+            )
+        )
+        soc = _first_social(body)
+        assert soc is not None
+        assert soc["data"].get("custom_icon_color") == "#000000"
+
+
+# ─────────────────────────────────────────────────────────────
+# inpock 변환 — 공용 레지스트리 적용 + /api/r/ eager 해석 제외
+# ─────────────────────────────────────────────────────────────
+
+
+class TestInpockSocialRegistry:
+    def test_make_social_block_returns_tuple_with_fallbacks(self):
+        from apps.pages.services.external_importers import inpock
+
+        social, fallbacks = inpock.make_social_block(
+            [
+                {"type": "instagram", "value": "https://instagram.com/foo"},
+                {"type": "blog", "value": "https://blog.naver.com/x"},  # 네이버 → social
+                {"type": "blog", "value": "https://blog.toss.im/y"},  # 비-네이버 → 버튼
+            ]
+        )
+        assert social is not None
+        data = social["data"]
+        assert data.get("instagram")
+        assert data.get("naver_blog")  # 네이버 블로그는 social 아이콘으로 흡수
+        # 비-네이버 블로그는 fallback single_link 로 보존
+        assert len(fallbacks) == 1
+        assert fallbacks[0]["data"]["url"].startswith("https://blog.toss.im")
+
+    def test_make_social_block_empty(self):
+        from apps.pages.services.external_importers import inpock
+
+        assert inpock.make_social_block([]) == (None, [])
+
+    def test_no_eager_api_r_resolution(self):
+        """대량 복사 시 IP밴 위험인 /api/r/ 즉시 해석은 백엔드에 이식되지 않아야 함."""
+        from apps.pages.services.external_importers import inpock
+
+        assert not hasattr(inpock, "resolve_inpock_redirect")
+        assert not hasattr(inpock, "preresolve_inpock_links")
+        assert not hasattr(inpock, "NetworkDownError")

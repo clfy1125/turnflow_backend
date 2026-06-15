@@ -16,6 +16,11 @@ extend-exclude = '''
   | migrations
 )/
 '''
+# external_importers/{litly,linktree,inpock,social_registry}.py 는 TurnflowLinkCopy 에서
+# 벤더링한 파일이라 업스트림과 바이트 동일해야 한다(동기화 깨끗하게). force-exclude 는 디렉터리
+# 순회(make format)뿐 아니라 pre-commit 이 파일을 명시 전달할 때도 적용된다.
+# 정책: apps/pages/services/external_importers/SYNC.md
+force-exclude = '/external_importers/(litly|linktree|inpock|social_registry)\.py$'
 
 [tool.isort]
 profile = "black"
@@ -23,16 +28,25 @@ line_length = 100
 skip_gitignore = true
 known_first_party = ["apps", "config"]
 skip = ["migrations"]
+# 벤더링된 변환기는 정렬 제외 (SYNC.md — verbatim 유지)
+extend_skip = ["litly.py", "linktree.py", "inpock.py", "social_registry.py"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# force-exclude: pre-commit 이 파일을 명시 전달해도 아래 exclude 를 적용 (벤더 파일 보호)
+force-exclude = true
 exclude = [
     ".git",
     ".venv",
     "__pycache__",
     "*/migrations/*",
     "staticfiles",
+    # 벤더링된 변환기 — 업스트림과 verbatim 유지 (SYNC.md). 린터가 손대면 안 됨.
+    "apps/pages/services/external_importers/litly.py",
+    "apps/pages/services/external_importers/linktree.py",
+    "apps/pages/services/external_importers/inpock.py",
+    "apps/pages/services/external_importers/social_registry.py",
 ]
 
 [tool.ruff.lint]

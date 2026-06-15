@@ -1,0 +1,12 @@
+# flake8 설정. pre-commit 의 flake8 훅 인라인 args(--max-line-length / --extend-ignore)와
+# 일치시키되, 벤더링된 변환기(external_importers/{litly,linktree,inpock,social_registry}.py)는
+# 제외한다 — 업스트림(TurnflowLinkCopy)과 byte-identical 로 유지해야 하므로 린트 대상 아님.
+# 정책: apps/pages/services/external_importers/SYNC.md
+[flake8]
+max-line-length = 100
+extend-ignore = E203,W503
+extend-exclude =
+    apps/pages/services/external_importers/litly.py,
+    apps/pages/services/external_importers/linktree.py,
+    apps/pages/services/external_importers/inpock.py,
+    apps/pages/services/external_importers/social_registry.py
