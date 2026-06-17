@@ -8,7 +8,7 @@
         "company-api-mcp"
       ],
       "env": {
-        "OPENAPI_URL": "https://pro-earwig-presently.ngrok-free.app/api/schema/"
+        "OPENAPI_URL": "https://dev-api.turnflow.link/api/schema/"
       }
     }
   }

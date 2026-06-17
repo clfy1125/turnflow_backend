@@ -2,6 +2,7 @@ services:
   db:
     image: postgres:16-alpine
     container_name: instagram_backend_db
+    restart: unless-stopped
     command: postgres -c max_connections=200
     environment:
       POSTGRES_DB: ${DB_NAME:-instagram_service}
@@ -20,6 +21,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: instagram_backend_redis
+    restart: unless-stopped
     command: redis-server --appendonly yes
     volumes:
       - redis_data:/data
@@ -37,6 +39,7 @@ services:
       dockerfile: Dockerfile
     image: instagram_backend_web
     container_name: instagram_backend_web
+    restart: unless-stopped
     command: python manage.py runserver 0.0.0.0:8000
     environment:
       - DJANGO_SETTINGS_MODULE=config.settings.local
@@ -76,6 +79,7 @@ services:
       dockerfile: Dockerfile
     image: instagram_backend_web
     container_name: instagram_backend_celery
+    restart: unless-stopped
     # dev 는 단일 워커가 모든 큐를 소비해야 함 — base.py CELERY_TASK_ROUTES 가 DM/webhook/verify 를
     # 전용 큐로 라우팅하므로, 이 큐들을 안 먹으면 dev 에서 DM 이 적체돼 멈춘다.
     # (prod 는 docker-compose.prod.yml 에서 큐별 전용 워커로 분리 — dev 는 통합 1개로 단순 유지.)
@@ -116,6 +120,7 @@ services:
       dockerfile: Dockerfile
     image: instagram_backend_web
     container_name: instagram_backend_celery_beat
+    restart: unless-stopped
     command: celery -A config beat -l info --pidfile=/tmp/celerybeat.pid
     environment:
       - DJANGO_SETTINGS_MODULE=config.settings.local
@@ -139,6 +144,25 @@ services:
     depends_on:
       - db
       - redis
+      - web
+
+  # Cloudflare Tunnel — 개발 서버를 dev-api.turnflow.link 로 공개 (ngrok 대체).
+  # remotely-managed(토큰) 방식: 공개 호스트명/라우팅(ingress)은 Cloudflare Zero Trust 대시보드에서 설정.
+  #   → 대시보드 Public Hostname 의 Service 는 반드시  http://web:8000  (컨테이너 내부의 localhost 아님)
+  # cloudflared 는 outbound 연결만 하므로 포트 개방/포트포워딩 불필요. DNS(CNAME)는 대시보드가 자동 생성.
+  # 기본 'make up' 에는 안 뜸 — 'tunnel' profile 로만 기동:
+  #   docker compose --profile tunnel up -d cloudflared
+  # 토큰은 .env 의 CLOUDFLARE_TUNNEL_TOKEN. 자세한 셋업: CLOUDFLARE_TUNNEL_SETUP.md
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: instagram_backend_cloudflared
+    restart: unless-stopped
+    # --protocol http2: QUIC(UDP/7844) 가 막히는 환경(Windows/Docker Desktop 등)에서 엣지 연결이
+    # "tls: no application protocol" 로 실패하는 것을 피해 HTTP/2(TCP/7844) 로 고정. QUIC 가 되는
+    # 네트워크면 이 플래그를 빼고 기본(quic)으로 둬도 됨.
+    command: tunnel --no-autoupdate --protocol http2 run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    profiles: ["tunnel"]
+    depends_on:
       - web
 
 volumes:

@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 OPENAPI_URL: str = os.environ.get(
     "OPENAPI_URL",
-    "https://pro-earwig-presently.ngrok-free.app/api/schema/",
+    "https://dev-api.turnflow.link/api/schema/",
 )
 SPEC_CACHE_TTL: int = int(os.environ.get("SPEC_CACHE_TTL", "3600"))
 

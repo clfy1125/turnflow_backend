@@ -81,3 +81,8 @@ test/
 geoip/
 *.mmdb
 nul
+
+# Debug/experiment artifacts (AI 페이지 생성 실험 스크린샷, Playwright MCP 스냅샷)
+# 루트의 디버그 PNG(baseline-*, exp-*, kim-seg*, gb-* 등)와 playwright 페이지 스냅샷.
+/*.png
+/.playwright-mcp/

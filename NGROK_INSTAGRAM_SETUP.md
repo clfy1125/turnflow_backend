@@ -1,5 +1,8 @@
 # Instagram 실제 연동 가이드 (ngrok 사용)
 
+> ℹ️ 개발 서버 공개는 ngrok 대신 **Cloudflare Tunnel(고정 URL `dev-api.turnflow.link`)** 로 이전 권장.
+> 셋업: [CLOUDFLARE_TUNNEL_SETUP.md](CLOUDFLARE_TUNNEL_SETUP.md). 이 문서는 ngrok 기반 IG 연동 참고용으로 유지.
+
 ## 🌐 현재 설정
 
 **ngrok 도메인**: `https://pro-earwig-presently.ngrok-free.app`

@@ -368,6 +368,12 @@ CELERY_BEAT_SCHEDULE = {
         "task": "apps.integrations.tasks.dead_letter_alerter",
         "schedule": 60 * 10,  # 10분 — 토큰 만료/도착 미확인 누적 알림
     },
+    # ===== DM 예약 발송: 활성 기간 자동 종료 =====
+    # scheduled_end_at 이 지난 ACTIVE 캠페인을 COMPLETED 로 전환 (멱등).
+    "dm-enforce-campaign-schedules": {
+        "task": "apps.integrations.tasks.enforce_campaign_schedules",
+        "schedule": 60,  # 1분 — 종료 예약 시각 경과 캠페인 자동 종료
+    },
     # ===== GATE-0 백업 관측 =====
     # 실제 백업은 호스트 cron(deploy/backups/pg_backup.sh + pgBackRest)에서 수행.
     # 이 beat 는 연속 WAL 아카이빙 상태만 감시(pg_stat_archiver) → 실패/지연 시 Telegram.

@@ -35,7 +35,8 @@
       "WebFetch(domain:www.sprinklr.com)",
       "Bash(xargs grep *)",
       "Bash(docker stop clfy_postgres_db *)",
-      "Bash(curl *)"
+      "Bash(curl *)",
+      "PowerShell(Get-ChildItem -Path \"C:\\\\Users\\\\USER\\\\Desktop\\\\CLFY\\\\TurnflowLink-dev\\\\src\\\\app\\\\pages\\\\link\" -Recurse | Where-Object { $_.Extension -match '\\\\.\\(tsx|ts\\)$' } | Select-Object FullName)"
     ]
   },
   "enableAllProjectMcpServers": true,
