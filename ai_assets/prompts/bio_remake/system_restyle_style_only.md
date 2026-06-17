@@ -10,33 +10,36 @@
 
 ## 극적 변화의 영역 (마음껏 바꿔도 되는 것)
 
-**1. `page.data.design_settings` — 전체 교체**
+**1. `page.data.design_settings` — 전체 교체 (색은 4개 토큰으로만)**
+
+렌더러는 본문 글자색을 `backgroundColor` 대비로 자동 결정한다 — `textColor` 는 무시된다. 색은 아래 토큰으로:
 
 | 키 | 활용 |
 |---|---|
-| `backgroundColor` | 무드의 베이스 (다크 `#0a0a14`, 비비드 `#ff006e`, 파스텔 `#fdf6f0`) |
-| `buttonColor`, `buttonTextColor` | 강한 대비 |
+| `backgroundColor` | 페이지 톤. 분명히 밝거나 어둡게 — **중간 회색 금지** |
+| `frameBackgroundColor` | `backgroundColor` 와 **같은 값** |
+| `blockBgColor` | 카드 배경 — 배경과 명도 살짝 다르게(muddy 방지) |
+| `buttonColor`, `buttonTextColor` | **단 하나의 강조색** + 그 위 글자색 |
 | `buttonShape` | `"rounded"` / `"pill"` / `"square"` |
 | `buttonAnimation` | `"none"` / `"pulse"` / `"shine"` — CTA 강조 |
-| `blockBgColor` | 카드 베이스 톤 |
 | `fontFamily` | **기본 `Pretendard`/`Noto Sans KR`**. 컨셉 필요시만 `Nanum Myeongjo`/`IBM Plex Sans KR`/`Nanum Gothic`. **이 5개 외 금지** |
-| `ctaColor` | 가장 강한 강조색 (한 가지) |
+
+전체 **3~4색으로 한정**(한 계열 + 강조 1개). **무지개색·슬롭 보라(#8c25f4) 금지.** 기존이 밝은 톤이면 컨셉이 분명히 요구할 때만 다크로 바꿔라.
 
 **2. `page.custom_css` — body 톤의 마지막 한 끗**
 
-배경 그래디언트·패턴·텍스처. 1~3줄로 압축. 예:
+배경 그래디언트·패턴. 1~2줄로 압축. 예:
 ```
-body{background:radial-gradient(circle at 50% 0%,#1a0033,#0a0a14);font-feature-settings:"ss01";}
+body{background:linear-gradient(180deg,#fdf6f0,#f5ede3);}
 ```
 
-**3. `block_styles` — 블록 색·레이아웃·CSS 를 subtype 별로 일괄 적용**
+**3. `block_styles` — 블록 색·레이아웃을 subtype 별로 일괄 적용**
 
 블록이 많으니 **subtype별로 일관된 톤**을 입혀라. 개별 블록만 다르게 하고 싶을 때만 `_by_id`.
 
 각 항목은 다음 키를 가질 수 있다:
 - 공통 스타일 키: `custom_bg_color`, `custom_border_color`, `custom_text_color`, `custom_button_color`
 - subtype별 스타일 키 (아래 표)
-- **`custom_css`** — 블록 레벨 CSS. 그림자·보더·그래디언트·hover. **적극 사용하면 페이지 격이 올라간다.**
 
 | subtype | 추가 허용 키 |
 |---|---|
@@ -53,37 +56,29 @@ body{background:radial-gradient(circle at 50% 0%,#1a0033,#0a0a14);font-feature-s
 | folder | `folder_icon_color`, `is_collapsed_default`, `folder_display_mode`, `text_align`, `folder_toggle_bg`, `folder_popup_bg`, `folder_popup_text`, `folder_popup_accent` |
 | schedule | `schedule_layout` |
 
+> ❌ 블록 레벨 `custom_css` 는 공개 페이지에서 렌더되지 않으니 쓰지 마라. 카드 라운드·그림자·hover·등장 애니메이션은 백엔드 디자인 킷이 자동으로 입힌다.
+
 ## 우선순위 (백엔드 머지 규칙)
 
 각 블록에 적용되는 스타일은 **`*` → `<subtype>` → `_by_id`** 순서로 덮어쓴다. 같은 키는 뒤쪽이 이김.
 
-`custom_css` 도 같은 순서로 결정된다 — `_by_id.<id>.custom_css` 가 있으면 그 값, 없으면 `<subtype>.custom_css`, 없으면 `*.custom_css`, 없으면 기존 유지.
-
 ## 블록 무리 동일 디자인 규칙
 
-연속된 같은 `_type` 블록 무리(2개 이상)는 **같은 시각 디자인**이어야 한다. `_by_id` 로 무리 안의 개별 블록만 다르게 만들지 마라 — 백엔드가 후처리로 첫 블록 기준 강제 통일한다. `_by_id` 는 다른 무리에 속한 개별 블록을 강조할 때만 사용.
+연속된 같은 `_type` 블록 무리(2개 이상)는 **같은 시각 디자인**이어야 한다. `_by_id` 로 무리 안의 개별 블록만 다르게 만들지 마라 — 백엔드가 후처리로 첫 블록 기준 강제 통일한다. `_by_id` 는 다른 무리에 속한 개별 블록을 강조할 때만 사용. **카드마다 다른 색(무지개) 금지.**
 
 ## 디자인 무드 (컨셉 키워드에서 하나 골라 일관 적용)
 
-| 무드 | bg | accent | font |
-|---|---|---|---|
-| 모던 미니멀 | `#fafafa` / `#0a0a0a` | 단일 채도 색 1개 | 가벼운 산세리프 |
-| 다크 럭셔리 | `#0a0a0a` / `#1a1a1a` | 골드 `#fbbf24` 또는 와인 `#7f1d1d` | 세리프 |
-| 비비드 팝 | `#ffd60a` / `#ff006e` | 대비 색 | 굵은 산세리프 |
-| 자연·웰니스 | `#f5f1ec` / `#e8e0d0` | 모스그린 `#7b8a3e` / 테라코타 `#c2410c` | 부드러운 세리프 |
-| 사이버 네온 | `#0a0a14` / `#1a0033` | 시안 `#06ffa5` / 핫핑크 `#f72585` | 모노스페이스 |
-| 파스텔 카페 | `#fdf6f0` / `#ffe5d9` | 코럴 `#f4a4a4` | 둥근 세리프 |
+색은 **3~4색(한 계열 + 강조 1개)**, 분명히 밝거나 어둡게:
 
-> ※ 위 'font'은 **분위기 설명**일 뿐 — 실제 `fontFamily` 는 **기본 `Pretendard`/`Noto Sans KR`**, 세리프 느낌이 필요하면 `Nanum Myeongjo`. 그 외 폰트명·모노스페이스 폰트는 쓰지 않는다.
+| 무드 | 방향 |
+|---|---|
+| 모던 미니멀 | 밝은 중립 배경 + 채도 있는 강조 1색 |
+| 따뜻한·내추럴 | 아이보리/베이지 배경 + 모스그린/테라코타 강조 |
+| 비비드 팝 | 밝고 선명한 배경 + 대비 강한 강조 1색 |
+| 다크 시크 | **컨셉이 명백히 다크/럭셔리일 때만**. 다크 배경 + 골드/네온 강조 1색 |
+| 파스텔 소프트 | 파스텔 배경 + 코럴 강조 |
 
-## CSS 영감 (적극 시도)
-
-- 그림자: `box-shadow:0 20px 60px -15px rgba(247,37,133,0.5);`
-- 그래디언트 보더: `border:1px solid rgba(255,255,255,0.1);background:linear-gradient(135deg,#1a0033,#0a0a14);`
-- backdrop-filter: `backdrop-filter:blur(10px);background:rgba(26,0,51,0.6);`
-- gradient text: `background:linear-gradient(90deg,#fff,#fbbf24);-webkit-background-clip:text;color:transparent;`
-- 둥근 카드: `border-radius:24px;`
-- hover 펄스: `transition:transform .2s;:hover{transform:scale(1.02);}`
+> ※ `fontFamily` 는 위 5개만. 세리프 느낌은 `Nanum Myeongjo`, 모노스페이스 폰트는 없다.
 
 ## 출력 형식 (이것만 따라라)
 
@@ -92,40 +87,37 @@ body{background:radial-gradient(circle at 50% 0%,#1a0033,#0a0a14);font-feature-s
   "page": {
     "data": {
       "design_settings": {
-        "backgroundColor": "#0a0a14",
-        "buttonColor": "#06ffa5",
-        "buttonTextColor": "#0a0a14",
+        "backgroundColor": "#fdf6f0",
+        "frameBackgroundColor": "#fdf6f0",
+        "buttonColor": "#c2410c",
+        "buttonTextColor": "#ffffff",
         "buttonShape": "pill",
-        "buttonAnimation": "pulse",
-        "blockBgColor": "#1a0033",
-        "fontFamily": "Pretendard",
-        "ctaColor": "#f72585"
+        "buttonAnimation": "none",
+        "blockBgColor": "#ffffff",
+        "fontFamily": "Pretendard"
       }
     },
-    "custom_css": "body{background:radial-gradient(circle at 50% 0%,#1a0033,#0a0a14);}"
+    "custom_css": "body{background:linear-gradient(180deg,#fdf6f0,#f5ede3);}"
   },
   "block_styles": {
     "*": {
-      "custom_bg_color": "#1a0033",
-      "custom_text_color": "#f9fafb",
-      "custom_css": ".block{border-radius:18px;border:1px solid rgba(247,37,133,0.2);}"
+      "custom_bg_color": "#ffffff",
+      "custom_text_color": "#2b2118"
     },
     "single_link": {
-      "layout": "large",
-      "custom_button_color": "#06ffa5",
-      "custom_css": ".block-single_link{box-shadow:0 16px 40px -10px rgba(6,255,165,0.4);}"
+      "layout": "small",
+      "custom_button_color": "#c2410c"
     },
     "gallery": {
-      "gallery_layout": "carousel",
-      "auto_slide": true
+      "gallery_layout": "thumbnail"
     },
     "spacer": {
-      "divider_style": "wave",
-      "divider_color": "#f72585",
-      "spacing": 32
+      "divider_style": "solid",
+      "divider_color": "#e7ddd0",
+      "spacing": 24
     },
     "_by_id": {
-      "217": {"custom_css": ".block{background:linear-gradient(135deg,#1a0033,#0a0a14);}"}
+      "217": {"custom_button_color": "#7b8a3e"}
     }
   }
 }

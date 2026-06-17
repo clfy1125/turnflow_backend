@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from . import services as _  # noqa: F401
-from .services.image_guard import ensure_image_placeholders
+from .services.image_guard import count_empty_image_slots, ensure_image_placeholders
 
 
 def _profile(layout, **kw):
@@ -159,3 +159,56 @@ class TestRobustness:
         out = ensure_image_placeholders(r, "nonexistent")
         # generic = avatar 전략 → center 로
         assert out["blocks"][0]["data"]["profile_layout"] == "center"
+
+
+class TestCountEmptyImageSlots:
+    def test_counts_empty_and_placeholder(self):
+        ph = "https://placehold.co/800x800/efe7e0/efe7e0.png"
+        r = {
+            "blocks": [
+                {"type": "profile", "data": {"profile_layout": "cover_bg", "cover_image_url": ""}},
+                {"data": {"_type": "gallery", "images": ["https://r2/a.jpg", "", ph]}},
+                {
+                    "data": {
+                        "_type": "group_link",
+                        "group_layout": "grid-2",
+                        "links": [
+                            {"title": "A", "thumbnail_url": "https://r2/x.jpg"},
+                            {"title": "B", "thumbnail_url": ""},
+                        ],
+                    }
+                },
+            ]
+        }
+        # cover(1) + gallery(목표4 - 실유효1 = 3) + group_link 빈 썸네일(1) = 5
+        assert count_empty_image_slots(r) == 5
+
+    def test_review_list_excluded(self):
+        r = {
+            "blocks": [
+                {
+                    "data": {
+                        "_type": "group_link",
+                        "group_layout": "list",
+                        "links": [
+                            {"title": "달콤한하루 ★★★★★", "thumbnail_url": ""},
+                            {"title": "mins_pick ★★★★☆", "thumbnail_url": ""},
+                        ],
+                    }
+                }
+            ]
+        }
+        assert count_empty_image_slots(r) == 0  # 후기 리스트는 썸네일 불필요
+
+    def test_full_page_zero(self):
+        r = {
+            "blocks": [
+                {"type": "profile", "data": {"profile_layout": "center", "avatar_url": "u"}},
+                {"data": {"_type": "single_link", "layout": "small", "label": "x"}},
+            ]
+        }
+        assert count_empty_image_slots(r) == 0
+
+    def test_non_dict_safe(self):
+        assert count_empty_image_slots(None) == 0
+        assert count_empty_image_slots({}) == 0

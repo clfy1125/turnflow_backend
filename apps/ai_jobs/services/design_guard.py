@@ -7,8 +7,9 @@
 프론트 렌더러(``PublicLinkPage.tsx`` / ``useBlockColors.ts``)의 실제 색 결정 로직을
 ``color_utils`` 로 포팅해 "렌더 후 보일 색"을 예측하고, WCAG 4.5:1 미달만 최소 침습으로 고친다.
 
-리메이크(full_restyle/style_only)는 ``style_patcher`` 가 따로 처리하므로 건드리지 않는다.
-이 모듈은 **새-페이지 생성 결과 전용**.
+리메이크(full_restyle/style_only)에도 적용된다 — ``style_patcher`` 가 구조/콘텐츠를 보존·머지한
+뒤, ``tasks.run_ai_job`` 이 이 모듈로 시각 품질(대비/슬롭색/빈 히어로)을 새-페이지 수준으로
+끌어올린다. ``fix_hero``/``pin_palette`` 로 리메이크 특성(기존 레이아웃 존중·컨셉 이미지 주도)을 제어.
 """
 
 from __future__ import annotations

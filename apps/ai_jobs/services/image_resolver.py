@@ -20,6 +20,8 @@ import io
 import json
 import logging
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 import httpx
@@ -48,6 +50,10 @@ _DOWNLOAD_TIMEOUT = 15.0
 
 # 재호스팅 경로 프리픽스 (R2/로컬 공통)
 _HOSTED_PREFIX = "ai_images"
+
+# 이미지 해석 병렬도 — 키워드별 검색+다운로드+재호스팅이 I/O 바운드라 스레드풀로 동시 처리해
+# 이미지 단계(직렬 ~15-25s)를 단축한다. Pixabay 레이트리밋을 고려해 4~6 정도가 적정.
+_RESOLVE_MAX_WORKERS = config("AI_IMAGE_RESOLVE_WORKERS", default=5, cast=int)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -79,15 +85,34 @@ def resolve_images(data: dict, *, user_image_urls: dict[str, str] | None = None)
                 logger.warning("{{user_image:%s}} 에 매핑된 URL 없음 → 빈 값으로 제거", n)
             json_str = json_str.replace("{{user_image:" + n + "}}", url)
 
-    # 2) Pixabay 키워드 치환. 같은 이미지가 여러 블록에 중복되지 않도록 used 추적.
+    # 2) Pixabay 키워드 치환 — **병렬**(스레드풀)로 검색/재호스팅 후 **사후 dedup**.
+    #    각 키워드를 독립 실행(자체 used)해 레이스를 없애고, 결과를 등장순으로 훑으며 같은
+    #    이미지(digest)가 두 슬롯에 들어가면 그 키워드만 직렬 재선택한다(충돌은 드물다).
     keywords = list(dict.fromkeys(_IMAGE_PATTERN.findall(json_str)))  # 등장순 보존 + 중복 제거
     if keywords:
-        logger.info("이미지 키워드 %d개 발견, 검색/재호스팅 시작", len(keywords))
-        used = {"hashes": set(), "pixabay_ids": set()}
+        logger.info("이미지 키워드 %d개 발견, 병렬 검색/재호스팅 시작", len(keywords))
+        results: dict[str, tuple[str, str | None]] = {}
+        workers = max(1, min(_RESOLVE_MAX_WORKERS, len(keywords)))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            fut_map = {ex.submit(_resolve_one_detailed, kw): kw for kw in keywords}
+            for fut, kw in fut_map.items():
+                try:
+                    results[kw] = fut.result()
+                except Exception as exc:  # noqa: BLE001 — 한 슬롯 실패가 전체를 막지 않게
+                    logger.warning("이미지 resolve 실패(폴백) '%s': %s", kw, exc)
+                    results[kw] = (_placeholder(kw), None)
+
+        seen: set[str] = set()  # 이미 배치된 이미지 digest — 중복 방지(등장순 결정적)
         for keyword in keywords:
-            final_url = _resolve_one(keyword, used)
-            placeholder = "{{image:" + keyword + "}}"
-            json_str = json_str.replace(placeholder, final_url)
+            url, digest = results.get(keyword) or (_placeholder(keyword), None)
+            if digest and digest in seen:
+                # 다른 키워드가 이미 같은 이미지를 썼다 → seen 을 피해 직렬 재선택.
+                url2, digest2 = _resolve_one_detailed(keyword, forbidden_digests=seen)
+                if url2:
+                    url, digest = url2, digest2
+            if digest:
+                seen.add(digest)
+            json_str = json_str.replace("{{image:" + keyword + "}}", url)
 
     return json.loads(json_str)
 
@@ -151,61 +176,70 @@ def _vlm_pick_index(keyword: str, urls: list[str]) -> int:
 
 
 # Pixabay 다운로드 429(레이트리밋) 서킷브레이커 — 한 번 걸리면 일정 시간 재호스팅을 생략하고
-# 외부 URL 을 그대로 쓴다(요청 폭주 방지 + 이미지 단계 수 분 지연 방지).
+# 외부 URL 을 그대로 쓴다(요청 폭주 방지 + 이미지 단계 수 분 지연 방지). 병렬 실행이므로 lock 보호.
 _RATE_LIMIT_COOLDOWN_S = 180.0
 _rate_limited_until = 0.0
+_rate_limit_lock = threading.Lock()
 
 
-def _host_candidate(pid: int, purl: str, keyword: str, used: dict) -> str | None:
-    """후보 1장을 다운로드/정제/R2 재호스팅. 중복(해시)이면 None. 실패 시 외부 URL/None."""
+def _host_candidate(pid: int, purl: str, keyword: str, used: dict) -> tuple[str | None, str | None]:
+    """후보 1장 다운로드/정제/R2 재호스팅. 반환 ``(url, digest)``.
+
+    - 성공: ``(hosted_url, digest)``  - 외부 URL 폴백(쿨다운/429/재호스팅 실패): ``(purl, None)``
+    - 다운로드 실패/중복(해시): ``(None, None)``
+    """
     global _rate_limited_until
     import time as _time
 
-    if _time.time() < _rate_limited_until:
+    with _rate_limit_lock:
+        cooling = _time.time() < _rate_limited_until
+    if cooling:
         # 쿨다운 중 — 재호스팅 생략, Pixabay 외부 URL 직사용(렌더는 정상).
         used["pixabay_ids"].add(pid)
-        return purl
+        return purl, None
     try:
         raw = _download(purl)
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 429:
-            _rate_limited_until = _time.time() + _RATE_LIMIT_COOLDOWN_S
+            with _rate_limit_lock:
+                _rate_limited_until = _time.time() + _RATE_LIMIT_COOLDOWN_S
             logger.warning(
                 "Pixabay 429 — %ds 쿨다운 시작, 외부 URL 폴백", int(_RATE_LIMIT_COOLDOWN_S)
             )
             used["pixabay_ids"].add(pid)
-            return purl
+            return purl, None
         logger.warning("이미지 다운로드 실패 (%s): %s", purl, exc)
-        return None
+        return None, None
     except Exception as exc:  # noqa: BLE001
         logger.warning("이미지 다운로드 실패 (%s): %s", purl, exc)
-        return None
+        return None, None
     try:
         hosted_url, digest = _store_hosted(raw, source_url=purl)
     except Exception as exc:  # noqa: BLE001
         logger.warning("이미지 재호스팅 실패 (%s): %s → 외부 URL", purl, exc)
         used["pixabay_ids"].add(pid)
-        return purl
+        return purl, None
     if digest in used["hashes"]:
-        return None  # 다른 키워드가 이미 쓴 동일 이미지 → 중복 방지
+        return None, None  # 다른 키워드가 이미 쓴 동일 이미지 → 중복 방지
     used["hashes"].add(digest)
     used["pixabay_ids"].add(pid)
     logger.info("이미지 재호스팅 완료: '%s' → %s", keyword, hosted_url)
-    return hosted_url
+    return hosted_url, digest
 
 
-def _resolve_one(keyword: str, used: dict | None = None) -> str:
-    """키워드 → Pixabay 후보(관련도순) → (비전 게이트로) 적합한 1장 → 재호스팅 → 서비스 URL.
+def _resolve_one_detailed(
+    keyword: str, forbidden_digests: frozenset[str] | set[str] = frozenset()
+) -> tuple[str, str | None]:
+    """키워드 → Pixabay 후보(관련도순) → (비전 게이트로) 1장 → 재호스팅 → ``(url, digest)``.
 
-    1) 후보를 태그-관련도로 정렬(``_search_pixabay_candidates``).
-    2) ``AI_IMAGE_VLM_RERANK`` 켜져 있으면 상위 N장을 비전 모델에 보여 **키워드에 맞는 1장**을 고른다.
-       - 비전이 "적합 없음(0)" 이면 엉뚱한 사진을 넣느니 **중립 placeholder** 를 쓴다(잘못된 이미지 < 빈 이미지).
-    3) 선택(또는 기존 순서)대로 다운로드/재호스팅. ``used`` 로 페이지 내 중복 방지.
+    각 호출은 **독립**이라 병렬 안전(자체 ``used``). ``forbidden_digests`` 를 주면 그 이미지는
+    피해 재선택한다(사후 dedup 충돌 처리용). digest 는 hosted 일 때만 채워지고, placeholder/외부
+    URL 폴백/빈 슬롯이면 None(그런 슬롯은 dedup 대상이 아니다).
     """
-    used = used if used is not None else {"hashes": set(), "pixabay_ids": set()}
+    used = {"hashes": set(forbidden_digests), "pixabay_ids": set()}
     candidates = _search_pixabay_candidates(keyword)
     if not candidates:
-        return _placeholder(keyword)
+        return _placeholder(keyword), None
 
     ordered = [c for c in candidates if c[0] not in used["pixabay_ids"]] or list(candidates)
 
@@ -215,7 +249,7 @@ def _resolve_one(keyword: str, used: dict | None = None) -> str:
         idx = _vlm_pick_index(keyword, [u for _pid, u in topk])
         if idx == 0:
             logger.info("VLM: '%s' 후보 전부 무관 → 빈 슬롯", keyword)
-            return ""
+            return "", None
         if 1 <= idx <= len(topk):
             chosen = topk[idx - 1]
             ordered = [chosen] + [c for c in ordered if c is not chosen]
@@ -223,15 +257,23 @@ def _resolve_one(keyword: str, used: dict | None = None) -> str:
     # 재호스팅은 최대 3개 후보만 시도 — 다운로드 장애(429 등) 시 20개를 끝까지 도는 게
     # 이미지 단계가 분 단위로 늘어지던 주범. 실패하면 선택 후보의 외부 URL 로 폴백(빈 슬롯 X).
     for pid, purl in ordered[:3]:
-        hosted = _host_candidate(pid, purl, keyword, used)
+        res = _host_candidate(pid, purl, keyword, used)
+        if res is None:  # 패치/예외 폴백 — 실패로 간주
+            continue
+        hosted, digest = res
         if hosted:
-            return hosted
+            return hosted, digest
     if ordered:
         pid, purl = ordered[0]
         used["pixabay_ids"].add(pid)
         logger.info("이미지 재호스팅 3회 실패: '%s' → 외부 URL 폴백", keyword)
-        return purl
-    return ""
+        return purl, None
+    return "", None
+
+
+def _resolve_one(keyword: str, used: dict | None = None) -> str:
+    """하위호환 thin wrapper — URL 만 반환. 페이지 내 dedup 은 resolve_images 의 사후 dedup 담당."""
+    return _resolve_one_detailed(keyword)[0]
 
 
 def _search_pixabay_candidates(keyword: str, n: int = 20) -> list[tuple[int, str]]:

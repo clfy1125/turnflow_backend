@@ -250,7 +250,10 @@ def _enforce_group_uniformity(blocks: list[dict]) -> list[dict]:
 
     통일 대상:
       - data 내부의 색·layout·정렬 키 (``_GROUP_UNIFORM_DATA_KEYS``)
-      - block.custom_css (블록 레벨 CSS)
+      - block.custom_css (블록 레벨 CSS — 보존/머지는 하지만 **공개 페이지에서는 렌더되지
+        않는다**(2026-06-15 라이브 DOM 재확인). 카드 디자인은 page-level 디자인킷
+        (``design_css.enhance_page_css``)이 입힌다. 그래서 리뉴얼 프롬프트는 블록 custom_css 를
+        더 이상 요청하지 않는다 — 들어와도 죽은 값이라 무해하므로 머지 로직은 그대로 둔다.)
 
     예외 — **쇼케이스 남발 방지**:
       - 그룹의 첫 블록이 ``layout: "large"`` 여도 나머지 블록은 ``"small"`` 로 강등한다.

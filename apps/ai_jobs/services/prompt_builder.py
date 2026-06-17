@@ -197,6 +197,64 @@ def resolve_design_lead(user_input: dict) -> str:
     return "recipe"
 
 
+def _infer_remake_category(user_input: dict) -> str:
+    """리뉴얼 페이로드에서 카테고리를 추론한다 — 명시 category 우선, 없으면 concept +
+    기존 페이지 제목/블록 텍스트로 추론. full_restyle(existing_blocks)·style_only(sample_blocks)
+    양쪽을 모두 본다(모드별로 동일 카테고리를 쓰기 위함)."""
+    meta = user_input.get("existing_page_meta") or {}
+    blocks = user_input.get("existing_blocks") or user_input.get("sample_blocks") or []
+    bits = [user_input.get("concept") or "", str(meta.get("title") or "")]
+    for b in blocks[:10]:
+        d = (b.get("data") if isinstance(b, dict) else None) or {}
+        for k in ("headline", "label", "content", "subline"):
+            v = d.get(k)
+            if isinstance(v, str) and v:
+                bits.append(v[:120])
+    return _cat.resolve_category(
+        {"category": user_input.get("category") or "", "concept": " ".join(bits)[:800]}
+    )
+
+
+def _palette_prompt_lines(palette: dict, design_lead: str) -> list[str]:
+    """추출 팔레트 #hex 를 design_settings 색으로 쓰라는 프롬프트 라인(새-페이지·리뉴얼 공용).
+
+    비전 라벨러가 이미지에서 직접 읽은 색(#hex)은 prose(mood_notes)보다 구체적이라
+    design_settings 색을 이 값에 맞추라고 명시한다. concept_image 가 디자인을 주도할 때는
+    이 팔레트를 유일한 색 기준으로 못 박는다."""
+    if not palette:
+        return []
+    plines = [
+        "### [이미지에서 추출한 색 팔레트 — 이 #hex 를 그대로 design_settings 에 써라]",
+        "(이미지 픽셀에서 결정적으로 추출한 실제 색이다. 무드 설명보다 **이 구체 #hex 를 최우선**하고, "
+        "비슷한 색으로 바꾸지 마라. 본문 글자색은 배경 대비로 자동 결정되니 textColor 는 넣지 않는다.)",
+    ]
+    if design_lead == "concept_image":
+        plines.append(
+            "**⚠️ 이 팔레트가 이 페이지 디자인의 유일한 색 기준이다** — 카테고리의 통상적 "
+            "색 취향(크림/베이지/파스텔 등)이나 예시 페이지의 색은 전부 무시하고, 배경/카드/"
+            "버튼/custom_css 그래디언트까지 모두 이 #hex 계열로만 설계하라. 사용자가 이미지를 "
+            "올린 이유는 **이 색감을 원해서**다."
+        )
+    label_map = [
+        ("background", "backgroundColor (= frameBackgroundColor 동일값)"),
+        ("surface", "blockBgColor (카드 배경)"),
+        ("accent", "buttonColor (단 하나의 강조색 — 버튼/소셜/뱃지)"),
+    ]
+    for key, label in label_map:
+        if palette.get(key):
+            plines.append(f"- {label}: {palette[key]}")
+    if palette.get("brightness"):
+        plines.append(
+            f"- 전체 밝기: {palette['brightness']} (참고용 — backgroundColor 는 위 #hex "
+            "**그대로**. 더 어둡게/밝게 변형 금지. 체크리스트의 '분명히 밝거나 어둡게' "
+            "지시보다 이 #hex 가 우선이다)"
+        )
+    if palette.get("dominant_colors"):
+        plines.append(f"- 이미지 주요 색(참고): {', '.join(palette['dominant_colors'])}")
+    plines.append("")
+    return plines
+
+
 def build_prompts(
     job_type: str,
     user_input: dict,
@@ -223,6 +281,15 @@ def build_prompts(
 
     # 새-페이지 생성: 카테고리 결정(명시 category 우선, 없으면 concept 추론).
     new_category = None if is_remake else _cat.resolve_category(user_input)
+    # 리뉴얼: 카테고리 디자인 규율(섹션 청사진 제외)·rewrite 풀 레시피에 쓸 카테고리.
+    remake_category = _infer_remake_category(user_input) if is_remake else ""
+
+    # job 디자인 시드(tasks 가 input_payload 에 심음). 무드/폰트 다양화 + 후기 게이트에 쓴다.
+    seed = int(user_input.get("_design_seed") or 0)
+    include_reviews_new = _cat.should_include_reviews(new_category, seed) if new_category else False
+    include_reviews_remake = (
+        _cat.should_include_reviews(remake_category, seed) if remake_category else False
+    )
 
     # 1) System prompt
     if is_remake and mode == "full_restyle":
@@ -252,8 +319,10 @@ def build_prompts(
     example_dir = _EXAMPLE_DIR_MAP.get(job_type, "bio")
     reference_page_slug = (user_input.get("reference_page_slug") or "").strip()
 
-    # 새-페이지: 디자인 주도권 라우팅 (template > concept_image > recipe).
-    design_lead = "" if is_remake else resolve_design_lead(user_input)
+    # 디자인 주도권 라우팅 (template > concept_image > recipe). 리뉴얼도 동일하게 적용 —
+    # reference_page_slug / image_catalog 신호만 읽으며 둘 다 리뉴얼 페이로드에도 존재한다
+    # (단 style_only 는 image_catalog 가 없어 concept_image 로는 안 떨어지고 template/recipe 만).
+    design_lead = resolve_design_lead(user_input)
 
     # 명시 레퍼런스가 없으면 카테고리 기본 레퍼런스(예: invitation → @wedding)로 폴백.
     # 단 **recipe 모드일 때만** — 컨셉 이미지가 주도할 때 레퍼런스까지 끼어들면 색감이
@@ -294,8 +363,13 @@ def build_prompts(
             )
             else "recipe"
         )
-    if not is_remake:
-        logger.info("prompt design_lead=%s (category=%s)", design_lead, new_category)
+    logger.info(
+        "prompt design_lead=%s (category=%s, remake=%s, mode=%s)",
+        design_lead,
+        new_category or remake_category or "",
+        is_remake,
+        mode or "",
+    )
 
     # 4) 사용자 입력 조합
     concept = user_input.get("concept", "")
@@ -347,7 +421,35 @@ def build_prompts(
         # 무드/색 지시는 recipe 주도일 때만 — template/concept_image 주도면 색은 그쪽이 결정.
         if new_category:
             fixed_parts += [
-                _cat.build_recipe_prompt(new_category, include_mood=(design_lead == "recipe"))
+                _cat.build_recipe_prompt(
+                    new_category,
+                    include_mood=(design_lead == "recipe"),
+                    seed=seed,
+                    include_reviews=include_reviews_new,
+                )
+            ]
+    elif (
+        is_remake
+        and remake_category
+        and not (mode == "full_restyle" and not user_input.get("preserve_content", False))
+    ):
+        # 리뉴얼 style_only / full_restyle+preserve_content — 구조를 보존해야 하므로 카테고리
+        # **디자인 규율만** 주입(섹션 청사진·블록 수 floor 제외). full_restyle rewrite 는
+        # 가변부에서 풀 레시피를 받으므로 여기서는 제외(중복 방지).
+        fixed_parts.append(
+            _cat.build_recipe_prompt(
+                remake_category,
+                include_mood=False,
+                structural=False,
+                seed=seed,
+                include_reviews=include_reviews_remake,
+            )
+        )
+        if design_lead == "recipe":
+            fixed_parts += [
+                "- **색/무드는 기존 페이지를 기준**으로 컨셉에 맞게 다듬어라(전면 교체보다 개선). "
+                "단 무지개색·슬롭 보라(#8c25f4)·중간 회색 배경은 피하고 3~4색으로 정리.",
+                "",
             ]
     if block_rules:
         fixed_parts += [f"### [블록 규칙]\n{block_rules}", ""]
@@ -447,24 +549,30 @@ def build_prompts(
             ]
 
         design_policy = [
-            "### [디자인 — 극적 변화 권장 / CSS 필수 작성]",
-            "텍스트와는 별개로 **시각적 정체성은 컨셉에 맞게 완전히 새로 설계**하라. 보수적으로 가지 마라.",
+            "### [디자인 — 색·레이아웃을 컨셉에 맞게 새로 설계]",
+            "텍스트와는 별개로 **시각적 정체성은 컨셉에 맞게 새로 설계**하라. 단 카드 라운드·그림자·"
+            "등장 애니메이션 같은 폴리시는 **백엔드 디자인 킷이 자동으로 입힌다** — 직접 CSS 로 만들 "
+            "필요 없다. 너는 색·폰트·레이아웃·블록 구성에 집중하라.",
             "",
-            "**디자인은 다음 3 가지 레이어가 모두 채워질 때 완성된다 — 셋 다 반드시 작성**:",
-            "1. ``page.data.design_settings`` (전체 교체) — 배경·버튼색·폰트·강조색.",
-            "2. ``page.custom_css`` (**비워두지 마라**) — 페이지 전역 톤의 마지막 한 끗. body 배경 그래디언트/패턴, font-feature-settings, 전역 typography 같은 한두 줄로도 충분. 빈 문자열로 응답하면 백엔드가 무시한다.",
-            "   예: ``body{background:radial-gradient(circle at 50% 0%,#1a0033,#0a0a14);font-feature-settings:'ss01';}``",
-            "3. 각 블록의 ``custom_css`` — box-shadow, border-radius, backdrop-filter, gradient text, hover 효과 등. 한 블록이 그냥 색만 바뀌는 게 아니라 카드 자체가 변해야 한다.",
+            "**채워야 할 2 레이어**:",
+            "1. ``page.data.design_settings`` (전체 교체) — **4개 색 토큰으로만** 설계:",
+            "   - ``backgroundColor`` = ``frameBackgroundColor`` (같은 값. 분명히 밝거나 어둡게 — 중간 회색 금지)",
+            "   - ``blockBgColor`` (카드 배경 — 배경과 명도 살짝 다르게. 너무 같으면 흐릿/muddy)",
+            "   - ``buttonColor`` (**단 하나의 강조색** — 버튼/소셜/뱃지에만). ``buttonShape``/``buttonAnimation``/``fontFamily`` 도 무드에 맞게.",
+            "   - **textColor 는 넣지 마라** — 본문 글자색은 배경 대비로 자동 결정된다.",
+            "2. ``page.custom_css`` (**비워두지 마라**) — body 배경(은은한 그래디언트) **한두 줄만**. "
+            "예: ``body{background:linear-gradient(180deg,#FFF8F0,#F5EDE3);}``",
             "",
-            "추가로:",
-            "- 블록 색(``custom_bg_color``, ``custom_text_color``, ``custom_button_color``) 컨셉에 맞게 과감히.",
+            "- 전체 3~4색으로 한정 — 한 색 계열 + 강조 1개가 가장 세련됐다(무지개색·슬롭 보라 #8c25f4 금지).",
             "- ``*_layout`` 적극 다양화 (``layout: large``, ``gallery_layout: carousel`` 등).",
+            "- ❌ **블록(Block) 단위 ``custom_css`` 는 공개 페이지에서 렌더되지 않는다 — 만들지 마라.** "
+            "카드 그림자·라운드·hover 는 디자인 킷이 자동 처리하므로 토큰 낭비다.",
             "",
             '**유일한 시각 자제 항목**: 기존 블록에 ``custom_border_color`` 가 없었으면 새로 넣지 마라. ``text_layout: "plain"`` 인 블록은 ``default`` 로 바꾸지 마라 (백엔드가 막는다). 그 외 모든 시각 변화는 자유.',
             "",
             "### [블록 무리 — 같은 디자인 통일]",
-            "**연속된 같은 _type 블록 무리(2개 이상)는 같은 시각 디자인을 가져야 한다.** 같은 기능을 가진 카드가 각기 다른 톤이면 페이지가 어수선해진다.",
-            "- 예: ``single_link/single_link`` 4개가 연속이면 4개 모두 동일한 ``custom_bg_color``·``custom_text_color``·``custom_button_color``·``custom_css`` 사용.",
+            "**연속된 같은 _type 블록 무리(2개 이상)는 같은 시각 디자인을 가져야 한다.** 같은 기능을 가진 카드가 각기 다른 톤이면 페이지가 어수선해진다. **카드마다 다른 색(무지개 버튼) 금지.**",
+            "- 예: ``single_link/single_link`` 4개가 연속이면 4개 모두 동일한 ``custom_bg_color``·``custom_text_color``·``custom_button_color`` 사용.",
             "- 무리 간 구분은 spacer / divider 블록으로 — 무리 안의 개별 차이로 X.",
             "- 백엔드가 후처리로 연속 무리의 시각 스타일을 첫 블록 기준으로 강제 통일한다. AI 가 다양화해도 무시되니 처음부터 통일해서 응답하라.",
             "",
@@ -477,16 +585,8 @@ def build_prompts(
         # (이게 없으면 모델이 기존 블록 재스타일에 그쳐 결과가 빈약하다. preserve 모드는
         # 내용 보존이 우선이라 제외 — 디자인 정책만으로 충분.)
         if not preserve_content:
-            _infer_bits = [concept, str(existing_page_meta.get("title") or "")]
-            for _b in existing_blocks[:10]:
-                _d = _b.get("data") or {}
-                for _k in ("headline", "label", "content", "subline"):
-                    _v = _d.get(_k)
-                    if isinstance(_v, str) and _v:
-                        _infer_bits.append(_v[:120])
-            remake_category = _cat.resolve_category({"concept": " ".join(_infer_bits)[:800]})
             target_blocks = max(len(existing_blocks) + 6, 14)
-            variable_parts += [
+            _rewrite_lines = [
                 "### [전체 다시 작성 — 새 페이지 설계 수준으로 보강 (핵심)]",
                 f"기존 블록 재스타일에 **그치지 마라**. 새 페이지를 만들 듯 페이지 전체를 다시 설계하고, "
                 f"부족한 섹션을 ``_new: true`` 블록으로 적극 보강해 **최종 {target_blocks}개 이상**이 되게 하라. "
@@ -495,13 +595,27 @@ def build_prompts(
                 "응답은 실패로 간주된다.**",
                 '- **섹션 리듬**: 이모지 섹션 헤더(text, text_layout:"default", headline 한 줄) → 내용 블록들 → spacer 구분선.',
                 "- **비주얼 보강**: 새 gallery 블록(images 에 {{image:영문 구체 키워드}} 4장+) — 업종 분위기를 보여줄 것.",
-                '- **후기 보강**: text toggle 1개(headline "💬 실제 후기", content 에 `아이디 ★★★★★\\n한줄평` 5~6개, 실명 금지).',
+            ]
+            if include_reviews_remake:
+                _rewrite_lines.append(
+                    '- **후기 보강**: text toggle 1개(headline "💬 실제 후기", content 에 '
+                    "`아이디 ★★★★★\\n한줄평` 5~6개, 실명 금지)."
+                )
+            _rewrite_lines += [
                 "- **누락 섹션 보강**: SNS(social), 지도(map — 오프라인 업장이면), 이용안내/FAQ(text toggle), "
                 "가격 안내(text plain) 등 아래 카테고리 레시피의 섹션을 참고해 채워라.",
                 "- 새 group_link 도 가능: links 항목에 title/url(그럴듯한 실제형)/price/badge + thumbnail_url 은 {{image:키워드}}.",
                 "",
-                _cat.build_recipe_prompt(remake_category),
+                _cat.build_recipe_prompt(
+                    remake_category,
+                    include_mood=(design_lead == "recipe"),
+                    structural=True,
+                    block_floor=target_blocks,
+                    seed=seed,
+                    include_reviews=include_reviews_remake,
+                ),
             ]
+            variable_parts += _rewrite_lines
 
         # 사용자가 리뉴얼에 첨부한 이미지 — 새 블록으로 배치하게 안내.
         # (기존 블록 이미지는 placeholder freeze 로 보호되므로 건드리지 않는다.)
@@ -534,6 +648,9 @@ def build_prompts(
                     "",
                 ]
             variable_parts += rlines
+
+        # 컨셉 이미지 팔레트(#hex) — concept_image 주도면 색의 단일 기준(팔레트 없으면 [] 반환).
+        variable_parts += _palette_prompt_lines(remake_catalog.get("palette") or {}, design_lead)
 
         variable_parts += [
             f"### [현재 페이지 — full_restyle 대상{chunk_label}]",
@@ -611,38 +728,7 @@ def build_prompts(
             ]
         # 비전 라벨러가 이미지에서 직접 읽은 색(#hex). prose(mood_notes)보다 구체적이라
         # design_settings 색을 이 값에 맞추라고 명시 — 색감 재현 정확도를 높이는 핵심.
-        palette = image_catalog.get("palette") or {}
-        if palette:
-            plines = [
-                "### [이미지에서 추출한 색 팔레트 — 이 #hex 를 그대로 design_settings 에 써라]",
-                "(이미지 픽셀에서 결정적으로 추출한 실제 색이다. 무드 설명보다 **이 구체 #hex 를 최우선**하고, "
-                "비슷한 색으로 바꾸지 마라. 본문 글자색은 배경 대비로 자동 결정되니 textColor 는 넣지 않는다.)",
-            ]
-            if design_lead == "concept_image":
-                plines.append(
-                    "**⚠️ 이 팔레트가 이 페이지 디자인의 유일한 색 기준이다** — 카테고리의 통상적 "
-                    "색 취향(크림/베이지/파스텔 등)이나 예시 페이지의 색은 전부 무시하고, 배경/카드/"
-                    "버튼/custom_css 그래디언트까지 모두 이 #hex 계열로만 설계하라. 사용자가 이미지를 "
-                    "올린 이유는 **이 색감을 원해서**다."
-                )
-            label_map = [
-                ("background", "backgroundColor (= frameBackgroundColor 동일값)"),
-                ("surface", "blockBgColor (카드 배경)"),
-                ("accent", "buttonColor (단 하나의 강조색 — 버튼/소셜/뱃지)"),
-            ]
-            for key, label in label_map:
-                if palette.get(key):
-                    plines.append(f"- {label}: {palette[key]}")
-            if palette.get("brightness"):
-                plines.append(
-                    f"- 전체 밝기: {palette['brightness']} (참고용 — backgroundColor 는 위 #hex "
-                    "**그대로**. 더 어둡게/밝게 변형 금지. 체크리스트의 '분명히 밝거나 어둡게' "
-                    "지시보다 이 #hex 가 우선이다)"
-                )
-            if palette.get("dominant_colors"):
-                plines.append(f"- 이미지 주요 색(참고): {', '.join(palette['dominant_colors'])}")
-            plines.append("")
-            variable_parts += plines
+        variable_parts += _palette_prompt_lines(image_catalog.get("palette") or {}, design_lead)
 
         # 레퍼런스 스크린샷에서 읽은 구조 — 히어로/블록순서/카드스타일을 원본에 맞춘다.
         structure = image_catalog.get("structure") or {}

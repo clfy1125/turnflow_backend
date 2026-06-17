@@ -223,6 +223,72 @@ def _guard_block_images(data: dict, gallery_kw: _Cycler, thumb_kw: _Cycler, repo
             report["link_thumb_filled"] += 1
 
 
+def _is_empty_img(v) -> bool:
+    """resolve 후 빈 이미지 슬롯 — 빈 문자열/None 또는 회색 placeholder(placehold.co)."""
+    if not (isinstance(v, str) and v.strip()):
+        return True
+    return "placehold.co" in v
+
+
+def count_empty_image_slots(result: dict) -> int:
+    """resolve_images 후 남은 빈 이미지 슬롯 수(2차 보강 필요 판단용, read-only).
+
+    ``ensure_image_placeholders`` 가 채우는 자리와 동일하게 센다: profile cover/avatar(레이아웃
+    기준), gallery images(목표 미달분), group_link 항목 thumbnail(후기/계좌/가격표 리스트 제외),
+    쇼케이스 single_link(large) thumbnail. 빈 슬롯이 임계 미만이면 refill 패스를 건너뛴다(속도).
+    """
+    if not isinstance(result, dict):
+        return 0
+    n = 0
+    try:
+        blocks = result.get("blocks")
+        if not isinstance(blocks, list):
+            return 0
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            d = b.get("data")
+            if not isinstance(d, dict):
+                continue
+            if _is_profile(b):
+                layout = d.get("profile_layout") or d.get("layout") or "center"
+                if layout in _COVER_LAYOUTS and _is_empty_img(d.get("cover_image_url")):
+                    n += 1
+                if layout in _AVATAR_LAYOUTS and _is_empty_img(d.get("avatar_url")):
+                    n += 1
+                continue
+            sub = d.get("_type")
+            if sub == "gallery":
+                imgs = d.get("images")
+                imgs = [x for x in imgs if isinstance(x, str)] if isinstance(imgs, list) else []
+                real = [x for x in imgs if not _is_empty_img(x)]
+                if len(real) < _GALLERY_TARGET:
+                    n += _GALLERY_TARGET - len(real)
+            elif sub == "group_link":
+                links = d.get("links")
+                if not isinstance(links, list):
+                    continue
+                enabled = [
+                    ln for ln in links if isinstance(ln, dict) and ln.get("is_enabled", True)
+                ]
+                if not enabled or _looks_review_group(enabled) or _looks_account_group(enabled):
+                    continue
+                if d.get("group_layout") not in _IMAGE_GROUP_LAYOUTS and _looks_price_table(
+                    enabled
+                ):
+                    continue
+                n += sum(1 for ln in enabled if _is_empty_img(ln.get("thumbnail_url")))
+            elif sub == "single_link":
+                if d.get("layout") in _SHOWCASE_LINK_LAYOUTS and _is_empty_img(
+                    d.get("thumbnail_url")
+                ):
+                    n += 1
+    except Exception:  # noqa: BLE001
+        logger.exception("count_empty_image_slots 실패(무시)")
+        return 0
+    return n
+
+
 def ensure_image_placeholders(
     result: dict,
     category: str,

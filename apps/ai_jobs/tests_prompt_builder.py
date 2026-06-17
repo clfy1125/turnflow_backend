@@ -132,3 +132,93 @@ class TestBuildPromptsBranching:
         )
         # style_only 는 예시 미포함 — 레퍼런스도 무시.
         assert "감성 카페" not in user_p
+
+
+class TestRemakeParity:
+    """리뉴얼(remake) 에 새-페이지 디자인 규율/레시피가 모드별로 주입되는지."""
+
+    def _existing_blocks(self):
+        return [
+            {
+                "id": 1,
+                "type": "profile",
+                "order": 1,
+                "data": {"headline": "베베마켓", "subline": "유아용품 공동구매"},
+            },
+            {
+                "id": 2,
+                "type": "single_link",
+                "order": 2,
+                "data": {"label": "공구 신청", "url": "[URL_1]"},
+            },
+        ]
+
+    def test_full_restyle_rewrite_injects_structural_recipe(self, db):
+        _, user_p = build_prompts(
+            "bio_remake",
+            {
+                "concept": "유아용품 공동구매 페이지",
+                "existing_blocks": self._existing_blocks(),
+                "existing_page_meta": {"title": "베베마켓"},
+                "preserve_content": False,
+            },
+            mode="full_restyle",
+        )
+        # rewrite = 새 페이지 설계 수준 — 구조 청사진 + 풍성화 가이드 포함.
+        assert "전체 다시 작성" in user_p
+        assert "꼭 들어가야 할 섹션" in user_p
+        # 보편 디자인 규율도 포함.
+        assert "링크 카드 3단계 크기 정책" in user_p
+        # 블록 custom_css 금지로 전환됐는지(stale 제거 확인).
+        assert "렌더되지 않는다" in user_p
+
+    def test_full_restyle_preserve_injects_discipline_only(self, db):
+        _, user_p = build_prompts(
+            "bio_remake",
+            {
+                "concept": "유아용품 공동구매 페이지",
+                "existing_blocks": self._existing_blocks(),
+                "existing_page_meta": {"title": "베베마켓"},
+                "preserve_content": True,
+            },
+            mode="full_restyle",
+        )
+        # preserve = 구조 보존 → 디자인 규율만(섹션 청사진·풍성화 없음).
+        assert "링크 카드 3단계 크기 정책" in user_p  # 규율
+        assert "꼭 들어가야 할 섹션" not in user_p  # 청사진 제외
+        assert "전체 다시 작성" not in user_p  # 풍성화 제외
+        assert "[텍스트 콘텐츠 — 보존]" in user_p
+
+    def test_style_only_injects_discipline_only(self, db):
+        _, user_p = build_prompts(
+            "bio_remake",
+            {
+                "concept": "유아용품 공동구매 페이지",
+                "sample_blocks": [{"id": 1, "type": "profile", "data": {}}],
+                "all_block_ids": [1, 2, 3],
+                "existing_page_meta": {"title": "베베마켓"},
+            },
+            mode="style_only",
+        )
+        assert "링크 카드 3단계 크기 정책" in user_p  # 규율
+        assert "꼭 들어가야 할 섹션" not in user_p  # 청사진 제외
+
+    def test_full_restyle_concept_image_injects_palette(self, db):
+        _, user_p = build_prompts(
+            "bio_remake",
+            {
+                "concept": "공동구매",
+                "existing_blocks": self._existing_blocks(),
+                "existing_page_meta": {"title": "베베마켓"},
+                "preserve_content": False,
+                "image_catalog": {
+                    "palette": {"background": "#101820", "accent": "#f2a900"},
+                    "mood_notes": "다크 럭셔리",
+                    "usable": [],
+                },
+            },
+            mode="full_restyle",
+        )
+        assert "이미지에서 추출한 색 팔레트" in user_p
+        assert "#101820" in user_p
+        assert "유일한 색 기준" in user_p  # concept_image 주도 강조

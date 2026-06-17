@@ -37,10 +37,12 @@ class TestUserImageResolve:
         assert out == data
 
     def test_pixabay_keyword_left_for_existing_path(self, monkeypatch):
-        # {{image:키워드}} 는 기존 경로(_resolve_one)로 위임 — 여기선 키워드가 그대로 검출되는지만 확인.
+        # {{image:키워드}} 는 병렬 경로(_resolve_one_detailed)로 위임 — 키워드 검출만 확인.
         import apps.ai_jobs.services.image_resolver as ir
 
-        monkeypatch.setattr(ir, "_resolve_one", lambda kw, *a, **k: f"RESOLVED::{kw}")
+        monkeypatch.setattr(
+            ir, "_resolve_one_detailed", lambda kw, *a, **k: (f"RESOLVED::{kw}", None)
+        )
         data = {
             "blocks": [{"data": {"image_url": "{{user_image:1}}", "bg": "{{image:cafe interior}}"}}]
         }
@@ -148,3 +150,40 @@ class TestVlmGate:
         data = {"blocks": [{"data": {"a": "{{image:cafe}}"}}]}
         out = resolve_images(data)
         assert out["blocks"][0]["data"]["a"] == "https://r2/1.jpg"
+
+
+class TestParallelResolve:
+    def test_worker_exception_falls_back_to_placeholder(self, monkeypatch):
+        # 한 키워드 resolve 가 터져도 그 슬롯만 placeholder 로, 나머지는 정상 해석(병렬·비치명).
+        import apps.ai_jobs.services.image_resolver as ir
+
+        def fake(kw, *a, **k):
+            if "boom" in kw:
+                raise RuntimeError("explode")
+            return (f"https://r2/{kw}.jpg", kw)
+
+        monkeypatch.setattr(ir, "_resolve_one_detailed", fake)
+        data = {"blocks": [{"data": {"a": "{{image:boom kw}}", "b": "{{image:good kw}}"}}]}
+        out = resolve_images(data)
+        assert out["blocks"][0]["data"]["a"].startswith("https://placehold.co/")
+        assert out["blocks"][0]["data"]["b"] == "https://r2/good kw.jpg"
+
+    def test_duplicate_digest_reresolved(self, monkeypatch):
+        # 두 키워드가 같은 digest 로 수렴하면 두 번째는 seen 을 피해 재선택(중복 이미지 방지).
+        import apps.ai_jobs.services.image_resolver as ir
+
+        calls = {"n": 0}
+
+        def fake(kw, forbidden_digests=frozenset()):
+            # 1차: 둘 다 dig1. 재선택(forbidden 에 dig1 있음): dig2.
+            if "dig1" in forbidden_digests:
+                return ("https://r2/2.jpg", "dig2")
+            return ("https://r2/1.jpg", "dig1")
+
+        monkeypatch.setattr(ir, "_resolve_one_detailed", fake)
+        data = {"blocks": [{"data": {"a": "{{image:k1}}"}}, {"data": {"b": "{{image:k2}}"}}]}
+        out = resolve_images(data)
+        a = out["blocks"][0]["data"]["a"]
+        b = out["blocks"][1]["data"]["b"]
+        assert a != b
+        assert {a, b} == {"https://r2/1.jpg", "https://r2/2.jpg"}

@@ -15,6 +15,8 @@ salondeletter 모바일 청첩장(인사말이 길어도 되는 유일한 예외
 
 from __future__ import annotations
 
+from .design_seed import pick
+
 # ── 카테고리 키(슬러그) ──────────────────────────────────────
 PROFILE = "profile"
 BIZCARD = "bizcard"
@@ -175,7 +177,6 @@ CATEGORY_PROFILES: dict[str, dict] = {
             "촬영/작업 안내(요금 요약 — text 짧게, 표처럼)",
             "예약·문의 CTA(네이버 예약/카카오톡 채널 — small)",
             "인스타 피드로 유도하는 small 링크('📷 인스타그램 @핸들에서 더 보기')",
-            "후기(text toggle 1개 — 아이디 ★ 한줄평 5~6개)",
             "About 약력(text plain, **2~3문장으로 아주 짧게** — 긴 자기소개 금지)",
         ],
         "services": [
@@ -521,7 +522,7 @@ CATEGORY_PROFILES: dict[str, dict] = {
             "프로필 헤더 + 한 줄 소개",
             "대표 CTA 1개",
             "주요 링크 group_link",
-            "갤러리 또는 후기",
+            "갤러리",
             "문의/SNS",
         ],
         "services": ["카카오톡 채널", "인스타·유튜브", "스마트스토어", "문의 폼"],
@@ -629,14 +630,128 @@ def hero_strategy(category: str) -> str:
     return get_profile(category).get("hero", "avatar")
 
 
-def build_recipe_prompt(category: str, include_mood: bool = True) -> str:
-    """카테고리 레시피를 프롬프트 섹션 문자열로 렌더한다(새-페이지 생성용).
+# ── 다양화: job 시드로 무드/폰트를 풀에서 고른다(색은 가드가 최종 결정) ──────────
+# 각 프로필의 base ``mood`` 가 풀의 0번, 아래 _EXTRA_MOODS 가 대안. 모두 슬롭(#8c25f4)·
+# 네온·중간회색 금지를 내장한 "취향만 다른" 안전 옵션 — 같은 업종도 job 마다 색감이 달라진다.
+_EXTRA_MOODS: dict[str, list[str]] = {
+    PROFILE: [
+        "쿨·미니멀. 화이트/라이트그레이 배경 + 차분한 블루/세이지 포인트 1색, 여백 넉넉히.",
+        "다크 무드. 차콜/딥네이비 배경 + 선명한 포인트 1색(네온·보라 금지).",
+    ],
+    BIZCARD: [
+        "웜 프로페셔널. 아이보리/그레이지 배경 + 딥그린 또는 버건디 포인트 1색.",
+    ],
+    LANDING: [
+        "다크 테크. 차콜/딥네이비 배경 + 일렉트릭 블루/민트 포인트 1색(촌스러운 그래디언트 금지).",
+        "웜 미니멀. 오프화이트 배경 + 코럴/앰버 포인트 1색, 큰 타이포.",
+    ],
+    PORTFOLIO: [
+        "갤러리 다크. 차콜/블랙 배경 + 화이트 텍스트, 작품이 빛나는 미술관 톤.",
+    ],
+    BROCHURE: [
+        "프레시 내추럴. 화이트/세이지/베이지 + 우드 포인트, 자연스러운 톤.",
+    ],
+    RENTAL: [
+        "모던 호텔. 차콜/그레이지 + 골드/브라스 포인트 1색, 고급스러운 여백.",
+    ],
+    GROUPBUY: [
+        "프레시 딜. 화이트 배경 + 비비드 그린/민트 포인트 + 큰 숫자, 깔끔한 긴급감.",
+    ],
+    INVITATION: [
+        "클래식 그린. 세이지/올리브 + 아이보리 + 골드 포인트, 명조(Nanum Myeongjo).",
+    ],
+    AFFILIATE: [
+        "웜 추천. 크림/베이지 배경 + 테라코타 포인트 1색, 상품 썸네일 강조.",
+    ],
+    COMMISSION: [
+        "잉크 모노. 화이트 + 차콜 라인 + 포인트 1색(만화 컷 느낌), 가격/주의 박스는 정돈.",
+    ],
+    PROMO: [
+        "축제 비비드. 딥퍼플 또는 마젠타 배경 + 옐로/시안 포인트(과한 무지개 금지), 큰 숫자.",
+    ],
+    GENERIC: [
+        "웜 뉴트럴. 베이지/크림 배경 + 차분한 포인트 1색.",
+        "다크 심플. 차콜 배경 + 밝은 포인트 1색(네온 금지).",
+    ],
+}
+
+# 카테고리별 폰트 풀(5종 화이트리스트 내). 중복 = 가중치(invitation 은 명조 강하게 bias).
+_FONT_WHITELIST = (
+    "Pretendard",
+    "Noto Sans KR",
+    "IBM Plex Sans KR",
+    "Nanum Gothic",
+    "Nanum Myeongjo",
+)
+_FONT_POOL_BY_CATEGORY: dict[str, list[str]] = {
+    PROFILE: ["Pretendard", "Noto Sans KR", "Nanum Gothic"],
+    BIZCARD: ["Pretendard", "IBM Plex Sans KR"],
+    LANDING: ["Pretendard", "IBM Plex Sans KR"],
+    PORTFOLIO: ["IBM Plex Sans KR", "Pretendard", "Nanum Myeongjo"],
+    BROCHURE: ["Pretendard", "Nanum Myeongjo", "Noto Sans KR"],
+    RENTAL: ["Pretendard", "Nanum Myeongjo"],
+    GROUPBUY: ["Pretendard", "Noto Sans KR"],
+    INVITATION: ["Nanum Myeongjo", "Nanum Myeongjo", "Noto Sans KR"],
+    AFFILIATE: ["Pretendard", "Noto Sans KR"],
+    COMMISSION: ["Nanum Gothic", "Pretendard"],
+    PROMO: ["Pretendard", "Noto Sans KR"],
+    GENERIC: ["Pretendard", "Noto Sans KR"],
+}
+
+# 후기(고객 리뷰)를 자동으로 넣을 카테고리 — 커머스형만. 그 외엔 강제하지 않는다.
+COMMERCE_CATEGORIES = frozenset({LANDING, BROCHURE, RENTAL, GROUPBUY, AFFILIATE, PROMO})
+
+
+def get_mood(category: str, seed: int = 0) -> str:
+    """카테고리 무드 풀에서 시드로 하나 선택(base mood + 대안들). seed=0 이면 base."""
+    prof = get_profile(category)
+    base = prof.get("mood") or ""
+    pool = ([base] if base else []) + _EXTRA_MOODS.get(category, [])
+    return pick(seed, pool, salt=3) or base
+
+
+def get_font(category: str, seed: int = 0) -> str:
+    """카테고리 폰트 풀(화이트리스트 내)에서 시드로 하나 선택."""
+    pool = _FONT_POOL_BY_CATEGORY.get(category) or ["Pretendard", "Noto Sans KR"]
+    return pick(seed, pool, salt=4) or "Pretendard"
+
+
+def should_include_reviews(category: str, seed: int = 0) -> bool:
+    """후기 블록을 넣을지 — **커머스 카테고리에서만 + 가끔(시드 게이트 ~33%)**.
+
+    사용자 피드백: "맨날 같은 형식 고객 후기가 들어간다" → 보편 강제를 끄고, 커머스에서만
+    job 마다 약 1/3 확률로(결정적) 넣어 신뢰 요소는 살리되 천편일률을 깬다.
+    """
+    return category in COMMERCE_CATEGORIES and (int(seed) % 3 == 0)
+
+
+def build_recipe_prompt(
+    category: str,
+    include_mood: bool = True,
+    structural: bool = True,
+    block_floor: int | None = None,
+    seed: int = 0,
+    include_reviews: bool = True,
+) -> str:
+    """카테고리 레시피를 프롬프트 섹션 문자열로 렌더한다.
 
     Args:
+        seed: job 별 디자인 시드. 무드/폰트를 풀에서 결정적으로 골라 "맨날 같은 디자인"을
+            깬다(seed=0 이면 base 무드 + 기본 폰트). 색은 시드가 정하지 않는다 — 가드가 최종.
+        include_reviews: False 면 후기(고객 리뷰) 강제 규칙과 섹션을 뺀다. 커머스가 아니거나
+            시드 게이트에 안 걸린 작업은 후기를 넣지 않는다(should_include_reviews 참조).
         include_mood: False 면 무드/색 지시를 뺀다 — 컨셉 이미지 팔레트나 레퍼런스
             템플릿이 디자인 주도권을 가질 때, 레시피의 기본 색 취향(크림/베이지 등)이
             그것과 경쟁해 "맨날 비슷한 색감"이 되는 문제를 막는다. 구조(섹션)·카피·
             이미지 전략은 그대로 유지.
+        structural: False 면 **구조 청사진**(히어로 강제·필수 섹션 목록·블록 수 floor·
+            섹션 리듬·영상/폼/유틸 블록 추가 지시·서비스 링크 제안)을 뺀다. 보편 디자인
+            규율(카드 크기·썸네일·후기 토글·가짜통계 금지·이미지 키워드·카피톤·가독성 등)만
+            남긴다. **리뉴얼(remake) 의 style_only / preserve_content 모드용** — 기존 페이지
+            구조를 보존해야 하므로 "새 섹션을 만들라"는 지시를 빼고 품질 규율만 적용한다.
+        block_floor: 지정 시 규칙 1의 블록 수 하한을 이 값으로 쓴다(하드코딩 25~30 대신).
+            리뉴얼 rewrite 모드의 ``target_blocks`` 를 그대로 받는 용도. ``structural=True``
+            일 때만 의미가 있다.
     """
     p = get_profile(category)
     hero_line = (
@@ -651,38 +766,54 @@ def build_recipe_prompt(category: str, include_mood: bool = True) -> str:
     )
     lines = [f"### [카테고리 레시피 — {p['label']}]"]
     if include_mood:
-        lines.append(f"- 무드/색: {p['mood']}")
+        # 무드/폰트를 job 시드로 풀에서 골라 같은 업종도 매번 다른 색감/타이포가 나오게.
+        lines.append(f"- 무드/색: {get_mood(category, seed)}")
+        lines.append(
+            f"- 폰트 취향(우선): {get_font(category, seed)} "
+            "(design_settings.fontFamily 에 반영. 무드에 더 맞는 화이트리스트 폰트가 있으면 그걸로.)"
+        )
     else:
         lines.append(
             "- 무드/색: **이 레시피가 정하지 않는다** — 위/아래에 주어진 팔레트(컨셉 이미지 "
             "추출 #hex) 또는 레퍼런스 페이지의 색을 그대로 따르라."
         )
-    lines += [
-        f"- 프로필 레이아웃: {hero_line}",
-        "- 꼭 들어가야 할 섹션(위→아래, 컨셉에 맞게 가감):",
-    ]
-    lines += [f"  {i + 1}. {s}" for i, s in enumerate(p["sections"])]
-    lines.append(
-        f"- 한국에서 실제 쓰는 링크/CTA(가능한 것만, 그럴듯한 실제형 URL): {', '.join(p['services'])}."
-    )
+    if structural:
+        lines += [
+            f"- 프로필 레이아웃: {hero_line}",
+            "- 꼭 들어가야 할 섹션(위→아래, 컨셉에 맞게 가감):",
+        ]
+        sections = p["sections"]
+        if not include_reviews:
+            # 후기를 넣지 않는 작업이면 섹션 청사진에서도 후기 줄을 뺀다.
+            sections = [s for s in sections if "후기" not in s]
+        lines += [f"  {i + 1}. {s}" for i, s in enumerate(sections)]
+        lines.append(
+            f"- 한국에서 실제 쓰는 링크/CTA(가능한 것만, 그럴듯한 실제형 URL): {', '.join(p['services'])}."
+        )
     lines.append("- 카피 톤(이모지를 줄 맨 앞 1개로, 과용 금지). 이런 느낌으로 새로 작성:")
     lines += [f"    {c}" for c in p["copy"]]
     lines.append(f"- 가독성: {read_line}")
     lines.append("")
     lines.append("### [공통 강제 규칙 — 위반 시 실패]")
-    lines.append(
-        f"1. **블록을 풍부하게 — 최소 {p['min_blocks']}개는 바닥 조건일 뿐, 더 많을수록 좋다**. "
-        "잘 만든 실제 페이지는 25~30블록이다(사람이 공들여 만든 것처럼). 빈약/단조 금지. "
-        "한 종류만 반복하지 말고 **여러 블록 타입을 섞어라**(single_link/group_link/text/gallery/"
-        "notice/social/map/spacer/folder). 단 쓸데없는 채우기 블록 말고 **그 비즈니스에 진짜 "
-        "필요한 정보**로 채워라."
-    )
-    lines.append(
-        "1-1. **섹션 리듬(사람 손맛)**: 페이지를 주제별 섹션으로 나누고, 각 섹션은 "
-        '**이모지 섹션 헤더(text, `text_layout:"default"`, headline 한 줄 — 예: "🔥 이번 주 BEST", '
-        '"🛁 목욕·위생 케어", "📚 시즌 1 에피소드") → 내용 블록들 → spacer 구분선** 순서로 묶어라. '
-        "이 리듬이 있어야 긴 페이지도 정돈돼 보인다."
-    )
+    if structural:
+        floor = block_floor or p["min_blocks"]
+        aspiration = (
+            " 잘 만든 실제 페이지는 25~30블록이다(사람이 공들여 만든 것처럼)."
+            if block_floor is None
+            else ""
+        )
+        lines.append(
+            f"1. **블록을 풍부하게 — 최소 {floor}개는 바닥 조건일 뿐, 더 많을수록 좋다**.{aspiration} "
+            "빈약/단조 금지. 한 종류만 반복하지 말고 **여러 블록 타입을 섞어라**(single_link/group_link/"
+            "text/gallery/notice/social/map/spacer/folder). 단 쓸데없는 채우기 블록 말고 **그 비즈니스에 "
+            "진짜 필요한 정보**로 채워라."
+        )
+        lines.append(
+            "1-1. **섹션 리듬(사람 손맛)**: 페이지를 주제별 섹션으로 나누고, 각 섹션은 "
+            '**이모지 섹션 헤더(text, `text_layout:"default"`, headline 한 줄 — 예: "🔥 이번 주 BEST", '
+            '"🛁 목욕·위생 케어", "📚 시즌 1 에피소드") → 내용 블록들 → spacer 구분선** 순서로 묶어라. '
+            "이 리듬이 있어야 긴 페이지도 정돈돼 보인다."
+        )
     lines.append(
         '2. **링크 카드 3단계 크기 정책**: ①기본은 `layout:"small"`(컴팩트 — 보조 링크 전부). '
         "②**페이지의 주요 전환 CTA 딱 1개는 `medium`(스탠다드)** — 카톡 문의·무료체험·예약·주문처럼 "
@@ -704,14 +835,15 @@ def build_recipe_prompt(category: str, include_mood: bool = True) -> str:
         "'갤러리' 라벨이면 gallery 블록이어야 한다. 클릭할 수 없는 정보(편의시설 나열 등)를 "
         "single_link 로 만들지 마라 — text 불릿으로."
     )
-    lines.append(
-        "3. **후기는 텍스트 토글 1개로**: group_link 로 줄줄이 만들지 말고 **text 블록 1개** "
-        '(`text_layout:"toggle"`, headline 예: "💬 실제 후기 모음") 안에 5~6개 후기를 모아라. '
-        "각 후기는 `아이디 ★★★★★` 한 줄 + 다음 줄에 한줄평, 후기 사이는 빈 줄. 이름은 **실명이 "
-        "아니라 아이디/닉네임**(예: 달콤한하루, mins_pick, 콩이맘22, 여행자J). 별은 유니코드 ★"
-        "(이모지 ⭐ 금지), **별점을 일부러 다르게**(대부분 ★★★★★, 1~2개는 ★★★★☆) — 다 똑같으면 "
-        "가짜 티. 한줄평은 20자 내외로 짧게."
-    )
+    if include_reviews:
+        lines.append(
+            "3. **후기는 텍스트 토글 1개로**: group_link 로 줄줄이 만들지 말고 **text 블록 1개** "
+            '(`text_layout:"toggle"`, headline 예: "💬 실제 후기 모음") 안에 5~6개 후기를 모아라. '
+            "각 후기는 `아이디 ★★★★★` 한 줄 + 다음 줄에 한줄평, 후기 사이는 빈 줄. 이름은 **실명이 "
+            "아니라 아이디/닉네임**(예: 달콤한하루, mins_pick, 콩이맘22, 여행자J). 별은 유니코드 ★"
+            "(이모지 ⭐ 금지), **별점을 일부러 다르게**(대부분 ★★★★★, 1~2개는 ★★★★☆) — 다 똑같으면 "
+            "가짜 티. 한줄평은 20자 내외로 짧게."
+        )
     lines.append(
         '4. **가짜 통계 금지**: "만족도 100%", 억지 별점 수치, 가짜 다운로드/회원수 같은 건 AI 티가 난다. '
         "쓰려면 그럴듯한 사용자 한줄평(후기)으로."
@@ -730,21 +862,23 @@ def build_recipe_prompt(category: str, include_mood: bool = True) -> str:
         "'baby eating with spoon high chair', 수제잼 → 'jam on toast bread'). "
         "'korean' 같은 국적/인종 한정어도 검색 실패의 주범이니 빼라."
     )
-    lines.append(
-        "7. **영상(video) 블록 — 영상이 어울리는 비즈니스(크리에이터/공연/강의/홍보 등)면 1개 넣어라**. "
-        "생성 페이지는 유저가 고쳐 쓰는 **스캐폴드**다 — 영상 자리가 잡혀 있어야 유저가 자기 영상으로 "
-        "교체한다. [목표] 컨셉에 실제 영상 URL(youtube/youtu.be/tiktok/vimeo)이 있으면 **그 URL 을 "
-        "그대로** `video_urls` 에 넣고, 없으면 그럴듯한 유튜브 URL 형식(예: "
-        "`https://youtube.com/watch?v=...`) placeholder 1개만 — 유저 교체용 자리다."
-    )
+    if structural:
+        lines.append(
+            "7. **영상(video) 블록 — 영상이 어울리는 비즈니스(크리에이터/공연/강의/홍보 등)면 1개 넣어라**. "
+            "생성 페이지는 유저가 고쳐 쓰는 **스캐폴드**다 — 영상 자리가 잡혀 있어야 유저가 자기 영상으로 "
+            "교체한다. [목표] 컨셉에 실제 영상 URL(youtube/youtu.be/tiktok/vimeo)이 있으면 **그 URL 을 "
+            "그대로** `video_urls` 에 넣고, 없으면 그럴듯한 유튜브 URL 형식(예: "
+            "`https://youtube.com/watch?v=...`) placeholder 1개만 — 유저 교체용 자리다."
+        )
     lines.append(
         "8. **정확한 한국어**: 오타·띄어쓰기 오류 금지(예: '바로'를 '비로', '점심시간'을 '정심시간'으로 쓰지 마라). "
         "채널은 '카카오톡 채널'(서비스 종료된 '카카오스토리' 금지). 한/영 중복 버튼(예: '무료체험'+'Free Trial') 금지."
     )
-    lines.append(
-        "9. **고객정보 폼(customer/inquiry)은 꼭 필요할 때만** — 입력칸 라벨이 영어로 떠 어색하다. "
-        "단순 문의/예약/신청은 카카오톡 채널·네이버폼 등 **외부 링크(single_link small)** 로 받는 게 더 자연스럽다."
-    )
+    if structural:
+        lines.append(
+            "9. **고객정보 폼(customer/inquiry)은 꼭 필요할 때만** — 입력칸 라벨이 영어로 떠 어색하다. "
+            "단순 문의/예약/신청은 카카오톡 채널·네이버폼 등 **외부 링크(single_link small)** 로 받는 게 더 자연스럽다."
+        )
     lines.append(
         "10. **중요 정보는 숨기지 마라**: 요금표·쿠폰코드·일시·계좌 같은 핵심 정보는 toggle 로 접지 "
         '말고 `text_layout:"plain"` 으로 바로 보이게. toggle 은 길어도 되는 보조 정보(이용안내· '
@@ -755,24 +889,25 @@ def build_recipe_prompt(category: str, include_mood: bool = True) -> str:
         "없으니 **이모지 1개 + 줄바꿈 + 짧은 줄** 로 구조를 만들어라(예: '⏰ 평일 15,000원/시간\\n"
         "🌙 심야 12,000원/시간'). 빈 줄로 문단을 나누고, headline 에 핵심을 담아라."
     )
-    lines.append(
-        "12. **유틸리티 블록 활용 (섹션에 명시된 카테고리는 필수)**:\n"
-        "    - **search**: 블록이 16개 이상으로 길어지면 profile(과 notice) 바로 아래에 검색 블록 "
-        '1개(`_type:"search"`, search_placeholder 는 페이지 성격에 맞게).\n'
-        "    - **folder**: 같은 성격의 링크/코너가 3개 이상이면 folder(toggle)로 묶어라. "
-        "**작성법(이 형식을 그대로)** — 하위 블록들에 임시 정수 id 를 달고 folder 가 참조:\n"
-        '      {"id": 901, "type": "single_link", "order": 5, "data": {"_type": "single_link", '
-        '"label": "수분 크림", "url": "https://...", "thumbnail_url": "{{image:moisturizer jar}}"}}\n'
-        '      {"id": 902, "type": "single_link", "order": 6, "data": {"_type": "single_link", '
-        '"label": "토너", "url": "https://...", "thumbnail_url": "{{image:toner bottle}}"}}\n'
-        '      {"type": "single_link", "order": 7, "data": {"_type": "folder", '
-        '"label": "🧴 스킨케어 모아보기", "child_block_ids": [901, 902], '
-        '"folder_display_mode": "toggle", "is_collapsed_default": false}}\n'
-        "      (백엔드가 임시 id 를 실제 ID 로 재매핑하고, 하위 블록은 폴더 안에만 렌더된다.)\n"
-        "    - **schedule**: 공구 일정·행사·오픈 일정처럼 **실제 날짜가 컨셉에 있으면** schedule 블록 "
-        '사용(`schedule_layout:"list"` 만 — calendar 는 현재 달만 보여 미래 일정이 가려진다). '
-        'schedule_items 항목 형식: {"id": "uuid", "title": "공구 OPEN", "start_date": "2026-06-15", '
-        '"end_date": "2026-06-15"}. 날짜는 컨셉에 적힌 실제 날짜만 — 임의 창작 금지.'
-    )
+    if structural:
+        lines.append(
+            "12. **유틸리티 블록 활용 (섹션에 명시된 카테고리는 필수)**:\n"
+            "    - **search**: 블록이 16개 이상으로 길어지면 profile(과 notice) 바로 아래에 검색 블록 "
+            '1개(`_type:"search"`, search_placeholder 는 페이지 성격에 맞게).\n'
+            "    - **folder**: 같은 성격의 링크/코너가 3개 이상이면 folder(toggle)로 묶어라. "
+            "**작성법(이 형식을 그대로)** — 하위 블록들에 임시 정수 id 를 달고 folder 가 참조:\n"
+            '      {"id": 901, "type": "single_link", "order": 5, "data": {"_type": "single_link", '
+            '"label": "수분 크림", "url": "https://...", "thumbnail_url": "{{image:moisturizer jar}}"}}\n'
+            '      {"id": 902, "type": "single_link", "order": 6, "data": {"_type": "single_link", '
+            '"label": "토너", "url": "https://...", "thumbnail_url": "{{image:toner bottle}}"}}\n'
+            '      {"type": "single_link", "order": 7, "data": {"_type": "folder", '
+            '"label": "🧴 스킨케어 모아보기", "child_block_ids": [901, 902], '
+            '"folder_display_mode": "toggle", "is_collapsed_default": false}}\n'
+            "      (백엔드가 임시 id 를 실제 ID 로 재매핑하고, 하위 블록은 폴더 안에만 렌더된다.)\n"
+            "    - **schedule**: 공구 일정·행사·오픈 일정처럼 **실제 날짜가 컨셉에 있으면** schedule 블록 "
+            '사용(`schedule_layout:"list"` 만 — calendar 는 현재 달만 보여 미래 일정이 가려진다). '
+            'schedule_items 항목 형식: {"id": "uuid", "title": "공구 OPEN", "start_date": "2026-06-15", '
+            '"end_date": "2026-06-15"}. 날짜는 컨셉에 적힌 실제 날짜만 — 임의 창작 금지.'
+        )
     lines.append("")
     return "\n".join(lines)
