@@ -19,11 +19,7 @@ from celery import shared_task
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from .dm_exceptions import (
-    DMSendError,
-    DMTransientError,
-    exception_to_classification,
-)
+from .dm_exceptions import DMSendError, DMTransientError, exception_to_classification
 from .models import (
     AutoDMCampaign,
     EventInbox,
@@ -87,19 +83,14 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
         # 외부 사용자의 답글 역시 캠페인 트리거 대상이 아님 (top-level 댓글만 트리거).
         # parent_id 가 있으면 무조건 skip.
         if parent_id:
-            logger.info(
-                f"Skipping reply (대댓글): comment_id={comment_id} parent={parent_id}"
-            )
+            logger.info(f"Skipping reply (대댓글): comment_id={comment_id} parent={parent_id}")
             return {"status": "skipped", "reason": "is_reply"}
 
         # ★ Self-comment 가드:
         # 비즈니스 본인이 자기 게시물에 댓글 → 자기 자신에게 DM 가는 루프 차단.
         # webhook entry.id 는 connected page 의 IG user id 와 동일.
         page_ig_user_id = str(webhook_payload.get("entry_id") or "")
-        if (
-            page_ig_user_id
-            and str(from_user_id) == page_ig_user_id
-        ):
+        if page_ig_user_id and str(from_user_id) == page_ig_user_id:
             logger.info(
                 f"Skipping self-comment DM: page={page_ig_user_id} "
                 f"commented on own post (comment_id={comment_id})"
@@ -122,14 +113,14 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
         # webhook 의 entry.id 는 IG user id — 그 계정의 캠페인만 후보
         ig_user_id = str(webhook_payload.get("entry_id") or "")
         candidate_qs = (
-            AutoDMCampaign.objects
-            .filter(status=AutoDMCampaign.Status.ACTIVE)
-            .select_related("ig_connection", "ig_connection__workspace")
+            AutoDMCampaign.objects.filter(status=AutoDMCampaign.Status.ACTIVE)
+            # 예약 발송: 활성 기간(window) 안에 있는 캠페인만 후보 (시작 전/종료 후 제외)
+            .filter(AutoDMCampaign.schedule_window_q()).select_related(
+                "ig_connection", "ig_connection__workspace"
+            )
         )
         if ig_user_id:
-            candidate_qs = candidate_qs.filter(
-                ig_connection__external_account_id=ig_user_id
-            )
+            candidate_qs = candidate_qs.filter(ig_connection__external_account_id=ig_user_id)
 
         # trigger_type 평가:
         #   specific_media (or attached next_media): media_id 일치
@@ -209,11 +200,11 @@ def process_story_reply_and_send_dm(self, payload: dict):
     keyword_filter 도 동일하게 평가.
     """
     page_ig_user_id = str(payload.get("page_ig_user_id") or "")
-    sender_user_id  = str(payload.get("sender_user_id") or "")
+    sender_user_id = str(payload.get("sender_user_id") or "")
     sender_username = str(payload.get("sender_username") or "")
-    story_id        = str(payload.get("story_id") or "")
-    message_mid     = str(payload.get("message_mid") or "")
-    message_text    = payload.get("message_text") or ""
+    story_id = str(payload.get("story_id") or "")
+    message_mid = str(payload.get("message_mid") or "")
+    message_text = payload.get("message_text") or ""
 
     if not (page_ig_user_id and sender_user_id and story_id and message_mid):
         return {"status": "skipped", "reason": "missing required fields"}
@@ -223,13 +214,15 @@ def process_story_reply_and_send_dm(self, payload: dict):
         return {"status": "skipped", "reason": "self_story_reply"}
 
     candidate_qs = (
-        AutoDMCampaign.objects
-        .filter(
+        AutoDMCampaign.objects.filter(
             status=AutoDMCampaign.Status.ACTIVE,
             trigger_type=AutoDMCampaign.TriggerType.STORY_REPLY,
             ig_connection__external_account_id=page_ig_user_id,
         )
-        .select_related("ig_connection", "ig_connection__workspace")
+        # 예약 발송: 활성 기간(window) 안에 있는 캠페인만 후보
+        .filter(AutoDMCampaign.schedule_window_q()).select_related(
+            "ig_connection", "ig_connection__workspace"
+        )
     )
 
     matched_campaigns = []
@@ -274,6 +267,14 @@ def _enqueue_send_dm_for_story_reply(
         → 같은 답장(같은 mid) 에 대해 동일 캠페인 중복 발송 차단.
     """
     ig_conn = campaign.ig_connection
+
+    # ★ 예약 발송 창 가드 (TOCTOU 안전망)
+    if not campaign.is_runnable_now():
+        return {
+            "campaign_id": str(campaign.id),
+            "status": "skipped",
+            "reason": "outside_schedule_window",
+        }
 
     # Self-DM 가드
     if str(sender_user_id) == str(ig_conn.external_account_id):
@@ -388,10 +389,7 @@ def _maybe_attach_next_media_from_webhook(
     ig_conn = unattached_campaigns[0].ig_connection
 
     # 룰 2: baseline 과 동일 미디어면 skip
-    if (
-        ig_conn.last_seen_media_id
-        and ig_conn.last_seen_media_id == webhook_media_id
-    ):
+    if ig_conn.last_seen_media_id and ig_conn.last_seen_media_id == webhook_media_id:
         return []
 
     # baseline 없으면 룰 1: 무조건 attach (첫 사용자)
@@ -441,9 +439,7 @@ def _maybe_attach_next_media_from_webhook(
     # baseline 갱신
     ig_conn.last_seen_media_id = webhook_media_id
     ig_conn.last_seen_media_at = new_media_at
-    ig_conn.save(
-        update_fields=["last_seen_media_id", "last_seen_media_at"]
-    )
+    ig_conn.save(update_fields=["last_seen_media_id", "last_seen_media_at"])
 
     if updated_count:
         logger.info(
@@ -477,6 +473,15 @@ def _enqueue_send_dm(
       - gate_status = PENDING(gate 사용 시) / NONE
     """
     ig_conn = campaign.ig_connection
+
+    # ★ 예약 발송 창 가드 (TOCTOU 안전망): 후보 선정 이후 종료 시각이 지났을 수 있으므로
+    # 큐 적재 직전에 한 번 더 확인. 창 밖이면 로그도 남기지 않고 조용히 skip.
+    if not campaign.is_runnable_now():
+        return {
+            "campaign_id": str(campaign.id),
+            "status": "skipped",
+            "reason": "outside_schedule_window",
+        }
 
     # ★ Self-DM 가드 (이중 안전망):
     # 캠페인 owner = 댓글 작성자면 skip. _process_comment_and_send_dm 에서
@@ -514,10 +519,7 @@ def _enqueue_send_dm(
     # v3.8: Follow-gate 재활성 (is_user_follow_business 기반 silent verify).
     # reward_message_template 가 비어 있으면 게이트 의미 없음 → STANDALONE 으로 fallback.
     message_body = campaign.get_opening_message()
-    if (
-        campaign.follow_gate_enabled
-        and (campaign.reward_message_template or "").strip()
-    ):
+    if campaign.follow_gate_enabled and (campaign.reward_message_template or "").strip():
         dm_kind = SentDMLog.DMKind.OPENING
         gate_status = SentDMLog.GateStatus.PENDING
     else:
@@ -594,9 +596,7 @@ def send_dm_task(self, log_id: str):
     재시도: transient 에러만 백오프 재시도.
     """
     try:
-        log = SentDMLog.objects.select_related(
-            "campaign", "campaign__ig_connection"
-        ).get(id=log_id)
+        log = SentDMLog.objects.select_related("campaign", "campaign__ig_connection").get(id=log_id)
     except SentDMLog.DoesNotExist:
         logger.warning(f"SentDMLog {log_id} not found")
         return {"status": "not_found"}
@@ -607,6 +607,15 @@ def send_dm_task(self, log_id: str):
 
     campaign = log.campaign
     ig_conn = campaign.ig_connection
+
+    # ★ 예약 발송 창 가드 (권위 있는 단일 체크포인트):
+    # 모든 발송이 이 태스크를 거친다 — opening / reward(postback) / follow 재안내 /
+    # reconcile 재큐 / 수동 재시도. enqueue 시점 가드를 통과한 뒤라도, 실행 시점에
+    # 캠페인 활성 기간(window)이 끝났으면(또는 아직 시작 전이면) 여기서 확정 차단한다.
+    # 상태(pause/complete)는 별도 관심사라 건드리지 않고, 오직 예약 창만 본다.
+    if not campaign.is_within_schedule():
+        log.mark_skipped("Campaign outside active schedule window")
+        return {"status": "skipped", "reason": "outside_schedule_window"}
 
     if ig_conn.status != IGAccountConnection.Status.ACTIVE:
         log.mark_failed(
@@ -622,10 +631,7 @@ def send_dm_task(self, log_id: str):
     # 사용자가 버튼 클릭 시 webhook 으로 postback payload = "fg:{log_id}" 가 돌아온다.
     # generic template 으로 보내야 인스타 앱에서 "메시지 박스 안에 버튼" 형태로 보임.
     buttons = None
-    if (
-        log.dm_kind == SentDMLog.DMKind.OPENING
-        and log.gate_status == SentDMLog.GateStatus.PENDING
-    ):
+    if log.dm_kind == SentDMLog.DMKind.OPENING and log.gate_status == SentDMLog.GateStatus.PENDING:
         buttons = [
             {
                 "type": "postback",
@@ -659,7 +665,7 @@ def send_dm_task(self, log_id: str):
 
         # v3.2: retriable인 transient (RATE_LIMITED)만 재시도
         if cls.retriable and self.request.retries < self.max_retries:
-            backoff = min(60 * (2 ** self.request.retries), 60 * 60 * 6)  # 최대 6h
+            backoff = min(60 * (2**self.request.retries), 60 * 60 * 6)  # 최대 6h
             log.next_retry_at = timezone.now() + timedelta(seconds=backoff)
             # RATE_LIMITED 상태로 표시 후 재시도 큐에 들어가도록 QUEUED로 회귀
             log.status = SentDMLog.Status.QUEUED
@@ -696,16 +702,13 @@ def send_dm_task(self, log_id: str):
         campaign.increment_sent()
 
     # 5분 후 첫 능동 검증 예약 (echo가 먼저 오면 skip됨)
-    verify_dm_delivery.apply_async(
-        args=[str(log.id)], countdown=300
-    )
+    verify_dm_delivery.apply_async(args=[str(log.id)], countdown=300)
 
     # public_reply_enabled 면 댓글에 공개 답글도 게시 (best-effort)
     # v3.5: public_reply_templates(list) 또는 legacy public_reply_template 중 하나라도 있으면 OK
     # v3.7: Story 답장 캠페인 (comment_id 없음) 은 공개 답글 불가능 → skip
     has_reply_content = bool(
-        (campaign.public_reply_templates or [])
-        or (campaign.public_reply_template or "").strip()
+        (campaign.public_reply_templates or []) or (campaign.public_reply_template or "").strip()
     )
     if (
         campaign.public_reply_enabled
@@ -745,9 +748,7 @@ def verify_dm_delivery(self, log_id: str):
         FAILED_NO_TRACE 로 종결 (프론트는 자가 점검 체크리스트 노출).
     """
     try:
-        log = SentDMLog.objects.select_related(
-            "campaign__ig_connection"
-        ).get(id=log_id)
+        log = SentDMLog.objects.select_related("campaign__ig_connection").get(id=log_id)
     except SentDMLog.DoesNotExist:
         return {"status": "not_found"}
 
@@ -771,9 +772,7 @@ def verify_dm_delivery(self, log_id: str):
         )
         raise self.retry(exc=e, countdown=120) from e
     except DMSendError as e:
-        log.append_verification_log(
-            {"path": "conv_api", "result": "api_error", "error": str(e)}
-        )
+        log.append_verification_log({"path": "conv_api", "result": "api_error", "error": str(e)})
         return {"status": "api_error", "error": str(e)}
 
     if message is not None:
@@ -989,11 +988,15 @@ def poll_new_media_for_next_campaigns():
     """
     from .models import AutoDMCampaign
 
-    next_campaigns_qs = AutoDMCampaign.objects.filter(
-        trigger_type=AutoDMCampaign.TriggerType.NEXT_MEDIA,
-        status=AutoDMCampaign.Status.ACTIVE,
-        media_id="",
-    ).values_list("ig_connection_id", flat=True).distinct()
+    next_campaigns_qs = (
+        AutoDMCampaign.objects.filter(
+            trigger_type=AutoDMCampaign.TriggerType.NEXT_MEDIA,
+            status=AutoDMCampaign.Status.ACTIVE,
+            media_id="",
+        )
+        .values_list("ig_connection_id", flat=True)
+        .distinct()
+    )
 
     ig_connection_ids = list(next_campaigns_qs)
     if not ig_connection_ids:
@@ -1023,9 +1026,7 @@ def poll_new_media_for_next_campaigns():
                 limit=5,
             )
         except Exception as e:
-            logger.warning(
-                f"poll_new_media: API failed for ig_conn={conn.id}: {e}"
-            )
+            logger.warning(f"poll_new_media: API failed for ig_conn={conn.id}: {e}")
             continue
 
         conn.last_polled_at = timezone.now()
@@ -1093,9 +1094,7 @@ def poll_new_media_for_next_campaigns():
             # last_seen 갱신은 마지막(=가장 최신) 미디어로
         latest_new = new_medias[-1][2]
         conn.last_seen_media_id = str(latest_new.get("id") or "")
-        conn.last_seen_media_at = _parse_iso_timestamp(
-            latest_new.get("timestamp")
-        )
+        conn.last_seen_media_at = _parse_iso_timestamp(latest_new.get("timestamp"))
         conn.save(
             update_fields=[
                 "last_seen_media_id",
@@ -1136,8 +1135,7 @@ def check_polling_anomalies():
 
     # 활성 next_media 캠페인 보유 IG 계정 (media_id 비어있는 것만 = 아직 attach 안됨)
     pending_ig_ids = (
-        AutoDMCampaign.objects
-        .filter(
+        AutoDMCampaign.objects.filter(
             trigger_type=AutoDMCampaign.TriggerType.NEXT_MEDIA,
             status=AutoDMCampaign.Status.ACTIVE,
             media_id="",
@@ -1168,18 +1166,43 @@ def check_polling_anomalies():
             f"despite active next_media campaigns: [{ids}]"
         )
     if stale:
-        items = ", ".join(
-            f"{c.id}(last={c.last_polled_at.isoformat()})" for c in stale[:10]
-        )
-        logger.warning(
-            f"check_polling_anomalies: {len(stale)} ig_conn stale (>15min): [{items}]"
-        )
+        items = ", ".join(f"{c.id}(last={c.last_polled_at.isoformat()})" for c in stale[:10])
+        logger.warning(f"check_polling_anomalies: {len(stale)} ig_conn stale (>15min): [{items}]")
 
     return {
         "checked": len(pending_ig_ids),
         "never_polled": len(never_polled),
         "stale": len(stale),
     }
+
+
+# ===== 예약 발송: 활성 기간 자동 종료 =====
+
+
+@shared_task
+def enforce_campaign_schedules():
+    """예약 발송 캠페인의 자동 종료 처리 (Beat: 1분 주기).
+
+    scheduled_end_at 이 지난 ACTIVE 캠페인을 COMPLETED 로 전환하고 ended_at 을 기록한다.
+    멱등 — 이미 COMPLETED/PAUSED 면 대상 아님.
+
+    시작(scheduled_start_at) 게이팅은 발송 경로의 ``schedule_window_q`` 가 담당하므로
+    여기서는 별도 상태 전이를 하지 않는다 (시작 전 캠페인은 ACTIVE 그대로 두되 발송만 안 됨).
+    이 분리 덕분에 Beat 가 잠시 죽어도 "시작 전인데 발송됨" 같은 오발송은 발생하지 않는다.
+    """
+    now = timezone.now()
+    ended = AutoDMCampaign.objects.filter(
+        status=AutoDMCampaign.Status.ACTIVE,
+        scheduled_end_at__isnull=False,
+        scheduled_end_at__lte=now,
+    ).update(
+        status=AutoDMCampaign.Status.COMPLETED,
+        ended_at=now,
+        updated_at=now,
+    )
+    if ended:
+        logger.info(f"enforce_campaign_schedules: auto-completed {ended} campaign(s)")
+    return {"auto_completed": ended}
 
 
 # ===== 공개 답글 + Follow-gate =====
@@ -1318,9 +1341,7 @@ def post_public_reply(self, log_id: str):
 
         return {"status": "abandoned", "reason": "permanent", "code": e.code}
     except Exception as e:
-        logger.warning(
-            f"post_public_reply failed for log={log_id}: {e}; will retry"
-        )
+        logger.warning(f"post_public_reply failed for log={log_id}: {e}; will retry")
         try:
             raise self.retry(exc=e, countdown=60) from e
         except self.MaxRetriesExceededError:
@@ -1374,8 +1395,7 @@ def handle_inbound_message_for_gate(
         return {"status": "skipped", "reason": "self_message"}
 
     candidates = (
-        SentDMLog.objects
-        .select_related("campaign__ig_connection")
+        SentDMLog.objects.select_related("campaign__ig_connection")
         .filter(
             recipient_user_id=sender_user_id,
             gate_status=SentDMLog.GateStatus.PENDING,
@@ -1420,17 +1440,19 @@ def send_reward_dm(self, opening_log_id: str):
     24h 메시징 윈도우 내에서만 가능 (사용자가 우리에게 메시지 보낸 직후라 OK).
     """
     try:
-        opening = SentDMLog.objects.select_related(
-            "campaign__ig_connection"
-        ).get(id=opening_log_id)
+        opening = SentDMLog.objects.select_related("campaign__ig_connection").get(id=opening_log_id)
     except SentDMLog.DoesNotExist:
         return {"status": "not_found"}
 
     campaign = opening.campaign
+
+    # ★ 예약 발송 창 가드: 이 경로(키워드 답장 reward)는 send_dm_task 를 거치지 않고
+    # 직접 발송하므로 별도로 창 검사. 활성 기간이 끝났으면 reward 도 발송하지 않는다.
+    if not campaign.is_within_schedule():
+        return {"status": "skipped", "reason": "outside_schedule_window"}
+
     if not campaign.reward_message_template:
-        logger.warning(
-            f"send_reward_dm: campaign {campaign.id} has no reward template; skip"
-        )
+        logger.warning(f"send_reward_dm: campaign {campaign.id} has no reward template; skip")
         return {"status": "skipped", "reason": "no reward template"}
 
     ig_conn = campaign.ig_connection
@@ -1474,7 +1496,7 @@ def send_reward_dm(self, opening_log_id: str):
     except DMSendError as e:
         cls_info = exception_to_classification(e)
         if cls_info.retriable and self.request.retries < self.max_retries:
-            backoff = min(60 * (2 ** self.request.retries), 60 * 60)
+            backoff = min(60 * (2**self.request.retries), 60 * 60)
             reward_log.next_retry_at = timezone.now() + timedelta(seconds=backoff)
             reward_log.status = SentDMLog.Status.QUEUED
             reward_log.save(update_fields=["next_retry_at", "status"])
@@ -1518,9 +1540,7 @@ def _check_and_handle_spam(
     """스팸 검사 + 숨김 처리"""
     try:
         campaign = (
-            AutoDMCampaign.objects.filter(media_id=media_id)
-            .select_related("ig_connection")
-            .first()
+            AutoDMCampaign.objects.filter(media_id=media_id).select_related("ig_connection").first()
         )
         if not campaign:
             return {"is_spam": False, "spam_filter_processed": False}
@@ -1647,7 +1667,9 @@ def refresh_ig_tokens_pending_expiry(self):
             )
             logger.info(
                 "IG token refreshed: conn=%s user=@%s new_exp=%s",
-                conn.id, conn.username, conn.token_expires_at,
+                conn.id,
+                conn.username,
+                conn.token_expires_at,
             )
         except Exception as e:
             logger.exception("IG token refresh failed: conn=%s err=%s", conn.id, e)
@@ -1726,9 +1748,9 @@ def process_follow_gate_postback(self, opening_log_id: str, igsid: str):
         - 같은 (campaign, igsid) 30초 쿨다운: 사용자가 미친 듯이 눌러도 한 번만 처리
     """
     try:
-        opening = SentDMLog.objects.select_related(
-            "campaign", "campaign__ig_connection"
-        ).get(id=opening_log_id)
+        opening = SentDMLog.objects.select_related("campaign", "campaign__ig_connection").get(
+            id=opening_log_id
+        )
     except SentDMLog.DoesNotExist:
         logger.warning("follow-gate: opening log %s not found", opening_log_id)
         return {"status": "not_found"}
@@ -1756,6 +1778,13 @@ def process_follow_gate_postback(self, opening_log_id: str, igsid: str):
     if ig_conn.status != IGAccountConnection.Status.ACTIVE:
         return {"status": "skipped", "reason": "ig_not_active"}
 
+    # button-only 모드: 팔로우 검증을 건너뛰고 즉시 reward 발송.
+    # 위의 PASSED 멱등성(:gate_status)/OPENING dm_kind/30s 쿨다운/ig_conn ACTIVE 가드를
+    # 모두 통과한 뒤이므로, gate_verify_follow=false 면 check_user_follow_business
+    # 호출 없이 바로 reward 큐에 넣는다 (연타·중복 방어는 위 가드가 동일하게 적용됨).
+    if not campaign.gate_verify_follow:
+        return _enqueue_reward_dm(opening=opening, igsid=igsid)
+
     # IG Profile API 호출
     try:
         is_follow = InstagramMessagingService.check_user_follow_business(
@@ -1766,9 +1795,7 @@ def process_follow_gate_postback(self, opening_log_id: str, igsid: str):
         cls = exception_to_classification(e)
         if cls.retriable and self.request.retries < self.max_retries:
             raise self.retry(exc=e, countdown=30) from e
-        logger.warning(
-            "follow-gate: profile check failed (terminal) log=%s err=%s", opening.id, e
-        )
+        logger.warning("follow-gate: profile check failed (terminal) log=%s err=%s", opening.id, e)
         return {"status": "failed", "reason": str(e)}
 
     follow_passed = bool(is_follow)
@@ -1814,9 +1841,7 @@ def _enqueue_reward_dm(*, opening: SentDMLog, igsid: str) -> dict:
                 parent_log=opening,
             )
             # opening 도 PASSED 로 마킹
-            SentDMLog.objects.filter(pk=opening.pk).update(
-                gate_status=SentDMLog.GateStatus.PASSED
-            )
+            SentDMLog.objects.filter(pk=opening.pk).update(gate_status=SentDMLog.GateStatus.PASSED)
     except IntegrityError:
         existing = SentDMLog.objects.filter(idempotency_key=idem).first()
         return {
@@ -1909,11 +1934,21 @@ def sync_ig_profile_picture(self, connection_id: str) -> dict:
         conn = IGAccountConnection.objects.get(id=connection_id)
     except IGAccountConnection.DoesNotExist:
         logger.warning("sync_ig_profile_picture: connection not found id=%s", connection_id)
-        return {"status": "skipped", "reason": "connection_not_found", "connection_id": connection_id}
+        return {
+            "status": "skipped",
+            "reason": "connection_not_found",
+            "connection_id": connection_id,
+        }
 
     if conn.status != IGAccountConnection.Status.ACTIVE:
-        logger.info("sync_ig_profile_picture: skip non-active conn=%s status=%s", conn.id, conn.status)
-        return {"status": "skipped", "reason": f"status_{conn.status}", "connection_id": str(conn.id)}
+        logger.info(
+            "sync_ig_profile_picture: skip non-active conn=%s status=%s", conn.id, conn.status
+        )
+        return {
+            "status": "skipped",
+            "reason": f"status_{conn.status}",
+            "connection_id": str(conn.id),
+        }
 
     token = conn.access_token
     if not token:
@@ -1931,12 +1966,18 @@ def sync_ig_profile_picture(self, connection_id: str) -> dict:
         msg = str(e)
         if "401" in msg or "403" in msg or "OAuthException" in msg:
             conn.mark_as_error(f"profile sync token error: {msg[:200]}")
-        logger.warning("sync_ig_profile_picture: get_account_info failed conn=%s err=%s", conn.id, e)
+        logger.warning(
+            "sync_ig_profile_picture: get_account_info failed conn=%s err=%s", conn.id, e
+        )
         try:
             self.retry(exc=e)
         except self.MaxRetriesExceededError:
             pass
-        return {"status": "failed", "reason": "get_account_info_failed", "connection_id": str(conn.id)}
+        return {
+            "status": "failed",
+            "reason": "get_account_info_failed",
+            "connection_id": str(conn.id),
+        }
 
     remote_url = (account_info.get("profile_picture_url") or "").strip()
     new_name = (account_info.get("name") or "").strip()
@@ -2015,9 +2056,7 @@ def sync_ig_profile_picture(self, connection_id: str) -> dict:
         update_fields.append("username")
     conn.save(update_fields=update_fields)
 
-    logger.info(
-        "sync_ig_profile_picture: updated conn=%s url=%s", conn.id, new_cached_url
-    )
+    logger.info("sync_ig_profile_picture: updated conn=%s url=%s", conn.id, new_cached_url)
     return {
         "status": "updated",
         "connection_id": str(conn.id),
@@ -2112,7 +2151,5 @@ def process_messaging_event(self, event_key: str):
 
     evt.processed_at = timezone.now()
     evt.save(update_fields=["processed_at"])
-    logger.info(
-        "process_messaging_event %s: matched=%s", event_key, matched
-    )
+    logger.info("process_messaging_event %s: matched=%s", event_key, matched)
     return {"status": "ok", "matched": matched}

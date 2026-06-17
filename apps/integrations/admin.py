@@ -1,5 +1,6 @@
 from django.contrib import admin
-from .models import IGAccountConnection, AutoDMCampaign, SentDMLog, SpamFilterConfig, SpamCommentLog
+
+from .models import AutoDMCampaign, IGAccountConnection, SentDMLog, SpamCommentLog, SpamFilterConfig
 
 
 @admin.register(IGAccountConnection)
@@ -34,8 +35,10 @@ class AutoDMCampaignAdmin(admin.ModelAdmin):
         "max_sends_per_hour",
         "created_at",
         "started_at",
+        "scheduled_start_at",
+        "scheduled_end_at",
     )
-    list_filter = ("status", "created_at")
+    list_filter = ("status", "follow_gate_enabled", "gate_verify_follow", "created_at")
     search_fields = ("name", "media_id", "ig_connection__username")
     readonly_fields = (
         "id",
@@ -51,7 +54,22 @@ class AutoDMCampaignAdmin(admin.ModelAdmin):
         ("기본 정보", {"fields": ("name", "description", "ig_connection")}),
         ("타겟 게시물", {"fields": ("media_id", "media_url")}),
         ("메시지 설정", {"fields": ("message_template", "max_sends_per_hour")}),
+        (
+            "버튼 게이트 (follow / button-only)",
+            {
+                "fields": (
+                    "follow_gate_enabled",
+                    "gate_verify_follow",
+                    "follow_gate_prompt",
+                    "follow_gate_button_label",
+                    "follow_gate_retry_message",
+                    "reward_message_template",
+                    "gate_trigger_keywords",
+                )
+            },
+        ),
         ("상태", {"fields": ("status",)}),
+        ("예약 발송", {"fields": ("scheduled_start_at", "scheduled_end_at")}),
         ("통계", {"fields": ("total_sent", "total_failed")}),
         ("시간 정보", {"fields": ("created_at", "updated_at", "started_at", "ended_at")}),
     )

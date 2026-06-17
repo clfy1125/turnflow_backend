@@ -14,6 +14,9 @@ class AiJob(models.Model):
         # 외부 서비스(인포크/리틀리/링크트리) 페이지를 비동기로 가져오기.
         # 이미지 재업로드 옵션이 있어 LLM 호출 없이도 분 단위 작업이 됨 → AiJob 으로 처리.
         EXTERNAL_IMPORT = "external_import", "외부 페이지 가져오기"
+        # 게시물(이미지+캡션) → AutoDM 캠페인 폼 초안. gemma-4 가 50개 답글 등 긴 출력을
+        # 만드느라 수십 초가 걸려 동기 응답은 prod gunicorn 타임아웃에 걸린다 → AiJob 으로 처리.
+        DM_CAMPAIGN_ASSIST = "dm_campaign_assist", "DM 캠페인 폼 자동완성"
 
     class LlmModel(models.TextChoices):
         GEMMA = "gemma", "Gemma (자체 H100, 폴백/오버플로우)"

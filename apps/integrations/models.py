@@ -51,7 +51,9 @@ class IGAccountConnection(models.Model):
     )
     username = models.CharField(max_length=255, verbose_name="Instagram Username", blank=True)
     name = models.CharField(
-        max_length=255, blank=True, default="",
+        max_length=255,
+        blank=True,
+        default="",
         verbose_name="Display Name",
         help_text="IG /me 응답의 name 필드 (사람이 읽는 표시명)",
     )
@@ -62,17 +64,21 @@ class IGAccountConnection(models.Model):
     # Profile picture — IG CDN URL 은 서명된 일시 URL 로 만료될 수 있으므로
     # 우리 스토리지(R2/로컬)에 사본을 보관하여 안정 URL 제공.
     profile_picture_url = models.URLField(
-        max_length=1024, blank=True, default="",
+        max_length=1024,
+        blank=True,
+        default="",
         verbose_name="Cached Profile Picture URL",
         help_text="R2/로컬에 캐싱된 안정 URL — 프론트에 노출",
     )
     profile_picture_source_url = models.TextField(
-        blank=True, default="",
+        blank=True,
+        default="",
         verbose_name="IG Source Profile Picture URL",
         help_text="IG /me 가 준 원본 URL — 변경 감지/디버그용 (내부)",
     )
     profile_picture_synced_at = models.DateTimeField(
-        null=True, blank=True,
+        null=True,
+        blank=True,
         verbose_name="Profile Picture Last Synced At",
     )
 
@@ -431,9 +437,21 @@ class AutoDMCampaign(models.Model):
         default=False,
         verbose_name="Follow-gate 사용",
         help_text=(
-            "활성화 시 opening DM 에 '팔로우했어요' quick_reply 버튼이 추가되고, "
-            "사용자가 버튼 클릭 시 IG Profile API 로 팔로우 여부를 silent 검증한 뒤 "
-            "reward_message_template 을 발송한다."
+            "활성화 시 opening DM 에 버튼이 추가되고, 사용자가 버튼 클릭 시 "
+            "reward_message_template 을 발송한다. 버튼 클릭 시 팔로우 검증 여부는 "
+            "gate_verify_follow 로 제어한다 (true=검증 후 발송 / false=즉시 발송)."
+        ),
+    )
+    gate_verify_follow = models.BooleanField(
+        default=True,
+        verbose_name="팔로우 여부 검증",
+        help_text=(
+            "follow_gate_enabled=true 일 때만 의미 있음. "
+            "true(기본): 버튼 클릭 시 IG Profile API(is_user_follow_business)로 "
+            "팔로우 여부를 검증한 뒤 통과 시에만 reward 발송 (기존 follow-gate 동작). "
+            "false: 검증을 건너뛰고 버튼 클릭 즉시 reward 를 발송 "
+            "(button-only 모드 — 팔로우 확인 없음). "
+            "follow_gate_enabled=false 면 이 값과 무관하게 게이트 미사용."
         ),
     )
     follow_gate_prompt = models.TextField(
@@ -493,6 +511,28 @@ class AutoDMCampaign(models.Model):
     total_sent = models.IntegerField(default=0, verbose_name="총 발송 수")
     total_failed = models.IntegerField(default=0, verbose_name="총 실패 수")
 
+    # ===== 예약 발송 (DM scheduling — 활성 기간 한정 + 자동 종료) =====
+    # scheduled_* 는 "계획"(이 기간에만 발송)이고, started_at/ended_at 은 "실제 기록"이다.
+    # 둘 다 비우면 기존처럼 status 만으로 수동 운영(always_on).
+    scheduled_start_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="예약 시작일시",
+        help_text=(
+            "이 시각 이후부터 발송 시작 (status=active 여도 이 시각 전에는 발송하지 않음). "
+            "비우면 즉시 시작. ISO8601 타임존 포함 권장 (예: 2026-07-01T09:00:00+09:00)."
+        ),
+    )
+    scheduled_end_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="예약 종료일시",
+        help_text=(
+            "이 시각 이후 캠페인 자동 종료(status=completed, 발송 중단). "
+            "비우면 수동 종료 전까지 무기한. scheduled_start_at 이 있으면 그보다 미래여야 함."
+        ),
+    )
+
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="생성일시")
     updated_at = models.DateTimeField(auto_now=True, verbose_name="수정일시")
@@ -504,8 +544,91 @@ class AutoDMCampaign(models.Model):
         return f"{self.name} ({target})"
 
     def is_active(self) -> bool:
-        """캠페인이 활성 상태인지 확인"""
+        """캠페인이 활성 상태인지 확인 (status 만 본다 — 예약 창은 is_runnable_now 참고)"""
         return self.status == self.Status.ACTIVE
+
+    def copy(self, new_name: str | None = None) -> "AutoDMCampaign":
+        """이 캠페인을 비활성(INACTIVE) 복사본으로 복제해 저장 후 반환.
+
+        설정 필드는 전부 복사(트리거·키워드·메시지·공개답글·Follow-gate·예약 기간 포함),
+        통계(total_sent/total_failed)·실행기록(started_at/ended_at)·타임스탬프는 초기화한다.
+        SentDMLog 등 자식 로그는 복사하지 않는다.
+
+        _meta.fields 인트로스펙션 + EXCLUDE denylist 방식이라, 향후 설정 필드가 추가돼도
+        자동으로 복사된다(통계/타임스탬프만 명시적으로 제외).
+        """
+        EXCLUDE = {
+            "id",
+            "name",
+            "status",
+            "total_sent",
+            "total_failed",
+            "created_at",
+            "updated_at",
+            "started_at",
+            "ended_at",
+        }
+        data = {}
+        for f in self._meta.fields:
+            if f.name in EXCLUDE:
+                continue
+            # FK 는 *_id(attname)로 복사 (ig_connection → ig_connection_id)
+            data[f.attname] = getattr(self, f.attname)
+        return AutoDMCampaign.objects.create(
+            name=(new_name or f"{self.name} 복사")[:255],
+            status=self.Status.INACTIVE,
+            **data,
+        )
+
+    # ===== 예약 발송 윈도우 =====
+
+    @staticmethod
+    def schedule_window_q(now=None):
+        """현재 예약 창(window) 안에 있는 캠페인을 고르는 Q 필터.
+
+        scheduled_start_at 이 없거나 이미 지났고(시작됨),
+        scheduled_end_at 이 없거나 아직 안 지난(미종료) 캠페인.
+        발송 경로에서 status=ACTIVE 필터와 함께 ``.filter()`` 에 적용한다.
+        """
+        from django.db.models import Q
+
+        if now is None:
+            now = timezone.now()
+        started = Q(scheduled_start_at__isnull=True) | Q(scheduled_start_at__lte=now)
+        not_ended = Q(scheduled_end_at__isnull=True) | Q(scheduled_end_at__gt=now)
+        return started & not_ended
+
+    def is_within_schedule(self, now=None) -> bool:
+        """현재 시각이 이 캠페인의 예약 창 안에 있는지 (status 무관)."""
+        if now is None:
+            now = timezone.now()
+        if self.scheduled_start_at and now < self.scheduled_start_at:
+            return False
+        if self.scheduled_end_at and now >= self.scheduled_end_at:
+            return False
+        return True
+
+    def is_runnable_now(self, now=None) -> bool:
+        """지금 실제로 DM 을 발송할 수 있는지 = status=ACTIVE 이고 예약 창 안."""
+        return self.is_active() and self.is_within_schedule(now)
+
+    def schedule_state(self, now=None) -> str:
+        """예약 창 기준 UX 상태 (status 와 별개로 프론트 배지용).
+
+        - "always_on": 시작/종료 예약 둘 다 없음 (수동 운영)
+        - "scheduled": 시작 예약이 아직 안 됨 (대기 중)
+        - "running":   예약 창 진행 중
+        - "ended":     종료 예약 시각 경과 (자동 종료 대상)
+        """
+        if now is None:
+            now = timezone.now()
+        if self.scheduled_end_at and now >= self.scheduled_end_at:
+            return "ended"
+        if self.scheduled_start_at and now < self.scheduled_start_at:
+            return "scheduled"
+        if not self.scheduled_start_at and not self.scheduled_end_at:
+            return "always_on"
+        return "running"
 
     def can_send_more(self) -> bool:
         """더 많은 DM을 보낼 수 있는지 확인 (시간당 제한 체크)"""
@@ -573,9 +696,7 @@ class AutoDMCampaign(models.Model):
         import random
 
         candidates = [
-            t.strip()
-            for t in (self.public_reply_templates or [])
-            if t and str(t).strip()
+            t.strip() for t in (self.public_reply_templates or []) if t and str(t).strip()
         ]
         if candidates:
             return random.choice(candidates)
@@ -773,9 +894,7 @@ class SentDMLog(models.Model):
     )
 
     # 웹훅 echo의 mid (검증용, 보통 meta_message_id와 동일)
-    echo_mid = models.CharField(
-        max_length=255, blank=True, default="", verbose_name="Echo MID"
-    )
+    echo_mid = models.CharField(max_length=255, blank=True, default="", verbose_name="Echo MID")
 
     # 검증 경로
     verified_via = models.CharField(
@@ -906,9 +1025,7 @@ class SentDMLog(models.Model):
         self.delivered_at = self.delivered_at or timezone.now()
         if mid:
             self.echo_mid = mid
-        self.save(
-            update_fields=["status", "verified_via", "delivered_at", "echo_mid"]
-        )
+        self.save(update_fields=["status", "verified_via", "delivered_at", "echo_mid"])
 
     def mark_read(self):
         """messaging_seen 수신"""

@@ -2,6 +2,7 @@
 Instagram integration serializers
 """
 
+from django.utils import timezone
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
@@ -81,10 +82,13 @@ class DisconnectResponseSerializer(serializers.Serializer):
         help_text="Meta webhook 구독 해제 성공 여부 (best-effort)"
     )
     webhook_error = serializers.CharField(
-        allow_null=True, allow_blank=True,
-        help_text="webhook 해제 실패 시 에러 메시지 (실패해도 disconnect 는 진행됨)"
+        allow_null=True,
+        allow_blank=True,
+        help_text="webhook 해제 실패 시 에러 메시지 (실패해도 disconnect 는 진행됨)",
     )
-    reason = serializers.CharField(help_text="해제 이유 (user_requested / meta_deauth / token_expired 등)")
+    reason = serializers.CharField(
+        help_text="해제 이유 (user_requested / meta_deauth / token_expired 등)"
+    )
 
 
 class ConnectionCallbackResponseSerializer(serializers.Serializer):
@@ -102,6 +106,9 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
     ig_username = serializers.CharField(source="ig_connection.username", read_only=True)
     is_active = serializers.SerializerMethodField()
     can_send = serializers.SerializerMethodField()
+    # 예약 발송: 창 기준 UX 상태 (always_on / scheduled / running / ended)
+    schedule_state = serializers.SerializerMethodField()
+    is_runnable_now = serializers.SerializerMethodField()
 
     class Meta:
         model = AutoDMCampaign
@@ -130,6 +137,7 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
             "public_reply_batch_pause_seconds",
             # Follow-gate (v3.8 — is_user_follow_business silent verify)
             "follow_gate_enabled",
+            "gate_verify_follow",
             "follow_gate_prompt",
             "follow_gate_button_label",
             "follow_gate_retry_message",
@@ -142,6 +150,11 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
             "total_failed",
             "is_active",
             "can_send",
+            # 예약 발송 (활성 기간 + 자동 종료)
+            "scheduled_start_at",
+            "scheduled_end_at",
+            "schedule_state",
+            "is_runnable_now",
             # timestamps
             "created_at",
             "updated_at",
@@ -156,6 +169,8 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
             "total_failed",
             "is_active",
             "can_send",
+            "schedule_state",
+            "is_runnable_now",
             "created_at",
             "updated_at",
             "started_at",
@@ -167,6 +182,34 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
 
     def get_can_send(self, obj) -> bool:
         return obj.can_send_more()
+
+    def get_schedule_state(self, obj) -> str:
+        return obj.schedule_state()
+
+    def get_is_runnable_now(self, obj) -> bool:
+        return obj.is_runnable_now()
+
+    def validate(self, attrs):
+        """예약 창 정합성 검증 (PATCH/PUT 경로 — 이 시리얼라이저가 update 에 쓰임).
+
+        부분 수정 시 누락된 값은 기존 인스턴스 값으로 보완해 종료>시작 관계를 확인한다.
+        """
+        start = attrs.get("scheduled_start_at", getattr(self.instance, "scheduled_start_at", None))
+        end = attrs.get("scheduled_end_at", getattr(self.instance, "scheduled_end_at", None))
+        if start and end and end <= start:
+            raise serializers.ValidationError(
+                {"scheduled_end_at": "scheduled_end_at 은 scheduled_start_at 보다 미래여야 합니다."}
+            )
+        # create/schedule 엔드포인트와 동일 규칙: 과거 종료일은 거부(즉시 종료되는 footgun 방지).
+        # 단, 사용자가 이번 요청에서 scheduled_end_at 을 새로 보낸 경우에만 검사한다
+        # (기존에 지나간 종료일을 그대로 둔 채 다른 필드만 PATCH 하는 건 막지 않음).
+        if "scheduled_end_at" in attrs and end and end <= timezone.now():
+            raise serializers.ValidationError(
+                {
+                    "scheduled_end_at": "scheduled_end_at 은 현재 시각보다 미래여야 합니다 (과거면 즉시 종료됨)."
+                }
+            )
+        return attrs
 
 
 class AutoDMCampaignCreateSerializer(serializers.Serializer):
@@ -202,7 +245,10 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
         help_text="trigger_type=specific_media 일 때 필수. any/next 일 때는 빈 문자열",
     )
     media_url = serializers.URLField(
-        required=False, allow_blank=True, allow_null=True, default=None,
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        default=None,
         help_text="게시물 URL (참고용)",
     )
 
@@ -224,18 +270,24 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
 
     # 메시지 (둘 중 하나는 필수)
     opening_message_template = serializers.CharField(
-        required=False, allow_blank=True, default="",
+        required=False,
+        allow_blank=True,
+        default="",
         help_text="첫 인사 DM 본문 (Private Reply via comment_id)",
     )
     message_template = serializers.CharField(
-        required=False, allow_blank=True, default="",
+        required=False,
+        allow_blank=True,
+        default="",
         help_text="legacy 별칭 — opening_message_template 미사용 시 이 값 사용",
     )
 
     # 공개 답글 (v3.5)
     public_reply_enabled = serializers.BooleanField(default=False)
     public_reply_template = serializers.CharField(
-        required=False, allow_blank=True, default="",
+        required=False,
+        allow_blank=True,
+        default="",
         help_text="[deprecated] 단일 템플릿. 새 캠페인은 public_reply_templates 사용 권장.",
     )
     public_reply_templates = serializers.ListField(
@@ -248,11 +300,15 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
         ),
     )
     public_reply_batch_size = serializers.IntegerField(
-        default=10, min_value=1, max_value=200,
+        default=10,
+        min_value=1,
+        max_value=200,
         help_text="이 개수만큼 답글 게시 후 쿨다운 적용 (기본 10)",
     )
     public_reply_batch_pause_seconds = serializers.IntegerField(
-        default=300, min_value=30, max_value=3600,
+        default=300,
+        min_value=30,
+        max_value=3600,
         help_text="배치 도달 후 다음 답글까지 대기 시간 (초, 기본 300)",
     )
 
@@ -260,24 +316,41 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
     follow_gate_enabled = serializers.BooleanField(
         default=False,
         help_text=(
-            "true 면 opening DM 에 '팔로우했어요' quick_reply 버튼이 첨부되고, "
-            "사용자가 클릭 시 IG Profile API 로 팔로우 여부를 확인한 후 "
-            "reward_message_template 을 발송한다. reward_message_template 가 비어 있으면 무시."
+            "true 면 opening DM 에 버튼이 첨부되고, 사용자가 클릭 시 "
+            "reward_message_template 을 발송한다. reward_message_template 가 비어 있으면 무시. "
+            "버튼 클릭 시 팔로우 검증 여부는 gate_verify_follow 로 제어."
+        ),
+    )
+    gate_verify_follow = serializers.BooleanField(
+        default=True,
+        help_text=(
+            "follow_gate_enabled=true 전제. true(기본): 버튼 클릭 시 IG Profile API 로 "
+            "팔로우 여부를 검증한 후 통과 시에만 reward 발송 (기존 follow-gate). "
+            "false: 검증을 건너뛰고 버튼 클릭 즉시 reward 발송 (button-only 모드). "
+            "button-only 모드에선 follow_gate_button_label / follow_gate_prompt 를 "
+            "용도에 맞게 직접 지정 권장 (비우면 follow 용 기본 문구가 노출됨)."
         ),
     )
     follow_gate_prompt = serializers.CharField(
-        required=False, allow_blank=True, default="",
+        required=False,
+        allow_blank=True,
+        default="",
         help_text=(
             "Opening DM 본문 (게이트 안내 문구). 비우면 기본 문구 사용. "
             "예: '댓글 남겨주셔서 감사해요! 팔로우도 하셨나요? 버튼을 눌러주세요!'"
         ),
     )
     follow_gate_button_label = serializers.CharField(
-        required=False, allow_blank=True, max_length=20, default="",
+        required=False,
+        allow_blank=True,
+        max_length=20,
+        default="",
         help_text="버튼 라벨 (Meta 한도 20자). 비우면 '팔로우했어요'.",
     )
     follow_gate_retry_message = serializers.CharField(
-        required=False, allow_blank=True, default="",
+        required=False,
+        allow_blank=True,
+        default="",
         help_text=(
             "팔로우 미확인 시 재안내 문구. 비우면 시스템 기본 문구 사용. "
             "재안내 메시지에도 같은 '팔로우했어요' 버튼이 자동 첨부된다."
@@ -292,8 +365,26 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
     )
 
     # 운영
-    max_sends_per_hour = serializers.IntegerField(
-        default=200, min_value=1, max_value=500
+    max_sends_per_hour = serializers.IntegerField(default=200, min_value=1, max_value=500)
+
+    # 예약 발송 (활성 기간 한정 + 자동 종료) — 둘 다 생략하면 기존처럼 즉시/무기한 운영
+    scheduled_start_at = serializers.DateTimeField(
+        required=False,
+        allow_null=True,
+        default=None,
+        help_text=(
+            "예약 시작일시 (ISO8601, 타임존 포함). 이 시각부터 발송 시작. "
+            "비우면 즉시 시작. 예: '2026-07-01T09:00:00+09:00'"
+        ),
+    )
+    scheduled_end_at = serializers.DateTimeField(
+        required=False,
+        allow_null=True,
+        default=None,
+        help_text=(
+            "예약 종료일시 (ISO8601, 타임존 포함). 이 시각 이후 자동 종료(status=completed). "
+            "비우면 무기한. scheduled_start_at 보다 미래여야 함. 예: '2026-07-31T23:59:59+09:00'"
+        ),
     )
 
     def validate(self, attrs):
@@ -306,21 +397,24 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
         # v3.7: STORY_REPLY 트리거는 media_id 에 Story ID 가 필수
         if trigger == AutoDMCampaign.TriggerType.STORY_REPLY and not media_id:
             raise serializers.ValidationError(
-                {"media_id": "trigger_type=story_reply 일 때 media_id 에 대상 Story ID 가 필수입니다."}
+                {
+                    "media_id": "trigger_type=story_reply 일 때 media_id 에 대상 Story ID 가 필수입니다."
+                }
             )
         # Story 답장 캠페인은 공개 답글 불가능 (Story 에는 댓글 자체가 없음)
-        if (
-            trigger == AutoDMCampaign.TriggerType.STORY_REPLY
-            and attrs.get("public_reply_enabled")
-        ):
+        if trigger == AutoDMCampaign.TriggerType.STORY_REPLY and attrs.get("public_reply_enabled"):
             raise serializers.ValidationError(
-                {"public_reply_enabled": "Story 답장 캠페인은 공개 답글을 사용할 수 없습니다 (Story 에 댓글 기능이 없음)."}
+                {
+                    "public_reply_enabled": "Story 답장 캠페인은 공개 답글을 사용할 수 없습니다 (Story 에 댓글 기능이 없음)."
+                }
             )
         opening = (attrs.get("opening_message_template") or "").strip()
         legacy_msg = (attrs.get("message_template") or "").strip()
         if not opening and not legacy_msg:
             raise serializers.ValidationError(
-                {"opening_message_template": "opening_message_template 또는 message_template 중 하나는 필수입니다."}
+                {
+                    "opening_message_template": "opening_message_template 또는 message_template 중 하나는 필수입니다."
+                }
             )
         # Follow-gate 사용 시 reward_message_template 필수
         if attrs.get("follow_gate_enabled"):
@@ -347,6 +441,19 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
                         )
                     }
                 )
+        # 예약 발송 창 검증
+        start = attrs.get("scheduled_start_at")
+        end = attrs.get("scheduled_end_at")
+        if start and end and end <= start:
+            raise serializers.ValidationError(
+                {"scheduled_end_at": "scheduled_end_at 은 scheduled_start_at 보다 미래여야 합니다."}
+            )
+        if end and end <= timezone.now():
+            raise serializers.ValidationError(
+                {
+                    "scheduled_end_at": "scheduled_end_at 은 현재 시각보다 미래여야 합니다 (과거면 즉시 종료됨)."
+                }
+            )
         return attrs
 
 
@@ -372,6 +479,7 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
             "public_reply_batch_pause_seconds",
             # Follow-gate (v3.8)
             "follow_gate_enabled",
+            "gate_verify_follow",
             "follow_gate_prompt",
             "follow_gate_button_label",
             "follow_gate_retry_message",
@@ -379,9 +487,14 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
             "gate_trigger_keywords",
             "max_sends_per_hour",
             "status",
+            # 예약 발송
+            "scheduled_start_at",
+            "scheduled_end_at",
         ]
         extra_kwargs = {
             "media_url": {"required": False, "allow_null": True, "allow_blank": True},
+            "scheduled_start_at": {"required": False, "allow_null": True},
+            "scheduled_end_at": {"required": False, "allow_null": True},
             "description": {"required": False, "allow_blank": True},
             "max_sends_per_hour": {"required": False},
             "status": {"required": False},
@@ -396,12 +509,76 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
             "public_reply_batch_size": {"required": False},
             "public_reply_batch_pause_seconds": {"required": False},
             "follow_gate_enabled": {"required": False},
+            "gate_verify_follow": {"required": False},
             "follow_gate_prompt": {"required": False, "allow_blank": True},
             "follow_gate_button_label": {"required": False, "allow_blank": True},
             "follow_gate_retry_message": {"required": False, "allow_blank": True},
             "reward_message_template": {"required": False, "allow_blank": True},
             "gate_trigger_keywords": {"required": False},
         }
+
+
+class AutoDMCampaignScheduleSerializer(serializers.Serializer):
+    """캠페인 예약 발송 창(활성 기간) 설정 — POST .../auto-dm-campaigns/{id}/schedule/.
+
+    예약 창을 **통째로 교체**한다 (PATCH 의 부분 갱신과 달리, 생략한 필드는 null 로 해제).
+    예: 시작만 보내면 종료 예약은 해제되어 무기한이 된다.
+    """
+
+    scheduled_start_at = serializers.DateTimeField(
+        required=False,
+        allow_null=True,
+        default=None,
+        help_text=(
+            "발송 시작일시 (ISO8601, 타임존 포함). null/생략이면 즉시 시작. "
+            "예: '2026-07-01T09:00:00+09:00'"
+        ),
+    )
+    scheduled_end_at = serializers.DateTimeField(
+        required=False,
+        allow_null=True,
+        default=None,
+        help_text=(
+            "자동 종료일시 (ISO8601, 타임존 포함). null/생략이면 무기한. "
+            "이 시각 이후 status=completed 로 자동 전환. 예: '2026-07-31T23:59:59+09:00'"
+        ),
+    )
+    activate = serializers.BooleanField(
+        required=False,
+        default=True,
+        help_text=(
+            "true(기본): 예약 설정과 동시에 status 를 active 로 전환(필요 시 종료 기록 해제). "
+            "false: status 는 그대로 두고 예약 창만 갱신."
+        ),
+    )
+
+    def validate(self, attrs):
+        start = attrs.get("scheduled_start_at")
+        end = attrs.get("scheduled_end_at")
+        if start and end and end <= start:
+            raise serializers.ValidationError(
+                {"scheduled_end_at": "종료일은 시작일보다 미래여야 합니다."}
+            )
+        if end and end <= timezone.now():
+            raise serializers.ValidationError(
+                {"scheduled_end_at": "종료일은 현재 시각보다 미래여야 합니다 (과거면 즉시 종료됨)."}
+            )
+        return attrs
+
+
+class AutoDMCampaignCopySerializer(serializers.Serializer):
+    """캠페인 복사 — POST .../auto-dm-campaigns/{id}/copy/.
+
+    원본 캠페인을 비활성(INACTIVE) 복사본으로 복제한다. 이름만 바꿀 수 있고,
+    나머지 설정(예약 기간 포함)은 전부 원본과 동일하게 복사된다.
+    """
+
+    name = serializers.CharField(
+        max_length=255,
+        required=False,
+        allow_blank=True,
+        help_text="복사본 캠페인 이름. 생략/공백이면 '{원본명} 복사' 로 자동 생성.",
+    )
 
 
 class SentDMLogSerializer(serializers.ModelSerializer):
@@ -540,9 +717,7 @@ class DMVerificationStatsSerializer(serializers.Serializer):
     delivery_rate = serializers.FloatField(
         help_text="ACCEPTED 진입 건 중 DELIVERED+READ 비율 (0~1)"
     )
-    read_rate = serializers.FloatField(
-        help_text="DELIVERED 건 중 READ 비율 (0~1)"
-    )
+    read_rate = serializers.FloatField(help_text="DELIVERED 건 중 READ 비율 (0~1)")
 
     # v3.3 — DM 종류별 분리
     standalone_total = serializers.IntegerField(help_text="단발 DM (gate 미사용) 총 수")

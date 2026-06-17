@@ -182,6 +182,7 @@ class AdminCampaignDetailSerializer(serializers.ModelSerializer):
             "public_reply_batch_size",
             "public_reply_batch_pause_seconds",
             "follow_gate_enabled",
+            "gate_verify_follow",
             "follow_gate_prompt",
             "follow_gate_button_label",
             "follow_gate_retry_message",

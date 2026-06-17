@@ -508,3 +508,95 @@ class ClassifyPostsResponseSerializer(serializers.Serializer):
     assignments = ClassifyAssignmentSerializer(many=True)
     new_categories = ClassifyNewCategorySerializer(many=True)
     usage = AiLlmTryUsageSerializer()
+
+
+# ── AutoDM 캠페인 폼-작성 도움 (AI suggest) ─────────────────────
+
+
+class AutoDMCampaignAiSuggestRequestSerializer(serializers.Serializer):
+    """POST /api/v1/integrations/auto-dm-campaigns/ai-suggest/ 요청 바디.
+
+    게시물(이미지+캡션)을 gemma-4 로 분석해 AutoDM 캠페인 폼 초안을 생성한다.
+    프론트가 게시물 목록에서 이미 받은 caption/image_url 을 그대로 넘기는 것을 권장
+    (mock 모드 dev 에서도 동작, Graph 재조회 불필요). caption/image_url 둘 다 비어 있으면
+    media_id 로 백엔드가 Graph API 조회를 시도한다(mock 모드/연결 없음 시 400).
+    """
+
+    media_id = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+        help_text="게시물 IG media id (참고용 echo + caption/image 미제공 시 Graph 조회 키).",
+    )
+    ig_connection_id = serializers.UUIDField(
+        required=False,
+        allow_null=True,
+        help_text="Graph 조회에 사용할 IG connection UUID. 미지정 시 첫 활성 connection.",
+    )
+    caption = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+        help_text="게시물 캡션. 제공 시 Graph 조회를 건너뛴다 (권장).",
+    )
+    image_url = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+        help_text="게시물 이미지/썸네일 URL. 제공 시 백엔드가 받아 base64 로 비전 입력에 사용.",
+    )
+    media_type = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+        help_text="IMAGE / VIDEO / CAROUSEL_ALBUM 등 (참고용 echo).",
+    )
+    business_type = serializers.CharField(
+        required=False, allow_blank=True, default="", help_text="업종 힌트 (선택)."
+    )
+    campaign_goal = serializers.CharField(
+        required=False, allow_blank=True, default="", help_text="캠페인 목적 힌트 (선택)."
+    )
+    tone = serializers.CharField(
+        required=False, allow_blank=True, default="", help_text="원하는 말투 힌트 (선택)."
+    )
+    link_url = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+        help_text="DM/보상에 넣을 링크 (선택). 있으면 본문 {{link}} 자리에 치환.",
+    )
+    include_follow_gate = serializers.BooleanField(
+        required=False, default=True, help_text="팔로우 게이트 문구도 생성할지 (기본 true)."
+    )
+    reply_variant_count = serializers.IntegerField(
+        required=False,
+        default=50,
+        min_value=1,
+        max_value=50,
+        help_text="공개 답글 변형 개수 (기본 50, 1~50). 코드 풀에서 즉시 추출(LLM 미사용).",
+    )
+
+    def validate(self, attrs):
+        has_context = any(
+            (attrs.get(k) or "").strip() for k in ("caption", "image_url", "media_id")
+        )
+        if not has_context:
+            raise serializers.ValidationError(
+                "caption, image_url, media_id 중 최소 하나는 필요합니다."
+            )
+        return attrs
+
+
+class AutoDMCampaignAiSuggestJobSerializer(serializers.Serializer):
+    """POST .../ai-suggest/ 의 202 응답 — 생성 작업이 큐에 등록됨.
+
+    gemma-4 가 답글 변형 등 긴 출력을 만드느라 수십 초가 걸려 동기 응답은 prod 타임아웃에
+    걸린다. 그래서 작업을 큐에 넣고 job_id 를 즉시 반환하며, 프론트는 poll_url 을 1~2초
+    간격으로 폴링해 status=succeeded 가 되면 result_json.suggestion 을 폼에 채운다.
+    """
+
+    job_id = serializers.UUIDField(help_text="생성 작업 ID")
+    status = serializers.CharField(help_text="작업 상태 (queued)")
+    poll_url = serializers.CharField(help_text="작업 상태 폴링 URL (GET)")
+    message = serializers.CharField(help_text="안내 메시지")

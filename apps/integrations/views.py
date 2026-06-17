@@ -2,36 +2,58 @@
 Instagram integration views
 """
 
-from rest_framework import viewsets, status
-from rest_framework.decorators import action, api_view, permission_classes
-from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated, AllowAny
-from drf_spectacular.utils import extend_schema, OpenApiResponse, OpenApiParameter, OpenApiExample
-from django.shortcuts import redirect
-from django.http import HttpResponse
-from django.conf import settings
-from django.utils import timezone
-from datetime import timedelta
+import logging
 import secrets
+from datetime import timedelta
 
+import requests
+from django.conf import settings
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.http import HttpResponse
+from django.utils import timezone
+from django.utils.dateparse import parse_date, parse_datetime
+from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiResponse, extend_schema
+from rest_framework import status, viewsets
+from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.exceptions import ValidationError as DRFValidationError
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.response import Response
+
+# AI 폼-작성 도움(게시물→캠페인 초안) 요청/작업 시리얼라이저. @extend_schema 가 클래스 정의 시점에
+# 시리얼라이저 객체를 요구하므로 최상단 import (ai_jobs→integrations 의존이 없어 순환 없음).
+from apps.ai_jobs.serializers import (
+    AutoDMCampaignAiSuggestJobSerializer,
+    AutoDMCampaignAiSuggestRequestSerializer,
+)
 from apps.workspace.models import Workspace
-from apps.workspace.permissions import IsWorkspaceMember
-from .models import IGAccountConnection, AutoDMCampaign, EventInbox, SentDMLog, SpamFilterConfig, SpamCommentLog, IGOAuthState
+
+from .models import (
+    AutoDMCampaign,
+    EventInbox,
+    IGAccountConnection,
+    IGOAuthState,
+    SentDMLog,
+    SpamCommentLog,
+    SpamFilterConfig,
+)
 from .serializers import (
-    IGAccountConnectionSerializer,
+    AutoDMCampaignCopySerializer,
+    AutoDMCampaignCreateSerializer,
+    AutoDMCampaignScheduleSerializer,
+    AutoDMCampaignSerializer,
+    AutoDMCampaignUpdateSerializer,
+    ConnectionCallbackResponseSerializer,
     ConnectionStartResponseSerializer,
     DisconnectResponseSerializer,
-    ConnectionCallbackResponseSerializer,
-    AutoDMCampaignSerializer,
-    AutoDMCampaignCreateSerializer,
-    AutoDMCampaignUpdateSerializer,
+    IGAccountConnectionSerializer,
     SentDMLogSerializer,
+    SpamCommentLogSerializer,
     SpamFilterConfigSerializer,
     SpamFilterConfigUpdateSerializer,
-    SpamCommentLogSerializer,
 )
 from .services import InstagramOAuthService, MockInstagramProvider
-import requests
+
+logger = logging.getLogger(__name__)
 
 
 class InstagramIntegrationViewSet(viewsets.ViewSet):
@@ -62,9 +84,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         from rest_framework.exceptions import PermissionDenied
 
         if not ig_connection_id:
-            return IGAccountConnection.objects.filter(
-                workspace=workspace, status="active"
-            ).first()
+            return IGAccountConnection.objects.filter(workspace=workspace, status="active").first()
 
         try:
             connection = IGAccountConnection.objects.get(id=ig_connection_id)
@@ -79,17 +99,17 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         description="""
         ## 목적
         Instagram Business 계정 연동을 시작합니다.
-        
+
         ## 인증
         - **Bearer 토큰 필수**
-        
+
         ## 동작 방식
         1. Instagram OAuth 인증 URL 생성
         2. 사용자를 Facebook OAuth 페이지로 리디렉션
         3. 사용자가 권한 승인
         4. Callback URL로 리디렉션됨
         5. 백엔드에서 토큰 교환 및 Instagram 계정 정보 조회
-        
+
         ## 필요한 Facebook 권한
         - `pages_show_list` - Facebook Page 목록 조회
         - `pages_read_engagement` - Page 정보 및 engagement 읽기
@@ -97,7 +117,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         - `instagram_manage_comments` - Instagram 댓글 관리
         - `instagram_manage_messages` - Instagram DM 관리
         - `business_management` - 비즈니스 계정 관리
-        
+
         ## 사용 예시
         ```javascript
         // 프론트엔드에서 새 창으로 OAuth 시작
@@ -111,12 +131,12 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 }
             }
         );
-        
+
         const data = await response.json();
         // 새 창으로 Facebook OAuth 페이지 열기
         window.open(data.authorization_url, '_blank', 'width=600,height=800');
         ```
-        
+
         ## 응답 예시
         ```json
         {
@@ -177,7 +197,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         description="""
         ## 목적
         Instagram OAuth 콜백을 처리하고 계정 연결을 완료합니다.
-        
+
         ## 동작 방식
         1. Authorization code 수신
         2. Code를 Access Token으로 교환
@@ -185,18 +205,18 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         4. Facebook Pages 조회
         5. Instagram Business Account 확인
         6. 계정 정보 조회 및 IGAccountConnection 생성
-        
+
         ## 주의사항
         - 이 엔드포인트는 **Facebook OAuth에서 자동으로 호출**됩니다
         - 사용자가 직접 호출할 필요 없음
         - Meta 개발자 센터에 이 URL을 **OAuth 리디렉션 URI**로 등록 필수
-        
+
         ## Meta 앱 설정
         리디렉션 URI 등록:
         ```
         https://your-domain.com/api/v1/integrations/instagram/connect/callback/
         ```
-        
+
         ## 성공 응답 예시
         ```json
         {
@@ -227,7 +247,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
             }
         }
         ```
-        
+
         ## 에러 응답
         - `OAUTH_AUTHORIZATION_FAILED` - OAuth 인증 실패
         - `MISSING_PARAMETERS` - code 또는 state 파라미터 누락
@@ -403,15 +423,15 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 except Exception as e:
                     logger.error(f"Exception during get_account_info: {str(e)}")
 
-                    html = f"""
+                    html = """
                     <!DOCTYPE html>
                     <html>
                     <head>
                         <meta charset="UTF-8">
                         <title>Instagram 연동 실패</title>
                         <style>
-                            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 40px; text-align: center; }}
-                            .error {{ color: #dc3545; }}
+                            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 40px; text-align: center; }
+                            .error { color: #dc3545; }
                         </style>
                     </head>
                     <body>
@@ -419,15 +439,15 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                         <p>Instagram API 호출 중 오류가 발생했습니다.</p>
                         <p>창이 자동으로 닫힙니다...</p>
                         <script>
-                            if (window.opener) {{
-                                window.opener.postMessage({{
+                            if (window.opener) {
+                                window.opener.postMessage({
                                     type: 'INSTAGRAM_ERROR',
                                     success: false,
                                     errorCode: 'INSTAGRAM_API_ERROR',
                                     message: 'Instagram API 호출 중 오류가 발생했습니다.'
-                                }}, '*');
+                                }, '*');
                                 setTimeout(() => window.close(), 2000);
-                            }}
+                            }
                         </script>
                     </body>
                     </html>
@@ -435,7 +455,9 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                     return HttpResponse(html)
 
                 # Use user_id from token response or account_info
-                instagram_account_id = account_info.get("user_id") or ig_user_id or account_info.get("id", "")
+                instagram_account_id = (
+                    account_info.get("user_id") or ig_user_id or account_info.get("id", "")
+                )
 
                 account_info["id"] = instagram_account_id
 
@@ -480,7 +502,9 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                         access_token=access_token,
                         fields="comments,messages",
                     )
-                    logger.debug(f"Webhook subscription result for {instagram_account_id}: {subscribe_result}")
+                    logger.debug(
+                        f"Webhook subscription result for {instagram_account_id}: {subscribe_result}"
+                    )
                 except Exception as e:
                     logger.warning(f"Failed to subscribe webhooks for {instagram_account_id}: {e}")
 
@@ -488,6 +512,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 # (프론트가 별도로 sync 트리거할 필요 없이 즉시 데이터 확보)
                 try:
                     from apps.insights.tasks import bootstrap_account
+
                     bootstrap_account.delay(str(connection.id))
                     logger.info(f"Enqueued insights bootstrap for {connection.id}")
                 except Exception as e:
@@ -497,6 +522,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 # 연동 즉시 우리 스토리지로 사본을 끌어와서 안정 URL 확보. best-effort.
                 try:
                     from .tasks import sync_ig_profile_picture
+
                     sync_ig_profile_picture.delay(str(connection.id))
                     logger.info(f"Enqueued profile picture sync for {connection.id}")
                 except Exception as e:
@@ -584,15 +610,15 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         description="""
         ## 목적
         워크스페이스에 연결된 Instagram 계정 목록을 조회합니다.
-        
+
         ## 사용 시나리오
         - 연결된 계정 확인
         - 토큰 만료 상태 확인
         - 계정 정보 조회
-        
+
         ## 인증
         - **Bearer 토큰 필수**
-        
+
         ## 응답 데이터
         - `id`: 연결 ID
         - `external_account_id`: Instagram 계정 ID
@@ -601,7 +627,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         - `token_expires_at`: 토큰 만료 시간
         - `status`: 연결 상태 (active/expired/revoked/error)
         - `is_expired`: 토큰 만료 여부
-        
+
         ## 사용 예시
         ```javascript
         const response = await fetch(
@@ -612,7 +638,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 }
             }
         );
-        
+
         const connections = await response.json();
         ```
         """,
@@ -639,15 +665,15 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         description="""
         ## 목적 (개발 전용)
         연동된 Instagram 계정으로 실제 Instagram Graph API를 호출하여 테스트합니다.
-        
+
         ## 테스트 항목
         - ✅ 프로필 정보 조회 (username, profile_picture, followers_count 등)
         - ✅ 최근 미디어 조회 (게시물 5개)
         - ✅ 미디어 상세 정보 (좋아요 수, 댓글 수 등)
-        
+
         ## 응답
         연결된 Instagram 계정의 프로필 및 최근 게시물 정보를 반환합니다.
-        
+
         ## 주의
         - 개발/테스트 용도로만 사용하세요.
         - 프로덕션에서는 제거될 수 있습니다.
@@ -806,19 +832,19 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         description="""
         ## 목적 (개발 전용)
         연동된 Instagram 계정의 게시물(미디어) 목록을 조회합니다.
-        
+
         ## 기능
         - 📸 게시물 목록 조회 (IMAGE, VIDEO, CAROUSEL_ALBUM)
         - 📊 각 게시물의 인게이지먼트 데이터 (좋아요, 댓글 수)
         - 🔄 페이지네이션 지원 (limit, after)
-        
+
         ## Query Parameters
         - `limit`: 가져올 게시물 수 (기본값: 10, 최대: 50)
         - `after`: 페이지네이션 커서 (다음 페이지 조회 시 사용)
-        
+
         ## 응답
         게시물 목록과 페이지네이션 정보를 반환합니다.
-        
+
         ## 주의
         - 개발/테스트 용도로만 사용하세요.
         """,
@@ -1460,9 +1486,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         """Meta Deauthorize Callback — 사용자가 IG 설정에서 앱 제거 시 호출됨"""
         from .services import InstagramOAuthService
 
-        signed_request = request.data.get("signed_request") or request.POST.get(
-            "signed_request"
-        )
+        signed_request = request.data.get("signed_request") or request.POST.get("signed_request")
         if not signed_request:
             return Response(
                 {"error": "missing signed_request"},
@@ -1500,15 +1524,15 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         description="""
         ## 목적 (개발 전용)
         특정 Instagram 게시물의 상세 정보를 조회합니다.
-        
+
         ## 기능
         - 📸 게시물 상세 정보
         - 💬 댓글 목록 (최근 50개)
         - 📊 인게이지먼트 통계
-        
+
         ## Path Parameters
         - `media_id`: Instagram 미디어 ID
-        
+
         ## 주의
         - 개발/테스트 용도로만 사용하세요.
         """,
@@ -1648,25 +1672,122 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     serializer_class = AutoDMCampaignSerializer
 
+    # 목록(list) 정렬 허용 필드 화이트리스트 (임의 컬럼 정렬·인젝션 방지).
+    # ordering 쿼리 파라미터는 '-' 접두사(내림차순)와 콤마 다중 지정을 지원한다.
+    LIST_ORDERING_FIELDS = (
+        "created_at",
+        "updated_at",
+        "name",
+        "status",
+        "total_sent",
+        "total_failed",
+        "started_at",
+        "scheduled_start_at",
+        "scheduled_end_at",
+    )
+    DEFAULT_LIST_ORDERING = "-created_at"
+
     def get_queryset(self):
         """사용자의 workspace에 속한 캠페인만 조회.
 
         멀티 IG 계정: ?ig_connection_id=<uuid> 로 특정 IG 계정의 캠페인만 필터.
         다른 사용자의 connection 을 지정해도 user_workspaces 필터 때문에 결과 비어있음.
+
+        목록(list) 조회에 한해 status / 생성일 범위 필터와 ordering 정렬을 추가로 적용한다.
+        상세 조회·커스텀 액션(get_object)에는 영향을 주지 않는다(기본 -created_at 정렬).
         """
         user_workspaces = Workspace.objects.filter(memberships__user=self.request.user)
 
-        qs = (
-            AutoDMCampaign.objects.filter(ig_connection__workspace__in=user_workspaces)
-            .select_related("ig_connection")
-            .order_by("-created_at")
-        )
+        qs = AutoDMCampaign.objects.filter(
+            ig_connection__workspace__in=user_workspaces
+        ).select_related("ig_connection")
 
         ig_connection_id = self.request.query_params.get("ig_connection_id")
         if ig_connection_id:
             qs = qs.filter(ig_connection_id=ig_connection_id)
 
-        return qs
+        if self.action == "list":
+            return self._filter_and_order_list(qs)
+        return qs.order_by(self.DEFAULT_LIST_ORDERING)
+
+    def _filter_and_order_list(self, qs):
+        """목록 전용 status / 생성일 범위 필터 + ordering 정렬 적용.
+
+        잘못된 입력(허용되지 않은 status·정렬 필드, 날짜 형식 오류)은 400 으로 거부한다.
+        """
+        params = self.request.query_params
+
+        # status 필터 (콤마로 다중 지정 가능: ?status=active,paused)
+        status_param = params.get("status")
+        if status_param:
+            valid = set(AutoDMCampaign.Status.values)
+            requested = [s.strip() for s in status_param.split(",") if s.strip()]
+            invalid = [s for s in requested if s not in valid]
+            if invalid:
+                raise DRFValidationError(
+                    {"status": f"허용되지 않은 status 값: {invalid}. 가능: {sorted(valid)}"}
+                )
+            if requested:
+                qs = qs.filter(status__in=requested)
+
+        # 생성일 범위 필터 (created_after / created_before, 둘 다 경계 포함)
+        created_after = params.get("created_after")
+        if created_after:
+            kind, value = self._parse_date_param(created_after, "created_after")
+            lookup = "created_at__date__gte" if kind == "date" else "created_at__gte"
+            qs = qs.filter(**{lookup: value})
+
+        created_before = params.get("created_before")
+        if created_before:
+            kind, value = self._parse_date_param(created_before, "created_before")
+            lookup = "created_at__date__lte" if kind == "date" else "created_at__lte"
+            qs = qs.filter(**{lookup: value})
+
+        # ordering 정렬 (콤마 다중, '-' 접두사 내림차순)
+        ordering_param = params.get("ordering")
+        if ordering_param:
+            cleaned = []
+            for raw in ordering_param.split(","):
+                field = raw.strip()
+                if not field:
+                    continue
+                bare = field[1:] if field.startswith("-") else field
+                if bare not in self.LIST_ORDERING_FIELDS:
+                    raise DRFValidationError(
+                        {
+                            "ordering": (
+                                f"허용되지 않은 정렬 필드: {bare!r}. "
+                                f"가능: {list(self.LIST_ORDERING_FIELDS)}"
+                            )
+                        }
+                    )
+                cleaned.append(field)
+            if cleaned:
+                return qs.order_by(*cleaned)
+
+        return qs.order_by(self.DEFAULT_LIST_ORDERING)
+
+    @staticmethod
+    def _parse_date_param(raw, field_name):
+        """쿼리 파라미터를 (종류, 값) 으로 파싱. 종류는 "date" 또는 "dt".
+
+        날짜만(YYYY-MM-DD) 이면 date 로 취급해 __date 룩업(그날 전체 포함)을 쓰게 한다.
+        주의: Django 의 parse_datetime 은 날짜만 줘도 자정 datetime 을 돌려주므로,
+        date-only 를 먼저 가려내려면 parse_date($-anchored)를 먼저 시도해야 한다.
+        시각이 포함된 ISO8601 이면 datetime(naive 는 현재 타임존으로 aware 변환).
+        둘 다 실패하면 400.
+        """
+        d = parse_date(raw)
+        if d is not None:
+            return "date", d
+        dt = parse_datetime(raw)
+        if dt is not None:
+            if timezone.is_naive(dt):
+                dt = timezone.make_aware(dt)
+            return "dt", dt
+        raise DRFValidationError(
+            {field_name: f"날짜 형식이 올바르지 않습니다 (YYYY-MM-DD 또는 ISO8601): {raw!r}"}
+        )
 
     @extend_schema(
         summary="캠페인 옵션 가이드 (정적, 인증 불필요)",
@@ -1678,15 +1799,21 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         ## 응답 구조
         ```json
         {
-          "version": "v3.4",
+          "version": "v4.0",
           "trigger_types": [
             {"value": "specific_media", "label": "...", "description": "...", "tier": "free"},
             {"value": "any_media", ..., "tier": "pro"},
             {"value": "next_media", ..., "notes": ["...", ...]}
           ],
           "keyword_modes": [...],
-          "follow_gate": {"headline": "...", "items": [...]},
-          "public_reply": {"headline": "...", "description": "...", "items": [...]}
+          "follow_gate": {
+            "headline": "...",
+            "modes": {"follow": "팔로우 확인 후 발송", "button": "버튼 클릭 즉시 발송", "off": "게이트 미사용"},
+            "items": [...],
+            "fields": {"follow_gate_enabled": "...", "gate_verify_follow": "...", "...": "..."}
+          },
+          "public_reply": {"headline": "...", "description": "...", "items": [...]},
+          "scheduling": {"headline": "...", "items": [...]}
         }
         ```
 
@@ -1708,23 +1835,392 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         return Response(build_campaign_guide())
 
     @extend_schema(
-        summary="캠페인 목록 조회",
-        description=(
-            "사용자의 workspace 에 속한 모든 Auto DM 캠페인을 조회합니다.\n\n"
-            "**멀티 IG 계정**: 한 워크스페이스에 여러 IG 계정이 연동된 경우 "
-            "`?ig_connection_id=<uuid>` 로 특정 계정의 캠페인만 필터링할 수 있습니다. "
-            "권한이 없는 connection ID 를 지정하면 빈 리스트가 반환됩니다."
-        ),
+        summary="AI 캠페인 폼 자동 채우기 (게시물 기반)",
+        description="""
+        ## 목적
+        사용자가 게시물만 고르면, 그 게시물의 **이미지 + 캡션**을 자체 LLM(gemma-4, 멀티모달)으로
+        분석해 AutoDM 캠페인 폼 초안을 생성한다. 프론트는 결과값을 폼에 채워 넣고, 사용자가
+        수정 후 일반 생성 엔드포인트(`POST /auto-dm-campaigns/`)로 제출한다.
+
+        **DB(캠페인)에는 저장하지 않는 도움(draft) 기능.** 결과는 AiJob 으로만 보관된다.
+
+        ## 비동기 흐름 (폴링)
+        gemma-4 가 답글 변형 등 긴 출력을 만드느라 수십 초가 걸려 동기 응답은 프로덕션 타임아웃에
+        걸린다. 그래서 **작업을 큐에 등록하고 `202` 로 `job_id` 를 즉시 반환**한다.
+        1. `POST .../ai-suggest/?workspace_id=...` → `202 { job_id, poll_url, status }`
+        2. `GET /api/v1/ai/jobs/{job_id}/` 를 1~2초 간격으로 폴링
+        3. `status === "succeeded"` 가 되면 `result_json.suggestion` 을 폼에 채운다
+           (`status === "failed"` 면 `error_message` 표시)
+
+        ## result_json 형태 (폴링 완료 시) — 출력 키는 생성 시리얼라이저 필드명과 1:1
+        ```json
+        {
+          "model": "gemma-4", "elapsed_seconds": 32.1, "vision_used": true,
+          "suggestion": {
+            "name": "신상 원피스 사이즈 문의 자동응대",
+            "keyword_filter": ["사이즈", "재입고", "문의"], "keyword_mode": "any",
+            "public_reply_enabled": true,
+            "public_reply_templates": ["DM 보내드렸어요! 확인 부탁드려요 💌", "...(기본 50개, 모두 고유)..."],
+            "simple": { "opening_message_template": "안녕하세요! ... 👉 https://shop.example.com/dress" },
+            "follow_gate": {
+              "follow_gate_prompt": "댓글 감사합니다! 버튼을 눌러 받아가세요 🎁",
+              "follow_gate_button_label": "자료 받기",
+              "follow_gate_button_label_alt": "팔로우했어요",
+              "reward_message_template": "감사합니다! 보러가기 👉 https://shop.example.com/dress",
+              "follow_gate_retry_message": "아직 팔로우 확인이 안 됐어요 🥲 ..."
+            }
+          },
+          "echo": { "media_id": "...", "media_type": "IMAGE" }, "usage": { "...": 0 }
+        }
+        ```
+        - `public_reply_templates`: 기본 50개(`reply_variant_count` 로 1~50 조절). **LLM 미사용** —
+          코드 풀의 정형 인사 문구를 끝맺음(!/~/이모지) 변주해 즉시 추출하므로 빠르다. 서로 다르게(스팸 회피).
+        - `follow_gate.*`: 검증 모드 / 버튼 전용 모드 둘 다 커버. `follow_gate_button_label_alt` 는
+          검증 모드 토글용 대안 라벨(DB 컬럼 아님). `include_follow_gate=false` 면 `follow_gate` 는 null.
+        - AI 는 `trigger_type`/`media_id` 를 정하지 않는다(사용자가 이미 게시물/범위 선택). `echo` 로만 되돌려줌.
+
+        ## 게시물 컨텍스트 입력
+        - **권장**: 프론트가 게시물 목록에서 이미 받은 `caption` / `image_url` 을 그대로 전달
+          (Graph 재조회 불필요, mock 모드 dev 에서도 동작).
+        - `caption` / `image_url` 둘 다 비어 있고 `media_id` 가 있으면 백엔드가 Graph API 로 조회.
+          단, **mock 모드이거나 활성 IG 연결이 없으면 400** — 이때는 caption/image_url 을 직접 전달.
+        - `business_type` / `campaign_goal` / `tone` / `link_url` 은 선택(없으면 게시물에서 추론).
+          `link_url` 이 있으면 DM/보상 본문의 `{{link}}` 자리에 치환된다.
+
+        ## 인증
+        Bearer 토큰 필수. `?workspace_id=<uuid>` 쿼리 파라미터 필수(멤버십 검증).
+
+        ## 사용 예시
+        ```javascript
+        const { job_id, poll_url } = await (await fetch(
+          `/api/v1/integrations/auto-dm-campaigns/ai-suggest/?workspace_id=${wsId}`,
+          {
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              media_id: "18418812427189917",
+              caption: "신상 원피스 입고! 사이즈 문의는 댓글로 🥰",
+              image_url: "https://scontent.cdninstagram.com/....jpg",
+              business_type: "여성 의류 쇼핑몰",
+              campaign_goal: "사이즈/재입고 문의 DM 유도",
+              link_url: "https://shop.example.com/dress",
+              include_follow_gate: true,
+              reply_variant_count: 50
+            })
+          }
+        )).json();
+
+        // 폴링
+        const timer = setInterval(async () => {
+          const job = await (await fetch(poll_url, { headers: { Authorization: `Bearer ${token}` } })).json();
+          if (job.status === "succeeded") {
+            clearInterval(timer);
+            const { suggestion } = job.result_json;  // 폼에 매핑
+          } else if (job.status === "failed") {
+            clearInterval(timer);
+            // job.error_message 표시
+          }
+        }, 1500);
+        ```
+        """,
+        request=AutoDMCampaignAiSuggestRequestSerializer,
+        responses={
+            202: OpenApiResponse(
+                response=AutoDMCampaignAiSuggestJobSerializer,
+                description="생성 작업이 큐에 등록됨. poll_url 을 폴링해 result_json.suggestion 사용.",
+            ),
+            400: OpenApiResponse(
+                description="workspace_id 누락 / 게시물 컨텍스트 없음 / mock·연결없음 상태에서 Graph 조회 필요"
+            ),
+            401: OpenApiResponse(description="인증 실패"),
+            403: OpenApiResponse(description="해당 워크스페이스의 멤버가 아님"),
+            404: OpenApiResponse(description="워크스페이스/게시물을 찾을 수 없음"),
+            500: OpenApiResponse(
+                description="예상치 못한 서버 오류 (LLM 호출 실패는 작업 status=failed 로 표면화)"
+            ),
+        },
+        parameters=[
+            OpenApiParameter(
+                name="workspace_id",
+                description="Workspace UUID (필수)",
+                required=True,
+                type=str,
+                location=OpenApiParameter.QUERY,
+            ),
+        ],
+        examples=[
+            OpenApiExample(
+                "게시물 caption+image 직접 전달 (권장)",
+                value={
+                    "media_id": "18418812427189917",
+                    "caption": "신상 원피스 입고! 사이즈 문의는 댓글로 남겨주세요 🥰 #원피스",
+                    "image_url": "https://scontent.cdninstagram.com/....jpg",
+                    "media_type": "IMAGE",
+                    "business_type": "여성 의류 쇼핑몰",
+                    "campaign_goal": "사이즈/재입고 문의를 DM으로 유도하고 링크 전달",
+                    "tone": "친근하고 발랄한",
+                    "link_url": "https://shop.example.com/dress",
+                    "include_follow_gate": True,
+                    "reply_variant_count": 50,
+                },
+                request_only=True,
+            ),
+        ],
+        tags=["Auto DM"],
+    )
+    @action(detail=False, methods=["post"], url_path="ai-suggest")
+    def ai_suggest(self, request):
+        """게시물 기반 캠페인 폼 초안 생성 작업을 큐에 등록 (비동기, gemma-4 비전).
+
+        gemma-4 가 답글 변형 등 긴 출력을 만드느라 수십 초가 걸려 동기 응답은 prod gunicorn
+        타임아웃에 걸린다 → AiJob 으로 큐잉하고 job_id 를 즉시 반환(202). 프론트는
+        GET /api/v1/ai/jobs/{id}/ 를 폴링해 succeeded 가 되면 result_json.suggestion 을 폼에 채운다.
+
+        무거운 작업(이미지 다운로드 + LLM 호출)은 Celery 태스크로 미루고, 빠른 동기 검증
+        (워크스페이스 멤버십 / 게시물 컨텍스트 / Graph 메타 조회)만 여기서 처리한다.
+        """
+        from rest_framework.exceptions import NotFound, PermissionDenied
+
+        from apps.ai_jobs.models import AiJob
+        from apps.ai_jobs.tasks import run_dm_campaign_assist_job
+
+        ser = AutoDMCampaignAiSuggestRequestSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        vd = ser.validated_data
+
+        # 워크스페이스 확인 (create 와 동일 패턴 — DRF 예외로 통일 에러 포맷)
+        workspace_id = request.query_params.get("workspace_id")
+        if not workspace_id:
+            raise DRFValidationError({"workspace_id": "workspace_id 쿼리 파라미터가 필요합니다."})
+        try:
+            workspace = Workspace.objects.get(id=workspace_id)
+        except (Workspace.DoesNotExist, DjangoValidationError, ValueError, TypeError):
+            raise NotFound("Workspace 를 찾을 수 없습니다.") from None
+        if not workspace.memberships.filter(user=request.user).exists():
+            raise PermissionDenied("이 워크스페이스의 멤버가 아닙니다.")
+
+        caption = (vd.get("caption") or "").strip()
+        image_url = (vd.get("image_url") or "").strip()
+        media_type = (vd.get("media_type") or "").strip()
+        media_id = (vd.get("media_id") or "").strip()
+        ig_connection_id = vd.get("ig_connection_id")
+
+        # caption/image 둘 다 없으면 media_id 로 Graph 메타 조회 (동기 검증: non-mock 한정).
+        if not caption and not image_url:
+            if not media_id:
+                raise DRFValidationError("caption, image_url, media_id 중 최소 하나는 필요합니다.")
+            if MockInstagramProvider.is_mock_mode():
+                raise DRFValidationError(
+                    "Mock 모드에서는 게시물 정보를 조회할 수 없습니다. caption/image_url 을 직접 전달해주세요."
+                )
+            connection = self._resolve_connection_for_suggest(workspace, ig_connection_id)
+            if not connection:
+                raise DRFValidationError(
+                    "활성 Instagram 연결이 없습니다. caption/image_url 을 직접 전달해주세요."
+                )
+            caption, image_url, media_type = self._fetch_media_context(connection, media_id)
+
+        job = AiJob.objects.create(
+            user=request.user,
+            job_type=AiJob.JobType.DM_CAMPAIGN_ASSIST,
+            llm_model=AiJob.LlmModel.GEMMA,
+            input_payload={
+                "caption": caption,
+                "image_url": image_url,
+                "media_type": media_type,
+                "media_id": media_id,
+                "business_type": vd.get("business_type", ""),
+                "campaign_goal": vd.get("campaign_goal", ""),
+                "tone": vd.get("tone", ""),
+                "link_url": vd.get("link_url", ""),
+                "include_follow_gate": vd.get("include_follow_gate", True),
+                "reply_variant_count": vd.get("reply_variant_count", 50),
+                "workspace_id": str(workspace.id),
+            },
+        )
+        run_dm_campaign_assist_job.delay(str(job.id))
+
+        return Response(
+            {
+                "job_id": str(job.id),
+                "status": job.status,
+                "poll_url": f"/api/v1/ai/jobs/{job.id}/",
+                "message": "캠페인 초안 생성을 시작했어요. 잠시 후 결과를 폴링해주세요.",
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+    def _resolve_connection_for_suggest(self, workspace, ig_connection_id):
+        """ai_suggest 용 IG connection 해석. 미지정 시 첫 활성 connection."""
+        if not ig_connection_id:
+            return IGAccountConnection.objects.filter(workspace=workspace, status="active").first()
+        from rest_framework.exceptions import PermissionDenied
+
+        try:
+            connection = IGAccountConnection.objects.get(id=ig_connection_id)
+        except (IGAccountConnection.DoesNotExist, DjangoValidationError, ValueError, TypeError):
+            return None
+        if connection.workspace_id != workspace.id:
+            raise PermissionDenied("이 IG 계정은 해당 워크스페이스에 속하지 않습니다.")
+        if connection.status != IGAccountConnection.Status.ACTIVE:
+            return None
+        return connection
+
+    def _fetch_media_context(self, connection, media_id):
+        """Graph API 로 게시물 caption/image_url/media_type 조회 (get_media_detail 패턴)."""
+        from rest_framework.exceptions import NotFound
+
+        try:
+            url = f"{InstagramOAuthService.GRAPH_API_BASE}/{media_id}"
+            resp = requests.get(
+                url,
+                params={
+                    "fields": "caption,media_type,media_url,thumbnail_url",
+                    "access_token": connection.access_token,
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.exceptions.RequestException as exc:
+            raise NotFound(f"게시물 정보를 가져올 수 없습니다: {str(exc)[:200]}") from exc
+
+        caption = data.get("caption") or ""
+        image_url = data.get("media_url") or data.get("thumbnail_url") or ""
+        media_type = data.get("media_type") or ""
+        return caption, image_url, media_type
+
+    @extend_schema(
+        summary="캠페인 목록 조회 (필터·정렬)",
+        description="""
+        ## 목적
+        로그인한 사용자가 멤버인 workspace 의 모든 Auto DM 캠페인을 조회합니다.
+        상태(status)·생성일 범위로 필터링하고, 여러 기준으로 정렬할 수 있습니다.
+
+        ## 응답 형태
+        **페이지네이션 없이** 캠페인 객체 배열을 그대로 반환합니다(평면 리스트).
+        각 항목의 `media_url` 이 비어 있고 `media_id` 가 있으면 Instagram Graph API 로
+        best-effort 보강합니다(토큰 만료/실패 시 조용히 건너뜀).
+
+        ## 쿼리 파라미터
+        | 파라미터 | 타입 | 설명 |
+        |---|---|---|
+        | `ig_connection_id` | uuid | 특정 IG 계정의 캠페인만. 권한 없는 ID 면 빈 배열. |
+        | `status` | string | 상태 필터. 콤마로 다중 지정 가능. 값: `active`/`paused`/`completed`/`inactive`. 예: `status=active,paused` |
+        | `created_after` | date \\| datetime | 이 시각/날짜 **이후**(포함) 생성분. `YYYY-MM-DD` 또는 ISO8601. 날짜만 주면 그날 **00:00:00**(Asia/Seoul)부터. |
+        | `created_before` | date \\| datetime | 이 시각/날짜 **이전**(포함) 생성분. 날짜만 주면 그날 **23:59:59**(Asia/Seoul)까지(해당일 포함). |
+        | `ordering` | string | 정렬 기준. 콤마 다중 지정 가능, `-` 접두사는 내림차순. 기본값 `-created_at`. |
+
+        **정렬 가능 필드(ordering)**: `created_at`, `updated_at`, `name`, `status`,
+        `total_sent`, `total_failed`, `started_at`, `scheduled_start_at`, `scheduled_end_at`.
+        허용 목록 밖의 필드를 주면 **400** 입니다.
+
+        ## 예시
+        ```bash
+        # 활성/일시정지 캠페인을 발송수 많은 순으로
+        curl -G 'https://dev-api.turnflow.link/api/v1/integrations/auto-dm-campaigns/' \\
+          -H 'Authorization: Bearer <ACCESS_TOKEN>' \\
+          --data-urlencode 'status=active,paused' \\
+          --data-urlencode 'ordering=-total_sent'
+
+        # 2026-06-01 ~ 2026-06-30 사이 생성된 캠페인을 이름 오름차순으로
+        curl -G 'https://dev-api.turnflow.link/api/v1/integrations/auto-dm-campaigns/' \\
+          -H 'Authorization: Bearer <ACCESS_TOKEN>' \\
+          --data-urlencode 'created_after=2026-06-01' \\
+          --data-urlencode 'created_before=2026-06-30' \\
+          --data-urlencode 'ordering=name'
+        ```
+        ```javascript
+        const qs = new URLSearchParams({
+          status: "active",
+          created_after: "2026-06-01",
+          ordering: "-created_at",
+        });
+        const res = await fetch(
+          `/api/v1/integrations/auto-dm-campaigns/?${qs}`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        const campaigns = await res.json(); // 배열(평면 리스트)
+        ```
+
+        ## 인증
+        IsAuthenticated. 본인이 멤버인 workspace 의 캠페인만 노출됩니다.
+        """,
         parameters=[
             OpenApiParameter(
                 name="ig_connection_id",
                 type=str,
                 location=OpenApiParameter.QUERY,
-                description="특정 IG 계정의 캠페인만 필터링 (UUID)",
+                description="특정 IG 계정의 캠페인만 필터링 (UUID). 권한 없는 ID 면 빈 배열.",
                 required=False,
             ),
+            OpenApiParameter(
+                name="status",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                enum=["active", "paused", "completed", "inactive"],
+                description="상태 필터. 콤마로 다중 지정 가능 (예: active,paused).",
+            ),
+            OpenApiParameter(
+                name="created_after",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description=(
+                    "생성일시 하한(포함). YYYY-MM-DD 또는 ISO8601. "
+                    "날짜만 주면 그날 00:00:00(Asia/Seoul)부터. 예: 2026-06-01"
+                ),
+            ),
+            OpenApiParameter(
+                name="created_before",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description=(
+                    "생성일시 상한(포함). YYYY-MM-DD 또는 ISO8601. "
+                    "날짜만 주면 그날 23:59:59(Asia/Seoul)까지(해당일 포함). 예: 2026-06-30"
+                ),
+            ),
+            OpenApiParameter(
+                name="ordering",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                enum=[
+                    "created_at",
+                    "-created_at",
+                    "updated_at",
+                    "-updated_at",
+                    "name",
+                    "-name",
+                    "status",
+                    "-status",
+                    "total_sent",
+                    "-total_sent",
+                    "total_failed",
+                    "-total_failed",
+                    "started_at",
+                    "-started_at",
+                    "scheduled_start_at",
+                    "-scheduled_start_at",
+                    "scheduled_end_at",
+                    "-scheduled_end_at",
+                ],
+                description=(
+                    "정렬 기준. 콤마로 다중 지정 가능, '-' 접두사는 내림차순. 기본 -created_at."
+                ),
+            ),
         ],
-        responses={200: AutoDMCampaignSerializer(many=True)},
+        responses={
+            200: AutoDMCampaignSerializer(many=True),
+            400: OpenApiResponse(
+                description=(
+                    "잘못된 필터/정렬 값 (날짜 형식 오류, 허용되지 않은 status·ordering 필드 등)"
+                )
+            ),
+            401: OpenApiResponse(description="인증 필요"),
+        },
         tags=["Auto DM"],
     )
     def list(self, request):
@@ -1788,28 +2284,31 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         description="""
         ## 기능
         새로운 Auto DM 캠페인을 생성합니다.
-        
+
         ## 사용 방법
-        
+
         ### 1단계: 게시물ID 확인
         먼저 `/api/v1/integrations/instagram/{workspace_id}/media/list/` API로 게시물 목록을 조회하여 `media_id`를 얻습니다.
-        
+
         ### 2단계: 캠페인 생성
         URL: `POST /api/v1/integrations/auto-dm-campaigns/?workspace_id={workspace_id}`
-        
+
         **필수 파라미터:**
         - `workspace_id` (쿼리 파라미터): Workspace UUID
-        
+
         **필수 필드:**
         - `media_id`: Instagram 게시물ID (예: "18418812427189917")
         - `name`: 캠페인 이름 (예: "신규 고객 DM 자동발송")
         - `message_template`: DM 메시지 내용 (예: "댓글 감사합니다! 링크: https://...")
-        
+
         **선택 필드:**
         - `media_url`: 게시물 URL (비워두거나 null 가능)
         - `description`: 캠페인 설명
         - `max_sends_per_hour`: 시간당 최대 발송 수 (기본값: 200, 최대: 500)
-        
+        - `scheduled_start_at`: 예약 시작일시 (ISO8601). 이 시각부터 발송 시작. 비우면 즉시.
+        - `scheduled_end_at`: 예약 종료일시 (ISO8601). 이 시각 이후 자동 종료. 비우면 무기한.
+          (생성 후 변경은 `POST .../{id}/schedule/` 사용 권장)
+
         ### 예시
         ```json
         {
@@ -1820,14 +2319,40 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
           "max_sends_per_hour": 150
         }
         ```
-        
+
+        ### 버튼 게이트 (선택 — 버튼 클릭 시 reward DM)
+        opening DM 에 버튼을 붙이고, 사용자가 그 버튼을 누르면 본 DM(`reward_message_template`)을 발송합니다.
+        - `follow_gate_enabled`: true 면 버튼 게이트 사용 (이때 `reward_message_template` 필수)
+        - `gate_verify_follow`: true(기본)=버튼 클릭 시 팔로우 여부를 확인한 뒤 발송 (follow 모드) /
+          false=팔로우 확인 없이 버튼 클릭 즉시 발송 (**button-only** 모드)
+        - `follow_gate_button_label`: 버튼 라벨 (최대 20자). button-only 면 직접 지정 권장 (비우면 "팔로우했어요")
+        - `follow_gate_prompt`: opening DM 본문(버튼 안내 문구). 비우면 기본 문구
+        - `follow_gate_retry_message`: 미팔로우 시 재안내 (follow 모드 전용 — button-only 면 미사용)
+        - `reward_message_template`: 버튼 클릭 후 보낼 본 DM (게이트 사용 시 필수)
+
+        button-only 예시 (팔로우 확인 없이 버튼만 누르면 발송):
+        ```json
+        {
+          "media_id": "18418812427189917",
+          "name": "쿠폰 신청",
+          "message_template": "신청 안내드립니다",
+          "follow_gate_enabled": true,
+          "gate_verify_follow": false,
+          "follow_gate_prompt": "버튼을 누르면 바로 보내드려요!",
+          "follow_gate_button_label": "받기",
+          "reward_message_template": "감사합니다! 쿠폰 링크: https://example.com/coupon"
+        }
+        ```
+
         ## 동작 방식
         1. 캠페인 생성 후 자동으로 `ACTIVE` 상태로 설정
         2. 해당 게시물에 댓글이 달리면 Webhook으로 수신
         3. Celery 태스크가 자동으로 DM 발송 처리
         4. 중복 발송 방지 (같은 댓글에 대해 1회만 발송)
         5. 시간당 발송 제한 적용
-        
+        6. 예약 발송: `scheduled_start_at` 이전엔 발송하지 않고, `scheduled_end_at` 이후엔
+           자동 종료(`completed`)됩니다. 응답의 `schedule_state` 로 현재 상태 확인.
+
         ## 주의사항
         - Workspace에 활성화된 Instagram 연결이 있어야 함
         - Meta에서 `instagram_manage_messages` 권한 승인 필요
@@ -1929,7 +2454,12 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
 
     @extend_schema(
         summary="캠페인 수정",
-        description="기존 Auto DM 캠페인을 수정합니다.",
+        description=(
+            "기존 Auto DM 캠페인을 수정합니다(전체 교체, PUT).\n\n"
+            "예약 발송 필드 `scheduled_start_at` / `scheduled_end_at` 도 함께 수정할 수 있습니다 "
+            "(부분 변경은 PATCH 또는 `POST .../{id}/schedule/` 권장). "
+            "`scheduled_end_at` 은 `scheduled_start_at` 보다 미래여야 합니다."
+        ),
         request=AutoDMCampaignUpdateSerializer,
         responses={200: AutoDMCampaignSerializer},
         tags=["Auto DM"],
@@ -1944,7 +2474,12 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
 
     @extend_schema(
         summary="캠페인 부분 수정",
-        description="Auto DM 캠페인의 일부 필드만 수정합니다.",
+        description=(
+            "Auto DM 캠페인의 일부 필드만 수정합니다(PATCH).\n\n"
+            "예약 발송 창만 바꾸려면 `scheduled_start_at` / `scheduled_end_at` 만 보내면 됩니다 "
+            "(보내지 않은 필드는 기존 값 유지). 활성화까지 한 번에 처리하려면 "
+            "`POST .../{id}/schedule/` 를 사용하세요."
+        ),
         request=AutoDMCampaignUpdateSerializer,
         responses={200: AutoDMCampaignSerializer},
         tags=["Auto DM"],
@@ -1986,18 +2521,172 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
 
     @extend_schema(
         summary="캠페인 재개",
-        description="일시정지된 캠페인을 다시 활성화합니다.",
+        description=(
+            "일시정지/종료된 캠페인을 다시 활성화(status=active)합니다.\n\n"
+            "**예약 발송 주의**: 종료 예약(scheduled_end_at)이 이미 과거라면, 재개 직후 "
+            "자동 종료 배치가 다시 종료시킵니다. 이를 막기 위해 재개 시 **과거가 된 "
+            "scheduled_end_at 은 자동으로 해제(null)** 합니다. 기간을 다시 지정하려면 "
+            "`POST .../schedule/` 또는 PATCH 로 새 종료일을 설정하세요."
+        ),
         responses={200: AutoDMCampaignSerializer},
         tags=["Auto DM"],
     )
     @action(detail=True, methods=["post"])
     def resume(self, request, pk=None):
-        """캠페인 재개"""
+        """캠페인 재개 (과거가 된 종료 예약은 해제)"""
         campaign = self.get_object()
         campaign.status = AutoDMCampaign.Status.ACTIVE
+        # 종료 예약이 이미 지났으면 즉시 재종료되지 않도록 해제
+        if campaign.scheduled_end_at and campaign.scheduled_end_at <= timezone.now():
+            campaign.scheduled_end_at = None
+        # 자동 종료로 기록된 ended_at 을 비워 ACTIVE 인데 과거 종료시각이 남는 모순 방지
+        # (schedule 액션의 activate 분기와 동일하게 정리)
+        campaign.ended_at = None
         campaign.save()
         serializer = self.get_serializer(campaign)
         return Response(serializer.data)
+
+    @extend_schema(
+        summary="캠페인 복사 (비활성 복사본 생성)",
+        description="""
+        ## 기능
+        기존 캠페인을 **비활성(INACTIVE) 복사본**으로 복제합니다. 잘 만든 캠페인을
+        템플릿처럼 재사용할 때 사용합니다.
+
+        - 캠페인 **이름**만 바뀌고(기본 `"{원본명} 복사"`), **나머지 설정은 전부 동일**하게
+          복사됩니다 — 트리거/미디어/키워드/메시지/공개답글/Follow-gate/발송제한,
+          그리고 **예약 발송 기간(scheduled_start_at/end_at)** 까지 그대로.
+        - 복사본은 항상 **status=inactive** 로 생성됩니다(사용자가 검토 후 직접 활성화).
+        - 발송 통계(total_sent/total_failed)와 실행 기록(started_at/ended_at)은 **초기화**됩니다.
+        - 발송 로그(SentDMLog)는 복사되지 않습니다.
+
+        > 복사본은 원본과 **동일한 IG 연동(ig_connection)** 에 속합니다.
+        > 비활성 상태라 활성화 전까지는 어떤 DM도 발송되지 않습니다.
+
+        ## 요청 본문 (선택)
+        | 필드 | 타입 | 필수 | 설명 |
+        |---|---|---|---|
+        | `name` | string(≤255) | 선택 | 복사본 이름. 생략/공백이면 `"{원본명} 복사"` 자동 생성. |
+
+        ## 예시
+        ```bash
+        curl -X POST \\
+          'https://dev-api.turnflow.link/api/v1/integrations/auto-dm-campaigns/{id}/copy/' \\
+          -H 'Authorization: Bearer <ACCESS_TOKEN>' \\
+          -H 'Content-Type: application/json' \\
+          -d '{}'
+        ```
+        이름 직접 지정:
+        ```json
+        { "name": "여름 이벤트 (B안)" }
+        ```
+        응답(201)은 새로 생성된 복사본 전체이며 `status="inactive"`, `total_sent=0` 입니다.
+
+        ## 인증
+        IsAuthenticated — 본인 워크스페이스의 캠페인만 복사 가능(타 워크스페이스는 404).
+        """,
+        request=AutoDMCampaignCopySerializer,
+        responses={
+            201: OpenApiResponse(
+                response=AutoDMCampaignSerializer, description="복사본 생성 성공 (비활성)"
+            ),
+            400: OpenApiResponse(description="잘못된 요청 (name 형식 오류 등)"),
+            401: OpenApiResponse(description="인증 필요"),
+            403: OpenApiResponse(description="권한 없음 (해당 workspace 멤버 아님)"),
+            404: OpenApiResponse(description="캠페인을 찾을 수 없음"),
+        },
+        tags=["Auto DM"],
+    )
+    @action(detail=True, methods=["post"])
+    def copy(self, request, pk=None):
+        """캠페인을 비활성 복사본으로 복제"""
+        source = self.get_object()  # 테넌시/권한 + 404 자동 처리
+        in_ser = AutoDMCampaignCopySerializer(data=request.data)
+        in_ser.is_valid(raise_exception=True)
+        new_campaign = source.copy(new_name=in_ser.validated_data.get("name") or None)
+        return Response(
+            AutoDMCampaignSerializer(new_campaign).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    @extend_schema(
+        summary="캠페인 예약 발송 설정",
+        description="""
+        ## 기능
+        캠페인이 **실제로 DM을 발송하는 활성 기간(window)** 을 지정합니다.
+        시작일 전에는 발송하지 않고, 종료일이 지나면 **자동으로 종료(completed)** 됩니다
+        (별도 운영자 조작 불필요).
+
+        ## 요청 본문
+        | 필드 | 타입 | 필수 | 설명 |
+        |---|---|---|---|
+        | `scheduled_start_at` | datetime(ISO8601) \\| null | 선택 | 발송 시작일시. 생략/null 이면 즉시 시작. |
+        | `scheduled_end_at`   | datetime(ISO8601) \\| null | 선택 | 자동 종료일시. 생략/null 이면 무기한. |
+        | `activate`           | boolean | 선택(기본 true) | true 면 status 를 active 로 전환하며 과거 종료 기록 해제. false 면 status 유지. |
+
+        > 이 API는 예약 창을 **통째로 교체**합니다. 한쪽만 보내면 다른 쪽은 해제(null)됩니다.
+        > 부분만 바꾸려면 PATCH `/auto-dm-campaigns/{id}/` 로 해당 필드만 보내세요.
+
+        ## 검증 규칙
+        - `scheduled_end_at` 은 `scheduled_start_at` 보다 미래여야 합니다.
+        - `scheduled_end_at` 은 현재 시각보다 미래여야 합니다(과거면 즉시 종료되므로 거부).
+        - 시각은 타임존 포함을 권장합니다 (서버 기준 Asia/Seoul, UTC 저장).
+
+        ## 동작 방식
+        1. 댓글/스토리 웹훅 처리 시, 현재 시각이 활성 기간 안인 캠페인만 발송 후보가 됩니다.
+        2. Celery Beat(1분 주기)가 `scheduled_end_at` 경과 캠페인을 `completed` 로 전환합니다.
+        3. 응답의 `schedule_state` 로 현재 상태를 확인하세요:
+           `always_on`(기간 미설정) / `scheduled`(시작 대기) / `running`(진행 중) / `ended`(종료됨).
+
+        ## 예시
+        ```bash
+        curl -X POST \\
+          'https://dev-api.turnflow.link/api/v1/integrations/auto-dm-campaigns/{id}/schedule/' \\
+          -H 'Authorization: Bearer <ACCESS_TOKEN>' \\
+          -H 'Content-Type: application/json' \\
+          -d '{
+            "scheduled_start_at": "2026-07-01T09:00:00+09:00",
+            "scheduled_end_at": "2026-07-31T23:59:59+09:00",
+            "activate": true
+          }'
+        ```
+        예약 해제(상시 발송으로 되돌리기):
+        ```json
+        { "scheduled_start_at": null, "scheduled_end_at": null }
+        ```
+        """,
+        request=AutoDMCampaignScheduleSerializer,
+        responses={
+            200: OpenApiResponse(response=AutoDMCampaignSerializer, description="예약 설정 적용됨"),
+            400: OpenApiResponse(description="검증 실패 (종료일 ≤ 시작일, 종료일 과거 등)"),
+            401: OpenApiResponse(description="인증 필요"),
+            403: OpenApiResponse(description="권한 없음 (해당 workspace 멤버 아님)"),
+            404: OpenApiResponse(description="캠페인을 찾을 수 없음"),
+        },
+        tags=["Auto DM"],
+    )
+    @action(detail=True, methods=["post"])
+    def schedule(self, request, pk=None):
+        """예약 발송 창(활성 기간) 설정 + 자동 종료 예약"""
+        campaign = self.get_object()
+        serializer = AutoDMCampaignScheduleSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        campaign.scheduled_start_at = data.get("scheduled_start_at")
+        campaign.scheduled_end_at = data.get("scheduled_end_at")
+        update_fields = ["scheduled_start_at", "scheduled_end_at", "updated_at"]
+
+        if data.get("activate", True):
+            campaign.status = AutoDMCampaign.Status.ACTIVE
+            campaign.ended_at = None
+            update_fields += ["status", "ended_at"]
+            if campaign.started_at is None:
+                campaign.started_at = timezone.now()
+                update_fields.append("started_at")
+
+        campaign.save(update_fields=update_fields)
+        return Response(AutoDMCampaignSerializer(campaign).data)
 
     @extend_schema(
         summary="캠페인 발송 로그 조회",
@@ -2011,7 +2700,9 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         ),
         parameters=[
             OpenApiParameter(
-                name="include_children", type=bool, location=OpenApiParameter.QUERY,
+                name="include_children",
+                type=bool,
+                location=OpenApiParameter.QUERY,
                 description="true 면 follow-gate 자식 로그(재안내·보상 DM)까지 모두 반환 (디버깅용).",
                 required=False,
             ),
@@ -2026,7 +2717,9 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         logs = campaign.dm_logs.all().order_by("-created_at")
 
         include_children = str(request.query_params.get("include_children", "")).lower() in (
-            "1", "true", "yes",
+            "1",
+            "true",
+            "yes",
         )
         if not include_children:
             logs = logs.filter(parent_log__isnull=True)
@@ -2055,9 +2748,7 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         # v3.8: child log (재안내/보상 DM) 는 통계 부풀림 방지 차원에서 제외 →
         # opening / standalone 행만 카운트해 "댓글 1건 = 1 row" 와 일치시킨다.
         last_24h = timezone.now() - timedelta(hours=24)
-        recent_logs = campaign.dm_logs.filter(
-            created_at__gte=last_24h, parent_log__isnull=True
-        )
+        recent_logs = campaign.dm_logs.filter(created_at__gte=last_24h, parent_log__isnull=True)
 
         stats = {
             "total_sent": campaign.total_sent,
@@ -2184,9 +2875,7 @@ def _process_messaging_events(entry: dict, logger) -> None:
         if read:
             mid = read.get("mid")
             if mid:
-                _enqueue_messaging_event(
-                    EventInbox.EVENT_READ, mid, {"mid": mid}, logger
-                )
+                _enqueue_messaging_event(EventInbox.EVENT_READ, mid, {"mid": mid}, logger)
             continue
 
         # ----- postback (button click) -----
@@ -2203,9 +2892,7 @@ def _process_messaging_events(entry: dict, logger) -> None:
         if not message:
             continue
 
-        is_echo = bool(message.get("is_echo")) or (
-            page_ig_user_id and sender_id == page_ig_user_id
-        )
+        is_echo = bool(message.get("is_echo")) or (page_ig_user_id and sender_id == page_ig_user_id)
         mid = message.get("mid")
 
         # Follow-gate quick_reply 응답 (사용자 → 우리). is_echo 제외.
@@ -2243,22 +2930,19 @@ def _process_messaging_events(entry: dict, logger) -> None:
                 process_story_reply_and_send_dm.delay(
                     {
                         "page_ig_user_id": page_ig_user_id,
-                        "sender_user_id":  sender_id,
+                        "sender_user_id": sender_id,
                         "sender_username": "",  # messages webhook 엔 username 없음
-                        "story_id":        story_id,
-                        "message_mid":     mid or "",
-                        "message_text":    message.get("text", "") or "",
-                        "entry_time":      ev.get("timestamp"),
+                        "story_id": story_id,
+                        "message_mid": mid or "",
+                        "message_text": message.get("text", "") or "",
+                        "entry_time": ev.get("timestamp"),
                     }
                 )
                 logger.debug(
-                    f"Story reply queued: sender={sender_id}, "
-                    f"story={story_id}, mid={mid}"
+                    f"Story reply queued: sender={sender_id}, " f"story={story_id}, mid={mid}"
                 )
             else:
-                logger.debug(
-                    f"Inbound DM received (no handler): sender={sender_id}, mid={mid}"
-                )
+                logger.debug(f"Inbound DM received (no handler): sender={sender_id}, mid={mid}")
 
 
 def _maybe_dispatch_follow_gate(*, payload: str, sender_id: str, logger) -> bool:
@@ -2285,7 +2969,8 @@ def _maybe_dispatch_follow_gate(*, payload: str, sender_id: str, logger) -> bool
     process_follow_gate_postback.delay(opening_log_id, sender_id)
     logger.info(
         "follow-gate postback queued: opening_log=%s igsid=%s",
-        opening_log_id, sender_id,
+        opening_log_id,
+        sender_id,
     )
     return True
 
@@ -2294,9 +2979,7 @@ def _mark_log_delivered_by_echo(
     *, mid: str, page_ig_user_id: str, recipient_user_id: str, logger
 ) -> None:
     """is_echo:true 이벤트의 mid 와 SentDMLog.meta_message_id 매칭 → DELIVERED"""
-    qs = SentDMLog.objects.filter(meta_message_id=mid).select_related(
-        "campaign__ig_connection"
-    )
+    qs = SentDMLog.objects.filter(meta_message_id=mid).select_related("campaign__ig_connection")
     if not qs.exists() and recipient_user_id:
         # 일부 케이스에서 mid가 echo 단계에서 다르게 발급될 수 있어
         # recipient + 최근 ACCEPTED 건으로 fallback 매칭
@@ -2372,8 +3055,8 @@ def instagram_webhook(request):
 
     elif request.method == "POST":
         # Webhook 이벤트 수신
-        import logging
         import json
+        import logging
 
         logger = logging.getLogger(__name__)
 
@@ -2475,26 +3158,26 @@ class SpamFilterViewSet(viewsets.ViewSet):
         ## 목적
         Instagram Business 계정에 연결된 스팸 필터 설정을 조회합니다.
         설정이 없는 경우 자동으로 기본 설정을 생성하여 반환합니다.
-        
+
         ## 사용 시나리오
         - 스팸 필터 관리 페이지 진입 시 현재 설정 로드
         - 스팸 필터 활성화 상태 확인
         - 현재 설정된 스팸 키워드 목록 확인
-        
+
         ## 인증
         - **Bearer 토큰 필수**
         - 해당 Instagram 계정이 속한 워크스페이스의 멤버여야 함
-        
+
         ## 기본 설정 (자동 생성 시)
         - `status`: inactive (비활성)
         - `spam_keywords`: ["아이돌", "주소창", "사건", "원본영상", "실시간검색"]
         - `block_urls`: true
-        
+
         ## 응답 필드
         - `is_active`: 현재 활성화 여부 (boolean)
         - `total_spam_detected`: 총 스팸 감지 수
         - `total_hidden`: 총 숨김 처리 수
-        
+
         ## 사용 예시
         ```javascript
         // Instagram 계정의 스팸 필터 설정 조회
@@ -2508,12 +3191,12 @@ class SpamFilterViewSet(viewsets.ViewSet):
                 }
             }
         );
-        
+
         const config = await response.json();
         console.log('활성화 상태:', config.is_active);
         console.log('스팸 키워드:', config.spam_keywords);
         ```
-        
+
         ## 응답 예시
         ```json
         {
@@ -2544,6 +3227,7 @@ class SpamFilterViewSet(viewsets.ViewSet):
         spam_filter = self.get_spam_filter(ig_connection_id)
         serializer = SpamFilterConfigSerializer(spam_filter)
         return Response(serializer.data)
+
     @extend_schema(
         summary="스팸 필터 설정 조회 및 업데이트",
         description="GET으로 조회하고 PATCH로 부분 업데이트합니다.",
@@ -2556,7 +3240,11 @@ class SpamFilterViewSet(viewsets.ViewSet):
             404: OpenApiResponse(description="Instagram 계정을 찾을 수 없음"),
         },
     )
-    @action(detail=False, methods=["get", "patch"], url_path="ig-connections/(?P<ig_connection_id>[^/.]+)")
+    @action(
+        detail=False,
+        methods=["get", "patch"],
+        url_path="ig-connections/(?P<ig_connection_id>[^/.]+)",
+    )
     def config(self, request, ig_connection_id=None):
         """스팸 필터 설정 조회/업데이트"""
         spam_filter = self.get_spam_filter(ig_connection_id)
@@ -2578,27 +3266,27 @@ class SpamFilterViewSet(viewsets.ViewSet):
         ## 목적
         Instagram Business 계정의 스팸 필터를 즉시 활성화합니다.
         활성화 후 수신되는 모든 댓글에 대해 스팸 검사가 자동으로 수행됩니다.
-        
+
         ## 사용 시나리오
         - 스팸 필터 토글 버튼을 ON으로 전환할 때
         - 스팸 댓글이 갑자기 많아져서 긴급하게 필터를 켜야 할 때
         - 설정 완료 후 필터 작동 시작
-        
+
         ## 인증
         - **Bearer 토큰 필수**
         - 해당 Instagram 계정이 속한 워크스페이스의 멤버여야 함
-        
+
         ## 동작 방식
         1. 스팸 필터 상태를 "active"로 변경
         2. 이후 수신되는 댓글부터 스팸 검사 시작
         3. 스팸으로 판정된 댓글은 자동으로 숨김 처리
         4. 정상 댓글만 DM 자동발송 대상이 됨
-        
+
         ## 주의사항
         - 이미 수신된 댓글에는 소급 적용되지 않음
         - 스팸 키워드가 설정되어 있어야 정상 작동
         - 활성화 즉시 웹훅으로 들어오는 댓글부터 필터링됨
-        
+
         ## 사용 예시
         ```javascript
         // 스팸 필터 활성화
@@ -2612,13 +3300,13 @@ class SpamFilterViewSet(viewsets.ViewSet):
                 }
             }
         );
-        
+
         const result = await response.json();
         if (result.is_active) {
             console.log('스팸 필터가 활성화되었습니다.');
         }
         ```
-        
+
         ## 응답 예시
         ```json
         {
@@ -2662,29 +3350,29 @@ class SpamFilterViewSet(viewsets.ViewSet):
         ## 목적
         Instagram Business 계정의 스팸 필터를 즉시 비활성화합니다.
         비활성화 후에는 스팸 검사가 수행되지 않으며, 모든 댓글이 정상 처리됩니다.
-        
+
         ## 사용 시나리오
         - 스팸 필터 토글 버튼을 OFF로 전환할 때
         - 스팸 필터가 정상 댓글을 너무 많이 차단할 때
         - 일시적으로 필터링을 중단하고 싶을 때
         - 테스트 또는 디버깅 목적
-        
+
         ## 인증
         - **Bearer 토큰 필수**
         - 해당 Instagram 계정이 속한 워크스페이스의 멤버여야 함
-        
+
         ## 동작 방식
         1. 스팸 필터 상태를 "inactive"로 변경
         2. 이후 수신되는 댓글에 대해 스팸 검사 미수행
         3. 모든 댓글이 정상 댓글로 처리됨
         4. DM 자동발송 캠페인이 설정되어 있으면 모든 댓글에 DM 발송
-        
+
         ## 주의사항
         - 비활성화해도 기존 스팸 로그는 유지됨
         - 스팸 키워드 설정도 그대로 보존됨
         - 언제든지 다시 활성화 가능
         - 통계 데이터는 초기화되지 않음
-        
+
         ## 사용 예시
         ```javascript
         // 스팸 필터 비활성화
@@ -2698,13 +3386,13 @@ class SpamFilterViewSet(viewsets.ViewSet):
                 }
             }
         );
-        
+
         const result = await response.json();
         if (!result.is_active) {
             console.log('스팸 필터가 비활성화되었습니다.');
         }
         ```
-        
+
         ## 응답 예시
         ```json
         {
@@ -2748,38 +3436,38 @@ class SpamFilterViewSet(viewsets.ViewSet):
         ## 목적
         스팸으로 감지된 댓글들의 상세 로그를 조회합니다.
         댓글 내용, 작성자, 스팸 판정 이유, 처리 상태 등을 확인할 수 있습니다.
-        
+
         ## 사용 시나리오
         - 스팸 필터 성능 모니터링
         - 잘못 차단된 댓글(오탐) 확인
         - 특정 사용자의 스팸 댓글 이력 조회
         - 스팸 패턴 분석을 위한 데이터 수집
-        
+
         ## 인증
         - **Bearer 토큰 필수**
         - 해당 Instagram 계정이 속한 워크스페이스의 멤버여야 함
-        
+
         ## Query Parameters
         - `status`: 로그 상태 필터 (선택)
           - `detected`: 스팸으로 감지됨
           - `hidden`: 숨김 처리 완료
           - `failed`: 숨김 처리 실패
         - `limit`: 반환할 최대 개수 (선택, 기본: 50, 최대: 500)
-        
+
         ## 응답 필드
         - `spam_reasons`: 스팸으로 판정된 이유 배열
           - `contains_url`: URL 포함
           - `keyword:xxx`: 특정 키워드 매칭
         - `status`: 처리 상태
         - `hidden_at`: 숨김 처리된 시각 (null일 수 있음)
-        
+
         ## 정렬
         - 최신 순으로 정렬됨 (created_at DESC)
-        
+
         ## 주의사항
         - 대량 조회 시 성능을 위해 limit 설정 권장
         - 웹훅 원본 데이터도 포함되므로 민감 정보 주의
-        
+
         ## 사용 예시
         ```javascript
         // 최근 숨김 처리된 스팸 댓글 20개 조회
@@ -2793,14 +3481,14 @@ class SpamFilterViewSet(viewsets.ViewSet):
                 }
             }
         );
-        
+
         const logs = await response.json();
         logs.forEach(log => {
             console.log(`${log.commenter_username}: ${log.comment_text}`);
             console.log(`판정 이유: ${log.spam_reasons.join(', ')}`);
         });
         ```
-        
+
         ## 응답 예시
         ```json
         [
@@ -2876,17 +3564,17 @@ class SpamFilterViewSet(viewsets.ViewSet):
         ## 목적
         스팸 필터의 성능 지표와 통계 데이터를 조회합니다.
         대시보드나 리포트 화면에서 스팸 필터 효과를 시각화할 때 사용합니다.
-        
+
         ## 사용 시나리오
         - 스팸 필터 대시보드 화면 로드
         - 필터 성능 모니터링
         - 일별 스팸 추이 그래프 데이터 수집
         - 필터 효과성 평가 (성공률 확인)
-        
+
         ## 인증
         - **Bearer 토큰 필수**
         - 해당 Instagram 계정이 속한 워크스페이스의 멤버여야 함
-        
+
         ## 응답 필드
         - `total_spam_detected`: 총 스팸 감지 수 (누적)
         - `total_hidden`: 총 숨김 처리 수 (누적)
@@ -2894,17 +3582,17 @@ class SpamFilterViewSet(viewsets.ViewSet):
         - `recent_spam`: 최근 7일간 일별 스팸 감지 수
           - `date`: 날짜 (YYYY-MM-DD)
           - `count`: 해당 날짜의 스팸 감지 수
-        
+
         ## 성공률 계산식
         ```
         success_rate = (total_hidden / total_spam_detected) * 100
         ```
-        
+
         ## 주의사항
         - 통계는 실시간으로 업데이트됨
         - `recent_spam`은 최근 7일간 데이터만 포함
         - 데이터가 없는 날짜는 배열에 포함되지 않음
-        
+
         ## 사용 예시
         ```javascript
         // 스팸 필터 통계 조회 및 차트 렌더링
@@ -2918,21 +3606,21 @@ class SpamFilterViewSet(viewsets.ViewSet):
                 }
             }
         );
-        
+
         const stats = await response.json();
-        
+
         // 성공률 표시
         console.log(`스팸 차단 성공률: ${stats.success_rate}%`);
-        
+
         // 일별 스팸 추이 차트 데이터
         const chartData = stats.recent_spam.map(item => ({
             x: new Date(item.date),
             y: item.count
         }));
-        
+
         renderChart(chartData);
         ```
-        
+
         ## 응답 예시
         ```json
         {
@@ -2971,7 +3659,7 @@ class SpamFilterViewSet(viewsets.ViewSet):
             ]
         }
         ```
-        
+
         ## 데이터 해석
         - **성공률 90% 이상**: 필터가 잘 작동하고 있음
         - **성공률 80% 미만**: API 오류 또는 네트워크 문제 확인 필요

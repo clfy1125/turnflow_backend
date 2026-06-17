@@ -16,6 +16,10 @@ from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 
+# 이미지 2차 보강(refill)을 돌릴 최소 빈-슬롯 수. 1차에서 거의 다 채워졌으면(이 미만)
+# 보강 패스를 통째로 건너뛰어 속도를 번다(빈 슬롯 1개는 sanitizer 가 정리). 튜너블.
+_IMAGE_REFILL_THRESHOLD = 2
+
 
 def _label_source_images(job, source_ids: list, input_payload: dict) -> dict:
     """업로드 이미지를 비전 LLM 으로 라벨링하고 image_catalog 를 만든다.
@@ -296,6 +300,16 @@ def run_ai_job(self, job_id: str):
         # ── 2-3. LLM 호출 + 파싱 ────────────────────
         # full_restyle 모드 + 블록이 chunk 크기 초과면 분할 호출.
         input_payload = job.input_payload or {}
+
+        # job 디자인 시드 — 무드/폰트/장식/variant 다양화 + 후기 게이트에 공유(결정적·재현가능).
+        # build_prompts(가변부) 와 이미지/CSS 단계가 같은 값을 쓰도록 input_payload 에 심는다.
+        from .services.design_seed import seed_from_job_id
+
+        design_seed = seed_from_job_id(job.id)
+        input_payload["_design_seed"] = design_seed
+        job.input_payload = input_payload
+        job.save(update_fields=["input_payload", "updated_at"])
+
         frozen_blocks = input_payload.get("existing_blocks") or []
         is_chunked_full = (
             job.mode == AiJob.Mode.FULL_RESTYLE and len(frozen_blocks) > FULL_RESTYLE_CHUNK_SIZE
@@ -466,61 +480,66 @@ def run_ai_job(self, job_id: str):
         # ── 4. 이미지 치환 ──────────────────────────
         job.set_stage(AiJob.Stage.RESOLVING_IMAGES, 85, "이미지를 검색하고 있습니다.")
 
-        # 새-페이지 한정: 카테고리 결정 + 빈 이미지 슬롯(빈 cover/avatar/gallery/grid 썸네일)에
-        # {{image:키워드}} 주입. **resolve 이전**에 해야 곧이어 도는 resolve 가 실제 사진으로 채운다.
+        # 카테고리 결정 + 빈 이미지 슬롯(빈 cover/avatar/gallery/grid 썸네일)에 {{image:키워드}}
+        # 주입. **resolve 이전**에 해야 곧이어 도는 resolve 가 실제 사진으로 채운다. 리메이크
+        # full_restyle 도 동일하게 보강하고(기존 레이아웃 존중), style_only 는 구조 보존상 제외.
         is_new_page = not input_payload.get("_baseline_page_meta")
-        category: str | None = None
-        if is_new_page:
-            from .services.category_profiles import resolve_category
+        from .services.category_profiles import resolve_category
+
+        # 카테고리는 한 번만 결정해 이미지 가드·sanitize·디자인킷 CSS 에 공유한다(새/리메이크 공통).
+        category = resolve_category(input_payload)
+
+        # 이미지 슬롯 보강 정책:
+        #  - 새-페이지 / 리메이크 full_restyle(rewrite·preserve): 빈 이미지 슬롯에 키워드
+        #    placeholder 주입(resolve 이전) + 컴팩트 카드 정책. 리메이크는 force_hero_strategy=False
+        #    로 기존 프로필 레이아웃을 존중(빈 슬롯만 채움, 새 이미지 블록은 만들지 않음).
+        #  - 리메이크 style_only: 구조/콘텐츠 불변 + image_catalog 부재 → 스톡을 임의 주입하지
+        #    않는다(sanitizer 가 빈 갤러리/썸네일 깨짐만 정리).
+        do_image_guard = is_new_page or job.mode == AiJob.Mode.FULL_RESTYLE
+        if do_image_guard:
             from .services.design_guard import enforce_compact_links
             from .services.image_guard import ensure_image_placeholders
 
-            category = resolve_category(input_payload)
             # 큰 카드 남발 방지(컴팩트 우선) → 그 다음 빈 이미지 슬롯 보강(최종 레이아웃 기준).
-            result_data = enforce_compact_links(result_data)
-            result_data = ensure_image_placeholders(
-                result_data, category, input_payload.get("concept", "")
-            )
-        elif job.mode == AiJob.Mode.FULL_RESTYLE and not input_payload.get(
-            "preserve_content", False
-        ):
-            # 리메이크 '전체 다시 작성' — 새 페이지 수준 보강. 프롬프트가 추가한 _new
-            # 갤러리/그룹링크의 {{image:}} 와 빈 히어로 슬롯을 resolve 이전에 채우고,
-            # 카드 크기 정책(보조 small/CTA medium/쇼케이스 1개)도 동일 적용.
-            # force_hero_strategy=False: 사용자의 프로필 레이아웃/기존 이미지는 존중.
-            from .services.category_profiles import resolve_category
-            from .services.design_guard import enforce_compact_links
-            from .services.image_guard import ensure_image_placeholders
-
-            category = resolve_category(input_payload)
             result_data = enforce_compact_links(result_data)
             result_data = ensure_image_placeholders(
                 result_data,
                 category,
                 input_payload.get("concept", ""),
-                force_hero_strategy=False,
+                force_hero_strategy=is_new_page,
             )
 
         # {{user_image:N}} → 업로드 이미지 URL, {{image:키워드}} → Pixabay (image_catalog 있을 때만 전자)
         user_image_urls = (input_payload.get("image_catalog") or {}).get("url_by_n")
         result_data = resolve_images(result_data, user_image_urls=user_image_urls)
 
-        # ── 4.4.5 이미지 2차 보강(refill) — 새-페이지 한정 ──
+        # ── 4.4.5 이미지 2차 보강(refill) — 빈 슬롯이 충분히 남았을 때만(속도) ──
         # 비전 게이트 거부/검색 실패로 빈 슬롯("")이 남으면(아바타 placeholder 아이콘,
         # 썸네일 빠진 그룹링크, 휑한 갤러리의 주범) **다른 키워드(salt 오프셋)** 로 placeholder
-        # 를 다시 심고 한 번 더 resolve 한다. 추가 비용은 실패 슬롯 수만큼만.
-        if is_new_page and category:
-            result_data = ensure_image_placeholders(
-                result_data, category, input_payload.get("concept", ""), salt=1
-            )
-            result_data = resolve_images(result_data, user_image_urls=user_image_urls)
+        # 를 다시 심고 한 번 더 resolve 한다. 1차에서 거의 다 채워졌으면(빈 슬롯 < 임계) 통째로
+        # 건너뛴다 — refill 패스(ensure+resolve)가 통째로 빠져 happy-path 가 크게 빨라진다.
+        if do_image_guard and category:
+            from .services.image_guard import count_empty_image_slots
+
+            empty = count_empty_image_slots(result_data)
+            if empty >= _IMAGE_REFILL_THRESHOLD:
+                logger.info("AiJob %s 이미지 2차 보강: 빈 슬롯 %d개", job.id, empty)
+                result_data = ensure_image_placeholders(
+                    result_data,
+                    category,
+                    input_payload.get("concept", ""),
+                    salt=1,
+                    force_hero_strategy=is_new_page,
+                )
+                result_data = resolve_images(result_data, user_image_urls=user_image_urls)
 
         # ── 4.5 결과 정화 ───────────────────────────
         # LLM 이 만든 가짜 URL("#" 등)은 페이지 검증기에서 거부되어 저장 자체가 400 으로
         # 실패한다. 또 썸네일 없는 그룹링크 grid/carousel 은 빈 이미지 박스로 렌더된다.
         # 긴 텍스트도 통제(청첩장/커미션만 예외). 저장 직전에 한 번 정화해 막는다.
+        # 카테고리 인지 — 리메이크에도 적용(예: 청첩장/커미션 인사말이 과도 trim 되지 않게).
         long_text_ok = False
-        if is_new_page and category:
+        if category:
             from .services.category_profiles import is_long_text_category
 
             long_text_ok = is_long_text_category(category)
@@ -566,21 +585,28 @@ def run_ai_job(self, job_id: str):
             # 비주얼 리파인이 custom_css 를 덮을 수 있으므로 **맨 마지막**에 적용.
             from .services.design_css import enhance_page_css
 
-            result_data = enhance_page_css(result_data, category or "generic")
+            result_data = enhance_page_css(result_data, category or "generic", seed=design_seed)
         else:
             # 리메이크: 구조/콘텐츠는 style_patcher 가 보존·머지했고, 여기선 **시각 품질만**
-            # 새-페이지 수준으로 끌어올린다 — ① WCAG 대비/슬롭색/muddy 보정(히어로 보정은
-            # 사용자 레이아웃 존중 차원에서 제외) ② 디자인 킷 CSS(카드 라운드/그림자/등장
-            # 애니메이션). 카테고리는 컨셉+페이지 텍스트에서 추론.
-            from .services.category_profiles import resolve_category as _resolve_cat
+            # 새-페이지 수준으로 끌어올린다 — ① WCAG 대비/슬롭색/muddy 보정 ② 컨셉 이미지를
+            # 올려 색을 주도하면(full_restyle 한정) 추출 팔레트를 코드로 고정(pin) ③ 디자인 킷 CSS.
             from .services.design_css import enhance_page_css as _enhance_css
             from .services.design_guard import enforce_design_quality as _edq
+            from .services.prompt_builder import resolve_design_lead
 
+            # 컨셉 이미지가 디자인을 주도하면 추출 팔레트를 강제 스냅(모델이 무시해도 되돌림).
+            # 아니면 palette 는 슬롭색 교체용 accent 후보로만 쓰이고 기존 baseline 색은 보존된다.
+            remake_palette = (input_payload.get("image_catalog") or {}).get("palette") or {}
+            remake_pin = resolve_design_lead(input_payload) == "concept_image"
             # fix_hero=True: 모델이 cover_bg 로 바꾸고 이미지를 안 채우면 빈 회색 띠가 뜬다 —
             # 본문의 실제 이미지를 승격하거나 center 로 강등(콘텐츠 변경 아님, 깨짐 방지).
-            result_data = _edq(result_data, palette={}, fix_hero=True)
-            _remake_cat = _resolve_cat(input_payload)
-            result_data = _enhance_css(result_data, _remake_cat or "generic")
+            result_data = _edq(
+                result_data,
+                palette=remake_palette,
+                fix_hero=True,
+                pin_palette=remake_pin,
+            )
+            result_data = _enhance_css(result_data, category or "generic", seed=design_seed)
 
         # ── 5. 완료 + 토큰 차감 ──────────────────────
         job.result_json = result_data
@@ -813,3 +839,121 @@ def run_external_import_job(self, job_id: str):
         job.save()
         logger.exception("external_import 실패: %s", job_id)
         raise
+
+
+@shared_task(
+    bind=True,
+    autoretry_for=(),  # suggest_campaign_fields 는 내부 폴백으로 raise 안 함 — 자동 재시도 불필요
+    time_limit=300,  # gemma-4 가 50개 답글 + 본문 생성에 1분 내외, top-up 포함 여유
+    soft_time_limit=270,
+)
+def run_dm_campaign_assist_job(self, job_id: str):
+    """``AiJob.JobType.DM_CAMPAIGN_ASSIST`` 작업을 실행.
+
+    게시물 이미지+캡션을 gemma-4 로 분석해 AutoDM 캠페인 폼 초안을 만들어 ``result_json``
+    에 저장한다. 프론트는 ``GET /api/v1/ai/jobs/{id}/`` 로 폴링해 ``result_json`` 을 읽는다.
+
+    ``input_payload`` 스키마::
+
+        {
+            "caption": "...", "image_url": "https://...", "media_type": "IMAGE",
+            "media_id": "...", "business_type": "...", "campaign_goal": "...",
+            "tone": "...", "link_url": "...",
+            "include_follow_gate": true, "reply_variant_count": 20
+        }
+
+    ``result_json`` 은 동기 버전의 응답과 동일한 형태(suggestion/echo/usage/...)다.
+    """
+    from .models import AiJob
+    from .services.dm_campaign_assistant import suggest_campaign_fields
+    from .services.model_router import resolve_vision_model
+
+    try:
+        job = AiJob.objects.get(pk=job_id)
+    except AiJob.DoesNotExist:
+        logger.error("AiJob 없음: %s", job_id)
+        return
+
+    job.status = AiJob.Status.RUNNING
+    job.started_at = timezone.now()
+    job.save(update_fields=["status", "started_at", "updated_at"])
+
+    payload = job.input_payload or {}
+    image_url = (payload.get("image_url") or "").strip()
+    media_id = (payload.get("media_id") or "").strip()
+    media_type = (payload.get("media_type") or "").strip()
+
+    try:
+        # ── 1. 이미지 다운로드 (base64 비전 입력용, best-effort) ──
+        image_bytes = None
+        if image_url:
+            job.set_stage(AiJob.Stage.PREPARING_PROMPT, 15, "게시물 이미지를 불러오는 중입니다.")
+            try:
+                from .services.image_resolver import _download
+
+                image_bytes = _download(image_url)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("dm_assist: 이미지 다운로드 실패 → URL 패스스루. %s", exc)
+                image_bytes = None
+
+        # ── 2. gemma-4 호출 + 정규화 (서비스가 50개 고유 보장, raise 안 함) ──
+        job.set_stage(AiJob.Stage.CALLING_MODEL, 40, "AI가 캠페인 문구를 작성하고 있습니다.")
+        result = suggest_campaign_fields(
+            caption=payload.get("caption", ""),
+            image_url=image_url,
+            image_bytes=image_bytes,
+            media_type=media_type,
+            business_type=payload.get("business_type", ""),
+            campaign_goal=payload.get("campaign_goal", ""),
+            tone=payload.get("tone", ""),
+            link_url=payload.get("link_url", ""),
+            include_follow_gate=bool(payload.get("include_follow_gate", True)),
+            reply_variant_count=int(payload.get("reply_variant_count", 50)),
+            model_name=resolve_vision_model(),
+        )
+
+        # ── 3. 결과 저장 (동기 버전과 동일한 응답 형태) ──
+        job.model_name = result.model
+        job.result_json = {
+            "model": result.model,
+            "elapsed_seconds": result.elapsed_seconds,
+            "vision_used": result.vision_used,
+            "suggestion": {
+                "name": result.name,
+                "keyword_filter": result.keyword_filter,
+                "keyword_mode": result.keyword_mode,
+                "public_reply_enabled": result.public_reply_enabled,
+                "public_reply_templates": result.public_reply_templates,
+                "simple": {"opening_message_template": result.opening_message_template},
+                "follow_gate": result.follow_gate,
+            },
+            "echo": {"media_id": media_id, "media_type": media_type},
+            "usage": {
+                "prompt_tokens": result.prompt_tokens,
+                "completion_tokens": result.completion_tokens,
+                "total_tokens": result.total_tokens,
+                "cache_hit_tokens": result.cache_hit_tokens,
+                "cache_miss_tokens": result.cache_miss_tokens,
+                "estimated_cost_usd": round(result.estimated_cost_usd, 6),
+            },
+        }
+        job.status = AiJob.Status.SUCCEEDED
+        job.stage = AiJob.Stage.COMPLETED
+        job.progress = 100
+        job.message = "캠페인 폼 초안 생성 완료."
+        job.finished_at = timezone.now()
+        job.save()
+        logger.info(
+            "dm_assist 완료: job=%s replies=%d %.1fs",
+            job_id,
+            result.reply_count,
+            result.elapsed_seconds,
+        )
+
+    except Exception as exc:  # noqa: BLE001
+        job.status = AiJob.Status.FAILED
+        job.error_message = str(exc)[:1000]
+        job.message = "캠페인 초안 생성 중 오류가 발생했습니다."
+        job.finished_at = timezone.now()
+        job.save()
+        logger.exception("dm_assist 실패: %s", job_id)

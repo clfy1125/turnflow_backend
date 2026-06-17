@@ -27,12 +27,7 @@ from datetime import timedelta
 
 from django.db.models import Count, Q
 from django.utils import timezone
-from drf_spectacular.utils import (
-    OpenApiExample,
-    OpenApiParameter,
-    OpenApiResponse,
-    extend_schema,
-)
+from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, PermissionDenied
@@ -59,9 +54,7 @@ def _user_workspaces(request):
 def _get_log_for_user(request, log_id: str) -> SentDMLog:
     """워크스페이스 멤버십 검증 후 SentDMLog 반환"""
     try:
-        log = SentDMLog.objects.select_related(
-            "campaign__ig_connection__workspace"
-        ).get(id=log_id)
+        log = SentDMLog.objects.select_related("campaign__ig_connection__workspace").get(id=log_id)
     except SentDMLog.DoesNotExist as e:
         raise NotFound("DM 로그를 찾을 수 없습니다.") from e
     workspace = log.campaign.ig_connection.workspace
@@ -117,9 +110,7 @@ class DMVerificationViewSet(viewsets.ViewSet):
             OpenApiParameter("campaign_id", str, OpenApiParameter.QUERY, required=False),
             OpenApiParameter("status", str, OpenApiParameter.QUERY, required=False),
             OpenApiParameter("since", str, OpenApiParameter.QUERY, required=False),
-            OpenApiParameter(
-                "recipient_username", str, OpenApiParameter.QUERY, required=False
-            ),
+            OpenApiParameter("recipient_username", str, OpenApiParameter.QUERY, required=False),
         ],
         responses={
             200: SentDMLogSerializer(many=True),
@@ -340,8 +331,7 @@ class DMVerificationViewSet(viewsets.ViewSet):
                 "verified_via": "",
                 "found_in_meta": False,
                 "detail": (
-                    "Meta DB에서 메시지를 찾을 수 없습니다. "
-                    "자동 워커가 1시간까지 재시도합니다."
+                    "Meta DB에서 메시지를 찾을 수 없습니다. " "자동 워커가 1시간까지 재시도합니다."
                 ),
             }
         )
@@ -421,6 +411,34 @@ class DMVerificationViewSet(viewsets.ViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # 예약 발송: 캠페인 활성 기간이 끝났으면(또는 아직 시작 전이면) 수동 재시도도 막는다.
+        # (send_dm_task 가 실행 시점에 한 번 더 차단하지만, 운영자에게 명확한 사유를 즉시 반환)
+        if not log.campaign.is_within_schedule():
+            return Response(
+                {
+                    "success": False,
+                    "error": {
+                        "code": 409,
+                        "message": "캠페인이 활성 발송 기간(예약 창) 밖이라 재시도할 수 없습니다.",
+                        "details": {
+                            "schedule_state": log.campaign.schedule_state(),
+                            "scheduled_start_at": (
+                                log.campaign.scheduled_start_at.isoformat()
+                                if log.campaign.scheduled_start_at
+                                else None
+                            ),
+                            "scheduled_end_at": (
+                                log.campaign.scheduled_end_at.isoformat()
+                                if log.campaign.scheduled_end_at
+                                else None
+                            ),
+                            "hint": "기간을 연장하려면 캠페인 schedule API 로 종료일을 변경하세요.",
+                        },
+                    },
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
         log.status = SentDMLog.Status.QUEUED
         log.retry_count += 1
         log.next_retry_at = None
@@ -460,9 +478,7 @@ class DMVerificationViewSet(viewsets.ViewSet):
         """,
         parameters=[
             OpenApiParameter("campaign_id", str, OpenApiParameter.QUERY, required=False),
-            OpenApiParameter(
-                "ig_connection_id", str, OpenApiParameter.QUERY, required=False
-            ),
+            OpenApiParameter("ig_connection_id", str, OpenApiParameter.QUERY, required=False),
             OpenApiParameter("since", str, OpenApiParameter.QUERY, required=False),
         ],
         responses={
@@ -511,46 +527,31 @@ class DMVerificationViewSet(viewsets.ViewSet):
             # v3.3 — DM 종류별
             standalone_total=Count("id", filter=Q(dm_kind="standalone")),
             opening_total=Count("id", filter=Q(dm_kind="opening")),
-            opening_delivered=Count(
-                "id", filter=Q(dm_kind="opening") & delivered_or_read
-            ),
+            opening_delivered=Count("id", filter=Q(dm_kind="opening") & delivered_or_read),
             reward_total=Count("id", filter=Q(dm_kind="reward")),
-            reward_delivered=Count(
-                "id", filter=Q(dm_kind="reward") & delivered_or_read
-            ),
+            reward_delivered=Count("id", filter=Q(dm_kind="reward") & delivered_or_read),
             # v3.3 — Follow-gate
             gate_pending=Count("id", filter=Q(gate_status="pending")),
             gate_passed=Count("id", filter=Q(gate_status="passed")),
             gate_expired=Count("id", filter=Q(gate_status="expired")),
             # 공개 답글
-            public_replies_posted=Count(
-                "id", filter=~Q(public_reply_id="")
-            ),
+            public_replies_posted=Count("id", filter=~Q(public_reply_id="")),
         )
 
         # ACCEPTED 진입 건 = accepted + delivered + read + failed_no_trace
         # (DELIVERED/READ는 ACCEPTED를 거쳐 갔고, no_trace 도 ACCEPTED 후 종결)
         accepted_or_after = (
-            agg["accepted"]
-            + agg["delivered"]
-            + agg["read"]
-            + agg["failed_no_trace"]
+            agg["accepted"] + agg["delivered"] + agg["read"] + agg["failed_no_trace"]
         )
         confirmed_delivered = agg["delivered"] + agg["read"]
 
-        delivery_rate = (
-            confirmed_delivered / accepted_or_after if accepted_or_after else 0.0
-        )
-        read_rate = (
-            agg["read"] / confirmed_delivered if confirmed_delivered else 0.0
-        )
+        delivery_rate = confirmed_delivered / accepted_or_after if accepted_or_after else 0.0
+        read_rate = agg["read"] / confirmed_delivered if confirmed_delivered else 0.0
 
         # Gate 통과율 = gate_passed / opening_delivered
         # (opening DELIVERED 중 사용자가 응답해서 통과한 비율)
         gate_passthrough_rate = (
-            agg["gate_passed"] / agg["opening_delivered"]
-            if agg["opening_delivered"]
-            else 0.0
+            agg["gate_passed"] / agg["opening_delivered"] if agg["opening_delivered"] else 0.0
         )
 
         agg["delivery_rate"] = round(delivery_rate, 4)
@@ -579,9 +580,7 @@ class DMVerificationViewSet(viewsets.ViewSet):
         """,
         parameters=[
             OpenApiParameter("message_id", str, OpenApiParameter.QUERY, required=False),
-            OpenApiParameter(
-                "idempotency_key", str, OpenApiParameter.QUERY, required=False
-            ),
+            OpenApiParameter("idempotency_key", str, OpenApiParameter.QUERY, required=False),
         ],
         responses={
             200: DMLookupResponseSerializer,
@@ -611,9 +610,7 @@ class DMVerificationViewSet(viewsets.ViewSet):
         ).select_related("campaign")
 
         if message_id:
-            log = qs.filter(
-                Q(meta_message_id=message_id) | Q(echo_mid=message_id)
-            ).first()
+            log = qs.filter(Q(meta_message_id=message_id) | Q(echo_mid=message_id)).first()
         else:
             log = qs.filter(idempotency_key=idem).first()
 
@@ -692,9 +689,7 @@ class DMVerificationViewSet(viewsets.ViewSet):
                 read=Count("id", filter=Q(status="read")),
                 no_trace=Count("id", filter=Q(status="failed_no_trace")),
             )
-            denom = (
-                agg["accepted"] + agg["delivered"] + agg["read"] + agg["no_trace"]
-            )
+            denom = agg["accepted"] + agg["delivered"] + agg["read"] + agg["no_trace"]
             num = agg["delivered"] + agg["read"]
             return round(num / denom, 4) if denom else None
 
@@ -713,9 +708,7 @@ class DMVerificationViewSet(viewsets.ViewSet):
         ).count()
 
         last_polled = ig_conn.last_polled_at
-        seconds_since_poll = (
-            (now - last_polled).total_seconds() if last_polled else None
-        )
+        seconds_since_poll = (now - last_polled).total_seconds() if last_polled else None
 
         if next_media_pending == 0:
             polling_status = "not_needed"
@@ -741,20 +734,14 @@ class DMVerificationViewSet(viewsets.ViewSet):
                 ).count(),
                 # next_media 폴링 모니터링 (v3.4)
                 "next_media_pending_count": next_media_pending,
-                "last_polled_at": (
-                    last_polled.isoformat() if last_polled else None
-                ),
+                "last_polled_at": (last_polled.isoformat() if last_polled else None),
                 "seconds_since_last_poll": (
-                    int(seconds_since_poll)
-                    if seconds_since_poll is not None
-                    else None
+                    int(seconds_since_poll) if seconds_since_poll is not None else None
                 ),
                 "polling_status": polling_status,
                 "last_seen_media_id": ig_conn.last_seen_media_id or None,
                 "last_seen_media_at": (
-                    ig_conn.last_seen_media_at.isoformat()
-                    if ig_conn.last_seen_media_at
-                    else None
+                    ig_conn.last_seen_media_at.isoformat() if ig_conn.last_seen_media_at else None
                 ),
             }
         )
