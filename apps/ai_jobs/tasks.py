@@ -926,6 +926,7 @@ def run_dm_campaign_assist_job(self, job_id: str):
                 "public_reply_templates": result.public_reply_templates,
                 "simple": {"opening_message_template": result.opening_message_template},
                 "follow_gate": result.follow_gate,
+                "link_button": result.link_button,
             },
             "echo": {"media_id": media_id, "media_type": media_type},
             "usage": {

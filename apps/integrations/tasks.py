@@ -632,6 +632,7 @@ def send_dm_task(self, log_id: str):
     # generic template 으로 보내야 인스타 앱에서 "메시지 박스 안에 버튼" 형태로 보임.
     buttons = None
     if log.dm_kind == SentDMLog.DMKind.OPENING and log.gate_status == SentDMLog.GateStatus.PENDING:
+        # follow-gate opening/재안내 DM: postback 버튼 (클릭 시 webhook 으로 fg:{log_id} 회신)
         buttons = [
             {
                 "type": "postback",
@@ -639,6 +640,10 @@ def send_dm_task(self, log_id: str):
                 "payload": f"fg:{log.id}",
             }
         ]
+    elif log.dm_kind in (SentDMLog.DMKind.STANDALONE, SentDMLog.DMKind.REWARD):
+        # 콘텐츠 전달 DM(단순 DM / reward): 설정된 링크 버튼(web_url)을 첨부.
+        # → 단순 DM 발송 · 버튼클릭 즉시 reward · 팔로우 검증 후 reward 모두 링크 버튼이 붙는다.
+        buttons = campaign.get_link_buttons()
 
     try:
         # ★ Story 답장 캠페인 (comment_id 없음) → user_id 기반 DM (24h 윈도우)
@@ -1492,6 +1497,7 @@ def send_reward_dm(self, opening_log_id: str):
             recipient_id=opening.recipient_user_id,
             message_text=campaign.reward_message_template,
             access_token=ig_conn.access_token,
+            buttons=campaign.get_link_buttons(),
         )
     except DMSendError as e:
         cls_info = exception_to_classification(e)

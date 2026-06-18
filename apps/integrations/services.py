@@ -3,13 +3,13 @@ Instagram OAuth and Mock Provider services
 """
 
 import threading
+from datetime import datetime, timedelta
+from typing import Dict, Optional
+from urllib.parse import urlencode
 
 import requests
 from django.conf import settings
-from datetime import datetime, timedelta
 from requests.adapters import HTTPAdapter
-from typing import Dict, Optional
-from urllib.parse import urlencode
 from urllib3.util.retry import Retry
 
 # ── P3b: Meta Graph API 호출용 커넥션 풀 재사용 세션 ──
@@ -31,14 +31,20 @@ def get_http_session() -> requests.Session:
                     pool_connections=64,
                     pool_maxsize=256,
                     max_retries=Retry(
-                        total=2, connect=2, read=0, redirect=0,
-                        backoff_factor=0.2, status_forcelist=(),
+                        total=2,
+                        connect=2,
+                        read=0,
+                        redirect=0,
+                        backoff_factor=0.2,
+                        status_forcelist=(),
                     ),
                 )
                 s.mount("https://", adapter)
                 s.mount("http://", adapter)
                 _http_session = s
     return _http_session
+
+
 import secrets
 import uuid
 
@@ -183,7 +189,9 @@ class InstagramOAuthService:
         return response.json()
 
     @classmethod
-    def subscribe_to_webhooks(cls, ig_user_id: str, access_token: str, fields: str = "comments,messages") -> Dict:
+    def subscribe_to_webhooks(
+        cls, ig_user_id: str, access_token: str, fields: str = "comments,messages"
+    ) -> Dict:
         """
         Enable webhook subscriptions for an Instagram professional account.
 
@@ -477,8 +485,9 @@ class InstagramMessagingService:
 
         Args:
             quick_replies: 메시지 하단 inline 옵션. {"title", "payload"} 리스트. 최대 13개.
-            buttons: 메시지 카드(generic template) 내부 postback 버튼.
-                {"title", "payload", "type"=postback} 리스트. 최대 3개.
+            buttons: 메시지 카드(generic template) 내부 버튼. 최대 3개.
+                - postback: {"type":"postback","title","payload"} — 클릭 시 webhook postback (follow-gate).
+                - web_url:  {"type":"web_url","title","url"} — 클릭 시 URL 열기 (링크 버튼).
                 buttons 가 있으면 generic template 포맷으로 전송되어
                 인스타 앱에서 "버튼이 박힌 메시지" 형태로 보인다.
                 quick_replies 와 동시에 지정 시 buttons 우선.
@@ -532,7 +541,7 @@ class InstagramMessagingService:
         - 둘 다 없음 → plain text
         """
         if buttons:
-            norm = cls._normalize_postback_buttons(buttons)
+            norm = cls._normalize_buttons(buttons)
             if norm:
                 # Meta IG generic: elements[0].title 필수 (80자 한도)
                 title = (text or " ").strip() or " "
@@ -578,23 +587,33 @@ class InstagramMessagingService:
         return out
 
     @staticmethod
-    def _normalize_postback_buttons(buttons: list) -> list:
-        """Meta generic template buttons 스키마로 변환. 최대 3개, title 20자."""
+    def _normalize_buttons(buttons: list) -> list:
+        """Meta generic template buttons 스키마로 변환. 최대 3개, title 20자.
+
+        두 종류 지원:
+          - postback: ``{"type":"postback","title","payload"}`` — 버튼 클릭 시 webhook 으로
+            payload 가 돌아온다 (follow-gate 버튼). payload 없으면 제외.
+          - web_url:  ``{"type":"web_url","title","url"}`` — 버튼 클릭 시 URL 을 연다 (링크 버튼).
+            url 이 http/https 가 아니면 제외.
+        """
         out = []
         for b in buttons[:3]:
             if not isinstance(b, dict):
                 continue
+            btype = str(b.get("type", "postback")).strip()
             title = str(b.get("title", "")).strip()
-            payload_val = str(b.get("payload", "")).strip()
-            if not title or not payload_val:
+            if not title:
                 continue
-            out.append(
-                {
-                    "type": b.get("type", "postback"),
-                    "title": title[:20],
-                    "payload": payload_val[:1000],
-                }
-            )
+            if btype == "web_url":
+                url = str(b.get("url", "")).strip()
+                if not (url.startswith("http://") or url.startswith("https://")):
+                    continue
+                out.append({"type": "web_url", "title": title[:20], "url": url})
+            else:
+                payload_val = str(b.get("payload", "")).strip()
+                if not payload_val:
+                    continue
+                out.append({"type": "postback", "title": title[:20], "payload": payload_val[:1000]})
         return out
 
     # ===== Follow-gate: 사용자가 비즈니스 계정을 팔로우 중인지 조회 =====
@@ -620,12 +639,7 @@ class InstagramMessagingService:
             DMTokenError: code 190 등 토큰 무효 (즉시 처리 중단해야 함)
             DMTransientError: 5xx / 네트워크 (재시도 가능)
         """
-        from .dm_exceptions import (
-            DMApiError,
-            DMTokenError,
-            DMTransientError,
-            TOKEN_CODES,
-        )
+        from .dm_exceptions import TOKEN_CODES, DMApiError, DMTokenError, DMTransientError
 
         if not igsid:
             return None
@@ -687,6 +701,8 @@ class InstagramMessagingService:
             그 외 4xx                                → DMApiError (→ FAILED_NO_TRACE)
         """
         from .dm_exceptions import (
+            RETRIABLE_CODES,
+            TOKEN_CODES,
             DMAnomalyError,
             DMApiError,
             DMInvalidParamError,
@@ -694,8 +710,6 @@ class InstagramMessagingService:
             DMTokenError,
             DMTransientError,
             DMWindowExpiredError,
-            RETRIABLE_CODES,
-            TOKEN_CODES,
         )
 
         # Mock 모드: DEBUG=True + INSTAGRAM_MOCK_MODE=True 일 때만 (prod 는 DEBUG=False 라 절대 미동작).
@@ -804,12 +818,7 @@ class InstagramMessagingService:
             DMTransientError: 5xx / 네트워크 오류 (재시도 권장)
             DMApiError: 그 외 4xx
         """
-        from .dm_exceptions import (
-            DMApiError,
-            DMTokenError,
-            DMTransientError,
-            TOKEN_CODES,
-        )
+        from .dm_exceptions import TOKEN_CODES, DMApiError, DMTokenError, DMTransientError
 
         if not message_id:
             return None
@@ -1017,9 +1026,7 @@ class InstagramMediaService:
         return body.get("data", []) or []
 
     @classmethod
-    def get_media_timestamp(
-        cls, media_id: str, access_token: str
-    ) -> "datetime | None":
+    def get_media_timestamp(cls, media_id: str, access_token: str) -> "datetime | None":
         """
         단일 미디어의 timestamp 조회 (v3.6 next_media webhook 검증용).
 

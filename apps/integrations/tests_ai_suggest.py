@@ -77,14 +77,15 @@ def ig_connection(workspace_and_user):
 
 
 def _full_json(_n_replies=50):
-    """gemma 가 돌려주는 맥락 항목 JSON. 공개 답글은 코드 풀에서 만들므로 미포함(인자 무시)."""
+    """gemma 가 돌려주는 맥락 항목 JSON. 공개 답글은 코드 풀, 링크는 본문에 안 넣고 link_label 만."""
     return (
         '{"name": "신상 원피스 자동응대", "kw": ["사이즈", "재입고", "문의"], "kw_mode": "any",'
-        ' "opening_dm": "안녕하세요! 문의 감사해요 🥰\\n자세한 건 여기 👉 {{link}}",'
+        ' "opening_dm": "안녕하세요! 문의 감사해요 🥰 자료 보내드릴게요",'
         ' "gate_prompt": "댓글 감사합니다! 버튼을 눌러주세요",'
         ' "gate_button": "자료 받기", "gate_button_alt": "팔로우했어요",'
-        ' "reward_dm": "감사합니다! 보러가기 👉 {{link}}",'
-        ' "gate_retry": "팔로우 확인이 안 됐어요. 다시 눌러주세요!"}'
+        ' "reward_dm": "감사합니다! 약속드린 자료 보내드려요",'
+        ' "gate_retry": "팔로우 확인이 안 됐어요. 다시 눌러주세요!",'
+        ' "link_label": "받으러 가기"}'
     )
 
 
@@ -126,20 +127,44 @@ class TestSuggestNormalization:
             )
         assert r.follow_gate is None
 
-    def test_link_substituted_when_present(self):
+    def test_link_becomes_button_not_text(self):
+        """링크는 본문에 안 들어가고 link_button(라벨+URL)으로 제안된다."""
         with patch(_SVC, return_value=_FakeLlm(_full_json(3))):
             r = suggest_campaign_fields(
                 caption="c", reply_variant_count=3, link_url="https://shop.test/x"
             )
-        assert "https://shop.test/x" in r.opening_message_template
-        assert "{{link}}" not in r.opening_message_template
-        assert "{{link}}" not in r.follow_gate["reward_message_template"]
+        assert "https://shop.test/x" not in r.opening_message_template
+        assert "https://shop.test/x" not in r.follow_gate["reward_message_template"]
+        assert r.link_button == {
+            "link_button_label": "받으러 가기",
+            "link_button_url": "https://shop.test/x",
+        }
 
-    def test_link_line_removed_when_absent(self):
+    def test_link_button_uses_example_url_when_no_link(self):
+        """link_url 미입력이어도 link_button 은 항상 채워진다(라벨 + 예시 URL)."""
         with patch(_SVC, return_value=_FakeLlm(_full_json(3))):
             r = suggest_campaign_fields(caption="c", reply_variant_count=3, link_url="")
+        assert r.link_button == {
+            "link_button_label": "받으러 가기",
+            "link_button_url": "https://example.com",
+        }
         assert "{{link}}" not in r.opening_message_template
-        assert "👉" not in r.opening_message_template  # 플레이스홀더 줄째 제거
+
+    def test_link_button_label_default(self):
+        """link_label 비었는데 link_url 있으면 라벨 기본값 '자세히 보기'."""
+        js = (
+            '{"name": "n", "kw": [], "kw_mode": "any", "opening_dm": "o",'
+            ' "gate_prompt": "p", "gate_button": "b", "gate_button_alt": "a",'
+            ' "reward_dm": "r", "gate_retry": "rt", "link_label": ""}'
+        )
+        with patch(_SVC, return_value=_FakeLlm(js)):
+            r = suggest_campaign_fields(
+                caption="c", reply_variant_count=1, link_url="https://x.io/a"
+            )
+        assert r.link_button == {
+            "link_button_label": "자세히 보기",
+            "link_button_url": "https://x.io/a",
+        }
 
     def test_keyword_mode_defaults_on_invalid(self):
         js = '{"kw": ["a"], "kw_mode": "weird", "replies": ["x"]}'
@@ -344,7 +369,9 @@ class TestDmAssistTask:
         assert sug["name"]
         assert len(sug["public_reply_templates"]) == 20
         assert sug["follow_gate"]["follow_gate_button_label"]
-        assert "https://shop.test/x" in sug["simple"]["opening_message_template"]
+        # 링크는 본문이 아니라 link_button 으로
+        assert "https://shop.test/x" not in sug["simple"]["opening_message_template"]
+        assert sug["link_button"]["link_button_url"] == "https://shop.test/x"
 
     def test_task_follow_gate_excluded(self, workspace_and_user):
         from apps.ai_jobs.models import AiJob
@@ -390,3 +417,4 @@ def test_dataclass_defaults():
     assert r.keyword_mode == "any"
     assert r.public_reply_enabled is True
     assert r.follow_gate is None
+    assert r.link_button is None

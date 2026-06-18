@@ -485,6 +485,27 @@ class AutoDMCampaign(models.Model):
         verbose_name="Reward DM 템플릿",
         help_text="follow_gate 통과 후 발송할 본 DM (링크 등 포함)",
     )
+
+    # 링크 버튼 (web_url) — 발송되는 DM 카드에 "라벨 달린 링크 버튼"으로 첨부된다.
+    # - 단순 DM(STANDALONE): opening/단발 DM 에 첨부
+    # - follow-gate(버튼클릭 즉시 / 팔로우 검증 후): reward DM 에 첨부
+    # URL 본문에 직접 박는 대신 Meta generic-template 의 web_url 버튼으로 보내 깔끔하고
+    # 정책상 안전(첫 DM 텍스트 URL 스팸 판정 회피). 비우면 버튼 미첨부.
+    link_button_url = models.URLField(
+        max_length=2048,
+        blank=True,
+        default="",
+        verbose_name="링크 버튼 URL",
+        help_text="DM 카드에 붙일 링크 버튼이 여는 URL (http/https). 비우면 버튼 없음.",
+    )
+    link_button_label = models.CharField(
+        max_length=20,
+        blank=True,
+        default="",
+        verbose_name="링크 버튼 라벨",
+        help_text="링크 버튼 글자 (Meta 한도 20자). link_button_url 있고 비우면 '자세히 보기'.",
+    )
+
     gate_trigger_keywords = models.JSONField(
         default=list,
         blank=True,
@@ -686,6 +707,21 @@ class AutoDMCampaign(models.Model):
     def get_follow_gate_retry_message(self) -> str:
         """Follow 미확인 시 재안내 문구. 캠페인 설정값 우선, 비면 기본 문구."""
         return (self.follow_gate_retry_message or "").strip() or self.DEFAULT_FOLLOW_GATE_RETRY
+
+    # 링크 버튼 (web_url) 기본 라벨 — URL 만 있고 라벨이 비었을 때 fallback
+    DEFAULT_LINK_BUTTON_LABEL = "자세히 보기"
+
+    def get_link_buttons(self) -> list | None:
+        """발송 DM 에 첨부할 web_url 링크 버튼 1개를 Meta 버튼 형태로 반환.
+
+        link_button_url 이 설정돼 있을 때만 ``[{"type":"web_url","title","url"}]`` 반환.
+        없으면 None (버튼 미첨부). 단순 DM / reward DM 발송 시 send 태스크가 사용한다.
+        """
+        url = (self.link_button_url or "").strip()
+        if not url:
+            return None
+        label = (self.link_button_label or "").strip() or self.DEFAULT_LINK_BUTTON_LABEL
+        return [{"type": "web_url", "title": label[:20], "url": url}]
 
     def pick_public_reply_template(self) -> str:
         """공개 답글 템플릿 1개 선택.

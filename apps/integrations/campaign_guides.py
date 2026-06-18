@@ -189,13 +189,36 @@ SCHEDULING_GUIDE: dict = {
 }
 
 
+# 링크 버튼 안내 (v4.1 — DM 카드에 web_url 버튼 첨부)
+LINK_BUTTON_GUIDE: dict = {
+    "headline": "링크 버튼 (DM 에 라벨 달린 링크 버튼 첨부)",
+    "description": (
+        "URL 을 본문 텍스트에 박는 대신, 발송되는 DM 카드에 라벨 달린 링크 버튼(Meta web_url 버튼)으로 "
+        "첨부합니다. 인스타 앱에서 버튼으로 보이고, 첫 DM 텍스트에 URL 을 직접 넣어 스팸 판정되는 "
+        "문제를 피합니다."
+    ),
+    "items": [
+        "단순 DM(게이트 미사용)은 그 DM 에 링크 버튼이 붙습니다.",
+        "follow-gate(팔로우 검증 / 버튼클릭 즉시) 모드에선 reward DM 에 붙습니다 "
+        "(opening/재안내 DM 에는 게이트 버튼이 붙으므로 링크 버튼은 reward 에만).",
+        "link_button_url 이 비어 있으면 버튼은 첨부되지 않습니다.",
+        "Meta 버튼 라벨 한도는 20자입니다.",
+    ],
+    "fields": {
+        "link_button_url": "버튼이 여는 URL (http/https). 비우면 버튼 없음.",
+        "link_button_label": "버튼 글자 (최대 20자). 비우면 '자세히 보기'.",
+    },
+}
+
+
 def build_campaign_guide() -> dict:
     """프론트가 한 번에 받아 갈 수 있는 통합 가이드."""
     return {
-        "version": "v4.0",
+        "version": "v4.1",
         "trigger_types": TRIGGER_TYPE_GUIDE,
         "keyword_modes": KEYWORD_MODE_GUIDE,
         "follow_gate": FOLLOW_GATE_GUIDE,
         "public_reply": PUBLIC_REPLY_GUIDE,
         "scheduling": SCHEDULING_GUIDE,
+        "link_button": LINK_BUTTON_GUIDE,
     }

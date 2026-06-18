@@ -564,7 +564,7 @@ class AutoDMCampaignAiSuggestRequestSerializer(serializers.Serializer):
         required=False,
         allow_blank=True,
         default="",
-        help_text="DM/보상에 넣을 링크 (선택). 있으면 본문 {{link}} 자리에 치환.",
+        help_text="보낼 링크 (선택). link_button 으로 제안됨 — 주면 그 URL, 안 주면 예시 URL(교체용). 본문엔 안 들어감.",
     )
     include_follow_gate = serializers.BooleanField(
         required=False, default=True, help_text="팔로우 게이트 문구도 생성할지 (기본 true)."

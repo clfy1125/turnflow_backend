@@ -9,6 +9,7 @@ from datetime import timedelta
 import requests
 from django.conf import settings
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db.models import F
 from django.http import HttpResponse
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
@@ -16,6 +17,7 @@ from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiRespo
 from rest_framework import status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.exceptions import ValidationError as DRFValidationError
+from rest_framework.filters import SearchFilter
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
@@ -27,6 +29,12 @@ from apps.ai_jobs.serializers import (
 )
 from apps.workspace.models import Workspace
 
+from .campaign_stats import (
+    annotate_campaign_stats,
+    build_counts,
+    build_delivery_summary,
+    compute_monthly_usage,
+)
 from .models import (
     AutoDMCampaign,
     EventInbox,
@@ -39,9 +47,13 @@ from .models import (
 from .serializers import (
     AutoDMCampaignCopySerializer,
     AutoDMCampaignCreateSerializer,
+    AutoDMCampaignListSerializer,
     AutoDMCampaignScheduleSerializer,
     AutoDMCampaignSerializer,
+    AutoDMCampaignSummarySerializer,
     AutoDMCampaignUpdateSerializer,
+    CampaignBulkActionRequestSerializer,
+    CampaignBulkActionResponseSerializer,
     ConnectionCallbackResponseSerializer,
     ConnectionStartResponseSerializer,
     DisconnectResponseSerializer,
@@ -413,6 +425,14 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 short_lived_token = token_response["access_token"]
                 ig_user_id = token_response.get("user_id", "")
 
+                # 진단용: 발급된 권한/사용자 식별자만 남긴다 (토큰·시크릿은 절대 로깅 금지).
+                # graph.instagram.com 거부 원인(권한 미부여 vs 계정타입/역할) 구분에 사용.
+                logger.info(
+                    "IG short-lived token OK: user_id=%s permissions=%r",
+                    ig_user_id,
+                    token_response.get("permissions"),
+                )
+
                 # 2. Get long-lived token (60 days)
                 long_lived_response = InstagramOAuthService.get_long_lived_token(short_lived_token)
                 access_token = long_lived_response["access_token"]
@@ -465,22 +485,27 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 expires_in = long_lived_response.get("expires_in", 5184000)  # Default 60 days
                 expires_at = timezone.now() + timedelta(seconds=expires_in)
 
-                # Get or create connection (without access_token in defaults)
-                connection, created = IGAccountConnection.objects.get_or_create(
-                    workspace=workspace,
-                    external_account_id=account_info["id"],
-                    defaults={
-                        "username": account_info.get("username", account_info.get("name", "")),
-                        "account_type": "BUSINESS",
-                        "token_expires_at": expires_at,
-                        "scopes": InstagramOAuthService.REQUIRED_SCOPES,
-                        "status": IGAccountConnection.Status.ACTIVE,
-                        "last_verified_at": timezone.now(),
-                        "error_message": "",
-                    },
+                # 재연동 = 완전 교체 (멱등):
+                # 같은 (workspace, 계정) 의 기존 연동이 있으면 — revoked/error/expired 포함 —
+                # 새 행을 만들지 않고 그 행을 그대로 재활성화하고 토큰/메타데이터를 덮어쓴다.
+                # (workspace, external_account_id) 에 유니크 제약이 없어 get_or_create 는
+                # 과거 중복 행에서 MultipleObjectsReturned 로 터질 수 있으므로 filter().first() 로
+                # 안전하게 가장 최근 행을 잡고, 없으면 새로 만든다.
+                connection = (
+                    IGAccountConnection.objects.filter(
+                        workspace=workspace,
+                        external_account_id=account_info["id"],
+                    )
+                    .order_by("-created_at")
+                    .first()
                 )
+                if connection is None:
+                    connection = IGAccountConnection(
+                        workspace=workspace,
+                        external_account_id=account_info["id"],
+                    )
 
-                # Set encrypted field through descriptor and update other fields
+                # 기존/신규 공통: 모든 필드를 최신 값으로 덮어써 재연동이 곧 교체가 되게 한다.
                 connection.username = account_info.get("username", account_info.get("name", ""))
                 connection.account_type = "BUSINESS"
                 connection.access_token = (
@@ -571,7 +596,18 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
             return HttpResponse(html)
 
         except Exception as e:
-            logger.error(f"Fatal error in connect_callback: {type(e).__name__} - {str(e)}")
+            # Meta/Instagram HTTPError 는 응답 본문에 실패 사유(JSON)가 들어있다.
+            # raise_for_status() 가 본문을 버리므로 여기서 명시적으로 남겨 진단 가능하게 한다.
+            meta_body = ""
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                try:
+                    meta_body = f" | status={resp.status_code} body={resp.text[:1000]}"
+                except Exception:
+                    pass
+            logger.error(
+                f"Fatal error in connect_callback: {type(e).__name__} - {str(e)}{meta_body}"
+            )
 
             html = f"""
             <!DOCTYPE html>
@@ -1672,6 +1708,10 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     serializer_class = AutoDMCampaignSerializer
 
+    # 검색(?search=): 캠페인 이름/설명 + 연동 IG username (DRF SearchFilter, list 에서만 적용).
+    filter_backends = [SearchFilter]
+    search_fields = ["name", "description", "ig_connection__username"]
+
     # 목록(list) 정렬 허용 필드 화이트리스트 (임의 컬럼 정렬·인젝션 방지).
     # ordering 쿼리 파라미터는 '-' 접두사(내림차순)와 콤마 다중 지정을 지원한다.
     LIST_ORDERING_FIELDS = (
@@ -1684,8 +1724,17 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         "started_at",
         "scheduled_start_at",
         "scheduled_end_at",
+        "last_sent_at",  # annotate 기반 — 가장 최근 발송 시각
     )
+    # 노출 정렬명 → 실제 정렬 컬럼(annotate 별칭)
+    LIST_ORDERING_ALIASES = {"last_sent_at": "_last_sent_at"}
     DEFAULT_LIST_ORDERING = "-created_at"
+
+    def get_serializer_class(self):
+        # 목록/토글 응답은 per-item 통계 enrichment 포함 serializer 사용.
+        if self.action in ("list", "pause", "resume"):
+            return AutoDMCampaignListSerializer
+        return AutoDMCampaignSerializer
 
     def get_queryset(self):
         """사용자의 workspace에 속한 캠페인만 조회.
@@ -1693,8 +1742,8 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         멀티 IG 계정: ?ig_connection_id=<uuid> 로 특정 IG 계정의 캠페인만 필터.
         다른 사용자의 connection 을 지정해도 user_workspaces 필터 때문에 결과 비어있음.
 
-        목록(list) 조회에 한해 status / 생성일 범위 필터와 ordering 정렬을 추가로 적용한다.
-        상세 조회·커스텀 액션(get_object)에는 영향을 주지 않는다(기본 -created_at 정렬).
+        목록(list) 조회에 한해 통계 annotate + status/생성일/facet 필터 + ordering 정렬을
+        추가로 적용한다. 상세 조회·커스텀 액션(get_object)에는 영향을 주지 않는다(-created_at).
         """
         user_workspaces = Workspace.objects.filter(memberships__user=self.request.user)
 
@@ -1707,13 +1756,15 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
             qs = qs.filter(ig_connection_id=ig_connection_id)
 
         if self.action == "list":
+            qs = annotate_campaign_stats(qs)
             return self._filter_and_order_list(qs)
         return qs.order_by(self.DEFAULT_LIST_ORDERING)
 
     def _filter_and_order_list(self, qs):
-        """목록 전용 status / 생성일 범위 필터 + ordering 정렬 적용.
+        """목록 전용 status/생성일/facet 필터 + ordering 정렬 적용.
 
-        잘못된 입력(허용되지 않은 status·정렬 필드, 날짜 형식 오류)은 400 으로 거부한다.
+        잘못된 입력(허용되지 않은 status·trigger_type·정렬 필드, 날짜/불리언 형식 오류)은
+        400 으로 거부한다.
         """
         params = self.request.query_params
 
@@ -1729,6 +1780,27 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
                 )
             if requested:
                 qs = qs.filter(status__in=requested)
+
+        # facet: trigger_type (콤마 다중)
+        trigger_param = params.get("trigger_type")
+        if trigger_param:
+            valid_tt = set(AutoDMCampaign.TriggerType.values)
+            requested_tt = [t.strip() for t in trigger_param.split(",") if t.strip()]
+            invalid_tt = [t for t in requested_tt if t not in valid_tt]
+            if invalid_tt:
+                raise DRFValidationError(
+                    {
+                        "trigger_type": f"허용되지 않은 trigger_type: {invalid_tt}. 가능: {sorted(valid_tt)}"
+                    }
+                )
+            if requested_tt:
+                qs = qs.filter(trigger_type__in=requested_tt)
+
+        # facet: 불리언 토글 (follow_gate_enabled / public_reply_enabled)
+        for bool_field in ("follow_gate_enabled", "public_reply_enabled"):
+            raw = params.get(bool_field)
+            if raw is not None and raw != "":
+                qs = qs.filter(**{bool_field: self._parse_bool(raw, bool_field)})
 
         # 생성일 범위 필터 (created_after / created_before, 둘 다 경계 포함)
         created_after = params.get("created_after")
@@ -1751,7 +1823,8 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
                 field = raw.strip()
                 if not field:
                     continue
-                bare = field[1:] if field.startswith("-") else field
+                desc = field.startswith("-")
+                bare = field[1:] if desc else field
                 if bare not in self.LIST_ORDERING_FIELDS:
                     raise DRFValidationError(
                         {
@@ -1761,11 +1834,28 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
                             )
                         }
                     )
-                cleaned.append(field)
+                col = self.LIST_ORDERING_ALIASES.get(bare, bare)
+                if col == "_last_sent_at":
+                    # 미발송(null) 은 항상 뒤로 — '최근 발송순'에서 빈 캠페인이 위로 뜨지 않게.
+                    cleaned.append(
+                        F(col).desc(nulls_last=True) if desc else F(col).asc(nulls_last=True)
+                    )
+                else:
+                    cleaned.append(f"-{col}" if desc else col)
             if cleaned:
                 return qs.order_by(*cleaned)
 
         return qs.order_by(self.DEFAULT_LIST_ORDERING)
+
+    @staticmethod
+    def _parse_bool(raw, field_name):
+        """불리언 쿼리 파라미터 파싱 (true/false/1/0/yes/no). 실패 시 400."""
+        val = str(raw).strip().lower()
+        if val in ("1", "true", "yes", "y"):
+            return True
+        if val in ("0", "false", "no", "n"):
+            return False
+        raise DRFValidationError({field_name: f"불리언 값이어야 합니다 (true/false): {raw!r}"})
 
     @staticmethod
     def _parse_date_param(raw, field_name):
@@ -1861,14 +1951,15 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
             "keyword_filter": ["사이즈", "재입고", "문의"], "keyword_mode": "any",
             "public_reply_enabled": true,
             "public_reply_templates": ["DM 보내드렸어요! 확인 부탁드려요 💌", "...(기본 50개, 모두 고유)..."],
-            "simple": { "opening_message_template": "안녕하세요! ... 👉 https://shop.example.com/dress" },
+            "simple": { "opening_message_template": "안녕하세요! 문의 감사해요 🥰 자료 보내드릴게요" },
             "follow_gate": {
               "follow_gate_prompt": "댓글 감사합니다! 버튼을 눌러 받아가세요 🎁",
               "follow_gate_button_label": "자료 받기",
               "follow_gate_button_label_alt": "팔로우했어요",
-              "reward_message_template": "감사합니다! 보러가기 👉 https://shop.example.com/dress",
+              "reward_message_template": "감사합니다! 약속드린 자료 보내드려요 🙌",
               "follow_gate_retry_message": "아직 팔로우 확인이 안 됐어요 🥲 ..."
-            }
+            },
+            "link_button": { "link_button_label": "받으러 가기", "link_button_url": "https://shop.example.com/dress" }
           },
           "echo": { "media_id": "...", "media_type": "IMAGE" }, "usage": { "...": 0 }
         }
@@ -1877,6 +1968,10 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
           코드 풀의 정형 인사 문구를 끝맺음(!/~/이모지) 변주해 즉시 추출하므로 빠르다. 서로 다르게(스팸 회피).
         - `follow_gate.*`: 검증 모드 / 버튼 전용 모드 둘 다 커버. `follow_gate_button_label_alt` 는
           검증 모드 토글용 대안 라벨(DB 컬럼 아님). `include_follow_gate=false` 면 `follow_gate` 는 null.
+        - `link_button`: **항상** `{link_button_label, link_button_url}` 로 채워진다. `link_url` 을 주면 그 URL,
+          안 주면 예시 URL(`https://example.com`)이 들어가니 **사용자가 실제 링크로 교체**해야 한다.
+          **링크 URL 은 본문 텍스트엔 안 들어간다** — 그대로 캠페인 `link_button_url`/`link_button_label` 에 넣으면
+          발송 DM 에 라벨 달린 링크 버튼으로 첨부된다(단순 DM·reward 모두).
         - AI 는 `trigger_type`/`media_id` 를 정하지 않는다(사용자가 이미 게시물/범위 선택). `echo` 로만 되돌려줌.
 
         ## 게시물 컨텍스트 입력
@@ -1885,7 +1980,7 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         - `caption` / `image_url` 둘 다 비어 있고 `media_id` 가 있으면 백엔드가 Graph API 로 조회.
           단, **mock 모드이거나 활성 IG 연결이 없으면 400** — 이때는 caption/image_url 을 직접 전달.
         - `business_type` / `campaign_goal` / `tone` / `link_url` 은 선택(없으면 게시물에서 추론).
-          `link_url` 이 있으면 DM/보상 본문의 `{{link}}` 자리에 치환된다.
+          `link_url` 은 본문이 아니라 **`link_button`** 으로 제안된다 — 주면 그 URL, 안 주면 예시 URL(교체용).
 
         ## 인증
         Bearer 토큰 필수. `?workspace_id=<uuid>` 쿼리 파라미터 필수(멤버십 검증).
@@ -2102,18 +2197,34 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         각 항목의 `media_url` 이 비어 있고 `media_id` 가 있으면 Instagram Graph API 로
         best-effort 보강합니다(토큰 만료/실패 시 조용히 건너뜀).
 
+        **항목별 통계 필드(read-only)** — 항목마다 통계를 따로 호출(N+1)할 필요 없이 함께 옵니다:
+        | 필드 | 타입 | 의미 |
+        |---|---|---|
+        | `delivered_count` | int | 도착확인(delivered)+읽음(read) DM 수 |
+        | `delivery_rate` | float(0~1) | ACCEPTED 진입 건 중 도착확인 비율 |
+        | `needs_attention_count` | int | 사용자 조치 필요 로그 수 (토큰만료/윈도우만료/파라미터오류/도착미확인) |
+        | `last_sent_at` | datetime\\|null | 가장 최근 발송 로그 시각 |
+        | `thumbnail_url` | string\\|null | 게시물 썸네일(=media_url 미러) |
+
         ## 쿼리 파라미터
         | 파라미터 | 타입 | 설명 |
         |---|---|---|
         | `ig_connection_id` | uuid | 특정 IG 계정의 캠페인만. 권한 없는 ID 면 빈 배열. |
-        | `status` | string | 상태 필터. 콤마로 다중 지정 가능. 값: `active`/`paused`/`completed`/`inactive`. 예: `status=active,paused` |
+        | `search` | string | 캠페인 이름/설명 + 연동 IG username 부분일치 검색. |
+        | `status` | string | 상태 필터. 콤마 다중. 값: `active`/`paused`/`completed`/`inactive`. 예: `status=active,paused` |
+        | `trigger_type` | string | 트리거 필터. 콤마 다중. 값: `specific_media`/`any_media`/`next_media`/`story_reply`. |
+        | `follow_gate_enabled` | bool | Follow-gate 사용 여부 필터 (true/false). |
+        | `public_reply_enabled` | bool | 공개 답글 사용 여부 필터 (true/false). |
         | `created_after` | date \\| datetime | 이 시각/날짜 **이후**(포함) 생성분. `YYYY-MM-DD` 또는 ISO8601. 날짜만 주면 그날 **00:00:00**(Asia/Seoul)부터. |
         | `created_before` | date \\| datetime | 이 시각/날짜 **이전**(포함) 생성분. 날짜만 주면 그날 **23:59:59**(Asia/Seoul)까지(해당일 포함). |
         | `ordering` | string | 정렬 기준. 콤마 다중 지정 가능, `-` 접두사는 내림차순. 기본값 `-created_at`. |
 
         **정렬 가능 필드(ordering)**: `created_at`, `updated_at`, `name`, `status`,
-        `total_sent`, `total_failed`, `started_at`, `scheduled_start_at`, `scheduled_end_at`.
-        허용 목록 밖의 필드를 주면 **400** 입니다.
+        `total_sent`, `total_failed`, `started_at`, `scheduled_start_at`, `scheduled_end_at`,
+        `last_sent_at`(최근 발송순 — 미발송은 항상 뒤로). 허용 목록 밖의 필드를 주면 **400** 입니다.
+
+        > 빠른 대시보드 집계(상태별 개수·월 사용량·발송 품질)는 별도
+        > `GET .../auto-dm-campaigns/summary/` 를 사용하세요.
 
         ## 예시
         ```bash
@@ -2155,12 +2266,41 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
                 required=False,
             ),
             OpenApiParameter(
+                name="search",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="캠페인 이름/설명 + 연동 IG username 부분일치 검색.",
+            ),
+            OpenApiParameter(
                 name="status",
                 type=str,
                 location=OpenApiParameter.QUERY,
                 required=False,
                 enum=["active", "paused", "completed", "inactive"],
                 description="상태 필터. 콤마로 다중 지정 가능 (예: active,paused).",
+            ),
+            OpenApiParameter(
+                name="trigger_type",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                enum=["specific_media", "any_media", "next_media", "story_reply"],
+                description="트리거 종류 필터. 콤마로 다중 지정 가능.",
+            ),
+            OpenApiParameter(
+                name="follow_gate_enabled",
+                type=bool,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Follow-gate 사용 여부 필터 (true/false).",
+            ),
+            OpenApiParameter(
+                name="public_reply_enabled",
+                type=bool,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="공개 답글 사용 여부 필터 (true/false).",
             ),
             OpenApiParameter(
                 name="created_after",
@@ -2206,6 +2346,8 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
                     "-scheduled_start_at",
                     "scheduled_end_at",
                     "-scheduled_end_at",
+                    "last_sent_at",
+                    "-last_sent_at",
                 ],
                 description=(
                     "정렬 기준. 콤마로 다중 지정 가능, '-' 접두사는 내림차순. 기본 -created_at."
@@ -2213,10 +2355,11 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
             ),
         ],
         responses={
-            200: AutoDMCampaignSerializer(many=True),
+            200: AutoDMCampaignListSerializer(many=True),
             400: OpenApiResponse(
                 description=(
-                    "잘못된 필터/정렬 값 (날짜 형식 오류, 허용되지 않은 status·ordering 필드 등)"
+                    "잘못된 필터/정렬 값 (날짜·불리언 형식 오류, 허용되지 않은 "
+                    "status·trigger_type·ordering 필드 등)"
                 )
             ),
             401: OpenApiResponse(description="인증 필요"),
@@ -2224,8 +2367,10 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         tags=["Auto DM"],
     )
     def list(self, request):
-        """캠페인 목록 조회"""
-        queryset = self.get_queryset()
+        """캠페인 목록 조회 (검색·필터·정렬 + per-item 통계 enrichment)"""
+        # filter_queryset 으로 ?search= (이름/설명/IG username) 적용. get_queryset 에서
+        # 이미 통계 annotate + status/facet/날짜 필터 + ordering 이 적용된 상태.
+        queryset = self.filter_queryset(self.get_queryset())
         serializer = self.get_serializer(queryset, many=True)
         data = serializer.data
 
@@ -2261,10 +2406,140 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
                     media_url = media_data.get("media_url") or media_data.get("permalink")
                     if media_url:
                         item["media_url"] = media_url
+                        # thumbnail_url 은 media_url 미러 — 보강된 값과 동기화.
+                        item["thumbnail_url"] = media_url
                 except Exception:
                     # Best-effort fallback: ignore and continue
                     continue
 
+        return Response(data)
+
+    @extend_schema(
+        summary="캠페인 대시보드 요약",
+        description="""
+        ## 목적
+        캠페인 목록 화면 상단 대시보드용 **집계 한 방** 엔드포인트. 상태별 개수,
+        이번 달 DM 사용량/한도, 발송 품질, 마지막 활동 시각을 한 번에 반환합니다.
+        (목록을 모두 받아 프론트에서 합산할 필요가 없습니다.)
+
+        ## 스코프 결정
+        - `ig_connection_id` 지정(권장): 해당 IG 계정의 캠페인으로 `counts`·`delivery` 를
+          집계하고, `usage` 는 그 계정이 속한 **워크스페이스** 기준으로 계산합니다.
+        - `workspace_id` 지정: 그 워크스페이스 전체.
+        - 둘 다 생략: 사용자의 워크스페이스가 **하나면** 그것으로 자동 결정.
+          여러 개면 **400** (둘 중 하나를 지정해야 함).
+
+        ## 응답
+        ```json
+        {
+          "counts": {"active": 3, "paused": 1, "completed": 2, "inactive": 0, "total": 6},
+          "usage": {
+            "sent_this_month": 42,
+            "monthly_free_limit": 100,
+            "remaining_this_month": 58,
+            "is_over_limit": false,
+            "period_start": "2026-06-01T00:00:00+09:00",
+            "period_end": "2026-07-01T00:00:00+09:00"
+          },
+          "delivery": {
+            "total_sent": 40,
+            "delivery_rate": 0.95,
+            "success_rate": 0.93,
+            "needs_attention_total": 2
+          },
+          "last_activity_at": "2026-06-17T18:20:00+09:00"
+        }
+        ```
+
+        - **usage**: 한도는 플랜(starter 100 / pro 1000 / enterprise -1=무제한). 단 **관리자
+          (is_staff/superuser) 계정은 플랜과 무관하게 무제한(-1)**. `monthly_free_limit=-1`
+          이면 `remaining_this_month=null`, `is_over_limit=false`. 사용량은 SentDMLog 에서
+          이번 캘린더월(Asia/Seoul)을 직접 집계해 정확합니다.
+        - **delivery_rate**: ACCEPTED 진입 건 중 도착확인(delivered+read) 비율 (0~1).
+        - **needs_attention_total**: 토큰만료/윈도우만료/파라미터오류/도착미확인 로그 합.
+
+        ## 인증
+        IsAuthenticated. 본인이 멤버인 워크스페이스만.
+        """,
+        parameters=[
+            OpenApiParameter(
+                name="ig_connection_id",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="특정 IG 계정으로 스코프 (UUID). usage 는 그 워크스페이스 기준.",
+            ),
+            OpenApiParameter(
+                name="workspace_id",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="특정 워크스페이스로 스코프 (UUID). ig_connection_id 미지정 시 사용.",
+            ),
+        ],
+        responses={
+            200: AutoDMCampaignSummarySerializer,
+            400: OpenApiResponse(
+                description="워크스페이스를 결정할 수 없음(여러 개) 또는 잘못된 id"
+            ),
+            401: OpenApiResponse(description="인증 필요"),
+        },
+        tags=["Auto DM"],
+    )
+    @action(detail=False, methods=["get"])
+    def summary(self, request):
+        """캠페인 목록 상단 대시보드용 집계 (counts / usage / delivery / last_activity_at)."""
+        user_workspaces = Workspace.objects.filter(memberships__user=request.user)
+        campaigns = AutoDMCampaign.objects.filter(ig_connection__workspace__in=user_workspaces)
+
+        ig_connection_id = request.query_params.get("ig_connection_id")
+        workspace_id = request.query_params.get("workspace_id")
+
+        if ig_connection_id:
+            conn = (
+                IGAccountConnection.objects.filter(
+                    id=ig_connection_id, workspace__in=user_workspaces
+                )
+                .select_related("workspace")
+                .first()
+            )
+            if conn is None:
+                raise DRFValidationError(
+                    {"ig_connection_id": "해당 IG 연동을 찾을 수 없거나 권한이 없습니다."}
+                )
+            workspace = conn.workspace
+            campaigns = campaigns.filter(ig_connection_id=ig_connection_id)
+        elif workspace_id:
+            workspace = user_workspaces.filter(id=workspace_id).first()
+            if workspace is None:
+                raise DRFValidationError(
+                    {"workspace_id": "워크스페이스를 찾을 수 없거나 권한이 없습니다."}
+                )
+            campaigns = campaigns.filter(ig_connection__workspace=workspace)
+        else:
+            ws_list = list(user_workspaces[:2])
+            if len(ws_list) == 1:
+                workspace = ws_list[0]
+            elif not ws_list:
+                raise DRFValidationError({"detail": "소속된 워크스페이스가 없습니다."})
+            else:
+                raise DRFValidationError(
+                    {
+                        "detail": (
+                            "워크스페이스가 여러 개입니다. ig_connection_id 또는 "
+                            "workspace_id 를 지정하세요."
+                        )
+                    }
+                )
+
+        delivery = build_delivery_summary(campaigns)
+        last_activity = delivery.pop("_last_activity_at")
+        data = {
+            "counts": build_counts(campaigns),
+            "usage": compute_monthly_usage(workspace, user=request.user),
+            "delivery": delivery,
+            "last_activity_at": last_activity,
+        }
         return Response(data)
 
     @extend_schema(
@@ -2341,6 +2616,24 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
           "follow_gate_prompt": "버튼을 누르면 바로 보내드려요!",
           "follow_gate_button_label": "받기",
           "reward_message_template": "감사합니다! 쿠폰 링크: https://example.com/coupon"
+        }
+        ```
+
+        ### 링크 버튼 (선택 — DM 카드에 라벨 달린 web_url 버튼)
+        URL 을 본문 텍스트에 박는 대신, 발송 DM 카드에 **"라벨 달린 링크 버튼"** 으로 첨부합니다
+        (Meta generic-template `web_url` 버튼). 인스타 앱에서 버튼 형태로 보이고, 첫 DM 텍스트에
+        URL 직박 시 스팸 판정되는 문제를 피합니다.
+        - `link_button_url`: 버튼이 여는 URL (http/https). 비우면 버튼 미첨부.
+        - `link_button_label`: 버튼 글자 (최대 20자). 비우면 "자세히 보기".
+        - **적용 위치**: 단순 DM(게이트 off)은 그 DM 에, follow-gate(검증/버튼즉시)는 **reward DM** 에 붙습니다
+          (opening/재안내 DM 에는 게이트 버튼이 붙으므로 링크 버튼은 reward 에만).
+        ```json
+        {
+          "media_id": "18418812427189917",
+          "name": "무료 가이드 배포",
+          "opening_message_template": "안녕하세요! 무료 가이드 보내드려요 😊",
+          "link_button_url": "https://example.com/guide",
+          "link_button_label": "가이드 받기"
         }
         ```
 
@@ -2506,8 +2799,12 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
 
     @extend_schema(
         summary="캠페인 일시정지",
-        description="활성 상태의 캠페인을 일시정지합니다.",
-        responses={200: AutoDMCampaignSerializer},
+        description=(
+            "활성 상태의 캠페인을 일시정지합니다.\n\n"
+            "응답은 **목록 항목과 동일한 형태(통계 enrichment 포함)** 의 갱신된 캠페인 객체라,"
+            " 인라인 토글 후 해당 1건만 교체하면 됩니다."
+        ),
+        responses={200: AutoDMCampaignListSerializer},
         tags=["Auto DM"],
     )
     @action(detail=True, methods=["post"])
@@ -2526,9 +2823,10 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
             "**예약 발송 주의**: 종료 예약(scheduled_end_at)이 이미 과거라면, 재개 직후 "
             "자동 종료 배치가 다시 종료시킵니다. 이를 막기 위해 재개 시 **과거가 된 "
             "scheduled_end_at 은 자동으로 해제(null)** 합니다. 기간을 다시 지정하려면 "
-            "`POST .../schedule/` 또는 PATCH 로 새 종료일을 설정하세요."
+            "`POST .../schedule/` 또는 PATCH 로 새 종료일을 설정하세요.\n\n"
+            "응답은 **목록 항목과 동일한 형태(통계 enrichment 포함)** 의 갱신된 캠페인 객체입니다."
         ),
-        responses={200: AutoDMCampaignSerializer},
+        responses={200: AutoDMCampaignListSerializer},
         tags=["Auto DM"],
     )
     @action(detail=True, methods=["post"])
@@ -2545,6 +2843,114 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         campaign.save()
         serializer = self.get_serializer(campaign)
         return Response(serializer.data)
+
+    @extend_schema(
+        summary="캠페인 일괄 일시정지",
+        description=(
+            "여러 캠페인을 한 번에 일시정지합니다.\n\n"
+            '요청 `{"ids": [<uuid>, ...]}` (최대 200개). 응답은 '
+            '`{"succeeded": [<uuid>...], "failed": [{"id", "reason"}...]}` 형태로, '
+            "권한 없거나 존재하지 않는 id 는 `failed`(reason=`not_found`)에 담깁니다 "
+            "(전체 실패가 아니라 건별 부분 성공)."
+        ),
+        request=CampaignBulkActionRequestSerializer,
+        responses={
+            200: CampaignBulkActionResponseSerializer,
+            400: OpenApiResponse(description="ids 누락/형식 오류"),
+            401: OpenApiResponse(description="인증 필요"),
+        },
+        tags=["Auto DM"],
+    )
+    @action(detail=False, methods=["post"], url_path="bulk-pause")
+    def bulk_pause(self, request):
+        """캠페인 일괄 일시정지"""
+        return self._bulk_action(request, "pause")
+
+    @extend_schema(
+        summary="캠페인 일괄 재개",
+        description=(
+            "여러 캠페인을 한 번에 재개(status=active)합니다. 과거가 된 종료 예약은 건별로 "
+            "자동 해제합니다(단건 resume 과 동일 규칙).\n\n"
+            "요청/응답 형식은 일괄 일시정지와 동일."
+        ),
+        request=CampaignBulkActionRequestSerializer,
+        responses={
+            200: CampaignBulkActionResponseSerializer,
+            400: OpenApiResponse(description="ids 누락/형식 오류"),
+            401: OpenApiResponse(description="인증 필요"),
+        },
+        tags=["Auto DM"],
+    )
+    @action(detail=False, methods=["post"], url_path="bulk-resume")
+    def bulk_resume(self, request):
+        """캠페인 일괄 재개"""
+        return self._bulk_action(request, "resume")
+
+    @extend_schema(
+        summary="캠페인 일괄 삭제",
+        description=(
+            "여러 캠페인을 한 번에 삭제합니다(되돌릴 수 없음).\n\n"
+            "요청/응답 형식은 일괄 일시정지와 동일. 권한 없거나 없는 id 는 "
+            "`failed`(reason=`not_found`)."
+        ),
+        request=CampaignBulkActionRequestSerializer,
+        responses={
+            200: CampaignBulkActionResponseSerializer,
+            400: OpenApiResponse(description="ids 누락/형식 오류"),
+            401: OpenApiResponse(description="인증 필요"),
+        },
+        tags=["Auto DM"],
+    )
+    @action(detail=False, methods=["post"], url_path="bulk-delete")
+    def bulk_delete(self, request):
+        """캠페인 일괄 삭제"""
+        return self._bulk_action(request, "delete")
+
+    def _bulk_action(self, request, op):
+        """벌크 액션 공통 처리 — 건별 부분 성공.
+
+        본인 워크스페이스 소속 캠페인만 대상이며, 그 외 id 는 not_found 로 실패 처리한다.
+        반환: {"succeeded": [id...], "failed": [{"id", "reason"}...]}.
+        """
+        in_ser = CampaignBulkActionRequestSerializer(data=request.data)
+        in_ser.is_valid(raise_exception=True)
+        # 입력 순서 유지하며 중복 제거
+        ids = list(dict.fromkeys(str(i) for i in in_ser.validated_data["ids"]))
+
+        user_workspaces = Workspace.objects.filter(memberships__user=request.user)
+        owned = {
+            str(c.id): c
+            for c in AutoDMCampaign.objects.filter(
+                id__in=ids, ig_connection__workspace__in=user_workspaces
+            )
+        }
+
+        succeeded, failed = [], []
+        now = timezone.now()
+        for cid in ids:
+            campaign = owned.get(cid)
+            if campaign is None:
+                failed.append({"id": cid, "reason": "not_found"})
+                continue
+            try:
+                if op == "pause":
+                    campaign.status = AutoDMCampaign.Status.PAUSED
+                    campaign.save(update_fields=["status", "updated_at"])
+                elif op == "resume":
+                    campaign.status = AutoDMCampaign.Status.ACTIVE
+                    if campaign.scheduled_end_at and campaign.scheduled_end_at <= now:
+                        campaign.scheduled_end_at = None
+                    campaign.ended_at = None
+                    campaign.save(
+                        update_fields=["status", "scheduled_end_at", "ended_at", "updated_at"]
+                    )
+                elif op == "delete":
+                    campaign.delete()
+                succeeded.append(cid)
+            except Exception as exc:  # noqa: BLE001 — 건별 격리, 사유를 응답에 담는다
+                failed.append({"id": cid, "reason": str(exc)[:200]})
+
+        return Response({"succeeded": succeeded, "failed": failed})
 
     @extend_schema(
         summary="캠페인 복사 (비활성 복사본 생성)",

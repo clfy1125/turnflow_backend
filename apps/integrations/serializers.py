@@ -143,6 +143,9 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
             "follow_gate_retry_message",
             "reward_message_template",
             "gate_trigger_keywords",
+            # 링크 버튼 (web_url — DM 카드에 라벨 달린 링크 버튼으로 첨부)
+            "link_button_url",
+            "link_button_label",
             # 운영
             "status",
             "max_sends_per_hour",
@@ -210,6 +213,133 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
                 }
             )
         return attrs
+
+
+class AutoDMCampaignListSerializer(AutoDMCampaignSerializer):
+    """목록/요약/토글 응답용 — 기본 캠페인 필드 + per-item 통계 enrichment (조회 고도화 v4.1).
+
+    delivery_rate / needs_attention_count / delivered_count / last_sent_at / thumbnail_url 을
+    read-only 로 추가해, 프론트가 항목마다 stats 를 따로 호출하던 N+1 을 제거한다.
+    목록 쿼리는 annotate_campaign_stats 로 한 번에 집계되며, 단건(pause/resume 등) 은
+    compute_campaign_enrichment 가 즉석 집계한다.
+    """
+
+    delivered_count = serializers.SerializerMethodField()
+    delivery_rate = serializers.SerializerMethodField()
+    needs_attention_count = serializers.SerializerMethodField()
+    last_sent_at = serializers.SerializerMethodField()
+    thumbnail_url = serializers.SerializerMethodField()
+
+    class Meta(AutoDMCampaignSerializer.Meta):
+        fields = AutoDMCampaignSerializer.Meta.fields + [
+            "delivered_count",
+            "delivery_rate",
+            "needs_attention_count",
+            "last_sent_at",
+            "thumbnail_url",
+        ]
+
+    def _enrich(self, obj):
+        cache = getattr(obj, "_enrichment_cache", None)
+        if cache is None:
+            from .campaign_stats import compute_campaign_enrichment
+
+            cache = compute_campaign_enrichment(obj)
+            obj._enrichment_cache = cache
+        return cache
+
+    def get_delivered_count(self, obj) -> int:
+        return self._enrich(obj)["delivered_count"]
+
+    def get_delivery_rate(self, obj) -> float:
+        return self._enrich(obj)["delivery_rate"]
+
+    def get_needs_attention_count(self, obj) -> int:
+        return self._enrich(obj)["needs_attention_count"]
+
+    @extend_schema_field(serializers.DateTimeField(allow_null=True))
+    def get_last_sent_at(self, obj):
+        return self._enrich(obj)["last_sent_at"]
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_thumbnail_url(self, obj):
+        return self._enrich(obj)["thumbnail_url"]
+
+
+class CampaignSummaryCountsSerializer(serializers.Serializer):
+    """상태별 캠페인 개수."""
+
+    active = serializers.IntegerField()
+    paused = serializers.IntegerField()
+    completed = serializers.IntegerField()
+    inactive = serializers.IntegerField()
+    total = serializers.IntegerField()
+
+
+class CampaignSummaryUsageSerializer(serializers.Serializer):
+    """이번 달 DM 사용량 + 한도 (워크스페이스 단위)."""
+
+    sent_this_month = serializers.IntegerField(help_text="이번 캘린더월에 발송(접수)된 DM 수")
+    monthly_free_limit = serializers.IntegerField(
+        help_text="플랜 월 DM 한도 (starter 100 / pro 1000 / enterprise -1=무제한)"
+    )
+    remaining_this_month = serializers.IntegerField(
+        allow_null=True, help_text="남은 발송 가능 수. 무제한이면 null"
+    )
+    is_over_limit = serializers.BooleanField(
+        help_text="한도 도달/초과 여부 (무제한이면 항상 false)"
+    )
+    period_start = serializers.DateTimeField(help_text="집계 기간 시작 (해당 월 1일 00:00 KST)")
+    period_end = serializers.DateTimeField(help_text="집계 기간 끝 (다음 달 1일 00:00 KST, 미포함)")
+
+
+class CampaignSummaryDeliverySerializer(serializers.Serializer):
+    """발송 품질 요약 (목록 범위 전체 합산)."""
+
+    total_sent = serializers.IntegerField(help_text="도착/읽음 확인된 DM 합")
+    delivery_rate = serializers.FloatField(help_text="ACCEPTED 진입 건 중 도착확인 비율 (0~1)")
+    success_rate = serializers.FloatField(
+        help_text="전체 로그 중 도착(또는 legacy sent) 비율 (0~1)"
+    )
+    needs_attention_total = serializers.IntegerField(
+        help_text="사용자 조치 필요 로그 합 (토큰만료/윈도우만료/파라미터오류/도착미확인)"
+    )
+
+
+class AutoDMCampaignSummarySerializer(serializers.Serializer):
+    """캠페인 요약 응답 (GET .../auto-dm-campaigns/summary/)."""
+
+    counts = CampaignSummaryCountsSerializer()
+    usage = CampaignSummaryUsageSerializer()
+    delivery = CampaignSummaryDeliverySerializer()
+    last_activity_at = serializers.DateTimeField(
+        allow_null=True, help_text="가장 최근 DM 로그 생성 시각 (없으면 null)"
+    )
+
+
+class CampaignBulkActionRequestSerializer(serializers.Serializer):
+    """벌크 액션 요청 — 캠페인 id 배열."""
+
+    ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        min_length=1,
+        max_length=200,
+        help_text="대상 캠페인 UUID 배열 (최대 200개).",
+    )
+
+
+class CampaignBulkFailureSerializer(serializers.Serializer):
+    """벌크 액션 실패 항목."""
+
+    id = serializers.CharField(help_text="실패한 캠페인 id (또는 잘못된 입력값)")
+    reason = serializers.CharField(help_text="실패 사유 코드 (not_found 등)")
+
+
+class CampaignBulkActionResponseSerializer(serializers.Serializer):
+    """벌크 액션 응답 — 성공 id 목록 + 실패 상세."""
+
+    succeeded = serializers.ListField(child=serializers.UUIDField())
+    failed = CampaignBulkFailureSerializer(many=True)
 
 
 class AutoDMCampaignCreateSerializer(serializers.Serializer):
@@ -357,6 +487,24 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
         ),
     )
     reward_message_template = serializers.CharField(required=False, allow_blank=True, default="")
+
+    # 링크 버튼 (web_url) — 발송 DM 카드에 라벨 달린 링크 버튼으로 첨부.
+    # 단순 DM·버튼클릭 즉시 reward·팔로우 검증 후 reward 모두에 적용된다(콘텐츠 전달 DM에 붙음).
+    link_button_url = serializers.URLField(
+        required=False,
+        allow_blank=True,
+        default="",
+        max_length=2048,
+        help_text="발송 DM 에 붙일 링크 버튼 URL (http/https). 비우면 버튼 없음.",
+    )
+    link_button_label = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+        max_length=20,
+        help_text="링크 버튼 글자 (Meta 한도 20자). link_button_url 있고 비우면 '자세히 보기'.",
+    )
+
     gate_trigger_keywords = serializers.ListField(
         child=serializers.CharField(max_length=64),
         required=False,
@@ -485,6 +633,9 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
             "follow_gate_retry_message",
             "reward_message_template",
             "gate_trigger_keywords",
+            # 링크 버튼 (web_url)
+            "link_button_url",
+            "link_button_label",
             "max_sends_per_hour",
             "status",
             # 예약 발송
@@ -492,6 +643,8 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
             "scheduled_end_at",
         ]
         extra_kwargs = {
+            "link_button_url": {"required": False, "allow_blank": True},
+            "link_button_label": {"required": False, "allow_blank": True},
             "media_url": {"required": False, "allow_null": True, "allow_blank": True},
             "scheduled_start_at": {"required": False, "allow_null": True},
             "scheduled_end_at": {"required": False, "allow_null": True},
