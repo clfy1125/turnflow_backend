@@ -133,6 +133,59 @@ def _is_dark(bg: str) -> bool:
     return bool(rgb and C.luma(rgb) < 0.5)
 
 
+def _signature_background_css(
+    variant: str, dark: bool, acc: str, background: str, seed: int
+) -> str:
+    """배경 시그니처 — 라이트는 accent 저알파 메시 그라데, 다크는 별가루(starfield).
+
+    배경 톤(design_settings.backgroundColor)은 그대로 유지(자동 글자색 보존)하고 그 위에
+    은은한 레이어만 얹는다. editorial(미니멀)·outline(카툰 잉크)은 정체성상 제외.
+    ``> *{z-index:1}`` 로 콘텐츠가 배경 레이어에 가리지 않게 한다.
+    """
+    if variant in ("editorial", "outline"):
+        return ""
+    rgb = C.parse_hex(acc) or (124, 92, 255)
+    r, g, b = rgb
+    if dark:
+        dots_acc = f"radial-gradient(1.4px 1.4px at 200px 160px,rgba({r},{g},{b},.9),transparent)"
+        return (
+            ".page-container > *{ position:relative; z-index:1; }\n"
+            '.page-container::after{ content:""; position:fixed; inset:0; z-index:0;'
+            " pointer-events:none; opacity:.5; background-image:"
+            "radial-gradient(1.2px 1.2px at 20px 30px,#fff,transparent),"
+            "radial-gradient(1px 1px at 120px 80px,rgba(255,255,255,.75),transparent),"
+            + dots_acc
+            + ","
+            "radial-gradient(1px 1px at 80px 220px,#fff,transparent);"
+            " background-size:320px 280px; animation:tf-tw 5s ease-in-out infinite alternate; }\n"
+            "@keyframes tf-tw{ from{opacity:.32} to{opacity:.6} }\n"
+        )
+    # 라이트: accent 저알파 메시 2겹 + 베이스 색. 위치는 seed 로 변주.
+    x1, y1, x2, y2 = pick(seed, [(14, 8, 88, 12), (10, 10, 90, 86), (16, 90, 84, 18)], salt=3)
+    grad1 = f"radial-gradient(42% 28% at {x1}% {y1}%,rgba({r},{g},{b},.10),transparent 70%)"
+    grad2 = f"radial-gradient(38% 26% at {x2}% {y2}%,rgba({r},{g},{b},.06),transparent 72%)"
+    return (
+        ".page-container > *{ position:relative; z-index:1; }\n"
+        ".page-container{ background:" + grad1 + "," + grad2 + "," + background + " !important; }\n"
+    )
+
+
+def _bold_card_shadow_css(acc: str) -> str:
+    """bold variant 카드에 하드 오프셋 섀도(브루탈리스트 느낌) — 카드 앵커 훅에 추가형 override."""
+    rgb = C.parse_hex(acc) or (17, 17, 26)
+    r, g, b = rgb
+    off = f"6px 6px 0 rgba({r},{g},{b},.18)"
+    hover = f"9px 9px 0 rgba({r},{g},{b},.30)"
+    return (
+        '.block-link[data-block-type="single_link"] > a,'
+        '.block-link[data-block-type="group_link"] a{'
+        " box-shadow:" + off + " !important;"
+        " transition:transform .18s ease, box-shadow .18s ease; }\n"
+        '.block-link[data-block-type="single_link"] > a:hover{'
+        " transform:translate(-2px,-2px); box-shadow:" + hover + " !important; }\n"
+    )
+
+
 def build_design_css(*, accent: str, background: str, category: str, seed: int = 0) -> str:
     """팔레트+카테고리+job 시드로 page-level 디자인 킷 CSS 문자열 생성.
 
@@ -213,6 +266,12 @@ def build_design_css(*, accent: str, background: str, category: str, seed: int =
 .block-link[data-block-type="spacer"] div[class*="border"]{{ border-color:{acc} !important; opacity:.55; }}
 ::selection{{ background:{acc}; color:#fff; }}
 """
+    # 시그니처 모듈(추가형) — 기존 카드 로직은 건드리지 않고 뒤에 덧붙인다.
+    sig_bg = _signature_background_css(variant, dark, acc, background, seed)
+    if sig_bg:
+        css += "\n" + sig_bg
+    if variant == "bold":
+        css += "\n" + _bold_card_shadow_css(acc)
     return css
 
 

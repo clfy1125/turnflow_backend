@@ -201,6 +201,7 @@ custom_button_color?: string;  // 블록 버튼색
 > - `single_link` 의 `url` 은 **반드시 비어 있지 않은 `https://` URL**. **빈 url 단일링크는 렌더가 통째로 생략된다.** 진짜를 모르면 **그럴듯한 실제형 URL**(예: `https://instagram.com/브랜드핸들`, `https://pf.kakao.com/_xxx`)을 넣어라 — 사용자가 나중에 교체한다.
 > - `thumbnail_url`·`image_url` 등 **보조** URL 은 모르면 **빈 문자열 `""` 로 두거나 생략**(빈 값 허용, 이미지가 안 뜰 뿐 렌더는 됨).
 > - 공통: `#`·`javascript:`·스킴 없는 값 금지(서버 검증에서 거부 → 페이지 저장 실패). 이미지 자리는 실제 URL 대신 `{{image:영문키워드}}` / `{{user_image:N}}`.
+> - **전화·이메일은 `single_link` 의 `url` 에 `tel:`/`mailto:` 로 넣지 마라** — 반드시 **social 블록**(`phone`/`email` 키)으로 만든다. 앱이 자동으로 `tel:`/`mailto:` 를 붙인다.
 
 ---
 

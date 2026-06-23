@@ -153,6 +153,7 @@ AI가 링크인바이오 페이지 JSON을 생성하는 **비동기 작업**을 
 | `concept` | ✅ | string | 페이지 컨셉 설명 (최대 2000자) |
 | `category` | ❌ | string | **새 페이지 생성 시 명시 권장.** 카테고리별 전용 레시피(섹션 구성·카피 톤·이미지 전략·디자인 변형)가 적용됨. 허용값은 `GET /api/v1/ai/categories/` 의 슬러그: `profile-link`·`digital-card`·`landing`·`portfolio`·`brochure`·`space-booking`·`group-buy`·`invitation`·`affiliate`·`commission`·`promotion`. 비우면 concept 에서 자동 추론 |
 | `slug` | ❌ | string | 리메이크할 기존 페이지의 slug. 전달 시 해당 페이지의 블록을 참고하여 AI가 리메이크 |
+| `apply_to_slug` | ❌ | string | **새 페이지 생성 전용.** 프론트가 미리 만들어 둔 빈 페이지의 slug. 전달하면 작업 성공 시 백엔드가 `result_json` 을 이 페이지에 **자동 적용**한다 → 별도 `POST /api/v1/pages/ai/@{slug}/` 호출 불필요. 리메이크(`slug` 전달) 시 무시 |
 | `model` | ❌ | string | AI 모델 선택. `deepseek`(기본), `gemma`(자체 호스팅), `gpt5`(개발 중) |
 | `image_ids` | ❌ | uuid[] | 업로드 이미지 id (최대 10, `POST /api/v1/ai/source-images/` 로 먼저 업로드). AI가 라벨링 후 페이지에 배치. **새 페이지 생성과 리메이크 모두 지원** — 리메이크에선 기존 이미지 보존 + 첨부 이미지가 새 갤러리/쇼케이스 블록으로 추가 (style_only 모드 제외) |
 | `reference_page_slug` | ❌ | string | 디자인 톤 few-shot 레퍼런스 페이지 slug (`GET /api/v1/ai/categories/{slug}/references/` 에서 선택). 비우면 카테고리 기본 레퍼런스(예: invitation → 검증된 청첩장 디자인) 자동 적용 |
@@ -201,14 +202,18 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
 | `completed` | 100 | 완료 |
 
 ## 완료 후 적용 방법
-`result_json`을 그대로 `POST /api/v1/pages/ai/@{slug}/` 에 전달하면 페이지에 적용됩니다.
+- **새 페이지 생성 (권장 흐름)**: 빈 페이지를 먼저 만들고 그 slug 를 `apply_to_slug` 로 전달하면,
+  작업 성공 시 백엔드가 결과를 그 페이지에 **자동 적용**한다. 즉 `status == "succeeded"` 면
+  페이지가 이미 완성돼 있어 별도 적용 호출이 필요 없다.
+- **`apply_to_slug` 를 안 보낸 경우 / 리메이크**: 기존 방식대로 `result_json` 을 그대로
+  `POST /api/v1/pages/ai/@{slug}/` 에 전달해 적용한다.
 
 ## 에러
 | 코드 | 원인 |
 |------|------|
 | 400 | concept 누락 |
 | 401 | 인증 실패 |
-| 404 | slug에 해당하는 페이지 없음 또는 권한 없음 |
+| 404 | `slug`/`apply_to_slug` 에 해당하는 페이지 없음 또는 권한 없음 |
         """,
         request=AiJobCreateSerializer,
         responses={
@@ -253,6 +258,16 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
                 value={
                     "concept": "성수동 모임공간 '레이어드' 대여. 시간당 요금, 네이버 예약, 주차 안내.",
                     "category": "space-booking",
+                },
+                request_only=True,
+            ),
+            OpenApiExample(
+                "빈 페이지에 자동 적용 (권장 흐름)",
+                summary="미리 만든 빈 페이지 slug 를 apply_to_slug 로 전달 → 성공 시 자동 적용",
+                value={
+                    "concept": "성수동 모임공간 '레이어드' 대여. 시간당 요금, 네이버 예약, 주차 안내.",
+                    "category": "space-booking",
+                    "apply_to_slug": "page-wq3ygwlq75",
                 },
                 request_only=True,
             ),
@@ -427,6 +442,25 @@ GET /api/v1/ai/jobs/{id}/  →  { status, stage, progress, message }
             order = {str(i): n for n, i in enumerate(raw_image_ids)}
             source_images.sort(key=lambda im: order.get(str(im.id), 0))
             input_payload["source_image_ids"] = [str(im.id) for im in source_images]
+
+        # 새 페이지 생성: 프론트가 미리 만들어 둔 빈 페이지를 job 에 연결해 두면,
+        # 작업 성공 시 run_ai_job 이 결과를 그 페이지에 자동 적용한다(별도 적용 호출 불필요).
+        # 리메이크(slug 전달)는 위에서 page=source_page 가 이미 잡혔고, 적용은 프론트가
+        # 롤백 UX와 함께 담당하므로 apply_to_slug 는 무시한다.
+        apply_to_slug = (vd.get("apply_to_slug") or "").strip()
+        if page is None and apply_to_slug:
+            target_page = Page.objects.filter(slug=apply_to_slug, user=request.user).first()
+            if target_page is None:
+                return Response(
+                    {
+                        "detail": (
+                            f"적용 대상 페이지(slug '{apply_to_slug}')를 찾을 수 없거나 "
+                            "권한이 없습니다."
+                        )
+                    },
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            page = target_page
 
         # AiJob 생성
         job = AiJob.objects.create(

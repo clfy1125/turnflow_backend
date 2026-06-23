@@ -105,6 +105,7 @@ def enforce_design_quality(
         "pure_black_softened": 0,
         "hero_image_promoted": 0,
         "hero_downgraded": 0,
+        "gallery_keep_ratio_off": 0,
     }
 
     ds = _get_design_settings(result)
@@ -117,6 +118,10 @@ def enforce_design_quality(
     if isinstance(blocks, list):
         if fix_hero:
             _fix_empty_hero(blocks, report)
+        # gallery keep_ratio 는 색이 아니라 레이아웃이므로 design_settings 유무와 무관하게 강제.
+        for b in blocks:
+            if isinstance(b, dict):
+                _force_gallery_keep_ratio_off(b, report)
         if ds is not None:
             for b in blocks:
                 if isinstance(b, dict):
@@ -125,6 +130,20 @@ def enforce_design_quality(
     if any(report.values()):
         logger.info("design_guard 보정: %s", {k: v for k, v in report.items() if v})
     return result
+
+
+def _force_gallery_keep_ratio_off(block: dict, report: dict) -> None:
+    """gallery 의 ``keep_ratio`` 를 코드로 항상 OFF — 시스템 결정(프롬프트 의존 X).
+
+    keep_ratio=True 는 썸네일이 원본 비율대로 들쭉날쭉 늘어나 갤러리 레이아웃을 깨는 주범.
+    OFF(고정 비율 크롭)가 가장 깔끔하다는 디자인 판단을 코드로 강제한다(멱등).
+    """
+    d = block.get("data")
+    if not isinstance(d, dict) or d.get("_type") != "gallery":
+        return
+    if d.get("keep_ratio") is not False:
+        d["keep_ratio"] = False
+        report["gallery_keep_ratio_off"] += 1
 
 
 def _is_profile(block: dict) -> bool:

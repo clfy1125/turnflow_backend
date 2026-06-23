@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 
@@ -289,6 +290,27 @@ def count_empty_image_slots(result: dict) -> int:
     return n
 
 
+def _harvest_llm_keywords(result: dict) -> list[str]:
+    """LLM 이 페이지에 이미 심은 ``{{image:키워드}}`` 들을 등장순·중복제거로 수집한다.
+
+    이 키워드들은 프롬프트 지시대로 concept(실제 피사체)을 반영한 영문이라, 빈 슬롯을
+    카테고리 고정 키워드(예: invitation→``"wedding couple..."``)로 채우기 **전에** 우선
+    재사용해, concept 과 무관한 이미지 누수(밴드 부스인데 웨딩 사진)를 막는다.
+    """
+    try:
+        found = re.findall(r"\{\{image:([^}]+)\}\}", json.dumps(result, ensure_ascii=False))
+    except (TypeError, ValueError):
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for kw in found:
+        k = kw.strip()
+        if k and k.lower() not in seen:
+            seen.add(k.lower())
+            out.append(k)
+    return out
+
+
 def ensure_image_placeholders(
     result: dict,
     category: str,
@@ -311,9 +333,13 @@ def ensure_image_placeholders(
         return result
     try:
         prof = CP.get_profile(category)
-        hero_kw = _Cycler(prof.get("hero_keywords") or [], start=salt)
-        gallery_kw = _Cycler(prof.get("gallery_keywords") or [], start=salt)
-        thumb_kw = _Cycler(prof.get("thumb_keywords") or [], start=salt)
+        # LLM 이 이미 심은 concept 반영 키워드를 카테고리 고정 키워드보다 우선 재사용한다.
+        # (카테고리 고정 키워드가 concept 과 무관하게 빈 슬롯을 채우는 누수 방지 — 전 카테고리.)
+        # LLM 이 통째로 imageless 면 llm_kw 가 비어 카테고리 풀로 자연 폴백.
+        llm_kw = _harvest_llm_keywords(result)
+        hero_kw = _Cycler(llm_kw + (prof.get("hero_keywords") or []), start=salt)
+        gallery_kw = _Cycler(llm_kw + (prof.get("gallery_keywords") or []), start=salt)
+        thumb_kw = _Cycler(llm_kw + (prof.get("thumb_keywords") or []), start=salt)
 
         report = {
             "cover_filled": 0,

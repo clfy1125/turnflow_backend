@@ -6,7 +6,26 @@
 
 ---
 
-## TL;DR — 새 페이지 생성 4단계
+## TL;DR — 새 페이지 생성 (권장 흐름)
+
+```
+0) 빈 페이지 생성         POST /api/v1/pages/ ...                → slug (예: page-xxxx)
+1) (선택) 이미지 업로드   POST /api/v1/ai/source-images/        → image id 목록
+2) 작업 시작              POST /api/v1/ai/jobs/                  → { id }
+                          { concept, category, apply_to_slug: slug }   ⭐ apply_to_slug = 0)의 slug
+3) 폴링 (1~2초)           GET  /api/v1/ai/jobs/{id}/             → status/stage/progress
+                          status == "succeeded" 이면 그 페이지에 이미 적용 완료 → 페이지로 이동
+```
+
+> **변경점 (2026-06):** `apply_to_slug` 를 보내면 백엔드가 성공 시 결과를 그 페이지에 **자동 적용**한다.
+> 프론트는 4단계 적용 호출(`POST /pages/ai/@{slug}/`)을 따로 할 필요가 없다 —
+> `succeeded` = 페이지 완성. (안 보내면 아래 "수동 적용" 흐름으로 fallback.)
+>
+> ⚠️ **`succeeded` 인데 페이지가 비어 보이던 버그의 원인이 이것**: 예전엔 프론트가 별도 적용 호출을
+> 빠뜨리면(또는 실패해도 에러를 안 띄우면) job 은 성공인데 페이지는 빈 채로 남았다. 이제 apply_to_slug
+> 로 백엔드가 적용을 책임진다. 적용까지 실패하면 job 이 `failed` 로 떨어지므로 프론트는 그때 에러를 띄우면 된다.
+
+### (fallback) 수동 적용 4단계 — apply_to_slug 미사용 / 리메이크
 
 ```
 1) (선택) 이미지 업로드   POST /api/v1/ai/source-images/        → image id 목록
@@ -24,6 +43,7 @@ POST /api/v1/ai/jobs/
 {
   "concept": "성수동 모임공간 '레이어드' 대여. 시간당 요금, 네이버 예약, 주차 안내.",
   "category": "space-booking",       // ⭐ 명시 권장 (아래 표) — 카테고리 전용 레시피 적용
+  "apply_to_slug": "page-xxxx",      // ⭐ 새 페이지: 0)에서 만든 빈 페이지 slug → 성공 시 자동 적용
   "image_ids": ["<uuid>", "..."],    // 선택: 1단계에서 받은 id (최대 10장)
   "reference_page_slug": ""          // 선택: 디자인 톤 레퍼런스. 비우면 카테고리 기본값 자동
 }
@@ -60,7 +80,10 @@ calling_model → parsing_response → resolving_images → completed). 통상 6
 
 ## 4) 적용 / 롤백
 
-- 적용: `result_json` 을 **그대로** `POST /api/v1/pages/ai/@{slug}/` 에 전달 (기존 블록 전체 교체).
+- **자동 적용 (새 페이지, `apply_to_slug` 전달 시)**: 백엔드가 성공 시 그 페이지에 결과를 적용하므로
+  프론트의 별도 적용 호출이 **불필요**. `succeeded` 면 페이지로 이동만 하면 된다.
+- **수동 적용 (`apply_to_slug` 미사용 / 리메이크)**: `result_json` 을 **그대로**
+  `POST /api/v1/pages/ai/@{slug}/` 에 전달 (기존 블록 전체 교체).
 - 롤백: `POST /api/v1/ai/jobs/{job_id}/rollback/` — 해당 작업의 result_json 으로 복구.
 - 페이지별 작업 이력: `GET /api/v1/ai/pages/{slug}/jobs/`.
 

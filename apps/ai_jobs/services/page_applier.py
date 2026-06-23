@@ -90,7 +90,10 @@ def apply_result_json_to_page(page: Page, result_json: dict) -> Page:
             Block(
                 page=page,
                 type=_block_type(raw),
-                order=raw.get("order") or (i + 1),
+                # 순서는 배열 위치로 결정한다. LLM 이 0-based/중복/누락 order 를 내도
+                # (page_id, order) 유니크 제약을 위반하지 않게 — 예전엔 `raw.order or (i+1)`
+                # 이라 order=0(falsy)이 1 로 바뀌어 다음 블록(order=1)과 충돌했다.
+                order=i + 1,
                 is_enabled=raw.get("is_enabled", True),
                 data=raw.get("data") or {},
                 custom_css=raw.get("custom_css", ""),

@@ -15,6 +15,18 @@ class AiJobCreateSerializer(serializers.Serializer):
         default="",
         help_text="리메이크할 기존 페이지의 slug. 전달 시 해당 페이지의 현재 블록을 참고하여 AI가 리메이크합니다.",
     )
+    apply_to_slug = serializers.SlugField(
+        max_length=120,
+        required=False,
+        allow_blank=True,
+        default="",
+        help_text=(
+            "새 페이지 생성 전용. 프론트가 미리 만들어 둔 빈 페이지의 slug. "
+            "전달하면 작업 성공 시 백엔드가 result_json 을 이 페이지에 **자동 적용**한다 "
+            "(별도 POST /api/v1/pages/ai/@{slug}/ 호출 불필요). "
+            "리메이크(slug 전달) 시에는 무시된다 — 리메이크는 프론트가 롤백 UX와 함께 직접 적용."
+        ),
+    )
     concept = serializers.CharField(
         max_length=2000,
         help_text="페이지 컨셉 설명. 예: '제품 판매 랜딩 페이지', '밴드 프로필 페이지'",

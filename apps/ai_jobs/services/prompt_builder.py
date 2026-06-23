@@ -426,6 +426,8 @@ def build_prompts(
                     include_mood=(design_lead == "recipe"),
                     seed=seed,
                     include_reviews=include_reviews_new,
+                    # 레퍼런스 주도면 카테고리의 cover_bg/hero 지시를 빼고 레퍼런스 레이아웃을 따른다.
+                    include_hero=(design_lead != "template"),
                 )
             ]
     elif (
@@ -613,6 +615,7 @@ def build_prompts(
                     block_floor=target_blocks,
                     seed=seed,
                     include_reviews=include_reviews_remake,
+                    include_hero=(design_lead != "template"),
                 ),
             ]
             variable_parts += _rewrite_lines
@@ -787,9 +790,11 @@ def build_prompts(
     goal_text = concept if concept else "링크인바이오 페이지를 만들어줘."
     if using_reference:
         goal_text = (
-            "위 레퍼런스 페이지가 **디자인의 유일한 기준**이다 — design_settings 색, 카드 스타일, "
-            "폰트, 블록 구성 흐름을 레퍼런스 그대로 따라 하되, 콘텐츠(문구/링크/이미지 키워드)만 "
-            f"아래 목표에 맞게 바꿔라.\n{goal_text}"
+            "위 레퍼런스 페이지가 **디자인의 단일 기준**이다. **블록의 종류와 순서를 레퍼런스와 "
+            "동일하게 유지**하고(추가/삭제는 최소화), 콘텐츠(문구/링크/이미지 키워드)만 아래 목표에 "
+            "맞게 바꿔라. **색·폰트·custom_css 는 시스템이 레퍼런스 그대로 입히므로 새로 만들거나 "
+            "바꾸려 애쓰지 마라**(design_settings 와 custom_css 에 공들이지 말 것).\n"
+            f"{goal_text}"
         )
     variable_parts += [
         "### [목표]",

@@ -235,6 +235,38 @@ def _maybe_visual_refine(job, result_data: dict, input_payload: dict, palette: d
         return result_data
 
 
+def _apply_reference_template(result_data: dict, reference_page_slug: str) -> bool:
+    """레퍼런스가 유효하면 그 design_settings + page.custom_css 를 결과에 **그대로 복제**한다.
+
+    큐레이션 레퍼런스의 '룩'은 손수 만든 page.custom_css(네온/글로우/폰트 @import/스캔라인 등)와
+    design_settings 색에 있다. 이를 디자인킷으로 덮지 않고 통째로 입혀 "레퍼런스처럼" 보이게 한다.
+    LLM 은 블록 구조(종류·순서)를 레퍼런스와 동일하게 유지하라는 지시를 받으므로 custom_css 의
+    nth-child 규칙이 대체로 정렬된다. 적용했으면 True, 레퍼런스가 무효(미존재/비공개/빈 디자인)면 False.
+    """
+    if not isinstance(result_data, dict):
+        return False
+    from apps.pages.models import Page
+
+    ref = Page.objects.filter(
+        slug=reference_page_slug, is_reference=True, is_public=True, is_active=True
+    ).first()
+    if ref is None:
+        return False
+    ref_ds = (ref.data or {}).get("design_settings") or {}
+    ref_css = (ref.data or {}).get("custom_css") or ref.custom_css or ""
+    if not ref_ds and not ref_css:
+        return False
+    result_data.setdefault("data", {})
+    if isinstance(result_data["data"], dict):
+        if ref_ds:
+            result_data["data"]["design_settings"] = dict(ref_ds)
+        result_data["data"]["custom_css"] = ref_css
+    if ref_ds:
+        result_data["design_settings"] = dict(ref_ds)
+    result_data["custom_css"] = ref_css
+    return True
+
+
 # acks_late + reject_on_worker_lost: 워커가 LLM 호출 도중 재시작(warm shutdown)/크래시로
 # 죽어도 태스크를 ack 하지 않아 브로커가 재배달하게 한다. 기본값(acks_late=False)에서는
 # 수신 즉시 ack 되어, 실행 중 워커가 죽으면 좀비(running 고정) 작업이 되고 재시도되지 않는다.
@@ -484,6 +516,10 @@ def run_ai_job(self, job_id: str):
         # 주입. **resolve 이전**에 해야 곧이어 도는 resolve 가 실제 사진으로 채운다. 리메이크
         # full_restyle 도 동일하게 보강하고(기존 레이아웃 존중), style_only 는 구조 보존상 제외.
         is_new_page = not input_payload.get("_baseline_page_meta")
+        # 레퍼런스 페이지를 명시했으면 그 페이지가 디자인의 단일 기준 — 카테고리 hero 전략을
+        # 코드로 강제(cover_bg 덮어쓰기 + 카테고리 고정 이미지)하지 않고 레퍼런스 레이아웃을
+        # 존중한다(force_hero_strategy=False). (레퍼런스 없는 새 페이지는 기존대로 강제.)
+        using_reference = bool((input_payload.get("reference_page_slug") or "").strip())
         from .services.category_profiles import resolve_category
 
         # 카테고리는 한 번만 결정해 이미지 가드·sanitize·디자인킷 CSS 에 공유한다(새/리메이크 공통).
@@ -506,7 +542,7 @@ def run_ai_job(self, job_id: str):
                 result_data,
                 category,
                 input_payload.get("concept", ""),
-                force_hero_strategy=is_new_page,
+                force_hero_strategy=(is_new_page and not using_reference),
             )
 
         # {{user_image:N}} → 업로드 이미지 URL, {{image:키워드}} → Pixabay (image_catalog 있을 때만 전자)
@@ -529,7 +565,7 @@ def run_ai_job(self, job_id: str):
                     category,
                     input_payload.get("concept", ""),
                     salt=1,
-                    force_hero_strategy=is_new_page,
+                    force_hero_strategy=(is_new_page and not using_reference),
                 )
                 result_data = resolve_images(result_data, user_image_urls=user_image_urls)
 
@@ -568,24 +604,33 @@ def run_ai_job(self, job_id: str):
             pin = resolve_design_lead(input_payload) == "concept_image"
             result_data = enforce_design_quality(result_data, palette=palette, pin_palette=pin)
 
-            # ── 4.7 (opt-in) 스크린샷 비평 보정 루프 — 새-페이지 한정 ──
-            # settings.AI_VISUAL_REFINE 가 켜져 있을 때만. 실패는 비치명적(원본 유지).
-            from django.conf import settings as _settings
+            # 레퍼런스 템플릿 복제 — 레퍼런스가 로드되면 그 design_settings + page.custom_css 를
+            # 그대로 입히고(레퍼런스의 수제 CSS·색이 룩의 본체), 비주얼 리파인/디자인킷은 건너뛴다.
+            # 레퍼런스가 무효면 기존 디자인킷 경로로 폴백.
+            ref_slug = (input_payload.get("reference_page_slug") or "").strip()
+            if using_reference and ref_slug and _apply_reference_template(result_data, ref_slug):
+                logger.info("AiJob %s 레퍼런스 템플릿 복제: %s", job.id, ref_slug)
+            else:
+                # ── 4.7 (opt-in) 스크린샷 비평 보정 루프 — 새-페이지 한정 ──
+                # settings.AI_VISUAL_REFINE 가 켜져 있을 때만. 실패는 비치명적(원본 유지).
+                from django.conf import settings as _settings
 
-            if getattr(_settings, "AI_VISUAL_REFINE", False):
-                job.set_stage(AiJob.Stage.RESOLVING_IMAGES, 90, "디자인을 스크린샷으로 점검 중...")
-                result_data = _maybe_visual_refine(job, result_data, input_payload, palette)
-                if pin:
-                    # 비평 패치가 배경/버튼색을 갈아끼웠어도 컨셉 팔레트로 재고정.
-                    result_data = enforce_design_quality(
-                        result_data, palette=palette, pin_palette=True
+                if getattr(_settings, "AI_VISUAL_REFINE", False):
+                    job.set_stage(
+                        AiJob.Stage.RESOLVING_IMAGES, 90, "디자인을 스크린샷으로 점검 중..."
                     )
+                    result_data = _maybe_visual_refine(job, result_data, input_payload, palette)
+                    if pin:
+                        # 비평 패치가 배경/버튼색을 갈아끼웠어도 컨셉 팔레트로 재고정.
+                        result_data = enforce_design_quality(
+                            result_data, palette=palette, pin_palette=True
+                        )
 
-            # 디자인 킷(page custom_css) 주입 — 카드 라운드/그림자/강조/등장 애니메이션 등.
-            # 비주얼 리파인이 custom_css 를 덮을 수 있으므로 **맨 마지막**에 적용.
-            from .services.design_css import enhance_page_css
+                # 디자인 킷(page custom_css) 주입 — 카드 라운드/그림자/강조/등장 애니메이션 등.
+                # 비주얼 리파인이 custom_css 를 덮을 수 있으므로 **맨 마지막**에 적용.
+                from .services.design_css import enhance_page_css
 
-            result_data = enhance_page_css(result_data, category or "generic", seed=design_seed)
+                result_data = enhance_page_css(result_data, category or "generic", seed=design_seed)
         else:
             # 리메이크: 구조/콘텐츠는 style_patcher 가 보존·머지했고, 여기선 **시각 품질만**
             # 새-페이지 수준으로 끌어올린다 — ① WCAG 대비/슬롭색/muddy 보정 ② 컨셉 이미지를
@@ -610,6 +655,26 @@ def run_ai_job(self, job_id: str):
 
         # ── 5. 완료 + 토큰 차감 ──────────────────────
         job.result_json = result_data
+
+        # 새 페이지 생성: 프론트가 연결해 둔 빈 페이지(job.page)에 결과를 즉시 적용한다.
+        # 이렇게 해야 status=succeeded ⟺ 페이지 완성이 보장돼 "성공했는데 빈 페이지" 갭이 사라진다.
+        # (리메이크는 is_new_page=False — 프론트가 롤백 UX와 함께 직접 적용하므로 여기서 건드리지 않음.)
+        if is_new_page and job.page_id:
+            from .services.page_applier import apply_result_json_to_page
+
+            try:
+                apply_result_json_to_page(job.page, result_data)
+            except Exception as apply_exc:  # noqa: BLE001
+                # 적용 검증 실패는 결정적(재시도해도 동일)이라 LLM 재생성 없이 즉시 실패 처리.
+                # 빈 페이지로 "성공" 표시하지 않고 프론트가 에러를 띄우도록 한다.
+                job.status = AiJob.Status.FAILED
+                job.error_message = f"결과 적용 실패: {apply_exc}"[:1000]
+                job.message = "생성한 결과를 페이지에 적용하지 못했습니다."
+                job.finished_at = timezone.now()
+                job.save()
+                logger.exception("AiJob 결과 적용 실패: %s", job_id)
+                return
+
         job.status = AiJob.Status.SUCCEEDED
         job.stage = AiJob.Stage.COMPLETED
         job.progress = 100

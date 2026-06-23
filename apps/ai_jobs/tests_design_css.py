@@ -7,6 +7,7 @@ from .services import category_profiles as CP
 from .services.design_css import (
     _MARKER,
     _resolve_variant,
+    _signature_background_css,
     build_design_css,
     enhance_page_css,
 )
@@ -137,3 +138,43 @@ class TestSeededVariety:
         }
         out = enhance_page_css(r, CP.INVITATION, seed=0)
         assert out["data"]["design_settings"]["fontFamily"] == "Pretendard"
+
+
+class TestSignatureModules:
+    """플레이북 하이브리드: 배경 시그니처(메시/스타필드) + bold 하드섀도.
+
+    검증된 훅(.page-container / [data-block-type])만 쓰고, 플레이북의 미검증 훅
+    (.mt-6.space-y-3 / div:first-of-type h2)은 새지 않는다.
+    """
+
+    def test_signature_helper_light_dark_and_exclusions(self):
+        # 라이트 → 메시 그라데(.page-container 배경) + 콘텐츠 z-index 가드
+        light = _signature_background_css("soft", False, "#7C5CFF", "#F6F3FF", 0)
+        assert ".page-container{ background:radial-gradient" in light
+        assert ".page-container > *{ position:relative; z-index:1; }" in light
+        assert "tf-tw" not in light
+        # 다크 → 스타필드
+        dark = _signature_background_css("clean", True, "#3B82F6", "#0B0F1A", 0)
+        assert "tf-tw" in dark and ".page-container::after" in dark
+        # editorial(미니멀)·outline(카툰)은 제외 → 빈 문자열
+        assert _signature_background_css("editorial", False, "#C9A24B", "#FBF3EC", 0) == ""
+        assert _signature_background_css("outline", False, "#A8552A", "#EBE3D4", 0) == ""
+
+    def test_bold_variant_hard_shadow(self):
+        assert _resolve_variant(CP.GROUPBUY, 0) == "bold"
+        css = build_design_css(accent="#16E07A", background="#EFEFE7", category=CP.GROUPBUY, seed=0)
+        assert "6px 6px 0" in css  # 하드 오프셋 섀도
+        assert "translate(-2px,-2px)" in css  # hover
+
+    def test_no_unverified_playbook_hooks_leak(self):
+        # 다크 랜딩(스타필드 포함)에도 미검증 훅이 새지 않아야 한다.
+        css = build_design_css(accent="#3B82F6", background="#0B0F1A", category=CP.LANDING, seed=0)
+        assert ".mt-6.space-y-3" not in css
+        assert "div:first-of-type h2" not in css
+
+    def test_signature_idempotent_via_enhance(self):
+        r = {"data": {"design_settings": {"buttonColor": "#7C5CFF", "backgroundColor": "#F6F3FF"}}}
+        once = enhance_page_css(r, CP.PROFILE, seed=1)["custom_css"]
+        twice = enhance_page_css(r, CP.PROFILE, seed=1)["custom_css"]
+        assert once == twice
+        assert twice.count(_MARKER) == 1

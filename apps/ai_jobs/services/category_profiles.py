@@ -732,6 +732,7 @@ def build_recipe_prompt(
     block_floor: int | None = None,
     seed: int = 0,
     include_reviews: bool = True,
+    include_hero: bool = True,
 ) -> str:
     """카테고리 레시피를 프롬프트 섹션 문자열로 렌더한다.
 
@@ -740,6 +741,9 @@ def build_recipe_prompt(
             깬다(seed=0 이면 base 무드 + 기본 폰트). 색은 시드가 정하지 않는다 — 가드가 최종.
         include_reviews: False 면 후기(고객 리뷰) 강제 규칙과 섹션을 뺀다. 커머스가 아니거나
             시드 게이트에 안 걸린 작업은 후기를 넣지 않는다(should_include_reviews 참조).
+        include_hero: False 면 프로필 히어로 레이아웃 지시(cover_bg/center 강제)를 뺀다.
+            레퍼런스 페이지 주도(design_lead="template")일 때, 카테고리의 cover_bg 지시가
+            레퍼런스의 실제 레이아웃을 덮어쓰는 것을 막는다. 섹션 청사진은 그대로 유지.
         include_mood: False 면 무드/색 지시를 뺀다 — 컨셉 이미지 팔레트나 레퍼런스
             템플릿이 디자인 주도권을 가질 때, 레시피의 기본 색 취향(크림/베이지 등)이
             그것과 경쟁해 "맨날 비슷한 색감"이 되는 문제를 막는다. 구조(섹션)·카피·
@@ -778,10 +782,9 @@ def build_recipe_prompt(
             "추출 #hex) 또는 레퍼런스 페이지의 색을 그대로 따르라."
         )
     if structural:
-        lines += [
-            f"- 프로필 레이아웃: {hero_line}",
-            "- 꼭 들어가야 할 섹션(위→아래, 컨셉에 맞게 가감):",
-        ]
+        if include_hero:
+            lines.append(f"- 프로필 레이아웃: {hero_line}")
+        lines.append("- 꼭 들어가야 할 섹션(위→아래, 컨셉에 맞게 가감):")
         sections = p["sections"]
         if not include_reviews:
             # 후기를 넣지 않는 작업이면 섹션 청사진에서도 후기 줄을 뺀다.
