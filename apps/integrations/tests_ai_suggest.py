@@ -11,7 +11,7 @@
 LLM(call_llm_messages_with_usage)·task.delay·이미지 다운로드는 모두 patch 한다 (실제 호출 없음).
 """
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from django.utils import timezone
@@ -225,6 +225,70 @@ class TestSampleReplies:
         assert len(set(matched)) == 50
 
 
+# ── 캐러셀 이미지 선택 (_pick_image_url, DB 불필요) ────────────
+
+
+class TestPickImageUrl:
+    """캐러셀이면 마지막 이미지 슬라이드, 단일이면 media_url/thumbnail_url."""
+
+    @staticmethod
+    def _pick(data):
+        from apps.integrations.views import AutoDMCampaignViewSet
+
+        return AutoDMCampaignViewSet._pick_image_url(data)
+
+    def test_carousel_picks_last_image_slide(self):
+        data = {
+            "media_type": "CAROUSEL_ALBUM",
+            "children": {
+                "data": [
+                    {"media_type": "IMAGE", "media_url": "https://cdn/first.jpg"},
+                    {"media_type": "IMAGE", "media_url": "https://cdn/mid.jpg"},
+                    {"media_type": "IMAGE", "media_url": "https://cdn/last.jpg"},
+                ]
+            },
+        }
+        assert self._pick(data) == "https://cdn/last.jpg"
+
+    def test_carousel_skips_trailing_video_to_last_image(self):
+        # 마지막 장이 영상이면 그 앞의 마지막 '이미지' 슬라이드를 쓴다.
+        data = {
+            "media_type": "CAROUSEL_ALBUM",
+            "children": {
+                "data": [
+                    {"media_type": "IMAGE", "media_url": "https://cdn/a.jpg"},
+                    {"media_type": "IMAGE", "media_url": "https://cdn/b.jpg"},
+                    {"media_type": "VIDEO", "media_url": "https://cdn/v.mp4"},
+                ]
+            },
+        }
+        assert self._pick(data) == "https://cdn/b.jpg"
+
+    def test_carousel_all_video_falls_back_to_last_url(self):
+        data = {
+            "media_type": "CAROUSEL_ALBUM",
+            "children": {
+                "data": [
+                    {"media_type": "VIDEO", "media_url": "https://cdn/v1.mp4"},
+                    {"media_type": "VIDEO", "media_url": "https://cdn/v2.mp4"},
+                ]
+            },
+        }
+        assert self._pick(data) == "https://cdn/v2.mp4"
+
+    def test_carousel_no_children_falls_back_to_media_url(self):
+        data = {"media_type": "CAROUSEL_ALBUM", "media_url": "https://cdn/cover.jpg"}
+        assert self._pick(data) == "https://cdn/cover.jpg"
+
+    def test_single_image_uses_media_url(self):
+        data = {"media_type": "IMAGE", "media_url": "https://cdn/single.jpg"}
+        assert self._pick(data) == "https://cdn/single.jpg"
+
+    def test_video_uses_thumbnail_when_no_media_url(self):
+        data = {"media_type": "VIDEO", "thumbnail_url": "https://cdn/thumb.jpg"}
+        assert self._pick(data) == "https://cdn/thumb.jpg"
+
+
 # ── API 엔드포인트 테스트 ──────────────────────────────────────
 
 
@@ -281,6 +345,74 @@ class TestAiSuggestEndpoint:
             )
         assert resp.status_code == 202, resp.content
         mock_get.assert_not_called()
+
+    def test_carousel_overrides_to_last_slide_image(self, ig_connection, settings):
+        """프론트가 캐러셀 첫 장 image_url 을 넘겨도 백엔드가 마지막 슬라이드로 교체한다."""
+        settings.DEBUG = False  # is_mock_mode() False → Graph 조회 경로 활성
+        ws = ig_connection.workspace
+        user = ws.owner
+        client = APIClient()
+        client.force_authenticate(user=user)
+
+        fake_resp = MagicMock()
+        fake_resp.raise_for_status.return_value = None
+        fake_resp.json.return_value = {
+            "media_type": "CAROUSEL_ALBUM",
+            "children": {
+                "data": [
+                    {"media_type": "IMAGE", "media_url": "https://cdn/first.jpg"},
+                    {"media_type": "IMAGE", "media_url": "https://cdn/last.jpg"},
+                ]
+            },
+        }
+        with (
+            patch(_DELAY),
+            patch("apps.integrations.views.requests.get", return_value=fake_resp) as mock_get,
+        ):
+            resp = client.post(
+                _url(ws.id),
+                {
+                    "media_id": "carousel_1",
+                    "caption": "캡션 있음",
+                    "image_url": "https://cdn/first.jpg",  # 프론트가 넘긴 대표(첫) 장
+                    "media_type": "CAROUSEL_ALBUM",
+                },
+                format="json",
+            )
+        assert resp.status_code == 202, resp.content
+        mock_get.assert_called_once()
+        from apps.ai_jobs.models import AiJob
+
+        job = AiJob.objects.get(id=resp.json()["job_id"])
+        assert job.input_payload["image_url"] == "https://cdn/last.jpg"
+
+    def test_non_carousel_does_not_refetch_when_image_supplied(self, ig_connection, settings):
+        """단일 IMAGE 는 프론트 image_url 을 그대로 쓰고 추가 Graph 조회를 안 한다."""
+        settings.DEBUG = False
+        ws = ig_connection.workspace
+        user = ws.owner
+        client = APIClient()
+        client.force_authenticate(user=user)
+        with (
+            patch(_DELAY),
+            patch("apps.integrations.views.requests.get") as mock_get,
+        ):
+            resp = client.post(
+                _url(ws.id),
+                {
+                    "media_id": "single_1",
+                    "caption": "캡션",
+                    "image_url": "https://cdn/single.jpg",
+                    "media_type": "IMAGE",
+                },
+                format="json",
+            )
+        assert resp.status_code == 202, resp.content
+        mock_get.assert_not_called()
+        from apps.ai_jobs.models import AiJob
+
+        job = AiJob.objects.get(id=resp.json()["job_id"])
+        assert job.input_payload["image_url"] == "https://cdn/single.jpg"
 
     def test_400_when_no_context(self, workspace_and_user):
         ws, user = workspace_and_user

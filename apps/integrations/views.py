@@ -2114,6 +2114,17 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
                     "활성 Instagram 연결이 없습니다. caption/image_url 을 직접 전달해주세요."
                 )
             caption, image_url, media_type = self._fetch_media_context(connection, media_id)
+        elif (
+            media_type.upper() == "CAROUSEL_ALBUM"
+            and media_id
+            and not MockInstagramProvider.is_mock_mode()
+        ):
+            # 프론트가 대표(첫) 이미지를 넘겼더라도 캐러셀이면 마지막 슬라이드로 교체 (best-effort).
+            connection = self._resolve_connection_for_suggest(workspace, ig_connection_id)
+            if connection:
+                last_image = self._fetch_carousel_last_image(connection, media_id)
+                if last_image:
+                    image_url = last_image
 
         job = AiJob.objects.create(
             user=request.user,
@@ -2162,7 +2173,11 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         return connection
 
     def _fetch_media_context(self, connection, media_id):
-        """Graph API 로 게시물 caption/image_url/media_type 조회 (get_media_detail 패턴)."""
+        """Graph API 로 게시물 caption/image_url/media_type 조회 (get_media_detail 패턴).
+
+        캐러셀(CAROUSEL_ALBUM)이면 마지막 슬라이드 이미지를 비전 입력으로 쓴다
+        (마케팅 게시물은 보통 마지막 장에 혜택/가격/CTA 가 담김 → _pick_image_url 참고).
+        """
         from rest_framework.exceptions import NotFound
 
         try:
@@ -2170,7 +2185,10 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
             resp = requests.get(
                 url,
                 params={
-                    "fields": "caption,media_type,media_url,thumbnail_url",
+                    "fields": (
+                        "caption,media_type,media_url,thumbnail_url,"
+                        "children{media_url,media_type}"
+                    ),
                     "access_token": connection.access_token,
                 },
                 timeout=10,
@@ -2181,9 +2199,53 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
             raise NotFound(f"게시물 정보를 가져올 수 없습니다: {str(exc)[:200]}") from exc
 
         caption = data.get("caption") or ""
-        image_url = data.get("media_url") or data.get("thumbnail_url") or ""
         media_type = data.get("media_type") or ""
+        image_url = self._pick_image_url(data)
         return caption, image_url, media_type
+
+    @staticmethod
+    def _pick_image_url(media_data: dict) -> str:
+        """게시물 데이터에서 비전에 쓸 이미지 URL 1장을 고른다.
+
+        캐러셀(CAROUSEL_ALBUM)이면 **마지막** 이미지 슬라이드를 우선한다(마케팅 게시물은
+        보통 마지막 장에 혜택/가격/CTA 가 담김). 이미지 슬라이드가 없으면(전부 영상 등)
+        마지막으로 url 이 있는 슬라이드, 그래도 없으면 게시물 대표 media_url/thumbnail_url
+        로 폴백한다. 단일 게시물은 media_url(없으면 thumbnail_url).
+        """
+        if (media_data.get("media_type") or "").upper() == "CAROUSEL_ALBUM":
+            children = ((media_data.get("children") or {}).get("data")) or []
+            # 마지막 → 처음 순으로 이미지 슬라이드 탐색 (마지막 사진 우선)
+            for child in reversed(children):
+                if (child.get("media_type") or "").upper() == "IMAGE" and child.get("media_url"):
+                    return child["media_url"]
+            for child in reversed(children):
+                if child.get("media_url"):
+                    return child["media_url"]
+        return media_data.get("media_url") or media_data.get("thumbnail_url") or ""
+
+    def _fetch_carousel_last_image(self, connection, media_id) -> str:
+        """캐러셀 게시물의 마지막 이미지 슬라이드 URL (best-effort, 실패 시 빈 문자열).
+
+        프론트가 대표(첫) 이미지를 넘긴 경우에도 마지막 슬라이드로 교체하기 위해 사용한다.
+        Graph 호출이 실패해도 캠페인 초안 생성은 계속돼야 하므로 절대 raise 하지 않는다.
+        """
+        try:
+            url = f"{InstagramOAuthService.GRAPH_API_BASE}/{media_id}"
+            resp = requests.get(
+                url,
+                params={
+                    "fields": "media_type,children{media_url,media_type}",
+                    "access_token": connection.access_token,
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            return self._pick_image_url(resp.json())
+        except requests.exceptions.RequestException as exc:
+            logger.warning(
+                "ai_suggest: 캐러셀 마지막 이미지 조회 실패 → 기존 image_url 유지. %s", exc
+            )
+            return ""
 
     @extend_schema(
         summary="캠페인 목록 조회 (필터·정렬)",
