@@ -13,7 +13,11 @@ WORKDIR /app
 # 시스템 의존성 설치
 # Playwright Chromium 의존성: libnss3, libnspr4, libatk*, libcups2, libdrm2, libxkbcommon0,
 # libxcomposite1, libxdamage1, libxfixes3, libxrandr2, libgbm1, libpango-1.0-0, libcairo2,
-# libasound2, fonts-noto-cjk (한국어 페이지 렌더링용)
+# libasound2.
+# 폰트(스냅샷 캡쳐 렌더링용 — slim 이미지엔 폰트가 없어 글리프가 □/빈칸으로 나옴):
+#   - fonts-noto-cjk         : 한국어 본문
+#   - fonts-noto-color-emoji : 이모지(🎙️ 등) — 없으면 두부(□)로 렌더됨
+#   - fonts-noto-core        : 라틴/기호 등 폭넓은 폴백
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     postgresql-client \
@@ -34,6 +38,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcairo2 \
     libasound2 \
     fonts-noto-cjk \
+    fonts-noto-color-emoji \
+    fonts-noto-core \
     && rm -rf /var/lib/apt/lists/*
 
 # Python 의존성 설치
