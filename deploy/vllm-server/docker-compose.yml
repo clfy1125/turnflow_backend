@@ -47,8 +47,19 @@ services:
       - default
 
   litellm:
+    # ⚠️ main-stable 은 '움직이는 태그' — CPU-spin 회귀 빌드로 자동 갱신될 수 있음(62코어 폭주 사례).
+    #    정상 동작하던 릴리스로 핀 권장: ghcr.io/berriai/litellm:vX.Y.Z-stable
+    #    (확인: docker images ghcr.io/berriai/litellm / github.com/BerriAI/litellm/releases)
     image: ghcr.io/berriai/litellm:main-stable
     container_name: litellm-proxy
+    restart: unless-stopped
+    # CPU/메모리 상한 — 버그난 빌드가 호스트 전체를 잡아먹어 turnflow 스택을 굶기는 것 방지.
+    # (docker compose v2 는 up 시 deploy.resources.limits 를 적용한다)
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 8g
     depends_on:
       - vllm
       - db
