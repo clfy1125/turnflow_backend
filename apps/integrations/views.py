@@ -3725,8 +3725,6 @@ def _mark_log_read_by_mid(mid: str, logger) -> None:
     },
     tags=["Integrations"],
 )
-@api_view(["GET", "POST"])
-@permission_classes([AllowAny])
 def _verify_webhook_signature(request, logger) -> bool:
     """X-Hub-Signature-256 (앱 시크릿 키 HMAC-SHA256, 원본 바디 기준) 검증 (P3).
 
@@ -3752,6 +3750,8 @@ def _verify_webhook_signature(request, logger) -> bool:
     return _hmac.compare_digest(received, expected)
 
 
+@api_view(["GET", "POST"])
+@permission_classes([AllowAny])
 def instagram_webhook(request):
     """
     Instagram Webhook 엔드포인트
