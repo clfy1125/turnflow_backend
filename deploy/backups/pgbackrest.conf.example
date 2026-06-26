@@ -5,10 +5,12 @@
 # RPO ≈ seconds–minutes (archive_timeout=60 ships a partial segment each minute).
 # RTO ≈ tens of minutes (restore last base backup + replay WAL to target time/LSN).
 #
-# pg1-path must match the postgres data dir. With the postgres:16-alpine container
-# and named volume turnflow_instagram_postgres, the host path is typically:
-#   /var/lib/docker/volumes/turnflow_instagram_postgres/_data
-# Run pgBackRest on the HOST against that path (the simplest single-box setup).
+# pgBackRest runs INSIDE the db container (image = deploy/backups/Dockerfile.db), because
+# Postgres executes archive_command as its own subprocess — so the binary must be there,
+# and a host-built (glibc) binary can't run in this musl/alpine image anyway.
+# Install this file at /etc/pgbackrest/pgbackrest.conf via the compose bind-mount
+# (./deploy/backups/pgbackrest.conf -> /etc/pgbackrest/pgbackrest.conf:ro).
+# Drive backup/check with:  docker compose -f docker-compose.prod.yml exec -u postgres db pgbackrest ...
 
 [global]
 repo1-type=s3
@@ -32,6 +34,8 @@ log-level-console=info
 log-level-file=detail
 
 [turnflow]
-pg1-path=/var/lib/docker/volumes/turnflow_instagram_postgres/_data
+# CONTAINER data dir (pgBackRest runs inside the db container). Connects to local PG
+# over the unix socket as the postgres user (run exec with `-u postgres`).
+pg1-path=/var/lib/postgresql/data
 pg1-port=5432
-# pg1-socket-path or pg1-host/pg1-user as needed if running pgBackRest outside the container.
+pg1-socket-path=/var/run/postgresql

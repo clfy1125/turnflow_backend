@@ -21,7 +21,12 @@ x-app-env: &app_env
 
 services:
   db:
-    image: postgres:16-alpine
+    # stock postgres:16-alpine + pgBackRest baked in (DR / WAL PITR). See deploy/backups/Dockerfile.db.
+    # The `image:` tag caches the build so it only rebuilds when the Dockerfile/apk layer changes.
+    build:
+      context: ./deploy/backups
+      dockerfile: Dockerfile.db
+    image: turnflow_instagram_db_pgbackrest:16
     container_name: turnflow_instagram_db
     restart: unless-stopped
     # PG tuning + reduced max_connections (PgBouncer multiplexes, so 300 is ample).
@@ -45,6 +50,10 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD}
     volumes:
       - turnflow_instagram_postgres:/var/lib/postgresql/data
+      # pgBackRest config (gitignored, filled on server from pgbackrest.conf.example) + log dir.
+      # The conf file MUST exist on the host before `up`, else Docker creates a dir there.
+      - ./deploy/backups/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+      - turnflow_instagram_pgbackrest_log:/var/log/pgbackrest
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres}"]
       interval: 10s
@@ -313,6 +322,7 @@ volumes:
   turnflow_instagram_static:
   turnflow_instagram_media:
   turnflow_instagram_logs:
+  turnflow_instagram_pgbackrest_log:
 
 networks:
   turnflow_instagram_net:

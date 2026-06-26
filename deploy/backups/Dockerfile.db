@@ -1,0 +1,16 @@
+# DR / GATE-0 — db image = stock postgres:16-alpine + pgBackRest.
+#
+# WHY in the container (not the host): Postgres runs `archive_command` as one of its
+# own subprocesses, so `pgbackrest archive-push` must exist INSIDE the db container.
+# A host-built pgbackrest binary can't be reused here either — the host is glibc, this
+# image is musl(alpine) — so the binary lives in the image. Backups/restore/check are
+# then driven with `docker compose exec -u postgres db pgbackrest ...` against the same
+# install, keeping one coherent setup.
+#
+# Build:   docker compose -f docker-compose.prod.yml build db
+# Layer is tiny (apk add) so rebuilds are fast and rebuild only on apk cache change.
+FROM postgres:16-alpine
+
+RUN apk add --no-cache pgbackrest \
+    && mkdir -p /var/log/pgbackrest /var/lib/pgbackrest /tmp/pgbackrest \
+    && chown -R postgres:postgres /var/log/pgbackrest /var/lib/pgbackrest /tmp/pgbackrest
