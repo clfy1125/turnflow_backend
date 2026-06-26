@@ -109,6 +109,8 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
     # 예약 발송: 창 기준 UX 상태 (always_on / scheduled / running / ended)
     schedule_state = serializers.SerializerMethodField()
     is_runnable_now = serializers.SerializerMethodField()
+    # 웹훅 누락 시 자동 보정 가능 여부 + 위험 안내 (프론트 고지용)
+    miss_recovery = serializers.SerializerMethodField()
 
     class Meta:
         model = AutoDMCampaign
@@ -158,6 +160,7 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
             "scheduled_end_at",
             "schedule_state",
             "is_runnable_now",
+            "miss_recovery",
             # timestamps
             "created_at",
             "updated_at",
@@ -174,6 +177,7 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
             "can_send",
             "schedule_state",
             "is_runnable_now",
+            "miss_recovery",
             "created_at",
             "updated_at",
             "started_at",
@@ -191,6 +195,30 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
 
     def get_is_runnable_now(self, obj) -> bool:
         return obj.is_runnable_now()
+
+    def get_miss_recovery(self, obj) -> dict:
+        """웹훅 누락 시 자동 보정(poll_missed_comments) 가능 여부 + 위험 안내.
+
+        specific_media / next_media(attach 후 specific 로 전환)만 시간당 폴링으로 누락이 보정된다.
+        any_media(폴링 비용)·story_reply(메시지 기반이라 재조회할 댓글 소스가 없음)는 보정망이 없어,
+        인스타 웹훅이 누락되면 해당 DM 이 발송되지 않을 수 있다 → 프론트에서 사용자에게 고지.
+        """
+        safe = obj.trigger_type in (
+            AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
+            AutoDMCampaign.TriggerType.NEXT_MEDIA,
+        )
+        return {
+            "auto_recovery_supported": safe,
+            "warning": (
+                None
+                if safe
+                else (
+                    "이 트리거 유형(모든 게시물/스토리 답장)은 인스타그램 웹훅이 누락되면 "
+                    "자동 보정·재발송이 되지 않습니다. 누락 없는 발송이 중요하면 "
+                    "'특정 게시물'(specific_media) 트리거를 권장합니다."
+                )
+            ),
+        }
 
     def validate(self, attrs):
         """예약 창 정합성 검증 (PATCH/PUT 경로 — 이 시리얼라이저가 update 에 쓰임).

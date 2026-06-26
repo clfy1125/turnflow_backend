@@ -4,10 +4,15 @@ API v1 URL configuration
 
 from django.urls import include, path
 
-from apps.core.views import healthz
+from apps.core.views import healthz, live, ready
+from apps.core.views_internal import scheduler_tick
 
 urlpatterns = [
     path("healthz", healthz, name="healthz"),
+    path("healthz/live", live, name="healthz-live"),
+    path("healthz/ready", ready, name="healthz-ready"),
+    # DR 내부 컨트롤플레인 — 외부 Cron 전용(공유시크릿+IP allowlist)
+    path("internal/scheduler/tick", scheduler_tick, name="scheduler-tick"),
     path("auth/", include("apps.authentication.urls")),
     path("", include("apps.workspace.urls")),
     path("", include("apps.billing.urls")),

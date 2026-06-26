@@ -2,10 +2,51 @@
 Custom exception handlers for standardized API responses
 """
 
-from rest_framework.views import exception_handler
-from rest_framework.response import Response
-from rest_framework import status
 from django.core.exceptions import ValidationError as DjangoValidationError
+from rest_framework import status
+from rest_framework.exceptions import APIException
+from rest_framework.response import Response
+from rest_framework.views import exception_handler
+
+
+class DuplicateActiveCampaignError(APIException):
+    """같은 Instagram 게시물(media_id)에 이미 활성(active) 캠페인이 있을 때 발생.
+
+    HTTP 409 Conflict 로 응답한다. ``custom_exception_handler`` 가 다른 APIException 과
+    동일하게 표준 에러 포맷으로 감싸므로, 프론트엔드는 다음 두 가지로 분기한다:
+
+        - HTTP status == 409
+        - ``error.details.code == "duplicate_active_campaign"``
+
+    ``for_conflict()`` 로 생성하면 충돌 캠페인의 id/name 이 ``error.details`` 에 함께 담겨,
+    프론트가 "이미 이 게시물엔 'XXX' 캠페인이 활성 상태입니다" 같은 안내와 함께
+    해당 캠페인으로 이동/일시정지 CTA 를 제공할 수 있다.
+    """
+
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = "이 게시물에는 이미 활성 상태인 캠페인이 있습니다."
+    default_code = "duplicate_active_campaign"
+
+    @classmethod
+    def for_conflict(cls, conflict, media_id: str) -> "DuplicateActiveCampaignError":
+        """충돌 캠페인 정보를 담은 예외 인스턴스를 만든다.
+
+        detail 을 dict 로 주면 표준 핸들러가 ``error.details`` 로 그대로 전달하고,
+        dict 의 첫 키(``message``)가 ``error.message`` 로 노출된다.
+        """
+        return cls(
+            {
+                "message": (
+                    f"이 게시물에는 이미 활성 상태인 캠페인 '{conflict.name}' 이(가) 있습니다. "
+                    "한 게시물에는 활성 캠페인을 하나만 둘 수 있습니다. "
+                    "기존 캠페인을 일시정지하거나 종료한 뒤 다시 시도하세요."
+                ),
+                "code": cls.default_code,
+                "conflict_campaign_id": str(conflict.id),
+                "conflict_campaign_name": conflict.name,
+                "media_id": media_id,
+            }
+        )
 
 
 class PlanLimitExceededError(Exception):

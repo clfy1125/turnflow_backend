@@ -19,6 +19,7 @@ from apps.admin_api.views.autodm import (
     AdminCampaignListView,
     AdminCampaignPauseView,
     AdminCampaignResumeView,
+    AdminDMBacklogView,
     AdminDMLogDetailView,
     AdminDMLogListView,
     AdminDMLogRetryView,
@@ -128,5 +129,6 @@ urlpatterns = [
         AdminDMVerificationStatsView.as_view(),
         name="dm-verification-stats",
     ),
+    path("auto-dm/backlog/", AdminDMBacklogView.as_view(), name="dm-backlog"),
     path("ig-connections/", AdminIGConnectionListView.as_view(), name="ig-connection-list"),
 ]

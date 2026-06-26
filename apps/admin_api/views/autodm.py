@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 from datetime import timedelta
 
+from django.db.models import Count, Min
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
@@ -651,13 +652,15 @@ class AdminDMLogRetryView(APIView):
 
         log = get_object_or_404(SentDMLog, pk=pk)
 
-        retriable_statuses = {
+        # transient(즉시 재큐) + revivable(제자리 되살림: failed_token/skipped) 모두 허용.
+        transient_statuses = {
             SentDMLog.Status.RATE_LIMITED,
             SentDMLog.Status.QUEUED,
             SentDMLog.Status.SUBMITTING,
             # legacy 호환
             SentDMLog.Status.FAILED_API,
         }
+        retriable_statuses = transient_statuses | set(SentDMLog.REVIVABLE_STATUSES)
         if log.status not in retriable_statuses:
             return Response(
                 {
@@ -668,10 +671,9 @@ class AdminDMLogRetryView(APIView):
                         "details": {
                             "allowed": list(retriable_statuses),
                             "hint": (
-                                "failed_token: 재연동 필요, "
-                                "failed_window: 댓글이 24시간 윈도우 내에 있어야 함, "
+                                "failed_window: 댓글이 24시간/7일 윈도우 내에 있어야 함, "
                                 "failed_param: 댓글이 7일 초과되었을 가능성, "
-                                "failed_no_trace: 자가 점검 체크리스트 확인 필요"
+                                "failed_no_trace: 이미 접수된 건(중복 방지 위해 재시도 불가)"
                             ),
                         },
                     },
@@ -680,12 +682,29 @@ class AdminDMLogRetryView(APIView):
             )
 
         before = log.status
-        log.status = SentDMLog.Status.QUEUED
-        log.retry_count += 1
-        log.next_retry_at = None
-        log.save(update_fields=["status", "retry_count", "next_retry_at"])
-
-        send_dm_task.delay(str(log.id))
+        if log.status in SentDMLog.REVIVABLE_STATUSES:
+            # failed_token/skipped → 제자리 되살림 (같은 row·같은 key). 윈도우 밖이면 거부.
+            revived = log.revive(reason="admin_retry")
+            if not revived:
+                return Response(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": 400,
+                            "message": (
+                                f"상태 {log.status} 는 메시징 윈도우가 만료되어 되살릴 수 없습니다."
+                            ),
+                            "details": {"hint": "comment 7일 / user_id 24h 윈도우 경과"},
+                        },
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        else:
+            log.status = SentDMLog.Status.QUEUED
+            log.retry_count += 1
+            log.next_retry_at = None
+            log.save(update_fields=["status", "retry_count", "next_retry_at"])
+            send_dm_task.delay(str(log.id))
 
         log_admin_action(
             request=request,
@@ -1115,3 +1134,127 @@ class AdminIGConnectionListView(generics.ListAPIView):
     )
     def get(self, request, *args, **kwargs):
         return super().get(request, *args, **kwargs)
+
+
+# ===== 백로그/처리량 모니터링 (P7) =====
+
+
+class AdminDMBacklogView(APIView):
+    """DM 발송 백로그·처리량 모니터링 (cross-workspace).
+
+    유입(inflow) > 처리량(throughput)으로 QUEUED 가 쌓이다 메시징 윈도우(7d/24h) 만료로
+    손실되는 'E1' 위험을 가시화한다.
+    """
+
+    permission_classes = [IsAdminUser]
+
+    @extend_schema(
+        tags=[TAG],
+        summary="[관리자] DM 백로그/처리량",
+        description="""
+## 개요
+QUEUED(대기) 적체 수, 가장 오래된 대기 건의 나이, 메시징 윈도우 만료 임박 건수,
+최근 1시간 처리량(throughput)·유입(inflow), 적체 상위 계정을 집계합니다.
+
+## 사용 시나리오
+- 바이럴/저플랜 계정에서 발송 대기가 쌓여 댓글 7일 / user_id 24시간 윈도우 만료로
+  누락(FAILED_WINDOW)되기 전에 운영자가 인지.
+
+## 인증
+- `Authorization: Bearer <staff_access_token>` (is_staff=True)
+
+## 비즈니스 로직
+- `window_risk_count`: QUEUED 중 만료까지 `risk_hours`(기본 6h) 이내인 건수(손실 임박).
+- `per_account`: QUEUED 적체 상위 20개 계정(대기 수 + 최오래 대기 나이).
+        """,
+        parameters=[
+            OpenApiParameter(
+                "risk_hours",
+                int,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="윈도우 만료 임박 판정 시간(기본 6).",
+            ),
+        ],
+        responses={
+            200: OpenApiResponse(description="백로그 요약"),
+            401: OpenApiResponse(description="인증 누락/만료"),
+            403: OpenApiResponse(description="관리자 권한 없음"),
+        },
+        examples=[
+            OpenApiExample(
+                "백로그 응답 예시",
+                value={
+                    "total_queued": 320,
+                    "oldest_queued_age_seconds": 5400,
+                    "window_risk_count": 4,
+                    "risk_hours": 6,
+                    "sent_last_hour": 690,
+                    "inflow_last_hour": 920,
+                    "per_account": [
+                        {
+                            "ig_connection_id": "1a2b3c4d-...",
+                            "ig_username": "my_brand",
+                            "queued": 210,
+                            "oldest_age_seconds": 5400,
+                        }
+                    ],
+                },
+                response_only=True,
+            )
+        ],
+    )
+    def get(self, request):
+        now = timezone.now()
+        try:
+            risk_hours = int(request.query_params.get("risk_hours", 6))
+        except (TypeError, ValueError):
+            risk_hours = 6
+
+        queued = SentDMLog.objects.filter(status=SentDMLog.Status.QUEUED)
+        total_queued = queued.count()
+        oldest_created = queued.order_by("created_at").values_list("created_at", flat=True).first()
+        oldest_age_seconds = int((now - oldest_created).total_seconds()) if oldest_created else 0
+
+        # 윈도우 임박 — QUEUED 를 created_at 순으로 스캔(상한 2000). comment 7d / user_id 24h.
+        risk_cut = timedelta(hours=risk_hours)
+        window_risk = 0
+        for cid, created in queued.order_by("created_at").values_list("comment_id", "created_at")[
+            :2000
+        ]:
+            window = timedelta(days=7) if cid else timedelta(hours=24)
+            if (created + window) - now <= risk_cut:
+                window_risk += 1
+
+        sent_last_hour = SentDMLog.objects.filter(accepted_at__gte=now - timedelta(hours=1)).count()
+        inflow_last_hour = SentDMLog.objects.filter(
+            created_at__gte=now - timedelta(hours=1)
+        ).count()
+
+        per_account = []
+        for row in (
+            queued.values("campaign__ig_connection_id", "campaign__ig_connection__username")
+            .annotate(queued=Count("id"), oldest=Min("created_at"))
+            .order_by("-queued")[:20]
+        ):
+            oldest = row.get("oldest")
+            per_account.append(
+                {
+                    "ig_connection_id": str(row.get("campaign__ig_connection_id")),
+                    "ig_username": row.get("campaign__ig_connection__username"),
+                    "queued": row.get("queued"),
+                    "oldest_age_seconds": int((now - oldest).total_seconds()) if oldest else 0,
+                }
+            )
+
+        return Response(
+            {
+                "total_queued": total_queued,
+                "oldest_queued_age_seconds": oldest_age_seconds,
+                "window_risk_count": window_risk,
+                "risk_hours": risk_hours,
+                "sent_last_hour": sent_last_hour,
+                "inflow_last_hour": inflow_last_hour,
+                "per_account": per_account,
+            }
+        )

@@ -11,11 +11,12 @@ apps/pages/services/external_importers/builder.py
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any
 
 from django.utils import timezone
 
 from apps.pages.models import Block, Page, _generate_unique_slug
+from apps.pages.services.css_remap import remap_block_ids_in_css
 from apps.pages.validators import validate_block_data
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,7 @@ def build_page_from_body(
 
     raw_blocks = body.get("blocks") or []
     new_blocks: list[Block] = []
+    source_ids: list[Any] = []  # new_blocks 와 1:1 — 외부 소스의 블록 id (data-block-id remap 용)
     for i, b in enumerate(raw_blocks):
         btype = b.get("type")
         bdata = b.get("data") or {}
@@ -77,7 +79,11 @@ def build_page_from_body(
             # 외부 임포트는 best-effort — 한 블록이 우리 validator 에 걸려도 전체 실패 X
             logger.info(
                 "external_import: skip invalid block source=%s slug=%s idx=%d type=%s err=%s",
-                source, source_slug, i, btype, e,
+                source,
+                source_slug,
+                i,
+                btype,
+                e,
             )
             continue
         new_blocks.append(
@@ -90,14 +96,32 @@ def build_page_from_body(
                 custom_css=b.get("custom_css", ""),
             )
         )
+        source_ids.append(b.get("id"))
 
     if new_blocks:
-        Block.objects.bulk_create(new_blocks)
+        created = Block.objects.bulk_create(new_blocks)
+        # 외부 페이지 custom_css 가 data-block-id 로 블록을 타게팅하면(우리 에디터/렌더러
+        # 규약), 소스 블록 id → 새 PK 로 치환해 clone 경로와 동일하게 보장한다. 현재
+        # 컨버터들은 data-block-id css 를 만들지 않아 대개 no-op 이지만, 향후 컨버터나
+        # 우리 규약을 따르는 외부 body 를 대비한 방어선이다.
+        old_to_new: dict[int, int] = {}
+        for sid, blk in zip(source_ids, created, strict=False):
+            if sid is None:
+                continue
+            try:
+                old_to_new[int(sid)] = blk.id
+            except (TypeError, ValueError):
+                continue  # 숫자가 아닌 소스 id 는 data-block-id 와 매칭될 수 없음
+        if old_to_new and page.custom_css:
+            remapped = remap_block_ids_in_css(page.custom_css, old_to_new)
+            if remapped != page.custom_css:
+                page.custom_css = remapped
+                page.save(update_fields=["custom_css", "updated_at"])
 
     return page, new_blocks, meta
 
 
-def find_existing_import(user, source_url: str) -> Optional[Page]:
+def find_existing_import(user, source_url: str) -> Page | None:
     """같은 사용자가 같은 ``source_url`` 로 이미 임포트한 페이지가 있으면 가장 최신 1건 반환.
 
     재임포트 감지용. 호출 측은 ``force=true`` 가 아닐 때 409 Conflict 응답을 만든다.

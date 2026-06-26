@@ -16,7 +16,9 @@ import logging
 from datetime import timedelta
 
 from celery import shared_task
+from django.conf import settings
 from django.db import IntegrityError, transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from .dm_exceptions import DMSendError, DMTransientError, exception_to_classification
@@ -24,6 +26,7 @@ from .models import (
     AutoDMCampaign,
     EventInbox,
     IGAccountConnection,
+    SeenComment,
     SentDMLog,
     SpamCommentLog,
     SpamFilterConfig,
@@ -33,10 +36,193 @@ from .services import (
     InstagramCommentService,
     InstagramMediaService,
     InstagramMessagingService,
+    InstagramOAuthService,
     SpamDetectionService,
 )
 
+# ===== 댓글 매칭 / 누락 보정 장부 공용 헬퍼 =====
+
+
+def _active_campaigns_for_account(ig_user_id: str, now=None):
+    """계정(IG user id)의 활성·예약창 내 캠페인 후보 queryset.
+
+    웹훅 처리와 누락 보정 폴링이 동일한 후보 선정 규칙을 공유하도록 단일화.
+    """
+    qs = (
+        AutoDMCampaign.objects.filter(status=AutoDMCampaign.Status.ACTIVE)
+        .filter(AutoDMCampaign.schedule_window_q(now))
+        .select_related("ig_connection", "ig_connection__workspace")
+    )
+    if ig_user_id:
+        qs = qs.filter(ig_connection__external_account_id=ig_user_id)
+    return qs
+
+
+def _matched_campaigns_for_comment(*, ig_user_id, media_id, comment_text, now=None):
+    """이 댓글에 트리거되는(매체+키워드 매칭) 활성 캠페인 목록.
+
+    웹훅 경로의 매칭 규칙과 동일 — 누락 보정 폴링이 재사용한다.
+    next_media webhook-attach 같은 웹훅 전용 부수효과는 포함하지 않는다.
+    """
+    return [
+        c
+        for c in _active_campaigns_for_account(ig_user_id, now)
+        if c.matches_media(media_id) and c.matches_keyword(comment_text)
+    ]
+
+
+def _record_seen_comment(
+    *, ig_connection_id, comment_id: str, media_id: str, source: str, triggered: bool = False
+) -> bool:
+    """댓글 관측 장부(SeenComment)에 멱등 기록. 반환값은 신규 생성 여부(True=처음 봄).
+
+    폴링은 반환값(False=이미 봄=앵커)으로 페이지네이션 종료를 판단한다.
+    웹훅 경로는 반환값을 무시하고 호출부에서 예외를 삼켜 DM 흐름을 막지 않는다.
+    """
+    ttl_days = getattr(settings, "MISSED_COMMENT_LEDGER_TTL_DAYS", 10)
+    _, created = SeenComment.objects.get_or_create(
+        ig_connection_id=ig_connection_id,
+        comment_id=comment_id,
+        defaults={
+            "media_id": media_id or "",
+            "source": source,
+            "triggered": triggered,
+            "expires_at": timezone.now() + timedelta(days=ttl_days),
+        },
+    )
+    return created
+
+
 logger = logging.getLogger(__name__)
+
+# P4: Action Block(정책 위반 일시 차단) 신호로 보는 Meta 에러 코드.
+# 368 = "temporarily blocked for policies violations". 감지 시 계정 쿨다운(에스컬레이팅).
+_ACTION_BLOCK_CODES = {368}
+
+
+# ===== 발송 속도 제어 / defer 헬퍼 (item 1·2) =====
+
+
+def _messaging_window(log) -> timedelta:
+    """이 로그가 발송 가능한 메시징 윈도우.
+
+    comment Private Reply 는 7일, user_id DM(story/reward) 는 24h.
+    rate-limit/transient 로 계속 defer 되더라도 이 윈도우가 지나면 graceful 종결한다.
+    """
+    return timedelta(days=7) if log.comment_id else timedelta(hours=24)
+
+
+def _resolve_plan_name(campaign) -> str:
+    """캠페인 소유 워크스페이스의 요금제 이름(free/starter/pro/enterprise). 실패 시 free."""
+    try:
+        from apps.billing.subscription_utils import get_user_plan
+
+        owner = campaign.ig_connection.workspace.owner
+        return (get_user_plan(owner).name or "free").lower()
+    except Exception:  # noqa: BLE001 - 요금제 조회 실패는 보수적으로 free 취급
+        return "free"
+
+
+def _rate_defer(log, campaign, ig_conn):
+    """발송 직전 속도 제어. defer 해야 하면 (seconds, reason), 보내도 되면 None.
+
+    - per-campaign 시간당 throttle(can_send_more): rolling 1h → 짧게 재평가.
+    - per-IG-account Meta 안전속도 거버너(rate_governor): 750/hr Private Reply + 분당 버스트.
+      초과 시 다음 윈도우(시각 경계)까지 defer → requeue 워커가 created_at 순으로 순차 재투입.
+    드랍/실패가 아니라 항상 '지연'이다.
+    """
+    # ★ P4: Action Block 쿨다운 중이면 그 계정 모든 발송을 defer (Meta 로 보내지 않음 → 차단 연장 방지).
+    from .rate_governor import action_block_cooldown_remaining
+
+    ab_remaining = action_block_cooldown_remaining(str(ig_conn.external_account_id))
+    if ab_remaining > 0:
+        return (ab_remaining, "action_block_cooldown")
+
+    if not campaign.can_send_more():
+        # rolling 1h window — 슬롯이 비는 정확한 시각 계산은 비용 대비 이득이 적어
+        # 5분 후 재평가(요구사항: 초과분은 드랍하지 않고 나중에 발송).
+        return (300, "campaign_hourly_cap")
+
+    if getattr(settings, "DM_GOVERNOR_ENABLED", True):
+        from .rate_governor import check as _rate_check
+
+        decision = _rate_check(
+            ig_account_id=str(ig_conn.external_account_id),
+            plan=_resolve_plan_name(campaign),
+        )
+        if not decision.allowed:
+            # retry_after = 다음 시간/분 윈도우까지 초. 최소 30초 보장.
+            return (max(int(decision.retry_after), 30), f"rate_governed:{decision.reason}")
+
+    return None
+
+
+def _defer_or_fail(log, campaign, ig_conn, exc) -> dict:
+    """발송 예외를 분류해 defer(재시도 대기) 또는 종결 처리하고 결과 dict 반환.
+
+    - retriable(rate-limit/transient): **횟수 상한으로 죽이지 않고** QUEUED+next_retry_at 로 defer.
+      → requeue_deferred_dms 워커가 재투입. 메시징 윈도우 만료(graceful 종결)는
+        send_dm_task 진입부의 age 가드가 단일 지점에서 처리한다.
+    - non-retriable(token/param/window/551·기타4xx): 즉시 종결.
+      no_trace(551·기타4xx)는 '실패'가 아니라 '미확인' → increment_unconfirmed.
+    parent_log 가 있는 child(reward/retry)는 통계 카운트에서 제외(opening/standalone 만).
+    """
+    cls = exception_to_classification(exc)
+    log.retry_count = (log.retry_count or 0) + 1
+
+    # ★ P4: Action Block(code 368 등) 감지 → 그 계정 발송을 에스컬레이팅 쿨다운으로 일시정지.
+    # 368 은 retriable 로 분류돼 아래에서 defer 되지만, 추가로 계정 쿨다운을 걸어 _rate_defer 가
+    # 그 계정의 모든 발송을 쿨다운 만료까지 Meta 로 보내지 않게 한다(차단 연장 방지·자동 재개).
+    if getattr(exc, "code", None) in _ACTION_BLOCK_CODES:
+        from .rate_governor import trip_action_block
+
+        cooldown = trip_action_block(str(ig_conn.external_account_id))
+        if cooldown > 0:  # 새 트립일 때만(중복 트립 무시) 로그·알림
+            log.append_verification_log(
+                {
+                    "path": "dm_send",
+                    "result": "action_block",
+                    "code": exc.code,
+                    "cooldown_s": cooldown,
+                }
+            )
+            try:
+                from apps.core.telegram import send_telegram_notification
+
+                hrs = round(cooldown / 3600, 1)
+                send_telegram_notification(
+                    f"🚫 *DM Action Block 감지* — @{ig_conn.username} "
+                    f"(code={exc.code})\n발송 {hrs}h 쿨다운 후 자동 재개. campaign=`{campaign.id}`"
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("action_block telegram 알림 실패 (non-fatal)")
+
+    if cls.retriable:
+        exp = min(log.retry_count, 10)
+        backoff = min(60 * (2**exp), 3600)  # 상한 1h (쿼터는 시각경계로 풀림)
+        log.next_retry_at = timezone.now() + timedelta(seconds=backoff)
+        log.status = SentDMLog.Status.QUEUED
+        log.save(update_fields=["retry_count", "next_retry_at", "status"])
+        return {"status": "deferred", "reason": cls.reason, "retry_count": log.retry_count}
+
+    # non-retriable → 종결
+    log.mark_failed(
+        status=cls.log_status,
+        error_message=str(exc),
+        error_code=str(exc.code) if exc.code is not None else "",
+        error_subcode=str(exc.subcode) if exc.subcode is not None else "",
+        api_response=exc.api_response,
+    )
+    if log.parent_log_id is None:
+        if cls.log_status == SentDMLog.Status.FAILED_NO_TRACE:
+            campaign.increment_unconfirmed()
+        else:
+            campaign.increment_failed()
+
+    if cls.log_status == SentDMLog.Status.FAILED_TOKEN:
+        ig_conn.mark_as_error(f"DM 발송 중 토큰/세션/권한 오류: {exc}")
+
+    return {"status": cls.log_status, "reason": cls.reason}
 
 
 # ===== 진입점 =====
@@ -112,23 +298,38 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
         # 2) 활성 캠페인 매칭 (trigger_type + keyword 모두 평가)
         # webhook 의 entry.id 는 IG user id — 그 계정의 캠페인만 후보
         ig_user_id = str(webhook_payload.get("entry_id") or "")
-        candidate_qs = (
-            AutoDMCampaign.objects.filter(status=AutoDMCampaign.Status.ACTIVE)
-            # 예약 발송: 활성 기간(window) 안에 있는 캠페인만 후보 (시작 전/종료 후 제외)
-            .filter(AutoDMCampaign.schedule_window_q()).select_related(
-                "ig_connection", "ig_connection__workspace"
-            )
-        )
-        if ig_user_id:
-            candidate_qs = candidate_qs.filter(ig_connection__external_account_id=ig_user_id)
+        candidate_qs = _active_campaigns_for_account(ig_user_id)
 
-        # trigger_type 평가:
-        #   specific_media (or attached next_media): media_id 일치
-        #   any_media: 모두 통과
+        # trigger_type 평가 + 누락 보정 장부(SeenComment) 기록 대상 수집:
+        #   - matched_campaigns: 매체+키워드 매칭 → DM enqueue 대상
+        #   - seen_conn_ids: 이 media 를 폴링하게 될 specific_media(=attach된 next_media 포함)
+        #     캠페인의 connection. keyword 매칭과 무관 — 폴링 앵커가 "모든 댓글"을 알아야 하므로.
         matched_campaigns = []
+        seen_conn_ids = set()
         for c in candidate_qs:
+            if (
+                c.trigger_type == AutoDMCampaign.TriggerType.SPECIFIC_MEDIA
+                and c.media_id == media_id
+            ):
+                seen_conn_ids.add(c.ig_connection_id)
             if c.matches_media(media_id) and c.matches_keyword(comment_text):
                 matched_campaigns.append(c)
+
+        # ★ 누락 보정 장부 기록: 웹훅 payload(value.id / value.media.id)만으로 생성 — 별도 Meta API 불필요.
+        # 폴링이 나중에 이 댓글을 "이미 봤다"(앵커)고 인식하게 한다. 기록 실패는 DM 을 막지 않는다.
+        for conn_id in seen_conn_ids:
+            try:
+                _record_seen_comment(
+                    ig_connection_id=conn_id,
+                    comment_id=comment_id,
+                    media_id=media_id,
+                    source=SeenComment.Source.WEBHOOK,
+                    triggered=bool(matched_campaigns),
+                )
+            except Exception:
+                logger.exception(
+                    "SeenComment 기록 실패: comment_id=%s conn=%s", comment_id, conn_id
+                )
 
         # ★ v3.6 — next_media webhook-based attach
         # 매칭된 캠페인이 없거나 next_media (media_id="") 캠페인이 있으면
@@ -284,8 +485,9 @@ def _enqueue_send_dm_for_story_reply(
             "reason": "self_story_reply",
         }
 
-    # 수신자 60초 쿨다운 (동일 사용자가 연속 답장하는 케이스 방어)
-    cooldown_cutoff = timezone.now() - timedelta(seconds=60)
+    # 수신자 쿨다운 (동일 사용자가 연속 답장하는 케이스 방어; DM_RECIPIENT_COOLDOWN_SECONDS)
+    cooldown_s = getattr(settings, "DM_RECIPIENT_COOLDOWN_SECONDS", 300)
+    cooldown_cutoff = timezone.now() - timedelta(seconds=cooldown_s)
     recent = SentDMLog.objects.filter(
         campaign=campaign,
         recipient_user_id=sender_user_id,
@@ -295,7 +497,7 @@ def _enqueue_send_dm_for_story_reply(
         return {
             "campaign_id": str(campaign.id),
             "status": "skipped",
-            "reason": "recipient_cooldown_60s",
+            "reason": f"recipient_cooldown_{cooldown_s}s",
         }
 
     idempotency_key = InstagramMessagingService.build_idempotency_key(
@@ -305,30 +507,7 @@ def _enqueue_send_dm_for_story_reply(
         campaign_id=campaign.id,
     )
 
-    if not campaign.can_send_more():
-        try:
-            SentDMLog.objects.create(
-                campaign=campaign,
-                comment_id="",  # story 답장은 comment_id 없음
-                comment_text=message_text,
-                recipient_user_id=sender_user_id,
-                recipient_username=sender_username,
-                message_sent=campaign.get_opening_message(),
-                status=SentDMLog.Status.SKIPPED,
-                error_message="Hourly send limit reached",
-                idempotency_key=idempotency_key,
-                webhook_payload=payload,
-                dm_kind=SentDMLog.DMKind.STANDALONE,
-                gate_status=SentDMLog.GateStatus.NONE,
-            )
-        except IntegrityError:
-            pass
-        return {
-            "campaign_id": str(campaign.id),
-            "status": "skipped",
-            "reason": "Hourly limit reached",
-        }
-
+    # 시간당 한도·계정 거버너는 send_dm_task 단일 지점에서 평가(초과 시 드랍 아닌 defer).
     try:
         with transaction.atomic():
             log = SentDMLog.objects.create(
@@ -493,9 +672,10 @@ def _enqueue_send_dm(
             "reason": "self_comment",
         }
 
-    # ★ 동일 수신자 60초 쿨다운: 같은 사람이 단시간에 여러 댓글 달면
-    # idempotency_key 는 comment_id 별로 다르므로 중복 방지 안 됨 → 별도 가드.
-    cooldown_cutoff = timezone.now() - timedelta(seconds=60)
+    # ★ 동일 수신자 쿨다운(DM_RECIPIENT_COOLDOWN_SECONDS): 같은 사람이 단시간에 여러 댓글 달면
+    # idempotency_key 는 comment_id 별로 다르므로 중복 방지 안 됨 → 별도 가드(계정 보호).
+    cooldown_s = getattr(settings, "DM_RECIPIENT_COOLDOWN_SECONDS", 300)
+    cooldown_cutoff = timezone.now() - timedelta(seconds=cooldown_s)
     recent_to_same_recipient = SentDMLog.objects.filter(
         campaign=campaign,
         recipient_user_id=from_user_id,
@@ -505,7 +685,7 @@ def _enqueue_send_dm(
         return {
             "campaign_id": str(campaign.id),
             "status": "skipped",
-            "reason": "recipient_cooldown_60s",
+            "reason": f"recipient_cooldown_{cooldown_s}s",
         }
 
     idempotency_key = InstagramMessagingService.build_idempotency_key(
@@ -526,31 +706,9 @@ def _enqueue_send_dm(
         dm_kind = SentDMLog.DMKind.STANDALONE
         gate_status = SentDMLog.GateStatus.NONE
 
-    # 시간당 발송 제한 체크
-    if not campaign.can_send_more():
-        try:
-            SentDMLog.objects.create(
-                campaign=campaign,
-                comment_id=comment_id,
-                comment_text=comment_text,
-                recipient_user_id=from_user_id,
-                recipient_username=from_username,
-                message_sent=message_body,
-                status=SentDMLog.Status.SKIPPED,
-                error_message="Hourly send limit reached",
-                idempotency_key=idempotency_key,
-                webhook_payload=webhook_payload,
-                dm_kind=dm_kind,
-                gate_status=SentDMLog.GateStatus.NONE,
-            )
-        except IntegrityError:
-            pass  # 이미 같은 키 존재 → 무시
-        return {
-            "campaign_id": str(campaign.id),
-            "status": "skipped",
-            "reason": "Hourly limit reached",
-        }
-
+    # 시간당 발송 제한·계정 거버너는 send_dm_task 진입 시 단일 지점에서 평가하며,
+    # 초과 시 드랍하지 않고 defer(QUEUED+next_retry_at) 한다 (requeue 워커가 순차 재투입).
+    # → 여기서는 항상 QUEUED 로 적재하고 발송 판단은 send_dm_task 에 위임.
     try:
         with transaction.atomic():
             log = SentDMLog.objects.create(
@@ -596,7 +754,11 @@ def send_dm_task(self, log_id: str):
     재시도: transient 에러만 백오프 재시도.
     """
     try:
-        log = SentDMLog.objects.select_related("campaign", "campaign__ig_connection").get(id=log_id)
+        log = SentDMLog.objects.select_related(
+            "campaign",
+            "campaign__ig_connection",
+            "campaign__ig_connection__workspace__owner",
+        ).get(id=log_id)
     except SentDMLog.DoesNotExist:
         logger.warning(f"SentDMLog {log_id} not found")
         return {"status": "not_found"}
@@ -622,8 +784,32 @@ def send_dm_task(self, log_id: str):
             status=SentDMLog.Status.FAILED_TOKEN,
             error_message=f"IG connection not active: {ig_conn.status}",
         )
-        campaign.increment_failed()
+        if log.parent_log_id is None:
+            campaign.increment_failed()
         return {"status": "failed_token"}
+
+    # ★ 메시징 윈도우 만료 가드 (graceful 종결의 단일 지점):
+    # rate-limit/한도 초과로 계속 defer 되더라도 comment 7일 / user_id 24h 가 지나면
+    # Meta 가 무조건 거부하므로 FAILED_WINDOW 로 종결한다(= rate-limit 실패가 아닌 윈도우 만료).
+    age = timezone.now() - log.created_at
+    if age >= _messaging_window(log):
+        log.mark_failed(
+            status=SentDMLog.Status.FAILED_WINDOW,
+            error_message="Messaging window expired while waiting for send capacity",
+        )
+        if log.parent_log_id is None:
+            campaign.increment_failed()
+        return {"status": "failed_window", "reason": "window_expired"}
+
+    # ★ 발송 속도 제어 (재진입 포함): 캠페인 시간당 한도/계정 거버너 초과 시
+    # 드랍·실패가 아니라 defer(QUEUED+next_retry_at) → requeue 워커가 순차 재투입.
+    defer = _rate_defer(log, campaign, ig_conn)
+    if defer is not None:
+        retry_after, reason = defer
+        log.next_retry_at = timezone.now() + timedelta(seconds=retry_after)
+        log.status = SentDMLog.Status.QUEUED
+        log.save(update_fields=["next_retry_at", "status"])
+        return {"status": "deferred", "reason": reason, "retry_after": retry_after}
 
     log.mark_submitting()
 
@@ -646,9 +832,13 @@ def send_dm_task(self, log_id: str):
         buttons = campaign.get_link_buttons()
 
     try:
-        # ★ Story 답장 캠페인 (comment_id 없음) → user_id 기반 DM (24h 윈도우)
-        # 그 외 (comment 트리거) → Private Reply via comment_id
-        if log.comment_id:
+        # 라우팅 규칙:
+        #  - 첫 DM(opening/standalone, parent_log 없음 + comment_id 있음) → Private Reply.
+        #    (Meta: 댓글당 Private Reply 1회.)
+        #  - child(reward/follow 재안내, parent_log 있음) 또는 Story 답장(comment_id 없음)
+        #    → user_id 기반 DM(24h 윈도우). child 는 comment_id 를 물려받아도 두 번째
+        #    Private Reply 를 보내면 안 되므로 반드시 user_id 경로.
+        if log.comment_id and log.parent_log_id is None:
             result = InstagramMessagingService.send_dm_via_comment(
                 ig_user_id=ig_conn.external_account_id,
                 comment_id=log.comment_id,
@@ -665,37 +855,41 @@ def send_dm_task(self, log_id: str):
                 buttons=buttons,
             )
     except DMSendError as e:
-        cls = exception_to_classification(e)
-        log.retry_count += 1
+        # ★ P6 (C4): 200 인데 message_id 없음(DMAnomalyError) → Meta 가 이미 보냈을 수 있어
+        # 그냥 재발송하면 중복. Conversations 조회로 '최근 발송 흔적'을 확인 후 분기.
+        from .dm_exceptions import DMAnomalyError
 
-        # v3.2: retriable인 transient (RATE_LIMITED)만 재시도
-        if cls.retriable and self.request.retries < self.max_retries:
-            backoff = min(60 * (2**self.request.retries), 60 * 60 * 6)  # 최대 6h
-            log.next_retry_at = timezone.now() + timedelta(seconds=backoff)
-            # RATE_LIMITED 상태로 표시 후 재시도 큐에 들어가도록 QUEUED로 회귀
-            log.status = SentDMLog.Status.QUEUED
-            log.save(update_fields=["retry_count", "next_retry_at", "status"])
-            raise self.retry(exc=e, countdown=backoff) from e
-
-        # 모든 FAILED_* (FAILED_TOKEN/FAILED_PARAM/FAILED_WINDOW/FAILED_NO_TRACE)
-        # 또는 RATE_LIMITED 한도 초과 → 즉시 Dead Letter (재시도 중단)
-        log.mark_failed(
-            status=cls.log_status,
-            error_message=str(e),
-            error_code=str(e.code) if e.code is not None else "",
-            error_subcode=str(e.subcode) if e.subcode is not None else "",
-            api_response=e.api_response,
-        )
-        # v3.8: parent_log 가 있는 child (reward / retry) DM 은 별도 트리거가 아니라
-        # 같은 캠페인-사용자 흐름의 후속 발송이므로 통계 카운터에서 제외.
-        # opening / standalone 만 캠페인 카운트.
-        if log.parent_log_id is None:
-            campaign.increment_failed()
-
-        if cls.log_status == SentDMLog.Status.FAILED_TOKEN:
-            ig_conn.mark_as_error(f"DM 발송 중 토큰/세션/권한 오류: {e}")
-
-        return {"status": cls.log_status, "reason": cls.reason}
+        if isinstance(e, DMAnomalyError):
+            recent = InstagramMessagingService.has_recent_message_to_recipient(
+                ig_user_id=ig_conn.external_account_id,
+                recipient_id=log.recipient_user_id,
+                access_token=ig_conn.access_token,
+                since_seconds=900,
+            )
+            if recent is True:
+                # 발송 확인됨 → 재발송 금지, 도착 확정 처리(conv_api 로 확인).
+                log.mark_accepted(message_id="", api_response={"anomaly": True, "recent": True})
+                if log.parent_log_id is None:
+                    campaign.increment_sent()
+                log.mark_delivered(via=SentDMLog.VerifiedVia.CONV_API)
+                log.append_verification_log({"path": "anomaly", "result": "confirmed_sent"})
+                return {"status": "delivered", "via": "anomaly_conv_api"}
+            if recent is None:
+                # 확인 불가 + 200 응답이었음 → 중복 방지 우선: 재발송 안 함, '미확인'으로 분리 집계.
+                log.mark_failed(
+                    status=SentDMLog.Status.FAILED_NO_TRACE,
+                    error_message="200 OK without message_id; delivery unconfirmed (no resend)",
+                    api_response=e.api_response,
+                )
+                if log.parent_log_id is None:
+                    campaign.increment_unconfirmed()
+                log.append_verification_log({"path": "anomaly", "result": "unconfirmed_no_resend"})
+                return {"status": "failed_no_trace", "reason": "anomaly_unconfirmed"}
+            # recent is False → 정말 안 갔음 → 기존 defer 재발송 경로.
+        # v3.9: rate-limit/transient 은 횟수 상한으로 종결하지 않고 defer.
+        # 윈도우 만료(graceful 종결)는 위 진입부 age 가드가 단일 지점에서 담당.
+        # no_trace(551·기타4xx)는 실패가 아닌 '미확인'으로 분리 집계.
+        return _defer_or_fail(log, campaign, ig_conn, e)
 
     # 성공 — ACCEPTED 진입
     log.mark_accepted(
@@ -706,8 +900,8 @@ def send_dm_task(self, log_id: str):
     if log.parent_log_id is None:
         campaign.increment_sent()
 
-    # 5분 후 첫 능동 검증 예약 (echo가 먼저 오면 skip됨)
-    verify_dm_delivery.apply_async(args=[str(log.id)], countdown=300)
+    # 10분 후 첫 능동 검증 예약 (echo가 먼저 오면 skip됨; v3.9: 쿼터 절약 위해 5→10분)
+    verify_dm_delivery.apply_async(args=[str(log.id)], countdown=600)
 
     # public_reply_enabled 면 댓글에 공개 답글도 게시 (best-effort)
     # v3.5: public_reply_templates(list) 또는 legacy public_reply_template 중 하나라도 있으면 OK
@@ -794,8 +988,11 @@ def verify_dm_delivery(self, log_id: str):
     )
 
     if age.total_seconds() < 35 * 60:
-        # 첫 검증(5분 시점) — 35분 시점까지 한 번 더 예약
+        # 첫 검증(10분 시점) — 35분 시점까지 한 번만 더 예약 (v3.9: sparse 폴링 = GET 약 2회).
         remaining = max(60, int(35 * 60 - age.total_seconds()))
+        # next_retry_at 기록 → reconcile_accepted_dms 가 예약 살아있는 건은 재큐하지 않도록 게이트.
+        log.next_retry_at = timezone.now() + timedelta(seconds=remaining)
+        log.save(update_fields=["next_retry_at"])
         verify_dm_delivery.apply_async(args=[log_id], countdown=remaining)
         return {"status": "deferred", "next_check_in_seconds": remaining}
 
@@ -804,7 +1001,8 @@ def verify_dm_delivery(self, log_id: str):
         status=SentDMLog.Status.FAILED_NO_TRACE,
         error_message="No echo and not found in Conversations API after 35 minutes",
     )
-    log.campaign.increment_failed()
+    # v3.9: no_trace 는 '실패'가 아니라 '미확인' → 전용 카운터(success_rate/total_failed 와 분리).
+    log.campaign.increment_unconfirmed()
     return {"status": "failed_no_trace"}
 
 
@@ -814,15 +1012,25 @@ def verify_dm_delivery(self, log_id: str):
 @shared_task
 def reconcile_accepted_dms():
     """
-    ACCEPTED 상태로 5분 이상 머무는 건들을 능동 검증.
+    ACCEPTED 상태로 10분 이상 머무는 건들을 능동 검증 (예약 유실 고아만).
+
+    v3.9: 매분 무조건 재큐하던 방식은 stuck 1건당 GET ~30회 쿼터 낭비를 유발했다.
+    verify_dm_delivery 가 다음 검증을 next_retry_at 으로 예약하므로, 여기서는 예약이
+    없거나(워커 재시작/메시지 유실) 2분 이상 지난 '고아'만 재가동한다(cutoff 5→10분).
 
     Beat: 1분 주기.
     """
-    cutoff = timezone.now() - timedelta(minutes=5)
-    queryset = SentDMLog.objects.filter(
-        status=SentDMLog.Status.ACCEPTED,
-        accepted_at__lte=cutoff,
-    ).values_list("id", flat=True)[:200]
+    now = timezone.now()
+    cutoff = now - timedelta(minutes=10)
+    grace = now - timedelta(minutes=2)
+    queryset = (
+        SentDMLog.objects.filter(
+            status=SentDMLog.Status.ACCEPTED,
+            accepted_at__lte=cutoff,
+        )
+        .filter(Q(next_retry_at__isnull=True) | Q(next_retry_at__lte=grace))
+        .values_list("id", flat=True)[:200]
+    )
 
     count = 0
     for log_id in queryset:
@@ -837,26 +1045,97 @@ def reconcile_accepted_dms():
 @shared_task
 def reconcile_stuck_submitting():
     """
-    SUBMITTING 상태로 60초 이상 정체된 건을 큐로 되돌림.
+    SUBMITTING 상태로 60초 이상 정체된 건을 큐로 되돌림(워커 크래시 복구).
+
+    ★ P6 (F2): Meta accept 직후 mark_accepted 전에 크래시했다면 그냥 재발송 시 중복.
+    재큐 전에 Conversations 조회로 '이미 보냈는지' 확인 — 확인되면(recent=True) 재발송 대신
+    도착 확정 처리한다. 확인 불가/없음(None/False)이면 기존대로 재큐(무손실 우선).
 
     Beat: 30초 주기.
     """
     cutoff = timezone.now() - timedelta(seconds=60)
-    qs = SentDMLog.objects.filter(
+    qs = SentDMLog.objects.select_related("campaign__ig_connection").filter(
         status=SentDMLog.Status.SUBMITTING,
         submitted_at__lte=cutoff,
     )
 
-    count = 0
+    requeued = 0
+    confirmed = 0
     for log in qs[:100]:
+        ig_conn = log.campaign.ig_connection
+        recent = None
+        try:
+            recent = InstagramMessagingService.has_recent_message_to_recipient(
+                ig_user_id=ig_conn.external_account_id,
+                recipient_id=log.recipient_user_id,
+                access_token=ig_conn.access_token,
+                since_seconds=900,
+            )
+        except Exception:  # noqa: BLE001 - 조회 실패는 보수적으로 재큐(무손실 우선)
+            recent = None
+
+        if recent is True:
+            # 이미 발송됨 → 재발송 금지, 도착 확정 처리.
+            log.mark_accepted(message_id="", api_response={"stuck_recovery": True, "recent": True})
+            if log.parent_log_id is None:
+                log.campaign.increment_sent()
+            log.mark_delivered(via=SentDMLog.VerifiedVia.CONV_API)
+            log.append_verification_log({"path": "stuck_recovery", "result": "confirmed_sent"})
+            confirmed += 1
+            continue
+
+        # recent in (False, None) → 발송 흔적 없음/확인 불가 → 재큐(기존 동작, 무손실 우선).
         log.status = SentDMLog.Status.QUEUED
         log.save(update_fields=["status"])
         send_dm_task.delay(str(log.id))
-        count += 1
+        requeued += 1
 
-    if count:
-        logger.warning(f"reconcile_stuck_submitting: requeued {count} stuck logs")
-    return {"requeued": count}
+    if requeued or confirmed:
+        logger.warning(
+            "reconcile_stuck_submitting: requeued %s, confirmed_already_sent %s",
+            requeued,
+            confirmed,
+        )
+    return {"requeued": requeued, "confirmed": confirmed}
+
+
+@shared_task
+def requeue_deferred_dms():
+    """next_retry_at 이 도래한 defer(QUEUED) 건을 send_dm_task 로 순차(FIFO) 재투입.
+
+    rate-limit/transient defer(item1) + 시간당 한도·계정 거버너 defer(item2) 공통 픽커다.
+    created_at 오름차순으로 처리 = 가장 오래 기다린 건부터 → "다음 윈도우에 순차 발송".
+    next_retry_at 이 없는 채 2분+ 정체된 QUEUED(초기 dispatch 유실)도 안전 재투입한다.
+
+    동시 픽업은 select_for_update(skip_locked) + next_retry_at=None 마킹으로 방지하고,
+    send_dm_task 진입 가드(status QUEUED/SUBMITTING)가 이중 발송을 막는다.
+
+    Beat: 30초 주기.
+    """
+    now = timezone.now()
+    stale_cutoff = now - timedelta(minutes=2)
+    with transaction.atomic():
+        rows = list(
+            SentDMLog.objects.select_for_update(skip_locked=True)
+            .filter(status=SentDMLog.Status.QUEUED)
+            .filter(
+                Q(next_retry_at__lte=now)
+                | Q(next_retry_at__isnull=True, created_at__lte=stale_cutoff)
+            )
+            .order_by("created_at")
+            .values_list("id", flat=True)[:200]
+        )
+        ids = list(rows)
+        if ids:
+            # 픽업 표식: next_retry_at 비워 다음 tick 중복 픽업 방지(재defer 시 send_dm_task 가 다시 채움).
+            SentDMLog.objects.filter(id__in=ids).update(next_retry_at=None)
+
+    for log_id in ids:
+        send_dm_task.delay(str(log_id))
+
+    if ids:
+        logger.info(f"requeue_deferred_dms: requeued {len(ids)} deferred logs")
+    return {"requeued": len(ids)}
 
 
 @shared_task
@@ -883,8 +1162,67 @@ def dead_letter_alerter():
             "DM dead-letter alert: "
             f"FAILED_TOKEN={token_failures}, FAILED_NO_TRACE={no_trace} (last 10min)"
         )
+        # P9: 로그뿐 아니라 Telegram 으로도 즉시 통지 (운영자 인지).
+        try:
+            from apps.core.telegram import send_telegram_notification
+
+            send_telegram_notification(
+                "⚠️ *DM dead-letter* (최근 10분)\n"
+                f"FAILED_TOKEN: *{token_failures}* (재연동 필요)\n"
+                f"FAILED_NO_TRACE: *{no_trace}* (도착 미확인)"
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("dead_letter_alerter telegram 알림 실패 (non-fatal)")
 
     return {"failed_token": token_failures, "failed_no_trace": no_trace}
+
+
+@shared_task
+def dm_backlog_alert():
+    """발송 백로그 위험 시 Telegram 경고 (P7 — E1 손실 예방). Beat: 30분 주기.
+
+    QUEUED(대기) 중 메시징 윈도우(7d/24h) 만료가 임박(기본 6h 이내)한 건이 있거나,
+    가장 오래된 QUEUED 가 임계(기본 2h)를 넘으면 알림 → 윈도우 만료 손실 전 운영자 인지.
+    """
+    now = timezone.now()
+    risk_hours = getattr(settings, "DM_BACKLOG_RISK_HOURS", 6)
+    oldest_alert_hours = getattr(settings, "DM_BACKLOG_OLDEST_ALERT_HOURS", 2)
+
+    queued = SentDMLog.objects.filter(status=SentDMLog.Status.QUEUED)
+    total = queued.count()
+    if not total:
+        return {"total_queued": 0}
+
+    oldest = queued.order_by("created_at").values_list("created_at", flat=True).first()
+    oldest_age_h = (now - oldest).total_seconds() / 3600 if oldest else 0
+
+    risk_cut = timedelta(hours=risk_hours)
+    risk = 0
+    for cid, created in queued.order_by("created_at").values_list("comment_id", "created_at")[
+        :5000
+    ]:
+        window = timedelta(days=7) if cid else timedelta(hours=24)
+        if (created + window) - now <= risk_cut:
+            risk += 1
+
+    if risk > 0 or oldest_age_h >= oldest_alert_hours:
+        try:
+            from apps.core.telegram import send_telegram_notification
+
+            send_telegram_notification(
+                "📨 *DM 백로그 경고*\n"
+                f"대기(QUEUED): *{total}*\n"
+                f"윈도우 만료 임박({risk_hours}h 내): *{risk}*\n"
+                f"최오래 대기: *{oldest_age_h:.1f}h*"
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("dm_backlog_alert telegram 실패 (non-fatal)")
+
+    return {
+        "total_queued": total,
+        "window_risk": risk,
+        "oldest_age_hours": round(oldest_age_h, 1),
+    }
 
 
 @shared_task
@@ -1210,6 +1548,206 @@ def enforce_campaign_schedules():
     return {"auto_completed": ended}
 
 
+# ===== 댓글 웹훅 누락 보정 (polling) =====
+
+
+def _poll_one_media(conn: IGAccountConnection, media_id: str, now) -> dict:
+    """한 (connection, media) 의 최근 댓글을 newest-first 로 훑어 웹훅 누락분을 보정 발송.
+
+    종료 조건(먼저 만나는 것):
+      1) 앵커 — 이미 장부(SeenComment)에 있는 댓글 → 그보다 오래된 건 모두 관측됨.
+      2) 7일 창(window_floor) 밖 댓글 — Private Reply 불가(어차피 Meta code=100) → 중단.
+      3) 댓글 소진(paging_after 없음).
+      4) 폭주 방지 상한(MAX_PAGES) — 도달 시 backfill gap 가능성 → 경고.
+
+    각 누락분은 기존 ``_enqueue_send_dm`` 로 enqueue → idempotency_key 가 웹훅과의
+    중복을 막고, rate_governor 가 발송량을 throttle 한다.
+    """
+    token = conn.access_token
+    window_floor = now - timedelta(days=getattr(settings, "PRIVATE_REPLY_WINDOW_DAYS", 7))
+    page_size = getattr(settings, "MISSED_COMMENT_POLL_PAGE_SIZE", 50)
+    max_pages = getattr(settings, "MISSED_COMMENT_POLL_MAX_PAGES", 20)
+
+    misses = 0
+    scanned = 0
+    after = None
+    pages = 0
+
+    while pages < max_pages:
+        resp = InstagramMediaService.list_media_comments(
+            media_id, token, limit=page_size, after=after
+        )
+        comments = resp.get("data") or []
+        if not comments:
+            return {"misses": misses, "scanned": scanned, "stop": "empty"}
+
+        for c in comments:
+            cid = c.get("id")
+            if not cid:
+                continue
+            scanned += 1
+            ts = _parse_iso_timestamp(c.get("timestamp"))
+
+            # (2) 7일 창 밖 → newest-first 이므로 이후도 전부 밖 → 종료
+            if ts is not None and ts < window_floor:
+                return {"misses": misses, "scanned": scanned, "stop": "window_floor"}
+
+            # (1) 장부 멱등 기록 — 이미 있으면 앵커
+            created = _record_seen_comment(
+                ig_connection_id=conn.id,
+                comment_id=cid,
+                media_id=media_id,
+                source=SeenComment.Source.POLL,
+            )
+            if not created:
+                return {"misses": misses, "scanned": scanned, "stop": "anchor"}
+
+            # 진짜 누락분 → 트리거 평가
+            text = c.get("text") or ""
+            matched = _matched_campaigns_for_comment(
+                ig_user_id=conn.external_account_id,
+                media_id=media_id,
+                comment_text=text,
+                now=now,
+            )
+            if not matched:
+                continue
+
+            # 수신자 식별: 댓글 edge 는 from.id 를 잘 주지 않으므로 username/comment_id 로 대체
+            # (실제 발송은 comment_id Private Reply 라 수신자 id 불필요. 쿨다운/통계용).
+            recipient_key = (c.get("from") or {}).get("id") or c.get("username") or cid
+            uname = c.get("username") or ""
+            enq_payload = {
+                "source": "poll_missed_comments",
+                "media_id": media_id,
+                "comment_id": cid,
+                "comment_ts": c.get("timestamp"),
+            }
+            any_enqueued = False
+            for camp in matched:
+                # per-campaign baseline: 캠페인 시작 전 댓글은 보정 발송하지 않음
+                # (오래된 게시물에 캠페인을 새로 켰을 때 기존 댓글 대량 발송 방지).
+                eff_start = camp.started_at or camp.scheduled_start_at or camp.created_at
+                if ts is not None and eff_start is not None and ts < eff_start:
+                    continue
+                _enqueue_send_dm(
+                    campaign=camp,
+                    comment_id=cid,
+                    comment_text=text,
+                    from_user_id=recipient_key,
+                    from_username=uname,
+                    webhook_payload=enq_payload,
+                )
+                any_enqueued = True
+
+            if any_enqueued:
+                misses += 1
+                try:
+                    SeenComment.objects.filter(ig_connection_id=conn.id, comment_id=cid).update(
+                        triggered=True
+                    )
+                except Exception:
+                    pass
+
+        after = resp.get("paging_after")
+        pages += 1
+        if not after:
+            return {"misses": misses, "scanned": scanned, "stop": "end_of_comments"}
+
+    # MAX_PAGES 소진했는데 앵커/창 미도달 → backfill gap 가능성 경고
+    logger.warning(
+        "poll_missed_comments: budget exhausted without anchor — possible gap "
+        "(conn=%s media=%s scanned=%s)",
+        conn.id,
+        media_id,
+        scanned,
+    )
+    try:
+        from apps.core.telegram import send_telegram_notification
+
+        send_telegram_notification(
+            f"⚠️ 댓글 누락 보정 폴링 budget 소진 (gap 가능): "
+            f"media={media_id} scanned={scanned}p={max_pages}"
+        )
+    except Exception:
+        pass
+    return {"misses": misses, "scanned": scanned, "stop": "budget_exhausted"}
+
+
+@shared_task(name="integrations.poll_missed_comments")
+def poll_missed_comments():
+    """댓글 웹훅 누락 보정 (Beat: 1시간 주기).
+
+    활성·예약창 내 specific_media(=attach된 next_media 포함) 캠페인이 붙은
+    (connection, media) 마다 최근 댓글을 재조회해 웹훅 누락분을 보정 발송한다.
+    ANY_MEDIA / STORY_REPLY 는 v1 대상 아님(전자는 비용, 후자는 댓글 아님).
+    """
+    if not getattr(settings, "MISSED_COMMENT_POLL_ENABLED", True):
+        return {"enabled": False}
+
+    now = timezone.now()
+    max_targets = getattr(settings, "MISSED_COMMENT_POLL_MAX_TARGETS", 1000)
+
+    targets = list(
+        AutoDMCampaign.objects.filter(status=AutoDMCampaign.Status.ACTIVE)
+        .filter(AutoDMCampaign.schedule_window_q(now))
+        .filter(trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA)
+        .exclude(media_id="")
+        .values_list("ig_connection_id", "media_id")
+        .distinct()[:max_targets]
+    )
+    if not targets:
+        return {"targets": 0, "polled": 0, "misses": 0}
+
+    conn_ids = {t[0] for t in targets}
+    conns = {
+        c.id: c
+        for c in IGAccountConnection.objects.filter(
+            id__in=conn_ids, status=IGAccountConnection.Status.ACTIVE
+        )
+    }
+
+    polled = 0
+    total_misses = 0
+    for conn_id, media_id in targets:
+        conn = conns.get(conn_id)
+        if conn is None:
+            continue
+        try:
+            result = _poll_one_media(conn, media_id, now)
+            total_misses += result.get("misses", 0)
+            polled += 1
+        except Exception:
+            logger.exception("poll_missed_comments: 실패 conn=%s media=%s", conn_id, media_id)
+
+    if total_misses:
+        logger.info("poll_missed_comments: polled=%s misses(enqueued)=%s", polled, total_misses)
+    return {"targets": len(targets), "polled": polled, "misses": total_misses}
+
+
+@shared_task(name="integrations.cleanup_comment_ledger")
+def cleanup_comment_ledger():
+    """만료된 댓글 관측 장부(SeenComment) 삭제 (Beat: 매일).
+
+    expires_at 가 지난 행을 배치 삭제. 멱등 — 다음 실행에 남은 만료분 계속 정리.
+    """
+    cutoff = timezone.now()
+    deleted = 0
+    while True:
+        ids = list(
+            SeenComment.objects.filter(expires_at__lt=cutoff).values_list("id", flat=True)[:5000]
+        )
+        if not ids:
+            break
+        n, _ = SeenComment.objects.filter(id__in=ids).delete()
+        deleted += n
+        if len(ids) < 5000:
+            break
+    if deleted:
+        logger.info("cleanup_comment_ledger: deleted %s expired rows", deleted)
+    return {"deleted": deleted}
+
+
 # ===== 공개 답글 + Follow-gate =====
 
 
@@ -1500,30 +2038,19 @@ def send_reward_dm(self, opening_log_id: str):
             buttons=campaign.get_link_buttons(),
         )
     except DMSendError as e:
-        cls_info = exception_to_classification(e)
-        if cls_info.retriable and self.request.retries < self.max_retries:
-            backoff = min(60 * (2**self.request.retries), 60 * 60)
-            reward_log.next_retry_at = timezone.now() + timedelta(seconds=backoff)
-            reward_log.status = SentDMLog.Status.QUEUED
-            reward_log.save(update_fields=["next_retry_at", "status"])
-            raise self.retry(exc=e, countdown=backoff) from e
-
-        reward_log.mark_failed(
-            status=cls_info.log_status,
-            error_message=str(e),
-            error_code=str(e.code) if e.code is not None else "",
-            error_subcode=str(e.subcode) if e.subcode is not None else "",
-            api_response=e.api_response,
-        )
-        campaign.increment_failed()
-        return {"status": cls_info.log_status, "reason": cls_info.reason}
+        # v3.9: rate-limit/transient 은 defer(QUEUED+next_retry_at) → requeue 워커가 send_dm_task 로
+        # 재투입(reward 는 child 라 user_id 경로로 재발송). non-retriable 은 즉시 종결.
+        # reward 는 항상 child(parent_log=opening) 이므로 _defer_or_fail 의 카운터 가드로 통계 제외.
+        return _defer_or_fail(reward_log, campaign, ig_conn, e)
 
     reward_log.mark_accepted(
         message_id=result["message_id"],
         api_response=result.get("_raw") or result,
     )
-    campaign.increment_sent()
-    verify_dm_delivery.apply_async(args=[str(reward_log.id)], countdown=300)
+    # reward 는 child → 캠페인 카운터 제외 (opening 이 이미 카운트됨).
+    if reward_log.parent_log_id is None:
+        campaign.increment_sent()
+    verify_dm_delivery.apply_async(args=[str(reward_log.id)], countdown=600)
 
     return {
         "status": "accepted",
@@ -1677,6 +2204,9 @@ def refresh_ig_tokens_pending_expiry(self):
                 conn.username,
                 conn.token_expires_at,
             )
+            # ★ P2: 토큰 복구 직후, 토큰 만료로 종결된(FAILED_TOKEN) 건을 윈도우 내라면 되살림.
+            # 배포·일시 토큰오류로 죽었던 발송이 토큰 복구와 동시에 자동 재발송된다.
+            revive_failed_token_logs.delay(str(conn.id))
         except Exception as e:
             logger.exception("IG token refresh failed: conn=%s err=%s", conn.id, e)
             try:
@@ -1692,16 +2222,53 @@ def refresh_ig_tokens_pending_expiry(self):
                 }
             )
 
-    message = _build_token_refresh_summary(
-        checked=len(candidates), succeeded=succeeded, failed=failed
-    )
-    send_telegram_notification(message)
+    # 6h 주기로 자주 도므로, 처리할 후보가 없으면 Telegram 알림을 생략(노이즈 방지).
+    # 후보가 있었던 실행(성공/실패 포함)만 요약 push.
+    if candidates:
+        message = _build_token_refresh_summary(
+            checked=len(candidates), succeeded=succeeded, failed=failed
+        )
+        send_telegram_notification(message)
 
     return {
         "checked": len(candidates),
         "succeeded": len(succeeded),
         "failed": len(failed),
     }
+
+
+@shared_task
+def revive_failed_token_logs(ig_connection_id: str):
+    """토큰 복구(갱신/재연동) 후, 해당 연결의 FAILED_TOKEN 로그를 윈도우 내라면 되살림 (P2).
+
+    제자리 되살림(SentDMLog.revive)이라 같은 idempotency_key 를 재사용 → 중복 발송 불가.
+    윈도우(comment 7d / user_id 24h)를 넘긴 건은 revive 가 알아서 거부한다.
+    """
+    revived = 0
+    scanned = 0
+    qs = (
+        SentDMLog.objects.filter(
+            campaign__ig_connection_id=ig_connection_id,
+            status=SentDMLog.Status.FAILED_TOKEN,
+        )
+        .select_related("campaign")
+        .order_by("created_at")[:500]
+    )
+    for log in qs:
+        scanned += 1
+        try:
+            if log.revive(reason="token_recovered"):
+                revived += 1
+        except Exception:
+            logger.exception("revive_failed_token_logs: revive 실패 log=%s", log.id)
+    if revived:
+        logger.info(
+            "revive_failed_token_logs: revived %s/%s logs for conn=%s",
+            revived,
+            scanned,
+            ig_connection_id,
+        )
+    return {"revived": revived, "scanned": scanned}
 
 
 def _build_token_refresh_summary(*, checked: int, succeeded: list, failed: list) -> str:

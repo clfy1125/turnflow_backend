@@ -33,6 +33,14 @@ class IGAccountConnection(models.Model):
             models.Index(fields=["external_account_id"]),
             models.Index(fields=["status"]),
         ]
+        constraints = [
+            # P5: 재연동 시 중복 행 생성 방지 → 캠페인 고아화 차단.
+            # (워크스페이스 + IG 계정)당 연동은 정확히 1행. 재연동은 그 행을 in-place 갱신.
+            models.UniqueConstraint(
+                fields=["workspace", "external_account_id"],
+                name="uq_igconn_ws_account",
+            )
+        ]
 
     # Primary key
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -525,12 +533,24 @@ class AutoDMCampaign(models.Model):
     max_sends_per_hour = models.IntegerField(
         default=200,
         verbose_name="시간당 최대 발송 수",
-        help_text="스팸 방지를 위한 시간당 발송 제한",
+        help_text=(
+            "캠페인별 사용자 throttle (anti-spam 관행값, 기본 200). "
+            "Meta 물리 한도는 계정당 750/hr Private Reply 이며 rate_governor 가 계정 단위로 별도 강제한다. "
+            "초과 시 드랍하지 않고 다음 시간 윈도우로 defer."
+        ),
     )
 
     # 통계
     total_sent = models.IntegerField(default=0, verbose_name="총 발송 수")
     total_failed = models.IntegerField(default=0, verbose_name="총 실패 수")
+    total_unconfirmed = models.IntegerField(
+        default=0,
+        verbose_name="총 도착미확인 수",
+        help_text=(
+            "FAILED_NO_TRACE (200 접수됐으나 35분 내 도착 미확인). "
+            "'실패'가 아니라 '미확인' 이므로 total_failed / success_rate 와 분리 집계."
+        ),
+    )
 
     # ===== 예약 발송 (DM scheduling — 활성 기간 한정 + 자동 종료) =====
     # scheduled_* 는 "계획"(이 기간에만 발송)이고, started_at/ended_at 은 "실제 기록"이다.
@@ -568,6 +588,61 @@ class AutoDMCampaign(models.Model):
         """캠페인이 활성 상태인지 확인 (status 만 본다 — 예약 창은 is_runnable_now 참고)"""
         return self.status == self.Status.ACTIVE
 
+    # 특정 게시물/스토리 한 개를 "점유"하는 트리거 (= 같은 media_id 에 활성 캠페인 1개 제한 대상).
+    # any_media 는 계정 전체를 대상으로 하므로 특정 게시물을 점유하지 않고,
+    # next_media 는 attach 전에는 media_id 가 비어 있어 점유하지 않는다(attach 되면
+    # specific_media 로 전환되며 그때부터 점유 대상).
+    MEDIA_BOUND_TRIGGERS = (TriggerType.SPECIFIC_MEDIA, TriggerType.STORY_REPLY)
+
+    def occupies_media_slot(self) -> bool:
+        """이 캠페인이 특정 게시물(media_id) 한 개를 점유하는지 여부."""
+        return self.trigger_type in self.MEDIA_BOUND_TRIGGERS and bool(
+            (self.media_id or "").strip()
+        )
+
+    @classmethod
+    def find_active_conflict(
+        cls,
+        *,
+        ig_connection_id,
+        media_id: str,
+        trigger_type=None,
+        exclude_id=None,
+    ) -> "AutoDMCampaign | None":
+        """같은 IG 게시물(media_id)에 이미 활성(ACTIVE) 캠페인이 있으면 그 캠페인을 반환.
+
+        한 게시물에 활성 캠페인이 둘 이상 생기는 것을 막기 위한 중복 검사의 단일 진실원천.
+        생성/활성화 변경(수정·재개·예약 활성화) 경로에서 호출한다.
+
+        반환:
+            충돌하는 활성 캠페인 인스턴스, 없으면 ``None``.
+
+        규칙:
+            - ``media_id`` 가 비어 있으면(any_media / 미부착 next_media) 특정 게시물을
+              점유하지 않으므로 항상 ``None``.
+            - ``trigger_type`` 이 주어졌고 media 점유 트리거가 아니면(any_media 등)
+              ``None`` — any_media 캠페인이 stray media_id 를 들고 있어도 오탐하지 않는다.
+            - ``exclude_id`` 로 자기 자신은 제외(수정/재개 시 본인과 충돌 처리 방지).
+            - 비교는 같은 ``ig_connection`` 범위 안에서만 수행(멀티테넌시/멀티 IG 안전).
+
+        NOTE: next_media 자동 attach(webhook/폴링)는 같은 신규 게시물에 여러 캠페인을
+        한 번에 붙이는 게 **의도된 동작**이므로 이 검사를 거치지 않는다(tasks.py).
+        이 검사는 사용자가 특정 게시물을 직접 지정/활성화하는 경로에만 적용된다.
+        """
+        media_id = (media_id or "").strip()
+        if not media_id:
+            return None
+        if trigger_type is not None and trigger_type not in cls.MEDIA_BOUND_TRIGGERS:
+            return None
+        qs = cls.objects.filter(
+            ig_connection_id=ig_connection_id,
+            media_id=media_id,
+            status=cls.Status.ACTIVE,
+        )
+        if exclude_id is not None:
+            qs = qs.exclude(id=exclude_id)
+        return qs.first()
+
     def copy(self, new_name: str | None = None) -> "AutoDMCampaign":
         """이 캠페인을 비활성(INACTIVE) 복사본으로 복제해 저장 후 반환.
 
@@ -584,6 +659,7 @@ class AutoDMCampaign(models.Model):
             "status",
             "total_sent",
             "total_failed",
+            "total_unconfirmed",
             "created_at",
             "updated_at",
             "started_at",
@@ -656,9 +732,20 @@ class AutoDMCampaign(models.Model):
         if not self.is_active():
             return False
 
-        # 최근 1시간 동안 발송된 DM 개수 체크
+        # 최근 1시간 동안 "실제 발송 시도/접수" 건수만 카운트.
+        # QUEUED(=defer 대기)·SKIPPED·실패 건을 세면 defer 누적분이 한도를 먹어
+        # 영영 안 풀리는 데드락이 생기므로 제외한다.
         one_hour_ago = timezone.now() - timedelta(hours=1)
-        recent_sends = self.dm_logs.filter(created_at__gte=one_hour_ago).count()
+        recent_sends = self.dm_logs.filter(
+            created_at__gte=one_hour_ago,
+            status__in=[
+                SentDMLog.Status.SUBMITTING,
+                SentDMLog.Status.ACCEPTED,
+                SentDMLog.Status.DELIVERED,
+                SentDMLog.Status.READ,
+                SentDMLog.Status.SENT,  # legacy
+            ],
+        ).count()
 
         return recent_sends < self.max_sends_per_hour
 
@@ -676,6 +763,18 @@ class AutoDMCampaign(models.Model):
 
         type(self).objects.filter(pk=self.pk).update(
             total_failed=F("total_failed") + 1, updated_at=timezone.now()
+        )
+
+    def increment_unconfirmed(self):
+        """도착미확인(FAILED_NO_TRACE) 카운트 증가 (원자적).
+
+        200 접수됐으나 echo/Conversations API 로 도착을 확인 못 한 건.
+        '실패'가 아니라 '미확인' 이므로 total_failed 와 분리해 success_rate 를 깎지 않는다.
+        """
+        from django.db.models import F
+
+        type(self).objects.filter(pk=self.pk).update(
+            total_unconfirmed=F("total_unconfirmed") + 1, updated_at=timezone.now()
         )
 
     # ===== 신규 로직 헬퍼 =====
@@ -868,6 +967,16 @@ class SentDMLog(models.Model):
         Status.SENT,  # legacy
     )
 
+    # 되살릴 수 있는 종결 상태 (P1 — 무손실 하드닝):
+    # 토큰 만료(일시적, 재연동/갱신으로 해소)·스케줄 스킵(창이 다시 열림)은 '일시적 원인'이라
+    # 같은 row 를 QUEUED 로 되돌려 재발송할 수 있다(같은 idempotency_key 재사용 → 중복 INSERT 불가).
+    # 제외: FAILED_WINDOW(정당한 메시징 윈도우 만료), FAILED_PARAM(잘못된 데이터),
+    #       FAILED_NO_TRACE(이미 ACCEPTED=발송됨, 되살리면 중복 발송).
+    REVIVABLE_STATUSES = (
+        Status.FAILED_TOKEN,
+        Status.SKIPPED,
+    )
+
     class Meta:
         db_table = "sent_dm_logs"
         verbose_name = "Sent DM Log"
@@ -1020,6 +1129,47 @@ class SentDMLog(models.Model):
     def is_delivered(self) -> bool:
         """사용자에게 '도착함'이라 보고 가능한지"""
         return self.status in self.DELIVERED_STATUSES
+
+    def messaging_window(self):
+        """이 로그가 발송 가능한 메시징 윈도우 (comment Private Reply 7일 / user_id DM 24h).
+
+        rate-limit/한도로 오래 defer 되거나, 되살림(revive) 시점이 윈도우 밖이면
+        어차피 Meta 가 거부하므로 이 경계를 단일 판단 기준으로 쓴다.
+        """
+        from datetime import timedelta
+
+        return timedelta(days=7) if self.comment_id else timedelta(hours=24)
+
+    def revive(self, reason: str = "", enqueue: bool = True) -> bool:
+        """실패 종결 로그를 '제자리에서' QUEUED 로 되살림 (P1 — 무손실 하드닝).
+
+        같은 row·같은 idempotency_key 를 재사용하므로 중복 INSERT(duplicate) 문제가 원천 차단된다.
+        대상은 REVIVABLE_STATUSES(FAILED_TOKEN/SKIPPED) 뿐이며, 메시징 윈도우가 이미
+        지났으면(어차피 Meta 거부) 되살리지 않는다.
+
+        Args:
+            reason: verification_log 에 남길 사유.
+            enqueue: True 면 send_dm_task 를 즉시 재투입.
+        Returns:
+            되살렸으면 True, 대상 아님/윈도우 만료면 False.
+        """
+        if self.status not in self.REVIVABLE_STATUSES:
+            return False
+        if timezone.now() - self.created_at >= self.messaging_window():
+            return False
+
+        old_status = self.status
+        self.status = self.Status.QUEUED
+        self.next_retry_at = None
+        self.save(update_fields=["status", "next_retry_at"])
+        self.append_verification_log(
+            {"path": "revive", "reason": reason or "manual", "from": old_status}
+        )
+        if enqueue:
+            from .tasks import send_dm_task
+
+            send_dm_task.delay(str(self.id))
+        return True
 
     def mark_submitting(self):
         """API 호출 시작"""
@@ -1316,3 +1466,110 @@ class EventInbox(models.Model):
 
     def __str__(self) -> str:
         return f"{self.event_key} ({'done' if self.processed_at else 'pending'})"
+
+
+class SeenComment(models.Model):
+    """댓글 관측 장부 (웹훅 누락 보정용) — 본문(text) 저장 안 함.
+
+    목적:
+        Instagram ``comments`` 웹훅은 전달이 보장되지 않아(36h 후 드롭) 트리거 댓글이
+        유실될 수 있다. 시간당 폴링이 댓글 edge 를 재조회해 누락분을 찾는데, 이때
+        "이미 본 댓글"을 빠르게 건너뛰고(앵커) 페이지네이션을 끊기 위한 최소 장부다.
+
+    중요 — 정확성의 하드 보증이 아니다:
+        DM "정확히 한 번"의 하드 보증은 ``SentDMLog.idempotency_key`` UNIQUE 제약이다.
+        이 장부는 폴링 앵커/관측을 위한 최적화 레이어이며, TTL(``expires_at``)로 만료돼
+        ``integrations.cleanup_comment_ledger`` 가 주기 삭제한다. 장부가 비어 있어도
+        idempotency_key 가 중복 발송을 막으므로 정확성에는 영향이 없다.
+
+    생성 경로:
+        - 웹훅: ``process_comment_and_send_dm`` 가 수신 즉시 기록(source=webhook).
+          웹훅 payload(value.id / value.media.id)만으로 생성 가능 — 별도 Meta API 호출 불필요.
+        - 폴링: ``poll_missed_comments`` 가 댓글 edge 응답으로 기록(source=poll).
+        UNIQUE(ig_connection, comment_id) 라서 ``get_or_create`` 의 created 플래그가 곧 앵커 판정.
+    """
+
+    class Source(models.TextChoices):
+        WEBHOOK = "webhook", "웹훅"
+        POLL = "poll", "폴링"
+
+    ig_connection = models.ForeignKey(
+        IGAccountConnection,
+        on_delete=models.CASCADE,
+        related_name="seen_comments",
+        verbose_name="Instagram Connection",
+    )
+    comment_id = models.CharField(max_length=255, verbose_name="댓글 ID")
+    media_id = models.CharField(
+        max_length=255,
+        db_index=True,
+        blank=True,
+        default="",
+        verbose_name="Media ID",
+    )
+    source = models.CharField(
+        max_length=10,
+        choices=Source.choices,
+        default=Source.WEBHOOK,
+        verbose_name="관측 경로",
+    )
+    triggered = models.BooleanField(
+        default=False,
+        verbose_name="DM 트리거됨",
+        help_text="매칭되어 DM enqueue 했는지 (관측/디버그용)",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="최초 관측 시각")
+    expires_at = models.DateTimeField(db_index=True, verbose_name="만료 시각(TTL)")
+
+    class Meta:
+        db_table = "seen_comments"
+        verbose_name = "Seen Comment"
+        verbose_name_plural = "Seen Comments"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["ig_connection", "comment_id"],
+                name="uq_seen_comment_conn_comment",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["ig_connection", "media_id"]),
+            models.Index(fields=["expires_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"SeenComment({self.comment_id} via {self.source})"
+
+
+class DMAccountBlock(models.Model):
+    """IG 계정별 Action Block(Meta code 368 등) 쿨다운의 **내구 저장소**.
+
+    rate_governor 의 Action Block 상태는 원래 Redis(`dm:ab:cooldown/level:*`)에만 있어
+    Redis flush / DR failover 시 소실 → 차단됐던 계정이 재개되어 Meta 차단을 '연장' 시키는
+    위험이 있었다. 이 테이블을 진실로 두고 Redis 는 fast-path 캐시로 쓴다:
+
+    - ``trip_action_block`` 가 캐시 + 이 행을 함께 upsert (듀얼라이트)
+    - ``action_block_cooldown_remaining`` 는 캐시 miss 시 이 행으로 폴백 + 캐시 재프라임
+    - ``rate_governor.rehydrate_from_db`` 가 Redis 손실 후 이 행들로 캐시 재시드
+
+    키는 IG 계정 단위(``external_account_id``) — Meta 한도가 계정당이므로(거버너 키와 동일).
+    설계: DR_IMPLEMENTATION_PLAN.md §7.2.
+    """
+
+    external_account_id = models.CharField(
+        max_length=255, unique=True, db_index=True, verbose_name="Instagram Account ID"
+    )
+    cooldown_until = models.DateTimeField(
+        null=True, blank=True, verbose_name="쿨다운 종료 시각(이 시각까지 발송 차단)"
+    )
+    level = models.IntegerField(default=0, verbose_name="에스컬레이션 레벨(반복 차단 횟수)")
+    last_tripped_at = models.DateTimeField(null=True, blank=True, verbose_name="마지막 트립 시각")
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "dm_account_block"
+        verbose_name = "DM Account Block"
+        verbose_name_plural = "DM Account Blocks"
+        indexes = [models.Index(fields=["cooldown_until"], name="dm_acct_block_cooldown_idx")]
+
+    def __str__(self) -> str:
+        return f"DMAccountBlock({self.external_account_id} until={self.cooldown_until} L{self.level})"

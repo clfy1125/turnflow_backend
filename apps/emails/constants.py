@@ -40,9 +40,8 @@ AVAILABLE_VARIABLES: dict[str, dict[str, str]] = {
     TEMPLATE_PASSWORD_RESET: {
         "full_name": "수신자 이름",
         "email": "수신자 이메일",
-        "reset_code": "6자리 숫자 재설정 코드",
-        "reset_url": "클릭 시 비밀번호 재설정 페이지로 이동하는 URL",
-        "expires_minutes": "코드/링크 유효 시간(분)",
+        "reset_url": "클릭 시 비밀번호 재설정 페이지로 이동하는 URL (token 쿼리 포함)",
+        "expires_minutes": "링크 유효 시간(분)",
         "service_name": "서비스명",
         "support_email": "고객센터 이메일",
     },

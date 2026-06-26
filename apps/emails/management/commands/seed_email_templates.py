@@ -73,14 +73,11 @@ DEFAULTS: dict[str, dict[str, str]] = {
         "html_body": _wrap(
             """
 <p>안녕하세요, <strong>{{ full_name }}</strong>님.</p>
-<p>비밀번호 재설정 요청을 받았습니다. 아래 버튼을 눌러 비밀번호를 변경해 주세요.</p>
-<p style="text-align:center;margin:24px 0;">
+<p>비밀번호 재설정 요청을 받았습니다. 아래 버튼을 눌러 비밀번호를 변경해 주세요. (유효시간 {{ expires_minutes }}분)</p>
+<p style="text-align:center;margin:28px 0;">
   <a href="{{ reset_url }}" style="display:inline-block;padding:12px 28px;background:#4f46e5;color:#ffffff;text-decoration:none;border-radius:8px;font-weight:600;">비밀번호 재설정하기</a>
 </p>
-<p>또는 아래 코드를 앱에서 입력해 주세요 (유효시간 {{ expires_minutes }}분):</p>
-<p style="text-align:center;margin:16px 0;">
-  <span style="display:inline-block;padding:12px 20px;background:#f3f4f6;color:#111827;font-size:22px;font-weight:700;letter-spacing:4px;border-radius:8px;">{{ reset_code }}</span>
-</p>
+<p style="font-size:13px;color:#6b7280;">버튼이 동작하지 않으면 아래 주소를 브라우저에 붙여넣으세요.<br><span style="word-break:break-all;color:#4f46e5;">{{ reset_url }}</span></p>
 <p style="font-size:13px;color:#6b7280;">본인이 요청하지 않았다면 이 메일을 무시하세요. 다른 사람이 요청했을 수도 있습니다.</p>
 """,
             preheader="{{ service_name }} 비밀번호 재설정",

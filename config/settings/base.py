@@ -4,6 +4,7 @@ Django settings for Instagram Service Backend project.
 Base settings - shared across all environments.
 """
 
+from datetime import timedelta
 from pathlib import Path
 
 from celery.schedules import crontab
@@ -51,6 +52,9 @@ MIDDLEWARE = [
     "whitenoise.middleware.WhiteNoiseMiddleware",
     "apps.core.middleware.RequestIDMiddleware",
     "apps.core.middleware.LoggingMiddleware",
+    # DR: passive 사이트(SITE_ID != SiteControl.active_site)에서 요청 503 차단 (split-brain 방지).
+    # 평상시 active 사이트에서는 완전 no-op. /healthz*, /internal/scheduler/* 는 하드 예외.
+    "apps.core.middleware.ActiveSiteGateMiddleware",
     # /api/v1/insights/* 전체 503 차단 (INSIGHTS_API_ENABLED=False 일 때만 동작)
     "apps.insights.middleware.InsightsDisabledMiddleware",
     "corsheaders.middleware.CorsMiddleware",
@@ -266,8 +270,6 @@ SPECTACULAR_SETTINGS = {
 }
 
 # Simple JWT Settings
-from datetime import timedelta
-
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(days=1),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
@@ -364,15 +366,31 @@ CELERY_BEAT_SCHEDULE = {
         "task": "apps.integrations.tasks.reconcile_stuck_submitting",
         "schedule": 30,  # 30초 — SUBMITTING 정체 건 재시도
     },
+    "dm-requeue-deferred": {
+        "task": "apps.integrations.tasks.requeue_deferred_dms",
+        "schedule": 30,  # 30초 — next_retry_at 도래한 defer(QUEUED) 건 순차(FIFO) 재투입
+    },
     "dm-dead-letter-alerter": {
         "task": "apps.integrations.tasks.dead_letter_alerter",
         "schedule": 60 * 10,  # 10분 — 토큰 만료/도착 미확인 누적 알림
+    },
+    # 백로그 위험(윈도우 만료 임박/오래된 대기) Telegram 경고 (P7 — E1 손실 예방).
+    "dm-backlog-alert": {
+        "task": "apps.integrations.tasks.dm_backlog_alert",
+        "schedule": 60 * 30,  # 30분
     },
     # ===== DM 예약 발송: 활성 기간 자동 종료 =====
     # scheduled_end_at 이 지난 ACTIVE 캠페인을 COMPLETED 로 전환 (멱등).
     "dm-enforce-campaign-schedules": {
         "task": "apps.integrations.tasks.enforce_campaign_schedules",
         "schedule": 60,  # 1분 — 종료 예약 시각 경과 캠페인 자동 종료
+    },
+    # ===== 댓글 웹훅 누락 보정 =====
+    # comments 웹훅 유실 대비 — specific_media 캠페인의 (connection,media) 댓글을 재조회해
+    # 누락 DM 보정. 발송은 rate_governor 가 throttle. MISSED_COMMENT_POLL_ENABLED 로 토글.
+    "dm-poll-missed-comments": {
+        "task": "integrations.poll_missed_comments",
+        "schedule": 60 * 60,  # 1시간
     },
     # ===== GATE-0 백업 관측 =====
     # 실제 백업은 호스트 cron(deploy/backups/pg_backup.sh + pgBackRest)에서 수행.
@@ -383,11 +401,25 @@ CELERY_BEAT_SCHEDULE = {
         "options": {"queue": "billing"},
     },
     # ===== IG Long-lived Token 자동 갱신 =====
-    # 매일 KST 09:00 — 만료까지 14일 미만 ACTIVE 연동의 token refresh + Telegram 요약.
+    # 6시간마다 — 만료까지 14일 미만 ACTIVE 연동의 token refresh + (후보 있을 때만) Telegram 요약.
+    # v3.10: daily 09:00 → 6h 주기로 강화 (한 번 실패한 연동을 하루 방치하지 않도록).
+    # 토큰 복구 성공 시 그 연결의 FAILED_TOKEN 발송을 자동 되살림(revive_failed_token_logs).
     # Meta 정책: ig_refresh_token 호출 시 60일 신규 발급. 활성 사용자는 사실상 영구 유지.
     "ig-refresh-tokens-pending-expiry": {
         "task": "apps.integrations.tasks.refresh_ig_tokens_pending_expiry",
-        "schedule": crontab(hour=9, minute=0),  # CELERY_TIMEZONE=Asia/Seoul 기준
+        "schedule": crontab(minute=0, hour="*/6"),  # CELERY_TIMEZONE=Asia/Seoul 기준
+    },
+    # 매일 KST 04:00 — 미인증 상태로 N일(기본 1일) 경과한 가입 계정 정리.
+    # 기본은 비활성(UNVERIFIED_ACCOUNT_CLEANUP_ENABLED=False) + dry-run 이라 안전.
+    "cleanup-unverified-accounts": {
+        "task": "authentication.cleanup_unverified_accounts",
+        "schedule": crontab(hour=4, minute=0),  # CELERY_TIMEZONE=Asia/Seoul 기준
+        "options": {"queue": "billing"},
+    },
+    # 매일 KST 04:30 — 만료된 댓글 관측 장부(SeenComment) 정리.
+    "cleanup-comment-ledger": {
+        "task": "integrations.cleanup_comment_ledger",
+        "schedule": crontab(hour=4, minute=30),  # CELERY_TIMEZONE=Asia/Seoul 기준
     },
     # ===== Instagram Insights 동기화 (임시 비활성) =====
     # insights 기능 출시 보류 — Meta IG insights API 호출이 발생하지 않도록 4개 beat 모두 주석 처리.
@@ -480,6 +512,34 @@ META_APP_SECRET = config("META_APP_SECRET", default="")
 # True(기본): 동시 UPDATE 레이스 제거 + webhook 응답 빨라짐.
 # False: 레거시 inline 처리로 즉시 롤백 (코드 재배포 없이 env 만으로).
 WEBHOOK_ASYNC_MESSAGING = config("WEBHOOK_ASYNC_MESSAGING", default=True, cast=bool)
+
+# P3 — 웹훅 POST 의 X-Hub-Signature-256 (HMAC) 검증 강제 여부.
+# False(기본): 불일치 시 경고만 남기고 처리(롤아웃 중 Meta 서명 수신 여부 관측).
+# True: 불일치/누락 시 403 (위조 페이로드 차단). META/INSTAGRAM_APP_SECRET 설정 + 검증 후 전환.
+WEBHOOK_HMAC_ENFORCED = config("WEBHOOK_HMAC_ENFORCED", default=False, cast=bool)
+
+# ─────────────────────────────────────────────────────────────
+# DM 발송 속도 거버너 (per-IG-account, Meta 안전속도)
+# ─────────────────────────────────────────────────────────────
+# Meta 물리 한도: 게시물/릴스 댓글 Private Reply = 계정당 750 calls/hour.
+# rate_governor 가 계정 단위로 시간당/분당 발송을 페이싱하고, 초과 시 다음 윈도우로 defer.
+# 켜는 순간 free/저플랜 발송율이 plan·캡 값으로 제한됨(운영 공지 필요).
+DM_GOVERNOR_ENABLED = config("DM_GOVERNOR_ENABLED", default=True, cast=bool)
+IG_PRIVATE_REPLY_HOURLY_CAP = config("IG_PRIVATE_REPLY_HOURLY_CAP", default=700, cast=int)
+
+# P4 — Action Block(code 368 등) 감지 시 계정별 발송 쿨다운(에스컬레이팅 24h→×2, 상한 7일).
+# 차단 중 재시도가 차단 기간을 연장시키므로, 쿨다운 동안 그 계정 DM 을 Meta 로 보내지 않는다.
+DM_ACTION_BLOCK_BASE_COOLDOWN_HOURS = config(
+    "DM_ACTION_BLOCK_BASE_COOLDOWN_HOURS", default=24, cast=int
+)
+DM_ACTION_BLOCK_MAX_COOLDOWN_DAYS = config("DM_ACTION_BLOCK_MAX_COOLDOWN_DAYS", default=7, cast=int)
+
+# P10 — 동일 수신자(같은 캠페인) 쿨다운 초. 단시간 다중 댓글/답장 시 한 번만 발송(계정 보호).
+DM_RECIPIENT_COOLDOWN_SECONDS = config("DM_RECIPIENT_COOLDOWN_SECONDS", default=300, cast=int)
+
+# P7 — 백로그 경고 임계. window 만료 임박 판정 시간 / 가장 오래된 QUEUED 경고 시간.
+DM_BACKLOG_RISK_HOURS = config("DM_BACKLOG_RISK_HOURS", default=6, cast=int)
+DM_BACKLOG_OLDEST_ALERT_HOURS = config("DM_BACKLOG_OLDEST_ALERT_HOURS", default=2, cast=int)
 
 # ─────────────────────────────────────────────────────────────
 # Telegram 운영 알림 (토큰 refresh / 장애 등)
@@ -579,6 +639,29 @@ SUPPORT_EMAIL = config("SUPPORT_EMAIL", default="support@turnflow.clfy.ai.kr")
 EMAIL_VERIFICATION_TTL_MINUTES = config("EMAIL_VERIFICATION_TTL_MINUTES", default=30, cast=int)
 PASSWORD_RESET_TTL_MINUTES = config("PASSWORD_RESET_TTL_MINUTES", default=60, cast=int)
 
+# 미인증 계정 정리(authentication.cleanup_unverified_accounts) — 비가역 삭제이므로 안전 기본값.
+# ENABLED=False 면 태스크가 아무것도 하지 않음. DRY_RUN=True 면 후보만 로그로 남기고 삭제하지 않음.
+# 운영 투입: 먼저 ENABLED=True + DRY_RUN=True 로 후보를 며칠 관찰 → 이후 DRY_RUN=False 로 실삭제 전환.
+UNVERIFIED_ACCOUNT_CLEANUP_ENABLED = config(
+    "UNVERIFIED_ACCOUNT_CLEANUP_ENABLED", default=False, cast=bool
+)
+UNVERIFIED_ACCOUNT_CLEANUP_DRY_RUN = config(
+    "UNVERIFIED_ACCOUNT_CLEANUP_DRY_RUN", default=True, cast=bool
+)
+UNVERIFIED_ACCOUNT_RETENTION_DAYS = config("UNVERIFIED_ACCOUNT_RETENTION_DAYS", default=1, cast=int)
+
+# ===== 댓글 웹훅 누락 보정 (integrations.poll_missed_comments) =====
+# Instagram comments 웹훅이 유실되면 트리거 댓글이 누락되므로, 시간당 댓글 edge 를 재조회해
+# 누락 DM 을 보정한다. 본문은 저장 안 하고 comment_id 최소 장부(SeenComment)만 TTL 보관.
+# 발송량은 기존 rate_governor 가 throttle 하므로 폴링 측 추가 제한 불필요.
+MISSED_COMMENT_POLL_ENABLED = config("MISSED_COMMENT_POLL_ENABLED", default=True, cast=bool)
+MISSED_COMMENT_LEDGER_TTL_DAYS = config("MISSED_COMMENT_LEDGER_TTL_DAYS", default=10, cast=int)
+PRIVATE_REPLY_WINDOW_DAYS = config("PRIVATE_REPLY_WINDOW_DAYS", default=7, cast=int)
+MISSED_COMMENT_POLL_PAGE_SIZE = config("MISSED_COMMENT_POLL_PAGE_SIZE", default=50, cast=int)
+# 폭주 방지 상한 — 정상 종료는 앵커 또는 7일 baseline. 소진 시 Telegram 경고.
+MISSED_COMMENT_POLL_MAX_PAGES = config("MISSED_COMMENT_POLL_MAX_PAGES", default=20, cast=int)
+MISSED_COMMENT_POLL_MAX_TARGETS = config("MISSED_COMMENT_POLL_MAX_TARGETS", default=1000, cast=int)
+
 # Onboarding drip campaign offsets (days after signup)
 ONBOARDING_DRIP_DAYS = [3, 7, 14]
 
@@ -592,3 +675,30 @@ ONBOARDING_ENABLED = config("ONBOARDING_ENABLED", default=False, cast=bool)
 # CSRF_TRUSTED_ORIGINS=https://pro-earwig-presently.ngrok-free.app,https://example.com
 _csrf_env = config("CSRF_TRUSTED_ORIGINS", default="")
 CSRF_TRUSTED_ORIGINS = [o.strip() for o in _csrf_env.split(",") if o.strip()]
+
+# ─────────────────────────────────────────────────────────────
+# DR (Disaster Recovery) — active_site 락 / 헬스 / 외부 스케줄러
+# 상세: DR_IMPLEMENTATION_PLAN.md
+# ─────────────────────────────────────────────────────────────
+# 이 서버의 정체성. 콜로=colo / 사내=office / Azure=azure. .env 로 서버별 지정.
+SITE_ID = config("SITE_ID", default="colo")
+
+# passive 사이트가 읽기 GET 을 서빙할지. 기본 False = fully-dark(쓰기·읽기 모두 503, 헬스/내부 제외).
+PASSIVE_ALLOW_READS = config("PASSIVE_ALLOW_READS", default=False, cast=bool)
+
+# /healthz/ready 가 스케줄러 heartbeat 신선도까지 요구할지. 기본 False(초기 alert-only, 자기유발 failover 방지).
+READY_REQUIRE_SCHEDULER_HEARTBEAT = config(
+    "READY_REQUIRE_SCHEDULER_HEARTBEAT", default=False, cast=bool
+)
+# /healthz/ready 가 형제 tier(web_webhook/web_external)의 /healthz/live 까지 프로빙할지.
+READY_PROBE_SIBLINGS = config("READY_PROBE_SIBLINGS", default=False, cast=bool)
+# 프로빙 대상 URL(콤마구분). 예: "http://web_webhook:8000/api/v1/healthz/live,http://web_external:8000/api/v1/healthz/live"
+_ready_siblings = config("READY_SIBLING_URLS", default="")
+READY_SIBLING_URLS = [u.strip() for u in _ready_siblings.split(",") if u.strip()]
+
+# 외부 스케줄러 tick 인증 — 공유 시크릿(상수시간 비교) + 송신 IP 허용목록.
+SCHEDULER_TICK_SECRET = config("SCHEDULER_TICK_SECRET", default="")
+_tick_ips = config("SCHEDULER_TICK_ALLOWED_IPS", default="")
+SCHEDULER_TICK_ALLOWED_IPS = [ip.strip() for ip in _tick_ips.split(",") if ip.strip()]
+# tick 성공 시 ping 할 dead-man 모니터 URL(Healthchecks.io 등). 비면 no-op.
+HEALTHCHECKS_TICK_URL = config("HEALTHCHECKS_TICK_URL", default="")

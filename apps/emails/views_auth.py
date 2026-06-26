@@ -24,7 +24,7 @@ from .serializers import (
     ResendVerificationSerializer,
     VerifyEmailRequestSerializer,
 )
-from .tasks import send_password_reset_email, send_verification_email
+from .tasks import send_password_reset_email, send_verification_email, send_welcome_email
 
 User = get_user_model()
 
@@ -177,6 +177,8 @@ class VerifyEmailView(generics.GenericAPIView):
             user.is_email_verified = True
             user.email_verified_at = timezone.now()
             user.save(update_fields=["is_email_verified", "email_verified_at"])
+            # 환영 메일은 최초 인증 성공 시점에만 1회 발송 (재인증 시 위 가드로 중복 방지).
+            send_welcome_email.delay(user.id)
 
         return Response({"is_email_verified": True})
 
@@ -208,11 +210,19 @@ await fetch('/api/v1/auth/password/reset-request/', {{
 ```
         """,
         request=PasswordResetRequestSerializer,
+        examples=[
+            OpenApiExample(
+                "재설정 요청",
+                request_only=True,
+                value={"email": "user@example.com"},
+            ),
+        ],
         responses={
             202: OpenApiResponse(
                 description="큐잉 완료 (계정 존재 여부와 관계 없이 동일 응답)",
                 response={"type": "object", "properties": {"detail": {"type": "string"}}},
             ),
+            400: OpenApiResponse(description="이메일 형식 오류 또는 누락"),
         },
     )
     def post(self, request):
@@ -252,12 +262,23 @@ class PasswordResetConfirmView(generics.GenericAPIView):
 | 400 | 토큰 만료/사용됨, 비밀번호 불일치 또는 정책 위반 |
         """,
         request=PasswordResetConfirmSerializer,
+        examples=[
+            OpenApiExample(
+                "재설정 확인",
+                request_only=True,
+                value={
+                    "token": "메일 링크의 token 값",
+                    "new_password": "NewStrongPass123!",
+                    "new_password_confirm": "NewStrongPass123!",
+                },
+            ),
+        ],
         responses={
             200: OpenApiResponse(
                 description="재설정 완료",
                 response={"type": "object", "properties": {"detail": {"type": "string"}}},
             ),
-            400: OpenApiResponse(description="토큰/비밀번호 오류"),
+            400: OpenApiResponse(description="토큰 만료/사용됨, 비밀번호 불일치 또는 정책 위반"),
         },
     )
     def post(self, request):

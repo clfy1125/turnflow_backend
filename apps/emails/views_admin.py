@@ -39,7 +39,6 @@ def _sample_context(key: str) -> dict:
         "email": "user@example.com",
         "verification_code": "482930",
         "verification_url": f"{settings.FRONTEND_URL}/verify-email?token=SAMPLE_TOKEN",
-        "reset_code": "593021",
         "reset_url": f"{settings.FRONTEND_URL}/reset-password?token=SAMPLE_TOKEN",
         "expires_minutes": settings.EMAIL_VERIFICATION_TTL_MINUTES,
         "service_name": settings.SERVICE_NAME,

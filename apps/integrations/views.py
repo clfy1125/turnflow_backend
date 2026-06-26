@@ -27,6 +27,7 @@ from apps.ai_jobs.serializers import (
     AutoDMCampaignAiSuggestJobSerializer,
     AutoDMCampaignAiSuggestRequestSerializer,
 )
+from apps.core.exceptions import DuplicateActiveCampaignError
 from apps.workspace.models import Workspace
 
 from .campaign_stats import (
@@ -488,9 +489,9 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 # 재연동 = 완전 교체 (멱등):
                 # 같은 (workspace, 계정) 의 기존 연동이 있으면 — revoked/error/expired 포함 —
                 # 새 행을 만들지 않고 그 행을 그대로 재활성화하고 토큰/메타데이터를 덮어쓴다.
-                # (workspace, external_account_id) 에 유니크 제약이 없어 get_or_create 는
-                # 과거 중복 행에서 MultipleObjectsReturned 로 터질 수 있으므로 filter().first() 로
-                # 안전하게 가장 최근 행을 잡고, 없으면 새로 만든다.
+                # P5: (workspace, external_account_id) 에 UNIQUE 제약(uq_igconn_ws_account)을 추가해
+                # 중복 행 생성을 DB 레벨에서 막았다(캠페인 고아화 방지). 기존 데이터는 마이그레이션
+                # 0026 이 dedupe 했다. filter().first() 는 이제 항상 ≤1 행을 안전하게 잡는다.
                 connection = (
                     IGAccountConnection.objects.filter(
                         workspace=workspace,
@@ -1736,6 +1737,49 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
             return AutoDMCampaignListSerializer
         return AutoDMCampaignSerializer
 
+    def _assert_no_active_media_conflict(
+        self, *, ig_connection_id, media_id, trigger_type, exclude_id=None
+    ):
+        """같은 게시물(media_id)에 이미 다른 활성 캠페인이 있으면 409 로 차단 (raw 검사).
+
+        생성 경로처럼 "새로" 그 게시물을 점유하는 경우에 직접 호출한다.
+        이미 그 게시물을 점유 중인 캠페인의 활성화 유지/단순 수정은 ``_guard_activation_conflict``
+        를 사용해 슬롯 무변경 시 검사를 건너뛴다(next_media fan-out 보호).
+        """
+        conflict = AutoDMCampaign.find_active_conflict(
+            ig_connection_id=ig_connection_id,
+            media_id=media_id,
+            trigger_type=trigger_type,
+            exclude_id=exclude_id,
+        )
+        if conflict is not None:
+            raise DuplicateActiveCampaignError.for_conflict(conflict, (media_id or "").strip())
+
+    def _guard_activation_conflict(self, campaign, *, media_id=None, trigger_type=None):
+        """기존 캠페인을 ACTIVE 로 만들/유지할 때 중복 차단.
+
+        ``campaign`` 의 **현재 상태 기준**으로, 활성 슬롯(active + 같은 media_id)을 이미
+        점유 중이면(슬롯 무변경) 검사를 건너뛴다. next_media 자동 fan-out 으로 같은
+        media_id 에 활성 캠페인이 여러 개 정당하게 존재할 수 있으므로, 이미 활성인 캠페인의
+        no-op 활성화/단순 수정까지 막지 않기 위함이다(슬롯이 "새로 바뀔" 때만 검사).
+
+        호출 시점에 ``campaign.status`` 는 아직 변경 전(원래 상태)이어야 한다.
+        """
+        target_media = campaign.media_id if media_id is None else media_id
+        target_trigger = campaign.trigger_type if trigger_type is None else trigger_type
+        already_occupying = (
+            campaign.status == AutoDMCampaign.Status.ACTIVE
+            and (campaign.media_id or "").strip() == (target_media or "").strip()
+        )
+        if already_occupying:
+            return
+        self._assert_no_active_media_conflict(
+            ig_connection_id=campaign.ig_connection_id,
+            media_id=target_media,
+            trigger_type=target_trigger,
+            exclude_id=campaign.id,
+        )
+
     def get_queryset(self):
         """사용자의 workspace에 속한 캠페인만 조회.
 
@@ -2708,6 +2752,16 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         6. 예약 발송: `scheduled_start_at` 이전엔 발송하지 않고, `scheduled_end_at` 이후엔
            자동 종료(`completed`)됩니다. 응답의 `schedule_state` 로 현재 상태 확인.
 
+        ## 중복 방지 (한 게시물 = 활성 캠페인 1개)
+        같은 Instagram 게시물(`media_id`)에 **활성(active) 캠페인을 둘 이상** 만들 수 없습니다.
+        이미 활성 캠페인이 있는 게시물로 생성하면 **HTTP 409** 로 거부됩니다.
+        - 적용 대상: `trigger_type=specific_media` / `story_reply` (즉 특정 게시물/스토리 지정).
+          `any_media`(계정 전체) · 아직 attach 안 된 `next_media` 는 특정 게시물을 점유하지 않아
+          이 제한에서 제외됩니다.
+        - 409 응답의 `error.details` 에 충돌 캠페인 정보가 담깁니다
+          (`code="duplicate_active_campaign"`, `conflict_campaign_id`, `conflict_campaign_name`, `media_id`).
+        - 기존 캠페인을 **일시정지/종료**하면 같은 게시물로 새 캠페인을 만들 수 있습니다.
+
         ## 주의사항
         - Workspace에 활성화된 Instagram 연결이 있어야 함
         - Meta에서 `instagram_manage_messages` 권한 승인 필요
@@ -2721,6 +2775,12 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
             ),
             403: OpenApiResponse(description="권한 없음 (해당 workspace의 멤버가 아님)"),
             404: OpenApiResponse(description="Workspace를 찾을 수 없음"),
+            409: OpenApiResponse(
+                description=(
+                    "중복 — 같은 게시물(media_id)에 이미 활성 캠페인이 있음. "
+                    "error.details.code='duplicate_active_campaign', 충돌 캠페인 id/name 포함."
+                )
+            ),
         },
         parameters=[
             OpenApiParameter(
@@ -2786,6 +2846,16 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
+        # 중복 방지: 같은 게시물에 이미 활성 캠페인이 있으면 409 로 차단.
+        # 생성 캠페인은 항상 ACTIVE 로 시작하므로 status gate 없이 항상 검사한다.
+        self._assert_no_active_media_conflict(
+            ig_connection_id=ig_connection.id,
+            media_id=serializer.validated_data.get("media_id", ""),
+            trigger_type=serializer.validated_data.get(
+                "trigger_type", AutoDMCampaign.TriggerType.SPECIFIC_MEDIA
+            ),
+        )
+
         # 캠페인 생성
         campaign = AutoDMCampaign.objects.create(
             ig_connection=ig_connection, **serializer.validated_data
@@ -2813,10 +2883,22 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
             "기존 Auto DM 캠페인을 수정합니다(전체 교체, PUT).\n\n"
             "예약 발송 필드 `scheduled_start_at` / `scheduled_end_at` 도 함께 수정할 수 있습니다 "
             "(부분 변경은 PATCH 또는 `POST .../{id}/schedule/` 권장). "
-            "`scheduled_end_at` 은 `scheduled_start_at` 보다 미래여야 합니다."
+            "`scheduled_end_at` 은 `scheduled_start_at` 보다 미래여야 합니다.\n\n"
+            "**중복 방지**: 이 수정으로 캠페인이 `status=active` 가 되는데 같은 게시물(`media_id`)에 "
+            "이미 다른 활성 캠페인이 있으면 **HTTP 409** 로 거부됩니다 "
+            "(`error.details.code='duplicate_active_campaign'`). status 가 active 로 바뀌지 않는 "
+            "수정(이름만 변경, 일시정지 등)은 차단되지 않습니다."
         ),
         request=AutoDMCampaignUpdateSerializer,
-        responses={200: AutoDMCampaignSerializer},
+        responses={
+            200: AutoDMCampaignSerializer,
+            409: OpenApiResponse(
+                description=(
+                    "중복 — 활성화하려는 게시물에 이미 활성 캠페인이 있음 "
+                    "(error.details.code='duplicate_active_campaign')."
+                )
+            ),
+        },
         tags=["Auto DM"],
     )
     def update(self, request, pk=None):
@@ -2824,6 +2906,7 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         campaign = self.get_object()
         serializer = self.get_serializer(campaign, data=request.data, partial=False)
         serializer.is_valid(raise_exception=True)
+        self._guard_update_active_conflict(campaign, serializer.validated_data)
         serializer.save()
         return Response(serializer.data)
 
@@ -2833,10 +2916,21 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
             "Auto DM 캠페인의 일부 필드만 수정합니다(PATCH).\n\n"
             "예약 발송 창만 바꾸려면 `scheduled_start_at` / `scheduled_end_at` 만 보내면 됩니다 "
             "(보내지 않은 필드는 기존 값 유지). 활성화까지 한 번에 처리하려면 "
-            "`POST .../{id}/schedule/` 를 사용하세요."
+            "`POST .../{id}/schedule/` 를 사용하세요.\n\n"
+            "**중복 방지**: 이 수정으로 캠페인이 `status=active` 가 되는데 같은 게시물(`media_id`)에 "
+            "이미 다른 활성 캠페인이 있으면 **HTTP 409** 로 거부됩니다 "
+            "(`error.details.code='duplicate_active_campaign'`)."
         ),
         request=AutoDMCampaignUpdateSerializer,
-        responses={200: AutoDMCampaignSerializer},
+        responses={
+            200: AutoDMCampaignSerializer,
+            409: OpenApiResponse(
+                description=(
+                    "중복 — 활성화하려는 게시물에 이미 활성 캠페인이 있음 "
+                    "(error.details.code='duplicate_active_campaign')."
+                )
+            ),
+        },
         tags=["Auto DM"],
     )
     def partial_update(self, request, pk=None):
@@ -2844,8 +2938,27 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         campaign = self.get_object()
         serializer = self.get_serializer(campaign, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
+        self._guard_update_active_conflict(campaign, serializer.validated_data)
         serializer.save()
         return Response(serializer.data)
+
+    def _guard_update_active_conflict(self, campaign, validated_data):
+        """수정(PUT/PATCH) 결과가 ACTIVE 일 때만 중복 검사.
+
+        media_id/trigger_type 도 함께 바뀔 수 있으므로 "변경 후" 값으로 판단한다.
+        ACTIVE 가 아니면(일시정지 등) 점유하지 않으므로 검사하지 않는다. 이미 같은 게시물을
+        활성 점유 중인 캠페인의 단순 수정(이름 변경 등)은 ``_guard_activation_conflict`` 가
+        슬롯 무변경으로 보고 건너뛴다(next_media fan-out 보호).
+        ig_connection 은 읽기전용이라 기존 값을 그대로 쓴다.
+        """
+        resulting_status = validated_data.get("status", campaign.status)
+        if resulting_status != AutoDMCampaign.Status.ACTIVE:
+            return
+        self._guard_activation_conflict(
+            campaign,
+            media_id=validated_data.get("media_id", campaign.media_id),
+            trigger_type=validated_data.get("trigger_type", campaign.trigger_type),
+        )
 
     @extend_schema(
         summary="캠페인 삭제",
@@ -2886,15 +2999,28 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
             "자동 종료 배치가 다시 종료시킵니다. 이를 막기 위해 재개 시 **과거가 된 "
             "scheduled_end_at 은 자동으로 해제(null)** 합니다. 기간을 다시 지정하려면 "
             "`POST .../schedule/` 또는 PATCH 로 새 종료일을 설정하세요.\n\n"
+            "**중복 방지**: 재개하려는 게시물(`media_id`)에 이미 다른 활성 캠페인이 있으면 "
+            "**HTTP 409** 로 거부됩니다(`error.details.code='duplicate_active_campaign'`). "
+            "기존 활성 캠페인을 먼저 일시정지/종료하세요.\n\n"
             "응답은 **목록 항목과 동일한 형태(통계 enrichment 포함)** 의 갱신된 캠페인 객체입니다."
         ),
-        responses={200: AutoDMCampaignListSerializer},
+        responses={
+            200: AutoDMCampaignListSerializer,
+            409: OpenApiResponse(
+                description=(
+                    "중복 — 같은 게시물에 이미 활성 캠페인이 있어 재개 불가 "
+                    "(error.details.code='duplicate_active_campaign')."
+                )
+            ),
+        },
         tags=["Auto DM"],
     )
     @action(detail=True, methods=["post"])
     def resume(self, request, pk=None):
         """캠페인 재개 (과거가 된 종료 예약은 해제)"""
         campaign = self.get_object()
+        # 중복 방지: 재개하려는 게시물에 이미 다른 활성 캠페인이 있으면 409 (저장 전, status 변경 전 차단)
+        self._guard_activation_conflict(campaign)
         campaign.status = AutoDMCampaign.Status.ACTIVE
         # 종료 예약이 이미 지났으면 즉시 재종료되지 않도록 해제
         if campaign.scheduled_end_at and campaign.scheduled_end_at <= timezone.now():
@@ -2905,6 +3031,78 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         campaign.save()
         serializer = self.get_serializer(campaign)
         return Response(serializer.data)
+
+    @extend_schema(
+        summary="실패한 DM 재발송 (프리미엄)",
+        description=(
+            "토큰 만료(`failed_token`)·스케줄 스킵(`skipped`)으로 종결된 이 캠페인의 DM 로그를 "
+            "**제자리에서 되살려(QUEUED) 재발송**합니다. 같은 idempotency_key 를 재사용하므로 "
+            "중복 발송은 발생하지 않습니다.\n\n"
+            "**사용 시나리오**: 인스타 계정을 재연동/토큰 갱신한 뒤, 토큰이 끊겼던 동안 누락된 "
+            "DM 을 한 번에 복구하고 싶을 때.\n\n"
+            "**되살림 조건**: 메시징 윈도우(댓글 7일 / user_id 24시간) 내인 건만 되살립니다. "
+            "윈도우를 넘긴 건(어차피 Meta 가 거부)·`failed_window`·`failed_param`·`failed_no_trace`"
+            "(이미 접수됨)는 대상이 아닙니다.\n\n"
+            "**요금제**: 유료(프리미엄) 플랜 전용. 무료 플랜은 403 을 반환합니다.\n\n"
+            "**인증**: `Authorization: Bearer <access_token>`."
+        ),
+        request=None,
+        responses={
+            200: OpenApiResponse(
+                description="되살림 완료",
+                examples=[
+                    OpenApiExample(
+                        "성공", value={"revived": 12, "scanned": 15, "campaign_id": "..."}
+                    )
+                ],
+            ),
+            401: OpenApiResponse(description="인증 누락/만료"),
+            403: OpenApiResponse(description="무료 플랜 — 프리미엄 전용 기능"),
+            404: OpenApiResponse(description="캠페인 없음(또는 권한 밖)"),
+        },
+        tags=["Auto DM"],
+    )
+    @action(detail=True, methods=["post"], url_path="retry-failed")
+    def retry_failed(self, request, pk=None):
+        """토큰 만료/스킵으로 죽은 DM 을 제자리 되살림 (프리미엄 전용)."""
+        from apps.billing.subscription_utils import get_user_plan
+
+        # 프리미엄 게이트 — 무료 플랜은 차단.
+        try:
+            plan_name = (get_user_plan(request.user).name or "free").lower()
+        except Exception:  # noqa: BLE001 - 플랜 조회 실패는 보수적으로 free 취급
+            plan_name = "free"
+        if plan_name == "free":
+            return Response(
+                {
+                    "success": False,
+                    "error": {
+                        "code": 403,
+                        "message": "실패 DM 재발송은 프리미엄(유료) 플랜 전용 기능입니다.",
+                        "details": {"plan": plan_name},
+                    },
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        campaign = self.get_object()
+        logs = list(
+            campaign.dm_logs.filter(status__in=list(SentDMLog.REVIVABLE_STATUSES)).order_by(
+                "created_at"
+            )[:1000]
+        )
+        revived = 0
+        for log in logs:
+            try:
+                if log.revive(reason="premium_manual_retry"):
+                    revived += 1
+            except Exception:  # noqa: BLE001
+                logger.exception("retry_failed: revive 실패 log=%s", log.id)
+
+        return Response(
+            {"revived": revived, "scanned": len(logs), "campaign_id": str(campaign.id)},
+            status=status.HTTP_200_OK,
+        )
 
     @extend_schema(
         summary="캠페인 일괄 일시정지",
@@ -2933,7 +3131,10 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         description=(
             "여러 캠페인을 한 번에 재개(status=active)합니다. 과거가 된 종료 예약은 건별로 "
             "자동 해제합니다(단건 resume 과 동일 규칙).\n\n"
-            "요청/응답 형식은 일괄 일시정지와 동일."
+            "요청/응답 형식은 일괄 일시정지와 동일.\n\n"
+            "**중복 방지**: 같은 게시물(`media_id`)에 이미 다른 활성 캠페인이 있는 건은 재개되지 않고 "
+            "`failed` 에 `reason='duplicate_active_campaign'` 으로 담깁니다(전체 실패가 아니라 건별 격리). "
+            '프론트는 이 사유를 받아 "이미 활성 캠페인이 있어 재개하지 못했습니다" 안내를 보여주세요.'
         ),
         request=CampaignBulkActionRequestSerializer,
         responses={
@@ -2999,6 +3200,20 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
                     campaign.status = AutoDMCampaign.Status.PAUSED
                     campaign.save(update_fields=["status", "updated_at"])
                 elif op == "resume":
+                    # 중복 방지: 같은 게시물에 이미 다른 활성 캠페인이 있으면 이 건만 실패로 격리
+                    # (벌크는 건별 부분 성공이므로 raise 하지 않고 failed 에 사유를 담는다).
+                    # 이미 그 게시물을 활성 점유 중이면(슬롯 무변경) 검사 생략 — fan-out 보호.
+                    already_occupying = campaign.status == AutoDMCampaign.Status.ACTIVE
+                    if not already_occupying:
+                        conflict = AutoDMCampaign.find_active_conflict(
+                            ig_connection_id=campaign.ig_connection_id,
+                            media_id=campaign.media_id,
+                            trigger_type=campaign.trigger_type,
+                            exclude_id=campaign.id,
+                        )
+                        if conflict is not None:
+                            failed.append({"id": cid, "reason": "duplicate_active_campaign"})
+                            continue
                     campaign.status = AutoDMCampaign.Status.ACTIVE
                     if campaign.scheduled_end_at and campaign.scheduled_end_at <= now:
                         campaign.scheduled_end_at = None
@@ -3099,6 +3314,9 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         - `scheduled_end_at` 은 `scheduled_start_at` 보다 미래여야 합니다.
         - `scheduled_end_at` 은 현재 시각보다 미래여야 합니다(과거면 즉시 종료되므로 거부).
         - 시각은 타임존 포함을 권장합니다 (서버 기준 Asia/Seoul, UTC 저장).
+        - **중복 방지**: `activate=true` 로 활성화하는데 같은 게시물(`media_id`)에 이미 다른 활성
+          캠페인이 있으면 **HTTP 409** 로 거부됩니다(`error.details.code='duplicate_active_campaign'`).
+          `activate=false`(예약 창만 갱신)는 이 검사를 거치지 않습니다.
 
         ## 동작 방식
         1. 댓글/스토리 웹훅 처리 시, 현재 시각이 활성 기간 안인 캠페인만 발송 후보가 됩니다.
@@ -3130,6 +3348,12 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
             401: OpenApiResponse(description="인증 필요"),
             403: OpenApiResponse(description="권한 없음 (해당 workspace 멤버 아님)"),
             404: OpenApiResponse(description="캠페인을 찾을 수 없음"),
+            409: OpenApiResponse(
+                description=(
+                    "중복 — activate=true 인데 같은 게시물에 이미 활성 캠페인이 있음 "
+                    "(error.details.code='duplicate_active_campaign')."
+                )
+            ),
         },
         tags=["Auto DM"],
     )
@@ -3146,6 +3370,9 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         update_fields = ["scheduled_start_at", "scheduled_end_at", "updated_at"]
 
         if data.get("activate", True):
+            # 중복 방지: 활성화와 함께 예약하는 경우, 같은 게시물에 이미 다른 활성 캠페인이 있으면 409
+            # (status 변경 전 검사 — 이미 같은 게시물을 활성 점유 중이면 슬롯 무변경으로 통과).
+            self._guard_activation_conflict(campaign)
             campaign.status = AutoDMCampaign.Status.ACTIVE
             campaign.ended_at = None
             update_fields += ["status", "ended_at"]
@@ -3221,6 +3448,8 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         stats = {
             "total_sent": campaign.total_sent,
             "total_failed": campaign.total_failed,
+            # FAILED_NO_TRACE(도착 미확인)는 '실패'가 아니라 '미확인' → 별도 노출, success_rate 분모 제외.
+            "total_unconfirmed": campaign.total_unconfirmed,
             "success_rate": (
                 campaign.total_sent / (campaign.total_sent + campaign.total_failed) * 100
                 if (campaign.total_sent + campaign.total_failed) > 0
@@ -3498,12 +3727,37 @@ def _mark_log_read_by_mid(mid: str, logger) -> None:
 )
 @api_view(["GET", "POST"])
 @permission_classes([AllowAny])
+def _verify_webhook_signature(request, logger) -> bool:
+    """X-Hub-Signature-256 (앱 시크릿 키 HMAC-SHA256, 원본 바디 기준) 검증 (P3).
+
+    Meta 는 webhook POST 에 이 서명을 함께 보낸다. 일치해야 정품 페이로드.
+    app secret 미설정(로컬/mock)이면 검증 불가 → 통과(True) 처리한다.
+    타이밍-세이프 비교(hmac.compare_digest).
+    """
+    import hashlib
+    import hmac as _hmac
+
+    from .services import InstagramOAuthService
+
+    secret = InstagramOAuthService.get_instagram_app_secret()
+    if not secret:
+        return True  # secret 없으면(로컬/mock) 검증 생략
+    header = request.META.get("HTTP_X_HUB_SIGNATURE_256", "") or request.headers.get(
+        "X-Hub-Signature-256", ""
+    )
+    if not header or not header.startswith("sha256="):
+        return False
+    received = header.split("=", 1)[1].strip()
+    expected = _hmac.new(secret.encode("utf-8"), request.body, hashlib.sha256).hexdigest()
+    return _hmac.compare_digest(received, expected)
+
+
 def instagram_webhook(request):
     """
     Instagram Webhook 엔드포인트
 
     GET: Webhook 인증
-    POST: Webhook 이벤트 수신
+    POST: Webhook 이벤트 수신 (X-Hub-Signature-256 HMAC 검증)
     """
     if request.method == "GET":
         # Webhook 인증
@@ -3527,6 +3781,18 @@ def instagram_webhook(request):
         import logging
 
         logger = logging.getLogger(__name__)
+
+        # ★ P3: 웹훅 위조 차단 — X-Hub-Signature-256 (HMAC) 검증.
+        # WEBHOOK_HMAC_ENFORCED=True 면 불일치 시 403 (정품 아닌 페이로드 거부),
+        # False(기본)면 경고만 남기고 처리(롤아웃 중 Meta 서명 수신 여부 관측 단계).
+        if not _verify_webhook_signature(request, logger):
+            if getattr(settings, "WEBHOOK_HMAC_ENFORCED", False):
+                logger.warning("Instagram webhook: invalid X-Hub-Signature-256 → 403 (enforced)")
+                return HttpResponse("Forbidden", status=403)
+            logger.warning(
+                "Instagram webhook: invalid/missing X-Hub-Signature-256 "
+                "(WEBHOOK_HMAC_ENFORCED=False — 처리 진행)"
+            )
 
         try:
             # 받은 데이터 파싱

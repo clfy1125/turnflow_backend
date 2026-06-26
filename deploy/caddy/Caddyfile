@@ -7,19 +7,101 @@
 # 따라서 업스트림은 **Docker DNS 서비스 이름:컨테이너포트** 로 지정한다 (127.0.0.1 은 Caddy 자신!).
 #
 # 적용:  이 파일을 /root/caddy/Caddyfile 로 복사 후
-#        docker exec -w /etc/caddy caddy caddy reload --config /etc/caddy/Caddyfile   (무중단 reload, ~2s)
+#        docker exec -w /etc/caddy caddy caddy validate --config /etc/caddy/Caddyfile   (먼저 검증!)
+#        docker exec -w /etc/caddy caddy caddy reload   --config /etc/caddy/Caddyfile   (무중단 reload, ~2s)
 #
-# P4a: SLA 3-tier 라우팅 (web_webhook / web_external / web_dashboard, 모두 컨테이너 포트 8000).
-# P1a: llm.clfy 잠금.
+# ══════════════════════════════════════════════════════════════════════════════
+# ‼️ 배포 의존성 (반드시 숙지)
+#   이 파일은 **3-tier** 업스트림(web_webhook / web_external / web_dashboard)을 가정한다 →
+#   docker-compose.prod.yml(3-tier) 가 떠 있어야 한다. 현 실서버가 단일 `turnflow_instagram_web`
+#   라면 이 파일 reload 시 **전부 502**. ⇒ compose 3-tier 컷오버와 **함께** 배포할 것.
+#   롤백(단일 업스트림): 맨 아래 [LEGACY] 블록으로 api 블록을 교체 후 reload.
+# ══════════════════════════════════════════════════════════════════════════════
 #
-# 롤백(컷오버 취소): 3개 핸들을 옛 단일 업스트림으로 되돌리고 reload. 아래 [LEGACY] 블록 참고.
+# 이상 트래픽 방어 — Method A (단일 도메인 + 경로별 규칙).  계층: Cloudflare(엣지) → Caddy(여기) → Django.
+#   ✅ 활성(스톡 Caddy 안전): trusted_proxies(정적 CF CIDR) · per-route 본문 캡 · 비정상 메소드 405 · 응답 헤더 하드닝
+#   🔒 주석(켜기 전 검증 필수): @not_cf 403 · PayApp/admin IP 허용목록   ← ufw+프록시 검증 후 활성화
+#   🧱 주석(xcaddy 커스텀 빌드 필요): rate_limit zone           ← 스톡 바이너리엔 rate_limit 모듈 없음(reload 깨짐)
+#
+# P4a: SLA 3-tier 라우팅.  P1a: llm.clfy 잠금.
+
+# ── 전역 옵션 ──────────────────────────────────────────────────────────────────
+{
+	servers {
+		# Cloudflare 가 보내는 Cf-Connecting-Ip 를 진짜 클라이언트 IP 로 신뢰한다.
+		# (정적 CIDR — 스톡 바이너리 호환. 동적 `cloudflare` IP 소스는 xcaddy 모듈이라 미사용.)
+		# 목록 갱신: https://www.cloudflare.com/ips/ (대역은 자주 안 바뀜)
+		trusted_proxies static 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32
+		client_ip_headers Cf-Connecting-Ip X-Forwarded-For
+		max_header_size 32KB
+		# read_body 는 미설정(무제한) — 느린 모바일 업로드 보호. 본문 폭주는 per-route max_size 로 차단.
+		timeouts {
+			read_header 10s
+			idle 60s
+		}
+		protocols h1 h2
+	}
+}
 
 api.turnflow.clfy.ai.kr {
 	encode zstd gzip
 
-	# ── Tier 1: Instagram webhook (fast path) ──
+	# ── 응답 헤더 하드닝 ──
+	# (요청측 X-Real-IP/True-Client-IP 위조는 위 trusted_proxies+client_ip_headers 가 무력화 — Caddy 는
+	#  Cf-Connecting-Ip 만 신뢰. Django 도 진짜 IP 는 Cf-Connecting-Ip / 관리된 XFF 에서 읽도록 설정할 것.)
+	header {
+		-Server
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		# HSTS 는 Caddy TLS 가 자동 — 명시하려면 주석 해제:
+		# Strict-Transport-Security "max-age=31536000; includeSubDomains"
+	}
+
+	# ── 비정상 HTTP 메소드 차단(스캐너) ── (OPTIONS = CORS preflight 이라 허용)
+	@bad_method {
+		not method GET POST PUT PATCH DELETE OPTIONS HEAD
+	}
+	handle @bad_method {
+		respond "Method Not Allowed" 405
+	}
+
+	# ── DR: 헬스 경로는 web_dashboard 로 결정적 라우팅(CF LB 모니터 일관성) ──
+	@health path /api/v1/healthz /api/v1/healthz/live /api/v1/healthz/ready
+	handle @health {
+		reverse_proxy web_dashboard:8000 {
+			transport http {
+				keepalive 30s
+				keepalive_idle_conns 512
+				max_conns_per_host 0
+			}
+		}
+	}
+
+	# ── DR: production 모드에서도 /maintenance-health → 200 (CF LB office 풀 모니터 단순화).
+	#    maintenance→production 스왑 시 CF 모니터 경로를 안 바꿔도 통과(옵션 a). ──
+	@maint_health path /maintenance-health
+	handle @maint_health {
+		respond "OK" 200
+	}
+
+	# 🔒 [OPT-IN] 비-Cloudflare 오리진 거부 — raw 서버 IP 직접 타격 차단.
+	#    ⚠️ 켜기 전 필수: (1) DNS 가 전 레코드 CF 프록시(오렌지구름) 확인, (2) 호스트 ufw 에 SSH 허용.
+	#       오설정 시 전면 락아웃(헬스체크 포함). 127.0.0.1:8001~8003 디버그 포트로 먼저 스모크 테스트.
+	#    (이 handle 은 @bad_method 다음, @webhook 보다 먼저 배치할 것.)
+	# @not_cf not remote_ip 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32
+	# handle @not_cf {
+	# 	respond "Forbidden" 403 {
+	# 		close
+	# 	}
+	# }
+
+	# ════════ Tier 1: Instagram 웹훅 (fast path → web_webhook, t/o 10) ════════
+	# ⚠️ 웹훅은 절대 rate_limit/챌린지 하지 않는다(Meta 소수 IP·정당 버스트). 위조 차단은 Django HMAC.
 	@webhook path /api/v1/integrations/instagram/webhook /api/v1/integrations/instagram/webhook/*
 	handle @webhook {
+		request_body {
+			max_size 512KB
+		}
 		reverse_proxy web_webhook:8000 {
 			transport http {
 				keepalive 30s
@@ -29,16 +111,15 @@ api.turnflow.clfy.ai.kr {
 		}
 	}
 
-	# ── Tier 3: external-IO 격리 (link 메타 스크랩, Graph proxy/test, importers, AI views) ──
-	# ⚠️ prefix 는 config/api_urls.py + apps/pages/link_urls.py 와 대조해 조정할 것.
-	@external {
-		path /api/v1/pages/link/*
-		path /api/v1/pages/*/fetch-meta*
-		path /api/v1/pages/importers/*
-		path /api/v1/pages/aiviews/*
-		path /api/v1/integrations/instagram/*/test*
-	}
+	# ════════ Tier 3: external-IO 격리 (→ web_external, 4x16) ════════
+	# 외부 호출/스크랩/AI·LLM/임포트 — SSRF·고비용 경로를 대시보드 풀에서 격리.
+	# ⚠️ 매처 경로는 실제 URLconf 와 대조 (config/api_urls.py: link=/api/v1/link/, ai=/api/v1/ai/, pages.ai=/api/v1/pages/ai/).
+	#    과거 버그: `/api/v1/pages/link/*` 는 실 경로와 불일치 → 격리 무력화(audit M-19). 아래는 교정본.
+	@external path /api/v1/link/* /api/v1/pages/ai/* /api/v1/ai/* /api/v1/pages/products/coupang/lookup /api/v1/pages/products/coupang/lookup/ /api/v1/integrations/instagram/*/test*
 	handle @external {
+		request_body {
+			max_size 30MB
+		}
 		reverse_proxy web_external:8000 {
 			transport http {
 				keepalive 30s
@@ -48,8 +129,14 @@ api.turnflow.clfy.ai.kr {
 		}
 	}
 
-	# ── Tier 2: dashboard / API / admin (default) ──
-	handle {
+	# ════════ Tier 2: 그 외 dashboard / API / admin / 공개페이지 (→ web_dashboard, 12x4) ════════
+
+	# 인증 경로 — 본문 작음(로그인/가입). 무차별 RL 은 Cloudflare + Django throttle 담당.
+	@auth path /api/v1/auth/*
+	handle @auth {
+		request_body {
+			max_size 128KB
+		}
 		reverse_proxy web_dashboard:8000 {
 			transport http {
 				keepalive 30s
@@ -58,19 +145,94 @@ api.turnflow.clfy.ai.kr {
 			}
 		}
 	}
+
+	# 페이지 미디어 업로드 — 큰 본문 허용(이미지). 외부호출 아님 → 대시보드 티어.
+	# (path 한 줄 = OR. 여러 줄로 나누면 AND 되어 매칭 안 됨!)
+	@media path /api/v1/pages/me/media /api/v1/pages/me/media/* /api/v1/pages/multipages/*/media /api/v1/pages/multipages/*/media/*
+	handle @media {
+		request_body {
+			max_size 30MB
+		}
+		reverse_proxy web_dashboard:8000 {
+			transport http {
+				keepalive 30s
+				keepalive_idle_conns 512
+				max_conns_per_host 0
+			}
+		}
+	}
+
+	# 기본(대시보드/API/admin/공개페이지) — default 5MB: 페이지 저장 등 큰 JSON 커버. 실 p99 측정 후 하향 권장.
+	handle {
+		request_body {
+			max_size 5MB
+		}
+		reverse_proxy web_dashboard:8000 {
+			transport http {
+				keepalive 30s
+				keepalive_idle_conns 512
+				max_conns_per_host 0
+			}
+		}
+	}
+
+	# 🔒 [OPT-IN] PayApp 결제 feedback 소스 IP 허용목록 (audit M-17).
+	#    ⚠️ (1) PayApp 송신 IP 서면 확인, (2) 한 결제 주기 관찰 후 활성화. <PAYAPP_IP> 치환.
+	#    위 handle 들보다 **먼저** 배치해야 매칭됨(handle 은 첫 매칭 우선).
+	# @payapp_block {
+	# 	path /api/v1/billing/payapp/feedback /api/v1/billing/payapp/feedback/ /api/v1/billing/payapp/fail /api/v1/billing/payapp/fail/
+	# 	not remote_ip <PAYAPP_IP_1> <PAYAPP_IP_2> <PAYAPP_CIDR/24>
+	# }
+	# handle @payapp_block {
+	# 	respond "Forbidden" 403
+	# }
+
+	# 🔒 [OPT-IN] admin 면 IP 허용목록. 동적 IP 면 Cloudflare Access(Zero Trust) 권장.
+	#    위 handle 들보다 **먼저** 배치. <OFFICE_CIDR>/<OPERATOR_IP> 치환.
+	# @admin_block {
+	# 	path /admin /admin/* /api/v1/admin /api/v1/admin/*
+	# 	not remote_ip <OFFICE_OR_VPN_CIDR> <OPERATOR_IP>
+	# }
+	# handle @admin_block {
+	# 	respond "Forbidden" 403
+	# }
 }
 
-# ── LiteLLM proxy — 잠금(P1a). 약한 마스터키(sk-master-key-admin1234) 회전 + 아래 한 겹 추가 ──
+# ──────────────────────────────────────────────────────────────────────────────
+# 🧱 [P1 업그레이드] Caddy rate_limit (CF 의 defense-in-depth + 내부망 버스트 차단)
+#    rate_limit 모듈은 **스톡 caddy 에 없다** → xcaddy 커스텀 빌드 후 컨테이너 교체 필요.
+#    (Caddyfile reload 가 아니라 이미지 재빌드 + docker run. 유지보수 창에서 진행.)
+#
+#    # ---- Dockerfile.caddy ----
+#    # FROM caddy:2-builder AS builder
+#    # RUN xcaddy build --with github.com/mholt/caddy-ratelimit
+#    # FROM caddy:2
+#    # COPY --from=builder /usr/bin/caddy /usr/bin/caddy
+#    # docker build -f Dockerfile.caddy -t turnflow_caddy:rl .
+#    # docker rm -f caddy && docker run -d --name caddy --restart unless-stopped -p 80:80 -p 443:443 \
+#    #   -v /root/caddy:/etc/caddy -v caddy_data:/data -v caddy_config:/config \
+#    #   --network turnflow_instagram_net turnflow_caddy:rl
+#
+#    빌드 후, @auth handle 안에 추가:
+#       rate_limit { zone auth_zone { key {http.request.client_ip}; events 20; window 1m } }
+#    @external handle 안에 추가(AI 비용 버스트):
+#       rate_limit { zone ai_cost_zone { key {http.request.client_ip}; events 60; window 1m } }
+#    기본 handle 안에 추가:
+#       rate_limit { zone default_zone { key {http.request.client_ip}; events 600; window 1m } }
+#    ⚠️ @webhook 과 공개페이지 GET(/api/v1/pages/@...) 은 rate_limit 하지 말 것.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── LiteLLM proxy — 잠금(P1a). 약한 마스터키 회전 + 아래 한 겹 추가 ──
 llm.clfy.ai.kr {
 	encode zstd gzip
 
-	# Option A — IP 허용목록(권장, defense-in-depth). 앱 서버/알려진 클라이언트 IP 만 허용.
+	# Option A — IP 허용목록(권장). 앱 서버/알려진 클라이언트 IP 만 허용.
 	# @blocked not remote_ip 1.2.3.4 5.6.7.8
 	# handle @blocked {
 	# 	respond "Forbidden" 403
 	# }
 
-	# Option B — LiteLLM 앞단 basic-auth (생성: docker exec caddy caddy hash-password).
+	# Option B — basic-auth (생성: docker exec caddy caddy hash-password).
 	# basic_auth {
 	# 	turnflow <bcrypt-hash>
 	# }
@@ -83,7 +245,8 @@ monitor.clfy.ai.kr {
 	reverse_proxy 172.19.0.1:19999
 }
 
-# ── [LEGACY] 컷오버 전/롤백용 단일 업스트림. 위 api 블록 대신 이걸로 바꾸고 reload 하면 즉시 원복.
+# ── [LEGACY] 컷오버 전/롤백용 단일 업스트림(하드닝 없음). 위 api 블록 대신 이걸로 바꾸고 reload 하면 즉시 원복.
+#    (단일 compose `turnflow_instagram_web` 로 되돌릴 때 사용.)
 # api.turnflow.clfy.ai.kr {
 # 	reverse_proxy turnflow_instagram_web:8000 {
 # 		transport http { keepalive 30s; keepalive_idle_conns 512; max_conns_per_host 0 }

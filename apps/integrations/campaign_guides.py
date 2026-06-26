@@ -16,6 +16,11 @@ TRIGGER_TYPE_GUIDE: list[dict] = [
         "description": ("선택한 한 개의 게시물에 달린 댓글에 대해서만 자동 DM을 발송합니다."),
         "requires": ["media_id"],
         "tier": "free",
+        "notes": [
+            "한 게시물에는 활성(active) 캠페인을 하나만 둘 수 있습니다. 이미 활성 캠페인이 있는 "
+            "게시물로 생성/활성화하면 409(duplicate_active_campaign)로 거부됩니다 — "
+            "기존 캠페인을 일시정지/종료 후 다시 시도하세요.",
+        ],
     },
     {
         "value": "any_media",
@@ -211,14 +216,35 @@ LINK_BUTTON_GUIDE: dict = {
 }
 
 
+# 중복 방지 안내 (v4.2 — 한 게시물 = 활성 캠페인 1개)
+DUPLICATE_PREVENTION_GUIDE: dict = {
+    "headline": "한 게시물에는 활성 캠페인 1개",
+    "description": (
+        "같은 Instagram 게시물에 활성(active) 캠페인을 둘 이상 만들 수 없습니다. "
+        "한 댓글에 여러 캠페인이 동시에 트리거되어 사용자가 중복 DM을 받는 사고를 막기 위함입니다."
+    ),
+    "items": [
+        "적용 대상: 특정 게시물(specific_media) · 특정 Story(story_reply). "
+        "모든 게시물(any_media)·미부착 next_media 는 특정 게시물을 점유하지 않아 제외됩니다.",
+        "이미 활성 캠페인이 있는 게시물로 생성/활성화(수정·재개·예약 활성화)하면 "
+        "HTTP 409 로 거부됩니다.",
+        "409 응답의 error.details.code 는 'duplicate_active_campaign' 이며, "
+        "conflict_campaign_id / conflict_campaign_name / media_id 가 함께 담깁니다.",
+        "기존 캠페인을 일시정지(pause)하거나 종료하면 같은 게시물로 새 캠페인을 만들 수 있습니다.",
+        "일괄 재개(bulk-resume)에서 충돌한 건은 failed[].reason='duplicate_active_campaign' 으로 격리됩니다.",
+    ],
+}
+
+
 def build_campaign_guide() -> dict:
     """프론트가 한 번에 받아 갈 수 있는 통합 가이드."""
     return {
-        "version": "v4.1",
+        "version": "v4.2",
         "trigger_types": TRIGGER_TYPE_GUIDE,
         "keyword_modes": KEYWORD_MODE_GUIDE,
         "follow_gate": FOLLOW_GATE_GUIDE,
         "public_reply": PUBLIC_REPLY_GUIDE,
         "scheduling": SCHEDULING_GUIDE,
         "link_button": LINK_BUTTON_GUIDE,
+        "duplicate_prevention": DUPLICATE_PREVENTION_GUIDE,
     }

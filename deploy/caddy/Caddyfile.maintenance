@@ -1,0 +1,54 @@
+# Host Caddy — TurnFlow **MAINTENANCE 모드** (DR 스탠바이 전용).
+#
+# 용도: 사내(office) 스탠바이 서버가 passive 일 때 사용. CF LB 가 colo 장애로 office 풀로
+#       전환하면, 사용자는 이 점검 페이지를 본다. 복구·promote 완료 후 dr-agent 가
+#       production Caddyfile 로 스왑(reload)한다.
+#
+# 적용:
+#   cp deploy/caddy/Caddyfile.maintenance /etc/caddy/Caddyfile
+#   docker exec -w /etc/caddy caddy caddy validate --config /etc/caddy/Caddyfile
+#   docker exec -w /etc/caddy caddy caddy reload   --config /etc/caddy/Caddyfile
+#   복구 완료 후 production 스왑:  cp deploy/caddy/Caddyfile /etc/caddy/Caddyfile && reload
+#
+# 핵심:
+#   - /maintenance-health → 200 (항상)  → CF LB office 풀 모니터가 이 경로를 보고 풀을 healthy 로
+#     판단해야 사용자에게 'CF 에러'가 아닌 '점검 페이지'를 노출한다.
+#   - /api/v1/healthz/ready → 503        → production 스왑 전까지 readiness DOWN 유지(트래픽 본격 수용 X).
+#   - 그 외 모든 경로 → 정적 maintenance.html (HTTP 503).
+
+{
+	servers {
+		trusted_proxies static 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32
+		client_ip_headers Cf-Connecting-Ip X-Forwarded-For
+	}
+}
+
+api.turnflow.clfy.ai.kr {
+	encode zstd gzip
+
+	# CF LB office 풀 모니터 — 항상 200 (점검 페이지 노출용으로 풀을 healthy 로 유지)
+	@maint_health path /maintenance-health
+	handle @maint_health {
+		respond "OK" 200
+	}
+
+	# readiness 는 503 — production 스왑 전까지 본격 트래픽 수용 안 함
+	@ready path /api/v1/healthz/ready
+	handle @ready {
+		respond 503
+	}
+
+	# 그 외 전부 점검 페이지(HTTP 503) — file_server status 로 503 강제(Caddy 2.7+)
+	handle {
+		root * /srv/maintenance
+		rewrite * /maintenance.html
+		header Cache-Control "no-store"
+		file_server {
+			status 503
+		}
+	}
+}
+
+# 참고: maintenance.html 마운트 — caddy 컨테이너 run 시
+#   -v /root/maintenance:/srv/maintenance
+# 에 deploy/caddy/maintenance.html 을 /root/maintenance/maintenance.html 로 복사.

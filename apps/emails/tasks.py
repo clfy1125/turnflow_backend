@@ -96,7 +96,8 @@ def send_password_reset_email(user_id: int) -> None:
     ctx = _user_context(user)
     ctx.update(
         {
-            "reset_code": token_row.code,
+            # 비밀번호 재설정은 token(쿼리스트링) 기반 링크만 사용한다.
+            # 확인 엔드포인트(PasswordResetConfirmView)가 token 만 받으므로 코드 입력 경로는 없음.
             "reset_url": f"{settings.FRONTEND_URL}/reset-password?token={raw_token}",
             "expires_minutes": settings.PASSWORD_RESET_TTL_MINUTES,
         }

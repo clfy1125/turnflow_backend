@@ -31,6 +31,7 @@ from django.db import transaction
 from django.utils.dateparse import parse_datetime
 
 from apps.pages.models import Block, Page
+from apps.pages.services.css_remap import remap_block_ids_in_css
 from apps.pages.validators import validate_block_data
 
 _PAGE_META_FIELDS = ("title", "is_public", "data", "custom_css")
@@ -114,6 +115,12 @@ def apply_result_json_to_page(page: Page, result_json: dict) -> Page:
             id_map[old_id] = new_block.id
     if not id_map:
         return page
+
+    # custom_css 의 data-block-id 를 새 블록 PK 로 치환 (result_json css 는 옛 PK 기준).
+    remapped_css = remap_block_ids_in_css(page.custom_css, id_map)
+    if remapped_css != page.custom_css:
+        page.custom_css = remapped_css
+        page.save(update_fields=["custom_css", "updated_at"])
 
     to_update: list[Block] = []
     for block in created:

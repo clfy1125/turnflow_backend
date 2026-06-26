@@ -3,8 +3,8 @@ Instagram OAuth and Mock Provider services
 """
 
 import threading
-from datetime import datetime, timedelta
-from typing import Dict, Optional
+from datetime import datetime
+from typing import Optional
 from urllib.parse import urlencode
 
 import requests
@@ -109,7 +109,7 @@ class InstagramOAuthService:
         return f"{cls.AUTHORIZE_URL}?{query_string}"
 
     @classmethod
-    def exchange_code_for_token(cls, code: str, redirect_uri: str) -> Dict:
+    def exchange_code_for_token(cls, code: str, redirect_uri: str) -> dict:
         """
         Exchange authorization code for short-lived Instagram User access token
 
@@ -134,7 +134,7 @@ class InstagramOAuthService:
         return result
 
     @classmethod
-    def get_long_lived_token(cls, short_lived_token: str) -> Dict:
+    def get_long_lived_token(cls, short_lived_token: str) -> dict:
         """
         Exchange short-lived token for long-lived token (60 days)
 
@@ -154,7 +154,7 @@ class InstagramOAuthService:
         return response.json()
 
     @classmethod
-    def refresh_long_lived_token(cls, long_lived_token: str) -> Dict:
+    def refresh_long_lived_token(cls, long_lived_token: str) -> dict:
         """
         Refresh a long-lived token for another 60 days
 
@@ -172,7 +172,7 @@ class InstagramOAuthService:
         return response.json()
 
     @classmethod
-    def get_account_info(cls, access_token: str) -> Dict:
+    def get_account_info(cls, access_token: str) -> dict:
         """
         Get Instagram professional account info for the logged-in user
 
@@ -191,7 +191,7 @@ class InstagramOAuthService:
     @classmethod
     def subscribe_to_webhooks(
         cls, ig_user_id: str, access_token: str, fields: str = "comments,messages"
-    ) -> Dict:
+    ) -> dict:
         """
         Enable webhook subscriptions for an Instagram professional account.
 
@@ -211,7 +211,7 @@ class InstagramOAuthService:
         return response.json()
 
     @classmethod
-    def unsubscribe_webhooks(cls, ig_user_id: str, access_token: str) -> Dict:
+    def unsubscribe_webhooks(cls, ig_user_id: str, access_token: str) -> dict:
         """
         Disable webhook subscriptions for an Instagram professional account.
 
@@ -236,7 +236,7 @@ class InstagramOAuthService:
             return {"success": True}
 
     @classmethod
-    def parse_signed_request(cls, signed_request: str) -> Optional[Dict]:
+    def parse_signed_request(cls, signed_request: str) -> Optional[dict]:
         """
         Meta Deauthorize Callback 의 signed_request 파싱.
 
@@ -345,7 +345,7 @@ class MockInstagramProvider:
         return f"{redirect_uri}?code={mock_code}&state={state}"
 
     @classmethod
-    def exchange_mock_code_for_token(cls, code: str) -> Dict:
+    def exchange_mock_code_for_token(cls, code: str) -> dict:
         """
         Simulate token exchange with mock data
 
@@ -372,7 +372,7 @@ class MockInstagramProvider:
         }
 
     @classmethod
-    def get_mock_long_lived_token(cls, short_lived_token: str) -> Dict:
+    def get_mock_long_lived_token(cls, short_lived_token: str) -> dict:
         """
         Simulate long-lived token exchange (60 days)
 
@@ -392,7 +392,7 @@ class MockInstagramProvider:
         }
 
     @classmethod
-    def get_mock_account_info(cls, access_token: str) -> Dict:
+    def get_mock_account_info(cls, access_token: str) -> dict:
         """
         Get mock account information
 
@@ -445,7 +445,18 @@ class InstagramMessagingService:
     DEFAULT_TIMEOUT = 10  # seconds
 
     @classmethod
-    def _get_headers(cls, access_token: str) -> Dict:
+    def _is_mock(cls) -> bool:
+        """Mock 모드 여부 (DEBUG=True + INSTAGRAM_MOCK_MODE=True).
+
+        InstagramMessagingService 는 InstagramOAuthService 를 상속하지 않으므로
+        is_mock_mode 를 물려받지 못한다 → _post_message 의 cls._is_mock() 가
+        과거 AttributeError 를 냈다. 동일 로직을 자체 정의해 보완.
+        prod 는 DEBUG=False 라 항상 False (실제 Meta 호출).
+        """
+        return settings.DEBUG and getattr(settings, "INSTAGRAM_MOCK_MODE", True)
+
+    @classmethod
+    def _get_headers(cls, access_token: str) -> dict:
         return {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
@@ -479,7 +490,7 @@ class InstagramMessagingService:
         access_token: str,
         quick_replies: Optional[list] = None,
         buttons: Optional[list] = None,
-    ) -> Dict:
+    ) -> dict:
         """
         Private Reply DM 발송 (POST /{ig_user_id}/messages, recipient.comment_id 사용)
 
@@ -514,7 +525,7 @@ class InstagramMessagingService:
         access_token: str,
         quick_replies: Optional[list] = None,
         buttons: Optional[list] = None,
-    ) -> Dict:
+    ) -> dict:
         """사용자 ID 기반 DM 발송 (24h 윈도우 내에서만 허용)."""
         url = f"{cls.GRAPH_API_BASE}/{ig_user_id}/messages"
         message = cls._build_message_payload(
@@ -533,7 +544,7 @@ class InstagramMessagingService:
         text: str,
         quick_replies: Optional[list] = None,
         buttons: Optional[list] = None,
-    ) -> Dict:
+    ) -> dict:
         """Meta IG message 페이로드 빌드.
 
         - buttons 있음 → generic template (카드 + postback 버튼)
@@ -559,7 +570,7 @@ class InstagramMessagingService:
                         },
                     }
                 }
-        message: Dict = {"text": text}
+        message: dict = {"text": text}
         if quick_replies:
             qr = cls._normalize_quick_replies(quick_replies)
             if qr:
@@ -639,7 +650,7 @@ class InstagramMessagingService:
             DMTokenError: code 190 등 토큰 무효 (즉시 처리 중단해야 함)
             DMTransientError: 5xx / 네트워크 (재시도 가능)
         """
-        from .dm_exceptions import TOKEN_CODES, DMApiError, DMTokenError, DMTransientError
+        from .dm_exceptions import TOKEN_CODES, DMTokenError, DMTransientError
 
         if not igsid:
             return None
@@ -687,7 +698,7 @@ class InstagramMessagingService:
         return bool(body.get("is_user_follow_business"))
 
     @classmethod
-    def _post_message(cls, url: str, payload: dict, access_token: str) -> Dict:
+    def _post_message(cls, url: str, payload: dict, access_token: str) -> dict:
         """공통 POST + 응답 강검증 + v3.2 에러 분류
 
         v3.2 매핑 (Meta v25 검증됨):
@@ -800,7 +811,7 @@ class InstagramMessagingService:
     # ===== 능동 검증: GET /{message_id} =====
 
     @classmethod
-    def fetch_message(cls, message_id: str, access_token: str) -> Optional[Dict]:
+    def fetch_message(cls, message_id: str, access_token: str) -> Optional[dict]:
         """
         GET /v25.0/{message_id} 로 메시지 단건 조회 (Conversations API).
 
@@ -863,6 +874,74 @@ class InstagramMessagingService:
 
         try:
             return resp.json()
+        except ValueError:
+            return None
+
+    @classmethod
+    def has_recent_message_to_recipient(
+        cls, ig_user_id: str, recipient_id: str, access_token: str, since_seconds: int = 900
+    ):
+        """우리(page) → recipient 로 최근 since_seconds 내 보낸 메시지가 있는지 확인 (P6).
+
+        message_id 없는 anomaly(200-no-msgid)·SUBMITTING 크래시 재발송 직전에
+        '이미 보냈는지'를 Conversations API 로 확인해 중복 발송을 막는다.
+
+        Returns:
+            True  — 최근 발송 흔적 있음(재발송 금지)
+            False — 흔적 없음(재발송해도 됨)
+            None  — 확인 불가(API 에러/미지원) → 호출부가 보수적으로 판단
+        """
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        if not (ig_user_id and recipient_id):
+            return None
+
+        url = f"{cls.GRAPH_API_BASE}/{ig_user_id}/conversations"
+        params = {
+            "platform": "instagram",
+            "user_id": str(recipient_id),
+            "fields": "messages.limit(5){from,created_time}",
+        }
+        try:
+            resp = get_http_session().get(
+                url,
+                params=params,
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=cls.DEFAULT_TIMEOUT,
+            )
+        except (requests.Timeout, requests.ConnectionError):
+            return None
+        if not resp.ok:
+            return None
+        try:
+            body = resp.json()
+        except ValueError:
+            return None
+
+        cutoff = timezone.now() - timedelta(seconds=since_seconds)
+        for conv in body.get("data") or []:
+            for m in ((conv.get("messages") or {}).get("data")) or []:
+                frm = (m.get("from") or {}).get("id")
+                if str(frm) != str(ig_user_id):
+                    continue  # 우리(page)가 보낸 메시지만
+                created = m.get("created_time") or ""
+                dt = cls._parse_graph_time(created)
+                if dt and dt >= cutoff:
+                    return True
+        return False
+
+    @staticmethod
+    def _parse_graph_time(value: str):
+        """Graph API created_time('2026-06-26T03:14:15+0000') 파싱. 실패 시 None."""
+        from datetime import datetime as _dt
+
+        if not value:
+            return None
+        v = value.replace("+0000", "+00:00").replace("Z", "+00:00")
+        try:
+            return _dt.fromisoformat(v)
         except ValueError:
             return None
 
@@ -1075,6 +1154,66 @@ class InstagramMediaService:
         except ValueError:
             return None
 
+    @classmethod
+    def list_media_comments(
+        cls,
+        media_id: str,
+        access_token: str,
+        limit: int = 50,
+        after: str | None = None,
+    ) -> dict:
+        """미디어의 top-level 댓글을 1페이지 조회 (웹훅 누락 보정 폴링용).
+
+        GET /v25.0/{media_id}/comments?fields=id,text,username,timestamp
+
+        Meta 사양 (v25.0): reverse-chronological(newest-first), 페이지당 최대 50,
+        **top-level 댓글만 반환**(대댓글 제외 — replies 필드 확장 미요청). cursor 페이지네이션.
+        ``from{id}`` 는 작성자 본인 토큰이 아니면 제한적이라 요청하지 않는다(username 으로 충분).
+
+        Returns:
+            {"data": [{"id","text","username","timestamp"}, ...],
+             "paging_after": "<cursor>" | None}   # 다음 페이지 없으면 None
+
+        실패(타임아웃/4xx/5xx) 시 ``{"data": [], "paging_after": None}`` 반환
+        (get_media_timestamp 와 동일한 방어적 처리 — 폴링은 best-effort).
+        """
+        if not media_id:
+            return {"data": [], "paging_after": None}
+
+        # Mock 모드(dev): 실제 API 호출 없이 no-op. 테스트는 이 메서드를 직접 patch.
+        if MockInstagramProvider.is_mock_mode():
+            return {"data": [], "paging_after": None}
+
+        url = f"{cls.GRAPH_API_BASE}/{media_id}/comments"
+        params = {
+            "fields": "id,text,username,timestamp",
+            "limit": limit,
+            "access_token": access_token,
+        }
+        if after:
+            params["after"] = after
+
+        try:
+            resp = requests.get(url, params=params, timeout=cls.DEFAULT_TIMEOUT)
+        except (requests.Timeout, requests.ConnectionError):
+            return {"data": [], "paging_after": None}
+
+        if not resp.ok:
+            return {"data": [], "paging_after": None}
+
+        try:
+            body = resp.json() or {}
+        except ValueError:
+            return {"data": [], "paging_after": None}
+
+        paging = body.get("paging") or {}
+        after_cursor = (paging.get("cursors") or {}).get("after")
+        # paging.next 가 있을 때만 다음 페이지 존재 → after 커서 반환
+        return {
+            "data": body.get("data", []) or [],
+            "paging_after": after_cursor if paging.get("next") else None,
+        }
+
 
 class CommentReplyPermanentError(Exception):
     """
@@ -1115,7 +1254,7 @@ class InstagramCommentService:
     GRAPH_API_BASE = "https://graph.instagram.com/v25.0"
 
     @classmethod
-    def _get_headers(cls, access_token: str) -> Dict:
+    def _get_headers(cls, access_token: str) -> dict:
         return {
             "Authorization": f"Bearer {access_token}",
         }
@@ -1132,7 +1271,7 @@ class InstagramCommentService:
     _PERMANENT_REPLY_ERROR_CODES = (1, 100, 190, 200, 10)
 
     @classmethod
-    def post_reply(cls, comment_id: str, message: str, access_token: str) -> Dict:
+    def post_reply(cls, comment_id: str, message: str, access_token: str) -> dict:
         """
         댓글에 공개 답글(reply) 게시.
 
@@ -1177,7 +1316,7 @@ class InstagramCommentService:
         return response.json()  # unreachable
 
     @classmethod
-    def hide_comment(cls, comment_id: str, access_token: str) -> Dict:
+    def hide_comment(cls, comment_id: str, access_token: str) -> dict:
         """
         댓글 숨김 처리
 
@@ -1201,7 +1340,7 @@ class InstagramCommentService:
         return response.json()
 
     @classmethod
-    def unhide_comment(cls, comment_id: str, access_token: str) -> Dict:
+    def unhide_comment(cls, comment_id: str, access_token: str) -> dict:
         """
         댓글 숨김 해제
 
@@ -1222,7 +1361,7 @@ class InstagramCommentService:
         return response.json()
 
     @classmethod
-    def delete_comment(cls, comment_id: str, access_token: str) -> Dict:
+    def delete_comment(cls, comment_id: str, access_token: str) -> dict:
         """
         댓글 삭제 (영구 삭제)
 
