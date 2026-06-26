@@ -10,6 +10,11 @@ from .base import *
 DEBUG = False
 
 ALLOWED_HOSTS = config("ALLOWED_HOSTS", cast=lambda v: [s.strip() for s in v.split(",")])
+# 컨테이너 내부 healthcheck(Docker)는 http://127.0.0.1:8000/... 으로 호출하므로 내부 호스트를 항상 허용.
+# (없으면 DisallowedHost 400 → healthcheck 실패 → web 컨테이너가 unhealthy 로 표시됨)
+for _h in ("127.0.0.1", "localhost"):
+    if _h not in ALLOWED_HOSTS:
+        ALLOWED_HOSTS.append(_h)
 
 # Security settings
 # Caddy handles SSL termination, so Django should NOT redirect to HTTPS itself
