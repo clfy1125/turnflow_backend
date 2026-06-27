@@ -17,7 +17,7 @@ from datetime import timedelta
 
 from celery import shared_task
 from django.conf import settings
-from django.db import IntegrityError, transaction
+from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
@@ -508,27 +508,24 @@ def _enqueue_send_dm_for_story_reply(
     )
 
     # 시간당 한도·계정 거버너는 send_dm_task 단일 지점에서 평가(초과 시 드랍 아닌 defer).
-    try:
-        with transaction.atomic():
-            log = SentDMLog.objects.create(
-                campaign=campaign,
-                comment_id="",  # ★ Story 답장은 comment_id 없음 (send_dm_task 가 user_id 분기 판단)
-                comment_text=message_text,
-                recipient_user_id=sender_user_id,
-                recipient_username=sender_username,
-                message_sent=campaign.get_opening_message(),
-                status=SentDMLog.Status.QUEUED,
-                idempotency_key=idempotency_key,
-                webhook_payload=payload,
-                dm_kind=SentDMLog.DMKind.STANDALONE,
-                gate_status=SentDMLog.GateStatus.NONE,
-            )
-    except IntegrityError:
-        existing = SentDMLog.objects.filter(idempotency_key=idempotency_key).first()
+    log, created = SentDMLog.create_idempotent(
+        idempotency_key=idempotency_key,
+        campaign=campaign,
+        comment_id="",  # ★ Story 답장은 comment_id 없음 (send_dm_task 가 user_id 분기 판단)
+        comment_text=message_text,
+        recipient_user_id=sender_user_id,
+        recipient_username=sender_username,
+        message_sent=campaign.get_opening_message(),
+        status=SentDMLog.Status.QUEUED,
+        webhook_payload=payload,
+        dm_kind=SentDMLog.DMKind.STANDALONE,
+        gate_status=SentDMLog.GateStatus.NONE,
+    )
+    if not created:
         return {
             "campaign_id": str(campaign.id),
             "status": "duplicate",
-            "log_id": str(existing.id) if existing else None,
+            "log_id": str(log.id) if log else None,
         }
 
     send_dm_task.delay(str(log.id))
@@ -709,27 +706,24 @@ def _enqueue_send_dm(
     # 시간당 발송 제한·계정 거버너는 send_dm_task 진입 시 단일 지점에서 평가하며,
     # 초과 시 드랍하지 않고 defer(QUEUED+next_retry_at) 한다 (requeue 워커가 순차 재투입).
     # → 여기서는 항상 QUEUED 로 적재하고 발송 판단은 send_dm_task 에 위임.
-    try:
-        with transaction.atomic():
-            log = SentDMLog.objects.create(
-                campaign=campaign,
-                comment_id=comment_id,
-                comment_text=comment_text,
-                recipient_user_id=from_user_id,
-                recipient_username=from_username,
-                message_sent=message_body,
-                status=SentDMLog.Status.QUEUED,
-                idempotency_key=idempotency_key,
-                webhook_payload=webhook_payload,
-                dm_kind=dm_kind,
-                gate_status=gate_status,
-            )
-    except IntegrityError:
-        existing = SentDMLog.objects.filter(idempotency_key=idempotency_key).first()
+    log, created = SentDMLog.create_idempotent(
+        idempotency_key=idempotency_key,
+        campaign=campaign,
+        comment_id=comment_id,
+        comment_text=comment_text,
+        recipient_user_id=from_user_id,
+        recipient_username=from_username,
+        message_sent=message_body,
+        status=SentDMLog.Status.QUEUED,
+        webhook_payload=webhook_payload,
+        dm_kind=dm_kind,
+        gate_status=gate_status,
+    )
+    if not created:
         return {
             "campaign_id": str(campaign.id),
             "status": "duplicate",
-            "log_id": str(existing.id) if existing else None,
+            "log_id": str(log.id) if log else None,
         }
 
     send_dm_task.delay(str(log.id))
@@ -2004,29 +1998,25 @@ def send_reward_dm(self, opening_log_id: str):
 
     # 멱등성 키 — opening 의 idempotency_key 에 ":reward" 접미사
     idem = f"{opening.idempotency_key}:reward"
-    try:
-        with transaction.atomic():
-            reward_log = SentDMLog.objects.create(
-                campaign=campaign,
-                comment_id=opening.comment_id,
-                comment_text=opening.comment_text,
-                recipient_user_id=opening.recipient_user_id,
-                recipient_username=opening.recipient_username,
-                message_sent=campaign.reward_message_template,
-                status=SentDMLog.Status.SUBMITTING,
-                idempotency_key=idem,
-                webhook_payload=opening.webhook_payload,
-                dm_kind=SentDMLog.DMKind.REWARD,
-                gate_status=SentDMLog.GateStatus.NONE,
-                parent_log=opening,
-            )
-            reward_log.submitted_at = timezone.now()
-            reward_log.save(update_fields=["submitted_at"])
-    except IntegrityError:
-        existing = SentDMLog.objects.filter(idempotency_key=idem).first()
+    reward_log, created = SentDMLog.create_idempotent(
+        idempotency_key=idem,
+        campaign=campaign,
+        comment_id=opening.comment_id,
+        comment_text=opening.comment_text,
+        recipient_user_id=opening.recipient_user_id,
+        recipient_username=opening.recipient_username,
+        message_sent=campaign.reward_message_template,
+        status=SentDMLog.Status.SUBMITTING,
+        submitted_at=timezone.now(),  # create 와 한 트랜잭션 — 별도 save 제거
+        webhook_payload=opening.webhook_payload,
+        dm_kind=SentDMLog.DMKind.REWARD,
+        gate_status=SentDMLog.GateStatus.NONE,
+        parent_log=opening,
+    )
+    if not created:
         return {
             "status": "duplicate",
-            "reward_log_id": str(existing.id) if existing else None,
+            "reward_log_id": str(reward_log.id) if reward_log else None,
         }
 
     try:
@@ -2398,30 +2388,27 @@ def _enqueue_reward_dm(*, opening: SentDMLog, igsid: str) -> dict:
     key_raw = f"reward:{campaign.id}:{opening.id}"
     idem = hashlib.sha256(key_raw.encode("utf-8")).hexdigest()
 
-    try:
-        with transaction.atomic():
-            reward_log = SentDMLog.objects.create(
-                campaign=campaign,
-                comment_id="",  # reward 는 24h 윈도우 내 user_id 발송
-                comment_text="",
-                recipient_user_id=igsid,
-                recipient_username=opening.recipient_username,
-                message_sent=reward_body,
-                status=SentDMLog.Status.QUEUED,
-                idempotency_key=idem,
-                dm_kind=SentDMLog.DMKind.REWARD,
-                gate_status=SentDMLog.GateStatus.PASSED,
-                parent_log=opening,
-            )
-            # opening 도 PASSED 로 마킹
-            SentDMLog.objects.filter(pk=opening.pk).update(gate_status=SentDMLog.GateStatus.PASSED)
-    except IntegrityError:
-        existing = SentDMLog.objects.filter(idempotency_key=idem).first()
+    reward_log, created = SentDMLog.create_idempotent(
+        idempotency_key=idem,
+        campaign=campaign,
+        comment_id="",  # reward 는 24h 윈도우 내 user_id 발송
+        comment_text="",
+        recipient_user_id=igsid,
+        recipient_username=opening.recipient_username,
+        message_sent=reward_body,
+        status=SentDMLog.Status.QUEUED,
+        dm_kind=SentDMLog.DMKind.REWARD,
+        gate_status=SentDMLog.GateStatus.PASSED,
+        parent_log=opening,
+    )
+    if not created:
         return {
             "status": "duplicate_reward",
             "opening_log_id": str(opening.id),
-            "reward_log_id": str(existing.id) if existing else None,
+            "reward_log_id": str(reward_log.id) if reward_log else None,
         }
+    # opening 도 PASSED 로 마킹 (reward dedup 이 이미 보장되므로 분리해도 무손실·멱등)
+    SentDMLog.objects.filter(pk=opening.pk).update(gate_status=SentDMLog.GateStatus.PASSED)
 
     send_dm_task.delay(str(reward_log.id))
     return {
@@ -2448,27 +2435,24 @@ def _enqueue_follow_retry(*, opening: SentDMLog, igsid: str) -> dict:
     key_raw = f"retry:{campaign.id}:{opening.id}:{timezone.now().timestamp():.0f}"
     idem = hashlib.sha256(key_raw.encode("utf-8")).hexdigest()
 
-    try:
-        with transaction.atomic():
-            retry_log = SentDMLog.objects.create(
-                campaign=campaign,
-                comment_id="",  # 재안내도 user_id 기반 (24h 윈도우 사용자가 방금 상호작용함)
-                comment_text="",
-                recipient_user_id=igsid,
-                recipient_username=opening.recipient_username,
-                message_sent=retry_body,
-                status=SentDMLog.Status.QUEUED,
-                idempotency_key=idem,
-                dm_kind=SentDMLog.DMKind.OPENING,  # quick_reply 다시 붙도록
-                gate_status=SentDMLog.GateStatus.PENDING,
-                parent_log=opening,
-            )
-    except IntegrityError:
-        existing = SentDMLog.objects.filter(idempotency_key=idem).first()
+    retry_log, created = SentDMLog.create_idempotent(
+        idempotency_key=idem,
+        campaign=campaign,
+        comment_id="",  # 재안내도 user_id 기반 (24h 윈도우 사용자가 방금 상호작용함)
+        comment_text="",
+        recipient_user_id=igsid,
+        recipient_username=opening.recipient_username,
+        message_sent=retry_body,
+        status=SentDMLog.Status.QUEUED,
+        dm_kind=SentDMLog.DMKind.OPENING,  # quick_reply 다시 붙도록
+        gate_status=SentDMLog.GateStatus.PENDING,
+        parent_log=opening,
+    )
+    if not created:
         return {
             "status": "duplicate_retry",
             "opening_log_id": str(opening.id),
-            "retry_log_id": str(existing.id) if existing else None,
+            "retry_log_id": str(retry_log.id) if retry_log else None,
         }
 
     send_dm_task.delay(str(retry_log.id))

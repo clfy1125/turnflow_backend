@@ -5,7 +5,7 @@ Instagram Account Connection models
 import uuid
 from datetime import timedelta
 
-from django.db import models
+from django.db import IntegrityError, models, transaction
 from django.utils import timezone
 
 from .encryption import EncryptedTextField
@@ -887,6 +887,39 @@ class AutoDMCampaign(models.Model):
         return any(k.lower() == text_lower or k.lower() in text_lower for k in kws)
 
 
+class DMDedupKey(models.Model):
+    """DM "정확히 한 번" 전역 멱등 레저 (WS-2 / SentDMLog 파티셔닝 대비).
+
+    SentDMLog 를 ``created_at`` 월별 파티션으로 전환하면 PostgreSQL 제약상 모든 UNIQUE/PK 가
+    파티션키(created_at)를 포함해야 해서 ``UNIQUE(idempotency_key)`` 가 *파티션별*로 약화된다
+    (월 경계 중복 발송 가능). 그래서 "정확히 한 번"의 하드 보증을 이 **비파티션 테이블**로 이관한다:
+
+        SentDMLog INSERT 와 **같은 트랜잭션**에서 여기에 먼저 INSERT 하고,
+        ``idempotency_key`` PK 충돌(IntegrityError) = "이미 발송됨"의 단일 진실.
+
+    같은 트랜잭션이라 SentDMLog INSERT 가 다른 이유로 실패하면 키 claim 도 롤백된다
+    (= orphan claim 없음 → 무손실). ``SentDMLog.create_idempotent()`` 가 유일한 사용처다.
+
+    재트리거 윈도우(웹훅 재전송·SeenComment TTL=10일·poll 보정) 밖이면 이 행은 prune 가능 →
+    유계. (현재는 보존; prune/파티션은 WS-2 manage_partitions 에서.)
+    """
+
+    # PK 자체가 UNIQUE 제약 → 별도 인덱스 없이 최소 저장(행당 ~키64B + created).
+    idempotency_key = models.CharField(
+        max_length=64, primary_key=True, verbose_name="Idempotency Key"
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="생성일시")
+
+    class Meta:
+        db_table = "dm_dedup_keys"
+        verbose_name = "DM Dedup Key"
+        verbose_name_plural = "DM Dedup Keys"
+        indexes = [models.Index(fields=["created_at"], name="dm_dedup_created_idx")]
+
+    def __str__(self) -> str:
+        return self.idempotency_key
+
+
 class SentDMLog(models.Model):
     """
     DM 발송 로그 (99.9% 발송 보증 시스템)
@@ -1119,6 +1152,29 @@ class SentDMLog(models.Model):
 
     def __str__(self):
         return f"{self.recipient_username} - {self.status}"
+
+    @classmethod
+    def create_idempotent(
+        cls, *, idempotency_key: str, **fields
+    ) -> "tuple[SentDMLog | None, bool]":
+        """전역 멱등 INSERT — DMDedupKey(전역 UNIQUE) claim + SentDMLog INSERT 를 한 트랜잭션으로.
+
+        반환: ``(log, created)``. ``created=True`` 면 신규 발송 대상, ``False`` 면 중복
+        (이미 같은 ``idempotency_key`` 가 발송됨 → ``log`` 은 기존 row, 아카이브됐으면 None).
+
+        WHY 두 겹: DMDedupKey 가 **전역** 하드 보증(SentDMLog 파티셔닝 후에도 유지), SentDMLog 의
+        ``unique=True`` 는 파티셔닝 전까지 2차 방어 + 파티셔닝 후엔 per-partition 방어로 남는다.
+        둘 중 어느 것이 충돌해도 같은 트랜잭션이 통째로 롤백돼 orphan claim 이 생기지 않는다(무손실).
+
+        호출부는 기존 ``try/except IntegrityError`` 인라인을 대체한다(=동작 동일, 보증만 강화).
+        """
+        try:
+            with transaction.atomic():
+                DMDedupKey.objects.create(idempotency_key=idempotency_key)
+                log = cls.objects.create(idempotency_key=idempotency_key, **fields)
+            return log, True
+        except IntegrityError:
+            return cls.objects.filter(idempotency_key=idempotency_key).first(), False
 
     # ===== 상태 전이 헬퍼 =====
 
@@ -1572,4 +1628,6 @@ class DMAccountBlock(models.Model):
         indexes = [models.Index(fields=["cooldown_until"], name="dm_acct_block_cooldown_idx")]
 
     def __str__(self) -> str:
-        return f"DMAccountBlock({self.external_account_id} until={self.cooldown_until} L{self.level})"
+        return (
+            f"DMAccountBlock({self.external_account_id} until={self.cooldown_until} L{self.level})"
+        )
