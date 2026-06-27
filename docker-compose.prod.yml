@@ -298,9 +298,14 @@ services:
     networks:
       - turnflow_instagram_net
 
+  # ⚠️ RETIRED — 스케줄링은 외부 cron → POST /api/v1/internal/scheduler/tick (DR §6, Step 2)으로 이관됨.
+  # beat 와 tick 동시 가동 = 이중 발사이므로 평상시 기동하지 않는다(`profiles: [fallback]` → 기본 up 제외).
+  # 긴급 폴백(외부 cron 전면 장애 시): docker compose --profile fallback up -d celery_beat
+  # (단, 그 전에 외부 cron 을 반드시 멈춰 이중 발사 방지.)
   celery_beat:
     image: *app_image
     container_name: turnflow_instagram_celery_beat
+    profiles: ["fallback"]
     restart: unless-stopped
     command: celery -A config beat -l info --pidfile=/tmp/celerybeat.pid
     env_file: [.env.production]

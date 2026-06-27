@@ -41,8 +41,9 @@ for svc in web_external web_dashboard web_webhook; do
   sleep 8
 done
 
-echo "==> 6/6 recreate workers + beat"
-APP_IMAGE="$IMAGE" $COMPOSE up -d --no-deps celery_dm celery_followup celery_default celery_billing celery_beat
+echo "==> 6/6 recreate workers (celery_beat RETIRED — 외부 cron→/internal/scheduler/tick 으로 이관, DR §6)"
+# celery_beat 는 profiles:[fallback] 라 평상시 기동 안 함(이중 발사 방지). 긴급 폴백만 수동 기동.
+APP_IMAGE="$IMAGE" $COMPOSE up -d --no-deps celery_dm celery_followup celery_default celery_billing
 
 echo "==> done. running images:"
 docker ps --format '  {{.Names}}\t{{.Image}}\t{{.Status}}' | grep turnflow || true
