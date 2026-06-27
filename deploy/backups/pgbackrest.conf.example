@@ -26,6 +26,10 @@ repo1-cipher-type=aes-256-cbc
 repo1-cipher-pass=__LONG_RANDOM_PASSPHRASE__
 repo1-retention-full=2
 repo1-retention-diff=6
+# WAL(아카이브) 보존 — 이걸 명시 안 하면 버전에 따라 "WAL 미만료 + 경고"로 archive/ 가 무한 증가.
+# full 2개가 커버하는 구간만 WAL 보관(약 2주 rewind), 그 이전 WAL 은 backup 종료 시 expire 가 자동 삭제.
+repo1-retention-archive=2
+repo1-retention-archive-type=full
 process-max=4
 compress-type=zst
 compress-level=3
