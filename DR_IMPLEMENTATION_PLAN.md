@@ -552,7 +552,37 @@ PG 네이티브 range 파티션(by `created_at`)은 모든 UNIQUE/PK가 **파티
   → `loadtest_dm.py`로 파티션·dedup 부하/정합 검증 후 머지.
 
 ### 15.7 미해결 (오너 결정)
-1. ④ dedup: **(A) 레저** vs (B) per-partition+SeenComment. (기본 권장: A)
+1. ~~④ dedup: (A) 레저 vs (B)~~ → **§15.8 에서 개정**(하이브리드 확정, 레저 제거).
 2. full 백업 창 요일/시각(잠정 화 03:00 KST) — 실제 트래픽 관측 후 확정.
-3. SentDMLog 콜드 아카이브 보존 hot 기간(잠정 6개월) + 아카이브 포맷(R2 Parquet/CSV/pg_dump 파티션).
+3. SentDMLog 배치 아카이브 보존 hot 기간(잠정 6개월) + 아카이브 포맷(R2 Parquet/CSV/COPY).
 4. EventInbox 파티션 유지일 7일 확정(재처리 멱등성 재확인).
+
+### 15.8 ★ 결정 개정 (REVISED) — 하이브리드 확정, Django 업그레이드 보류, dedup 레저 제거
+
+**배경:** ④ SentDMLog 파티셔닝을 파려다 두 가지 제약 발견:
+1. **Django 5.0 은 `CompositePrimaryKey` 미지원**(5.2+). PG 네이티브 파티션은 모든 PK/UNIQUE 가
+   파티션키 포함 필수 → 모델(단일 PK)과 DB(복합 PK) 불일치.
+2. **SentDMLog 에 self-FK `parent_log`(SET_NULL)** 존재. 복합 PK 모델로의 FK 는 Django 5.2 에서도
+   미지원이고, PG 레벨에서도 파티션 테이블로의 FK 는 파티션키 포함을 요구 → 버전 무관 걸림돌.
+   (단 `parent_log` 은 코드에서 거의 `parent_log_id`(child 플래그/링크)로만 쓰여 강등은 저영향.)
+
+**Django 업그레이드 검토 → 보류:** 5.2 로 올리면 (1)은 풀리나 (a) Django 5.0→5.2 + **DRF 3.14→3.16**
+연쇄 업그레이드로 앱 전체 회귀 위험(런칭 직전), (b) `CompositePrimaryKey` 도 **복합 PK 로의 FK 미지원**이라
+(2) self-FK 는 *여전히* 안 풀림. → **업그레이드는 런칭 후 별도 정비 과제로 분리.**
+
+**확정 — 하이브리드:**
+| 테이블 | 방식 | 이유 |
+|---|---|---|
+| **EventInbox** (일 570만 행) | **일별 range 파티션 + DROP** | 들어오는 FK 없음 → 깔끔. 고회전 → 즉시 DROP 필수. (모델은 id-PK 유지, DB 만 복합 PK; `SeparateDatabaseAndState` 로 hand-roll RunSQL) |
+| **SentDMLog** (영구·self-FK) | **배치 아카이브** (파티션 X) | self-FK·복합 PK 문제 **원천 회피**. 월 증가 느리고 업무기록이라 월 1회 배치 DELETE 감내 가능. **전역 `UNIQUE(idempotency_key)` 유지** |
+
+**귀결 — DMDedupKey 레저 제거:** SentDMLog 가 전역 UNIQUE 를 유지하므로 증분 1 의 `DMDedupKey`(전역 레저)는
+**redundant**(DM 당 INSERT 1회 + 월 86M 행 고회전 테이블, 무이득). → **레저 제거**, `create_idempotent` 헬퍼는
+**전역 UNIQUE 백엔드**로 되돌리되 무손실 하드닝(비-키 IntegrityError 전파)은 유지. 마이그레이션 0029 가
+`DMDedupKey` DROP. (향후 Django 업그레이드 후 SentDMLog 파티셔닝을 정말 하게 되면 그때 레저 재도입.)
+
+**증분 2 작업 (개정):**
+- (a) `DMDedupKey` 제거(0029 DeleteModel) + `create_idempotent` 전역-UNIQUE 백엔드로 재작성(하드닝 유지) + 테스트 갱신.
+- (b) EventInbox 일별 파티션 전환(RunSQL + SeparateDatabaseAndState) — id-PK 모델 유지, `(event_key, received_at)` per-partition unique.
+- (c) `maintenance` 태스크: EventInbox 차일 파티션 선생성 + 7일 초과 DROP, SentDMLog 6개월 초과 배치 아카이브(R2 COPY → 배치 DELETE).
+- (d) `loadtest_dm` 로 부하/정합 검증.

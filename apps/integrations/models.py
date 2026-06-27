@@ -5,7 +5,7 @@ Instagram Account Connection models
 import uuid
 from datetime import timedelta
 
-from django.db import models, transaction
+from django.db import IntegrityError, models, transaction
 from django.utils import timezone
 
 from .encryption import EncryptedTextField
@@ -887,39 +887,6 @@ class AutoDMCampaign(models.Model):
         return any(k.lower() == text_lower or k.lower() in text_lower for k in kws)
 
 
-class DMDedupKey(models.Model):
-    """DM "정확히 한 번" 전역 멱등 레저 (WS-2 / SentDMLog 파티셔닝 대비).
-
-    SentDMLog 를 ``created_at`` 월별 파티션으로 전환하면 PostgreSQL 제약상 모든 UNIQUE/PK 가
-    파티션키(created_at)를 포함해야 해서 ``UNIQUE(idempotency_key)`` 가 *파티션별*로 약화된다
-    (월 경계 중복 발송 가능). 그래서 "정확히 한 번"의 하드 보증을 이 **비파티션 테이블**로 이관한다:
-
-        SentDMLog INSERT 와 **같은 트랜잭션**에서 여기에 먼저 INSERT 하고,
-        ``idempotency_key`` PK 충돌(IntegrityError) = "이미 발송됨"의 단일 진실.
-
-    같은 트랜잭션이라 SentDMLog INSERT 가 다른 이유로 실패하면 키 claim 도 롤백된다
-    (= orphan claim 없음 → 무손실). ``SentDMLog.create_idempotent()`` 가 유일한 사용처다.
-
-    재트리거 윈도우(웹훅 재전송·SeenComment TTL=10일·poll 보정) 밖이면 이 행은 prune 가능 →
-    유계. (현재는 보존; prune/파티션은 WS-2 manage_partitions 에서.)
-    """
-
-    # PK 자체가 UNIQUE 제약 → 별도 인덱스 없이 최소 저장(행당 ~키64B + created).
-    idempotency_key = models.CharField(
-        max_length=64, primary_key=True, verbose_name="Idempotency Key"
-    )
-    created_at = models.DateTimeField(auto_now_add=True, verbose_name="생성일시")
-
-    class Meta:
-        db_table = "dm_dedup_keys"
-        verbose_name = "DM Dedup Key"
-        verbose_name_plural = "DM Dedup Keys"
-        indexes = [models.Index(fields=["created_at"], name="dm_dedup_created_idx")]
-
-    def __str__(self) -> str:
-        return self.idempotency_key
-
-
 class SentDMLog(models.Model):
     """
     DM 발송 로그 (99.9% 발송 보증 시스템)
@@ -1157,32 +1124,31 @@ class SentDMLog(models.Model):
     def create_idempotent(
         cls, *, idempotency_key: str, **fields
     ) -> "tuple[SentDMLog | None, bool]":
-        """전역 멱등 INSERT — DMDedupKey(전역 UNIQUE) claim + SentDMLog INSERT 를 한 트랜잭션으로.
+        """전역 멱등 INSERT — ``SentDMLog.idempotency_key`` 전역 UNIQUE 로 "정확히 한 번" 보증.
 
         반환: ``(log, created)``. ``created=True`` 면 신규 발송 대상, ``False`` 면 중복
         (이미 같은 ``idempotency_key`` 가 발송됨 → ``log`` 은 기존 row, 아카이브됐으면 None).
 
-        WHY 두 겹: DMDedupKey 가 **전역** 하드 보증(SentDMLog 파티셔닝 후에도 유지), SentDMLog 의
-        ``unique=True`` 는 파티셔닝 전까지 2차 방어 + 파티셔닝 후엔 per-partition 방어로 남는다.
-        log INSERT 가 실패하면 같은 트랜잭션이라 키 claim 도 롤백돼 orphan claim 이 없다(무손실).
+        ★ 무손실 하드닝: ``idempotency_key`` UNIQUE 충돌만 '중복'으로 본다. INSERT 가 *키 충돌이 아닌*
+        IntegrityError(NOT NULL·FK·CHECK 등)로 실패하면 — 같은 키 row 가 없으므로 — '중복'으로 둔갑시키지
+        않고 **그대로 전파**한다(트랜잭션째 롤백 → 부분 row 없음). 발송 누락이 silent drop 대신 에러/재시도로
+        가시화된다.
 
-        ★ 중복 판정은 **DMDedupKey claim 충돌만**으로 한다(get_or_create 의 created 플래그).
-        SentDMLog INSERT 단계에서 나는 IntegrityError/DataError(NOT NULL·FK·길이 등 '키 충돌이 아닌'
-        진짜 오류)는 '중복'으로 둔갑시키지 않고 **그대로 전파**한다 → silent drop 대신 에러/재시도로
-        가시화(무손실). 파티셔닝으로 SentDMLog 전역 UNIQUE 가 제거된 뒤 이 함수가 단일 보증이 되므로,
-        '키 충돌'과 '기타 오류'를 분리하는 것이 핵심.
+        (SentDMLog 는 배치 아카이브로 운영 — 파티셔닝 안 함 — 이라 전역 UNIQUE 가 그대로 단일 보증.
+        DMDedupKey 레저는 §15.8 에서 redundant 로 제거됨. 향후 파티셔닝 시 레저 재도입 검토.)
 
         호출부는 기존 ``try/except IntegrityError`` 인라인을 대체한다(=동작 동일, 보증만 강화).
         """
-        with transaction.atomic():
-            # get_or_create 는 INSERT 충돌을 내부 savepoint 로 흡수 → 동시성 안전하게 '진짜 중복'만 판정.
-            _, claimed = DMDedupKey.objects.get_or_create(idempotency_key=idempotency_key)
-            if not claimed:
-                # 키가 이미 레저에 있음 = 중복. 기존 log 반환(아카이브됐으면 None).
-                return cls.objects.filter(idempotency_key=idempotency_key).first(), False
-            # 새 키 claim 성공 → log 생성. 여기서 나는 예외는 '중복'이 아니므로 전파(트랜잭션째 롤백).
-            log = cls.objects.create(idempotency_key=idempotency_key, **fields)
+        try:
+            with transaction.atomic():
+                log = cls.objects.create(idempotency_key=idempotency_key, **fields)
             return log, True
+        except IntegrityError:
+            existing = cls.objects.filter(idempotency_key=idempotency_key).first()
+            if existing is None:
+                # 같은 키 row 가 없다 = UNIQUE 충돌이 아닌 다른 제약 위반 → '중복' 아님 → 전파.
+                raise
+            return existing, False
 
     # ===== 상태 전이 헬퍼 =====
 
