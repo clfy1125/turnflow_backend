@@ -674,7 +674,8 @@ MISSED_COMMENT_POLL_MAX_TARGETS = config("MISSED_COMMENT_POLL_MAX_TARGETS", defa
 EVENTINBOX_PARTITION_RETENTION_DAYS = config(
     "EVENTINBOX_PARTITION_RETENTION_DAYS", default=7, cast=int
 )
-EVENTINBOX_PARTITION_DAYS_AHEAD = config("EVENTINBOX_PARTITION_DAYS_AHEAD", default=7, cast=int)
+# 14일 선생성 버퍼 — maintain_partitions(일1회 beat)가 며칠 누락돼도 DEFAULT 로 새지 않게 여유.
+EVENTINBOX_PARTITION_DAYS_AHEAD = config("EVENTINBOX_PARTITION_DAYS_AHEAD", default=14, cast=int)
 # SentDMLog 배치 아카이브 — 0 이면 비활성(기본). ⚠️ 활성화 전 R2 export 선행 필수(업무기록 손실 방지).
 SENTDMLOG_ARCHIVE_RETENTION_DAYS = config("SENTDMLOG_ARCHIVE_RETENTION_DAYS", default=0, cast=int)
 

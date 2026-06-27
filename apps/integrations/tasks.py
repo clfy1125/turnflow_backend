@@ -1752,17 +1752,25 @@ def maintain_partitions():
     """
     from apps.integrations import partition_maintenance as pm
 
-    ensured = pm.ensure_eventinbox_partitions()
-    dropped = pm.drop_old_eventinbox_partitions()
-    archived = pm.archive_old_sentdmlogs()
-    logger.info(
-        "maintain_partitions: ensured=%d dropped=%d(%s) archived=%s",
-        len(ensured),
-        len(dropped),
-        dropped,
-        archived,
-    )
-    return {"ensured": len(ensured), "dropped": dropped, "archived": archived}
+    # 각 단계를 독립 격리 — ensure 가 실패해도 drop_old(디스크 회수 + DEFAULT 경고/정리)는 반드시 돌게.
+    result: dict = {}
+    try:
+        result["ensured"] = len(pm.ensure_eventinbox_partitions())
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("maintain_partitions: ensure 실패: %s", exc)
+        result["ensure_error"] = str(exc)
+    try:
+        result["dropped"] = pm.drop_old_eventinbox_partitions()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("maintain_partitions: drop_old 실패: %s", exc)
+        result["drop_error"] = str(exc)
+    try:
+        result["archived"] = pm.archive_old_sentdmlogs()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("maintain_partitions: archive 실패: %s", exc)
+        result["archive_error"] = str(exc)
+    logger.info("maintain_partitions: %s", result)
+    return result
 
 
 # ===== 공개 답글 + Follow-gate =====
@@ -2712,9 +2720,12 @@ def process_messaging_event(self, event_key: str):
     EventInbox.event_key 가 이미 UNIQUE 로 중복을 막고, 여기서 processed_at 으로 재처리도 막는다.
     실패하면 재시도되며, EventInbox 행은 남아 있어 reconcile 워커의 능동 검증이 안전망이 된다.
     """
-    try:
-        evt = EventInbox.objects.get(event_key=event_key)
-    except EventInbox.DoesNotExist:
+    # EventInbox 는 파티션 테이블에서 per-partition UNIQUE(event_key, received_at) 라, 동시/자정경계
+    # 재전송 시 같은 event_key 가 2행 생길 수 있다(무해 — 적용은 멱등, 중복 enqueue 는 아래 processed_at
+    # 게이트가 흡수, 중복 행은 파티션 DROP 으로 청소). .get() 은 MultipleObjectsReturned 로 죽으므로
+    # 가장 오래된 1건만 처리한다.
+    evt = EventInbox.objects.filter(event_key=event_key).order_by("received_at").first()
+    if evt is None:
         logger.warning("process_messaging_event: missing EventInbox %s", event_key)
         return {"status": "missing"}
 

@@ -16,7 +16,7 @@ import logging
 from datetime import date, timedelta
 
 from django.conf import settings
-from django.db import connection
+from django.db import connection, transaction
 
 logger = logging.getLogger(__name__)
 
@@ -49,20 +49,32 @@ def ensure_eventinbox_partitions(
     DROP 가능한 일별 파티션에 정확히 적재되며, 추후 DEFAULT-overlap 에러도 없다.
     """
     if days_ahead is None:
-        days_ahead = getattr(settings, "EVENTINBOX_PARTITION_DAYS_AHEAD", 7)
+        days_ahead = getattr(settings, "EVENTINBOX_PARTITION_DAYS_AHEAD", 14)
     today = today or date.today()
     names: list[str] = []
-    with connection.cursor() as cur:
-        for i in range(0, days_ahead + 1):
-            d = today + timedelta(days=i)
-            nxt = d + timedelta(days=1)
-            name = _eventinbox_partition_name(d)
-            cur.execute(
-                f'CREATE TABLE IF NOT EXISTS "{name}" PARTITION OF "{EVENTINBOX_TABLE}" '
-                f"FOR VALUES FROM (%s) TO (%s)",
-                [d.isoformat(), nxt.isoformat()],
-            )
+    failed: list[str] = []
+    for i in range(0, days_ahead + 1):
+        d = today + timedelta(days=i)
+        nxt = d + timedelta(days=1)
+        name = _eventinbox_partition_name(d)
+        # 일자별로 격리 — 한 일자 실패(예: DEFAULT-overlap, 일시 락)가 나머지 일자 선생성을
+        # 막지 않게 한다(중단 시 미래 파티션 미생성 → DEFAULT 누수 → wedge). atomic 으로 감싸
+        # autocommit/중첩 트랜잭션 양쪽에서 안전하게 부분 실패만 롤백.
+        try:
+            with transaction.atomic(), connection.cursor() as cur:
+                cur.execute(
+                    f'CREATE TABLE IF NOT EXISTS "{name}" PARTITION OF "{EVENTINBOX_TABLE}" '
+                    f"FOR VALUES FROM (%s) TO (%s)",
+                    [d.isoformat(), nxt.isoformat()],
+                )
             names.append(name)
+        except Exception as exc:  # noqa: BLE001
+            failed.append(name)
+            logger.warning("ensure_eventinbox_partitions: %s 생성 실패: %s", name, exc)
+    if failed:
+        logger.warning(
+            "ensure_eventinbox_partitions: %d개 일자 파티션 생성 실패 %s", len(failed), failed
+        )
     return names
 
 
@@ -91,11 +103,17 @@ def drop_old_eventinbox_partitions(
             if pdate < cutoff:
                 cur.execute(f'DROP TABLE IF EXISTS "{relname}"')
                 dropped.append(relname)
+        # DEFAULT 로 샌 행(파티션 선생성 지연 시) 중 보존 초과분을 정리 → DEFAULT 무한 비대화/wedge 방지.
+        # EventInbox 는 transient(36h 지난 dedup 마커 무가치)라 보존일 초과 DEFAULT 행 삭제는 무해.
+        cur.execute(
+            f'DELETE FROM "{DEFAULT_PARTITION}" WHERE received_at < %s', [cutoff.isoformat()]
+        )
         cur.execute(f'SELECT count(*) FROM "{DEFAULT_PARTITION}"')
         default_rows = cur.fetchone()[0]
         if default_rows:
+            # 보존 이내인데도 DEFAULT 에 행이 있음 = 그 일자 파티션 선생성이 밀렸다는 신호.
             logger.warning(
-                "EventInbox DEFAULT 파티션에 %d행 — 파티션 선생성 지연 의심(maintain_partitions 점검)",
+                "EventInbox DEFAULT 파티션에 %d행 — 파티션 선생성 지연 의심(maintain_partitions/beat 점검)",
                 default_rows,
             )
     return dropped
