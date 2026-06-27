@@ -421,6 +421,12 @@ CELERY_BEAT_SCHEDULE = {
         "task": "integrations.cleanup_comment_ledger",
         "schedule": crontab(hour=4, minute=30),  # CELERY_TIMEZONE=Asia/Seoul 기준
     },
+    # 매일 KST 02:00 — EventInbox 일별 파티션 유지(선생성 + 보존 초과 DROP) + (옵션)SentDMLog 아카이브. (§15.8)
+    "maintain-partitions": {
+        "task": "integrations.maintain_partitions",
+        "schedule": crontab(hour=2, minute=0),  # CELERY_TIMEZONE=Asia/Seoul 기준
+        "options": {"queue": "billing"},
+    },
     # ===== Instagram Insights 동기화 (임시 비활성) =====
     # insights 기능 출시 보류 — Meta IG insights API 호출이 발생하지 않도록 4개 beat 모두 주석 처리.
     # 활성화 시점에 아래 4개를 복원 + INSIGHTS_API_ENABLED=True 로 전환.
@@ -661,6 +667,16 @@ MISSED_COMMENT_POLL_PAGE_SIZE = config("MISSED_COMMENT_POLL_PAGE_SIZE", default=
 # 폭주 방지 상한 — 정상 종료는 앵커 또는 7일 baseline. 소진 시 Telegram 경고.
 MISSED_COMMENT_POLL_MAX_PAGES = config("MISSED_COMMENT_POLL_MAX_PAGES", default=20, cast=int)
 MISSED_COMMENT_POLL_MAX_TARGETS = config("MISSED_COMMENT_POLL_MAX_TARGETS", default=1000, cast=int)
+
+# ===== EventInbox 일별 파티션 유지 (integrations.maintain_partitions, §15.8) =====
+# 보존일 초과 일별 파티션은 즉시 DROP(WAL≈0). 행 도착 전에 파티션이 있어야 DEFAULT 로 안 새므로
+# DAYS_AHEAD 만큼 미리 선생성. 보존일은 웹훅 재전송 창(~36h)보다 넉넉히 크게(기본 7일).
+EVENTINBOX_PARTITION_RETENTION_DAYS = config(
+    "EVENTINBOX_PARTITION_RETENTION_DAYS", default=7, cast=int
+)
+EVENTINBOX_PARTITION_DAYS_AHEAD = config("EVENTINBOX_PARTITION_DAYS_AHEAD", default=7, cast=int)
+# SentDMLog 배치 아카이브 — 0 이면 비활성(기본). ⚠️ 활성화 전 R2 export 선행 필수(업무기록 손실 방지).
+SENTDMLOG_ARCHIVE_RETENTION_DAYS = config("SENTDMLOG_ARCHIVE_RETENTION_DAYS", default=0, cast=int)
 
 # Onboarding drip campaign offsets (days after signup)
 ONBOARDING_DRIP_DAYS = [3, 7, 14]

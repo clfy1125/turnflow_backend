@@ -1742,6 +1742,29 @@ def cleanup_comment_ledger():
     return {"deleted": deleted}
 
 
+@shared_task(name="integrations.maintain_partitions")
+def maintain_partitions():
+    """EventInbox 일별 파티션 유지 + (옵션)SentDMLog 배치 아카이브 (Beat: 매일).
+
+    1) 앞으로 N일치 파티션 선생성(행 도착 전에 있어야 DEFAULT 로 안 샘),
+    2) 보존일 초과 일별 파티션 DROP(즉시, WAL≈0),
+    3) (옵션) SentDMLog 오래된 행 배치 아카이브 — R2 export 선행 전까지 비활성. (§15.8)
+    """
+    from apps.integrations import partition_maintenance as pm
+
+    ensured = pm.ensure_eventinbox_partitions()
+    dropped = pm.drop_old_eventinbox_partitions()
+    archived = pm.archive_old_sentdmlogs()
+    logger.info(
+        "maintain_partitions: ensured=%d dropped=%d(%s) archived=%s",
+        len(ensured),
+        len(dropped),
+        dropped,
+        archived,
+    )
+    return {"ensured": len(ensured), "dropped": dropped, "archived": archived}
+
+
 # ===== 공개 답글 + Follow-gate =====
 
 
