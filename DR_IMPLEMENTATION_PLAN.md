@@ -479,3 +479,80 @@ R2 버킷 lifecycle 규칙으로 `pgbackrest/` 프리픽스 30일 경과 객체 
 ---
 
 *본 계획은 코드 변경 없이 설계만 확정한 문서다. 착수는 §10.1 P0부터, failover/restore 테스트는 §9.3(D-1) 통과 후.*
+
+---
+
+## 15. 용량·백업 운영 계획 (2,000-인플루언서 스케일)
+
+> 연동(런칭) 전에 확정·구현하기로 함. R2 비용은 무의미(수백 GB=월 $5~15, 대역폭 0)하므로 목표는
+> "비용 절감"이 아니라 **라이브 DB·R2 용량을 *유계*로 묶는 것**. 진짜 병목은 R2가 아니라
+> **SentDMLog 라이브 증가(~120 GB/월)**.
+
+### 15.1 스케일 가정 & 산정
+- 목표: **유료 인플루언서 2,000명** × **주 1캠페인** × **댓글/DM 1만** (추후 증가 가능).
+- 파생: **2,000만 DM/주 ≈ 286만/일 ≈ 1,980 DM/분 평균**(군집 피크 1만+/분, 3-tier 설계 한도 내), **8,600만 DM/월**.
+
+| 저장 대상 | 증가/정상상태 | 성격 | 행당(추정) |
+|---|---|---|---|
+| SentDMLog (라이브) | **~120 GB/월** | 영구·hot | ~1.4 KB (인덱스 11개) |
+| EventInbox (prune 시 7일) | 정상 ~40 GB | 유계 | ~1.0 KB (echo+read 2행+JSON) |
+| SeenComment | 정상 ~6 GB | TTL 10일 | ~0.2 KB |
+| R2 WAL(압축) | ~250 GB/월 생성, 보존 ~2주 → 정상 ~125 GB | 유계 | — |
+| R2 base backup | DB크기 비례 | retention 2 | message_sent 반복 → 압축 양호 |
+
+R2 ops: WAL 세그먼트 월 ~5만~11만 PUT ≪ Class A 무료 100만 → ops 비용 0.
+
+### 15.2 ① retention (확정) — `deploy/backups/pgbackrest.conf.example`
+```ini
+repo1-retention-full=2          # ①이번 주 ②지난 주 (폴백 안전망)
+repo1-retention-diff=6          # 현재 full 안에서 일별 diff 6개(1주)
+repo1-retention-archive=2       # ★ WAL을 full 2개 구간만 보관 → 이전 WAL 자동 expire
+repo1-retention-archive-type=full
+```
+- 효과: 약 **2주 rewind 윈도우** + full 폴백 1개. 최근 복구(RPO=분)는 영향 없음.
+
+### 15.3 ② 백업 cron (확정: 주1 full + 일 diff) — NET-NEW `deploy/backups/pgbackrest_backup.sh`
+- WAL 아카이빙: 연속(이미 §9 계획). **건드리지 않음**.
+- **full**: 주 1회, **최저 트래픽 새벽**(잠정 화 03:00 KST — 주말 인플루언서 포스팅 피크 회피, 관측 후 조정).
+- **diff**: 매일 03:30 KST (변경분만 → 빠름).
+- 래퍼: `docker compose exec -u postgres db pgbackrest --stanza=turnflow --type=<full|diff> backup` + Telegram 알림(pg_backup.sh 패턴), host crontab.
+- ⚠️ **db 볼륨 디스크 헤드룸 ≥ 수십 GB**: R2 업로드 지연 시 WAL이 `pg_wal`에 백로그(피크 ~100 MB/분).
+- ⚠️ full은 surge와 I/O 경쟁 → 반드시 저트래픽 창. `start-fast=y` 적용됨.
+
+### 15.4 ③ EventInbox 정리 (확정: 7일 + 일별 파티션 DROP)
+- **사유**: 하루 ~570만 행 → 단순 `DELETE`는 락·WAL 폭증. **일별 range 파티션 + 옛 파티션 `DROP`**(즉시, WAL≈0)이 정석.
+- **UNIQUE 제약 영향**: 파티션 PK/unique는 파티션키 포함 필수 → `event_key` UNIQUE → `(event_key, received_at)` per-partition.
+  - 위험 **낮음**: 중복 웹훅은 분 단위로 도착(같은 날=같은 파티션에서 잡힘). 일 경계의 드문 재전송은 **echo/read 재처리=멱등 status UPDATE**라 무해. (SentDMLog과 달리 실제 발송을 제어하지 않음)
+- NET-NEW: 파티션 전환 마이그레이션 + `manage_partitions` 일일 태스크(차일 파티션 선생성 + 7일 초과 DROP).
+
+### 15.5 ④ SentDMLog 월별 파티션 (확정: 지금 도입) — ★ idempotency 하드보증 충돌 해소 필요
+**문제 (코드 스캔 결과):** 운영 `SentDMLog.objects.create()` **5곳**(tasks.py 513·714·2009·2403·2453)이 모두
+`create() → except IntegrityError → 기존 row fetch` 패턴 = **전역 UNIQUE(idempotency_key)** 에 의존(모델 §1480 "정확히 한 번의 하드 보증").
+PG 네이티브 range 파티션(by `created_at`)은 모든 UNIQUE/PK가 **파티션키를 포함**해야 함 →
+`idempotency_key` UNIQUE → `(idempotency_key, created_at)` **per-partition** 으로 약화 → **월 경계 중복 발송 가능**(이론).
+
+**해소 옵션 (오너 결정 필요):**
+- **(A) 전역 dedup 레저 (권장 — 하드보증 유지):** NET-NEW 비파티션 테이블 `DMDedupKey(idempotency_key PK, created_at)`.
+  5개 create 사이트가 **먼저 `DMDedupKey` INSERT(ON CONFLICT)** 로 멱등 판정 → SentDMLog는 자유롭게 파티션/아카이브.
+  레저는 재트리거 윈도우(~30~45일) 밖이면 prune·파티션 가능 → 유계. **단 hot DM 경로 5곳 + 신규테이블 + 테스트** 필요.
+- **(B) per-partition unique + SeenComment 실무 dedup (가벼움):** 제약만 변경, create 사이트 무수정(같은 달 중복은 여전히 IntegrityError).
+  월 경계의 드문 중복은 SeenComment(TTL 10일) 앵커가 사실상 커버. **단 문서화된 "DB 하드보증"이 "2-소프트레이어"로 다운그레이드.**
+- (참고) (C) 비파티션 유지 + 배치 이관/삭제: 전역 unique 유지하나 대량 DELETE 부하·블로트 → 파티션보다 운영 무거움.
+
+**파티션 운영(공통):** PK `id` → `(id, created_at)`. 월별 파티션. `manage_partitions` 태스크가 **익월 파티션 선생성** +
+6개월 초과 파티션 **detach → R2 dump → drop**(콜드 아카이브) → hot DB "최근 6개월"로 유계 → full 백업도 빨라짐.
+**런칭 전(빈 테이블)이 마이그레이션 최적기.**
+
+> 곁가지(나중): SentDMLog 인덱스 11개 = WAL 증폭 주범. 중복 인덱스(`comment_id` 단독 + `(campaign, comment_id)`) 정리 시 쓰기↓.
+
+### 15.6 실행 순서 (2 워크스트림)
+- **WS-1 (안전·즉시 가능, 상관관계 없음):** ① retention 2줄 + ② 백업 cron 스크립트 + ③ EventInbox 일별 파티션·prune.
+  → 정확성 리스크 0. 먼저 머지/배포 가능.
+- **WS-2 (런칭 전 수술, hot-path):** ④ SentDMLog 파티션 + dedup(옵션 A 권장) + `manage_partitions` + 아카이브.
+  → `loadtest_dm.py`로 파티션·dedup 부하/정합 검증 후 머지.
+
+### 15.7 미해결 (오너 결정)
+1. ④ dedup: **(A) 레저** vs (B) per-partition+SeenComment. (기본 권장: A)
+2. full 백업 창 요일/시각(잠정 화 03:00 KST) — 실제 트래픽 관측 후 확정.
+3. SentDMLog 콜드 아카이브 보존 hot 기간(잠정 6개월) + 아카이브 포맷(R2 Parquet/CSV/pg_dump 파티션).
+4. EventInbox 파티션 유지일 7일 확정(재처리 멱등성 재확인).
