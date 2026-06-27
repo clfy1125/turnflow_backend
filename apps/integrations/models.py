@@ -5,7 +5,7 @@ Instagram Account Connection models
 import uuid
 from datetime import timedelta
 
-from django.db import IntegrityError, models, transaction
+from django.db import models, transaction
 from django.utils import timezone
 
 from .encryption import EncryptedTextField
@@ -1164,17 +1164,25 @@ class SentDMLog(models.Model):
 
         WHY 두 겹: DMDedupKey 가 **전역** 하드 보증(SentDMLog 파티셔닝 후에도 유지), SentDMLog 의
         ``unique=True`` 는 파티셔닝 전까지 2차 방어 + 파티셔닝 후엔 per-partition 방어로 남는다.
-        둘 중 어느 것이 충돌해도 같은 트랜잭션이 통째로 롤백돼 orphan claim 이 생기지 않는다(무손실).
+        log INSERT 가 실패하면 같은 트랜잭션이라 키 claim 도 롤백돼 orphan claim 이 없다(무손실).
+
+        ★ 중복 판정은 **DMDedupKey claim 충돌만**으로 한다(get_or_create 의 created 플래그).
+        SentDMLog INSERT 단계에서 나는 IntegrityError/DataError(NOT NULL·FK·길이 등 '키 충돌이 아닌'
+        진짜 오류)는 '중복'으로 둔갑시키지 않고 **그대로 전파**한다 → silent drop 대신 에러/재시도로
+        가시화(무손실). 파티셔닝으로 SentDMLog 전역 UNIQUE 가 제거된 뒤 이 함수가 단일 보증이 되므로,
+        '키 충돌'과 '기타 오류'를 분리하는 것이 핵심.
 
         호출부는 기존 ``try/except IntegrityError`` 인라인을 대체한다(=동작 동일, 보증만 강화).
         """
-        try:
-            with transaction.atomic():
-                DMDedupKey.objects.create(idempotency_key=idempotency_key)
-                log = cls.objects.create(idempotency_key=idempotency_key, **fields)
+        with transaction.atomic():
+            # get_or_create 는 INSERT 충돌을 내부 savepoint 로 흡수 → 동시성 안전하게 '진짜 중복'만 판정.
+            _, claimed = DMDedupKey.objects.get_or_create(idempotency_key=idempotency_key)
+            if not claimed:
+                # 키가 이미 레저에 있음 = 중복. 기존 log 반환(아카이브됐으면 None).
+                return cls.objects.filter(idempotency_key=idempotency_key).first(), False
+            # 새 키 claim 성공 → log 생성. 여기서 나는 예외는 '중복'이 아니므로 전파(트랜잭션째 롤백).
+            log = cls.objects.create(idempotency_key=idempotency_key, **fields)
             return log, True
-        except IntegrityError:
-            return cls.objects.filter(idempotency_key=idempotency_key).first(), False
 
     # ===== 상태 전이 헬퍼 =====
 

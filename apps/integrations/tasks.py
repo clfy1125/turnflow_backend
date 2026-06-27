@@ -1996,8 +1996,12 @@ def send_reward_dm(self, opening_log_id: str):
     if ig_conn.status != IGAccountConnection.Status.ACTIVE:
         return {"status": "failed_token", "reason": "ig connection not active"}
 
-    # 멱등성 키 — opening 의 idempotency_key 에 ":reward" 접미사
-    idem = f"{opening.idempotency_key}:reward"
+    # 멱등성 키 — opening 의 idempotency_key 를 시드로 sha256(64자 고정).
+    # 접미사 접합(":reward")은 varchar(64) 를 초과(71자)해 DataError 를 내므로 금지 — 형제 헬퍼
+    # (_enqueue_reward_dm/_enqueue_follow_retry)와 동일하게 항상 해시화한다.
+    import hashlib
+
+    idem = hashlib.sha256(f"reward:{opening.idempotency_key}".encode()).hexdigest()
     reward_log, created = SentDMLog.create_idempotent(
         idempotency_key=idem,
         campaign=campaign,

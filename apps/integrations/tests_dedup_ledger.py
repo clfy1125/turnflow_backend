@@ -15,6 +15,7 @@ NOTE(pytest-tests-prefix): tests_*.py 는 자동수집 안 됨 → 파일 경로
 import uuid
 
 import pytest
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 
 from apps.integrations.models import (
@@ -108,4 +109,22 @@ class TestCreateIdempotent:
         log, created = SentDMLog.create_idempotent(idempotency_key=key, **_fields(campaign))
         assert created is False
         assert log is None  # 아카이브돼 없음 — 그래도 재발송 안 함
+        assert SentDMLog.objects.filter(idempotency_key=key).count() == 0
+
+    def test_non_key_integrity_error_propagates_not_silent_dup(self, campaign):
+        """키 충돌이 '아닌' 진짜 DB 오류(여기선 NOT NULL FK 위반)는 '중복'으로 둔갑하지 말고 전파해야 한다.
+
+        무손실 핵심: 파티셔닝으로 SentDMLog 전역 UNIQUE 가 제거되면 create_idempotent 가 단일 보증.
+        비-키 IntegrityError 를 (None, False)='중복' 으로 삼키면 발송 누락(silent drop)이 무성히 침투.
+        → 예외가 전파되고(=에러/재시도로 가시화), claim 도 롤백돼 orphan 이 없어야 한다.
+        """
+        key = uuid.uuid4().hex
+        fields = _fields(campaign)
+        fields["campaign"] = None  # NOT NULL FK 위반 유도 (idempotency_key 충돌 아님)
+        with pytest.raises(IntegrityError):
+            # 바깥 atomic 으로 감싸 테스트 트랜잭션이 broken 상태로 남지 않게 한다.
+            with transaction.atomic():
+                SentDMLog.create_idempotent(idempotency_key=key, **fields)
+        # '중복'으로 둔갑하지 않았고(예외 전파), claim 도 롤백돼 orphan 이 없다.
+        assert DMDedupKey.objects.filter(idempotency_key=key).count() == 0
         assert SentDMLog.objects.filter(idempotency_key=key).count() == 0
