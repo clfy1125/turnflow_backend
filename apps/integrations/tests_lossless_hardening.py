@@ -175,12 +175,17 @@ class TestActionBlockCooldown:
 
     def test_escalation_doubles(self, ig_connection):
         from apps.integrations import rate_governor
+        from apps.integrations.models import DMAccountBlock
 
         acct = f"ab_{uuid.uuid4().hex}"
         c1 = rate_governor.trip_action_block(acct, base_hours=24, max_days=7)
         assert c1 == 24 * 3600
-        # 쿨다운 키만 지우고 레벨은 유지 → 다음 트립은 ×2
+        # 쿨다운 '만료'를 시뮬 — 레벨은 보존하되 캐시·DB 쿨다운을 둘 다 만료시켜야 다음 트립이 ×2.
+        # (DR 듀얼라이트로 action_block_cooldown_remaining 이 DB cooldown_until 도 보므로 캐시만 지우면 부족)
         cache.delete(f"dm:ab:cooldown:{acct}")
+        DMAccountBlock.objects.filter(external_account_id=acct).update(
+            cooldown_until=timezone.now() - timedelta(seconds=1)
+        )
         c2 = rate_governor.trip_action_block(acct, base_hours=24, max_days=7)
         assert c2 == 48 * 3600
 
