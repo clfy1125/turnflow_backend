@@ -1,0 +1,29 @@
+# TurnFlow DR — 감지기 Cron Worker 배포 설정.
+# 배포: wrangler deploy   (사전: KV 네임스페이스 생성 + 시크릿 등록 — README.md 참고)
+# 이 워커는 DR Step 2 의 tick 워커를 대체한다(tick + 회색지대 감지를 함께 수행).
+
+name = "turnflow-dr-detector"
+main = "detector-worker.js"
+compatibility_date = "2025-01-01"
+
+# 매 분 실행(Cloudflare cron 최소 단위 = 1분). tick + 프로빙.
+[triggers]
+crons = ["* * * * *"]
+
+# 감지 상태(streak/since_ts/alerted) 영속용 KV. id 는 `wrangler kv namespace create DR_STATE` 결과로 교체.
+[[kv_namespaces]]
+binding = "DR_STATE"
+id = "<KV_NAMESPACE_ID>"
+
+# 비밀 아님(공개돼도 무방한 임계/튜닝값). 시크릿(SCHEDULER_SECRET/TELEGRAM_*)은 `wrangler secret put` 으로.
+[vars]
+ORIGIN = "https://api.turnflow.clfy.ai.kr"
+EXPECTED_ACTIVE_SITE = "colo"
+T_SUSPECT_SECONDS = "180"      # DEGRADED→SUSPECTED 지속 임계(3분)
+T_WINDOW_SECONDS = "1800"      # SUSPECTED→CONFIRMED 지속창(30분)
+QUEUE_WARN = "5000"            # dm_send 큐 적체 경계
+WORKER_STALE_SECONDS = "600"   # 워커 heartbeat stale 경계(stall 상관 조건)
+DEFERRED_AGE_SECONDS = "3600"  # deferred DM '밀린 시간' 경계
+DB_LATENCY_MS = "2000"         # DB 왕복 지연 hard-fail 경계
+PROBE_TIMEOUT_MS = "5000"      # 프로브 타임아웃
+RECOVER_HEALTHY_POLLS = "2"    # 회복 히스테리시스(연속 healthy poll 수)

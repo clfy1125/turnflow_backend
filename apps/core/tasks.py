@@ -22,14 +22,13 @@ logger = logging.getLogger(__name__)
 WAL_LAG_ALERT_SECONDS = 300
 
 
-@shared_task(queue="billing")
-def backup_health_check() -> dict:
-    """Monitor Layer-2 (WAL archiving) health via pg_stat_archiver. Beat: every 30 min.
+def read_archiver_status() -> dict:
+    """pg_stat_archiver 한 줄을 dict 로 읽는다 — backup_health_check 와 /healthz/diag 공용.
 
-    Alerts on: archiver failures, or WAL not archived for > WAL_LAG_ALERT_SECONDS.
-    Returns a small status dict for logging/Flower. Never raises (best-effort monitor).
+    절대 raise 하지 않는다(측정 실패는 enabled=None+error 로). 반환 키:
+      enabled(True/False/None), archived_count, failed_count, last_archived_time(iso/None),
+      last_failed_time(iso/None), lag_seconds(int/None), broken(bool).
     """
-    status: dict = {"ok": True, "checked": "pg_stat_archiver"}
     try:
         with connection.cursor() as cur:
             cur.execute(
@@ -43,26 +42,60 @@ def backup_health_check() -> dict:
                 """
             )
             row = cur.fetchone()
+    except Exception as exc:  # noqa: BLE001 — 측정 실패(예: 권한/연결)
+        return {"enabled": None, "error": str(exc)}
 
-        if not row:
+    if not row:
+        return {"enabled": False}
+
+    archived, failed, last_arch, last_fail, lag = row
+    # 마지막 실패가 마지막 성공보다 최신 → 지금 아카이빙이 깨진 상태.
+    broken = bool(last_fail and (not last_arch or last_fail > last_arch))
+    return {
+        "enabled": True,
+        "archived_count": archived,
+        "failed_count": failed,
+        "last_archived_time": last_arch.isoformat() if last_arch else None,
+        "last_failed_time": last_fail.isoformat() if last_fail else None,
+        "lag_seconds": int(lag) if lag is not None else None,
+        "broken": broken,
+    }
+
+
+@shared_task(queue="billing")
+def backup_health_check() -> dict:
+    """Monitor Layer-2 (WAL archiving) health via pg_stat_archiver. Beat: every 30 min.
+
+    Alerts on: archiver failures, or WAL not archived for > WAL_LAG_ALERT_SECONDS.
+    Returns a small status dict for logging/Flower. Never raises (best-effort monitor).
+    """
+    status: dict = {"ok": True, "checked": "pg_stat_archiver"}
+    try:
+        info = read_archiver_status()
+        if info.get("enabled") is False:
             return {"ok": True, "note": "pg_stat_archiver empty (archiving not enabled yet)"}
+        if info.get("enabled") is None:  # 측정 실패
+            logger.warning("backup_health_check error: %s", info.get("error"))
+            return {"ok": False, "error": info.get("error")}
 
-        archived, failed, last_arch, last_fail, lag = row
         status.update(
-            archived_count=archived,
-            failed_count=failed,
-            lag_seconds=lag,
+            archived_count=info.get("archived_count"),
+            failed_count=info.get("failed_count"),
+            lag_seconds=info.get("lag_seconds"),
         )
 
         problems = []
-        # A recent failure that is newer than the last success → archiving is broken now.
-        if last_fail and (not last_arch or last_fail > last_arch):
-            problems.append(f"WAL archive FAILING (failed_count={failed}, last_failed={last_fail})")
-        # Archiving stalled.
-        if last_arch is None:
+        if info.get("broken"):
+            problems.append(
+                f"WAL archive FAILING (failed_count={info.get('failed_count')}, "
+                f"last_failed={info.get('last_failed_time')})"
+            )
+        if info.get("last_archived_time") is None:
             problems.append("WAL never archived (archive_mode/archive_command not effective)")
-        elif lag is not None and lag > WAL_LAG_ALERT_SECONDS:
-            problems.append(f"WAL archive lag {lag}s > {WAL_LAG_ALERT_SECONDS}s")
+        else:
+            lag = info.get("lag_seconds")
+            if lag is not None and lag > WAL_LAG_ALERT_SECONDS:
+                problems.append(f"WAL archive lag {lag}s > {WAL_LAG_ALERT_SECONDS}s")
 
         if problems:
             status["ok"] = False

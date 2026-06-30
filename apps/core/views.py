@@ -12,14 +12,22 @@ Core views — health check / monitoring.
 from __future__ import annotations
 
 import logging
+import time
 import urllib.request
 
 from django.conf import settings
 from django.core.cache import cache
 from django.db import connection
 from django.http import JsonResponse
+from django.utils import timezone
 
-from apps.core.site_control import get_site_state, scheduler_heartbeat_fresh
+from apps.core.internal_auth import verify_scheduler_request
+from apps.core.site_control import (
+    get_site_state,
+    scheduler_heartbeat_age,
+    scheduler_heartbeat_fresh,
+    worker_heartbeat_age,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -137,3 +145,93 @@ def ready(request):
             status=503,
         )
     return JsonResponse({"status": "ready", "site": settings.SITE_ID, "checks": checks})
+
+
+def diag(request):
+    """DR 감지기 전용 진단 점수판(읽기전용). 회색지대(워커 stall·큐 적체·아카이버 지연)까지 노출.
+
+    /healthz/ready 와 다른 점:
+      - **절대 503 으로 죽지 않는다** — 서브프로브 실패는 필드값으로 인코딩(항상 200). 감지기가
+        자기 임계/히스테리시스로 채점한다. ready 의 failover 시맨틱은 건드리지 않음.
+      - **active_site 게이트 없음** — passive 박스에서도 진실을 반환(감지기가 active_site 를 봐야 함).
+    인증은 tick 과 동일(X-Scheduler-Secret + IP allowlist) — 큐 깊이 등 인프라 정보 노출이므로.
+    각 서브프로브 try/except, 총예산 < ~500ms. (계획서 Phase A1)
+    """
+    ok, reason = verify_scheduler_request(request)
+    if not ok:
+        code = 403 if reason in ("bad_secret", "ip_not_allowed") else 503
+        return JsonResponse(
+            {"success": False, "error": {"code": code, "message": reason}}, status=code
+        )
+
+    out: dict = {"site": getattr(settings, "SITE_ID", "?")}
+
+    # SiteControl 상태 (5s 캐시 / LKG 폴백) — 감지기가 passive/이미-failover 를 구분하는 근거
+    try:
+        state = get_site_state()
+        out["active_site"] = state.get("active_site")
+        out["mode"] = state.get("mode")
+        out["epoch"] = state.get("epoch")
+        out["restore_complete"] = state.get("restore_complete")
+    except Exception:  # noqa: BLE001
+        out["active_site"] = None
+
+    # DB 왕복
+    try:
+        t0 = time.perf_counter()
+        with connection.cursor() as cur:
+            cur.execute("SELECT 1")
+        out["db_ok"] = True
+        out["db_latency_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+    except Exception:  # noqa: BLE001
+        out["db_ok"] = False
+        out["db_latency_ms"] = None
+
+    # Redis 왕복
+    try:
+        t0 = time.perf_counter()
+        cache.set("healthz:diag:ping", "1", 5)
+        out["redis_ok"] = cache.get("healthz:diag:ping") == "1"
+        out["redis_latency_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+    except Exception:  # noqa: BLE001
+        out["redis_ok"] = False
+        out["redis_latency_ms"] = None
+
+    # 마이그레이션 최신 여부
+    try:
+        from django.db.migrations.executor import MigrationExecutor
+
+        executor = MigrationExecutor(connection)
+        plan = executor.migration_plan(executor.loader.graph.leaf_nodes())
+        out["migrations_pending"] = bool(plan)
+    except Exception:  # noqa: BLE001
+        out["migrations_pending"] = None
+
+    # 큐 깊이 + deferred DM 적체 (회색지대 핵심)
+    try:
+        from apps.integrations.queue_health import oldest_due_deferred_dm_age_s, queue_depths
+
+        out["queue_depths"] = queue_depths()
+        out["oldest_deferred_dm_age_s"] = oldest_due_deferred_dm_age_s()
+    except Exception:  # noqa: BLE001
+        out["queue_depths"] = {}
+        out["oldest_deferred_dm_age_s"] = None
+
+    # heartbeat 신선도(초)
+    try:
+        out["worker_heartbeat_age_s"] = worker_heartbeat_age()
+        out["scheduler_tick_age_s"] = scheduler_heartbeat_age()
+    except Exception:  # noqa: BLE001
+        out["worker_heartbeat_age_s"] = None
+        out["scheduler_tick_age_s"] = None
+
+    # WAL 아카이버 상태(데이터 위험 신호 — 감지기는 경보전용으로 사용)
+    try:
+        from apps.core.tasks import read_archiver_status
+
+        out["wal"] = read_archiver_status()
+    except Exception:  # noqa: BLE001
+        out["wal"] = {}
+
+    out["server_time"] = timezone.now().isoformat()
+    return JsonResponse(out)

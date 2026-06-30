@@ -24,6 +24,7 @@ _LKG_KEY = "dr:site_state:lkg"  # last-known-good (DB 장애 폴백용, 장기 T
 _CACHE_TTL = 5
 _LKG_TTL = 3600
 _HEARTBEAT_KEY = "dr:scheduler:last_tick"
+_WORKER_HEARTBEAT_KEY = "dr:worker:last_beat"  # 워커가 태스크를 consume 중인지(stall 감지)
 
 # DB·LKG 모두 없을 때의 보수적 기본값 — 이 서버를 passive 로 간주(쓰기 차단).
 _UNKNOWN_STATE = {
@@ -119,3 +120,29 @@ def scheduler_heartbeat_fresh(max_age: int = 180) -> bool:
         return (int(time.time()) - int(ts)) <= max_age
     except (TypeError, ValueError):
         return False
+
+
+def _heartbeat_age(key: str) -> int | None:
+    """heartbeat 키의 나이(초). 없거나 파손이면 None. (/healthz/diag 가 채점)"""
+    ts = _safe_cache_get(key)
+    if ts is None:
+        return None
+    try:
+        return max(0, int(time.time()) - int(ts))
+    except (TypeError, ValueError):
+        return None
+
+
+def scheduler_heartbeat_age() -> int | None:
+    return _heartbeat_age(_HEARTBEAT_KEY)
+
+
+# ─────────────────────────────────────────────────────────────
+# 워커 dead-man heartbeat (task_postrun 에서 갱신 — config/celery.py)
+# ─────────────────────────────────────────────────────────────
+def touch_worker_heartbeat() -> None:
+    _safe_cache_set(_WORKER_HEARTBEAT_KEY, int(time.time()), 3600)
+
+
+def worker_heartbeat_age() -> int | None:
+    return _heartbeat_age(_WORKER_HEARTBEAT_KEY)

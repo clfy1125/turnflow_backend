@@ -7,7 +7,7 @@ import os
 
 from celery import Celery
 from celery.exceptions import Reject
-from celery.signals import task_prerun, worker_ready
+from celery.signals import task_postrun, task_prerun, worker_ready
 
 # Set the default Django settings module for the 'celery' program.
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings.local")
@@ -60,6 +60,22 @@ def _dr_rehydrate_governor(**kwargs):
             rehydrate_from_db()
     except Exception:  # noqa: BLE001 — best-effort
         _logger.exception("worker_ready governor rehydrate failed")
+
+
+@task_postrun.connect
+def _dr_worker_heartbeat(**kwargs):
+    """워커가 태스크를 실제 consume 했음을 알리는 heartbeat(/healthz/diag 가 읽음).
+
+    active 사이트에서 큐가 흐르는지(워커 stall 감지) 신호. best-effort — 무트래픽이면 stale
+    로 보이나, 감지기가 queue_depth 와 상관(빈 큐 + stale = 무해)으로 처리하므로 오탐 아님.
+    (DR_IMPLEMENTATION_PLAN.md §5, 계획서 Phase A1)
+    """
+    try:
+        from apps.core.site_control import touch_worker_heartbeat
+
+        touch_worker_heartbeat()
+    except Exception:  # noqa: BLE001 — best-effort
+        pass
 
 
 @app.task(bind=True, ignore_result=True)
