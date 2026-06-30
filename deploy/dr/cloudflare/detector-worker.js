@@ -184,7 +184,7 @@ function alertText(ev, verdict, c) {
 // ── 메인 tick(매 분) ──────────────────────────────────────────────────────────
 async function runTick(env) {
   const c = cfg(env);
-  const secret = env.SCHEDULER_SECRET || "";
+  const secret = env.SCHEDULER_TICK_SECRET || "";
   const now = Math.floor(Date.now() / 1000);
 
   // 1) 스케줄러 tick (기존 동작 — 서버가 due 잡 enqueue + Healthchecks ping)
@@ -238,7 +238,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.searchParams.get("debug") === "1") {
-      if ((request.headers.get("X-Scheduler-Secret") || "") !== (env.SCHEDULER_SECRET || "")) {
+      if ((request.headers.get("X-Scheduler-Secret") || "") !== (env.SCHEDULER_TICK_SECRET || "")) {
         return new Response("forbidden", { status: 403 });
       }
       const raw = (await env.DR_STATE.get(KV_KEY)) || "null";

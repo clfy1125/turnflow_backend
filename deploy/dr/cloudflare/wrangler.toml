@@ -15,7 +15,7 @@ crons = ["* * * * *"]
 binding = "DR_STATE"
 id = "<KV_NAMESPACE_ID>"
 
-# 비밀 아님(공개돼도 무방한 임계/튜닝값). 시크릿(SCHEDULER_SECRET/TELEGRAM_*)은 `wrangler secret put` 으로.
+# 비밀 아님(공개돼도 무방한 임계/튜닝값). 시크릿(SCHEDULER_TICK_SECRET/TELEGRAM_*)은 `wrangler secret put` 으로.
 [vars]
 ORIGIN = "https://api.turnflow.clfy.ai.kr"
 EXPECTED_ACTIVE_SITE = "colo"

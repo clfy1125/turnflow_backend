@@ -23,7 +23,7 @@ wrangler login
 wrangler kv namespace create DR_STATE
 
 # 2) 시크릿 등록 (vars 가 아니라 secret 으로 — 평문 노출 금지)
-wrangler secret put SCHEDULER_SECRET     # = 서버 .env.production 의 SCHEDULER_TICK_SECRET 과 동일값
+wrangler secret put SCHEDULER_TICK_SECRET  # = 서버 .env.production 의 동일 시크릿(기존 tick 워커가 이미 보유)
 wrangler secret put TELEGRAM_BOT_TOKEN   # 서버와 동일 봇
 wrangler secret put TELEGRAM_CHAT_ID
 # (선택) wrangler secret put HEALTHCHECKS_TICK_URL   # 서버가 tick 시 ping 하므로 대개 불필요
