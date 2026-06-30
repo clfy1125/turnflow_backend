@@ -1,0 +1,9 @@
+# deploy/dr/gcp/ — deny everything, re-allow only safe tracked files.
+# 채워진 설정(gcp.env)·실 시크릿(secrets/)·VM이 쓰는 인증서(certs/)는 절대 커밋 금지.
+# (적대적 리뷰 critical: R2 cipher / CF Origin 개인키 / CF API 토큰 커밋 방지)
+*
+!.gitignore
+!*.example
+!*.sh
+!*.md
+!Caddyfile.gcp
