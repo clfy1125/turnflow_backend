@@ -25,25 +25,40 @@ until $COMPOSE exec -T db pg_isready -U postgres >/dev/null 2>&1; do sleep 2; do
 echo "[restore] 2) postgres 정지(복구 위해 PGDATA 잠금 해제)"
 $COMPOSE stop db
 
-echo "[restore] 3) pgBackRest 복구(컨테이너 내부 일회성, R2 read) target='${TARGET:-LATEST}'"
-# --delta: initdb 클러스터 위에 차등 복원(불일치 파일 덮어쓰기/잉여 제거). --target-action=promote: 목표 도달 후 승격.
+echo "[restore] 3) pgBackRest 복구(컨테이너 내부 일회성, R2 read) target='${TARGET:-LATEST}' drill=$DRILL"
+# --delta: initdb 클러스터 위에 차등 복원(불일치 파일 덮어쓰기/잉여 제거).
 if [ -n "$TARGET" ]; then
+  # PITR 특정 시각으로 복구 후 승격.
   $COMPOSE run --rm --no-deps -u postgres --entrypoint pgbackrest db \
     --stanza="$STANZA" --type=time --target="$TARGET" --delta --target-action=promote $ARCH_OPT restore
-else
+elif [ "$DRILL" = "1" ]; then
+  # 드릴: 백업 일관성 지점까지만 복구 후 '즉시' 승격(아카이브 WAL 재생 불필요 → 빠름, RPO=마지막 백업).
+  # latest(=type=default)는 마지막 백업 이후 아카이브 WAL 을 segment 단위로 전부 재생하느라 매우 느림 → 드릴엔 부적합.
   $COMPOSE run --rm --no-deps -u postgres --entrypoint pgbackrest db \
-    --stanza="$STANZA" --delta --target-action=promote $ARCH_OPT restore
+    --stanza="$STANZA" --type=immediate --target-action=promote --delta $ARCH_OPT restore
+else
+  # LIVE 최신: 아카이브 WAL 전부 재생(RPO≈분) 후 끝에서 자동 승격. target-action 은 type 있을 때만 유효 → 미지정.
+  $COMPOSE run --rm --no-deps -u postgres --entrypoint pgbackrest db \
+    --stanza="$STANZA" --delta $ARCH_OPT restore
 fi
 
-echo "[restore] 4) db 기동 + WAL 재생 + consistency 대기"
+echo "[restore] 4) db 기동 + 승격 대기 (immediate/time=즉시, latest=아카이브 WAL량 비례로 길 수 있음)"
 $COMPOSE up -d db
 until $COMPOSE exec -T db pg_isready -U postgres >/dev/null 2>&1; do sleep 2; done
-# 복구 모드(recovery.signal)가 남아있는지 = 아직 재생 중인지 확인
-for i in $(seq 1 60); do
+# recovery 종료(=읽기쓰기 승격) 대기. drill/time 은 즉시, live-latest 는 WAL 전부 재생까지 길 수 있어 넉넉히.
+in_recovery=""
+for i in $(seq 1 300); do   # 최대 ~15분
   in_recovery="$($COMPOSE exec -T db psql -U postgres -tAc 'SELECT pg_is_in_recovery();' 2>/dev/null | tr -d '[:space:]')"
   [ "$in_recovery" = "f" ] && break
-  echo "    ...WAL 재생/승격 대기(${i})"; sleep 3
+  [ $((i % 10)) -eq 0 ] && echo "    ...승격 대기(${i}) — latest 는 마지막 백업 이후 WAL segment 를 전부 재생 중"
+  sleep 3
 done
+if [ "$in_recovery" != "f" ]; then
+  # ⚠️ 자동 강제 pg_promote 안 함 — 미재생 WAL 손실(데이터 유실) 위험. db 로그 확인 후 운영자가 수동 판단.
+  echo "[restore] ⚠️ 아직 recovery(읽기전용). WAL 재생이 매우 길거나 멈춤 → db 로그 확인:"
+  echo "[restore]    docker compose -f docker-compose.prod.yml --env-file .env.production logs --tail 40 db"
+  echo "[restore]    (정말 멈춤이고 RPO 손실 감수면 수동) ... exec -u postgres db psql -U postgres -c 'SELECT pg_promote();'"
+fi
 echo "[restore] 복구 완료 (pg_is_in_recovery=${in_recovery:-?})"
 
 # 드릴 fail-closed 가드: archive_mode 가 실제 off 인지 검증. 어떤 이유로든 on 이면 공유 R2 'turnflow'

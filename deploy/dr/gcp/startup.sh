@@ -98,7 +98,9 @@ fi
 # 드릴: --dry-run → send_dm_task.delay() 적재 자체를 안 함(실발송 방지 이중화). live: 정상.
 DRY=""; [ "$DRILL" = "1" ] && DRY="--dry-run"
 $COMPOSE run --rm --no-deps web_dashboard python manage.py dr_catchup --skip-poll $DRY || true
-$COMPOSE run --rm --no-deps web_dashboard python manage.py mark_restore_complete --promote --note "gcp ${MODE} $(date -u +%FT%TZ)"
+# promote 는 db:5432 직결(pgbouncer 우회) — db 재기동 직후 pgbouncer 의 stale 연결로 'server terminated abnormally' 나는 것 방지.
+$COMPOSE run --rm --no-deps -e DB_HOST=db -e DB_PORT=5432 -e DB_CONN_MAX_AGE=0 \
+  web_dashboard python manage.py mark_restore_complete --promote --note "gcp ${MODE} $(date -u +%FT%TZ)"
 
 # ── 9) (real 전용) 새 타임라인 full backup → R2 에 GCP 타임라인 정착 ──
 R2_SETTLED=1
