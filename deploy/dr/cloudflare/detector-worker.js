@@ -244,6 +244,23 @@ export default {
       const raw = (await env.DR_STATE.get(KV_KEY)) || "null";
       return new Response(raw, { headers: { "Content-Type": "application/json" } });
     }
+    // 수동 텔레그램 테스트: GET ?test=alert (시크릿 헤더 필요) — 워커의 실제 telegram() + 시크릿으로
+    // 샘플 SUSPECTED 경보를 발신. 상태기계/KV 와 무관, 실제 장애 유발 없음.
+    if (url.searchParams.get("test") === "alert") {
+      if ((request.headers.get("X-Scheduler-Secret") || "") !== (env.SCHEDULER_TICK_SECRET || "")) {
+        return new Response("forbidden", { status: 403 });
+      }
+      const c = cfg(env);
+      await telegram(
+        env,
+        alertText(
+          { type: "SUSPECTED", sustained: 180 },
+          { reasons: ["TEST — 실제 장애 아님(수동 테스트)"], klass: "TEST" },
+          c
+        )
+      );
+      return new Response("test alert sent — check Telegram", { status: 200 });
+    }
     return new Response("turnflow-dr-detector (cron worker)", { status: 200 });
   },
 };
