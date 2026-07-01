@@ -23,7 +23,7 @@
 	}
 }
 
-api.turnflow.clfy.ai.kr {
+turnflow-api.clfy.ai.kr {
 	encode zstd gzip
 
 	# CF LB office 풀 모니터 — 항상 200 (점검 페이지 노출용으로 풀을 healthy 로 유지)

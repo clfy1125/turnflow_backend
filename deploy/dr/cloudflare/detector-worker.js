@@ -20,7 +20,7 @@ const KV_KEY = "detector_state";
 // ── 설정(wrangler vars, 문자열로 들어오므로 num() 로 변환) ───────────────────
 function cfg(env) {
   return {
-    origin: env.ORIGIN || "https://api.turnflow.clfy.ai.kr",
+    origin: env.ORIGIN || "https://turnflow-api.clfy.ai.kr",
     expectedActiveSite: env.EXPECTED_ACTIVE_SITE || "colo",
     tSuspect: num(env.T_SUSPECT_SECONDS, 180), // DEGRADED→SUSPECTED (지속)
     tWindow: num(env.T_WINDOW_SECONDS, 1800), // SUSPECTED→CONFIRMED (30분 지속창)

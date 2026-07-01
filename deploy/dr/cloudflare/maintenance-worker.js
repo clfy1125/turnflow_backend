@@ -1,7 +1,7 @@
 /**
  * TurnFlow DR — (선택) 점검페이지 Worker.
  *
- * 라우트 `api.turnflow.clfy.ai.kr/*` 에 바인딩하면, 원본(colo)이 5xx/도달불가일 때 엣지에서
+ * 라우트 `turnflow-api.clfy.ai.kr/*` 에 바인딩하면, 원본(colo)이 5xx/도달불가일 때 엣지에서
  * 점검페이지(503 + Retry-After)를 서빙한다. 원본이 정상이면 **투명 패스스루**.
  * → 은퇴한 office 점검 Caddy 를 대체. colo 다운 ~ GCP DNS 스왑 사이 사용자가 raw 에러 대신 점검페이지를 봄.
  *

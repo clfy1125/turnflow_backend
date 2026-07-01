@@ -31,5 +31,5 @@ docker exec -w "$CADDY_ETC" caddy caddy validate --config "$CADDY_ETC/Caddyfile"
 docker exec -w "$CADDY_ETC" caddy caddy reload   --config "$CADDY_ETC/Caddyfile"
 
 echo "[failover] 완료. CF LB office 풀이 /healthz/ready=200 을 보면 실 앱 서빙."
-echo "          확인:  curl -fsS https://api.turnflow.clfy.ai.kr/api/v1/healthz/ready"
+echo "          확인:  curl -fsS https://turnflow-api.clfy.ai.kr/api/v1/healthz/ready"
 echo "          ⚠️ 되돌아온 콜로는 stale epoch 라 passive 유지됨. failback 은 수동 승인(failback.sh)."

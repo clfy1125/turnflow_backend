@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cloudflare DNS 스왑 — api.turnflow.clfy.ai.kr A 레코드를 지정 IP 로(proxied=on). 트래픽 전환(사람 승인).
+# Cloudflare DNS 스왑 — turnflow-api.clfy.ai.kr A 레코드를 지정 IP 로(proxied=on). 트래픽 전환(사람 승인).
 # 양방향: cf_origin.sh <GCP_IP>(전환) / cf_origin.sh "$COLO_IP"(failback 복귀).
 # 토큰: env CF_API_TOKEN 우선, 없으면 Secret Manager(turnflow-cf-api-token).
 set -euo pipefail

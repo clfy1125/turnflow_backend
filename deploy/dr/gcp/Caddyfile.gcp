@@ -15,7 +15,7 @@
 	}
 }
 
-api.turnflow.clfy.ai.kr {
+turnflow-api.clfy.ai.kr {
 	encode zstd gzip
 
 	# CF Origin Certificate — CF Full(strict) 가 신뢰. 자동 ACME 대체.

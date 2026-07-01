@@ -126,7 +126,7 @@ docker exec caddy caddy validate --config /etc/caddy/Caddyfile || echo "!! Caddy
 
 # ── 11) 자기 검증 + 알림(여기서 멈춤 — DNS 스왑은 사람) ───────────
 sleep 5
-READY="$(curl -sk --resolve api.turnflow.clfy.ai.kr:443:127.0.0.1 -o /dev/null -w '%{http_code}' https://api.turnflow.clfy.ai.kr/api/v1/healthz/ready || echo 000)"
+READY="$(curl -sk --resolve turnflow-api.clfy.ai.kr:443:127.0.0.1 -o /dev/null -w '%{http_code}' https://turnflow-api.clfy.ai.kr/api/v1/healthz/ready || echo 000)"
 EXT_IP="$(md instance/network-interfaces/0/access-configs/0/external-ip)"
 echo ">> /healthz/ready(local)=$READY  external-ip=$EXT_IP"
 

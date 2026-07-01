@@ -38,7 +38,7 @@
 4. **(선택, RTO 단축) 주기적 사전 복구**: office 에서 `restore_to_office.sh` 를 야간 cron 으로 돌려 DB 를 최신 근처로 유지 → failover 때 `--delta` 가 최근 WAL 만 재생(복구 빠름). 단 복구 중엔 office db 가 잠깐 바뀌므로 passive(트래픽 0)일 때만.
 
 ## 3-B) Cloudflare Load Balancer
-`api.turnflow.clfy.ai.kr` 를 단일 오리진 DNS → **CF Load Balancer** 로 전환. (Terraform: `cloudflare_load_balancer(_pool|_monitor)`)
+`turnflow-api.clfy.ai.kr` 를 단일 오리진 DNS → **CF Load Balancer** 로 전환. (Terraform: `cloudflare_load_balancer(_pool|_monitor)`)
 
 | 풀 | 오리진 | 모니터 경로 | 비고 |
 |---|---|---|---|
@@ -69,7 +69,7 @@
    내부 흐름(=`failover.sh`): `restore_to_office.sh`(PITR 복구→migrate→앱 기동) → `dr_catchup --skip-poll`(rate-governor/Action Block **DB 재수화** → DM 동결 0초) → `mark_restore_complete --promote`(active_site=office, **epoch++**) → Caddy maintenance→production `reload`.
 3. **검증**:
    ```bash
-   curl -fsS https://api.turnflow.clfy.ai.kr/api/v1/healthz/ready   # office 가 200 → CF 가 실앱 서빙
+   curl -fsS https://turnflow-api.clfy.ai.kr/api/v1/healthz/ready   # office 가 200 → CF 가 실앱 서빙
    ```
    - 프론트 로그인 / 공개페이지 / **DM 발송 재개** 확인(외부 cron tick 이 LB 타고 office 로 들어와 스케줄러 가동).
    - `scheduled_job.last_run_at` 갱신, deferred DM requeue 동작 확인.

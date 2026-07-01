@@ -18,7 +18,7 @@ echo ">> 1) 부팅/복구 진행 로그(별도 터미널 권장):"
 echo "     $SSH -- 'sudo tail -n 300 -f /var/log/turnflow-dr-startup.log'"
 echo
 echo ">> 2) Telegram '🧪 DR 드릴 ... ready=200' 알림(또는 로그 'startup 완료') 뜨면 검증:"
-echo "     $SSH -- 'curl -sk --resolve api.turnflow.clfy.ai.kr:443:127.0.0.1 -o /dev/null -w \"caddy_ready=%{http_code}\\n\" https://api.turnflow.clfy.ai.kr/api/v1/healthz/ready'"
+echo "     $SSH -- 'curl -sk --resolve turnflow-api.clfy.ai.kr:443:127.0.0.1 -o /dev/null -w \"caddy_ready=%{http_code}\\n\" https://turnflow-api.clfy.ai.kr/api/v1/healthz/ready'"
 echo "     # 200 이면: 복원 + migrate + dr_catchup + promote + Caddy/Origin cert 전 체인 OK"
 echo "     $SSH -- 'cd /opt/turnflow_backend && docker compose -f docker-compose.prod.yml exec -T web_dashboard python manage.py shell -c \"from apps.core.site_control import get_site_state as g; print(g())\"'"
 echo "     # active_site=gcp-drill, mode=live, restore_complete=True 확인"

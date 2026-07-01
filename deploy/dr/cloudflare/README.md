@@ -51,7 +51,7 @@ wrangler deploy
 ```bash
 # 별도 워커로 배포(라우트 바인딩 필요). prod 경로가 바뀌므로 저트래픽 창에.
 wrangler deploy maintenance-worker.js --name turnflow-dr-maintenance \
-  --route "api.turnflow.clfy.ai.kr/*"
+  --route "turnflow-api.clfy.ai.kr/*"
 ```
 - 헬스/내부/웹훅 경로는 패스스루 예외(LB 모니터·IG 웹훅 영향 없음).
 - 원본 정상이면 투명 패스스루, 5xx/불가면 503 점검페이지.

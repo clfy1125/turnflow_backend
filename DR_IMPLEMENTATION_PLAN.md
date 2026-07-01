@@ -300,7 +300,7 @@ throwaway 컨테이너에 `--type=time --target=<5분전>` 복구 → sanity row
 ## 8. 영역 D — CF LB + failover/failback + Azure
 
 ### 8.1 Cloudflare Load Balancer (운영)
-`api.turnflow.clfy.ai.kr` → CF LB. 풀 2개(§4.3), failover 순서 colo→office, **session affinity OFF**(stateless+JWT), steering=failover, **proxied ON**(WAF 유지), 모니터 interval 15s/timeout 5s/consecutive_down 3/up 2(~45s 감지), 알림→Telegram. Terraform `cloudflare_load_balancer(_pool|_monitor)`.
+`turnflow-api.clfy.ai.kr` → CF LB. 풀 2개(§4.3), failover 순서 colo→office, **session affinity OFF**(stateless+JWT), steering=failover, **proxied ON**(WAF 유지), 모니터 interval 15s/timeout 5s/consecutive_down 3/up 2(~45s 감지), 알림→Telegram. Terraform `cloudflare_load_balancer(_pool|_monitor)`.
 
 ### 8.2 failover.sh (반자동) — `deploy/dr/failover.sh`
 PITR restore → compose up → gated migrations → dr_catchup(STEP0 재수화 포함) → `mark_restore_complete --promote`(active_site=office, epoch++) → Caddy maintenance→production reload.
