@@ -2417,7 +2417,7 @@ def _build_token_refresh_summary(*, checked: int, succeeded: list, failed: list)
 
 
 @shared_task(bind=True, max_retries=3)
-def process_follow_gate_postback(self, opening_log_id: str, igsid: str):
+def process_follow_gate_postback(self, opening_log_id: str, igsid: str, recipient_account_id: str = ""):
     """
     사용자가 opening DM 의 'follow_check' quick_reply 버튼을 눌렀을 때 호출.
 
@@ -2443,6 +2443,18 @@ def process_follow_gate_postback(self, opening_log_id: str, igsid: str):
 
     campaign = opening.campaign
     ig_conn = campaign.ig_connection
+
+    # ★ 이 postback 이 opening 을 보낸 '바로 그 계정' 에 도착한 것인지 검증.
+    #    멀티계정 환경에서 동일 payload("fg:{opening_id}") postback 이 다른 연결계정에도 도달하면,
+    #    엉뚱한 igsid 로 reward 를 보내고 게이트를 선점(PASSED)해 정작 수신자는 reward 를 못 받는다.
+    #    (recipient_account_id 미전달 시 — 구버전 큐 태스크 — 는 검사 생략해 하위호환.)
+    if recipient_account_id and recipient_account_id != (ig_conn.external_account_id or ""):
+        return {
+            "status": "skipped",
+            "reason": "account_mismatch",
+            "opening_log_id": str(opening.id),
+            "recipient_account_id": recipient_account_id,
+        }
 
     # 이미 게이트 통과한 opening 이면 추가 처리 안 함
     if opening.gate_status == SentDMLog.GateStatus.PASSED:

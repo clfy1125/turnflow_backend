@@ -3581,6 +3581,7 @@ def _process_messaging_events(entry: dict, logger) -> None:
             _maybe_dispatch_follow_gate(
                 payload=str(postback.get("payload") or ""),
                 sender_id=sender_id,
+                recipient_id=recipient_id,
                 logger=logger,
             )
             continue
@@ -3598,6 +3599,7 @@ def _process_messaging_events(entry: dict, logger) -> None:
             if _maybe_dispatch_follow_gate(
                 payload=str(qr.get("payload") or ""),
                 sender_id=sender_id,
+                recipient_id=recipient_id,
                 logger=logger,
             ):
                 continue
@@ -3642,7 +3644,7 @@ def _process_messaging_events(entry: dict, logger) -> None:
                 logger.debug(f"Inbound DM received (no handler): sender={sender_id}, mid={mid}")
 
 
-def _maybe_dispatch_follow_gate(*, payload: str, sender_id: str, logger) -> bool:
+def _maybe_dispatch_follow_gate(*, payload: str, sender_id: str, recipient_id: str = "", logger) -> bool:
     """quick_reply / postback payload 가 follow-gate 인지 검사 후 Celery 라우팅.
 
     payload 포맷: "fg:{opening_log_id}"
@@ -3663,11 +3665,12 @@ def _maybe_dispatch_follow_gate(*, payload: str, sender_id: str, logger) -> bool
 
     from .tasks import process_follow_gate_postback
 
-    process_follow_gate_postback.delay(opening_log_id, sender_id)
+    process_follow_gate_postback.delay(opening_log_id, sender_id, recipient_id)
     logger.info(
-        "follow-gate postback queued: opening_log=%s igsid=%s",
+        "follow-gate postback queued: opening_log=%s igsid=%s account=%s",
         opening_log_id,
         sender_id,
+        recipient_id,
     )
     return True
 
