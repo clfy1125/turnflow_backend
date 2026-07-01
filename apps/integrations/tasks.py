@@ -40,6 +40,94 @@ from .services import (
     SpamDetectionService,
 )
 
+# ===== 웹훅 구독 재확정 (DR 컷오버 / Meta auto-disable 대비) =====
+# Meta 는 콜백 엔드포인트가 반복 실패하면 계정별 웹훅 구독을 auto-disable 한다
+# (엣지 장애·DR 컷오버 후 댓글 웹훅이 조용히 끊겨 캠페인이 무음이 되는 원인).
+# 서버 이전 직후(startup.sh) + 주기적(beat 6h)으로 comments/messages 구독을 재확정한다.
+REQUIRED_WEBHOOK_FIELDS = ("comments", "messages")
+
+
+def _subscribed_field_names(sub_response: dict) -> set:
+    """subscribed_apps GET 응답에서 구독 필드명 집합 추출(API 버전별 shape 방어)."""
+    names = set()
+    for app in (sub_response or {}).get("data", []) or []:
+        for f in app.get("subscribed_fields", []) or []:
+            if isinstance(f, dict) and f.get("name"):
+                names.add(f["name"])
+            elif isinstance(f, str):
+                names.add(f)
+    return names
+
+
+def resubscribe_active_connections(check_only: bool = False) -> dict:
+    """ACTIVE IG 연동 계정들의 웹훅 구독을 점검하고 필수 필드 누락 시 재구독.
+
+    멱등·계정별 best-effort(한 계정 실패해도 나머지 진행). check_only=True 면 조회만.
+    """
+    summary = {
+        "checked": 0,
+        "ok": 0,
+        "resubscribed": 0,
+        "failed": 0,
+        "skipped_expired": 0,
+        "details": [],
+    }
+    now = timezone.now()
+    qs = IGAccountConnection.objects.filter(status=IGAccountConnection.Status.ACTIVE)
+    for conn in qs.iterator():
+        igid = conn.external_account_id
+        if not igid:
+            continue
+        if conn.token_expires_at and conn.token_expires_at <= now:
+            summary["skipped_expired"] += 1
+            continue
+        summary["checked"] += 1
+        try:
+            token = conn.access_token
+            sub = InstagramOAuthService.get_webhook_subscriptions(igid, token)
+            missing = [f for f in REQUIRED_WEBHOOK_FIELDS if f not in _subscribed_field_names(sub)]
+            if not missing:
+                summary["ok"] += 1
+                continue
+            if check_only:
+                summary["details"].append(f"{igid}: missing={missing} (check-only)")
+                continue
+            InstagramOAuthService.subscribe_to_webhooks(
+                ig_user_id=igid,
+                access_token=token,
+                fields=",".join(REQUIRED_WEBHOOK_FIELDS),
+            )
+            summary["resubscribed"] += 1
+            summary["details"].append(f"{igid}: resubscribed (was missing {missing})")
+            logger.info("resubscribed webhooks ig=%s missing=%s", igid, missing)
+        except Exception as e:  # noqa: BLE001 — 계정별 best-effort
+            summary["failed"] += 1
+            summary["details"].append(f"{igid}: ERROR {e!r}")
+            logger.warning("resubscribe webhooks failed ig=%s: %s", igid, e)
+    return summary
+
+
+@shared_task
+def resubscribe_all_webhooks(check_only: bool = False) -> dict:
+    """주기(beat)/DR 훅. 활성 사이트에서만 실제 구독 변경. 재구독/실패 시 Telegram 경고."""
+    from apps.core.site_control import is_active_site
+
+    if not is_active_site():
+        logger.info("resubscribe_all_webhooks: passive site — skip")
+        return {"skipped": "passive_site"}
+    result = resubscribe_active_connections(check_only=check_only)
+    if result.get("resubscribed") or result.get("failed"):
+        try:
+            from apps.core.telegram import send_telegram_notification
+
+            send_telegram_notification(
+                "🔔 IG 웹훅 구독 점검: 재구독 %s · 실패 %s · 정상 %s/%s"
+                % (result["resubscribed"], result["failed"], result["ok"], result["checked"])
+            )
+        except Exception:
+            logger.exception("resubscribe_all_webhooks telegram 알림 실패 (non-fatal)")
+    return result
+
 # ===== 댓글 매칭 / 누락 보정 장부 공용 헬퍼 =====
 
 

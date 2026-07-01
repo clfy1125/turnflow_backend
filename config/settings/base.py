@@ -392,6 +392,14 @@ CELERY_BEAT_SCHEDULE = {
         "task": "integrations.poll_missed_comments",
         "schedule": 60 * 60,  # 1시간
     },
+    # ===== 웹훅 구독 재확정 =====
+    # Meta 는 콜백 실패(엣지 장애·DR 컷오버)가 쌓이면 계정별 웹훅 구독을 auto-disable →
+    # 댓글 웹훅이 조용히 끊겨 캠페인 무음. 6시간마다 ACTIVE 연동의 comments/messages 구독을
+    # 재확정(활성 사이트에서만 실변경, 재구독/실패 시 Telegram). DR promote 직후엔 startup.sh 가 즉시 실행.
+    "integrations-resubscribe-webhooks": {
+        "task": "apps.integrations.tasks.resubscribe_all_webhooks",
+        "schedule": 60 * 60 * 6,  # 6시간
+    },
     # ===== GATE-0 백업 관측 =====
     # 실제 백업은 호스트 cron(deploy/backups/pg_backup.sh + pgBackRest)에서 수행.
     # 이 beat 는 연속 WAL 아카이빙 상태만 감시(pg_stat_archiver) → 실패/지연 시 Telegram.

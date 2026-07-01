@@ -102,6 +102,15 @@ $COMPOSE run --rm --no-deps web_dashboard python manage.py dr_catchup --skip-pol
 $COMPOSE run --rm --no-deps -e DB_HOST=db -e DB_PORT=5432 -e DB_CONN_MAX_AGE=0 \
   web_dashboard python manage.py mark_restore_complete --promote --note "gcp ${MODE} $(date -u +%FT%TZ)"
 
+# ── 8.5) (live) 웹훅 구독 재확정 — 서버 이전 직후 연동 계정 전부 재구독 ──
+#   Meta 는 콜백 실패(엣지 장애·컷오버)가 쌓이면 웹훅을 auto-disable → 새 서버가 살아도
+#   댓글 웹훅이 안 오는 함정. promote 직후 즉시 comments/messages 재구독(멱등, best-effort).
+#   드릴은 실 Meta 를 건드리지 않으려 skip(실 failover 에서만).
+if [ "$DRILL" != "1" ]; then
+  echo ">> (live) 웹훅 구독 재확정"
+  $COMPOSE run --rm --no-deps web_dashboard python manage.py resubscribe_webhooks || true
+fi
+
 # ── 9) (real 전용) 새 타임라인 full backup → R2 에 GCP 타임라인 정착 ──
 R2_SETTLED=1
 if [ "$DRILL" != "1" ]; then

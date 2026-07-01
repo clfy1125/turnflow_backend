@@ -211,6 +211,19 @@ class InstagramOAuthService:
         return response.json()
 
     @classmethod
+    def get_webhook_subscriptions(cls, ig_user_id: str, access_token: str) -> dict:
+        """
+        Read current webhook field subscriptions for an Instagram professional account.
+
+        GET https://graph.instagram.com/v25.0/{ig_user_id}/subscribed_apps?access_token=...
+        구독 필드는 data[].subscribed_fields (버전별로 name/version dict 또는 문자열 list).
+        """
+        url = f"{cls.GRAPH_API_BASE}/{ig_user_id}/subscribed_apps"
+        response = requests.get(url, params={"access_token": access_token}, timeout=10)
+        response.raise_for_status()
+        return response.json()
+
+    @classmethod
     def unsubscribe_webhooks(cls, ig_user_id: str, access_token: str) -> dict:
         """
         Disable webhook subscriptions for an Instagram professional account.
