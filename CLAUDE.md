@@ -308,8 +308,13 @@ make test-cov                             # HTML 커버리지 리포트
 - `INSTAGRAM_OAUTH_FLOW.md` — IG OAuth 플로우
 - `INSTAGRAM_TEST_GUIDE.md` — IG 테스트 가이드
 - `CLOUDFLARE_TUNNEL_SETUP.md` — 개발 서버 공개(고정 URL `dev-api.turnflow.link`) Cloudflare Tunnel 셋업 (ngrok 대체)
-- `NGROK_INSTAGRAM_SETUP.md` — ngrok로 IG 콜백 받는 법 (Cloudflare Tunnel 로 이전 권장)
-- `STEP1~5_COMPLETION.md` — 단계별 완료 보고서
+- `AUTODM_DELIVERY_LIFECYCLE.md` (+ `.html`) — 자동 DM 발송 라이프사이클: 웹훅 수신→발송 확정→실패 처리·무손실 하드닝(v3.10.1)
+- `DR_IMPLEMENTATION_PLAN.md` — 재해복구(DR) 설계·결정 로그·코드 자산 맵
+- `deploy/dr/gcp/DRILL_RUNBOOK.md` — GCP cold-VM DR 드릴/컷오버 재현 런북 (+ `deploy/dr/gcp/README.md` 운영자 개요)
+- `SECURITY_AUDIT_2026-06.md` — 론칭 전 보안 취약점 감사(미해결 P0 포함)
+- `DM_CAMPAIGN_DUPLICATE_PREVENTION_FRONTEND.md` — 게시물당 활성 캠페인 1개(409) 프론트 가이드
+- `PASSWORD_RESET_GUIDE.md` — 비밀번호 재설정 플로우 프론트 가이드
+- `SERVICE_DIFFERENTIATION.md` — 서비스 차별점/경쟁 비교 (세일즈·마케팅)
 - `개인정보처리방침_변호사_전달자료.md`, `이용약관_변호사_전달자료.md` — 법무 자료 (수정 금지, 요청 시에만)
 - `api-mcp/README.md` — 사내 API 문서 검색 MCP 서버
 

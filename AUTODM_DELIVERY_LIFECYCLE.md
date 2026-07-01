@@ -278,7 +278,8 @@ SUBMITTING ──분류된 비재시도 실패──▶ FAILED_TOKEN / FAILED_WI
 | `code in {102, 190, 200}` | `DMTokenError` | `failed_token` | ✗ | **`ig_conn.mark_as_error`** → 사용자 IG 재연동 필요. dead-letter 알림 대상. `increment_failed` |
 | `code 100` | `DMInvalidParamError` | `failed_param` | ✗ | 파라미터 오류(Private Reply 7일 초과 포함). `increment_failed` |
 | `code 551` | `DMRecipientUnreachableError` | `failed_no_trace` | ✗ | 수신자 도달 불가(차단/옵트아웃 등). 자가 점검. **`increment_unconfirmed`(미확인)** |
-| `code in {1,2,4,17,32,613}` | `DMTransientError` | `queued`(defer) | **✓** | rate limit/transient. **무한 defer**(횟수 상한 없음) |
+| **`code in {1,2}`** ("error-but-delivered") | `DMTransientError` | `queued`(defer) | **✓** | ⚠️ Meta가 **실제로 전달하고도** 이 코드를 반환하는 사례 잦음(2026-07-01 실측). 재발송 전 `has_recent_message_to_recipient`(Conversations 조회)로 전달 흔적 확인(§5.1·§8.2·§11 P12): recent=True→**도착확정·재발송 안 함**, None→**defer**(무손실 우선), False→defer |
+| `code in {4,17,32,613}` | `DMTransientError` | `queued`(defer) | **✓** | 명시적 rate limit/transient(=요청 거부, 전달 없음). 검증 없이 **무한 defer**(횟수 상한 없음) |
 | **`code 368`** (Action Block) | `DMTransientError` | `queued`(defer) | **✓** | transient defer + **계정 에스컬레이팅 쿨다운**(§11 P4): 그 계정 발송을 24h→×2(상한 7일) 동안 Meta로 보내지 않고 자동 재개. 차단 중 재시도로 인한 차단 연장 방지 |
 | HTTP `5xx` | `DMTransientError` | `queued`(defer) | **✓** | 서버 오류. 무한 defer |
 | 그 외 `4xx` | `DMApiError` | `failed_no_trace` | ✗ | 분류 불가 클라이언트 오류. **`increment_unconfirmed`** |
@@ -290,6 +291,12 @@ SUBMITTING ──분류된 비재시도 실패──▶ FAILED_TOKEN / FAILED_WI
   - `retry_count += 1`, `backoff = min(60 * 2^min(retry_count,10), 3600)` → **60s … 최대 1h**(상한 1h, 쿼터는 시각 경계로 풀리므로).
   - `next_retry_at` 기록 + **상태를 `QUEUED`로 회귀** → `requeue_deferred_dms`(Beat 30s)가 도래분을 FIFO로 재투입(§6).
   - 종료는 오직 **메시징 윈도우 만료**(진입부 age 가드)로만 일어난다 → `FAILED_WINDOW`.
+- **code 1/2("error-but-delivered") 재발송 전 검증 (v3.10.1, P12)**: `except DMSendError` 블록(tasks.py:947)이 `maybe_delivered = isinstance(e, DMAnomalyError) or e.code in (1, 2)`로 anomaly(§8.2)와 **code 1/2를 동일 취급** — 재발송 전 `has_recent_message_to_recipient(since_seconds=900)`로 이미 보냈는지 확인한다.
+  - `recent=True` → `mark_accepted("") + increment_sent(opening만) + mark_delivered(CONV_API)`, **재발송 안 함**(오프닝 DM 2개 중복 방지).
+  - `recent=None`(조회 자체가 타임아웃/5xx로 불확실) → **code 1/2는 defer+retry**(무손실; `reconcile_stuck_submitting`의 None→requeue와 대칭). ⚠️ **anomaly(200-no-mid)만** None에서 `FAILED_NO_TRACE`로 종결(재발송 안 함) — code 1/2를 여기서 종결하면 유실 위험이라 비대칭이 의도적.
+  - `recent=False` → 기존 defer 재발송.
+  - **명시적 rate-limit `{4,17,32,368,613}`은 이 검증을 건너뜀** — 요청 거부라 전달이 없어 확인 불필요.
+  - ⚠️ 잔여 한계: 전달됐는데 Conversations 인덱싱 지연으로 `recent=False`면 재시도 중복 가능(기존과 동일=회귀 아님). 완전 제거는 '재시도 직전 재확인' 후속 개선.
 - 비재시도(`token/param/window`) → 즉시 `mark_failed` + `increment_failed`. `551`·`기타 4xx`(no_trace) → `mark_failed` + **`increment_unconfirmed`**(실패 아님).
 - `FAILED_TOKEN`이면 추가로 `ig_conn.mark_as_error`.
 - `parent_log`가 있는 child(reward/retry)는 **모든** 카운터(sent/failed/unconfirmed)에서 제외 — opening/standalone만 집계.
@@ -326,6 +333,11 @@ SUBMITTING ──분류된 비재시도 실패──▶ FAILED_TOKEN / FAILED_WI
 | **`cleanup_comment_ledger`** | **매일 04:30 KST** | 만료된 `SeenComment` 장부 정리(§9) |
 | **`dm_backlog_alert`** | **30분** | **(v3.10)** QUEUED 적체·윈도우 만료 임박 시 Telegram 경고(§11 P7) |
 | `refresh_ig_tokens_pending_expiry` | **6시간** | **(v3.10: daily→6h)** 만료 D-14 토큰 갱신 + 성공 시 FAILED_TOKEN 자동 되살림(§11 P2) |
+| **`resubscribe_all_webhooks`** | **6시간** | **(v3.10.1)** ACTIVE 연동 계정별 `subscribed_apps`(comments,messages) 재확정 — Meta auto-disable 로 인한 댓글 웹훅 무음 복구(§8.5·§11 P13). 활성 사이트에서만 실변경 |
+| `maintain_partitions` | 매일 02:00 KST | `EventInbox` 일별 파티션 유지 + `SentDMLog` 아카이브(멱등/로그 계층 durability) |
+| `backup-health-check` | 30분 | `pg_stat_archiver` 점검(WAL 아카이빙 정상성 — DR RPO 보증) |
+
+> ⚠️ **스케줄 발동 경로 주의**: DR Step2 이후 **celery-beat 은퇴**. 스케줄링은 **CF tick + `core.ScheduledJob` DB 행(next_due_at)**으로 동작하며 `settings.CELERY_BEAT_SCHEDULE`는 tick이 **안 읽는다**. 새 주기잡은 `ScheduledJob` 시드 마이그레이션이 필요하다(예: `core 0003_seed_resubscribe_webhooks_job`). beat 항목만 추가하면 절대 안 돎.
 
 > deprecated되어 Beat에서 제거됨(코드는 잔존): `expire_gate_pending`(follow-gate deprecate), `poll_new_media`(next_media가 webhook 기반 전환), `check_polling_anomalies`(폴링 제거).
 
@@ -363,10 +375,12 @@ SUBMITTING ──분류된 비재시도 실패──▶ FAILED_TOKEN / FAILED_WI
 ### 8.1b [부분 해결] `rate_governor` 고정 윈도우 카운터는 발송 시도마다 소비된다
 - `rate_governor.check()`는 **호출 즉시 `INCR`** 한다 — 발송 전에 카운터를 먹는다. defer 재시도 시 같은 1건이 카운터를 **여러 번** 소비할 수 있다(보수적 과소발송. 밴 위험↓).
 - **v3.10 (P8)**: Redis flush/재시작으로 카운터가 0으로 **리셋**되는 별개 위험은 fail-closed 로 해소(센티넬 소멸 감지 → 그 시각 동안 차단). 시도당 소비(과소발송) 특성 자체는 의도된 보수적 페이싱으로 유지.
+- **v3.10.1 보완 — Redis 유실 즉시 복구**: fail-closed 는 최대 1h 동결이 유일 회복이 아니다. `rate_governor.rehydrate_from_db()`가 `SentDMLog.submitted_at` 윈도우에서 계정별 시/분 카운터를 재구성 **AND** `dmrate:reset_until`을 삭제(동결 즉시 해제)한다 → `dr_catchup` STEP0 + 활성 사이트 Celery `worker_ready`에서 호출. 따라서 Redis 유실 후 반드시 1h 멈추지 않고 재수화하여 즉시 재개할 수 있다.
 
-### 8.2 [해결됨 ✅] `DMAnomalyError`(200인데 message_id 없음) 재발송 시 중복 위험
-- (과거) `DMAnomalyError`는 `rate_limited`(retriable)로 분류돼 그냥 재발송 → Meta가 이미 보냈으면 중복 DM.
-- **v3.10 (P6)**: 재발송 전 `has_recent_message_to_recipient`(Conversations 조회)로 '이미 보냈는지' 확인. found=True→도착확정(재발송 안 함)·None(불확실)→`FAILED_NO_TRACE`(미확인, 재발송 안 함)·False→기존 defer 재발송.
+### 8.2 [해결됨 ✅] 200-no-msgid anomaly + code 1/2 재발송 시 중복 위험
+- (과거) `DMAnomalyError`(200인데 message_id 없음)는 `rate_limited`(retriable)로 분류돼 그냥 재발송 → Meta가 이미 보냈으면 중복 DM.
+- **v3.10 (P6)**: anomaly(200-no-mid)·SUBMITTING 크래시(F2) 재발송 전 `has_recent_message_to_recipient`(Conversations 조회)로 '이미 보냈는지' 확인. found=True→도착확정(재발송 안 함)·None(불확실)→`FAILED_NO_TRACE`(미확인, 재발송 안 함)·False→기존 defer 재발송.
+- **v3.10.1 (P12)**: 검증-후-재발송을 **Meta code 1/2("error-but-delivered")** 까지 확장(오프닝 DM 2개 중복 방지, 커밋 d03a101). **단 None 처리가 비대칭**: anomaly는 None→`FAILED_NO_TRACE`(종결)지만 code 1/2는 None→**defer**(무손실 우선 — "please retry" 시맨틱이라 미전달 가능성 + 조회 자체가 None을 낼 수 있어 종결하면 유실). 상세 분기는 §5.1.
 
 ### 8.3 [해결됨 ✅] 웹훅 POST HMAC 서명 검증
 - (과거) `instagram_webhook` POST 에 `X-Hub-Signature-256` 검증이 없어 `AllowAny` 위조 페이로드로 DM 트리거 가능.
@@ -377,6 +391,15 @@ SUBMITTING ──분류된 비재시도 실패──▶ FAILED_TOKEN / FAILED_WI
 - 스팸 게이트가 `media_id`로 캠페인 1건만 찾으므로 `any_media`/`next_media` 트리거엔 누락될 수 있음(§2.2).
 - `mentions`/`messaging_postbacks`(changes 내) 필드는 현재 미처리(로깅만).
 - **`ANY_MEDIA`/`STORY_REPLY`는 댓글 누락 보정(§9) 대상이 아님** — 전자는 폴링 비용, 후자는 댓글이 아니라 messages 이벤트(재조회할 소스 없음). 웹훅 유실 시 보정망이 없어 **프론트 위험고지**로 대응(§11 P11 `miss_recovery` 필드).
+
+### 8.5 웹훅 구독 auto-disable → 재구독 자동화 (v3.10.1, P13)
+- **문제**: Meta는 콜백 엔드포인트가 **반복 실패**(CF 엣지 장애·DR 컷오버·5xx)하면 IG 계정별 `subscribed_apps`(comments/messages) 구독을 **조용히 auto-disable** 한다. 서버가 정상 복구돼도 **댓글 웹훅이 안 와 캠페인이 무음으로 정지**한다(2026-07-01 DR 훈련에서 실측).
+- **진단 신호**: 웹훅 경로는 정상(POST→`EVENT_RECEIVED` 200, GET 잘못된토큰→403)인데 `web_webhook` 로그에 `facebookexternalua` POST **0건** → Meta가 안 보내는 것 → 계정 구독 확인.
+- **자동화**:
+  - `manage.py resubscribe_webhooks [--check-only]` — ACTIVE 연동 전부 점검·재구독(수동/DR).
+  - Beat `resubscribe_all_webhooks`(6h) → `resubscribe_active_connections(check_only)` — 계정별 best-effort 멱등, `REQUIRED_WEBHOOK_FIELDS=("comments","messages")`, 활성 사이트에서만 실변경, 변화 시 Telegram.
+  - **DR startup.sh(live)**: promote 직후 즉시 전 계정 재구독 — "서버 이전 후 바로 웹훅 켜기".
+- **함정**: (1) 이 6h 잡은 `ScheduledJob` 시드(`core 0003`)로만 돎(§6.2 주의). (2) 게시물 **소유 계정** 댓글은 애초에 comments 웹훅이 안 옴 + 코드도 스킵 → 댓글-DM 테스트는 반드시 **다른 계정**으로.
 
 ---
 
@@ -430,7 +453,7 @@ SUBMITTING ──분류된 비재시도 실패──▶ FAILED_TOKEN / FAILED_WI
 | 능동 검증(GET /{message_id}) | `apps/integrations/services.py:800` `fetch_message` |
 | 발송 로그/상태머신 모델 | `apps/integrations/models.py:791` `SentDMLog` |
 | 에러 분류기 | `apps/integrations/dm_exceptions.py` `classify_api_error` / `exception_to_classification` |
-| 5분/35분 도착 검증 | `apps/integrations/tasks.py:742` `verify_dm_delivery` |
+| 10분/35분 도착 검증 | `apps/integrations/tasks.py:742` `verify_dm_delivery` |
 | Beat 안전망 | `apps/integrations/tasks.py:814~` `reconcile_accepted_dms` / `reconcile_stuck_submitting` / `dead_letter_alerter` |
 | Beat 스케줄 등록 | `config/settings/base.py:358~` `CELERY_BEAT_SCHEDULE` |
 | 도착률·통계 | `apps/integrations/campaign_stats.py`, `apps/admin_api/serializers/autodm.py` |
@@ -440,7 +463,9 @@ SUBMITTING ──분류된 비재시도 실패──▶ FAILED_TOKEN / FAILED_WI
 | **웹훅 HMAC 검증** | `apps/integrations/views.py` `_verify_webhook_signature` (P3) |
 | **Action Block 쿨다운** | `apps/integrations/rate_governor.py` `trip_action_block` / `action_block_cooldown_remaining`; `tasks.py` `_ACTION_BLOCK_CODES`, `_defer_or_fail`/`_rate_defer` 연동 (P4) |
 | **거버너 fail-closed 센티넬** | `apps/integrations/apps.py` `ready()` + `rate_governor.check`(`dmrate:alive`/`dmrate:reset_until`, P8) |
-| **검증 후 재발송** | `apps/integrations/services.py` `has_recent_message_to_recipient`; `tasks.py` anomaly 분기·`reconcile_stuck_submitting` (P6) |
+| **검증 후 재발송** | `apps/integrations/services.py` `has_recent_message_to_recipient`; `tasks.py:947` anomaly·**code 1/2** 분기(`maybe_delivered`)·`reconcile_stuck_submitting` (P6·**P12**) |
+| **Action Block DB 영속** | `apps/integrations/models.py` `DMAccountBlock`; `rate_governor.py` `_persist_action_block_to_db`/`_restore_action_block_from_db`/`rehydrate_from_db` (P4·P8) |
+| **웹훅 재구독 자동화** | `apps/integrations/tasks.py` `resubscribe_all_webhooks`/`resubscribe_active_connections`; `services.py` `subscribe_to_webhooks`/`get_webhook_subscriptions`; `management/commands/resubscribe_webhooks.py`; `core 0003_seed_resubscribe_webhooks_job` (P13) |
 | **백로그 모니터링** | `apps/admin_api/views/autodm.py` `AdminDMBacklogView` (`GET .../admin/auto-dm/backlog/`); `tasks.py` `dm_backlog_alert` (P7) |
 | **재연동 고아화 방지** | `apps/integrations/models.py` `IGAccountConnection` `uq_igconn_ws_account`; migration `0026` dedupe (P5) |
 | **위험고지 필드** | `apps/integrations/serializers.py` `AutoDMCampaignSerializer.miss_recovery` (P11) |
@@ -457,14 +482,16 @@ SUBMITTING ──분류된 비재시도 실패──▶ FAILED_TOKEN / FAILED_WI
 | **P1** | **제자리 되살림(revive)** — `FAILED_TOKEN`/`SKIPPED` 종결 건을 **같은 row·같은 idempotency_key** 로 QUEUED 복귀(`SentDMLog.revive`). 윈도우(7d/24h) 내인 것만. admin 재시도 엔드포인트도 이 경로로 통합 | 종결 건이 키를 점유해 폴링/재시도가 되살리지 못하던 **영구 손실(C1/C2/H1)** |
 | **P2** | 토큰 갱신 **6h 주기**로 강화 + 갱신 성공 시 `revive_failed_token_logs` 로 그 계정 FAILED_TOKEN 자동 되살림 + **프리미엄 전용** `POST .../auto-dm-campaigns/{id}/retry-failed/`(무료=403) | 토큰 만료 구간 누락(C1·G1) |
 | **P3** | 웹훅 **HMAC**(`X-Hub-Signature-256`) 검증. `WEBHOOK_HMAC_ENFORCED`(기본 False=관측 → True=403) | 위조 페이로드 주입(A5) |
-| **P4** | **Action Block 서킷 브레이커** — `code 368` 감지 시 그 계정 발송을 **에스컬레이팅 쿨다운**(24h→×2, 상한 7일) 동안 Meta로 보내지 않고 자동 재개. cache 기반(`dm:ab:*`) | 과발송 차단의 **차단 중 재시도→기간 연장**(I1) |
+| **P4** | **Action Block 서킷 브레이커** — `code 368` 감지 시 그 계정 발송을 **에스컬레이팅 쿨다운**(24h→×2, 상한 7일) 동안 Meta로 보내지 않고 자동 재개. cache(`dm:ab:*`) + **DB 이중기록**(`DMAccountBlock` 모델): 매 트립을 DB에 dual-write, 캐시 미스 시 `_restore_action_block_from_db`로 재프라임, `rehydrate_from_db()`가 Redis 유실/DR failover 후 쿨다운+레벨 재시드 → **차단이 Redis flush/컷오버로 조용히 풀리지 않음** | 과발송 차단의 **차단 중 재시도→기간 연장**(I1) + Redis/DR 유실로 인한 차단 소실 |
 | **P5** | `IGAccountConnection` `(workspace, external_account_id)` **UNIQUE**(`uq_igconn_ws_account`) + migration 0026 dedupe(캠페인/SeenComment/SpamFilter repoint 후 스테일 삭제) | 재연동 시 **캠페인 고아화**(G2) |
 | **P6** | **검증 후 재발송** — 200-no-msgid anomaly(C4)·SUBMITTING 크래시(F2) 재발송 전 `has_recent_message_to_recipient`(Conversations 조회). found=True→도착확정, None→미확인(재발송 안 함), False→재발송 | **중복 발송**(C4/F2) |
 | **P7** | **백로그 모니터링** `GET .../admin/auto-dm/backlog/`(QUEUED 적체·윈도우 임박·throughput/inflow·상위 계정) + `dm_backlog_alert`(30분 Telegram) | 유입>처리량 적체로 인한 **윈도우 만료 손실(E1)** 가시화 |
-| **P8** | 거버너 **fail-closed** — `AppConfig.ready()`가 센티넬(`dmrate:alive`)을 심고, check 에서 센티넬 소멸=Redis flush 로 보아 그 시각까지 차단(`dmrate:reset_until`). 콜드스타트(배포)는 ready 가 재시드해 안 막힘 | Redis 리셋 후 **순간 과발송→밴**(E3) |
+| **P8** | 거버너 **fail-closed** — `AppConfig.ready()`가 센티넬(`dmrate:alive`)을 심고, check 에서 센티넬 소멸=Redis flush 로 보아 그 시각까지 차단(`dmrate:reset_until`). 콜드스타트(배포)는 ready 가 재시드해 안 막힘. **v3.10.1: `rehydrate_from_db()`**가 `SentDMLog.submitted_at`에서 카운터 재구성 + `reset_until` 삭제로 **동결 즉시 해제**(dr_catchup STEP0 / worker_ready) → 1h 강제 동결 불필요(§8.1b) | Redis 리셋 후 **순간 과발송→밴**(E3) |
 | **P9** | `dead_letter_alerter`·`dm_backlog_alert`·Action Block 트립 **Telegram** 표준화 | 장애 인지 지연(G1) |
 | **P10** | 동일 수신자 쿨다운 60s→**설정화**(`DM_RECIPIENT_COOLDOWN_SECONDS`, 기본 300s) | 도배·계정 보호(B4) |
 | **P11** | `AutoDMCampaignSerializer.miss_recovery` — any_media/story_reply 는 `auto_recovery_supported=False`+경고 문구 노출(프론트 고지) | 보정 불가 트리거 **위험고지**(A1·any_media) |
+| **P12** | **code 1/2 "error-but-delivered" 중복 방지**(커밋 d03a101) — P6의 검증-후-재발송을 Meta code 1/2까지 확장. recent=True→도착확정, code 1/2 None→**defer**(무손실, anomaly와 비대칭), False→defer. rate-limit `{4,17,32,368,613}`은 검증 제외(§5.1·§8.2) | 오프닝 DM **2개 중복 발송**(2026-07-01 실측) |
+| **P13** | **웹훅 구독 재구독 자동화**(커밋 e538a9b·986be99) — Meta auto-disable 로 댓글 웹훅 무음이 되는 것을 `resubscribe_all_webhooks`(Beat 6h·`ScheduledJob` 시드) + DR startup + `manage.py resubscribe_webhooks`로 복구(§8.5) | 엣지 장애/DR 후 **캠페인 무음 정지** |
 
 ### 11.2 신규 설정
 | 키 | 기본 | 패치 |
@@ -484,4 +511,4 @@ SUBMITTING ──분류된 비재시도 실패──▶ FAILED_TOKEN / FAILED_WI
 
 ---
 
-*작성 기준: `hardening/dm-surge` 브랜치 · 발송 보증 v3.10. 코드 변경 시 본 문서의 §4 상태머신 / §5 분류표 / §6 스케줄 / §9 누락 보정 / §11 하드닝을 함께 갱신할 것.*
+*작성 기준: `hardening/dm-surge` 브랜치 · 발송 보증 **v3.10.1**(2026-07-01: P12 code 1/2 중복방지 + P13 웹훅 재구독 자동화 + Action Block/거버너 DR 영속·재수화). 코드 변경 시 본 문서의 §4 상태머신 / §5 분류표 / §6 스케줄 / §8 갭 / §9 누락 보정 / §11 하드닝을 함께 갱신할 것.*

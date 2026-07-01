@@ -158,15 +158,17 @@
     <h1>🔄 자동 DM 발송 라이프사이클</h1>
     <p>인스타그램 <b>웹훅 수신</b> → 캠페인 <b>트리거 매칭</b> → <b>발송</b> → <b>"보내졌음" 확정</b> → <b>실패 처리</b>까지 전 과정</p>
     <p>캠페인(AutoDMCampaign) 기반 자동 DM의 안정화(99.9% 발송 보증) 동작을 한눈에 정리한 문서입니다.</p>
+    <p style="opacity:.85;font-size:13px">v3.10.1 (2026-07-01): P12 code 1/2 중복방지 · P13 웹훅 재구독 자동화 · Action Block/거버너 DR 영속·재수화</p>
     <div class="pills">
       <span>apps/integrations</span>
       <span>Meta Graph API v25.0</span>
-      <span>발송 보증 v3.10 (무손실 하드닝)</span>
+      <span>발송 보증 v3.10.1 (무손실 하드닝)</span>
       <span>SentDMLog 상태머신</span>
       <span>defer-not-drop · rate_governor</span>
       <span>revive 제자리 되살림</span>
       <span>Action Block 쿨다운</span>
       <span>웹훅 HMAC</span>
+      <span>웹훅 재구독 자동화</span>
       <span>댓글 누락 보정(SeenComment)</span>
       <span>branch: hardening/dm-surge</span>
     </div>
@@ -187,7 +189,7 @@
       <li><a href="#s6"><span class="n">6</span> 재시도 &amp; 능동 검증</a></li>
       <li><a href="#s7"><span class="n">7</span> 관측 / 통계</a></li>
       <li><a href="#s8"><span class="n">8</span> 알려진 갭 / 주의사항</a></li>
-      <li><a href="#s11"><span class="n">11</span> 무손실 하드닝 (v3.10) ★</a></li>
+      <li><a href="#s11"><span class="n">11</span> 무손실 하드닝 (v3.10.1) ★</a></li>
       <li><a href="#s9"><span class="n">9</span> 핵심 코드 위치</a></li>
     </ol>
   </nav>
@@ -263,7 +265,7 @@
           <div class="col-head">✅ 200 + message_id + recipient_id</div>
           <div class="node ok">
             <div class="t">mark_accepted → ACCEPTED</div>
-            <div class="d">+5분 후 verify_dm_delivery 예약<br>공개답글 best-effort 예약</div>
+            <div class="d">+10분 후 verify_dm_delivery 예약<br>공개답글 best-effort 예약</div>
           </div>
           <div class="arrow"><span class="lbl">echo 웹훅 / 능동 조회</span></div>
           <div class="node ok">
@@ -522,7 +524,8 @@
         <tr><td><code>code ∈ {102,190,200}</code></td><td><span class="tag-status ts-red">failed_token</span></td><td class="no">✗</td><td><b>ig_conn.mark_as_error</b> → IG 재연동 필요 · 알림 대상</td></tr>
         <tr><td><code>code 100</code></td><td><span class="tag-status ts-red">failed_param</span></td><td class="no">✗</td><td>파라미터 오류(Private Reply 7일 초과 포함)</td></tr>
         <tr><td><code>code 551</code></td><td><span class="tag-status ts-red">failed_no_trace</span></td><td class="no">✗</td><td>수신자 도달 불가 → 자가 점검 · <b><code>increment_unconfirmed</code>(미확인)</b></td></tr>
-        <tr><td><code>code ∈ {1,2,4,17,32,613}</code></td><td><span class="tag-status ts-amber">queued(defer)</span></td><td class="yes">✓</td><td>rate limit/transient → <b>무한 defer</b></td></tr>
+        <tr><td><code>code ∈ {1,2}</code> ("error-but-delivered")</td><td><span class="tag-status ts-amber">queued(defer)</span></td><td class="yes">✓</td><td>⚠️ Meta가 <b>실제 전달하고도</b> 이 코드를 반환하는 사례 잦음(2026-07-01 실측). 재발송 전 <code>has_recent_message_to_recipient</code>(Conversations 조회)로 전달 흔적 확인(§5.1·§8.2·§11 P12): recent=True→<b>도착확정·재발송 안 함</b>, None→<b>defer</b>(무손실 우선), False→defer</td></tr>
+        <tr><td><code>code ∈ {4,17,32,613}</code></td><td><span class="tag-status ts-amber">queued(defer)</span></td><td class="yes">✓</td><td>명시적 rate limit/transient(=요청 거부, 전달 없음) → 검증 없이 <b>무한 defer</b></td></tr>
         <tr><td><code>code 368</code> (Action Block)</td><td><span class="tag-status ts-amber">queued(defer)</span></td><td class="yes">✓</td><td>defer + <b>계정 에스컬레이팅 쿨다운</b>(24h→×2, 상한 7일) → 자동 재개 (§11 P4)</td></tr>
         <tr><td>HTTP <code>5xx</code></td><td><span class="tag-status ts-amber">queued(defer)</span></td><td class="yes">✓</td><td>서버 오류 → 무한 defer</td></tr>
         <tr><td>그 외 <code>4xx</code></td><td><span class="tag-status ts-red">failed_no_trace</span></td><td class="no">✗</td><td>분류 불가 → <code>increment_unconfirmed</code></td></tr>
@@ -539,6 +542,18 @@
       <span class="state s-red">메시징 윈도우 만료<small>FAILED_WINDOW</small></span>
     </div>
     <p class="sub" style="margin-top:8px">산식 <code>min(60 × 2^min(retry_count,10), 3600)</code> — 상한 1h(쿼터는 시각 경계로 풀림). <b>retriable은 5회 후 죽지 않는다</b>; <code>QUEUED</code>로 회귀 후 <code>requeue_deferred_dms</code>가 FIFO 재투입하며, 종료는 오직 <b>윈도우 만료</b>(send_dm_task 진입부 age 가드)로만 일어납니다. (parent_log 있는 reward/retry child는 sent/failed/unconfirmed 모든 카운트 제외)</p>
+
+    <div class="note info">
+      <b>🆕 code 1/2 "error-but-delivered" 재발송 전 검증 — v3.10.1 (P12)</b>
+      <code>except DMSendError</code> 블록(<code>tasks.py:947</code>)이 <code>maybe_delivered = isinstance(e, DMAnomalyError) or e.code in (1, 2)</code>로 anomaly(§8.2)와 <b>code 1/2를 동일 취급</b> — 재발송 전 <code>has_recent_message_to_recipient(since_seconds=900)</code>로 이미 보냈는지 확인합니다.
+      <ul style="margin:8px 0 0">
+        <li><b>recent=True</b> → <code>mark_accepted("")</code> + <code>increment_sent</code>(opening만) + <code>mark_delivered(CONV_API)</code>, <b>재발송 안 함</b>(오프닝 DM 2개 중복 방지).</li>
+        <li><b>recent=None</b>(조회가 타임아웃/5xx로 불확실) → <b>code 1/2는 defer+retry</b>(무손실; <code>reconcile_stuck_submitting</code>의 None→requeue와 대칭). ⚠️ <b>비대칭</b>: anomaly(200-no-mid)만 None→<code>FAILED_NO_TRACE</code>로 종결(재발송 안 함), code 1/2를 여기서 종결하면 유실 위험이라 의도적.</li>
+        <li><b>recent=False</b> → 기존 defer 재발송.</li>
+        <li><b>명시적 rate-limit <code>{4,17,32,368,613}</code>은 이 검증을 건너뜀</b> — 요청 거부라 전달이 없어 확인 불필요.</li>
+        <li>⚠️ 잔여 한계: 전달됐는데 Conversations 인덱싱 지연으로 <code>recent=False</code>면 재시도 중복 가능(기존과 동일 = 회귀 아님).</li>
+      </ul>
+    </div>
   </section>
 
   <!-- 6. 재시도/검증 -->
@@ -576,8 +591,15 @@
         <tr><td><code>cleanup_comment_ledger</code> <span class="path">신규</span></td><td><b>매일</b></td><td>만료된 SeenComment 장부 정리</td></tr>
         <tr><td><code>dm_backlog_alert</code> <span class="path">v3.10</span></td><td><b>30분</b></td><td>QUEUED 적체·윈도우 만료 임박 시 Telegram 경고 (§11 P7)</td></tr>
         <tr><td><code>refresh_ig_tokens_pending_expiry</code> <span class="path">v3.10</span></td><td><b>6시간</b></td><td>(daily→6h) 토큰 갱신 + 성공 시 FAILED_TOKEN 자동 되살림 (§11 P2)</td></tr>
+        <tr><td><code>resubscribe_all_webhooks</code> <span class="path">v3.10.1</span></td><td><b>6시간</b></td><td>ACTIVE 연동 계정별 <code>subscribed_apps</code>(comments,messages) 재확정 — Meta auto-disable 로 인한 댓글 웹훅 무음 복구. 활성 사이트에서만 실변경 (§8.5·§11 P13)</td></tr>
+        <tr><td><code>maintain_partitions</code></td><td><b>매일 02:00 KST</b></td><td>EventInbox 일별 파티션 유지 + SentDMLog 아카이브(멱등/로그 계층 durability)</td></tr>
+        <tr><td><code>backup-health-check</code></td><td><b>30분</b></td><td><code>pg_stat_archiver</code> 점검(WAL 아카이빙 정상성 — DR RPO 보증)</td></tr>
       </tbody>
     </table>
+    <div class="note warn">
+      <b>⚠️ 스케줄 발동 경로 주의</b>
+      DR Step2 이후 <b>celery-beat 은퇴</b>. 스케줄링은 <b>CF tick + <code>core.ScheduledJob</code> DB 행(next_due_at)</b>으로 동작하며 <code>settings.CELERY_BEAT_SCHEDULE</code>는 tick이 <b>안 읽습니다</b>. 새 주기잡은 <code>ScheduledJob</code> 시드 마이그레이션이 필요합니다(예: <code>core 0003_seed_resubscribe_webhooks_job</code>). beat 항목만 추가하면 절대 안 돕니다.
+    </div>
     <p class="sub">deprecated 제거(코드 잔존): expire_gate_pending · poll_new_media · check_polling_anomalies</p>
   </section>
 
@@ -617,14 +639,16 @@
       <ul>
         <li><code>rate_governor.check()</code>는 호출 즉시 <code>INCR</code> — defer 재시도 시 같은 1건이 여러 번 소비될 수 있음(보수적 과소발송, 밴 위험↓).</li>
         <li><b>v3.10 (P8)</b>: Redis flush/재시작으로 카운터가 0으로 <b>리셋</b>되는 별개 위험은 fail-closed 로 해소(센티넬 소멸 감지 → 그 시각 동안 차단). 시도당 소비 특성은 의도된 보수적 페이싱으로 유지.</li>
+        <li><b>v3.10.1 — Redis 유실 즉시 복구</b>: fail-closed 의 최대 1h 동결이 유일 회복이 아닙니다. <code>rate_governor.rehydrate_from_db()</code>가 <code>SentDMLog.submitted_at</code> 윈도우에서 계정별 시/분 카운터를 재구성 <b>AND</b> <code>dmrate:reset_until</code>을 삭제(동결 즉시 해제) → <code>dr_catchup</code> STEP0 + 활성 사이트 Celery <code>worker_ready</code>에서 호출. Redis 유실 후 1h 멈추지 않고 재수화하여 즉시 재개합니다.</li>
       </ul>
     </div>
 
     <div class="issue" style="border-color:#86efac;background:linear-gradient(180deg,#f0fdf4,#fff)">
-      <h4><span class="chip" style="background:var(--green)">해결됨 ✅</span> 8.2 DMAnomalyError(200-no-msgid) 재발송 중복 위험 → 검증 후 재발송</h4>
+      <h4><span class="chip" style="background:var(--green)">해결됨 ✅</span> 8.2 200-no-msgid anomaly + code 1/2 재발송 중복 위험 → 검증 후 재발송</h4>
       <ul>
         <li>(과거) anomaly 가 <code>rate_limited</code>로 분류돼 그냥 재발송 → Meta 가 이미 보냈으면 중복 DM.</li>
         <li><b>v3.10 (P6)</b>: 재발송 전 <code>has_recent_message_to_recipient</code>(Conversations 조회)로 확인 — found=도착확정(재발송 안 함)·불확실=미확인(재발송 안 함)·없음=defer 재발송. SUBMITTING 크래시(F2)도 동일.</li>
+        <li><b>v3.10.1 (P12)</b>: 검증-후-재발송을 <b>Meta code 1/2("error-but-delivered")</b>까지 확장(오프닝 DM 2개 중복 방지, 커밋 d03a101). <b>단 None 처리가 비대칭</b>: anomaly는 None→<code>FAILED_NO_TRACE</code>(종결)지만 code 1/2는 None→<b>defer</b>(무손실 우선 — "please retry" 시맨틱이라 미전달 가능성 + 조회가 None을 낼 수 있어 종결하면 유실). 상세 분기는 §5.1.</li>
       </ul>
     </div>
 
@@ -651,11 +675,27 @@
         <li><b>안전</b>: 중복은 <code>idempotency_key</code>가 하드 차단, 폭주는 <code>rate_governor</code>가 throttle. <code>MISSED_COMMENT_POLL_ENABLED=False</code>로 즉시 끔.</li>
       </ul>
     </div>
+
+    <div class="issue" style="border-color:#86efac;background:linear-gradient(180deg,#f0fdf4,#fff)">
+      <h4><span class="chip" style="background:var(--green)">해결됨 ✅</span> 8.5 웹훅 구독 auto-disable → 재구독 자동화 <span class="path">v3.10.1 · P13</span></h4>
+      <ul>
+        <li><b>문제</b>: Meta는 콜백 엔드포인트가 <b>반복 실패</b>(CF 엣지 장애·DR 컷오버·5xx)하면 IG 계정별 <code>subscribed_apps</code>(comments/messages) 구독을 <b>조용히 auto-disable</b> 합니다. 서버가 정상 복구돼도 <b>댓글 웹훅이 안 와 캠페인이 무음으로 정지</b>합니다(2026-07-01 DR 훈련에서 실측).</li>
+        <li><b>진단 신호</b>: 웹훅 경로는 정상(POST→<code>EVENT_RECEIVED</code> 200, GET 잘못된토큰→403)인데 <code>web_webhook</code> 로그에 <code>facebookexternalua</code> POST <b>0건</b> → Meta가 안 보내는 것 → 계정 구독 확인.</li>
+        <li><b>자동화</b>:
+          <ul style="margin:4px 0 0">
+            <li><code>manage.py resubscribe_webhooks [--check-only]</code> — ACTIVE 연동 전부 점검·재구독(수동/DR).</li>
+            <li>Beat <code>resubscribe_all_webhooks</code>(6h) → <code>resubscribe_active_connections(check_only)</code> — 계정별 best-effort 멱등, <code>REQUIRED_WEBHOOK_FIELDS=("comments","messages")</code>, 활성 사이트에서만 실변경, 변화 시 Telegram.</li>
+            <li><b>DR startup.sh(live)</b>: promote 직후 즉시 전 계정 재구독 — "서버 이전 후 바로 웹훅 켜기".</li>
+          </ul>
+        </li>
+        <li><b>함정</b>: (1) 이 6h 잡은 <code>ScheduledJob</code> 시드(<code>core 0003</code>)로만 돎(§6.2 주의) — <code>CELERY_BEAT_SCHEDULE</code>만으로는 안 돎. (2) 게시물 <b>소유 계정</b> 댓글은 애초에 comments 웹훅이 안 옴 + 코드도 스킵 → 댓글-DM 테스트는 반드시 <b>다른 계정</b>으로.</li>
+      </ul>
+    </div>
   </section>
 
   <!-- 11. 무손실 하드닝 -->
   <section id="s11">
-    <h2><span class="badge">11</span> 무손실 하드닝 (v3.10)</h2>
+    <h2><span class="badge">11</span> 무손실 하드닝 (v3.10.1)</h2>
     <p class="sub">v3.9(defer·거버너·누락 보정) 위에, 실패 케이스 전수 분석에서 채택한 항목을 패치한 묶음.</p>
 
     <table>
@@ -664,14 +704,16 @@
         <tr><td><b>P1</b></td><td><b>제자리 되살림(revive)</b> — <code>failed_token</code>/<code>skipped</code> 종결 건을 <u>같은 row·같은 idempotency_key</u>로 QUEUED 복귀(<code>SentDMLog.revive</code>). 윈도우 내인 것만. admin 재시도도 이 경로</td><td>종결 건이 키를 점유해 못 되살리던 <b>영구 손실(C1/C2/H1)</b></td></tr>
         <tr><td><b>P2</b></td><td>토큰 갱신 <b>6h 주기</b> + 성공 시 <code>revive_failed_token_logs</code> 자동 되살림 + <b>프리미엄</b> <code>POST .../retry-failed/</code>(무료=403)</td><td>토큰 만료 구간 누락(C1·G1)</td></tr>
         <tr><td><b>P3</b></td><td>웹훅 <b>HMAC</b>(<code>X-Hub-Signature-256</code>) 검증. <code>WEBHOOK_HMAC_ENFORCED</code></td><td>위조 페이로드 주입(A5)</td></tr>
-        <tr><td><b>P4</b></td><td><b>Action Block 서킷 브레이커</b> — <code>code 368</code> 시 그 계정 발송을 <b>에스컬레이팅 쿨다운</b>(24h→×2, 상한 7일) 후 자동 재개. cache(<code>dm:ab:*</code>)</td><td>차단 중 재시도→<b>차단 연장</b>(I1)</td></tr>
+        <tr><td><b>P4</b></td><td><b>Action Block 서킷 브레이커</b> — <code>code 368</code> 시 그 계정 발송을 <b>에스컬레이팅 쿨다운</b>(24h→×2, 상한 7일) 후 자동 재개. cache(<code>dm:ab:*</code>) + <b>DB 이중기록</b>(<code>DMAccountBlock</code>): 캐시 미스 시 DB 복원, <code>rehydrate_from_db</code>가 Redis 유실/DR failover 후 재시드 → <b>차단이 조용히 풀리지 않음</b></td><td>차단 중 재시도→<b>차단 연장</b>(I1) + Redis/DR 유실로 인한 차단 소실</td></tr>
         <tr><td><b>P5</b></td><td><code>IGAccountConnection</code> (workspace, external_account_id) <b>UNIQUE</b> + migration 0026 dedupe(FK repoint 후 스테일 삭제)</td><td>재연동 <b>캠페인 고아화</b>(G2)</td></tr>
         <tr><td><b>P6</b></td><td><b>검증 후 재발송</b> — anomaly(C4)·SUBMITTING 크래시(F2) 재발송 전 <code>has_recent_message_to_recipient</code>(Conversations 조회)</td><td><b>중복 발송</b>(C4/F2)</td></tr>
         <tr><td><b>P7</b></td><td><b>백로그 모니터링</b> <code>GET .../admin/auto-dm/backlog/</code> + <code>dm_backlog_alert</code>(30분 Telegram)</td><td>적체→<b>윈도우 만료 손실(E1)</b> 가시화</td></tr>
-        <tr><td><b>P8</b></td><td>거버너 <b>fail-closed</b> — <code>AppConfig.ready()</code>가 센티넬(<code>dmrate:alive</code>)을 심고, 소멸=Redis flush 로 보아 그 시각까지 차단. 콜드스타트(배포)는 안 막힘</td><td>Redis 리셋 후 <b>과발송→밴</b>(E3)</td></tr>
+        <tr><td><b>P8</b></td><td>거버너 <b>fail-closed</b> — <code>AppConfig.ready()</code>가 센티넬(<code>dmrate:alive</code>)을 심고, 소멸=Redis flush 로 보아 그 시각까지 차단. 콜드스타트(배포)는 안 막힘. <b>v3.10.1</b>: <code>rehydrate_from_db()</code>가 <code>SentDMLog.submitted_at</code>에서 카운터 재구성 + <code>reset_until</code> 삭제(동결 즉시 해제), <code>dr_catchup</code> STEP0 / <code>worker_ready</code>에서 호출</td><td>Redis 리셋 후 <b>과발송→밴</b>(E3)</td></tr>
         <tr><td><b>P9</b></td><td><code>dead_letter_alerter</code>·<code>dm_backlog_alert</code>·Action Block 트립 <b>Telegram</b> 표준화</td><td>장애 인지 지연(G1)</td></tr>
         <tr><td><b>P10</b></td><td>동일 수신자 쿨다운 60s→<b>설정화</b>(<code>DM_RECIPIENT_COOLDOWN_SECONDS</code>, 기본 300s)</td><td>도배·계정 보호(B4)</td></tr>
         <tr><td><b>P11</b></td><td><code>AutoDMCampaignSerializer.miss_recovery</code> — any_media/story_reply 위험 경고 노출(프론트 고지)</td><td>보정 불가 트리거 <b>위험고지</b>(A1·any_media)</td></tr>
+        <tr><td><b>P12</b></td><td><b>code 1/2 "error-but-delivered" 중복 방지</b>(커밋 d03a101) — P6의 검증-후-재발송을 Meta code 1/2까지 확장. recent=True→도착확정, code 1/2 None→<b>defer</b>(무손실, anomaly와 비대칭), False→defer. rate-limit <code>{4,17,32,368,613}</code>은 검증 제외(§5.1·§8.2)</td><td>오프닝 DM <b>2개 중복 발송</b>(2026-07-01 실측)</td></tr>
+        <tr><td><b>P13</b></td><td><b>웹훅 구독 재구독 자동화</b>(커밋 e538a9b·986be99) — Meta auto-disable 로 댓글 웹훅 무음이 되는 것을 <code>resubscribe_all_webhooks</code>(Beat 6h·<code>ScheduledJob</code> 시드) + DR startup + <code>manage.py resubscribe_webhooks</code>로 복구(§8.5)</td><td>엣지 장애/DR 후 <b>캠페인 무음 정지</b></td></tr>
       </tbody>
     </table>
 
@@ -718,7 +760,7 @@
         <tr><td>능동 검증(GET /{message_id})</td><td class="path">apps/integrations/services.py:800 · fetch_message</td></tr>
         <tr><td>발송 로그/상태머신 모델</td><td class="path">apps/integrations/models.py:791 · SentDMLog</td></tr>
         <tr><td>에러 분류기</td><td class="path">apps/integrations/dm_exceptions.py · classify_api_error</td></tr>
-        <tr><td>5분/35분 도착 검증</td><td class="path">apps/integrations/tasks.py:742 · verify_dm_delivery</td></tr>
+        <tr><td>10분/35분 도착 검증</td><td class="path">apps/integrations/tasks.py:742 · verify_dm_delivery</td></tr>
         <tr><td>Beat 안전망</td><td class="path">apps/integrations/tasks.py:814~ · reconcile_* / dead_letter_alerter</td></tr>
         <tr><td>Beat 스케줄 등록</td><td class="path">config/settings/base.py:358~ · CELERY_BEAT_SCHEDULE</td></tr>
         <tr><td>제자리 되살림(revive) <span class="path">P1</span></td><td class="path">models.py · SentDMLog.revive / REVIVABLE_STATUSES / messaging_window</td></tr>
@@ -726,7 +768,9 @@
         <tr><td>웹훅 HMAC <span class="path">P3</span></td><td class="path">apps/integrations/views.py · _verify_webhook_signature</td></tr>
         <tr><td>Action Block 쿨다운 <span class="path">P4</span></td><td class="path">rate_governor.py trip_action_block / action_block_cooldown_remaining · tasks.py _ACTION_BLOCK_CODES</td></tr>
         <tr><td>거버너 fail-closed 센티넬 <span class="path">P8</span></td><td class="path">apps/integrations/apps.py ready() · rate_governor.check (dmrate:alive/reset_until)</td></tr>
-        <tr><td>검증 후 재발송 <span class="path">P6</span></td><td class="path">services.py has_recent_message_to_recipient · tasks.py anomaly/reconcile_stuck_submitting</td></tr>
+        <tr><td>검증 후 재발송 <span class="path">P6·P12</span></td><td class="path">services.py has_recent_message_to_recipient · tasks.py:947 anomaly·code 1/2 분기(maybe_delivered) · reconcile_stuck_submitting</td></tr>
+        <tr><td>Action Block DB 영속 <span class="path">P4·P8</span></td><td class="path">models.py DMAccountBlock · rate_governor.py _persist_action_block_to_db / _restore_action_block_from_db / rehydrate_from_db</td></tr>
+        <tr><td>웹훅 재구독 자동화 <span class="path">P13</span></td><td class="path">tasks.py resubscribe_all_webhooks / resubscribe_active_connections · services.py subscribe_to_webhooks / get_webhook_subscriptions · management/commands/resubscribe_webhooks.py · core 0003_seed_resubscribe_webhooks_job</td></tr>
         <tr><td>백로그 모니터링 <span class="path">P7</span></td><td class="path">admin_api/views/autodm.py AdminDMBacklogView · tasks.py dm_backlog_alert</td></tr>
         <tr><td>재연동 고아화 방지 <span class="path">P5</span></td><td class="path">models.py uq_igconn_ws_account · migration 0026</td></tr>
         <tr><td>위험고지 필드 <span class="path">P11</span></td><td class="path">apps/integrations/serializers.py AutoDMCampaignSerializer.miss_recovery</td></tr>
@@ -735,7 +779,7 @@
   </section>
 
   <footer>
-    작성 기준: <code>hardening/dm-surge</code> 브랜치 · 발송 보증 v3.10 (무손실 하드닝) · 코드 변경 시 §4 상태머신 / §5 분류표 / §6 스케줄 / 누락 보정 / §11 하드닝 함께 갱신<br>
+    작성 기준: <code>hardening/dm-surge</code> 브랜치 · 발송 보증 <b>v3.10.1</b>(2026-07-01: P12 code 1/2 중복방지 + P13 웹훅 재구독 자동화 + Action Block/거버너 DR 영속·재수화) · 코드 변경 시 §4 상태머신 / §5 분류표 / §6 스케줄 / §8 갭 / 누락 보정 / §11 하드닝 함께 갱신<br>
     원문 상세: <code>AUTODM_DELIVERY_LIFECYCLE.md</code>
   </footer>
 
