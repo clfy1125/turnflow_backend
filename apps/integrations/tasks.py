@@ -937,11 +937,16 @@ def send_dm_task(self, log_id: str):
                 buttons=buttons,
             )
     except DMSendError as e:
-        # ★ P6 (C4): 200 인데 message_id 없음(DMAnomalyError) → Meta 가 이미 보냈을 수 있어
-        # 그냥 재발송하면 중복. Conversations 조회로 '최근 발송 흔적'을 확인 후 분기.
+        # ★ P6 (C4): Meta 가 '이미 전달했을 수 있는데 실패처럼 응답' 하는 모호한 케이스는
+        # blind 재발송하면 중복(오프닝 DM 2개 함정). 재발송 전 Conversations 조회로 '최근 발송
+        # 흔적' 확인 후 분기. 대상: (a) DMAnomalyError(200-no-mid) (b) code 1/2("An unexpected
+        # error…retry" — Meta 가 처리·전달하고도 반환하는 사례 잦음, 2026-07-01 실측).
+        # 명시적 rate-limit(4/17/32/368/613)은 '요청 거부' 라 전달 없음 → 검증 없이 정상 defer.
         from .dm_exceptions import DMAnomalyError
 
-        if isinstance(e, DMAnomalyError):
+        maybe_delivered = isinstance(e, DMAnomalyError) or e.code in (1, 2)
+        if maybe_delivered:
+            _tag = "anomaly" if isinstance(e, DMAnomalyError) else f"err_code_{e.code}"
             recent = InstagramMessagingService.has_recent_message_to_recipient(
                 ig_user_id=ig_conn.external_account_id,
                 recipient_id=log.recipient_user_id,
@@ -950,14 +955,20 @@ def send_dm_task(self, log_id: str):
             )
             if recent is True:
                 # 발송 확인됨 → 재발송 금지, 도착 확정 처리(conv_api 로 확인).
-                log.mark_accepted(message_id="", api_response={"anomaly": True, "recent": True})
+                log.mark_accepted(
+                    message_id="", api_response={"maybe_delivered": _tag, "recent": True}
+                )
                 if log.parent_log_id is None:
                     campaign.increment_sent()
                 log.mark_delivered(via=SentDMLog.VerifiedVia.CONV_API)
-                log.append_verification_log({"path": "anomaly", "result": "confirmed_sent"})
-                return {"status": "delivered", "via": "anomaly_conv_api"}
-            if recent is None:
-                # 확인 불가 + 200 응답이었음 → 중복 방지 우선: 재발송 안 함, '미확인'으로 분리 집계.
+                log.append_verification_log({"path": _tag, "result": "confirmed_sent"})
+                return {"status": "delivered", "via": f"{_tag}_conv_api"}
+            if recent is None and isinstance(e, DMAnomalyError):
+                # 200-no-mid + 확인 불가 → 중복 방지 우선: 재발송 안 함('미확인' 분리 집계).
+                # (code 1/2 는 여기서 종결하지 않고 아래 defer+retry 로 흘린다 — 무손실 우선.
+                #  code 1/2 는 "please retry" 시맨틱이라 미전달 가능성이 크고, API 체크 자체가
+                #  타임아웃/5xx 로 None 을 낼 수 있어 여기서 FAILED 로 종결하면 유실 위험.
+                #  reconcile_stuck_submitting 의 recent=None→requeue 와 대칭을 맞춘다.)
                 log.mark_failed(
                     status=SentDMLog.Status.FAILED_NO_TRACE,
                     error_message="200 OK without message_id; delivery unconfirmed (no resend)",
@@ -965,9 +976,11 @@ def send_dm_task(self, log_id: str):
                 )
                 if log.parent_log_id is None:
                     campaign.increment_unconfirmed()
-                log.append_verification_log({"path": "anomaly", "result": "unconfirmed_no_resend"})
-                return {"status": "failed_no_trace", "reason": "anomaly_unconfirmed"}
-            # recent is False → 정말 안 갔음 → 기존 defer 재발송 경로.
+                log.append_verification_log({"path": _tag, "result": "unconfirmed_no_resend"})
+                return {"status": "failed_no_trace", "reason": f"{_tag}_unconfirmed"}
+            # recent is False(정말 안 감) 또는 code 1/2 + recent None(확인불가) → defer+retry(무손실).
+            # ⚠️ 잔여 한계: 전달됐는데 Conversations 인덱싱 지연으로 recent=False 면 재시도 시 중복 가능
+            #   (기존 동작과 동일 = 회귀 아님). 완전 제거는 '재시도 직전 재확인' 후속 개선 필요.
         # v3.9: rate-limit/transient 은 횟수 상한으로 종결하지 않고 defer.
         # 윈도우 만료(graceful 종결)는 위 진입부 age 가드가 단일 지점에서 담당.
         # no_trace(551·기타4xx)는 실패가 아닌 '미확인'으로 분리 집계.
