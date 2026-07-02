@@ -12,24 +12,13 @@ from datetime import timedelta
 from django.db import transaction
 from django.db.models import F
 from django.utils import timezone
-from drf_spectacular.utils import (
-    OpenApiExample,
-    OpenApiParameter,
-    OpenApiResponse,
-    extend_schema,
-)
+from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import status
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import (
-    AiTokenBalance,
-    ReferralCode,
-    ReferralRedemption,
-    SubscriptionStatus,
-    UserSubscription,
-)
+from .models import ReferralCode, ReferralRedemption, SubscriptionStatus, UserSubscription
 from .serializers import (
     ReferralCodeRedeemRequestSerializer,
     ReferralCodeValidateResponseSerializer,
@@ -238,7 +227,11 @@ class RedeemReferralCodeView(APIView):
         description="""
 ## 목적
 입력한 레퍼럴 코드를 사용해 **결제 없이 N일 무료 트라이얼**을 시작합니다.
-PayApp 결제는 호출되지 않으며, 카드 정보도 수집하지 않습니다.
+결제 호출이 없으며, 카드 정보도 수집하지 않습니다.
+
+> 💳 카드 등록과 함께 시작하는 프로 무료 체험(+제휴코드 연장)은
+> `POST /billing/toss/confirm/` 을 사용하세요. 제휴/레퍼럴 코드는 경로와 무관하게
+> **1인 1회**만 사용할 수 있습니다.
 
 ## 인증
 `Authorization: Bearer <access_token>` 헤더 필수
@@ -252,20 +245,21 @@ PayApp 결제는 호출되지 않으며, 카드 정보도 수집하지 않습니
    - `current_period_end = now + trial_days`
    - `cancelled_at = null`
 2. 사용자의 모든 페이지를 활성화 (유료 동등 권한)
-3. `target_plan.features.monthly_ai_tokens` 만큼 AI 토큰 지급
-4. `ReferralCode.current_uses += 1`
-5. `ReferralRedemption` 생성
+3. `ReferralCode.current_uses += 1`
+4. `ReferralRedemption` 생성
 
-> 📌 `pro_activated_at`은 **설정하지 않습니다**. 이 필드는 7일 환불 심사용으로,
-> 실제 결제가 발생한 시점(트라이얼 종료 후 정기결제)에서만 채워집니다.
+> 📌 `pro_activated_at`은 **설정하지 않습니다**. 이 필드는 실제 첫 결제 시점에만 채워집니다.
+> 📌 AI 토큰은 별도 지급하지 않습니다 — 트라이얼 중에는 유료 플랜과 동일하게 AI 무제한입니다.
 
 ## 트라이얼 만료 처리
-- `current_period_end`가 지나면 매일 실행되는 `billing.handle_trial_expiry` 배치가 free 플랜으로 자동 다운그레이드합니다.
-- 다운그레이드 시 페이지 비활성화/로고 복원/커스텀 CSS 초기화가 함께 진행됩니다.
+- `current_period_end`가 지나면 `billing.handle_trial_expiry` 배치가 free 플랜으로 자동 다운그레이드합니다.
+  (단, 트라이얼 중 카드를 등록했다면 만료 시점에 자동으로 첫 결제가 진행됩니다.)
+- 다운그레이드 시 페이지 비활성화/로고(배지) 복원이 함께 진행됩니다.
 
 ## 트라이얼 → 유료 전환
-- 트라이얼 중 `POST /billing/change-plan/` 또는 동일 플랜 결제 진행 시 정상 결제 흐름으로 진입합니다.
-- PayApp 결제 완료 시점에 `ReferralRedemption.converted_to_paid`가 자동으로 `True`로 마킹됩니다.
+- 트라이얼 중 `POST /billing/toss/confirm/` 으로 카드를 등록하면 **잔여 트라이얼 기간은 유지**되고,
+  만료 시점에 첫 결제가 자동 진행됩니다.
+- 첫 결제 성공 시점에 `ReferralRedemption.converted_to_paid`가 자동으로 `True`로 마킹됩니다.
 
 ## 사용 가능 조건 (모두 충족해야 함)
 | 조건 | 위반 시 |
@@ -462,18 +456,10 @@ if (res.ok) {
                 # 페이지 전체 활성화 (유료 동등)
                 from apps.pages.models import Page
 
-                Page.objects.filter(user=request.user, is_active=False).update(
-                    is_active=True
-                )
+                Page.objects.filter(user=request.user, is_active=False).update(is_active=True)
 
-                # AI 토큰 지급
-                monthly_tokens = code.target_plan.features.get("monthly_ai_tokens", 0)
-                if monthly_tokens > 0:
-                    balance = AiTokenBalance.get_or_create_for_user(request.user)
-                    balance.grant(
-                        monthly_tokens,
-                        description=f"레퍼럴 트라이얼 토큰 지급 ({code.code})",
-                    )
+                # AI 토큰 지급 없음 — 유료(트라이얼 포함)는 토큰과 무관하게 AI 무제한
+                # (기존 지급 코드는 features 키 불일치로 실제 지급된 적 없던 죽은 경로였음)
 
                 # 사용 횟수 증가
                 ReferralCode.objects.filter(pk=code.pk).update(

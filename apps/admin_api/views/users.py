@@ -21,12 +21,7 @@ from django.db.models import Count
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
-from drf_spectacular.utils import (
-    OpenApiExample,
-    OpenApiParameter,
-    OpenApiResponse,
-    extend_schema,
-)
+from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import filters, generics, status
 from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
@@ -437,9 +432,9 @@ class AdminUserSubscriptionUpdateView(APIView):
         summary="[관리자] 회원 구독(요금제) 강제 변경",
         description="""
 ## 개요
-대상 회원의 **실제 구독**(`UserSubscription`)의 플랜을 **결제/정기결제(rebill) 없이** 즉시 교체합니다.
+대상 회원의 **실제 구독**(`UserSubscription`)의 플랜을 **결제 없이** 즉시 교체합니다.
 CS 보상, 수기 부여, 강등 등 운영 조정 용도입니다. 사용자 본인 흐름(`POST /billing/change-plan/`,
-PayApp 결제 동반)과는 **완전히 분리**되어 있습니다.
+토스 결제 동반)과는 **완전히 분리**되어 있습니다.
 
 ## 사용 시나리오
 - 무료 회원에게 프로를 수기 부여 / 잘못 결제된 회원 강등 / 내부 `admin` 플랜 부여
@@ -450,7 +445,7 @@ PayApp 결제 동반)과는 **완전히 분리**되어 있습니다.
 ## 요청 (둘 중 **정확히 하나**)
 | 필드 | 타입 | 설명 |
 |------|------|------|
-| `plan` | string | SubscriptionPlan.name (예: `free` / `pro` / `admin`) |
+| `plan` | string | SubscriptionPlan.name (예: `free` / `basic` / `pro` / `admin`) |
 | `plan_id` | uuid | SubscriptionPlan.id |
 
 - 비활성(is_active=False) 플랜(예: 운영용 `admin`)도 어드민은 부여 가능 — 여기선 is_active 로 막지 않습니다.
@@ -459,8 +454,9 @@ PayApp 결제 동반)과는 **완전히 분리**되어 있습니다.
 - 구독 레코드가 **없으면 생성**, 있으면 플랜 교체.
 - `status="active"`, `current_period_start=now`, `current_period_end=null`(무기한 — 결제 주기가 없으므로),
   `cancelled_at=null` 로 설정합니다.
-- **PayApp 정기결제(`payapp_rebill_*`)는 건드리지 않습니다.** 결제 중인 회원을 free 로 강등할 때는
-  PayApp 해지가 자동으로 일어나지 않으므로 별도 처리가 필요합니다(서버는 경고 로그만 남김).
+- **토스 빌링키는 건드리지 않습니다.** 갱신 스케줄러는 `current_period_end`가 없는 구독을
+  과금하지 않으므로 수기 부여 회원에게 자동 청구가 나가지 않습니다. 결제 중이던 회원을
+  강등하면 빌링키가 남지만 주기가 제거돼 더 이상 과금되지 않습니다(서버가 로그를 남김).
 - AI 토큰 잔액은 **자동 지급/회수하지 않습니다**(등급만 조정). 필요 시 토큰은 별도 조정하세요.
 - 변경 성공 시 `AdminActionLog(user.subscription_update)` 로 감사 기록합니다.
 
@@ -508,11 +504,12 @@ PayApp 결제 동반)과는 **완전히 분리**되어 있습니다.
         sub = ensure_subscription(user)
         before = {"plan_name": sub.plan.name, "status": sub.status}
 
-        # free 로 강등하는데 PayApp 정기결제가 살아있으면 계속 청구될 수 있음 — 경고만.
-        if new_plan.name == "free" and sub.payapp_rebill_no:
-            logger.warning(
-                "[admin-users] req=%s user=%s free 강등이지만 PayApp rebill_no 존재 — "
-                "정기결제는 자동 해지되지 않음 (별도 처리 필요)",
+        # 강제 변경은 결제 주기를 제거하므로(period_end=null) 갱신 과금은 멈춘다.
+        # 빌링키가 남아있으면 추후 사용자 본인 결제 흐름에서 재사용 가능 — 정보 로그만.
+        if sub.has_billing_key:
+            logger.info(
+                "[admin-users] req=%s user=%s 구독 강제 변경 — 토스 빌링키 잔존 "
+                "(주기 제거로 자동 과금 없음)",
                 getattr(request, "id", ""),
                 user.email,
             )

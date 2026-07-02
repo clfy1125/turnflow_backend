@@ -1,8 +1,15 @@
 from django.contrib import admin
+
 from .models import (
-    UsageCounter, SubscriptionPlan, UserSubscription, PaymentHistory,
-    AiTokenBalance, AiTokenLedger, PayAppWebhookLog,
-    ReferralCode, ReferralRedemption,
+    AiTokenBalance,
+    AiTokenLedger,
+    PaymentHistory,
+    ReferralCode,
+    ReferralRedemption,
+    SubscriptionPlan,
+    TossWebhookLog,
+    UsageCounter,
+    UserSubscription,
 )
 
 
@@ -17,7 +24,14 @@ class UsageCounterAdmin(admin.ModelAdmin):
 
 @admin.register(SubscriptionPlan)
 class SubscriptionPlanAdmin(admin.ModelAdmin):
-    list_display = ["display_name", "name", "monthly_price", "is_active", "sort_order"]
+    list_display = [
+        "display_name",
+        "name",
+        "monthly_price",
+        "list_price",
+        "is_active",
+        "sort_order",
+    ]
     list_filter = ["is_active"]
     search_fields = ["name", "display_name"]
     readonly_fields = ["id", "created_at", "updated_at"]
@@ -26,18 +40,43 @@ class SubscriptionPlanAdmin(admin.ModelAdmin):
 
 @admin.register(UserSubscription)
 class UserSubscriptionAdmin(admin.ModelAdmin):
-    list_display = ["user", "plan", "status", "payapp_rebill_no", "current_period_start", "current_period_end"]
+    list_display = [
+        "user",
+        "plan",
+        "status",
+        "card_company",
+        "monthly_amount_snapshot",
+        "extra_ig_accounts",
+        "current_period_start",
+        "current_period_end",
+        "next_billing_retry_at",
+    ]
     list_filter = ["status", "plan"]
-    search_fields = ["user__email", "payapp_rebill_no"]
-    readonly_fields = ["id", "created_at", "updated_at"]
-    raw_id_fields = ["user", "plan"]
+    search_fields = ["user__email", "toss_customer_key"]
+    readonly_fields = [
+        "id",
+        "toss_customer_key",
+        "toss_billing_key_hash",
+        "_encrypted_toss_billing_key",
+        "created_at",
+        "updated_at",
+    ]
+    raw_id_fields = ["user", "plan", "pending_plan"]
 
 
 @admin.register(PaymentHistory)
 class PaymentHistoryAdmin(admin.ModelAdmin):
-    list_display = ["user", "amount", "status", "payment_method", "payapp_mul_no", "paid_at", "created_at"]
+    list_display = [
+        "user",
+        "amount",
+        "status",
+        "payment_method",
+        "toss_order_id",
+        "paid_at",
+        "created_at",
+    ]
     list_filter = ["status", "payment_method"]
-    search_fields = ["user__email", "payapp_mul_no", "payapp_rebill_no"]
+    search_fields = ["user__email", "toss_order_id", "toss_payment_key"]
     readonly_fields = ["id", "created_at"]
     raw_id_fields = ["user", "subscription"]
 
@@ -59,20 +98,27 @@ class AiTokenLedgerAdmin(admin.ModelAdmin):
     raw_id_fields = ["user"]
 
 
-@admin.register(PayAppWebhookLog)
-class PayAppWebhookLogAdmin(admin.ModelAdmin):
-    list_display = ["webhook_type", "mul_no", "rebill_no", "pay_state", "processed", "created_at"]
-    list_filter = ["webhook_type", "processed", "pay_state"]
-    search_fields = ["mul_no", "rebill_no"]
-    readonly_fields = ["id", "raw_data", "created_at"]
+@admin.register(TossWebhookLog)
+class TossWebhookLogAdmin(admin.ModelAdmin):
+    list_display = ["event_type", "payment_key", "order_id", "processed", "created_at"]
+    list_filter = ["event_type", "processed"]
+    search_fields = ["payment_key", "order_id", "dedup_key"]
+    readonly_fields = ["id", "dedup_key", "raw_data", "created_at"]
     ordering = ["-created_at"]
 
 
 @admin.register(ReferralCode)
 class ReferralCodeAdmin(admin.ModelAdmin):
     list_display = [
-        "code", "target_plan", "trial_days", "is_active",
-        "current_uses", "max_uses", "valid_from", "valid_until", "created_at",
+        "code",
+        "target_plan",
+        "trial_days",
+        "is_active",
+        "current_uses",
+        "max_uses",
+        "valid_from",
+        "valid_until",
+        "created_at",
     ]
     list_filter = ["is_active", "target_plan"]
     search_fields = ["code", "description"]
@@ -84,8 +130,12 @@ class ReferralCodeAdmin(admin.ModelAdmin):
 @admin.register(ReferralRedemption)
 class ReferralRedemptionAdmin(admin.ModelAdmin):
     list_display = [
-        "user", "referral_code", "trial_started_at", "trial_ends_at",
-        "converted_to_paid", "converted_at",
+        "user",
+        "referral_code",
+        "trial_started_at",
+        "trial_ends_at",
+        "converted_to_paid",
+        "converted_at",
     ]
     list_filter = ["converted_to_paid", "referral_code"]
     search_fields = ["user__email", "referral_code__code"]

@@ -334,12 +334,24 @@ CELERY_TASK_ROUTES = {
 }
 
 # Celery Beat Schedule (정기 결제 + DM 발송 보증 워커)
-# NOTE: 만료 처리 계열은 매시간 실행해 단일 실행 누락/지연 위험을 줄인다.
-#       각 태스크는 멱등하며, PayApp API 실패 시 다음 차수에서 재시도되도록 설계됨(apps/billing/tasks.py 참고).
+# NOTE: 토스는 PG측 스케줄러가 없다 — 갱신 과금의 주체는 process_due_renewals.
+#       만료 처리 계열은 매시간 실행해 단일 실행 누락/지연 위험을 줄인다.
+#       각 태스크는 멱등하다 (중복 과금 방지: 결정적 orderId + Idempotency-Key).
 CELERY_BEAT_SCHEDULE = {
+    # ── 토스 빌링 갱신 파이프라인 ──
+    "process-due-renewals": {
+        "task": "billing.process_due_renewals",
+        "schedule": 60 * 10,  # 10분 — 갱신 도래 구독 과금 디스패치
+        "options": {"queue": "billing"},
+    },
+    "reconcile-pending-payments": {
+        "task": "billing.reconcile_pending_payments",
+        "schedule": 60 * 30,  # 30분 — 모호 실패(PENDING) 결제 확정
+        "options": {"queue": "billing"},
+    },
     "check-missed-payments": {
         "task": "billing.check_missed_payments",
-        "schedule": 60 * 60,  # 매시간
+        "schedule": 60 * 60,  # 매시간 — 갱신 파이프라인 고장 감시
         "options": {"queue": "billing"},
     },
     "handle-grace-period-expiry": {
@@ -461,15 +473,14 @@ CELERY_BEAT_SCHEDULE = {
     #   - dm-check-polling-anomalies: 폴링 자체가 사라져 감시 불필요
 }
 
-# PayApp 결제 연동
-PAYAPP_USERID = config("PAYAPP_USERID", default="")
-PAYAPP_LINKKEY = config("PAYAPP_LINKKEY", default="")
-PAYAPP_LINKVAL = config("PAYAPP_LINKVAL", default="")
-PAYAPP_API_URL = config("PAYAPP_API_URL", default="https://api.payapp.kr/oapi/apiLoad.html")
-PAYAPP_FEEDBACK_URL = config("PAYAPP_FEEDBACK_URL", default="")
-PAYAPP_FAIL_URL = config("PAYAPP_FAIL_URL", default="")
-PAYAPP_RETURN_URL = config("PAYAPP_RETURN_URL", default="")
-PAYAPP_SHOPNAME = config("PAYAPP_SHOPNAME", default="TurnFlow")
+# TossPayments 빌링(정기결제) 연동
+# 라이브 전환 = 키만 test_* → live_* 로 교체 (+ 개발자센터 웹훅 URL 등록)
+TOSS_SECRET_KEY = config("TOSS_SECRET_KEY", default="")  # test_sk_... / live_sk_...
+TOSS_CLIENT_KEY = config("TOSS_CLIENT_KEY", default="")  # test_ck_... / live_ck_...
+TOSS_API_BASE = config("TOSS_API_BASE", default="https://api.tosspayments.com")
+# 카드번호 직접 입력으로 빌링키를 발급하는 dev 헬퍼 API 활성화 스위치.
+# 프론트 SDK 없이 Swagger만으로 결제 플로우를 검증하기 위한 것 — 운영에서는 반드시 False.
+TOSS_DEV_CARD_AUTH_ENABLED = config("TOSS_DEV_CARD_AUTH_ENABLED", default=False, cast=bool)
 
 # Logging
 LOGGING = {
@@ -504,6 +515,19 @@ LOGGING = {
         "apps": {
             "handlers": ["console"],
             "level": "DEBUG",
+            "propagate": False,
+        },
+        # httpx는 INFO에서 요청 URL 전체를 로깅함 — 토스 빌링키가 URL path에
+        # 들어가므로(POST /v1/billing/{billingKey}) INFO 로그는 시크릿 누출.
+        # WARNING으로 올려 차단한다 (앱 자체 로그가 마스킹된 경로를 남김).
+        "httpx": {
+            "handlers": ["console"],
+            "level": "WARNING",
+            "propagate": False,
+        },
+        "httpcore": {
+            "handlers": ["console"],
+            "level": "WARNING",
             "propagate": False,
         },
     },

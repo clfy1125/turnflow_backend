@@ -2,11 +2,14 @@
 Billing models: Plans and Usage tracking
 """
 
+import hashlib
+import uuid
+
 from django.conf import settings
 from django.db import models
 from django.utils import timezone
-from datetime import datetime
-import uuid
+
+from apps.integrations.encryption import EncryptedTextField
 
 
 class PlanChoices(models.TextChoices):
@@ -190,9 +193,13 @@ class SubscriptionPlan(models.Model):
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    name = models.CharField(max_length=30, unique=True)  # free / pro / pro_plus
-    display_name = models.CharField(max_length=50)  # 무료 / 프로 / 프로 플러스
-    monthly_price = models.IntegerField(default=0, help_text="월 요금 (원)")
+    name = models.CharField(max_length=30, unique=True)  # free / basic / pro / admin
+    display_name = models.CharField(max_length=50)  # 무료 / 베이직 / 프로
+    monthly_price = models.IntegerField(default=0, help_text="월 요금 (원) — 현재 판매가")
+    list_price = models.IntegerField(
+        default=0,
+        help_text="정가 (원). 할인 표시용 — monthly_price보다 크면 할인 판매 중",
+    )
     features = models.JSONField(
         default=dict,
         help_text="기능 제한 설정. 예: {max_pages: 3, ai_generation: false, ...}",
@@ -217,10 +224,24 @@ class SubscriptionStatus(models.TextChoices):
     TRIALING = "trialing", "Trialing"
 
 
+EXTRA_IG_ACCOUNT_PRICE = 9900  # 프로 추가 IG 계정 단가 (원/월)
+
+
+def hash_billing_key(billing_key: str) -> str:
+    """빌링키 역조회용 SHA-256 (BILLING_DELETED 웹훅은 빌링키만 옴)."""
+    return hashlib.sha256(billing_key.encode()).hexdigest()
+
+
+def generate_customer_key() -> str:
+    """토스 customerKey 생성 — 유추 불가 랜덤, 유저당 고정 저장."""
+    return f"tf_{uuid.uuid4().hex}"
+
+
 class UserSubscription(models.Model):
     """
     User 1:1 구독 정보.
-    PayApp 정기결제(rebill) 연동. 월간 구독만 지원.
+    토스페이먼츠 빌링키 정기결제 연동. 월간 구독만 지원.
+    갱신 과금은 PG가 아닌 우리 스케줄러(billing.process_due_renewals)가 주도한다.
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -242,31 +263,106 @@ class UserSubscription(models.Model):
     current_period_start = models.DateTimeField(default=timezone.now)
     current_period_end = models.DateTimeField(null=True, blank=True)
 
-    # PayApp 정기결제
-    payapp_rebill_no = models.CharField(
-        max_length=100, null=True, blank=True,
-        verbose_name="PayApp 정기결제 등록번호",
-        help_text="rebillRegist 응답의 rebill_no",
+    # ── 토스페이먼츠 빌링 ──
+    toss_customer_key = models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        unique=True,
+        verbose_name="토스 customerKey",
+        help_text="유저당 고정 랜덤 키 (tf_{uuid4.hex}). 유추 불가해야 함 — 외부 노출 금지",
     )
-    payapp_rebill_expire = models.DateField(
-        null=True, blank=True,
-        verbose_name="PayApp 정기결제 만료일",
-        help_text="rebillExpire로 설정한 만료일",
+    _encrypted_toss_billing_key = models.TextField(
+        blank=True,
+        default="",
+        verbose_name="토스 빌링키 (암호문)",
     )
-    payapp_pay_url = models.URLField(
-        max_length=500, null=True, blank=True,
-        verbose_name="PayApp 결제 URL",
-        help_text="최초 결제 시 프론트가 리다이렉트할 URL",
+    toss_billing_key = EncryptedTextField("_encrypted_toss_billing_key")
+    toss_billing_key_hash = models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="빌링키 SHA-256",
+        help_text="BILLING_DELETED 웹훅(빌링키만 옴) 역조회용 — Fernet 암호문은 비결정적",
+    )
+    billing_key_issued_at = models.DateTimeField(null=True, blank=True)
+    card_company = models.CharField(
+        max_length=50,
+        blank=True,
+        default="",
+        help_text="빌링키 발급 응답의 cardCompany (표시용)",
+    )
+    card_number_masked = models.CharField(
+        max_length=30,
+        blank=True,
+        default="",
+        help_text="마스킹된 카드번호 (표시용, 예: 433012******123*)",
+    )
+
+    # ── 청구액 ──
+    monthly_amount_snapshot = models.IntegerField(
+        null=True,
+        blank=True,
+        verbose_name="월 청구액 스냅샷",
+        help_text="구독 시작 시점 판매가 고정 (프로모 그랜드파더링). 갱신 청구 기본액",
+    )
+    extra_ig_accounts = models.PositiveSmallIntegerField(
+        default=0,
+        verbose_name="추가 IG 계정 수",
+        help_text="프로 전용 — 계정당 +9,900원/월 갱신 합산",
+    )
+    pending_plan = models.ForeignKey(
+        SubscriptionPlan,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="pending_subscriptions",
+        verbose_name="예약된 플랜 변경",
+        help_text="다운그레이드 예약 — 다음 갱신 시점에 적용",
+    )
+    pending_amount_snapshot = models.IntegerField(
+        null=True,
+        blank=True,
+        help_text="예약 플랜의 예약 시점 판매가",
+    )
+
+    # ── 트라이얼 ──
+    trial_used_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="프로 트라이얼 사용 시각",
+        help_text="카드등록 무료 1개월은 1인 1회 — 다운그레이드돼도 지우지 않음(어뷰징 방어)",
+    )
+
+    # ── Dunning (갱신 실패 재시도) ──
+    renewal_attempts = models.PositiveSmallIntegerField(
+        default=0,
+        help_text="현재 주기 갱신 과금 시도 횟수 (성공 시 0으로 리셋)",
+    )
+    next_billing_retry_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="past_due 재시도 예정 시각 (D+1/D+3/D+5)",
+    )
+    last_billing_error = models.CharField(
+        max_length=200,
+        blank=True,
+        default="",
+        help_text="마지막 과금 실패 사유 (토스 code: message)",
     )
 
     cancelled_at = models.DateTimeField(null=True, blank=True)
     page_activation_changed_at = models.DateTimeField(
-        null=True, blank=True,
+        null=True,
+        blank=True,
         verbose_name="페이지 활성화 변경 일시",
         help_text="하루 1회 제한용 — 마지막으로 페이지 활성화 조정한 시각",
     )
     pro_activated_at = models.DateTimeField(
-        null=True, blank=True,
+        null=True,
+        blank=True,
         verbose_name="유료 플랜 활성화 일시",
         help_text="환불 7일 심사용 — 유료 플랜 첫 결제 완료 시각",
     )
@@ -287,6 +383,36 @@ class UserSubscription(models.Model):
     def is_paid_plan(self):
         return self.plan.name != "free"
 
+    @property
+    def has_billing_key(self) -> bool:
+        return bool(self._encrypted_toss_billing_key)
+
+    @property
+    def renewal_amount(self) -> int:
+        """다음 갱신 청구액. 예약 플랜 > 스냅샷 > 현재 플랜가 순 + 추가 계정 가산."""
+        base = (
+            self.pending_amount_snapshot if self.pending_plan_id else self.monthly_amount_snapshot
+        )
+        if base is None:
+            base = self.plan.monthly_price
+        return base + EXTRA_IG_ACCOUNT_PRICE * self.extra_ig_accounts
+
+    def set_billing_key(self, billing_key: str, *, card_company: str = "", card_number: str = ""):
+        """빌링키 저장 (암호화 + 해시 + 카드 표시정보). save는 호출 측 책임."""
+        self.toss_billing_key = billing_key
+        self.toss_billing_key_hash = hash_billing_key(billing_key)
+        self.billing_key_issued_at = timezone.now()
+        self.card_company = card_company or ""
+        self.card_number_masked = card_number or ""
+
+    def clear_billing_key(self):
+        """빌링키 제거 (해지/BILLING_DELETED). save는 호출 측 책임."""
+        self.toss_billing_key = ""
+        self.toss_billing_key_hash = None
+        self.billing_key_issued_at = None
+        self.card_company = ""
+        self.card_number_masked = ""
+
 
 class PaymentStatus(models.TextChoices):
     PENDING = "pending", "Pending"
@@ -297,7 +423,8 @@ class PaymentStatus(models.TextChoices):
 
 class PaymentHistory(models.Model):
     """
-    결제 내역. 토스페이먼츠 필드는 nullable — 승인 후 채움.
+    결제 내역. 과금 시도 시 pending 행을 먼저 만들고(주문 소유권 락),
+    토스 승인 결과로 paid/failed를 확정한다.
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -322,26 +449,45 @@ class PaymentHistory(models.Model):
     payment_method = models.CharField(max_length=50, null=True, blank=True)
     description = models.CharField(max_length=200, default="")
 
-    # PayApp
-    payapp_mul_no = models.CharField(
-        max_length=100, null=True, blank=True, unique=True,
-        verbose_name="PayApp 결제요청번호",
-        help_text="PayApp mul_no — 멱등 키",
+    # ── 토스페이먼츠 ──
+    toss_payment_key = models.CharField(
+        max_length=200,
+        null=True,
+        blank=True,
+        unique=True,
+        verbose_name="토스 paymentKey",
+        help_text="승인 응답의 paymentKey — 취소/조회에 사용",
     )
-    payapp_rebill_no = models.CharField(
-        max_length=100, null=True, blank=True,
-        verbose_name="PayApp 정기결제 등록번호",
+    toss_order_id = models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        unique=True,
+        verbose_name="토스 orderId",
+        help_text="우리가 생성하는 주문 ID — 과금 시도 멱등/소유권 키",
+    )
+    toss_idempotency_key = models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        help_text="승인 API Idempotency-Key (UUID4) — 모호 실패 재시도 시 재사용",
     )
     receipt_url = models.URLField(
-        max_length=500, null=True, blank=True,
+        max_length=500,
+        null=True,
+        blank=True,
         verbose_name="매출전표 URL",
-        help_text="PayApp csturl — 카드 결제 시 영수증 URL",
+        help_text="토스 receipt.url — 영수증 URL",
     )
-    pay_type_display = models.CharField(
-        max_length=50, null=True, blank=True,
-        verbose_name="결제수단 표시명",
-        help_text="예: 신용카드, 휴대전화, 카카오페이 등",
+    card_company = models.CharField(max_length=50, blank=True, default="")
+    card_number_masked = models.CharField(max_length=30, blank=True, default="")
+    failure_code = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text="토스 승인 거절 코드",
     )
+    failure_message = models.CharField(max_length=200, blank=True, default="")
 
     paid_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -355,51 +501,49 @@ class PaymentHistory(models.Model):
 
 
 # ──────────────────────────────────────────────
-# PayApp 웹훅 로그 (멱등 보장용)
+# 토스 웹훅 로그 (멱등 보장용)
 # ──────────────────────────────────────────────
 
 
-class PayAppWebhookLog(models.Model):
+class TossWebhookLog(models.Model):
     """
-    PayApp feedbackurl / failurl 수신 로그.
-    동일 (mul_no, pay_state) 조합에 대해 unique 제약으로 중복 처리 방지.
+    토스페이먼츠 웹훅 수신 로그.
+    토스 웹훅에는 이벤트 ID/서명이 없으므로 본문 구조 기반 dedup_key(unique)로
+    중복 처리를 방지하고, 실제 상태는 paymentKey 재조회로 검증한다.
+    raw_data 저장 전 billingKey는 해시로 치환한다 (평문 저장 금지).
     """
-
-    WEBHOOK_TYPES = [
-        ("feedback", "Feedback (결제통보)"),
-        ("fail", "Fail (정기결제 실패)"),
-    ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    webhook_type = models.CharField(max_length=20, choices=WEBHOOK_TYPES)
-    mul_no = models.CharField(
-        max_length=100, null=True, blank=True, db_index=True,
-        verbose_name="결제요청번호",
+    event_type = models.CharField(
+        max_length=50,
+        verbose_name="이벤트 타입",
+        help_text="PAYMENT_STATUS_CHANGED / CANCEL_STATUS_CHANGED / BILLING_DELETED 등",
     )
-    rebill_no = models.CharField(
-        max_length=100, null=True, blank=True, db_index=True,
-        verbose_name="정기결제 등록번호",
+    dedup_key = models.CharField(
+        max_length=255,
+        unique=True,
+        help_text="본문 구조 기반 중복 방지 키",
     )
-    pay_state = models.CharField(
-        max_length=10,
-        verbose_name="결제요청 상태",
+    payment_key = models.CharField(
+        max_length=200,
+        blank=True,
+        default="",
+        db_index=True,
     )
-    raw_data = models.JSONField(
-        default=dict,
-        verbose_name="수신 데이터 원본",
-    )
+    order_id = models.CharField(max_length=64, blank=True, default="")
+    raw_data = models.JSONField(default=dict, verbose_name="수신 데이터 (빌링키는 해시 치환)")
     processed = models.BooleanField(default=False)
+    process_error = models.TextField(blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        db_table = "payapp_webhook_logs"
-        unique_together = [["mul_no", "pay_state"]]
+        db_table = "toss_webhook_logs"
         ordering = ["-created_at"]
-        verbose_name = "PayApp 웹훅 로그"
-        verbose_name_plural = "PayApp 웹훅 로그 목록"
+        verbose_name = "토스 웹훅 로그"
+        verbose_name_plural = "토스 웹훅 로그 목록"
 
     def __str__(self):
-        return f"[{self.webhook_type}] mul_no={self.mul_no} pay_state={self.pay_state}"
+        return f"[{self.event_type}] dedup={self.dedup_key} processed={self.processed}"
 
 
 # ──────────────────────────────────────────────
