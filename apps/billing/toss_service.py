@@ -59,7 +59,9 @@ class TossBillingClient:
 
     @classmethod
     def _auth_header(cls) -> dict:
-        secret = settings.TOSS_SECRET_KEY
+        # .strip(): docker-compose environment 로 주입되면 앞뒤 공백이 남을 수 있어
+        # base64 인코딩 전에 제거 (공백이 섞이면 UNAUTHORIZED_KEY).
+        secret = (settings.TOSS_SECRET_KEY or "").strip()
         token = base64.b64encode(f"{secret}:".encode()).decode()
         return {"Authorization": f"Basic {token}"}
 

@@ -105,10 +105,28 @@ def renewal_order_id(sub: UserSubscription, period_end, attempt: int) -> str:
     return f"tfsub-{sub.id.hex[:10]}-{period_end:%Y%m%d}-a{attempt}"
 
 
+# 토스 발급사 코드 → 카드사명 (API 버전에 따라 cardCompany 대신 card.issuerCode 만 오는 경우 대비).
+# 표시용이므로 미지 코드는 코드 문자열을 그대로 노출한다.
+ISSUER_CODES = {
+    "11": "국민", "21": "하나", "3C": "유니온페이", "31": "BC", "33": "우리BC",
+    "34": "수협", "35": "전북", "36": "씨티", "37": "우체국", "38": "새마을",
+    "39": "저축", "3A": "케이뱅크", "3K": "기업BC", "41": "신한", "42": "제주",
+    "46": "광주", "51": "삼성", "52": "산업", "61": "현대", "62": "신협",
+    "71": "롯데", "91": "NH", "W1": "우리", "15": "카카오뱅크", "24": "토스뱅크",
+    "4M": "마스터", "4V": "비자", "4J": "JCB", "6D": "다이너스", "7A": "아멕스",
+}
+
+
 def _card_display(issue_or_payment: dict) -> tuple[str, str]:
-    """토스 응답에서 카드사/마스킹 번호 추출 (top-level 우선, card 객체 폴백)."""
+    """토스 응답에서 카드사/마스킹 번호 추출.
+
+    API 버전에 따라 top-level cardCompany/cardNumber 이거나 card 객체(company/number
+    또는 issuerCode)일 수 있어 순서대로 폴백한다.
+    """
     card = issue_or_payment.get("card") or {}
     company = issue_or_payment.get("cardCompany") or card.get("company") or ""
+    if not company and card.get("issuerCode"):
+        company = ISSUER_CODES.get(card["issuerCode"], card["issuerCode"])
     number = issue_or_payment.get("cardNumber") or card.get("number") or ""
     return company, number
 

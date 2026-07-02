@@ -146,7 +146,7 @@ class TossPrepareView(APIView):
         customer_key = ensure_customer_key(sub)
         return Response(
             {
-                "client_key": settings.TOSS_CLIENT_KEY,
+                "client_key": (settings.TOSS_CLIENT_KEY or "").strip(),
                 "customer_key": customer_key,
                 "customer_email": request.user.email,
                 "has_billing_key": sub.has_billing_key,
