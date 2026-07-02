@@ -176,16 +176,10 @@ api.turnflow.clfy.ai.kr {
 		}
 	}
 
-	# 🔒 [OPT-IN] PayApp 결제 feedback 소스 IP 허용목록 (audit M-17).
-	#    ⚠️ (1) PayApp 송신 IP 서면 확인, (2) 한 결제 주기 관찰 후 활성화. <PAYAPP_IP> 치환.
-	#    위 handle 들보다 **먼저** 배치해야 매칭됨(handle 은 첫 매칭 우선).
-	# @payapp_block {
-	# 	path /api/v1/billing/payapp/feedback /api/v1/billing/payapp/feedback/ /api/v1/billing/payapp/fail /api/v1/billing/payapp/fail/
-	# 	not remote_ip <PAYAPP_IP_1> <PAYAPP_IP_2> <PAYAPP_CIDR/24>
-	# }
-	# handle @payapp_block {
-	# 	respond "Forbidden" 403
-	# }
+	# 🔒 결제 웹훅(토스페이먼츠 /api/v1/billing/toss/webhook/)은 IP 허용목록을 쓰지 않는다 —
+	#    토스 웹훅은 서명이 없어 본문을 신뢰하지 않고, 백엔드가 paymentKey 재조회로 검증한다.
+	#    (위조 본문은 재조회 단계에서 무시되므로 엣지 차단 불필요. audit M-17 의 PayApp
+	#    허용목록 블록은 PayApp 제거와 함께 삭제됨.)
 
 	# 🔒 [OPT-IN] admin 면 IP 허용목록. 동적 IP 면 Cloudflare Access(Zero Trust) 권장.
 	#    위 handle 들보다 **먼저** 배치. <OFFICE_CIDR>/<OPERATOR_IP> 치환.
@@ -335,16 +329,10 @@ turnflow-api.clfy.ai.kr {
 		}
 	}
 
-	# 🔒 [OPT-IN] PayApp 결제 feedback 소스 IP 허용목록 (audit M-17).
-	#    ⚠️ (1) PayApp 송신 IP 서면 확인, (2) 한 결제 주기 관찰 후 활성화. <PAYAPP_IP> 치환.
-	#    위 handle 들보다 **먼저** 배치해야 매칭됨(handle 은 첫 매칭 우선).
-	# @payapp_block {
-	# 	path /api/v1/billing/payapp/feedback /api/v1/billing/payapp/feedback/ /api/v1/billing/payapp/fail /api/v1/billing/payapp/fail/
-	# 	not remote_ip <PAYAPP_IP_1> <PAYAPP_IP_2> <PAYAPP_CIDR/24>
-	# }
-	# handle @payapp_block {
-	# 	respond "Forbidden" 403
-	# }
+	# 🔒 결제 웹훅(토스페이먼츠 /api/v1/billing/toss/webhook/)은 IP 허용목록을 쓰지 않는다 —
+	#    토스 웹훅은 서명이 없어 본문을 신뢰하지 않고, 백엔드가 paymentKey 재조회로 검증한다.
+	#    (위조 본문은 재조회 단계에서 무시되므로 엣지 차단 불필요. audit M-17 의 PayApp
+	#    허용목록 블록은 PayApp 제거와 함께 삭제됨.)
 
 	# 🔒 [OPT-IN] admin 면 IP 허용목록. 동적 IP 면 Cloudflare Access(Zero Trust) 권장.
 	#    위 handle 들보다 **먼저** 배치. <OFFICE_CIDR>/<OPERATOR_IP> 치환.
