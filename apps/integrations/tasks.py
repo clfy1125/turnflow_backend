@@ -128,6 +128,7 @@ def resubscribe_all_webhooks(check_only: bool = False) -> dict:
             logger.exception("resubscribe_all_webhooks telegram 알림 실패 (non-fatal)")
     return result
 
+
 # ===== 댓글 매칭 / 누락 보정 장부 공용 헬퍼 =====
 
 
@@ -882,6 +883,25 @@ def send_dm_task(self, log_id: str):
         if log.parent_log_id is None:
             campaign.increment_failed()
         return {"status": "failed_window", "reason": "window_expired"}
+
+    # ★ 플랜 월간 DM 한도 가드 (free/basic 200건 — pro/admin 은 -1이라 COUNT 자체 생략):
+    # 모든 발송 경로(opening/reward/revive/requeue)가 이 태스크를 지나므로 우회 불가.
+    # 한도 초과는 SKIPPED 종결 — REVIVABLE 이므로 업그레이드 후 retry_failed 로 되살릴 수
+    # 있다(월경계 defer 는 메시징 윈도우와 충돌해 큐만 부풀리므로 채택하지 않음).
+    # 집계 실패는 fail-open(발송 허용) — DM 무손실 원칙.
+    from apps.billing.dm_limits import check_dm_quota, notify_quota_reached_once
+
+    owner = ig_conn.workspace.owner
+    quota_ok, quota_used, quota_limit = check_dm_quota(owner)
+    if not quota_ok:
+        notify_quota_reached_once(owner, quota_used, quota_limit)
+        log.mark_skipped("monthly_dm_limit_reached")
+        return {
+            "status": "skipped",
+            "reason": "monthly_dm_limit",
+            "used": quota_used,
+            "limit": quota_limit,
+        }
 
     # ★ 발송 속도 제어 (재진입 포함): 캠페인 시간당 한도/계정 거버너 초과 시
     # 드랍·실패가 아니라 defer(QUEUED+next_retry_at) → requeue 워커가 순차 재투입.
@@ -2218,6 +2238,18 @@ def _check_and_handle_spam(
                 "reason": "Spam filter inactive",
             }
 
+        # ★ 플랜 런타임 게이트 — 스팸필터는 프로 전용. 다운그레이드 후에도 config 행은
+        # 남아있으므로(재업그레이드 시 설정 복원) 여기서 즉시 무력화한다.
+        # 플랜 조회 실패는 기능 꺼짐 취급(fail-closed) — 댓글이 필터를 안 타는 것뿐 파괴 없음.
+        from apps.billing.subscription_utils import owner_has_feature
+
+        if not owner_has_feature(ig_connection.workspace, "spam_filter"):
+            return {
+                "is_spam": False,
+                "spam_filter_processed": False,
+                "reason": "plan_not_allowed",
+            }
+
         is_spam, reasons = SpamDetectionService.is_spam(
             text=comment_text,
             spam_keywords=spam_filter.spam_keywords,
@@ -2430,7 +2462,9 @@ def _build_token_refresh_summary(*, checked: int, succeeded: list, failed: list)
 
 
 @shared_task(bind=True, max_retries=3)
-def process_follow_gate_postback(self, opening_log_id: str, igsid: str, recipient_account_id: str = ""):
+def process_follow_gate_postback(
+    self, opening_log_id: str, igsid: str, recipient_account_id: str = ""
+):
     """
     사용자가 opening DM 의 'follow_check' quick_reply 버튼을 눌렀을 때 호출.
 

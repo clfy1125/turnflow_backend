@@ -9,15 +9,14 @@ N+1 통계 호출을 제거하고 정의를 단일화한다.
     (확정도착 = delivered+read, 모수 = accepted+delivered+read+failed_no_trace)
   - needs_attention: dm_frontend_actions 의 severity=error 상태 + failed_no_trace
   - 월간 사용량: SentDMLog 에서 캘린더월(Asia/Seoul) 직접 집계 (UsageCounter 는 발송 시
-    증가되지 않아 stale → 정확도를 위해 로그를 직접 센다). 한도는 billing PlanLimits.
+    증가되지 않아 stale → 정확도를 위해 로그를 직접 센다).
+    한도는 owner 구독 플랜 features.dm_monthly_limit (billing.dm_limits 와 동일 정의).
 """
 
 from __future__ import annotations
 
 from django.db.models import Count, Max, Q
 from django.utils import timezone
-
-from apps.billing.models import PlanLimits
 
 from .models import AutoDMCampaign, SentDMLog
 
@@ -143,11 +142,15 @@ def is_admin_user(user) -> bool:
 def compute_monthly_usage(workspace, now=None, *, user=None) -> dict:
     """워크스페이스의 이번 달 DM 사용량 + 한도.
 
-    한도는 PlanLimits(workspace.plan) 의 dm_sent_per_month (-1=무제한).
-    단, 요청자가 **관리자(is_staff/superuser)** 면 플랜과 무관하게 무제한(-1) 으로 본다
-    (관리자/테스트 계정이 기본 starter 100 에 막히지 않도록).
+    한도는 workspace.owner 의 구독 플랜 features.dm_monthly_limit (-1=무제한) —
+    발송 게이트(billing.dm_limits.check_dm_quota)와 동일 정의.
+    요청자가 **관리자(is_staff/superuser)** 면 플랜과 무관하게 무제한(-1)으로 본다.
     사용량은 SentDMLog 에서 캘린더월 범위를 직접 집계(quota 소진 상태만).
+    주의: 표시 수치는 이 워크스페이스 범위이고, enforcement 는 owner 전체 범위다
+    (플랜이 유저 단위이므로 멀티 워크스페이스 분산 우회를 막기 위함).
     """
+    from apps.billing.dm_limits import get_dm_monthly_limit
+
     start, end = _month_bounds(now)
     sent_this_month = SentDMLog.objects.filter(
         campaign__ig_connection__workspace=workspace,
@@ -159,7 +162,7 @@ def compute_monthly_usage(workspace, now=None, *, user=None) -> dict:
     if is_admin_user(user):
         limit = -1  # 관리자 모드 → 무제한
     else:
-        limit = PlanLimits.get_limit(workspace.plan, "dm_sent_per_month")
+        limit = get_dm_monthly_limit(workspace.owner)
     is_unlimited = limit == -1
     return {
         "sent_this_month": sent_this_month,

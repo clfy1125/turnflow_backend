@@ -151,7 +151,10 @@ class TestSummaryCounts:
 
 @pytest.mark.django_db
 class TestSummaryUsage:
-    def test_starter_usage_math(self, ws_user, conn):
+    # 한도 정의가 workspace.plan(PlanLimits) → owner 구독 플랜 features.dm_monthly_limit
+    # 로 재배선됨(토스 요금제 개편). 구독 없는 owner 는 free = 200/월.
+
+    def test_free_usage_math(self, ws_user, conn):
         _, user = ws_user
         camp = _make_campaign(conn, "u")
         # quota 소진: accepted/delivered/read/failed_no_trace
@@ -168,8 +171,8 @@ class TestSummaryUsage:
         assert resp.status_code == 200, resp.content
         usage = resp.data["usage"]
         assert usage["sent_this_month"] == 3
-        assert usage["monthly_free_limit"] == 100  # starter
-        assert usage["remaining_this_month"] == 97
+        assert usage["monthly_free_limit"] == 200  # free 플랜 (owner 구독 기준)
+        assert usage["remaining_this_month"] == 197
         assert usage["is_over_limit"] is False
         assert usage["period_start"] is not None
         assert usage["period_end"] is not None
@@ -189,18 +192,22 @@ class TestSummaryUsage:
                     idempotency_key=f"over-{i}",
                     status=SentDMLog.Status.DELIVERED,
                 )
-                for i in range(100)
+                for i in range(200)
             ]
         )
         resp = _client(user).get(SUMMARY_URL, {"ig_connection_id": str(conn.id)})
         assert resp.status_code == 200, resp.content
         usage = resp.data["usage"]
-        assert usage["sent_this_month"] == 100
+        assert usage["sent_this_month"] == 200
         assert usage["remaining_this_month"] == 0
         assert usage["is_over_limit"] is True
 
-    def test_enterprise_unlimited(self, db):
+    def test_pro_owner_unlimited(self, db):
+        from apps.billing.models import SubscriptionPlan, UserSubscription
+
         ws, user = _make_ws_user("ent@example.com", "ent-ws", plan="enterprise")
+        pro = SubscriptionPlan.objects.get(name="pro")
+        UserSubscription.objects.create(user=user, plan=pro)
         conn = _make_conn(ws, ext="ig_ent")
         camp = _make_campaign(conn, "e")
         _log(camp, SentDMLog.Status.DELIVERED)
@@ -208,12 +215,12 @@ class TestSummaryUsage:
         resp = _client(user).get(SUMMARY_URL, {"ig_connection_id": str(conn.id)})
         assert resp.status_code == 200, resp.content
         usage = resp.data["usage"]
-        assert usage["monthly_free_limit"] == -1
+        assert usage["monthly_free_limit"] == -1  # pro = DM 무제한
         assert usage["remaining_this_month"] is None
         assert usage["is_over_limit"] is False
 
-    def test_admin_user_unlimited_despite_starter_plan(self, db):
-        # 관리자(is_staff) 는 starter 워크스페이스라도 무제한 — 기본 100 에 막히지 않음.
+    def test_admin_user_unlimited_despite_free_plan(self, db):
+        # 관리자(is_staff) 는 free 구독이라도 무제한 — 기본 200 에 막히지 않음.
         ws, user = _make_ws_user("adm@example.com", "adm-ws", plan="starter", is_staff=True)
         conn = _make_conn(ws, ext="ig_adm")
         camp = _make_campaign(conn, "a")
@@ -223,7 +230,7 @@ class TestSummaryUsage:
         assert resp.status_code == 200, resp.content
         usage = resp.data["usage"]
         assert usage["sent_this_month"] == 1
-        assert usage["monthly_free_limit"] == -1  # 100 이 아니라 무제한
+        assert usage["monthly_free_limit"] == -1  # 200 이 아니라 무제한
         assert usage["remaining_this_month"] is None
         assert usage["is_over_limit"] is False
 

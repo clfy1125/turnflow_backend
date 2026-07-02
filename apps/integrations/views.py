@@ -163,6 +163,12 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
             200: ConnectionStartResponseSerializer,
             401: OpenApiResponse(description="인증 실패 - 유효하지 않은 토큰"),
             403: OpenApiResponse(description="권한 없음 - 워크스페이스 멤버가 아님"),
+            429: OpenApiResponse(
+                description=(
+                    "PLAN_LIMIT_EXCEEDED — 플랜 IG 계정 연동 한도 초과 "
+                    "(무료/베이직/프로 기본 1개, 프로는 추가 계정 구매로 확장 가능)"
+                )
+            ),
         },
     )
     @action(
@@ -173,6 +179,28 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
     def connect_start(self, request, workspace_id=None):
         """Start Instagram OAuth flow"""
         workspace = self.get_workspace(workspace_id)
+
+        # ★ 플랜 IG 계정 수 게이트 — OAuth 팝업을 열기 전에 깔끔한 JSON(429)으로 차단.
+        # 허용 수 = features.max_ig_accounts(-1=무제한) + 구독 extra_ig_accounts(프로 추가 구매).
+        # 동일 계정 재연동은 슬롯을 안 늘리므로 callback 쪽 안전망이 따로 판별한다.
+        from apps.billing.subscription_utils import (
+            count_active_ig_connections,
+            get_ig_account_allowance,
+            get_user_plan,
+        )
+        from apps.core.exceptions import PlanLimitExceededError
+
+        owner = workspace.owner
+        allowance = get_ig_account_allowance(owner)
+        if allowance != -1:
+            current_active = count_active_ig_connections(owner)
+            if current_active >= allowance:
+                raise PlanLimitExceededError(
+                    metric="ig_accounts",
+                    limit=allowance,
+                    current=current_active,
+                    plan=get_user_plan(owner).name,
+                )
 
         # Generate state for CSRF protection
         state = secrets.token_urlsafe(32)
@@ -505,6 +533,60 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                         workspace=workspace,
                         external_account_id=account_info["id"],
                     )
+
+                # ★ 플랜 IG 계정 수 게이트 (TOCTOU 안전망 — connect_start 이후 상황이
+                # 바뀌었을 수 있음): 슬롯을 새로 차지하는 경우(신규 행 또는 비활성 행의
+                # 재활성화)에만 검사한다. 동일 계정 ACTIVE 재연동(토큰 갱신)은 항상 허용.
+                takes_new_slot = (
+                    connection.pk is None or connection.status != IGAccountConnection.Status.ACTIVE
+                )
+                if takes_new_slot:
+                    from apps.billing.subscription_utils import (
+                        count_active_ig_connections,
+                        get_ig_account_allowance,
+                    )
+
+                    allowance = get_ig_account_allowance(workspace.owner)
+                    if (
+                        allowance != -1
+                        and count_active_ig_connections(workspace.owner) >= allowance
+                    ):
+                        logger.warning(
+                            "IG 연동 차단(플랜 한도): workspace=%s allowance=%d",
+                            workspace.id,
+                            allowance,
+                        )
+                        html = f"""
+                        <!DOCTYPE html>
+                        <html>
+                        <head>
+                            <meta charset="UTF-8">
+                            <title>Instagram 연동 제한</title>
+                            <style>
+                                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 40px; text-align: center; }}
+                                .error {{ color: #dc3545; }}
+                            </style>
+                        </head>
+                        <body>
+                            <h2 class="error">🔒 연동 가능한 계정 수를 초과했습니다</h2>
+                            <p>현재 플랜에서는 IG 계정을 {allowance}개까지 연동할 수 있습니다.</p>
+                            <p>프로 플랜에서 추가 계정을 구매하거나 기존 연동을 해제해주세요.</p>
+                            <p>창이 자동으로 닫힙니다...</p>
+                            <script>
+                                if (window.opener) {{
+                                    window.opener.postMessage({{
+                                        type: 'INSTAGRAM_ERROR',
+                                        success: false,
+                                        errorCode: 'PLAN_LIMIT_EXCEEDED',
+                                        message: '연동 가능한 IG 계정 수를 초과했습니다. 플랜을 업그레이드하거나 추가 계정을 구매해주세요.'
+                                    }}, '*');
+                                    setTimeout(() => window.close(), 2000);
+                                }}
+                            </script>
+                        </body>
+                        </html>
+                        """
+                        return HttpResponse(html)
 
                 # 기존/신규 공통: 모든 필드를 최신 값으로 덮어써 재연동이 곧 교체가 되게 한다.
                 connection.username = account_info.get("username", account_info.get("name", ""))
@@ -3644,7 +3726,9 @@ def _process_messaging_events(entry: dict, logger) -> None:
                 logger.debug(f"Inbound DM received (no handler): sender={sender_id}, mid={mid}")
 
 
-def _maybe_dispatch_follow_gate(*, payload: str, sender_id: str, recipient_id: str = "", logger) -> bool:
+def _maybe_dispatch_follow_gate(
+    *, payload: str, sender_id: str, recipient_id: str = "", logger
+) -> bool:
     """quick_reply / postback payload 가 follow-gate 인지 검사 후 Celery 라우팅.
 
     payload 포맷: "fg:{opening_log_id}"
@@ -3857,9 +3941,37 @@ def instagram_webhook(request):
 class SpamFilterViewSet(viewsets.ViewSet):
     """
     스팸 필터 관리 ViewSet
+
+    플랜 게이트: 스팸 댓글 필터링은 **프로 전용** (features.spam_filter).
+    설정 변경(PATCH)·활성화는 게이트로 차단하지만, 조회·비활성화·로그는 열어둔다 —
+    다운그레이드된 사용자가 상태를 확인하고 끌 수 있어야 하므로.
     """
 
     permission_classes = [IsAuthenticated]
+
+    @staticmethod
+    def _spam_filter_plan_gate(request, spam_filter):
+        """spam_filter 기능 미보유 플랜이면 403 응답 반환, 보유면 None."""
+        from apps.billing.subscription_utils import owner_has_feature
+
+        workspace = spam_filter.ig_connection.workspace
+        if owner_has_feature(workspace, "spam_filter"):
+            return None
+        from apps.integrations.campaign_stats import is_admin_user
+
+        if is_admin_user(request.user):
+            return None
+        return Response(
+            {
+                "success": False,
+                "error": {
+                    "code": 403,
+                    "message": "스팸 댓글 필터링은 프로 플랜 전용 기능입니다.",
+                    "details": {"feature": "spam_filter"},
+                },
+            },
+            status=status.HTTP_403_FORBIDDEN,
+        )
 
     def get_spam_filter(self, ig_connection_id):
         """스팸 필터 설정 가져오기 (없으면 생성)"""
@@ -3990,7 +4102,11 @@ class SpamFilterViewSet(viewsets.ViewSet):
             serializer = SpamFilterConfigSerializer(spam_filter)
             return Response(serializer.data)
 
-        # PATCH
+        # PATCH — 프로 전용 (조회는 열어둠)
+        gate = self._spam_filter_plan_gate(request, spam_filter)
+        if gate is not None:
+            return gate
+
         serializer = SpamFilterConfigUpdateSerializer(spam_filter, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
@@ -4018,6 +4134,11 @@ class SpamFilterViewSet(viewsets.ViewSet):
         2. 이후 수신되는 댓글부터 스팸 검사 시작
         3. 스팸으로 판정된 댓글은 자동으로 숨김 처리
         4. 정상 댓글만 DM 자동발송 대상이 됨
+
+        ## 플랜 요구사항
+        - **프로 플랜 전용** 기능입니다. 무료/베이직 플랜은 403이 반환됩니다.
+        - 프로에서 다운그레이드된 경우 기존 설정은 보존되지만 필터 동작이 중단되며,
+          비활성화/조회는 계속 가능합니다.
 
         ## 주의사항
         - 이미 수신된 댓글에는 소급 적용되지 않음
@@ -4073,8 +4194,13 @@ class SpamFilterViewSet(viewsets.ViewSet):
         url_path="ig-connections/(?P<ig_connection_id>[^/.]+)/activate",
     )
     def activate(self, request, ig_connection_id=None):
-        """스팸 필터 활성화"""
+        """스팸 필터 활성화 (프로 전용)"""
         spam_filter = self.get_spam_filter(ig_connection_id)
+
+        gate = self._spam_filter_plan_gate(request, spam_filter)
+        if gate is not None:
+            return gate
+
         spam_filter.status = SpamFilterConfig.Status.ACTIVE
         spam_filter.save()
 

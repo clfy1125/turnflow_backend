@@ -30,10 +30,14 @@ from django.core.cache import cache
 logger = logging.getLogger(__name__)
 
 # (per_hour, per_minute) — settings.DM_RATE_LIMITS 로 오버라이드.
+# 미지 플랜명은 free 페이싱으로 폴백되므로 신규 플랜은 반드시 여기 명시할 것.
+# starter/enterprise 는 구 workspace.plan 오버라이드 호환용으로 잔존.
 _DEFAULT_LIMITS = {
     "free": (60, 8),
+    "basic": (300, 20),  # 월 200건 한도라 페이싱은 여유롭게 (starter급)
     "starter": (300, 20),
     "pro": (1200, 40),
+    "admin": (5000, 80),  # 내부 운영 계정 — enterprise급
     "enterprise": (5000, 80),
 }
 
