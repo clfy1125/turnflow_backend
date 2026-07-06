@@ -10,6 +10,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 
+import httpx
 from decouple import config
 from openai import OpenAI
 
@@ -17,6 +18,11 @@ logger = logging.getLogger(__name__)
 
 _LLM_URL = config("LLM_URL", default="https://llm.clfy.ai.kr")
 _LLM_API_KEY = config("LLM_API_KEY", default="")
+# llm.clfy.ai.kr 은 Cloudflare Origin 인증서(공개 CA 체인 아님)를 제시하므로, 이 호스트를
+# 직접 https 로 호출하는 개발 스택에선 TLS 검증이 실패한다(CERTIFICATE_VERIFY_FAILED).
+# 개발 .env 에 `LLM_TLS_VERIFY=False` 로 이 호스트에 한해 검증을 끈다. 운영은 내부
+# `http://litellm-proxy:4000`(TLS 없음)으로 호출하므로 기본 True 여도 이 분기를 타지 않는다.
+_LLM_TLS_VERIFY = config("LLM_TLS_VERIFY", default=True, cast=bool)
 
 
 # ── DeepSeek 가격표 (USD / 1M tokens) ─────────────────────────
@@ -151,11 +157,11 @@ class LlmCallResult:
 
 
 def _get_client() -> OpenAI:
-    return OpenAI(
-        base_url=_LLM_URL,
-        api_key=_LLM_API_KEY,
-        timeout=600.0,
-    )
+    kwargs = {"base_url": _LLM_URL, "api_key": _LLM_API_KEY, "timeout": 600.0}
+    if not _LLM_TLS_VERIFY:
+        # CF Origin 인증서 수용(개발 전용). 운영 경로(내부 http)는 이 분기를 타지 않는다.
+        kwargs["http_client"] = httpx.Client(verify=False, timeout=600.0)
+    return OpenAI(**kwargs)
 
 
 def _extract_usage(response, model: str) -> dict:
