@@ -80,11 +80,12 @@ services:
     image: instagram_backend_web
     container_name: instagram_backend_celery
     restart: unless-stopped
-    # dev 는 단일 워커가 모든 큐를 소비해야 함 — base.py CELERY_TASK_ROUTES 가 DM/webhook/verify 를
-    # 전용 큐로 라우팅하므로, 이 큐들을 안 먹으면 dev 에서 DM 이 적체돼 멈춘다.
+    # dev 는 단일 워커가 모든 큐를 소비해야 함 — base.py CELERY_TASK_ROUTES 가 DM/webhook/verify/ai_jobs 를
+    # 전용 큐로 라우팅하므로, 이 큐들을 안 먹으면 dev 에서 DM/AI/스팸필터가 적체돼 멈춘다.
     # (prod 는 docker-compose.prod.yml 에서 큐별 전용 워커로 분리 — dev 는 통합 1개로 단순 유지.)
+    # ai_jobs: run_ai_job(AI 페이지 생성) + run_spam_filter_check(gemma 스팸 판정) 라우팅 대상.
     # 처리량은 prefork 기본(=CPU 코어수). DM 동시성 데모가 필요하면 threads 워커를 따로 띄울 것(아래 주석).
-    command: celery -A config worker -l info --concurrency=20 -Q celery,snapshot,billing,dm_send,webhook_followup,verify
+    command: celery -A config worker -l info --concurrency=20 -Q celery,snapshot,billing,dm_send,webhook_followup,verify,ai_jobs
     # DM 처리량 측정용 전용 threads 워커(선택):
     #   docker compose run --rm celery_worker celery -A config worker --pool=threads --concurrency=100 -Q dm_send
     environment:
