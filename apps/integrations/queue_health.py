@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 # 워커가 consume 하는 Redis 리스트 키 == 큐 이름. CELERY_TASK_ROUTES 의 큐 + 기본 큐.
 # (config/settings/base.py CELERY_TASK_ROUTES 와 일치시킬 것)
-_KNOWN_QUEUES = ("dm_send", "webhook_followup", "verify", "snapshot", "billing", "celery")
+_KNOWN_QUEUES = ("dm_send", "webhook_followup", "verify", "snapshot", "billing", "ai_jobs", "celery")
 
 
 def queue_depths() -> dict[str, int]:

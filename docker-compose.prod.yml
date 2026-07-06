@@ -19,6 +19,16 @@ x-app-env: &app_env
   REDIS_HOST: redis
   REDIS_PORT: "6379"
 
+# 로그 로테이션(#7) — 기본 json-file 무제한 증가로 /var/lib/docker 가 차면 전 컨테이너 쓰기 정지.
+x-logging: &default_logging
+  driver: json-file
+  options: { max-size: "50m", max-file: "5" }
+
+# 파일 디스크립터 상한(#2) — celery_dm(100 threads)/web_external(64 threads) 등 고동시성에서
+# 기본 nofile=1024 로는 DM 버스트 시 EMFILE('too many open files')로 조용히 실패(OOM/재시작 신호에 안 잡힘).
+x-ulimits: &default_ulimits
+  nofile: { soft: 65535, hard: 65535 }
+
 services:
   db:
     # stock postgres:16-alpine + pgBackRest baked in (DR / WAL PITR). See deploy/backups/Dockerfile.db.
@@ -29,6 +39,9 @@ services:
     image: turnflow_instagram_db_pgbackrest:16
     container_name: turnflow_instagram_db
     restart: unless-stopped
+    init: true
+    logging: *default_logging
+    ulimits: *default_ulimits
     # PG tuning + reduced max_connections (PgBouncer multiplexes, so 300 is ample).
     # NOTE: changing this command recreates db (one restart) — do it in a maintenance window.
     command: >
@@ -69,6 +82,9 @@ services:
     image: edoburu/pgbouncer:latest
     container_name: turnflow_instagram_pgbouncer
     restart: unless-stopped
+    init: true
+    logging: *default_logging
+    ulimits: *default_ulimits
     environment:
       DB_HOST: db
       DB_PORT: "5432"
@@ -101,6 +117,9 @@ services:
     image: redis:7-alpine
     container_name: turnflow_instagram_redis
     restart: unless-stopped
+    init: true
+    logging: *default_logging
+    ulimits: *default_ulimits
     # noeviction (NOT allkeys-lru): redis is the Celery broker (/0); evicting keys would drop queued tasks.
     # maxmemory is a host-OOM guard only.
     command: redis-server --appendonly yes --maxmemory 8gb --maxmemory-policy noeviction
@@ -123,6 +142,9 @@ services:
     image: *app_image
     container_name: turnflow_instagram_web_webhook
     restart: unless-stopped
+    init: true
+    logging: *default_logging
+    ulimits: *default_ulimits
     command: >
       gunicorn config.wsgi:application --bind 0.0.0.0:8000
       --worker-class gthread --workers 4 --threads 4
@@ -159,6 +181,9 @@ services:
     image: *app_image
     container_name: turnflow_instagram_web_dashboard
     restart: unless-stopped
+    init: true
+    logging: *default_logging
+    ulimits: *default_ulimits
     command: >
       gunicorn config.wsgi:application --bind 0.0.0.0:8000
       --worker-class gthread --workers 12 --threads 4
@@ -194,6 +219,9 @@ services:
     image: *app_image
     container_name: turnflow_instagram_web_external
     restart: unless-stopped
+    init: true
+    logging: *default_logging
+    ulimits: *default_ulimits
     command: >
       gunicorn config.wsgi:application --bind 0.0.0.0:8000
       --worker-class gthread --workers 4 --threads 16
@@ -229,6 +257,9 @@ services:
   celery_dm:
     image: *app_image
     restart: unless-stopped
+    init: true
+    logging: *default_logging
+    ulimits: *default_ulimits
     command: celery -A config worker --pool=threads --concurrency=100 --prefetch-multiplier=1 -l info -Q dm_send
     env_file: [.env.production]
     environment: *app_env
@@ -247,6 +278,9 @@ services:
   celery_followup:
     image: *app_image
     restart: unless-stopped
+    init: true
+    logging: *default_logging
+    ulimits: *default_ulimits
     command: celery -A config worker --pool=threads --concurrency=80 --prefetch-multiplier=1 -l info -Q webhook_followup,verify
     env_file: [.env.production]
     environment: *app_env
@@ -266,6 +300,10 @@ services:
     image: *app_image
     container_name: turnflow_instagram_celery
     restart: unless-stopped
+    init: true
+    logging: *default_logging
+    ulimits: *default_ulimits
+    shm_size: "1gb"   # Playwright/Chromium 스냅샷용(#1; 코드도 --disable-dev-shm-usage 사용 — 이중 방어)
     command: celery -A config worker --concurrency=8 --prefetch-multiplier=1 -l info -Q celery,snapshot
     env_file: [.env.production]
     environment: *app_env
@@ -280,10 +318,36 @@ services:
     networks:
       - turnflow_instagram_net
 
+  # ── Celery: AI 작업 격리(#5) — run_ai_job(최대 600s LLM)·campaign-assist 를 snapshot/DM-reconcile 가
+  #    도는 celery_default 8슬롯에서 분리(head-of-line blocking 방지). 라우팅: apps.ai_jobs.tasks.* → ai_jobs.
+  celery_ai:
+    image: *app_image
+    restart: unless-stopped
+    init: true
+    logging: *default_logging
+    ulimits: *default_ulimits
+    shm_size: "1gb"   # AI_VISUAL_REFINE 켜질 경우 run_ai_job 이 Chromium 렌더 → shm 여유 확보
+    command: celery -A config worker --concurrency=4 --prefetch-multiplier=1 -l info -Q ai_jobs
+    env_file: [.env.production]
+    environment: *app_env
+    volumes:
+      - turnflow_instagram_logs:/app/logs
+    depends_on:
+      pgbouncer: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "6", memory: 10G }
+    networks:
+      - turnflow_instagram_net
+
   # ── Celery: billing batches + backup health-check (low rate, isolated) ──
   celery_billing:
     image: *app_image
     restart: unless-stopped
+    init: true
+    logging: *default_logging
+    ulimits: *default_ulimits
     command: celery -A config worker --concurrency=4 --prefetch-multiplier=1 -l info -Q billing
     env_file: [.env.production]
     environment: *app_env
@@ -307,6 +371,9 @@ services:
     container_name: turnflow_instagram_celery_beat
     profiles: ["fallback"]
     restart: unless-stopped
+    init: true
+    logging: *default_logging
+    ulimits: *default_ulimits
     command: celery -A config beat -l info --pidfile=/tmp/celerybeat.pid
     env_file: [.env.production]
     environment: *app_env

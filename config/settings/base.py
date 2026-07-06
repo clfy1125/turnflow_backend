@@ -331,6 +331,9 @@ CELERY_TASK_ROUTES = {
     "apps.integrations.tasks.verify_dm_delivery": {"queue": "verify"},
     # 정기 결제 배치
     "billing.*": {"queue": "billing"},
+    # AI 작업 격리(#5): run_ai_job(최대 600s)·campaign-assist 를 전용 워커(celery_ai)로 라우팅해
+    # snapshot/DM-reconcile 가 도는 celery_default 8슬롯과 head-of-line blocking 분리.
+    "apps.ai_jobs.tasks.*": {"queue": "ai_jobs"},
 }
 
 # Celery Beat Schedule (정기 결제 + DM 발송 보증 워커)
@@ -408,9 +411,15 @@ CELERY_BEAT_SCHEDULE = {
     # Meta 는 콜백 실패(엣지 장애·DR 컷오버)가 쌓이면 계정별 웹훅 구독을 auto-disable →
     # 댓글 웹훅이 조용히 끊겨 캠페인 무음. 6시간마다 ACTIVE 연동의 comments/messages 구독을
     # 재확정(활성 사이트에서만 실변경, 재구독/실패 시 Telegram). DR promote 직후엔 startup.sh 가 즉시 실행.
+    # 실제 구동은 core.ScheduledJob(0003 시드, 0005 에서 6h→1h 상향). CELERY_BEAT_SCHEDULE 은 fallback/문서용.
     "integrations-resubscribe-webhooks": {
         "task": "apps.integrations.tasks.resubscribe_all_webhooks",
-        "schedule": 60 * 60 * 6,  # 6시간
+        "schedule": 60 * 60,  # 1시간 (#6 — Meta auto-disable 무음창 6h→1h 축소)
+    },
+    # 인프라 헬스 경고(#6): Redis noeviction freeze·브로커 큐 적체·deferred DM 밀림 5분 감시(core.ScheduledJob 0005).
+    "integrations-dm-infra-health-alert": {
+        "task": "apps.integrations.tasks.dm_infra_health_alert",
+        "schedule": 60 * 5,  # 5분
     },
     # ===== GATE-0 백업 관측 =====
     # 실제 백업은 호스트 cron(deploy/backups/pg_backup.sh + pgBackRest)에서 수행.
@@ -658,7 +667,7 @@ SNAPSHOT_BASE_URL = config("SNAPSHOT_BASE_URL", default=FRONTEND_URL)
 # 기본 ON. 단 렌더+비전 호출로 페이지당 +20~40s 지연이 있으니, 지연이 부담되면(또는 운영에서
 # 프리미엄 티어 한정으로 쓰려면) AI_VISUAL_REFINE=False 로 끌 수 있다. 켜려면 SNAPSHOT_BASE_URL
 # 이 실제 렌더 가능한 프론트(예: app.turnflow.link)를 가리켜야 한다.
-AI_VISUAL_REFINE = config("AI_VISUAL_REFINE", default=True, cast=bool)
+AI_VISUAL_REFINE = config("AI_VISUAL_REFINE", default=False, cast=bool)  # 론칭 기본 OFF(#4): 페이지당 +20~40s(Chromium 렌더+gemma 비전 패스)·shm/vLLM 부하 제거. 켜려면 env 로.
 AI_VISUAL_REFINE_CYCLES = config("AI_VISUAL_REFINE_CYCLES", default=1, cast=int)
 # 비평기 모델 — 생성기와 다른 독립 모델 권장(비전 필수). 무료 자체호스팅 gemma-4 기본.
 AI_CRITIC_MODEL = config("AI_CRITIC_MODEL", default="gemma-4")

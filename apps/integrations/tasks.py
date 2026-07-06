@@ -1333,6 +1333,62 @@ def dm_backlog_alert():
         except Exception:  # noqa: BLE001
             logger.exception("dm_backlog_alert telegram 실패 (non-fatal)")
 
+
+@shared_task
+def dm_infra_health_alert():
+    """론칭 하드닝(#6) — 'CPU/메모리/재시작 신호에 안 잡히고 조용히 터지는' 인프라 신호를 Telegram 노출.
+
+    감시 3종(임계 초과분만 한 번에 묶어 알림 → 스팸 방지, 실패는 비치명적):
+      1) Redis 사용량 > maxmemory 임계(기본 70%) — noeviction 이라 8G 도달 시 write 거부 →
+         rate_governor fail-closed 로 전 계정 DM 정지(조용한 장애).
+      2) 브로커 큐(LLEN) 적체 — 워커 stall/CF tick 정지 시 큐가 쌓임(dm_backlog_alert 는 DB 레벨만 봄).
+      3) 밀린 deferred DM 나이 — requeue 파이프라인(워커/CF tick) 정지 신호.
+    """
+    from .queue_health import oldest_due_deferred_dm_age_s, queue_depths
+
+    problems: list[str] = []
+
+    # 1) Redis 메모리 (noeviction → 임계 초과 시 write 거부 = 전 계정 DM freeze)
+    try:
+        import redis as _redis
+
+        c = _redis.from_url(settings.CELERY_BROKER_URL)
+        try:
+            info = c.info("memory")
+            used = int(info.get("used_memory", 0))
+            maxm = int(info.get("maxmemory", 0))
+            if maxm > 0:
+                pct = round(used / maxm * 100, 1)
+                if pct >= getattr(settings, "REDIS_MEM_ALERT_PCT", 70):
+                    problems.append(
+                        f"Redis 메모리 {pct}% ({used >> 20}MiB/{maxm >> 20}MiB) — noeviction write 거부 임박"
+                    )
+        finally:
+            c.close()
+    except Exception:  # noqa: BLE001
+        logger.debug("dm_infra_health_alert: redis mem check failed", exc_info=True)
+
+    # 2) 큐 적체
+    depths = queue_depths()
+    depth_cut = getattr(settings, "QUEUE_DEPTH_ALERT", 5000)
+    hot = {q: n for q, n in depths.items() if n >= depth_cut}
+    if hot:
+        problems.append("큐 적체: " + ", ".join(f"{q}={n}" for q, n in sorted(hot.items(), key=lambda x: -x[1])))
+
+    # 3) deferred DM 밀림 (requeue 파이프라인 정지)
+    age = oldest_due_deferred_dm_age_s()
+    if age is not None and age >= getattr(settings, "DEFERRED_DM_ALERT_SECONDS", 3600):
+        problems.append(f"deferred DM 밀림 {age // 60}분 — requeue 파이프라인 점검(CF tick/워커)")
+
+    if problems:
+        try:
+            from apps.core.telegram import send_telegram_notification
+
+            send_telegram_notification("🩺 *인프라 헬스 경고*\n- " + "\n- ".join(problems))
+        except Exception:  # noqa: BLE001
+            logger.exception("dm_infra_health_alert telegram 실패 (non-fatal)")
+    return {"problems": problems, "queue_depths": depths}
+
     return {
         "total_queued": total,
         "window_risk": risk,
