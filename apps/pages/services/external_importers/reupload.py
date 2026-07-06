@@ -30,13 +30,14 @@ from typing import Any, Optional
 
 from django.core.files.base import ContentFile
 
-from apps.pages.image_pipeline import (
-    ImageValidationError,
-    process_upload,
-)
+from apps.core.ssrf import UnsafeURLError, assert_public_url, build_safe_opener
+from apps.pages.image_pipeline import ImageValidationError, process_upload
 from apps.pages.models import Page, PageMedia
 
 logger = logging.getLogger(__name__)
+
+# 리다이렉트 hop 마다 공인 IP 를 재검증하는 opener (SSRF 방어 — H-4).
+_SAFE_OPENER = build_safe_opener()
 
 
 MAX_IMAGES = 30
@@ -165,7 +166,12 @@ def replace_in_blocks(blocks: list[dict], url_map: dict[str, str]) -> int:
 
 
 def _download(url: str) -> bytes:
-    """외부 URL → 바이트. 사이즈 캡을 chunk 단위로 강제 — 큰 파일 메모리 폭주 방어."""
+    """외부 URL → 바이트. 사이즈 캡을 chunk 단위로 강제 — 큰 파일 메모리 폭주 방어.
+
+    H-4: 다운로드 전 SSRF 가드로 사설/루프백/링크로컬 IP·비 http(s) scheme 을 차단하고,
+    리다이렉트는 매 hop 마다 재검증하는 opener 로 추적한다(302 내부망 이동 우회 방어).
+    """
+    assert_public_url(url)  # 초기 URL 검증 (unsafe 면 UnsafeURLError)
     req = urllib.request.Request(
         url,
         headers={
@@ -173,7 +179,7 @@ def _download(url: str) -> bytes:
             "Accept": "image/*,*/*;q=0.8",
         },
     )
-    with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT_SEC) as resp:
+    with _SAFE_OPENER.open(req, timeout=FETCH_TIMEOUT_SEC) as resp:
         chunks: list[bytes] = []
         total = 0
         while True:
@@ -182,7 +188,7 @@ def _download(url: str) -> bytes:
                 break
             total += len(chunk)
             if total > MAX_BYTES_PER_IMAGE:
-                raise IOError(f"이미지 사이즈 한도 초과: {total} > {MAX_BYTES_PER_IMAGE}")
+                raise OSError(f"이미지 사이즈 한도 초과: {total} > {MAX_BYTES_PER_IMAGE}")
             chunks.append(chunk)
         return b"".join(chunks)
 
@@ -191,7 +197,11 @@ def _upload_one(page: Page, url: str, source_name: str) -> Optional[PageMedia]:
     """단일 외부 이미지 → PageMedia 생성. 실패 시 None."""
     try:
         raw = _download(url)
-    except (urllib.error.HTTPError, urllib.error.URLError, IOError, TimeoutError) as e:
+    except UnsafeURLError as e:
+        # SSRF 가드 차단 — 내부 대상 스캔 시도로 간주. 상세는 서버 로그만(응답엔 일반 사유).
+        logger.warning("reupload blocked by SSRF guard: %s", e)
+        return None
+    except (OSError, urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
         logger.info("reupload download failed url=%s err=%s", url, e)
         return None
 
