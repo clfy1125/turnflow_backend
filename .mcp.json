@@ -3,6 +3,10 @@
     "payapp-api": {
       "command": "npx",
       "args": ["-y", "@payapp/payments-payapp"]
+    },
+    "tosspayments-integration-guide": {
+      "command": "npx",
+      "args": ["-y", "@tosspayments/integration-guide-mcp@latest"]
     }
   }
 }
