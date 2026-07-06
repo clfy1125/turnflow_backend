@@ -10,6 +10,7 @@ from drf_spectacular.utils import OpenApiExample, OpenApiResponse, extend_schema
 from rest_framework import generics, status
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from .serializers import (
@@ -69,6 +70,9 @@ class RegisterView(generics.CreateAPIView):
     queryset = User.objects.all()
     permission_classes = [AllowAny]
     serializer_class = UserRegistrationSerializer
+    # H-1: 가입 폭주(다계정 생성·메일 유발) IP 스로틀
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth_register"
 
     @extend_schema(
         summary="회원가입",
@@ -171,6 +175,9 @@ class LoginView(generics.GenericAPIView):
     """
 
     permission_classes = [AllowAny]
+    # H-1: credential-stuffing / brute-force 방어 — IP 기준 스로틀
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth_login"
 
     @extend_schema(
         summary="로그인",
@@ -717,6 +724,9 @@ class GoogleLoginView(generics.GenericAPIView):
 
     permission_classes = [AllowAny]
     serializer_class = GoogleLoginSerializer
+    # H-1: Google 로그인 남용 방어 — IP 기준 스로틀
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth_google"
 
     @extend_schema(
         tags=["auth"],

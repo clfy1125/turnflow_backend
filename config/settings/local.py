@@ -42,6 +42,20 @@ REST_FRAMEWORK["DEFAULT_RENDERER_CLASSES"] = [
     "rest_framework.renderers.BrowsableAPIRenderer",
 ]
 
+# 인증 엔드포인트 레이트리밋(H-1)은 프로덕션(base.py 값)에서만 활성.
+# 로컬/테스트에서는 비활성(None)으로 두어 테스트가 IP 카운터에 누적돼 429 로 깨지는 것을 방지.
+# (scope 키는 존재해야 ScopedRateThrottle 이 ImproperlyConfigured 를 던지지 않음 → 값만 None.)
+for _auth_scope in (
+    "auth_login",
+    "auth_register",
+    "auth_google",
+    "email_verify",
+    "email_send",
+    "password_reset",
+    "password_reset_confirm",
+):
+    REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"][_auth_scope] = None
+
 # Email backend for development (console)
 EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
 

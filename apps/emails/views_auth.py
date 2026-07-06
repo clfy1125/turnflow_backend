@@ -16,6 +16,7 @@ from drf_spectacular.utils import OpenApiExample, OpenApiResponse, extend_schema
 from rest_framework import generics, status
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 
 from .models import EmailToken, EmailTokenPurpose
 from .serializers import (
@@ -39,6 +40,9 @@ def _client_ip(request) -> str | None:
 class SendVerificationEmailView(generics.GenericAPIView):
     permission_classes = [IsAuthenticated]
     serializer_class = ResendVerificationSerializer
+    # H-1: 인증메일 재발송 남용(메일 폭탄·Resend 비용) 방어
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "email_send"
 
     @extend_schema(
         tags=["auth"],
@@ -99,6 +103,9 @@ await fetch('/api/v1/auth/email/send-verification/', {{
 class VerifyEmailView(generics.GenericAPIView):
     permission_classes = [AllowAny]
     serializer_class = VerifyEmailRequestSerializer
+    # H-1: 6자리 코드 무차별 대입 방어 — IP 기준 스로틀
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "email_verify"
 
     @extend_schema(
         tags=["auth"],
@@ -186,6 +193,9 @@ class VerifyEmailView(generics.GenericAPIView):
 class PasswordResetRequestView(generics.GenericAPIView):
     permission_classes = [AllowAny]
     serializer_class = PasswordResetRequestSerializer
+    # H-1: 비밀번호 재설정 메일 폭탄 방어 — IP 기준 스로틀
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "password_reset"
 
     @extend_schema(
         tags=["auth"],
@@ -243,6 +253,9 @@ await fetch('/api/v1/auth/password/reset-request/', {{
 class PasswordResetConfirmView(generics.GenericAPIView):
     permission_classes = [AllowAny]
     serializer_class = PasswordResetConfirmSerializer
+    # H-1: 재설정 토큰 무차별 대입 방어 — IP 기준 스로틀
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "password_reset_confirm"
 
     @extend_schema(
         tags=["auth"],

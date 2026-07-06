@@ -233,6 +233,15 @@ REST_FRAMEWORK = {
         "insights_sync": "5/hour",
         # 외부 링크 메타 조회 — 사용자별 분당 60회 (인터랙티브 붙여넣기 UX + SSRF 어뷰즈 방어)
         "link_meta": "60/min",
+        # ── 인증 엔드포인트 brute-force / credential-stuffing / 메일폭탄 방어 (H-1) ──
+        # ScopedRateThrottle 은 익명 요청을 IP 로 키잉하므로 무인증 로그인/가입/재설정에 적용된다.
+        "auth_login": config("THROTTLE_AUTH_LOGIN", default="10/min"),
+        "auth_register": config("THROTTLE_AUTH_REGISTER", default="10/hour"),
+        "auth_google": config("THROTTLE_AUTH_GOOGLE", default="20/min"),
+        "email_verify": config("THROTTLE_EMAIL_VERIFY", default="10/min"),
+        "email_send": config("THROTTLE_EMAIL_SEND", default="5/hour"),
+        "password_reset": config("THROTTLE_PASSWORD_RESET", default="10/hour"),
+        "password_reset_confirm": config("THROTTLE_PASSWORD_RESET_CONFIRM", default="10/min"),
     },
 }
 
@@ -327,6 +336,9 @@ CELERY_TASK_ROUTES = {
     # 댓글 처리 + 웹훅 delivered/read 후속 UPDATE
     "apps.integrations.tasks.process_comment_and_send_dm": {"queue": "webhook_followup"},
     "apps.integrations.tasks.process_messaging_event": {"queue": "webhook_followup"},
+    # 스팸 필터 LLM 판정(3-7초 gemma) — DM 디스패치를 굶기지 않게 ai_jobs 워커로 격리.
+    # celery_ai 가 이미 최대 600s LLM 작업용으로 구동중이라 신규 인프라 불필요.
+    "apps.integrations.tasks.run_spam_filter_check": {"queue": "ai_jobs"},
     # 도착 검증
     "apps.integrations.tasks.verify_dm_delivery": {"queue": "verify"},
     # 정기 결제 배치
@@ -495,6 +507,10 @@ TOSS_DEV_CARD_AUTH_ENABLED = config("TOSS_DEV_CARD_AUTH_ENABLED", default=False,
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
+    "filters": {
+        # H-9/M-22: 로그에 섞여 들어갈 수 있는 토큰/시크릿 쿼리 파라미터 값 마스킹.
+        "scrub_secrets": {"()": "apps.core.log_filters.SecretScrubFilter"},
+    },
     "formatters": {
         "verbose": {
             "format": "{levelname} {asctime} {module} {process:d} {thread:d} {message}",
@@ -509,6 +525,7 @@ LOGGING = {
         "console": {
             "class": "logging.StreamHandler",
             "formatter": "verbose",
+            "filters": ["scrub_secrets"],
         },
     },
     "root": {
@@ -667,7 +684,9 @@ SNAPSHOT_BASE_URL = config("SNAPSHOT_BASE_URL", default=FRONTEND_URL)
 # 기본 ON. 단 렌더+비전 호출로 페이지당 +20~40s 지연이 있으니, 지연이 부담되면(또는 운영에서
 # 프리미엄 티어 한정으로 쓰려면) AI_VISUAL_REFINE=False 로 끌 수 있다. 켜려면 SNAPSHOT_BASE_URL
 # 이 실제 렌더 가능한 프론트(예: app.turnflow.link)를 가리켜야 한다.
-AI_VISUAL_REFINE = config("AI_VISUAL_REFINE", default=False, cast=bool)  # 론칭 기본 OFF(#4): 페이지당 +20~40s(Chromium 렌더+gemma 비전 패스)·shm/vLLM 부하 제거. 켜려면 env 로.
+AI_VISUAL_REFINE = config(
+    "AI_VISUAL_REFINE", default=False, cast=bool
+)  # 론칭 기본 OFF(#4): 페이지당 +20~40s(Chromium 렌더+gemma 비전 패스)·shm/vLLM 부하 제거. 켜려면 env 로.
 AI_VISUAL_REFINE_CYCLES = config("AI_VISUAL_REFINE_CYCLES", default=1, cast=int)
 # 비평기 모델 — 생성기와 다른 독립 모델 권장(비전 필수). 무료 자체호스팅 gemma-4 기본.
 AI_CRITIC_MODEL = config("AI_CRITIC_MODEL", default="gemma-4")
