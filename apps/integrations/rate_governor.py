@@ -187,6 +187,70 @@ def check(ig_account_id: str, plan: str = "free") -> Decision:
 
 
 # ───────────────────────────────────────────────────────────────
+# 수동 모더레이션(댓글 숨김/복원) 남용 방지 — 버튼 연타로 Meta quota 소진 방지
+# ───────────────────────────────────────────────────────────────
+# 숨김/복원은 사용자가 버튼으로 직접 호출한다. 연타하면 (a) 같은 댓글을 hide↔unhide 로
+# 왔다갔다 하며 무의미한 호출을 반복하거나 (b) 계정 전체 Meta Graph 호출을 급격히 소진해
+# 밴/스로틀당할 위험이 있다. DM 발송과 달리 사용자 요청이라 '지연' 대신 즉시 429 로 거절한다.
+# 두 겹으로 막는다:
+#   (1) 같은 (댓글, 액션) 쿨다운: 더블클릭/같은 버튼 연타를 흡수. hide 직후 unhide '정정'은
+#       액션이 달라 쿨다운을 공유하지 않으므로 허용된다(오탐 되돌리기 UX 보존).
+#   (2) 계정당 분/시 상한: 지속적 연타로 계정 quota 를 소진하지 못하게 버스트/누적 캡.
+# DM 거버너와 별도 네임스페이스(mod:*). settings.MODERATION_RATE_LIMITS 로 오버라이드.
+_MODERATION_DEFAULTS = {
+    "per_comment_cooldown": 10,  # 같은 (댓글, 액션) 재요청 최소 간격(초) — 더블클릭 흡수
+    "per_minute": 20,  # 계정당 분당 모더레이션 액션(버스트 상한)
+    "per_hour": 300,  # 계정당 시간당 모더레이션 액션(누적 상한, Meta 안전마진)
+}
+
+
+def _moderation_limits() -> dict:
+    cfg = getattr(settings, "MODERATION_RATE_LIMITS", None) or {}
+    return {**_MODERATION_DEFAULTS, **cfg}
+
+
+def moderation_action_check(ig_account_id: str, comment_id: str, action: str) -> Decision:
+    """댓글 숨김/복원 1회가 허용되는지 검사하고 카운터를 소비한다(버튼 연타 방지).
+
+    Args:
+        ig_account_id: IG 계정 식별자(external_account_id). Meta 한도가 계정당이므로 스코프 기준.
+        comment_id: 대상 댓글 ID. 같은 댓글의 같은 액션 더블클릭을 쿨다운으로 흡수.
+        action: "hide" | "unhide". 같은 댓글이라도 다른 액션은 쿨다운을 공유하지 않아
+            hide 직후 unhide 정정은 허용된다.
+
+    Returns:
+        Decision(allowed, retry_after, reason). 식별 불가/캐시 미가용 시엔 통과(사용자
+        액션을 임의로 막지 않는 안전 측).
+    """
+    if not ig_account_id:
+        return Decision(allowed=True)
+
+    lim = _moderation_limits()
+    now = int(time.time())
+
+    # (1) 같은 (댓글, 액션) 쿨다운 — 더블클릭/연타 흡수. cache.add 는 키가 없을 때만 True.
+    #     쿨다운에 걸리면 카운터를 소비하지 않고 즉시 거절(연타가 계정 quota 를 먹지 않게).
+    cooldown = int(lim.get("per_comment_cooldown", 0) or 0)
+    if comment_id and cooldown > 0:
+        if not cache.add(f"mod:cd:{action}:{comment_id}", now, timeout=cooldown):
+            return Decision(False, retry_after=cooldown, reason="per_comment_cooldown")
+
+    # (2) 계정당 분/시 상한 — 지속 연타로 Meta quota 소진 방지(분당 먼저: 더 짧은 윈도우).
+    per_minute = int(lim.get("per_minute", 0) or 0)
+    per_hour = int(lim.get("per_hour", 0) or 0)
+    if per_minute > 0:
+        m = _incr_window(f"mod:m:{ig_account_id}:{now // 60}", ttl=70)
+        if m > per_minute:
+            return Decision(False, retry_after=60 - (now % 60) + 1, reason="per_minute")
+    if per_hour > 0:
+        h = _incr_window(f"mod:h:{ig_account_id}:{now // 3600}", ttl=3700)
+        if h > per_hour:
+            return Decision(False, retry_after=3600 - (now % 3600) + 1, reason="per_hour")
+
+    return Decision(allowed=True)
+
+
+# ───────────────────────────────────────────────────────────────
 # DR — Action Block DB 영속화 + Redis 손실 후 DB 재수화 (#2 Option C)
 # 설계: DR_IMPLEMENTATION_PLAN.md §7.1, §7.2.
 # ───────────────────────────────────────────────────────────────

@@ -29,7 +29,6 @@ from .models import (
     SeenComment,
     SentDMLog,
     SpamCommentLog,
-    SpamFilterConfig,
 )
 from .services import (
     CommentReplyPermanentError,
@@ -37,7 +36,8 @@ from .services import (
     InstagramMediaService,
     InstagramMessagingService,
     InstagramOAuthService,
-    SpamDetectionService,
+    MockInstagramProvider,
+    scrub_secrets,
 )
 
 # ===== 웹훅 구독 재확정 (DR 컷오버 / Meta auto-disable 대비) =====
@@ -325,11 +325,10 @@ def _defer_or_fail(log, campaign, ig_conn, exc) -> dict:
 )
 def process_comment_and_send_dm(self, webhook_payload: dict):
     """
-    댓글 웹훅 이벤트 처리.
+    댓글 웹훅 이벤트 처리 (DM 캠페인 전용).
 
-    1) 스팸 검사 (스팸 필터 활성 시)
-    2) 스팸이면 댓글 숨김 처리 후 종료
-    3) 정상이면 매칭되는 활성 캠페인마다 DM 발송 큐에 enqueue
+    매칭되는 활성 캠페인마다 DM 발송 큐에 enqueue 한다.
+    스팸 검사는 이 태스크와 **독립**된 ``run_spam_filter_check`` 가 담당한다(웹훅에서 병렬 디스패치).
     """
     try:
         logger.debug(f"Processing comment webhook: {webhook_payload}")
@@ -372,19 +371,8 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
             )
             return {"status": "skipped", "reason": "self_comment"}
 
-        # 1) 스팸 검사
-        spam_result = _check_and_handle_spam(
-            comment_id=comment_id,
-            comment_text=comment_text,
-            from_user_id=from_user_id,
-            from_username=from_username,
-            media_id=media_id,
-            webhook_payload=webhook_payload,
-        )
-        if spam_result.get("is_spam"):
-            return spam_result
-
-        # 2) 활성 캠페인 매칭 (trigger_type + keyword 모두 평가)
+        # 활성 캠페인 매칭 (trigger_type + keyword 모두 평가)
+        # (스팸 검사는 run_spam_filter_check 가 독립적으로 처리 — 여기서 하지 않는다)
         # webhook 의 entry.id 는 IG user id — 그 계정의 캠페인만 후보
         ig_user_id = str(webhook_payload.get("entry_id") or "")
         candidate_qs = _active_campaigns_for_account(ig_user_id)
@@ -463,6 +451,218 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
     except Exception as e:
         logger.exception(f"Error processing comment webhook: {e}")
         raise
+
+
+@shared_task(
+    bind=True,
+    autoretry_for=(Exception,),
+    retry_kwargs={"max_retries": 3, "countdown": 60},
+    retry_backoff=True,
+)
+def run_spam_filter_check(self, webhook_payload: dict):
+    """댓글 웹훅 → 계정 전체 스팸 필터 (DM 캠페인과 **독립**).
+
+    ``process_comment_and_send_dm`` 과 별개 태스크로 병렬 실행된다. 캠페인 유무와 무관하게
+    entry_id(=IG 계정)로 ``SpamFilterConfig`` 를 **직접** 찾아, 활성+프로면 하이브리드(규칙+gemma)
+    로 판정한다. auto_hide 켜져 있으면 Meta API 로 숨기고, 아니면 감지만 기록(수동 숨김 대기).
+
+    멱등: ``UNIQUE(spam_filter, comment_id)`` 에 get_or_create 로 경합 → 최초 1회만 분류/숨김.
+    잠정 상태는 CLEAN(통계 제외·안전) — 스팸 확정 시에만 DETECTED/HIDDEN 으로 승격한다.
+    LLM 판정은 fail-open(불확실하면 숨기지 않음)이라 워커 크래시가 없으면 항상 종결 상태에 도달.
+    """
+    try:
+        field = webhook_payload.get("field")
+        value = webhook_payload.get("value", {})
+        if field != "comments":
+            return {"status": "skipped", "reason": f"unsupported_field:{field}"}
+
+        comment_id = value.get("id")
+        comment_text = value.get("text", "") or ""
+        from_user = value.get("from", {})
+        from_user_id = from_user.get("id")
+        from_username = from_user.get("username")
+        media = value.get("media", {})
+        media_id = media.get("id")
+        entry_id = str(webhook_payload.get("entry_id") or "")
+
+        if not all([comment_id, from_user_id, entry_id]):
+            return {"status": "error", "reason": "missing_fields"}
+
+        # ★ self 가드: 본인(비즈니스) 댓글·본인이 게시한 공개 답글은 검사 안 함.
+        # webhook entry.id == 연결된 IG 계정 user id. 우리 답글도 이 계정에서 나오므로 함께 걸러진다.
+        # (parent_id 가 있어도 self 가 아니면 외부 답글 → 검사 진행. 결정 3)
+        if str(from_user_id) == entry_id:
+            return {"status": "skipped", "reason": "self_comment"}
+
+        # ★ 계정 직접 조회 — 캠페인 우회(결합 해제 핵심). 캠페인 없는 게시물의 댓글도 검사된다.
+        # 같은 IG 계정(external_account_id)이 여러 워크스페이스에 연결될 수 있으므로(테스트/공유)
+        # 단일 .first() 가 아니라 **활성 연결 전부**를 훑어, 활성+프로 필터가 걸린 연결마다 적용한다.
+        # (DM 경로의 _active_campaigns_for_account 도 같은 계정의 모든 연결을 훑는 것과 일관)
+        conns = list(
+            IGAccountConnection.objects.filter(
+                external_account_id=entry_id,
+                status=IGAccountConnection.Status.ACTIVE,
+            ).select_related("workspace")
+        )
+        if not conns:
+            return {"status": "skipped", "reason": "no_active_connection"}
+
+        from apps.billing.subscription_utils import owner_has_feature
+
+        results = []
+        had_active_filter = False
+        plan_blocked = False
+        for conn in conns:
+            spam_filter = getattr(conn, "spam_filter", None)
+            if spam_filter is None or not spam_filter.is_active():
+                continue
+            had_active_filter = True
+            # 플랜 런타임 게이트 (fail-closed) — 스팸필터는 프로 전용.
+            if not owner_has_feature(conn.workspace, "spam_filter"):
+                plan_blocked = True
+                continue
+            try:
+                results.append(
+                    _run_spam_for_connection(
+                        conn,
+                        spam_filter,
+                        comment_id=comment_id,
+                        comment_text=comment_text,
+                        from_user_id=from_user_id,
+                        from_username=from_username,
+                        media_id=media_id,
+                        webhook_payload=webhook_payload,
+                    )
+                )
+            except Exception:
+                # 한 연결의 처리 실패가 다른 연결을 막지 않게 격리(멱등이라 재시도 안전).
+                logger.exception("spam 처리 실패: conn=%s comment=%s", conn.id, comment_id)
+
+        if not results:
+            # 활성 필터는 있었으나 전부 플랜 게이트로 막힌 경우와, 애초에 활성 필터가 없던 경우 구분.
+            if had_active_filter and plan_blocked:
+                return {"status": "skipped", "reason": "plan_not_allowed"}
+            return {"status": "skipped", "reason": "filter_inactive"}
+        return {"status": "processed", "results": results}
+
+    except Exception as e:
+        logger.exception("run_spam_filter_check error: %s", e)
+        raise
+
+
+def _run_spam_for_connection(
+    conn,
+    spam_filter,
+    *,
+    comment_id: str,
+    comment_text: str,
+    from_user_id: str,
+    from_username: str,
+    media_id: str,
+    webhook_payload: dict,
+) -> dict:
+    """단일 (연결, 스팸필터)에 대해 멱등 claim → 하이브리드 판정 → auto_hide 처리.
+
+    ``run_spam_filter_check`` 가 계정의 활성 필터 연결마다 호출한다.
+    """
+    from .spam_classifier import classify_comment
+
+    # ── 멱등 claim: (spam_filter, comment_id) UNIQUE 에 경합 → 최초 1회만 진행 ──
+    # 잠정 상태 CLEAN: 크래시로 중단돼도 오탐 감지로 집계되지 않는다(안전).
+    log, created = SpamCommentLog.objects.get_or_create(
+        spam_filter=spam_filter,
+        comment_id=comment_id,
+        defaults={
+            "comment_text": comment_text,
+            "commenter_user_id": str(from_user_id),
+            "commenter_username": from_username or "",
+            "media_id": media_id or "",
+            "status": SpamCommentLog.Status.CLEAN,
+            "spam_reasons": [],
+        },
+    )
+    if not created:
+        # 동일 comment 재도착 → 재분류·재숨김 없이 단락
+        return {
+            "status": "skipped",
+            "reason": "already_processed",
+            "conn_id": str(conn.id),
+            "spam_log_id": str(log.id),
+            "prior_status": log.status,
+        }
+
+    # ── 하이브리드 판정 (규칙 즉시차단 + 애매하면 gemma, fail-open) ──
+    verdict = classify_comment(
+        comment_text,
+        spam_keywords=spam_filter.spam_keywords,
+        block_urls=spam_filter.block_urls,
+        use_llm=getattr(spam_filter, "use_llm", True),
+    )
+
+    if not verdict.is_spam:
+        # 잠정 CLEAN 유지 (TTL 정리 대상) — 판정 메타만 기록
+        log.confidence = verdict.confidence
+        log.spam_category = verdict.category or ""
+        log.engine = verdict.engine
+        log.save(update_fields=["confidence", "spam_category", "engine"])
+        return {
+            "status": "clean",
+            "engine": verdict.engine,
+            "conn_id": str(conn.id),
+            "spam_log_id": str(log.id),
+        }
+
+    # ── 스팸 확정 → DETECTED 로 승격 + 원본 페이로드 보존(감사) ──
+    log.status = SpamCommentLog.Status.DETECTED
+    log.spam_reasons = verdict.reasons
+    log.confidence = verdict.confidence
+    log.spam_category = verdict.category or ""
+    log.engine = verdict.engine
+    log.webhook_payload = webhook_payload
+    log.save(
+        update_fields=[
+            "status",
+            "spam_reasons",
+            "confidence",
+            "spam_category",
+            "engine",
+            "webhook_payload",
+        ]
+    )
+    spam_filter.increment_spam_detected()
+
+    # auto_hide off → 감지만 기록(유저가 수동 숨김)
+    if not spam_filter.auto_hide_enabled:
+        return {
+            "status": "detected",
+            "engine": verdict.engine,
+            "conn_id": str(conn.id),
+            "spam_log_id": str(log.id),
+        }
+
+    # mock 토큰 — dev 에서 Meta 미호출(기존 hide_comment 는 mock 분기가 없음)
+    if MockInstagramProvider.is_mock_token(conn.access_token):
+        log.mark_as_hidden({"mock": True})
+        spam_filter.increment_hidden()
+        return {"status": "hidden_mock", "conn_id": str(conn.id), "spam_log_id": str(log.id)}
+
+    try:
+        api_response = InstagramCommentService.hide_comment(
+            comment_id=comment_id, access_token=conn.access_token
+        )
+        log.mark_as_hidden(api_response)
+        spam_filter.increment_hidden()
+        return {"status": "hidden", "conn_id": str(conn.id), "spam_log_id": str(log.id)}
+    except Exception as hide_error:
+        # 숨김 실패는 재분류 없이 FAILED 기록만(재시도 시 already_processed 로 단락).
+        # 유저가 모더레이션 API 로 수동 재숨김 가능.
+        log.mark_as_failed(scrub_secrets(str(hide_error)))
+        return {
+            "status": "failed_to_hide",
+            "conn_id": str(conn.id),
+            "spam_log_id": str(log.id),
+            "error": scrub_secrets(str(hide_error)),
+        }
 
 
 @shared_task(
@@ -1373,7 +1573,9 @@ def dm_infra_health_alert():
     depth_cut = getattr(settings, "QUEUE_DEPTH_ALERT", 5000)
     hot = {q: n for q, n in depths.items() if n >= depth_cut}
     if hot:
-        problems.append("큐 적체: " + ", ".join(f"{q}={n}" for q, n in sorted(hot.items(), key=lambda x: -x[1])))
+        problems.append(
+            "큐 적체: " + ", ".join(f"{q}={n}" for q, n in sorted(hot.items(), key=lambda x: -x[1]))
+        )
 
     # 3) deferred DM 밀림 (requeue 파이프라인 정지)
     age = oldest_due_deferred_dm_age_s()
@@ -1898,15 +2100,19 @@ def poll_missed_comments():
 
 @shared_task(name="integrations.cleanup_comment_ledger")
 def cleanup_comment_ledger():
-    """만료된 댓글 관측 장부(SeenComment) 삭제 (Beat: 매일).
+    """만료된 관측/멱등 장부 정리 (Beat: 매일).
 
-    expires_at 가 지난 행을 배치 삭제. 멱등 — 다음 실행에 남은 만료분 계속 정리.
+    - SeenComment: ``expires_at`` 이 지난 행(웹훅 누락 보정 앵커).
+    - SpamCommentLog(status=CLEAN): 스팸 아님으로 판정돼 멱등용으로만 남긴 장부 행 — 48h 경과분.
+      (스팸 행 detected/hidden/failed 는 통계·감사 위해 보존한다.)
+    배치 삭제. 멱등 — 다음 실행에 남은 만료분 계속 정리.
     """
-    cutoff = timezone.now()
+    now = timezone.now()
+
     deleted = 0
     while True:
         ids = list(
-            SeenComment.objects.filter(expires_at__lt=cutoff).values_list("id", flat=True)[:5000]
+            SeenComment.objects.filter(expires_at__lt=now).values_list("id", flat=True)[:5000]
         )
         if not ids:
             break
@@ -1914,9 +2120,30 @@ def cleanup_comment_ledger():
         deleted += n
         if len(ids) < 5000:
             break
-    if deleted:
-        logger.info("cleanup_comment_ledger: deleted %s expired rows", deleted)
-    return {"deleted": deleted}
+
+    # CLEAN 스팸 로그 TTL 정리 (멱등 장부라 오래 보관 불필요)
+    clean_cutoff = now - timedelta(hours=48)
+    deleted_clean = 0
+    while True:
+        ids = list(
+            SpamCommentLog.objects.filter(
+                status=SpamCommentLog.Status.CLEAN, created_at__lt=clean_cutoff
+            ).values_list("id", flat=True)[:5000]
+        )
+        if not ids:
+            break
+        n, _ = SpamCommentLog.objects.filter(id__in=ids).delete()
+        deleted_clean += n
+        if len(ids) < 5000:
+            break
+
+    if deleted or deleted_clean:
+        logger.info(
+            "cleanup_comment_ledger: deleted %s SeenComment, %s CLEAN spam logs",
+            deleted,
+            deleted_clean,
+        )
+    return {"deleted": deleted, "deleted_clean_spam_logs": deleted_clean}
 
 
 @shared_task(name="integrations.maintain_partitions")
@@ -2261,102 +2488,6 @@ def send_reward_dm(self, opening_log_id: str):
     }
 
 
-# ===== 스팸 처리 (기존 로직 보존) =====
-
-
-def _check_and_handle_spam(
-    comment_id: str,
-    comment_text: str,
-    from_user_id: str,
-    from_username: str,
-    media_id: str,
-    webhook_payload: dict,
-) -> dict:
-    """스팸 검사 + 숨김 처리"""
-    try:
-        campaign = (
-            AutoDMCampaign.objects.filter(media_id=media_id).select_related("ig_connection").first()
-        )
-        if not campaign:
-            return {"is_spam": False, "spam_filter_processed": False}
-
-        ig_connection = campaign.ig_connection
-
-        try:
-            spam_filter = SpamFilterConfig.objects.get(ig_connection=ig_connection)
-        except SpamFilterConfig.DoesNotExist:
-            return {"is_spam": False, "spam_filter_processed": False}
-
-        if not spam_filter.is_active():
-            return {
-                "is_spam": False,
-                "spam_filter_processed": False,
-                "reason": "Spam filter inactive",
-            }
-
-        # ★ 플랜 런타임 게이트 — 스팸필터는 프로 전용. 다운그레이드 후에도 config 행은
-        # 남아있으므로(재업그레이드 시 설정 복원) 여기서 즉시 무력화한다.
-        # 플랜 조회 실패는 기능 꺼짐 취급(fail-closed) — 댓글이 필터를 안 타는 것뿐 파괴 없음.
-        from apps.billing.subscription_utils import owner_has_feature
-
-        if not owner_has_feature(ig_connection.workspace, "spam_filter"):
-            return {
-                "is_spam": False,
-                "spam_filter_processed": False,
-                "reason": "plan_not_allowed",
-            }
-
-        is_spam, reasons = SpamDetectionService.is_spam(
-            text=comment_text,
-            spam_keywords=spam_filter.spam_keywords,
-            check_urls=spam_filter.block_urls,
-        )
-
-        if not is_spam:
-            return {"is_spam": False, "spam_filter_processed": True}
-
-        spam_log = SpamCommentLog.objects.create(
-            spam_filter=spam_filter,
-            comment_id=comment_id,
-            comment_text=comment_text,
-            commenter_user_id=from_user_id,
-            commenter_username=from_username,
-            media_id=media_id,
-            spam_reasons=reasons,
-            status=SpamCommentLog.Status.DETECTED,
-            webhook_payload=webhook_payload,
-        )
-        spam_filter.increment_spam_detected()
-
-        try:
-            api_response = InstagramCommentService.hide_comment(
-                comment_id=comment_id, access_token=ig_connection.access_token
-            )
-            spam_log.mark_as_hidden(api_response)
-            spam_filter.increment_hidden()
-            return {
-                "is_spam": True,
-                "status": "hidden",
-                "spam_filter_processed": True,
-                "spam_reasons": reasons,
-                "spam_log_id": str(spam_log.id),
-            }
-        except Exception as hide_error:
-            spam_log.mark_as_failed(str(hide_error))
-            return {
-                "is_spam": True,
-                "status": "failed_to_hide",
-                "spam_filter_processed": True,
-                "spam_reasons": reasons,
-                "error": str(hide_error),
-                "spam_log_id": str(spam_log.id),
-            }
-
-    except Exception as e:
-        logger.exception(f"Error in spam check: {e}")
-        return {"is_spam": False, "spam_filter_processed": False, "error": str(e)}
-
-
 # ═════════════════════════════════════════════════════════════
 # IG Long-lived Token 자동 갱신 (KST 09:00 daily)
 # ═════════════════════════════════════════════════════════════
@@ -2422,9 +2553,11 @@ def refresh_ig_tokens_pending_expiry(self):
             # 배포·일시 토큰오류로 죽었던 발송이 토큰 복구와 동시에 자동 재발송된다.
             revive_failed_token_logs.delay(str(conn.id))
         except Exception as e:
-            logger.exception("IG token refresh failed: conn=%s err=%s", conn.id, e)
+            # H-9: 예외 문자열에 토큰 URL 이 섞일 수 있으므로 로그·DB 저장 전 마스킹.
+            safe_err = scrub_secrets(str(e))
+            logger.exception("IG token refresh failed: conn=%s err=%s", conn.id, safe_err)
             try:
-                conn.error_message = f"refresh failed: {e}"[:500]
+                conn.error_message = f"refresh failed: {safe_err}"[:500]
                 conn.save(update_fields=["error_message", "updated_at"])
             except Exception:
                 pass
@@ -2432,7 +2565,7 @@ def refresh_ig_tokens_pending_expiry(self):
                 {
                     "id": str(conn.id),
                     "username": conn.username or "(unknown)",
-                    "error": str(e)[:200],
+                    "error": safe_err[:200],
                 }
             )
 

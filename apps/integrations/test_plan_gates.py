@@ -16,9 +16,10 @@ from apps.integrations.models import (
     AutoDMCampaign,
     IGAccountConnection,
     SentDMLog,
+    SpamCommentLog,
     SpamFilterConfig,
 )
-from apps.integrations.tasks import _check_and_handle_spam, send_dm_task
+from apps.integrations.tasks import run_spam_filter_check, send_dm_task
 from apps.workspace.models import Membership, Workspace
 
 User = get_user_model()
@@ -233,24 +234,28 @@ class TestSpamFilterGate:
         _give_plan(user, "free")
         ws = _ws(user)
         conn = _conn(ws)
-        campaign = _campaign(conn)
         SpamFilterConfig.objects.create(
             ig_connection=conn,
             status=SpamFilterConfig.Status.ACTIVE,
             spam_keywords=["아이돌"],
         )
 
-        result = _check_and_handle_spam(
-            comment_id="c1",
-            comment_text="아이돌 영상 원본",
-            from_user_id="u1",
-            from_username="spammer",
-            media_id=campaign.media_id,
-            webhook_payload={},
-        )
+        payload = {
+            "field": "comments",
+            "value": {
+                "id": "c1",
+                "text": "아이돌 영상 원본",
+                "from": {"id": "u1", "username": "spammer"},
+                "media": {"id": "m1"},
+            },
+            "entry_id": conn.external_account_id,
+        }
+        result = run_spam_filter_check.apply(args=[payload]).get()
 
-        assert result["is_spam"] is False
+        assert result["status"] == "skipped"
         assert result.get("reason") == "plan_not_allowed"
+        # 스팸 로그도 남지 않아야 함(게이트에서 조기 종료)
+        assert not SpamCommentLog.objects.filter(comment_id="c1").exists()
 
 
 # ──────────────────────────────────────────────

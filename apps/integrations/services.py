@@ -2,6 +2,7 @@
 Instagram OAuth and Mock Provider services
 """
 
+import re
 import threading
 from datetime import datetime
 from typing import Optional
@@ -11,6 +12,35 @@ import requests
 from django.conf import settings
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+# ── H-9/M-22: 토큰·시크릿 마스킹 ──
+# Meta Graph API 는 access_token 을 URL 쿼리로 받으므로, requests 의 HTTPError 문자열
+# (``... for url: https://.../refresh_access_token?...&access_token=<TOKEN>``)에 토큰이
+# 평문으로 들어간다. 로그·DB(error_message) 저장 전 반드시 scrub_secrets 를 통과시킬 것.
+_SECRET_QS_RE = re.compile(
+    r"(access_token|client_secret|authKey|billingKey|refresh_token|customerKey)=[^&\s\"']+",
+    re.IGNORECASE,
+)
+
+
+def scrub_secrets(text) -> str:
+    """URL 쿼리스트링/예외 문자열에서 토큰·시크릿 값을 ``name=***`` 로 마스킹."""
+    return _SECRET_QS_RE.sub(r"\1=***", str(text))
+
+
+def raise_for_status_clean(response) -> None:
+    """requests.raise_for_status 를 감싸 예외 메시지에서 토큰 URL 을 제거 (H-9).
+
+    상태코드만 남긴 예외로 교체하고 원본(URL 포함)은 ``from None`` 으로 체인에서 끊는다.
+    호출부가 ``e.response`` 로 상태코드/본문에 접근하는 것은 그대로 유지된다.
+    """
+    try:
+        response.raise_for_status()
+    except requests.HTTPError:
+        raise requests.HTTPError(
+            f"Instagram Graph API error: {response.status_code}", response=response
+        ) from None
+
 
 # ── P3b: Meta Graph API 호출용 커넥션 풀 재사용 세션 ──
 # 매 DM 발송마다 새 TCP+TLS 핸드셰이크를 만들지 않게 모듈 단위 Session 을 공유한다.
@@ -150,7 +180,7 @@ class InstagramOAuthService:
         }
 
         response = requests.get(cls.LONG_LIVED_TOKEN_URL, params=params)
-        response.raise_for_status()
+        raise_for_status_clean(response)
         return response.json()
 
     @classmethod
@@ -168,7 +198,7 @@ class InstagramOAuthService:
         }
 
         response = requests.get(cls.REFRESH_TOKEN_URL, params=params)
-        response.raise_for_status()
+        raise_for_status_clean(response)
         return response.json()
 
     @classmethod
@@ -185,7 +215,7 @@ class InstagramOAuthService:
         }
 
         response = requests.get(url, params=params)
-        response.raise_for_status()
+        raise_for_status_clean(response)
         return response.json()
 
     @classmethod
@@ -207,7 +237,7 @@ class InstagramOAuthService:
         }
 
         response = requests.post(url, params=params)
-        response.raise_for_status()
+        raise_for_status_clean(response)
         return response.json()
 
     @classmethod
@@ -220,7 +250,7 @@ class InstagramOAuthService:
         """
         url = f"{cls.GRAPH_API_BASE}/{ig_user_id}/subscribed_apps"
         response = requests.get(url, params={"access_token": access_token}, timeout=10)
-        response.raise_for_status()
+        raise_for_status_clean(response)
         return response.json()
 
     @classmethod
@@ -242,7 +272,7 @@ class InstagramOAuthService:
         params = {"access_token": access_token}
 
         response = requests.delete(url, params=params, timeout=10)
-        response.raise_for_status()
+        raise_for_status_clean(response)
         try:
             return response.json()
         except ValueError:
@@ -1082,7 +1112,7 @@ class InstagramMediaService:
             "access_token": access_token,
         }
         resp = requests.get(url, params=params, timeout=cls.DEFAULT_TIMEOUT)
-        resp.raise_for_status()
+        raise_for_status_clean(resp)
         body = resp.json() or {}
         return body.get("data", []) or []
 
@@ -1113,7 +1143,7 @@ class InstagramMediaService:
         url = f"{cls.GRAPH_API_BASE}/{ig_user_id}/stories"
         params = {"fields": fields, "access_token": access_token}
         resp = requests.get(url, params=params, timeout=cls.DEFAULT_TIMEOUT)
-        resp.raise_for_status()
+        raise_for_status_clean(resp)
         body = resp.json() or {}
         return body.get("data", []) or []
 

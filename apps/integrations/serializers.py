@@ -953,6 +953,8 @@ class SpamFilterConfigSerializer(serializers.ModelSerializer):
             "status",
             "spam_keywords",
             "block_urls",
+            "auto_hide_enabled",
+            "use_llm",
             "total_spam_detected",
             "total_hidden",
             "is_active",
@@ -979,7 +981,7 @@ class SpamFilterConfigUpdateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = SpamFilterConfig
-        fields = ["status", "spam_keywords", "block_urls"]
+        fields = ["status", "spam_keywords", "block_urls", "auto_hide_enabled", "use_llm"]
 
     def validate_spam_keywords(self, value):
         """스팸 키워드 검증"""
@@ -1010,6 +1012,9 @@ class SpamCommentLogSerializer(serializers.ModelSerializer):
             "commenter_username",
             "media_id",
             "spam_reasons",
+            "confidence",
+            "spam_category",
+            "engine",
             "status",
             "error_message",
             "webhook_payload",
@@ -1018,3 +1023,41 @@ class SpamCommentLogSerializer(serializers.ModelSerializer):
             "hidden_at",
         ]
         read_only_fields = fields  # 모두 읽기 전용
+
+
+class SpamDashboardSummarySerializer(serializers.Serializer):
+    """스팸 대시보드 요약 카드 (오늘/어제/누적/최근7일)."""
+
+    today_detected = serializers.IntegerField(help_text="오늘 감지한 스팸 수")
+    yesterday_detected = serializers.IntegerField(help_text="어제 감지한 스팸 수")
+    today_hidden = serializers.IntegerField(help_text="오늘 차단(숨김)한 댓글 수")
+    yesterday_hidden = serializers.IntegerField(help_text="어제 차단(숨김)한 댓글 수")
+    total_detected = serializers.IntegerField(help_text="총 감지한 스팸 수(누적)")
+    last7_detected = serializers.IntegerField(help_text="최근 7일 감지한 스팸 수")
+    total_hidden = serializers.IntegerField(help_text="총 차단(숨김)한 댓글 수(누적)")
+    last7_hidden = serializers.IntegerField(help_text="최근 7일 차단(숨김)한 댓글 수")
+
+
+class SpamDashboardChartPointSerializer(serializers.Serializer):
+    """14일 차트의 하루치 포인트."""
+
+    date = serializers.CharField(help_text="YYYY-MM-DD (Asia/Seoul)")
+    detected = serializers.IntegerField(help_text="해당일 스팸 감지 수")
+    hidden = serializers.IntegerField(help_text="해당일 댓글 차단 수")
+
+
+class SpamDashboardBiweeklySerializer(serializers.Serializer):
+    """최근 2주 평균/최대."""
+
+    avg_detected = serializers.FloatField(help_text="일 평균 스팸 감지")
+    avg_hidden = serializers.FloatField(help_text="일 평균 댓글 차단")
+    max_detected = serializers.IntegerField(help_text="일 최대 스팸 감지")
+    max_hidden = serializers.IntegerField(help_text="일 최대 댓글 차단")
+
+
+class SpamDashboardSerializer(serializers.Serializer):
+    """스팸 필터 대시보드 응답(요약 카드 + 14일 차트 + 2주 통계)."""
+
+    summary = SpamDashboardSummarySerializer()
+    chart_14d = SpamDashboardChartPointSerializer(many=True)
+    biweekly = SpamDashboardBiweeklySerializer()

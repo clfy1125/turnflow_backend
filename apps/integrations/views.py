@@ -13,6 +13,7 @@ from django.db.models import F
 from django.http import HttpResponse
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
+from django.utils.html import escape
 from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes
@@ -61,12 +62,30 @@ from .serializers import (
     IGAccountConnectionSerializer,
     SentDMLogSerializer,
     SpamCommentLogSerializer,
+    SpamDashboardSerializer,
     SpamFilterConfigSerializer,
     SpamFilterConfigUpdateSerializer,
 )
 from .services import InstagramOAuthService, MockInstagramProvider
 
 logger = logging.getLogger(__name__)
+
+
+def _js_embed(value) -> str:
+    """값을 인라인 <script> 안에 안전하게 삽입할 JS 리터럴로 직렬화 (H-5/M-8 XSS 방어).
+
+    json.dumps 로 따옴표·역슬래시를 이스케이프하고, `</`(script 조기 종료)와
+    U+2028/U+2029(JS 줄바꿈)를 추가로 무력화한다. 반환값은 이미 따옴표를 포함하므로
+    JS 문자열/객체 리터럴 위치에 **따옴표 없이** 그대로 끼워 넣는다.
+    """
+    import json
+
+    return (
+        json.dumps(value, ensure_ascii=False, default=str)
+        .replace("</", "<\\/")
+        .replace(" ", "\\u2028")
+        .replace(" ", "\\u2029")
+    )
 
 
 class InstagramIntegrationViewSet(viewsets.ViewSet):
@@ -338,7 +357,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
             </head>
             <body>
                 <h2 class="error">❌ OAuth 인증 실패</h2>
-                <p>{error}</p>
+                <p>{escape(error)}</p>
                 <p>창이 자동으로 닫힙니다...</p>
                 <script>
                     if (window.opener) {{
@@ -346,7 +365,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                             type: 'INSTAGRAM_ERROR',
                             success: false,
                             errorCode: 'OAUTH_AUTHORIZATION_FAILED',
-                            message: 'OAuth 인증에 실패했습니다: {error}'
+                            message: {_js_embed("OAuth 인증에 실패했습니다: " + str(error))}
                         }}, '*');
                         setTimeout(() => window.close(), 2000);
                     }}
@@ -659,8 +678,8 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
             <body>
                 <h2 class="success">✅ Instagram 연동 성공!</h2>
                 <div class="account">
-                    <p><strong>계정:</strong> @{connection_data.get('username', 'Unknown')}</p>
-                    <p><strong>유형:</strong> {connection_data.get('account_type', 'BUSINESS')}</p>
+                    <p><strong>계정:</strong> @{escape(str(connection_data.get('username', 'Unknown')))}</p>
+                    <p><strong>유형:</strong> {escape(str(connection_data.get('account_type', 'BUSINESS')))}</p>
                 </div>
                 <p>창이 자동으로 닫힙니다...</p>
                 <script>
@@ -668,7 +687,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                         window.opener.postMessage({{
                             type: 'INSTAGRAM_CONNECTED',
                             success: true,
-                            connection: {str(connection_data).replace("'", '"')}
+                            connection: {_js_embed(dict(connection_data))}
                         }}, '*');
                         setTimeout(() => window.close(), 1500);
                     }}
@@ -714,7 +733,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                             type: 'INSTAGRAM_ERROR',
                             success: false,
                             errorCode: 'INTERNAL_ERROR',
-                            message: '서버 오류가 발생했습니다: {str(e)}'
+                            message: {_js_embed("서버 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")}
                         }}, '*');
                         setTimeout(() => window.close(), 2000);
                     }}
@@ -3826,7 +3845,9 @@ def _verify_webhook_signature(request, logger) -> bool:
 
     secret = InstagramOAuthService.get_instagram_app_secret()
     if not secret:
-        return True  # secret 없으면(로컬/mock) 검증 생략
+        # secret 미설정 시: enforce 모드면 fail-closed(False, 검증 불가 = 거부),
+        # 아니면(로컬/mock) 검증 생략(True). prod.py 는 enforce 시 secret 존재를 부팅 가드로 강제.
+        return not getattr(settings, "WEBHOOK_HMAC_ENFORCED", False)
     header = request.META.get("HTTP_X_HUB_SIGNATURE_256", "") or request.headers.get(
         "X-Hub-Signature-256", ""
     )
@@ -3906,8 +3927,10 @@ def instagram_webhook(request):
 
                     # 댓글 이벤트 처리
                     if field == "comments":
-                        # Celery 태스크 비동기 실행
-                        from .tasks import process_comment_and_send_dm
+                        # Celery 태스크 비동기 실행.
+                        # DM 캠페인과 스팸 필터는 **독립**된 두 태스크로 병렬 디스패치한다.
+                        # (스팸 판정이 DM 발송을 막지 않고, 3-7초 gemma 가 DM 디스패치를 굶기지 않게)
+                        from .tasks import process_comment_and_send_dm, run_spam_filter_check
 
                         webhook_data = {
                             "field": field,
@@ -3916,9 +3939,11 @@ def instagram_webhook(request):
                             "time": entry.get("time"),
                         }
 
-                        # 비동기 태스크 실행
+                        # 기존 DM 경로 (변경 없음)
                         process_comment_and_send_dm.delay(webhook_data)
-                        logger.debug(f"Queued DM task for comment: {value.get('id')}")
+                        # 신규 독립 스팸 필터 경로 — 계정 전체 검사(캠페인 유무 무관)
+                        run_spam_filter_check.delay(webhook_data)
+                        logger.debug(f"Queued DM + spam tasks for comment: {value.get('id')}")
 
                     elif field in ["mentions", "messaging_postbacks"]:
                         logger.debug(f"Received {field} event, but not processing yet")
@@ -4404,18 +4429,25 @@ class SpamFilterViewSet(viewsets.ViewSet):
         detail=False, methods=["get"], url_path="ig-connections/(?P<ig_connection_id>[^/.]+)/logs"
     )
     def get_logs(self, request, ig_connection_id=None):
-        """스팸 댓글 로그 조회"""
+        """스팸 댓글 로그 조회 (CLEAN 멱등 장부 행은 제외)"""
         spam_filter = self.get_spam_filter(ig_connection_id)
 
         logs = SpamCommentLog.objects.filter(spam_filter=spam_filter)
 
-        # 상태 필터
+        # 상태 필터 — 지정하면 그 상태만, 없으면 스팸 로그(detected/hidden/failed)만.
+        # CLEAN 은 중복 웹훅 방지용 내부 멱등 장부라 사용자 로그에서 제외한다.
         status_param = request.query_params.get("status")
         if status_param:
             logs = logs.filter(status=status_param)
+        else:
+            logs = logs.exclude(status=SpamCommentLog.Status.CLEAN)
 
-        # 개수 제한
-        limit = int(request.query_params.get("limit", 50))
+        # 개수 제한 (기본 50, 최대 500)
+        try:
+            limit = int(request.query_params.get("limit", 50))
+        except (TypeError, ValueError):
+            limit = 50
+        limit = max(1, min(limit, 500))
         logs = logs[:limit]
 
         serializer = SpamCommentLogSerializer(logs, many=True)
@@ -4584,3 +4616,340 @@ class SpamFilterViewSet(viewsets.ViewSet):
                 ],
             }
         )
+
+    # ───────────────────────── 대시보드 (사용자 통계/그래프) ─────────────────────────
+
+    @extend_schema(
+        summary="스팸 필터 대시보드 통계",
+        description="""
+        ## 목적
+        사용자 대시보드용 스팸 필터 통계. 요약 카드(오늘/어제/누적/최근 7일)와
+        최근 14일 일별 차트(감지·차단), 2주 평균/최대를 한 번에 반환합니다.
+
+        ## 용어
+        - **감지(detected)**: 스팸으로 판정된 댓글 수 (숨김 여부 무관). `created_at` 기준.
+        - **차단(hidden)**: 실제로 숨김 처리된 댓글 수. `hidden_at` 기준(자동/수동 숨김 모두 포함).
+
+        ## 인증
+        - **Bearer 토큰 필수**, 해당 워크스페이스 멤버여야 함.
+
+        ## 특징
+        - 집계는 로그 테이블에서 실시간 계산(별도 집계 배치 없음, 항상 정확).
+        - 시간대는 **Asia/Seoul** 기준 하루 경계.
+        - 데이터 없는 날짜는 0으로 채워 14개 항목을 항상 반환.
+
+        ## 사용 예시
+        ```javascript
+        const res = await fetch(
+          `/api/v1/integrations/spam-filters/ig-connections/${igConnectionId}/dashboard/`,
+          { headers: { Authorization: `Bearer ${accessToken}` } }
+        );
+        const { summary, chart_14d, biweekly } = await res.json();
+        ```
+
+        ## 응답 예시
+        ```json
+        {
+          "summary": {
+            "today_detected": 23, "yesterday_detected": 18,
+            "today_hidden": 23, "yesterday_hidden": 17,
+            "total_detected": 306, "last7_detected": 148,
+            "total_hidden": 298, "last7_hidden": 142
+          },
+          "chart_14d": [
+            {"date": "2026-06-23", "detected": 30, "hidden": 29},
+            {"date": "2026-06-24", "detected": 27, "hidden": 26}
+          ],
+          "biweekly": {"avg_detected": 22.0, "avg_hidden": 21.0, "max_detected": 35, "max_hidden": 33}
+        }
+        ```
+        """,
+        responses={
+            200: SpamDashboardSerializer,
+            401: OpenApiResponse(description="인증 실패"),
+            403: OpenApiResponse(description="권한 없음 - 워크스페이스 멤버 아님"),
+            404: OpenApiResponse(description="Instagram 계정을 찾을 수 없음"),
+        },
+    )
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="ig-connections/(?P<ig_connection_id>[^/.]+)/dashboard",
+    )
+    def dashboard(self, request, ig_connection_id=None):
+        """스팸 필터 대시보드 통계 조회"""
+        from django.db.models import Count, Q
+        from django.db.models.functions import TruncDate
+
+        spam_filter = self.get_spam_filter(ig_connection_id)
+
+        tz = timezone.get_current_timezone()
+        today = timezone.localtime().date()
+        yesterday = today - timedelta(days=1)
+        start_14 = today - timedelta(days=13)  # 오늘 포함 14일
+
+        base = SpamCommentLog.objects.filter(spam_filter=spam_filter)
+        clean = SpamCommentLog.Status.CLEAN
+        hidden = SpamCommentLog.Status.HIDDEN
+
+        # 누적 총계 — 카운터(stale 가능) 대신 로그 행에서 직접 집계
+        totals = base.aggregate(
+            total_detected=Count("id", filter=~Q(status=clean)),
+            total_hidden=Count("id", filter=Q(status=hidden)),
+        )
+
+        # 14일 감지 시계열(created_at) / 차단 시계열(hidden_at)
+        detected_rows = (
+            base.exclude(status=clean)
+            .filter(created_at__date__gte=start_14)
+            .annotate(d=TruncDate("created_at", tzinfo=tz))
+            .values("d")
+            .annotate(c=Count("id"))
+        )
+        hidden_rows = (
+            base.filter(status=hidden, hidden_at__date__gte=start_14)
+            .annotate(d=TruncDate("hidden_at", tzinfo=tz))
+            .values("d")
+            .annotate(c=Count("id"))
+        )
+        detected_map = {r["d"]: r["c"] for r in detected_rows}
+        hidden_map = {r["d"]: r["c"] for r in hidden_rows}
+
+        chart, det_series, hid_series = [], [], []
+        for i in range(14):
+            day = start_14 + timedelta(days=i)
+            det = detected_map.get(day, 0)
+            hid = hidden_map.get(day, 0)
+            chart.append({"date": day.strftime("%Y-%m-%d"), "detected": det, "hidden": hid})
+            det_series.append(det)
+            hid_series.append(hid)
+
+        last7_detected = sum(detected_map.get(today - timedelta(days=k), 0) for k in range(7))
+        last7_hidden = sum(hidden_map.get(today - timedelta(days=k), 0) for k in range(7))
+
+        data = {
+            "summary": {
+                "today_detected": detected_map.get(today, 0),
+                "yesterday_detected": detected_map.get(yesterday, 0),
+                "today_hidden": hidden_map.get(today, 0),
+                "yesterday_hidden": hidden_map.get(yesterday, 0),
+                "total_detected": totals["total_detected"] or 0,
+                "last7_detected": last7_detected,
+                "total_hidden": totals["total_hidden"] or 0,
+                "last7_hidden": last7_hidden,
+            },
+            "chart_14d": chart,
+            "biweekly": {
+                "avg_detected": round(sum(det_series) / 14, 1),
+                "avg_hidden": round(sum(hid_series) / 14, 1),
+                "max_detected": max(det_series) if det_series else 0,
+                "max_hidden": max(hid_series) if hid_series else 0,
+            },
+        }
+        return Response(SpamDashboardSerializer(data).data)
+
+    # ───────────────────────── 수동 모더레이션 (숨김/복원) ─────────────────────────
+
+    def _get_owned_log(self, request, log_id):
+        """멤버십 검증된 SpamCommentLog 조회. 없으면 404, 타 워크스페이스면 403."""
+        from django.core.exceptions import ValidationError
+        from rest_framework.exceptions import NotFound, PermissionDenied
+
+        try:
+            log = SpamCommentLog.objects.select_related(
+                "spam_filter__ig_connection__workspace"
+            ).get(id=log_id)
+        except (SpamCommentLog.DoesNotExist, ValidationError, ValueError):
+            raise NotFound(detail="스팸 로그를 찾을 수 없습니다.") from None
+
+        workspace = log.spam_filter.ig_connection.workspace
+        if not workspace.memberships.filter(user=request.user).exists():
+            raise PermissionDenied("You are not a member of this workspace")
+        return log
+
+    def _moderation_throttle(self, conn, comment_id, action):
+        """숨김/복원 버튼 연타 제한 — Meta quota 소진·밴 방지.
+
+        차단이면 표준 429 Response(+ Retry-After 헤더)를 반환하고, 통과면 None.
+        Meta 호출 전에 호출해 연타/버스트가 실제 API 를 때리지 못하게 한다.
+        """
+        from .rate_governor import moderation_action_check
+
+        decision = moderation_action_check(conn.external_account_id, comment_id, action)
+        if decision.allowed:
+            return None
+        resp = Response(
+            {
+                "success": False,
+                "error": {
+                    "code": 429,
+                    "message": "숨김/복원 요청이 너무 잦습니다. 잠시 후 다시 시도해주세요.",
+                    "details": {
+                        "code": "moderation_rate_limited",
+                        "reason": decision.reason,
+                        "retry_after": decision.retry_after,
+                    },
+                },
+            },
+            status=status.HTTP_429_TOO_MANY_REQUESTS,
+        )
+        resp["Retry-After"] = str(decision.retry_after)
+        return resp
+
+    @extend_schema(
+        summary="스팸 댓글 수동 숨김",
+        description="""
+        ## 목적
+        감지되었으나 아직 숨겨지지 않은(detected) 스팸 댓글을 **수동으로 숨김** 처리합니다.
+        자동 숨김(auto_hide)을 꺼둔 계정에서 사용자가 검토 후 직접 숨길 때 사용합니다.
+
+        ## 인증 / 권한
+        - **Bearer 토큰 필수**, 해당 워크스페이스 멤버여야 함.
+        - **프로 플랜 전용** — 숨김은 필터링 동작이므로 게이트를 적용합니다.
+
+        ## 동작
+        1. Meta Graph API 로 댓글을 숨김(`hide=true`).
+        2. 로그 상태를 `hidden` 으로 갱신하고 `hidden_at` 기록.
+        3. Mock 모드(dev)에서는 실제 호출 없이 숨김 처리로 기록.
+
+        ## 사용 예시
+        ```javascript
+        await fetch(
+          `/api/v1/integrations/spam-filters/logs/${logId}/hide/`,
+          { method: 'POST', headers: { Authorization: `Bearer ${accessToken}` } }
+        );
+        ```
+        """,
+        responses={
+            200: SpamCommentLogSerializer,
+            401: OpenApiResponse(description="인증 실패"),
+            403: OpenApiResponse(description="권한 없음 - 프로 전용 또는 멤버 아님"),
+            404: OpenApiResponse(description="스팸 로그를 찾을 수 없음"),
+            429: OpenApiResponse(
+                description=(
+                    "숨김/복원 연타 제한 — 같은 댓글 더블클릭 또는 계정 분/시 상한 초과. "
+                    "`error.details.code=moderation_rate_limited`, `retry_after`(초)와 "
+                    "`Retry-After` 헤더 제공. Meta API 사용량 보호용."
+                )
+            ),
+            502: OpenApiResponse(description="Meta API 숨김 처리 실패"),
+        },
+    )
+    @action(detail=False, methods=["post"], url_path="logs/(?P<log_id>[^/.]+)/hide")
+    def hide_log(self, request, log_id=None):
+        """스팸 댓글 수동 숨김 (프로 전용)"""
+        from .services import InstagramCommentService, scrub_secrets
+
+        log = self._get_owned_log(request, log_id)
+
+        gate = self._spam_filter_plan_gate(request, log.spam_filter)
+        if gate is not None:
+            return gate
+
+        conn = log.spam_filter.ig_connection
+
+        throttled = self._moderation_throttle(conn, log.comment_id, "hide")
+        if throttled is not None:
+            return throttled
+
+        if MockInstagramProvider.is_mock_token(conn.access_token):
+            log.mark_as_hidden({"mock": True})
+            log.spam_filter.increment_hidden()
+            return Response(SpamCommentLogSerializer(log).data)
+
+        try:
+            api_response = InstagramCommentService.hide_comment(
+                comment_id=log.comment_id, access_token=conn.access_token
+            )
+        except Exception as e:
+            log.mark_as_failed(scrub_secrets(str(e)))
+            return Response(
+                {
+                    "success": False,
+                    "error": {
+                        "code": 502,
+                        "message": "댓글 숨김 처리에 실패했습니다. 잠시 후 다시 시도해주세요.",
+                        "details": {"reason": scrub_secrets(str(e))},
+                    },
+                },
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        log.mark_as_hidden(api_response)
+        log.spam_filter.increment_hidden()
+        return Response(SpamCommentLogSerializer(log).data)
+
+    @extend_schema(
+        summary="스팸 댓글 숨김 복원",
+        description="""
+        ## 목적
+        숨김 처리된 댓글을 **복원(숨김 해제)** 합니다. 오탐(정상 댓글이 스팸으로 숨겨진 경우)을
+        되돌릴 때 사용합니다.
+
+        ## 인증 / 권한
+        - **Bearer 토큰 필수**, 해당 워크스페이스 멤버여야 함.
+        - **게이트 없음** — 다운그레이드된 사용자도 잘못 숨겨진 댓글을 복원할 수 있어야 하므로
+          비활성화/복원은 열어둡니다.
+
+        ## 동작
+        1. Meta Graph API 로 숨김 해제(`hide=false`).
+        2. 로그 상태를 `detected` 로 되돌리고 `hidden_at` 을 비웁니다.
+        3. Mock 모드(dev)에서는 실제 호출 없이 상태만 갱신.
+
+        ## 사용 예시
+        ```javascript
+        await fetch(
+          `/api/v1/integrations/spam-filters/logs/${logId}/unhide/`,
+          { method: 'POST', headers: { Authorization: `Bearer ${accessToken}` } }
+        );
+        ```
+        """,
+        responses={
+            200: SpamCommentLogSerializer,
+            401: OpenApiResponse(description="인증 실패"),
+            403: OpenApiResponse(description="권한 없음 - 멤버 아님"),
+            404: OpenApiResponse(description="스팸 로그를 찾을 수 없음"),
+            429: OpenApiResponse(
+                description=(
+                    "숨김/복원 연타 제한 — 같은 댓글 더블클릭 또는 계정 분/시 상한 초과. "
+                    "`error.details.code=moderation_rate_limited`, `retry_after`(초)와 "
+                    "`Retry-After` 헤더 제공. Meta API 사용량 보호용."
+                )
+            ),
+            502: OpenApiResponse(description="Meta API 복원 실패"),
+        },
+    )
+    @action(detail=False, methods=["post"], url_path="logs/(?P<log_id>[^/.]+)/unhide")
+    def unhide_log(self, request, log_id=None):
+        """스팸 댓글 숨김 복원 (게이트 없음)"""
+        from .services import InstagramCommentService, scrub_secrets
+
+        log = self._get_owned_log(request, log_id)
+        conn = log.spam_filter.ig_connection
+
+        throttled = self._moderation_throttle(conn, log.comment_id, "unhide")
+        if throttled is not None:
+            return throttled
+
+        if not MockInstagramProvider.is_mock_token(conn.access_token):
+            try:
+                InstagramCommentService.unhide_comment(
+                    comment_id=log.comment_id, access_token=conn.access_token
+                )
+            except Exception as e:
+                return Response(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": 502,
+                            "message": "댓글 복원에 실패했습니다. 잠시 후 다시 시도해주세요.",
+                            "details": {"reason": scrub_secrets(str(e))},
+                        },
+                    },
+                    status=status.HTTP_502_BAD_GATEWAY,
+                )
+
+        log.status = SpamCommentLog.Status.DETECTED
+        log.hidden_at = None
+        log.save(update_fields=["status", "hidden_at"])
+        return Response(SpamCommentLogSerializer(log).data)

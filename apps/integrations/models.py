@@ -1355,6 +1355,22 @@ class SpamFilterConfig(models.Model):
     # URL 차단 설정
     block_urls = models.BooleanField(default=True, verbose_name="URL 차단")
 
+    # 자동 숨김 — 스팸 감지 시 Meta API 로 즉시 숨길지 여부.
+    # False(기본)면 감지만 DB 에 기록하고 유저가 수동으로 숨김한다(감지→수동 흐름).
+    # ⚠️ 계정 전체 검사로 전환되므로 기본 OFF 로 두어 대량 자동 숨김을 방지한다.
+    auto_hide_enabled = models.BooleanField(
+        default=False,
+        verbose_name="자동 숨김",
+        help_text="스팸 감지 시 자동으로 댓글을 숨김 처리 (off면 감지 기록만 → 수동 숨김 대기)",
+    )
+
+    # LLM 판정 사용 여부 — off면 규칙(키워드/URL)만으로 판정(gemma 롤아웃 kill-switch).
+    use_llm = models.BooleanField(
+        default=True,
+        verbose_name="LLM 판정 사용",
+        help_text="off면 gemma LLM 없이 키워드/URL 규칙만으로 스팸 판정",
+    )
+
     # 통계
     total_spam_detected = models.IntegerField(default=0, verbose_name="총 스팸 감지 수")
     total_hidden = models.IntegerField(default=0, verbose_name="총 숨김 처리 수")
@@ -1387,6 +1403,7 @@ class SpamCommentLog(models.Model):
     """
 
     class Status(models.TextChoices):
+        CLEAN = "clean", "정상"  # 스팸 아님 — 멱등 장부용(짧은 TTL 후 정리), 통계 제외
         DETECTED = "detected", "감지됨"
         HIDDEN = "hidden", "숨김처리"
         FAILED = "failed", "처리실패"
@@ -1400,6 +1417,16 @@ class SpamCommentLog(models.Model):
             models.Index(fields=["spam_filter", "status"]),
             models.Index(fields=["comment_id"]),
             models.Index(fields=["created_at"]),
+            models.Index(fields=["hidden_at"], name="spam_log_hidden_at_idx"),
+        ]
+        constraints = [
+            # 멱등성: 계정(spam_filter)당 comment_id 는 1행. 동시 중복 웹훅이
+            # get_or_create 로 이 제약에 경합 → 최초 1회만 분류/숨김 수행.
+            # (SeenComment 의 UNIQUE(ig_connection, comment_id) 선례와 동일)
+            models.UniqueConstraint(
+                fields=["spam_filter", "comment_id"],
+                name="uq_spam_log_filter_comment",
+            )
         ]
 
     # Primary key
@@ -1427,6 +1454,25 @@ class SpamCommentLog(models.Model):
         default=list,
         verbose_name="스팸 판정 이유",
         help_text="스팸으로 판단한 이유 목록 (예: ['contains_url', 'keyword:아이돌'])",
+    )
+
+    # LLM/하이브리드 판정 결과 (모더레이션 UI·디버그용)
+    confidence = models.FloatField(
+        null=True, blank=True, verbose_name="스팸 신뢰도", help_text="0.0~1.0 (LLM 판정 시)"
+    )
+    spam_category = models.CharField(
+        max_length=32,
+        blank=True,
+        default="",
+        verbose_name="스팸 분류",
+        help_text="rule/scam/adult/phishing/promo/abuse 등",
+    )
+    engine = models.CharField(
+        max_length=32,
+        blank=True,
+        default="",
+        verbose_name="판정 엔진",
+        help_text="rule / llm / llm_failopen / rule_trivial / rule_only 등",
     )
 
     # 처리 상태
