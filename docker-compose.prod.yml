@@ -81,6 +81,8 @@ services:
   pgbouncer:
     image: edoburu/pgbouncer:latest
     container_name: turnflow_instagram_pgbouncer
+    ports:
+      - "127.0.0.1:6432:6432"   # netdata(host-net)의 SHOW POOLS 스크레이프용(#6 pgbouncer 관측). 루프백 전용, 외부 미노출.
     restart: unless-stopped
     init: true
     logging: *default_logging
