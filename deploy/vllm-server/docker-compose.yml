@@ -36,7 +36,11 @@ services:
     environment:
       - VLLM_USE_TRITON_FLASH_ATTN=0
       - TORCH_COMPILE_DISABLE=True
-    entrypoint: /bin/sh -c "pip install --upgrade transformers && python3 -m vllm.entrypoints.openai.api_server --host 0.0.0.0 --port 8000 --model RedHatAI/gemma-4-31B-it-FP8-block --tensor-parallel-size 1 --gpu-memory-utilization 0.95 --max-model-len 65536 --kv-cache-dtype fp8 --max-num-seqs 16 --max-num-batched-tokens 16384 --enable-prefix-caching --enforce-eager --trust-remote-code --tool-call-parser gemma4 --reasoning-parser gemma4"
+      # 캐시된 모델만 사용 · HF API 미접촉 — 콜드스타트 시 huggingface 429(rate limit)로
+      # 모델 메타 조회가 실패해 재시작 루프에 빠지는 것 방지(2026-07-06 재부팅 때 실측).
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+    entrypoint: /bin/sh -c "pip install --upgrade 'transformers<5' && python3 -m vllm.entrypoints.openai.api_server --host 0.0.0.0 --port 8000 --model RedHatAI/gemma-4-31B-it-FP8-block --tensor-parallel-size 1 --gpu-memory-utilization 0.95 --max-model-len 65536 --kv-cache-dtype fp8 --max-num-seqs 16 --max-num-batched-tokens 16384 --enable-prefix-caching --enforce-eager --trust-remote-code --tool-call-parser gemma4 --reasoning-parser gemma4"
     networks:
       - default
       - turnflow_instagram_net
