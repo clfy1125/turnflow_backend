@@ -40,7 +40,11 @@ services:
       # 모델 메타 조회가 실패해 재시작 루프에 빠지는 것 방지(2026-07-06 재부팅 때 실측).
       - HF_HUB_OFFLINE=1
       - TRANSFORMERS_OFFLINE=1
-    entrypoint: /bin/sh -c "pip install --upgrade 'transformers<5' && python3 -m vllm.entrypoints.openai.api_server --host 0.0.0.0 --port 8000 --model RedHatAI/gemma-4-31B-it-FP8-block --tensor-parallel-size 1 --gpu-memory-utilization 0.95 --max-model-len 65536 --kv-cache-dtype fp8 --max-num-seqs 16 --max-num-batched-tokens 16384 --enable-prefix-caching --enforce-eager --trust-remote-code --tool-call-parser gemma4 --reasoning-parser gemma4"
+    # gemma4 아키텍처는 transformers 5.x 부터 인식됨. 4.x 마지막(4.57.6)에는 gemma4 없음
+    #   → 'transformers<5' 로 핀하면 "model type gemma4 not recognized" 로 크래시 루프(2026-07-06 실측, 29회 재시작).
+    #   5.13.0 은 vLLM 0.19.0 과 import 호환 + 캐시 gemma4 config 정상 해석 검증됨 → 재현성 위해 정확히 핀.
+    #   ⚠️ 'transformers<5' 로 되돌리지 말 것.
+    entrypoint: /bin/sh -c "pip install --upgrade 'transformers==5.13.0' && python3 -m vllm.entrypoints.openai.api_server --host 0.0.0.0 --port 8000 --model RedHatAI/gemma-4-31B-it-FP8-block --tensor-parallel-size 1 --gpu-memory-utilization 0.95 --max-model-len 65536 --kv-cache-dtype fp8 --max-num-seqs 16 --max-num-batched-tokens 16384 --enable-prefix-caching --enforce-eager --trust-remote-code --tool-call-parser gemma4 --reasoning-parser gemma4"
     networks:
       - default
       - turnflow_instagram_net
