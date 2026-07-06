@@ -14,8 +14,16 @@ services:
     container_name: gemma-vllm
     runtime: nvidia
     ipc: host
+    # 자원 상한 — 런타임 폭주/누수가 호스트를 잠식해 turnflow 스택을 굶기는 것 방지.
+    # host RAM 실측 peak 9.7GiB(2.5개월) → 32g 는 3.3x 여유(정상 추론 무영향, 폭주만 차단).
+    # 실제 제약은 GPU VRAM(H100, gpu-memory-utilization 0.95)이라 host RAM cap 은 안전.
+    # 운영엔 무중단 docker update 로 선반영(2026-07-06); 이 블록은 다음 recreate/재부팅 대비 영속화.
+    restart: unless-stopped
     deploy:
       resources:
+        limits:
+          cpus: "12"
+          memory: 32g
         reservations:
           devices:
             - driver: nvidia
