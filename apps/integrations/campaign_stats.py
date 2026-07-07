@@ -52,6 +52,31 @@ SENT_FOR_QUOTA_STATUSES = [
     SentDMLog.Status.FAILED_NO_TRACE,
     SentDMLog.Status.SENT,  # legacy
 ]
+# "발송 성공" 표시용: v3 정상 흐름(accepted 이후) + legacy sent.
+# ⚠️ v3 상태머신에서 성공 DM 은 accepted→delivered→read 로 가고 legacy 'sent' 가 되지
+# 않는다 — status='sent' 단독 카운트는 성공할수록 0 이 되는 함정 (2026-07-07 prod 실측).
+SENT_OK_STATUSES = [
+    SentDMLog.Status.ACCEPTED,
+    SentDMLog.Status.DELIVERED,
+    SentDMLog.Status.READ,
+    SentDMLog.Status.SENT,  # legacy
+]
+# "발송 실패" 표시용: 분류 실패(v3.2) + legacy. FAILED_NO_TRACE 는 '도착 미확인'이지
+# 실패가 아니므로 제외 (total_unconfirmed / unconfirmed 로 별도 노출).
+FAILED_STATUSES = [
+    SentDMLog.Status.FAILED,  # legacy
+    SentDMLog.Status.FAILED_TOKEN,
+    SentDMLog.Status.FAILED_WINDOW,
+    SentDMLog.Status.FAILED_PARAM,
+    SentDMLog.Status.FAILED_API,  # legacy alias
+]
+# "진행 중" 표시용: 아직 종결되지 않은 발송 전/중 상태 + legacy pending.
+IN_FLIGHT_STATUSES = [
+    SentDMLog.Status.QUEUED,
+    SentDMLog.Status.SUBMITTING,
+    SentDMLog.Status.RATE_LIMITED,
+    SentDMLog.Status.PENDING,  # legacy
+]
 
 # annotate 결과를 담는 임시 속성명 (모델 필드와 충돌 안 나게 언더스코어 프리픽스)
 _ANNO_CONFIRMED = "_confirmed_delivered"

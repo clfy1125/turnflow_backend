@@ -425,3 +425,72 @@ class TestBulkActions:
         _, user = ws_user
         resp = _client(user).post(LIST_URL + "bulk-pause/", {"ids": []}, format="json")
         assert resp.status_code == 400, resp.content
+
+
+@pytest.mark.django_db
+class TestCampaignStatsV3Statuses:
+    """GET .../{id}/stats/ — last_24h 가 v3 상태머신을 집계하는지.
+
+    회귀 배경(2026-07-07 prod 실측): 성공 DM 은 accepted→delivered→read 로 전이하고
+    legacy 'sent' 가 되지 않는데, 기존 코드가 status='sent' 만 세서 성공할수록
+    sent=0 으로 표시됐다 ("DM 발송 0" 프로덕션 버그).
+    """
+
+    def _stats(self, user, campaign):
+        resp = _client(user).get(f"{LIST_URL}{campaign.id}/stats/")
+        assert resp.status_code == 200, resp.content
+        return resp.data
+
+    def test_v3_success_statuses_counted_as_sent(self, ws_user, conn):
+        _, user = ws_user
+        campaign = _make_campaign(conn, "stats-v3")
+        _log(campaign, SentDMLog.Status.ACCEPTED)
+        _log(campaign, SentDMLog.Status.DELIVERED)
+        _log(campaign, SentDMLog.Status.READ)
+
+        d = self._stats(user, campaign)["last_24h"]
+        assert d["total"] == 3
+        assert d["sent"] == 3  # 회귀 지점 — 기존 코드는 0
+        assert d["delivered"] == 2  # delivered + read
+        assert d["read"] == 1
+        assert d["failed"] == 0
+
+    def test_failed_and_inflight_and_unconfirmed(self, ws_user, conn):
+        _, user = ws_user
+        campaign = _make_campaign(conn, "stats-mix")
+        _log(campaign, SentDMLog.Status.FAILED_TOKEN)
+        _log(campaign, SentDMLog.Status.FAILED_WINDOW)
+        _log(campaign, SentDMLog.Status.QUEUED)
+        _log(campaign, SentDMLog.Status.SUBMITTING)
+        _log(campaign, SentDMLog.Status.SKIPPED)
+        _log(campaign, SentDMLog.Status.FAILED_NO_TRACE)
+
+        d = self._stats(user, campaign)["last_24h"]
+        assert d["total"] == 6
+        assert d["failed"] == 2  # 분류 실패 (no_trace 는 실패 아님)
+        assert d["pending"] == 2  # queued + submitting
+        assert d["skipped"] == 1
+        assert d["unconfirmed"] == 1  # 도착 미확인은 별도 키
+        assert d["sent"] == 0
+
+    def test_child_logs_excluded(self, ws_user, conn):
+        """재안내/보상(child) 행은 24h 집계에서 제외 — 댓글 1건 = 1행 유지."""
+        _, user = ws_user
+        campaign = _make_campaign(conn, "stats-child")
+        opening = _log(
+            campaign,
+            SentDMLog.Status.READ,
+            dm_kind=SentDMLog.DMKind.OPENING,
+            gate_status=SentDMLog.GateStatus.PASSED,
+        )
+        _log(
+            campaign,
+            SentDMLog.Status.READ,
+            dm_kind=SentDMLog.DMKind.REWARD,
+            gate_status=SentDMLog.GateStatus.PASSED,
+            parent_log=opening,
+        )
+
+        d = self._stats(user, campaign)["last_24h"]
+        assert d["total"] == 1
+        assert d["sent"] == 1
