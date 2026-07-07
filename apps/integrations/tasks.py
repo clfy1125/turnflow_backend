@@ -2649,6 +2649,46 @@ def _build_token_refresh_summary(*, checked: int, succeeded: list, failed: list)
 # Follow-gate (v3.8): postback 수신 → IG Profile API 로 팔로우 확인 → 분기
 # ═════════════════════════════════════════════════════════════
 
+_GATE_CHAIN_MAX_HOPS = 10
+
+
+def _gate_chain(log: SentDMLog) -> list[SentDMLog]:
+    """클릭된 로그부터 parent_log 를 따라 플로우 루트까지의 체인 (clicked → … → root).
+
+    재안내(retry) DM 은 자신의 id 로 새 quick_reply 버튼을 달고 나가므로, postback 이
+    참조하는 로그는 루트 opening 이 아니라 체인 중간 노드일 수 있다. 게이트 통과 마킹과
+    reward 멱등 판정을 클릭된 노드 기준으로만 하면 루트가 PENDING 으로 남아
+    (= 기본 로그 API 의 follow_passed / 전환 통계가 영구 '미전환') 루트 버튼 재클릭 시
+    reward 중복 발송 구멍도 생긴다 — 반드시 체인 전체 기준으로 판정한다.
+    """
+    chain = [log]
+    cur = log
+    for _ in range(_GATE_CHAIN_MAX_HOPS):
+        if cur.parent_log_id is None:
+            break
+        cur = cur.parent_log
+        chain.append(cur)
+    return chain
+
+
+def _gate_flow_ids(root: SentDMLog) -> list:
+    """루트 opening 에서 시작하는 플로우 전체(루트 + 모든 자손 로그)의 pk 목록.
+
+    reward/재안내는 '클릭된 노드'에 붙으므로 루트의 직계 자식이 아닐 수 있다 —
+    reward 중복 존재 검사와 재안내 스로틀은 상향 체인이 아니라 이 플로우 전체로 한다.
+    """
+    ids = [root.pk]
+    frontier = [root.pk]
+    for _ in range(_GATE_CHAIN_MAX_HOPS):
+        children = list(
+            SentDMLog.objects.filter(parent_log_id__in=frontier).values_list("pk", flat=True)
+        )
+        if not children:
+            break
+        ids.extend(children)
+        frontier = children
+    return ids
+
 
 @shared_task(bind=True, max_retries=3)
 def process_follow_gate_postback(
@@ -2700,6 +2740,12 @@ def process_follow_gate_postback(
     if opening.dm_kind != SentDMLog.DMKind.OPENING:
         return {"status": "skipped", "reason": "not_opening_dm"}
 
+    # 재안내 버튼 postback 은 체인 중간 노드를 참조한다 — 루트가 이미 통과한 플로우면 skip
+    # (재안내로 통과한 뒤 원래 opening 버튼을 다시 누르는 경우의 reward 중복 방지).
+    chain = _gate_chain(opening)
+    if chain[-1].gate_status == SentDMLog.GateStatus.PASSED:
+        return {"status": "already_passed", "opening_log_id": str(opening.id)}
+
     # 30초 쿨다운 — 사용자가 버튼을 연타해도 한 번만 IG API 호출
     cooldown_cutoff = timezone.now() - timedelta(seconds=30)
     recent_followup = SentDMLog.objects.filter(
@@ -2717,7 +2763,7 @@ def process_follow_gate_postback(
     # 모두 통과한 뒤이므로, gate_verify_follow=false 면 check_user_follow_business
     # 호출 없이 바로 reward 큐에 넣는다 (연타·중복 방어는 위 가드가 동일하게 적용됨).
     if not campaign.gate_verify_follow:
-        return _enqueue_reward_dm(opening=opening, igsid=igsid)
+        return _enqueue_reward_dm(opening=opening, igsid=igsid, chain=chain)
 
     # IG Profile API 호출
     try:
@@ -2732,31 +2778,71 @@ def process_follow_gate_postback(
         logger.warning("follow-gate: profile check failed (terminal) log=%s err=%s", opening.id, e)
         return {"status": "failed", "reason": str(e)}
 
+    # 판정 근거를 영구 기록 — "팔로우 했는데 미통과" 분쟁 시 Meta 가 False 를 준 것인지
+    # 필드 누락(None → 보수적 미통과)인지 사후 구분이 불가능했던 관측성 갭 보완.
+    opening.append_verification_log({"path": "follow_check", "igsid": igsid, "result": is_follow})
+    logger.info(
+        "follow-gate: check campaign=%s log=%s igsid=%s is_follow=%r",
+        campaign.id,
+        opening.id,
+        igsid,
+        is_follow,
+    )
+
     follow_passed = bool(is_follow)
     if is_follow is None:
         # Meta 가 필드를 안 내려준 경우 — 권한/잘못된 IGSID. 보수적으로 미통과 처리.
         follow_passed = False
 
     if follow_passed:
-        return _enqueue_reward_dm(opening=opening, igsid=igsid)
-    return _enqueue_follow_retry(opening=opening, igsid=igsid)
+        return _enqueue_reward_dm(opening=opening, igsid=igsid, chain=chain)
+    return _enqueue_follow_retry(opening=opening, igsid=igsid, chain=chain)
 
 
-def _enqueue_reward_dm(*, opening: SentDMLog, igsid: str) -> dict:
-    """Gate 통과 → reward DM 발송 큐에 enqueue."""
+def _enqueue_reward_dm(
+    *, opening: SentDMLog, igsid: str, chain: list[SentDMLog] | None = None
+) -> dict:
+    """Gate 통과 → reward DM 발송 큐에 enqueue. 체인 전체(루트 포함)를 PASSED 로 마킹."""
     campaign = opening.campaign
+    chain = chain or _gate_chain(opening)
+    root = chain[-1]
+    flow_ids = _gate_flow_ids(root)
+
+    def _mark_flow_passed():
+        # 루트만 PENDING 으로 남으면 기본 로그 API 의 follow_passed / 전환 통계가
+        # 영구 '미전환' 으로 잘못 표시된다 — 클릭된 노드가 아니라 플로우의
+        # opening 계열(루트+재안내) 전체를 마킹.
+        SentDMLog.objects.filter(pk__in=flow_ids, dm_kind=SentDMLog.DMKind.OPENING).update(
+            gate_status=SentDMLog.GateStatus.PASSED
+        )
+
     reward_body = (campaign.reward_message_template or "").strip()
     if not reward_body:
         # 정책상 reward 비어있으면 게이트도 못 켜지지만 안전망
-        opening.gate_status = SentDMLog.GateStatus.PASSED
-        opening.save(update_fields=["gate_status", "sent_at"])
+        _mark_flow_passed()
         return {"status": "passed_no_reward", "opening_log_id": str(opening.id)}
 
-    # reward 는 새 idempotency_key (opening_log_id 를 시드로) — 같은 opening 에서
-    # 두 번 PASSED 처리해도 같은 키가 나와 DB UNIQUE 로 중복 방지.
+    # 플로우 단위 중복 방어 1: 플로우 어느 노드에든 이미 reward 자식이 있으면 재발송 금지.
+    # (기존 데이터는 reward 멱등키가 '클릭된 노드' 기준이라, 아래 루트 기준 키만으로는
+    #  재안내로 통과한 과거 플로우의 reward 를 못 잡는다 — 루트 버튼 재클릭 시 중복 구멍.
+    #  reward 는 재안내 노드에 붙어 있을 수 있어 상향 체인이 아닌 플로우 전체로 검사.)
+    existing = SentDMLog.objects.filter(
+        dm_kind=SentDMLog.DMKind.REWARD, parent_log_id__in=flow_ids
+    ).first()
+    if existing is not None:
+        _mark_flow_passed()
+        return {
+            "status": "duplicate_reward",
+            "opening_log_id": str(opening.id),
+            "reward_log_id": str(existing.id),
+        }
+
+    # 플로우 단위 중복 방어 2: 멱등키를 클릭된 노드가 아닌 '루트' 기준으로 — 체인의
+    # 서로 다른 버튼(원 opening / 재안내)을 눌러도 같은 키 → DB UNIQUE 로 한 번만 발송.
+    # (재안내 없는 플로우는 루트 == 클릭된 노드라 기존 키 체계와 동일.)
     import hashlib
 
-    key_raw = f"reward:{campaign.id}:{opening.id}"
+    key_raw = f"reward:{campaign.id}:{root.id}"
     idem = hashlib.sha256(key_raw.encode("utf-8")).hexdigest()
 
     reward_log, created = SentDMLog.create_idempotent(
@@ -2778,8 +2864,8 @@ def _enqueue_reward_dm(*, opening: SentDMLog, igsid: str) -> dict:
             "opening_log_id": str(opening.id),
             "reward_log_id": str(reward_log.id) if reward_log else None,
         }
-    # opening 도 PASSED 로 마킹 (reward dedup 이 이미 보장되므로 분리해도 무손실·멱등)
-    SentDMLog.objects.filter(pk=opening.pk).update(gate_status=SentDMLog.GateStatus.PASSED)
+    # 플로우 전체 PASSED 마킹 (reward dedup 이 이미 보장되므로 분리해도 무손실·멱등)
+    _mark_flow_passed()
 
     send_dm_task.delay(str(reward_log.id))
     return {
@@ -2789,7 +2875,9 @@ def _enqueue_reward_dm(*, opening: SentDMLog, igsid: str) -> dict:
     }
 
 
-def _enqueue_follow_retry(*, opening: SentDMLog, igsid: str) -> dict:
+def _enqueue_follow_retry(
+    *, opening: SentDMLog, igsid: str, chain: list[SentDMLog] | None = None
+) -> dict:
     """Gate 미통과 → 재안내 메시지 + 같은 quick_reply 재첨부.
 
     매 재시도마다 새 SentDMLog 가 생기지만, parent_log 로 opening 에 묶인다.
@@ -2797,6 +2885,25 @@ def _enqueue_follow_retry(*, opening: SentDMLog, igsid: str) -> dict:
     재시도 로그도 OPENING + PENDING 으로 만들어 send_dm_task 가 quick_reply 를 첨부하게 한다.
     """
     campaign = opening.campaign
+    chain = chain or _gate_chain(opening)
+    flow_ids = _gate_flow_ids(chain[-1])
+
+    # 플로우 전체 30초 재안내 스로틀 — 재안내마다 자기 id 의 새 버튼이 생기므로
+    # postback 핸들러의 '클릭된 노드의 자식' 쿨다운만으로는 최신 재안내 버튼 연타를
+    # 못 막는다(새 노드는 자식이 없음). 통과(reward) 경로는 스로틀하지 않는다.
+    cooldown_cutoff = timezone.now() - timedelta(seconds=30)
+    recent_retry = SentDMLog.objects.filter(
+        parent_log_id__in=flow_ids,
+        dm_kind=SentDMLog.DMKind.OPENING,
+        created_at__gte=cooldown_cutoff,
+    ).exists()
+    if recent_retry:
+        return {
+            "status": "skipped",
+            "reason": "retry_cooldown",
+            "opening_log_id": str(opening.id),
+        }
+
     retry_body = campaign.get_follow_gate_retry_message()
 
     # 멱등성 키: 같은 opening 의 재시도들은 시각까지 포함해 매번 다르게.
