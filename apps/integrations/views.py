@@ -13,7 +13,6 @@ from django.db.models import F
 from django.http import HttpResponse
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
-from django.utils.html import escape
 from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes
@@ -31,6 +30,7 @@ from apps.ai_jobs.serializers import (
 from apps.core.exceptions import DuplicateActiveCampaignError
 from apps.workspace.models import Workspace
 
+from . import oauth_callback_pages
 from .campaign_stats import (
     annotate_campaign_stats,
     build_counts,
@@ -69,23 +69,6 @@ from .serializers import (
 from .services import InstagramOAuthService, MockInstagramProvider
 
 logger = logging.getLogger(__name__)
-
-
-def _js_embed(value) -> str:
-    """값을 인라인 <script> 안에 안전하게 삽입할 JS 리터럴로 직렬화 (H-5/M-8 XSS 방어).
-
-    json.dumps 로 따옴표·역슬래시를 이스케이프하고, `</`(script 조기 종료)와
-    U+2028/U+2029(JS 줄바꿈)를 추가로 무력화한다. 반환값은 이미 따옴표를 포함하므로
-    JS 문자열/객체 리터럴 위치에 **따옴표 없이** 그대로 끼워 넣는다.
-    """
-    import json
-
-    return (
-        json.dumps(value, ensure_ascii=False, default=str)
-        .replace("</", "<\\/")
-        .replace(" ", "\\u2028")
-        .replace(" ", "\\u2029")
-    )
 
 
 class InstagramIntegrationViewSet(viewsets.ViewSet):
@@ -344,101 +327,15 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
 
         # Check for errors
         if error:
-            html = f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <meta charset="UTF-8">
-                <title>Instagram 연동 실패</title>
-                <style>
-                    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 40px; text-align: center; }}
-                    .error {{ color: #dc3545; }}
-                </style>
-            </head>
-            <body>
-                <h2 class="error">❌ OAuth 인증 실패</h2>
-                <p>{escape(error)}</p>
-                <p>창이 자동으로 닫힙니다...</p>
-                <script>
-                    if (window.opener) {{
-                        window.opener.postMessage({{
-                            type: 'INSTAGRAM_ERROR',
-                            success: false,
-                            errorCode: 'OAUTH_AUTHORIZATION_FAILED',
-                            message: {_js_embed("OAuth 인증에 실패했습니다: " + str(error))}
-                        }}, '*');
-                        setTimeout(() => window.close(), 2000);
-                    }}
-                </script>
-            </body>
-            </html>
-            """
-            return HttpResponse(html)
+            return HttpResponse(oauth_callback_pages.oauth_error(error))
 
         if not code or not state:
-            html = """
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <meta charset="UTF-8">
-                <title>Instagram 연동 실패</title>
-                <style>
-                    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 40px; text-align: center; }
-                    .error { color: #dc3545; }
-                </style>
-            </head>
-            <body>
-                <h2 class="error">❌ 필수 파라미터 누락</h2>
-                <p>창이 자동으로 닫힙니다...</p>
-                <script>
-                    if (window.opener) {
-                        window.opener.postMessage({
-                            type: 'INSTAGRAM_ERROR',
-                            success: false,
-                            errorCode: 'MISSING_PARAMETERS',
-                            message: '필수 파라미터가 누락되었습니다.'
-                        }, '*');
-                        setTimeout(() => window.close(), 2000);
-                    }
-                </script>
-            </body>
-            </html>
-            """
-            return HttpResponse(html)
+            return HttpResponse(oauth_callback_pages.missing_parameters())
 
         # Verify state (CSRF protection) using persisted IGOAuthState
         state_obj = IGOAuthState.objects.filter(state=state).first()
         if not state_obj or state_obj.is_expired():
-            html = """
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <meta charset="UTF-8">
-                <title>Instagram 연동 실패</title>
-                <style>
-                    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 40px; text-align: center; }
-                    .error { color: #dc3545; }
-                </style>
-            </head>
-            <body>
-                <h2 class="error">❌ 세션 만료</h2>
-                <p>세션이 만료되었거나 잘못된 요청입니다.</p>
-                <p>창이 자동으로 닫힙니다...</p>
-                <script>
-                    if (window.opener) {
-                        window.opener.postMessage({
-                            type: 'INSTAGRAM_ERROR',
-                            success: false,
-                            errorCode: 'INVALID_STATE',
-                            message: '세션이 만료되었거나 잘못된 요청입니다. 다시 시도해주세요.'
-                        }, '*');
-                        setTimeout(() => window.close(), 2000);
-                    }
-                </script>
-            </body>
-            </html>
-            """
-            return HttpResponse(html)
+            return HttpResponse(oauth_callback_pages.invalid_state())
 
         try:
             workspace = state_obj.workspace
@@ -490,37 +387,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                     account_info = InstagramOAuthService.get_account_info(access_token)
                 except Exception as e:
                     logger.error(f"Exception during get_account_info: {str(e)}")
-
-                    html = """
-                    <!DOCTYPE html>
-                    <html>
-                    <head>
-                        <meta charset="UTF-8">
-                        <title>Instagram 연동 실패</title>
-                        <style>
-                            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 40px; text-align: center; }
-                            .error { color: #dc3545; }
-                        </style>
-                    </head>
-                    <body>
-                        <h2 class="error">❌ Instagram API 오류</h2>
-                        <p>Instagram API 호출 중 오류가 발생했습니다.</p>
-                        <p>창이 자동으로 닫힙니다...</p>
-                        <script>
-                            if (window.opener) {
-                                window.opener.postMessage({
-                                    type: 'INSTAGRAM_ERROR',
-                                    success: false,
-                                    errorCode: 'INSTAGRAM_API_ERROR',
-                                    message: 'Instagram API 호출 중 오류가 발생했습니다.'
-                                }, '*');
-                                setTimeout(() => window.close(), 2000);
-                            }
-                        </script>
-                    </body>
-                    </html>
-                    """
-                    return HttpResponse(html)
+                    return HttpResponse(oauth_callback_pages.instagram_api_error())
 
                 # Use user_id from token response or account_info
                 instagram_account_id = (
@@ -575,37 +442,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                             workspace.id,
                             allowance,
                         )
-                        html = f"""
-                        <!DOCTYPE html>
-                        <html>
-                        <head>
-                            <meta charset="UTF-8">
-                            <title>Instagram 연동 제한</title>
-                            <style>
-                                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 40px; text-align: center; }}
-                                .error {{ color: #dc3545; }}
-                            </style>
-                        </head>
-                        <body>
-                            <h2 class="error">🔒 연동 가능한 계정 수를 초과했습니다</h2>
-                            <p>현재 플랜에서는 IG 계정을 {allowance}개까지 연동할 수 있습니다.</p>
-                            <p>프로 플랜에서 추가 계정을 구매하거나 기존 연동을 해제해주세요.</p>
-                            <p>창이 자동으로 닫힙니다...</p>
-                            <script>
-                                if (window.opener) {{
-                                    window.opener.postMessage({{
-                                        type: 'INSTAGRAM_ERROR',
-                                        success: false,
-                                        errorCode: 'PLAN_LIMIT_EXCEEDED',
-                                        message: '연동 가능한 IG 계정 수를 초과했습니다. 플랜을 업그레이드하거나 추가 계정을 구매해주세요.'
-                                    }}, '*');
-                                    setTimeout(() => window.close(), 2000);
-                                }}
-                            </script>
-                        </body>
-                        </html>
-                        """
-                        return HttpResponse(html)
+                        return HttpResponse(oauth_callback_pages.plan_limit_exceeded(allowance))
 
                 # 기존/신규 공통: 모든 필드를 최신 값으로 덮어써 재연동이 곧 교체가 되게 한다.
                 connection.username = account_info.get("username", account_info.get("name", ""))
@@ -663,39 +500,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
 
             # Return success response with HTML
             connection_data = IGAccountConnectionSerializer(connection).data
-            html = f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <meta charset="UTF-8">
-                <title>Instagram 연동 성공</title>
-                <style>
-                    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 40px; text-align: center; }}
-                    .success {{ color: #28a745; }}
-                    .account {{ margin-top: 20px; padding: 15px; background: #f8f9fa; border-radius: 8px; }}
-                </style>
-            </head>
-            <body>
-                <h2 class="success">✅ Instagram 연동 성공!</h2>
-                <div class="account">
-                    <p><strong>계정:</strong> @{escape(str(connection_data.get('username', 'Unknown')))}</p>
-                    <p><strong>유형:</strong> {escape(str(connection_data.get('account_type', 'BUSINESS')))}</p>
-                </div>
-                <p>창이 자동으로 닫힙니다...</p>
-                <script>
-                    if (window.opener) {{
-                        window.opener.postMessage({{
-                            type: 'INSTAGRAM_CONNECTED',
-                            success: true,
-                            connection: {_js_embed(dict(connection_data))}
-                        }}, '*');
-                        setTimeout(() => window.close(), 1500);
-                    }}
-                </script>
-            </body>
-            </html>
-            """
-            return HttpResponse(html)
+            return HttpResponse(oauth_callback_pages.connect_success(dict(connection_data)))
 
         except Exception as e:
             # Meta/Instagram HTTPError 는 응답 본문에 실패 사유(JSON)가 들어있다.
@@ -711,37 +516,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 f"Fatal error in connect_callback: {type(e).__name__} - {str(e)}{meta_body}"
             )
 
-            html = f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <meta charset="UTF-8">
-                <title>Instagram 연동 오류</title>
-                <style>
-                    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 40px; text-align: center; }}
-                    .error {{ color: #dc3545; }}
-                </style>
-            </head>
-            <body>
-                <h2 class="error">❌ 서버 오류</h2>
-                <p>연동 중 오류가 발생했습니다.</p>
-                <p>잠시 후 다시 시도해주세요.</p>
-                <p>창이 자동으로 닫힙니다...</p>
-                <script>
-                    if (window.opener) {{
-                        window.opener.postMessage({{
-                            type: 'INSTAGRAM_ERROR',
-                            success: false,
-                            errorCode: 'INTERNAL_ERROR',
-                            message: {_js_embed("서버 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")}
-                        }}, '*');
-                        setTimeout(() => window.close(), 2000);
-                    }}
-                </script>
-            </body>
-            </html>
-            """
-            return HttpResponse(html)
+            return HttpResponse(oauth_callback_pages.internal_error())
 
     @extend_schema(
         summary="연결된 Instagram 계정 목록",
