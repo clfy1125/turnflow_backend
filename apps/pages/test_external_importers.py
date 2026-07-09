@@ -11,6 +11,8 @@ apps/pages/test_external_importers.py
 
 from __future__ import annotations
 
+import urllib.error
+
 import pytest
 from django.contrib.auth import get_user_model
 from rest_framework.test import APIClient
@@ -18,8 +20,11 @@ from rest_framework.test import APIClient
 from apps.pages.models import Block, Page
 from apps.pages.services.external_importers import (
     SOURCES,
+    ExternalFetchError,
+    SourcePageNotFoundError,
     UnsupportedSourceError,
     detect_source,
+    fetch_payload,
     import_from_url,
     parse_slug,
 )
@@ -69,20 +74,39 @@ class TestDispatch:
         "url,expected_source",
         [
             ("https://link.inpock.co.kr/wannabuy", "inpock"),
+            ("https://inpk.link/hipservie", "inpock"),  # 인포크 단축 도메인 (2026-07)
+            ("https://www.linktr.ee/selenagomez", "linktree"),  # www. 접두 허용
+            ("https://linktree.com/selenagomez", "linktree"),  # 링크트리 별칭 도메인
             ("https://litt.ly/koreanwithmina", "litly"),
             ("https://linktr.ee/selenagomez", "linktree"),
             ("https://example.com/foo", None),
             ("", None),
             ("not a url", None),
+            # hostname 정확 일치 — 경로/유사 도메인에 지원 호스트명을 박은 우회 거절
+            ("https://evil.com/link.inpock.co.kr/foo", None),
+            ("https://evil.com/inpk.link/foo", None),
+            ("https://linkinpk.link/foo", None),
+            ("https://inpk.link.evil.com/foo", None),
+            # 대소문자 혼합 호스트 (DRF URLField 는 대소문자 안 가림)
+            ("https://INPK.link/foo", "inpock"),
+            ("https://Litt.LY/foo", "litly"),
         ],
     )
     def test_detect_source(self, url, expected_source):
         assert detect_source(url) == expected_source
 
+    def test_parse_slug_mixed_case_host(self):
+        """detect_source(소문자 정규화)와 동일 기준 — 혼합 대소문자 호스트도 slug 추출."""
+        assert parse_slug("https://INPK.link/hipservie", "inpock") == "hipservie"
+        assert parse_slug("https://Litt.LY/koreanwithmina", "litly") == "koreanwithmina"
+
     def test_parse_slug(self):
         assert parse_slug("https://litt.ly/koreanwithmina", "litly") == "koreanwithmina"
         assert parse_slug("https://linktr.ee/selenagomez/", "linktree") == "selenagomez"
         assert parse_slug("https://litt.ly/", "litly") is None
+        assert parse_slug("https://inpk.link/hipservie", "inpock") == "hipservie"
+        assert parse_slug("https://link.inpock.co.kr/09women", "inpock") == "09women"
+        assert parse_slug("https://linktree.com/nikeofficial", "linktree") == "nikeofficial"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -110,6 +134,13 @@ class TestImportFromUrl:
         assert "total_input_blocks" in meta
         assert "total_output_blocks" in meta
 
+    def test_inpock_short_domain_mock_fixture(self, mock_mode):
+        """inpk.link 단축 도메인 URL 도 동일하게 inpock 소스로 임포트."""
+        source, slug, body = import_from_url("https://inpk.link/09women")
+        assert source == "inpock"
+        assert slug == "09women"
+        assert len(body["blocks"]) > 0
+
     def test_litly_mock_fixture(self, mock_mode):
         source, slug, body = import_from_url("https://litt.ly/koreanwithmina")
         assert source == "litly"
@@ -124,6 +155,135 @@ class TestImportFromUrl:
         assert slug == "nikeofficial"
         assert isinstance(body.get("blocks"), list)
         assert len(body["blocks"]) > 0
+
+    def test_linktree_com_alias_mock_fixture(self, mock_mode):
+        """linktree.com 별칭 도메인 URL 도 동일하게 linktree 소스로 임포트."""
+        source, slug, body = import_from_url("https://linktree.com/nikeofficial")
+        assert source == "linktree"
+        assert slug == "nikeofficial"
+        assert len(body["blocks"]) > 0
+
+
+# ─────────────────────────────────────────────────────────────
+# fetch_payload — canonical URL 재구성 + 인포크 신/구 도메인 404 폴백
+# ─────────────────────────────────────────────────────────────
+
+
+def _http_404(url: str) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(url, 404, "Not Found", hdrs=None, fp=None)
+
+
+class TestInpockHostFallback:
+    """실모드 fetch 경로 — 네트워크는 fake fetch 로 차단."""
+
+    @pytest.fixture
+    def real_mode(self, monkeypatch):
+        monkeypatch.delenv("EXTERNAL_IMPORT_MOCK_MODE", raising=False)
+
+    def test_fetch_uses_canonical_url_not_raw_input(self, real_mode, monkeypatch):
+        """쿼리스트링이 붙은 사용자 URL 그대로가 아니라 host+slug 재구성 URL 로 fetch."""
+        calls: list[str] = []
+
+        def fake_fetch(url):
+            calls.append(url)
+            return {"ok": True}
+
+        monkeypatch.setitem(SOURCES["inpock"], "fetch", fake_fetch)
+        payload = fetch_payload("https://inpk.link/hipservie?utm_source=ig", "inpock")
+        assert payload == {"ok": True}
+        assert calls == ["https://inpk.link/hipservie"]
+
+    def test_404_falls_back_to_other_inpock_host(self, real_mode, monkeypatch):
+        """inpk.link 에 없는 구페이지 → link.inpock.co.kr 로 1회 폴백."""
+        calls: list[str] = []
+
+        def fake_fetch(url):
+            calls.append(url)
+            if url.startswith("https://inpk.link/"):
+                raise _http_404(url)
+            return {"from": "old-domain"}
+
+        monkeypatch.setitem(SOURCES["inpock"], "fetch", fake_fetch)
+        payload = fetch_payload("https://inpk.link/09women", "inpock")
+        assert payload == {"from": "old-domain"}
+        # 사용자가 입력한 호스트 먼저, 그 다음 나머지 화이트리스트 호스트
+        assert calls == [
+            "https://inpk.link/09women",
+            "https://link.inpock.co.kr/09women",
+        ]
+
+    def test_all_hosts_404_raises_not_found(self, real_mode, monkeypatch):
+        def fake_fetch(url):
+            raise _http_404(url)
+
+        monkeypatch.setitem(SOURCES["inpock"], "fetch", fake_fetch)
+        with pytest.raises(SourcePageNotFoundError):
+            fetch_payload("https://link.inpock.co.kr/no-such-user", "inpock")
+
+    def test_non_404_error_does_not_fall_back(self, real_mode, monkeypatch):
+        """5xx 는 폴백 없이 즉시 ExternalFetchError — 중복 타격 방지."""
+        calls: list[str] = []
+
+        def fake_fetch(url):
+            calls.append(url)
+            raise urllib.error.HTTPError(url, 503, "Service Unavailable", hdrs=None, fp=None)
+
+        monkeypatch.setitem(SOURCES["inpock"], "fetch", fake_fetch)
+        with pytest.raises(ExternalFetchError):
+            fetch_payload("https://link.inpock.co.kr/09women", "inpock")
+        assert len(calls) == 1
+
+    def test_single_host_source_404_raises_not_found(self, real_mode, monkeypatch):
+        """litly 처럼 호스트가 하나뿐인 소스는 기존과 동일하게 즉시 404."""
+
+        def fake_fetch(url):
+            raise _http_404(url)
+
+        monkeypatch.setitem(SOURCES["litly"], "fetch", fake_fetch)
+        with pytest.raises(SourcePageNotFoundError):
+            fetch_payload("https://litt.ly/no-such-user", "litly")
+
+    def test_linktree_com_fetches_via_canonical_host(self, real_mode, monkeypatch):
+        """linktree.com 입력 → 입력 호스트 우선, 404 시 canonical linktr.ee 로 폴백."""
+        calls: list[str] = []
+
+        def fake_fetch(url):
+            calls.append(url)
+            if url.startswith("https://linktree.com/"):
+                raise _http_404(url)
+            return {"from": "linktr.ee"}
+
+        monkeypatch.setitem(SOURCES["linktree"], "fetch", fake_fetch)
+        payload = fetch_payload("https://linktree.com/nikeofficial", "linktree")
+        assert payload == {"from": "linktr.ee"}
+        assert calls == [
+            "https://linktree.com/nikeofficial",
+            "https://linktr.ee/nikeofficial",
+        ]
+
+
+# ─────────────────────────────────────────────────────────────
+# find_existing_import — 별칭 도메인 재임포트 감지
+# ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.django_db
+class TestFindExistingImportAliasDomain:
+    def test_cross_domain_reimport_detected(self, user):
+        """구도메인으로 임포트한 페이지를 inpk.link URL 로 다시 임포트해도 감지(409 소스)."""
+        from apps.pages.services.external_importers.builder import find_existing_import
+
+        page = Page.objects.create(
+            user=user,
+            slug="alias-test",
+            title="t",
+            import_source="inpock",
+            import_source_slug="hipservie",
+            import_source_url="https://link.inpock.co.kr/hipservie",
+        )
+        assert find_existing_import(user, "https://inpk.link/hipservie") == page
+        assert find_existing_import(user, "https://link.inpock.co.kr/hipservie") == page
+        assert find_existing_import(user, "https://inpk.link/other-slug") is None
 
 
 # ─────────────────────────────────────────────────────────────

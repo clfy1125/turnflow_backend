@@ -122,14 +122,23 @@ def build_page_from_body(
 
 
 def find_existing_import(user, source_url: str) -> Page | None:
-    """같은 사용자가 같은 ``source_url`` 로 이미 임포트한 페이지가 있으면 가장 최신 1건 반환.
+    """같은 사용자가 같은 외부 페이지를 이미 임포트했으면 가장 최신 1건 반환.
 
     재임포트 감지용. 호출 측은 ``force=true`` 가 아닐 때 409 Conflict 응답을 만든다.
+
+    비교는 URL 문자열이 아니라 정규화된 ``(source, slug)`` 기준 — 인포크 신/구
+    도메인(``inpk.link`` ↔ ``link.inpock.co.kr``)처럼 같은 페이지를 가리키는 다른
+    URL 표기도 잡는다. 소스/slug 를 못 뽑는 URL 이면 기존처럼 URL 정확 일치 폴백.
     """
     if not source_url:
         return None
-    return (
-        Page.objects.filter(user=user, import_source_url=source_url)
-        .order_by("-imported_at", "-created_at")
-        .first()
-    )
+    from .dispatch import detect_source, parse_slug
+
+    qs = Page.objects.filter(user=user)
+    source = detect_source(source_url)
+    slug = parse_slug(source_url, source) if source else None
+    if source and slug:
+        qs = qs.filter(import_source=source, import_source_slug=slug)
+    else:
+        qs = qs.filter(import_source_url=source_url)
+    return qs.order_by("-imported_at", "-created_at").first()
