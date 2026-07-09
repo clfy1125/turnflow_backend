@@ -315,7 +315,10 @@ make test-cov                             # HTML 커버리지 리포트
 - `deploy/dr/gcp/DRILL_RUNBOOK.md` — GCP cold-VM DR 드릴/컷오버 재현 런북 (+ `deploy/dr/gcp/README.md` 운영자 개요)
 - `SECURITY_AUDIT_2026-06.md` — 론칭 전 보안 취약점 감사(미해결 P0 포함)
 - `DM_CAMPAIGN_DUPLICATE_PREVENTION_FRONTEND.md` — 게시물당 활성 캠페인 1개(409) 프론트 가이드
+- `DM_QUEUE_STATE_FRONTEND.md` — DM 순차 발송 큐 현황(게이지+ETA) 프론트 가이드 + v4.3 페이서 메커니즘 요약 (`max_sends_per_hour` deprecated)
 - `PASSWORD_RESET_GUIDE.md` — 비밀번호 재설정 플로우 프론트 가이드
+- `DISCONNECT_OTHER_DM_TOOLS_GUIDE.md` — 다른 DM 자동화 툴(매니챗 등) 연결 해제 안내 (댓글 fan-out·Private Reply 1회 충돌 / IG Login이라 Facebook 라우팅 불필요)
+- `CONNECT_CONFLICT_WARNING_FRONTEND.md` — 다른 DM 툴 충돌 경고 배너 프론트 스펙 (연결 직후 + 대시보드 상단, 닫기 규칙)
 - `SERVICE_DIFFERENTIATION.md` — 서비스 차별점/경쟁 비교 (세일즈·마케팅)
 - `개인정보처리방침_변호사_전달자료.md`, `이용약관_변호사_전달자료.md` — 법무 자료 (수정 금지, 요청 시에만)
 - `api-mcp/README.md` — 사내 API 문서 검색 MCP 서버

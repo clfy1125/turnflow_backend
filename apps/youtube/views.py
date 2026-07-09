@@ -497,7 +497,7 @@ def _callback_html(*, success: bool, error_code: str, message: str, connection: 
 <style>body{{font-family:-apple-system,sans-serif;text-align:center;padding:40px}}</style>
 </head><body>
 <h2>{body}</h2>
-<p>창이 자동으로 닫힙니다…</p>
+<p>창을 닫아주세요…</p>
 <script>
   if (window.opener) {{
     window.opener.postMessage({payload_json}, '*');

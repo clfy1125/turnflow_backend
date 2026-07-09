@@ -314,7 +314,7 @@ if not (sig and hmac.compare_digest(sig, expected)):
 
 | # | 취약점 | 위치 | 권고 요약 | ↻ 재점검 |
 |:---:|---|---|---|:---:|
-| M-7 | 외부 페이지 임포트 fetch — 화이트리스트가 최초 호스트만 검사, 302 리다이렉트로 내부망 이동 | `external_importers/{inpock,litly,linktree}.py` | `urlopen` 리다이렉트 비활성 + hop마다 IP 검증. `detect_source`를 `hostname` 정확/서픽스 매치로 | ❌ 미해결 (fetch 리다이렉트 기본 추적, hop IP 재검증 없음) |
+| M-7 | 외부 페이지 임포트 fetch — 화이트리스트가 최초 호스트만 검사, 302 리다이렉트로 내부망 이동 | `external_importers/{inpock,litly,linktree}.py` | `urlopen` 리다이렉트 비활성 + hop마다 IP 검증. `detect_source`를 `hostname` 정확/서픽스 매치로 | ⚠️ 부분해결(2026-07-08) — `detect_source` hostname 정확 일치 + fetch URL 을 화이트리스트 호스트+slug 로 재구성(경로에 호스트명 박은 우회 차단, inpk.link 지원과 함께 `dispatch.py`). **잔여**: 벤더 fetch 함수의 리다이렉트 기본 추적 + hop IP 재검증 없음 |
 | M-8 | IG OAuth 콜백 성공 경로 — `username`/`connection_dict` 무이스케이프 script 삽입 | [apps/integrations/views.py:580](apps/integrations/views.py#L580) | `str(dict).replace` 직렬화 제거, `json.dumps`+`</`이스케이프, 본문은 `escape()` | ✅ 완료(2026-07-06) — `_js_embed(dict(...))` 직렬화 + username/type `escape()`, `str(dict).replace` 제거 |
 | M-9 | 공개 링크페이지가 `custom_css`·블록 `data`를 서버 sanitize 없이 제공 → 저장형 XSS 통로 | [apps/pages/serializers.py:204](apps/pages/serializers.py#L204) | 블록 텍스트필드 저장 시 nh3 등으로 HTML 제거, `custom_css`는 `</style`·`url()`·`@import` 차단. 프론트 가이드에서 `innerHTML` 금지 | ❌ 미해결 (`data`/`custom_css` 원본 반환, 저장 검증 없음) |
 | M-10 | ai-suggest의 `image_url`을 워커가 그대로 다운로드 — 인증된 SSRF | [apps/ai_jobs/tasks.py:959](apps/ai_jobs/tasks.py#L959) | `image_url`을 URLField로, 다운로드 직전 사설/링크로컬 대역 차단 + `follow_redirects=False` | ❌ 미해결 (`image_resolver._download` `follow_redirects=True`, IP 가드 없음) |
