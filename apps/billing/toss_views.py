@@ -37,6 +37,7 @@ from .toss_flows import (
     change_extra_accounts,
     confirm_billing,
     ensure_customer_key,
+    preview_change_extra_accounts,
 )
 
 logger = logging.getLogger(__name__)
@@ -512,9 +513,10 @@ class ExtraAccountsView(APIView):
 `Authorization: Bearer <access_token>` 헤더 필수 — **프로 플랜 전용**
 
 ## 과금 규칙
-- **증가**: 증가분 × 9,900원을 **즉시 결제** (비례배분 없음, 한 달치).
-  결제 성공 시에만 슬롯이 늘어나며, 이후 매월 갱신 금액에 합산됩니다.
-- **감소**: 무과금. 단, 현재 연동된 IG 계정 수가 새 허용량(기본 1 + count) 이하여야
+- **증가**: 증가분 × 9,900원을 **현재 주기 잔여일만큼 비례하여 즉시 결제**.
+  결제 성공 시에만 슬롯이 늘어나며, 이후 매월 갱신 금액에 계정 전체가 합산됩니다.
+  잔여 비례액이 0이면 `payment`가 null이며 무과금으로 즉시 적용됩니다.
+- **감소**: 무과금·무환불. 단, 현재 연동된 IG 계정 수가 새 허용량(기본 1 + count) 이하여야
   합니다. 초과 상태면 먼저 연동을 해제해야 합니다.
 
 ## 요청 필드
@@ -589,3 +591,114 @@ const res = await fetch('/api/v1/billing/extra-accounts/', {
                 "next_renewal_amount": sub.renewal_amount,
             }
         )
+
+
+class ExtraAccountsPreviewView(APIView):
+    """추가 IG 계정 변경 견적 (미리보기) — 부작용 없음"""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["결제(토스)"],
+        summary="추가 IG 계정 변경 견적 (결제 전 미리보기)",
+        description="""
+## 목적
+`POST /billing/extra-accounts/`를 **실행하기 전에**, 지금 계정 수를 바꾸면 **즉시 얼마가
+청구되는지**를 계산해 돌려줍니다. **부작용이 전혀 없습니다**(토스 호출·DB 변경·결제 없음).
+실행 API와 **동일한 계산 로직**을 공유합니다.
+
+## 인증
+`Authorization: Bearer <access_token>` 헤더 필수 — **프로 플랜 전용**
+
+## 요청 필드
+| 필드 | 필수 | 타입 | 설명 |
+|------|------|------|------|
+| `count` | ✅ | int (0~10) | 변경 후 추가 계정 **총** 수 (현재 값이 아닌 목표 값) |
+
+## 응답 필드
+| 필드 | 설명 |
+|------|------|
+| `direction` | `increase`(즉시 비례 청구) / `decrease`(무과금) / `noop`(동일) |
+| `delta` | 목표 − 현재 (증감분) |
+| `immediate_charge.amount` | **지금 즉시 청구될 금액(원, 세포함)**. 0이면 무과금 즉시 적용 |
+| `immediate_charge.proration` | 증가 시 계산 내역: `remaining_days`, `unit_price`(9900), `units`(delta), `full_amount`, `net` |
+| `next_renewal_amount` | 변경 후 **다음 정기 갱신 예정 총액(전액)** |
+| `unit_price` | 추가 계정 단가(원/월) — **하드코딩 대신 이 값을 사용하세요** |
+
+## 프론트엔드 통합 (2단계: 견적 → 확정)
+```typescript
+const q = await (await fetch('/api/v1/billing/extra-accounts/preview/', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+  body: JSON.stringify({ count: 2 }),
+})).json();
+// "지금 7,920원이 결제됩니다" 확인: q.immediate_charge.amount / 단가 q.unit_price
+// 확정 시 POST /billing/extra-accounts/ (동일 body)
+```
+
+## 에러
+| 코드 | 원인 |
+|------|------|
+| 400 | 프로 아님·카드 미등록·체험/미납/해지 상태 |
+| 401 | 토큰 없음/만료 |
+        """,
+        request=ExtraAccountsRequestSerializer,
+        responses={
+            200: OpenApiResponse(
+                description="견적 (부작용 없음)",
+                examples=[
+                    OpenApiExample(
+                        "증가 견적 (0→2, 잔여 12일)",
+                        value={
+                            "direction": "increase",
+                            "delta": 2,
+                            "immediate_charge": {
+                                "amount": 7920,
+                                "currency": "KRW",
+                                "description": "추가 계정 2개 잔여 12일분 비례 청구",
+                                "proration": {
+                                    "period_days": 30,
+                                    "remaining_days": 12,
+                                    "unit_price": 9900,
+                                    "units": 2,
+                                    "full_amount": 19800,
+                                    "net": 7920,
+                                },
+                            },
+                            "effective_at": None,
+                            "next_renewal_amount": 35700,
+                            "unit_price": 9900,
+                        },
+                    ),
+                    OpenApiExample(
+                        "감소 견적 (2→1, 무과금)",
+                        value={
+                            "direction": "decrease",
+                            "delta": -1,
+                            "immediate_charge": {
+                                "amount": 0,
+                                "currency": "KRW",
+                                "description": "추가 계정 축소는 무과금 — 다음 갱신부터 낮은 금액으로 청구됩니다.",
+                                "proration": None,
+                            },
+                            "effective_at": None,
+                            "next_renewal_amount": 25800,
+                            "unit_price": 9900,
+                        },
+                    ),
+                ],
+            ),
+            400: OpenApiResponse(description="변경 불가 조건"),
+            401: OpenApiResponse(description="인증 실패"),
+        },
+    )
+    def post(self, request):
+        serializer = ExtraAccountsRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            quote = preview_change_extra_accounts(request.user, serializer.validated_data["count"])
+        except BillingFlowError as e:
+            return _flow_error_response(e)
+
+        return Response(quote)

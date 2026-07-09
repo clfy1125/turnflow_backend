@@ -19,7 +19,7 @@ from .serializers import (
     UserSubscriptionSerializer,
 )
 from .subscription_utils import ensure_subscription
-from .toss_flows import BillingFlowError, change_plan
+from .toss_flows import BillingFlowError, change_plan, preview_change_plan
 
 logger = logging.getLogger(__name__)
 
@@ -452,7 +452,7 @@ class ChangeSubscriptionView(APIView):
 ## 변경 규칙
 | 방향 | 동작 |
 |------|------|
-| **업그레이드** (basic→pro) | **즉시 새 플랜 전액 결제** + 결제 주기 리셋(오늘부터 30일). 비례배분 없음 |
+| **업그레이드** (basic→pro) | **남은 기간분 차액만 즉시 비례 결제**(신규 플랜 잔여분 − 기존 플랜 잔여 크레딧) + **결제 주기(갱신일) 유지**. 다음 갱신부터 신규 플랜 전액. 잔여 차액이 0이면 `payment`가 null이며 무과금으로 즉시 적용 |
 | **다운그레이드** (pro→basic) | **예약** — 현재 주기 종료(다음 갱신)에 적용. 응답 `effective_at` 참고 |
 | 같은 플랜 + 예약 있음 | 예약 취소 |
 | 같은 플랜 + 예약 없음 | 400 |
@@ -558,6 +558,129 @@ if (data.effective_at) {
                 "effective_at": result["effective_at"],
             }
         )
+
+
+class ChangePlanPreviewView(APIView):
+    """플랜 변경 견적 (미리보기) — 부작용 없음"""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["사용자플랜"],
+        summary="플랜 변경 견적 (결제 전 미리보기)",
+        description="""
+## 목적
+`POST /billing/change-plan/`을 **실제로 실행하기 전에**, 지금 변경하면 **즉시 얼마가
+청구되는지**를 계산해 돌려줍니다. **부작용이 전혀 없습니다**(토스 호출·DB 변경·결제 없음).
+실행 API와 **동일한 계산 로직**을 공유하므로 견적 금액 = 실제 청구 금액입니다.
+
+## 인증
+`Authorization: Bearer <access_token>` 헤더 필수
+
+## 요청 필드
+| 필드 | 필수 | 타입 | 설명 |
+|------|------|------|------|
+| `plan_name` | ✅ | `basic`/`pro` | 변경하려는 플랜 코드명 |
+| `extra_ig_accounts` | 선택 | int (0~10) | pro 업그레이드 시 함께 설정할 추가 IG 계정 수 |
+
+## 응답 필드
+| 필드 | 설명 |
+|------|------|
+| `direction` | `upgrade`(즉시 비례 청구) / `downgrade`(예약, 무과금) / `noop`(동일 플랜) |
+| `immediate_charge.amount` | **지금 즉시 청구될 금액(원, 세포함)**. 0이면 무과금 즉시 적용 |
+| `immediate_charge.proration` | 업그레이드 시 계산 내역: `remaining_days`(잔여일), `new_plan_prorated`(신규 잔여분), `current_plan_credit`(기존 크레딧), `net`(순청구=amount) |
+| `effective_at` | 다운그레이드면 적용 시각(=현재 주기 종료일), 그 외 null |
+| `next_renewal_amount` | 변경 후 **다음 정기 갱신 예정 총액(전액)** — 즉시 청구액과 별개 |
+| `next_renewal_at` | 다음 갱신 예정 시각(현재 주기 종료일) |
+
+> ⚠️ `immediate_charge.amount`(지금 청구)와 `next_renewal_amount`(다음 갱신 전액)는
+> 다른 값입니다. 업그레이드는 남은 기간분 **차액만** 지금 청구하고, 다음 갱신부터 전액입니다.
+
+## 프론트엔드 통합 (2단계: 견적 → 확정)
+```typescript
+// 1) 견적
+const q = await (await fetch('/api/v1/billing/change-plan/preview/', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+  body: JSON.stringify({ plan_name: 'pro' }),
+})).json();
+// "지금 6,000원이 결제됩니다" 확인 UI 노출: q.immediate_charge.amount
+
+// 2) 사용자가 확정하면 실행 API 호출
+if (confirm) {
+  await fetch('/api/v1/billing/change-plan/', { method: 'POST', /* 동일 body */ });
+}
+```
+
+## 에러
+| 코드 | 원인 |
+|------|------|
+| 400 | 변경 불가 조건(무료 사용자·카드 미등록·체험/미납/해지 상태·동일 플랜) |
+| 401 | 토큰 없음/만료 |
+| 404 | 존재하지 않거나 비활성 플랜 |
+        """,
+        request=ChangeSubscriptionRequestSerializer,
+        responses={
+            200: OpenApiResponse(
+                description="견적 (부작용 없음)",
+                examples=[
+                    OpenApiExample(
+                        "업그레이드 견적 (basic→pro, 잔여 12일)",
+                        value={
+                            "direction": "upgrade",
+                            "immediate_charge": {
+                                "amount": 2400,
+                                "currency": "KRW",
+                                "description": "프로 잔여 12일분 비례 청구 (기존 플랜 크레딧 -1560원 차감)",
+                                "proration": {
+                                    "period_days": 30,
+                                    "remaining_days": 12,
+                                    "new_plan_prorated": 3960,
+                                    "current_plan_credit": 1560,
+                                    "net": 2400,
+                                },
+                            },
+                            "effective_at": None,
+                            "next_renewal_amount": 9900,
+                            "next_renewal_at": "2026-08-08T00:00:00+09:00",
+                        },
+                    ),
+                    OpenApiExample(
+                        "다운그레이드 견적 (pro→basic, 무과금·예약)",
+                        value={
+                            "direction": "downgrade",
+                            "immediate_charge": {
+                                "amount": 0,
+                                "currency": "KRW",
+                                "description": "베이직 다운그레이드는 다음 갱신에 적용됩니다(무과금).",
+                                "proration": None,
+                            },
+                            "effective_at": "2026-08-08T00:00:00+09:00",
+                            "next_renewal_amount": 5900,
+                            "next_renewal_at": "2026-08-08T00:00:00+09:00",
+                        },
+                    ),
+                ],
+            ),
+            400: OpenApiResponse(description="변경 불가 조건"),
+            401: OpenApiResponse(description="인증 실패"),
+            404: OpenApiResponse(description="플랜을 찾을 수 없음"),
+        },
+    )
+    def post(self, request):
+        serializer = ChangeSubscriptionRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            quote = preview_change_plan(
+                request.user,
+                plan_name=serializer.validated_data["plan_name"],
+                extra_ig_accounts=serializer.validated_data.get("extra_ig_accounts") or 0,
+            )
+        except BillingFlowError as e:
+            return Response({"detail": e.detail, **e.extra}, status=e.status_code)
+
+        return Response(quote)
 
 
 class CancelSubscriptionView(APIView):

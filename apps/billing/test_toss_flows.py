@@ -4,15 +4,19 @@
 더러운 테스트 DB 대응: 이메일/키는 uuid 로 유일화, 집계는 델타 단언.
 """
 
+import math
 import uuid
 from datetime import timedelta
 
 import pytest
 from django.contrib.auth import get_user_model
+from django.urls import reverse
 from django.utils import timezone
+from rest_framework.test import APIClient
 
-from apps.billing import toss_flows
+from apps.billing import tasks, toss_flows
 from apps.billing.models import (
+    PaymentHistory,
     PaymentStatus,
     ReferralCode,
     ReferralRedemption,
@@ -292,8 +296,10 @@ class TestChangePlan:
         confirm_billing(user, auth_key="ak1", plan_name=plan.name)
         return ensure_subscription(user)
 
-    def test_upgrade_charges_and_resets_period(self, user, toss, basic_plan, pro_plan):
+    def test_upgrade_prorates_and_preserves_period(self, user, toss, basic_plan, pro_plan):
         self._paid_sub(user, basic_plan, toss)
+        sub = ensure_subscription(user)
+        period_end_before = sub.current_period_end
         toss.charges.clear()
 
         result = change_plan(user, "pro")
@@ -301,10 +307,16 @@ class TestChangePlan:
         sub = result["subscription"]
         assert sub.plan.name == "pro"
         assert sub.monthly_amount_snapshot == pro_plan.monthly_price
+        # ★주기(앵커) 유지 — 리셋되지 않는다★
+        assert sub.current_period_end == period_end_before
+        # 남은 기간분 차액만 비례 청구 (신규 전액보다 작다) — payment.amount 와 일치
         assert len(toss.charges) == 1
-        assert toss.charges[0]["amount"] == pro_plan.monthly_price
-        days = (sub.current_period_end - timezone.now()).days
-        assert 29 <= days <= 30
+        charged = toss.charges[0]["amount"]
+        assert charged == result["payment"].amount
+        assert 0 < charged < pro_plan.monthly_price
+        assert "-up-pro-0-" in toss.charges[0]["order_id"]
+        # 다음 정기 갱신은 프로 전액
+        assert sub.renewal_amount == pro_plan.monthly_price
 
     def test_downgrade_reserves_pending_plan(self, user, toss, basic_plan, pro_plan):
         # pro 즉시 과금 상태 만들기 (트라이얼 우회)
@@ -349,22 +361,38 @@ class TestChangePlan:
 @pytest.mark.django_db
 class TestExtraAccounts:
     def _pro_user(self, user, toss):
-        confirm_billing(user, auth_key="ak1", plan_name="pro")  # 트라이얼로 pro 활성
+        """ACTIVE 프로 (트라이얼 우회 즉시 과금) — 추가계정 변경은 TRIALING 차단이므로."""
+        sub = ensure_subscription(user)
+        sub.trial_used_at = timezone.now()
+        sub.save(update_fields=["trial_used_at"])
+        confirm_billing(user, auth_key="ak1", plan_name="pro")  # charge_now → ACTIVE
         return ensure_subscription(user)
 
-    def test_increase_charges_immediately(self, user, toss):
+    def test_increase_prorates_immediately(self, user, toss):
         self._pro_user(user, toss)
+        toss.charges.clear()
         result = change_extra_accounts(user, 2)
 
         sub = result["subscription"]
         assert sub.extra_ig_accounts == 2
+        # 잔여일 일할 청구 (전액 이하) — payment.amount 와 일치
         assert len(toss.charges) == 1
-        assert toss.charges[0]["amount"] == 9900 * 2  # 증가분 즉시 결제
-        assert "-extra-" in toss.charges[0]["order_id"]
+        charged = toss.charges[0]["amount"]
+        assert charged == result["payment"].amount
+        assert 0 < charged <= 9900 * 2
+        assert "-ex-0-2-" in toss.charges[0]["order_id"]
+        # 다음 갱신은 계정 전체가 합산된 전액
         assert sub.renewal_amount == sub.monthly_amount_snapshot + 9900 * 2
+
+    def test_trialing_blocks_extra_accounts(self, user, toss):
+        confirm_billing(user, auth_key="ak1", plan_name="pro")  # TRIALING
+        with pytest.raises(BillingFlowError) as e:
+            change_extra_accounts(user, 1)
+        assert "체험" in e.value.detail
 
     def test_increase_declined_does_not_change_count(self, user, toss):
         self._pro_user(user, toss)
+        toss.charges.clear()
         toss.charge_error = TossError("REJECT_CARD_PAYMENT", "한도 초과", 400)
 
         with pytest.raises(ChargeDeclinedError):
@@ -441,3 +469,258 @@ class TestApplyRefund:
         sub.refresh_from_db()
         assert page.custom_css == ".a{color:red}"  # CSS 는 지우지 않는다
         assert sub.trial_used_at is not None  # 트라이얼 사용 이력 유지
+
+
+# ──────────────────────────────────────────────
+# 비례배분 (proration) 계산 헬퍼 — 순수 함수, now 주입으로 정확값 단언
+# ──────────────────────────────────────────────
+
+
+@pytest.mark.django_db
+class TestProrationHelpers:
+    def _sub_with_period(self, user, base, days_total=30):
+        sub = ensure_subscription(user)
+        sub.current_period_start = base
+        sub.current_period_end = base + timedelta(days=days_total)
+        return sub
+
+    def test_ratio_half_and_clamps(self, user):
+        base = timezone.now()
+        sub = self._sub_with_period(user, base)
+        # 잔여 15/30 = 정확히 0.5
+        assert toss_flows.proration_ratio(sub, now=base + timedelta(days=15)) == 0.5
+        # 이미 지남 → 0.0
+        assert toss_flows.proration_ratio(sub, now=base + timedelta(days=40)) == 0.0
+        # 미래 과다 → 1.0 상한
+        assert toss_flows.proration_ratio(sub, now=base - timedelta(days=5)) == 1.0
+        # current_period_end None(free) → 0.0
+        sub.current_period_end = None
+        assert toss_flows.proration_ratio(sub, now=base) == 0.0
+
+    def test_extra_accounts_charge_prorated(self, user):
+        base = timezone.now()
+        sub = self._sub_with_period(user, base)
+        # 잔여 0.5, delta=2 → floor(9900*2*0.5) = 9900
+        amt = toss_flows.compute_extra_accounts_charge(sub, 2, now=base + timedelta(days=15))
+        assert amt == 9900
+
+    def test_upgrade_charge_is_new_minus_credit(self, user, basic_plan, pro_plan):
+        base = timezone.now()
+        sub = self._sub_with_period(user, base)
+        sub.plan = basic_plan
+        sub.monthly_amount_snapshot = basic_plan.monthly_price
+        sub.extra_ig_accounts = 0
+        now = base + timedelta(days=15)  # 잔여 0.5
+        amt = toss_flows.compute_upgrade_charge(sub, pro_plan, 0, now=now)
+        expected = max(
+            0,
+            math.floor(pro_plan.monthly_price * 0.5) - math.ceil(basic_plan.monthly_price * 0.5),
+        )
+        assert amt == expected
+        # 신규 전액보다 작아야 한다 (크레딧 차감)
+        assert amt < pro_plan.monthly_price
+
+    def test_zero_remaining_gives_zero_charge(self, user, pro_plan):
+        base = timezone.now()
+        sub = self._sub_with_period(user, base)
+        # 주기 말 (잔여 0) → 0원
+        assert toss_flows.compute_extra_accounts_charge(sub, 3, now=base + timedelta(days=30)) == 0
+
+
+# ──────────────────────────────────────────────
+# 비례배분 하드닝 — 이중과금 방어(결정적 orderId) · reconcile 자동 반영
+# ──────────────────────────────────────────────
+
+
+def _make_active_pro(user, toss):
+    sub = ensure_subscription(user)
+    sub.trial_used_at = timezone.now()
+    sub.save(update_fields=["trial_used_at"])
+    confirm_billing(user, auth_key="ak1", plan_name="pro")  # charge_now → ACTIVE
+    toss.charges.clear()
+    return ensure_subscription(user)
+
+
+def _done_payload(amount):
+    return {
+        "status": "DONE",
+        "paymentKey": f"pk_{uuid.uuid4().hex[:12]}",
+        "receipt": {"url": "https://receipt.example/x"},
+        "card": {"company": "현대", "number": "433012******123*"},
+        "totalAmount": amount,
+    }
+
+
+@pytest.mark.django_db
+class TestProrationHardening:
+    def test_deterministic_order_dedupes_paid(self, user, toss):
+        sub = _make_active_pro(user, toss)
+        order_id = toss_flows.proration_extra_order_id(sub, 1)
+
+        p1 = toss_flows.charge_prorated(sub, 5000, "테스트 비례", order_id)
+        n = len(toss.charges)
+        # 같은 주문 재요청(더블클릭) → 재청구 없이 기존 PAID 반환
+        p2 = toss_flows.charge_prorated(sub, 5000, "테스트 비례", order_id)
+
+        assert p2.pk == p1.pk
+        assert p2.status == PaymentStatus.PAID
+        assert len(toss.charges) == n  # 두 번째는 토스 재승인 안 함
+
+    def test_pending_order_blocks_duplicate(self, user, toss):
+        sub = _make_active_pro(user, toss)
+        order_id = toss_flows.proration_extra_order_id(sub, 1)
+
+        toss.charge_error = TossNetworkError("timeout")  # 모호 → PENDING
+        with pytest.raises(toss_flows.ChargePendingError):
+            toss_flows.charge_prorated(sub, 5000, "테스트", order_id)
+
+        toss.charge_error = None  # 네트워크 복구돼도
+        with pytest.raises(toss_flows.ChargePendingError):
+            toss_flows.charge_prorated(sub, 5000, "테스트", order_id)  # PENDING이라 재승인 금지
+        assert toss.charges == []
+
+    def test_inflight_pending_blocks_different_target(self, user, toss):
+        """이전 비례 청구가 미확정(PENDING)이면 다른 목표로의 청구도 차단 — 이중 청구 방지."""
+        sub = _make_active_pro(user, toss)
+
+        toss.charge_error = TossNetworkError("timeout")  # 첫 요청 모호 → PENDING(ex-0-1)
+        with pytest.raises(toss_flows.ChargePendingError):
+            toss_flows.charge_prorated(sub, 5000, "t1", toss_flows.proration_extra_order_id(sub, 1))
+
+        toss.charge_error = None  # 네트워크 정상이어도
+        with pytest.raises(toss_flows.ChargePendingError):
+            # 다른 목표(ex-0-3) — 이전 미확정 때문에 차단
+            toss_flows.charge_prorated(
+                sub, 15000, "t2", toss_flows.proration_extra_order_id(sub, 3)
+            )
+        assert toss.charges == []  # 두 번째는 승인 시도조차 안 함
+
+    def test_reconcile_finalizes_pending_upgrade(self, user, toss, basic_plan, pro_plan):
+        confirm_billing(user, auth_key="ak1", plan_name="basic")  # ACTIVE basic
+        toss.charges.clear()
+        sub = ensure_subscription(user)
+        order_id = toss_flows.proration_upgrade_order_id(sub, pro_plan, 0)
+        payment = PaymentHistory.objects.create(
+            user=user,
+            subscription=sub,
+            amount=3000,
+            status=PaymentStatus.PENDING,
+            description="업그레이드 비례",
+            toss_order_id=order_id,
+        )
+
+        tasks._reconcile_confirm_paid(payment, _done_payload(3000))
+
+        payment.refresh_from_db()
+        sub.refresh_from_db()
+        assert payment.status == PaymentStatus.PAID
+        assert sub.plan.name == "pro"  # 구독 상태 자동 반영
+        assert sub.monthly_amount_snapshot == pro_plan.monthly_price
+
+    def test_reconcile_finalizes_pending_extra(self, user, toss):
+        sub = _make_active_pro(user, toss)
+        order_id = toss_flows.proration_extra_order_id(sub, 3)  # 0 → 3
+        payment = PaymentHistory.objects.create(
+            user=user,
+            subscription=sub,
+            amount=9000,
+            status=PaymentStatus.PENDING,
+            description="추가계정 비례",
+            toss_order_id=order_id,
+        )
+
+        tasks._reconcile_confirm_paid(payment, _done_payload(9000))
+
+        payment.refresh_from_db()
+        sub.refresh_from_db()
+        assert payment.status == PaymentStatus.PAID
+        assert sub.extra_ig_accounts == 3
+
+
+# ──────────────────────────────────────────────
+# 견적(preview) — 부작용 없음 · 실행과 동일 계산 · HTTP 배선
+# ──────────────────────────────────────────────
+
+
+@pytest.mark.django_db
+class TestProrationPreview:
+    def _controlled_period(self, user, base):
+        sub = ensure_subscription(user)
+        UserSubscription.objects.filter(pk=sub.pk).update(
+            current_period_start=base, current_period_end=base + timedelta(days=30)
+        )
+        return ensure_subscription(user)
+
+    def test_preview_upgrade_matches_helper_and_no_side_effects(
+        self, user, toss, basic_plan, pro_plan
+    ):
+        confirm_billing(user, auth_key="ak1", plan_name="basic")  # ACTIVE basic
+        toss.charges.clear()
+        base = timezone.now()
+        self._controlled_period(user, base)
+        now = base + timedelta(days=15)  # ratio 0.5
+        before = PaymentHistory.objects.filter(user=user).count()
+
+        q = toss_flows.preview_change_plan(user, "pro", now=now)
+
+        expected = toss_flows._upgrade_charge_breakdown(
+            ensure_subscription(user), pro_plan, 0, now
+        )[2]
+        assert q["direction"] == "upgrade"
+        assert q["immediate_charge"]["amount"] == expected
+        assert q["immediate_charge"]["proration"]["net"] == expected
+        assert q["effective_at"] is None
+        assert q["next_renewal_amount"] == pro_plan.monthly_price
+        # 부작용 없음: 플랜 불변, 결제행 미생성, 토스 미호출
+        s = ensure_subscription(user)
+        assert s.plan.name == "basic"
+        assert PaymentHistory.objects.filter(user=user).count() == before
+        assert toss.charges == []
+
+    def test_preview_downgrade_is_zero_and_scheduled(self, user, toss, basic_plan):
+        sub = _make_active_pro(user, toss)
+        q = toss_flows.preview_change_plan(user, "basic")
+        assert q["direction"] == "downgrade"
+        assert q["immediate_charge"]["amount"] == 0
+        assert q["effective_at"] == sub.current_period_end
+        assert q["next_renewal_amount"] == basic_plan.monthly_price
+
+    def test_preview_extra_increase_matches_helper(self, user, toss):
+        _make_active_pro(user, toss)
+        base = timezone.now()
+        self._controlled_period(user, base)
+        now = base + timedelta(days=15)  # ratio 0.5
+
+        q = toss_flows.preview_change_extra_accounts(user, 2, now=now)
+
+        # 견적 == 실행 계산(동일 헬퍼·동일 now·동일 sub) — DB 정밀도 무관하게 일치해야 함
+        expected = toss_flows.compute_extra_accounts_charge(ensure_subscription(user), 2, now=now)
+        assert q["direction"] == "increase"
+        assert q["delta"] == 2
+        assert q["immediate_charge"]["amount"] == expected
+        assert 9800 <= expected <= 9900  # ~15/30 잔여 → 절반 근사
+        assert q["unit_price"] == 9900
+        assert q["next_renewal_amount"] == ensure_subscription(user).renewal_amount + 9900 * 2
+
+    def test_preview_free_user_rejected(self, user, toss):
+        with pytest.raises(BillingFlowError):
+            toss_flows.preview_change_plan(user, "pro")
+
+    def test_preview_endpoints_http_wiring(self, user, toss):
+        _make_active_pro(user, toss)
+        client = APIClient()
+        client.force_authenticate(user=user)
+
+        r1 = client.post(reverse("billing:extra-accounts-preview"), {"count": 2}, format="json")
+        assert r1.status_code == 200
+        assert r1.data["direction"] == "increase"
+        assert r1.data["unit_price"] == 9900
+
+        r2 = client.post(
+            reverse("billing:change-plan-preview"), {"plan_name": "basic"}, format="json"
+        )
+        assert r2.status_code == 200
+        assert r2.data["direction"] == "downgrade"
+
+        # 견적은 부작용 없음 — PENDING 결제 미생성
+        assert PaymentHistory.objects.filter(user=user, status=PaymentStatus.PENDING).count() == 0

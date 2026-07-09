@@ -112,12 +112,68 @@ const res = await api.post('/billing/toss/confirm/', {
 | 내 구독 + 사용량 | `GET /billing/my-subscription/` | `usage.dm/pages/ig_accounts/ai_tokens`, `trial_ends_at`, `next_billing{date,amount}` |
 | 해지 (기간말까지 이용) | `POST /billing/cancel/` | 즉시 환불 아님 — 기간말 자동 무료 전환 |
 | 해지 취소(재개) | `POST /billing/resume/` | 기간 내 + 카드 등록 상태만 |
-| 플랜 변경 | `POST /billing/change-plan/` `{plan_name}` | 업그레이드=즉시 결제+주기 리셋 / 다운그레이드=`effective_at`에 적용 |
+| 플랜 변경 | `POST /billing/change-plan/` `{plan_name}` | 업그레이드=**남은 기간분 차액만 즉시 비례 결제 + 갱신일 유지** / 다운그레이드=`effective_at`에 적용 |
+| 플랜 변경 **견적** | `POST /billing/change-plan/preview/` `{plan_name}` | **결제 전 미리보기(부작용 0)**. `immediate_charge.amount`=지금 청구액. → §3-1 |
 | 카드 변경 | prepare → requestBillingAuth → confirm(`plan_name` 생략) | past_due면 자동 재시도됨 |
-| 추가 IG 계정 (pro) | `POST /billing/extra-accounts/` `{count}` | 증가분 × 9,900원 **즉시 결제**, 이후 월 요금 합산 |
+| 추가 IG 계정 (pro) | `POST /billing/extra-accounts/` `{count}` | 증가분 × 9,900원을 **잔여일만큼 비례 즉시 결제**, 다음 갱신부터 전체 합산 |
+| 추가 IG 계정 **견적** | `POST /billing/extra-accounts/preview/` `{count}` | **결제 전 미리보기(부작용 0)**. `unit_price`(9,900) 포함. → §3-1 |
 | 결제 내역 | `GET /billing/payments/history/` | `receipt_url` = 토스 영수증 |
 | 환불 가능 여부 | `GET /billing/refund-eligibility/` | 결제 후 7일 + 유료 기능 미사용 |
 | 환불 | `POST /billing/payments/{id}/refund/` | 성공 시 즉시 무료 전환 |
+
+### 3-1. 비례배분(proration) & 결제 전 견적 — ⭐신규
+
+주기 중간에 **업그레이드**하거나 **추가 IG 계정을 늘리면**, 한 달치 전액이 아니라
+**남은 기간에 해당하는 금액만** 그 자리에서 결제됩니다. 갱신일(다음 결제일)은 **그대로 유지**되고,
+다음 갱신부터 새 요금 전액이 청구됩니다.
+
+- **업그레이드**(basic→pro): `지금 청구 = (프로 잔여분) − (기존 베이직 잔여 크레딧)`. 예) 잔여 12일이면 약 2,400원만 즉시 결제, 갱신일 그대로, 다음 달부터 프로 전액.
+- **추가 계정 증가**: `지금 청구 = 9,900 × 증가분 × (잔여일/30)`. 예) 7일차에 1개 추가(잔여 23일) → 약 7,590원.
+- **다운그레이드 / 계정 축소**: 즉시 청구·환불 **없음**. 다음 갱신부터 낮은 금액(다운그레이드는 `effective_at`에 적용).
+- 주기 말에 걸쳐 잔여 금액이 0이면 **무과금으로 즉시 적용**되고 `payment`/`immediate_charge.amount`는 0.
+
+**반드시 "견적 → 확정" 2단계로 붙이세요.** 실행 API를 바로 부르지 말고, 먼저 `preview`로
+"지금 N원이 결제됩니다"를 사용자에게 보여준 뒤 확정 시 실행 API를 호출합니다.
+
+```typescript
+// 1) 견적 (부작용 없음 — 몇 번을 불러도 안전, 결제 안 됨)
+const quote = await (await fetch('/api/v1/billing/change-plan/preview/', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+  body: JSON.stringify({ plan_name: 'pro' }),
+})).json();
+// quote.immediate_charge.amount → "지금 2,400원이 결제됩니다" 확인 모달
+// quote.next_renewal_amount    → "다음 달부터 매월 9,900원"
+
+// 2) 사용자가 확정하면 같은 body 로 실행 API 호출
+if (userConfirmed) {
+  const res = await fetch('/api/v1/billing/change-plan/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ plan_name: 'pro' }),
+  });
+}
+```
+
+**견적 응답 필드**
+| 필드 | 의미 |
+|---|---|
+| `direction` | `upgrade`/`downgrade`/`noop` (플랜) · `increase`/`decrease`/`noop` (추가계정) |
+| `immediate_charge.amount` | **지금 즉시 결제될 금액(원, 세포함)**. 0이면 무과금 즉시 적용 |
+| `immediate_charge.proration` | 업그레이드: `remaining_days`,`new_plan_prorated`,`current_plan_credit`,`net` / 추가계정: `unit_price`,`units`,`full_amount`,`net` |
+| `effective_at` | 다운그레이드 예약 적용 시각(현재 주기 종료일). 업그레이드/증가는 `null` |
+| `next_renewal_amount` | **다음 정기 갱신 전액**(즉시 청구액과 다름!) |
+| `unit_price` | (추가계정 견적) 계정 단가 9,900 — **하드코딩 말고 이 값을 쓰세요** |
+
+> ⚠️ **`immediate_charge.amount`(지금 청구) ≠ `next_renewal_amount`(다음 갱신 전액)** 를 반드시 구분해 표기하세요.
+> "지금 2,400원 결제 / 다음 달부터 매월 9,900원"처럼요. `my-subscription`의 `next_billing.amount`는
+> **다음 정기 갱신액**일 뿐, 지금 변경 시 즉시 청구액이 아닙니다(견적 API로 확인).
+
+> 💡 실행 API 응답의 `payment.amount`가 실제 청구된 금액입니다. 견적과 실청구는 **동일 계산**을 쓰지만,
+> 견적~확정 사이 시간이 흐르면 잔여일 계산으로 **최대 몇 원** 차이날 수 있습니다(정상). 최종 금액은 `payment.amount` 기준.
+
+> ⛔ **이중 청구 주의**: 실행 API 호출 중 버튼을 비활성화하세요. 서버가 결정적 주문번호로 중복 클릭을 막지만,
+> 이전 결제가 확인 중(202)일 때 다른 변경을 시도하면 `202`("결제 확인 중")로 거절될 수 있습니다 — 잠시 후 재시도 안내.
 
 ### past_due (결제 실패) 안내
 

@@ -38,6 +38,39 @@ MAX_RENEWAL_ATTEMPTS = 3
 PENDING_RECONCILE_AFTER_MINUTES = 30
 
 _RENEWAL_ORDER_RE = re.compile(r"^tfsub-[0-9a-f]{10}-\d{8}-a\d+$")
+# 비례(proration) 즉시청구 주문 — PENDING→DONE 확정 시 구독 상태 자동 반영 근거.
+_PRORATE_UP_RE = re.compile(r"^tfsub-[0-9a-f]{10}-up-([a-z]+)-(\d+)-\d{8}$")
+_PRORATE_EX_RE = re.compile(r"^tfsub-[0-9a-f]{10}-ex-\d+-(\d+)-\d{8}$")
+
+
+def _match_prorate_order(order_id: str):
+    """비례 주문 orderId 파싱 → ('up', plan_name, extra) | ('ex', None, count) | None."""
+    m = _PRORATE_UP_RE.match(order_id or "")
+    if m:
+        return ("up", m.group(1), int(m.group(2)))
+    m = _PRORATE_EX_RE.match(order_id or "")
+    if m:
+        return ("ex", None, int(m.group(1)))
+    return None
+
+
+def _finalize_prorate_success(sub_id, prorate) -> None:
+    """비례 즉시청구가 뒤늦게 확정될 때 구독 상태를 orderId 에 담긴 대상대로 반영 (멱등)."""
+    from .models import SubscriptionPlan
+    from .toss_flows import _apply_extra_state, _apply_upgrade_state
+
+    kind, plan_name, count = prorate
+    if kind == "up":
+        try:
+            new_plan = SubscriptionPlan.objects.get(name=plan_name, is_active=True)
+        except SubscriptionPlan.DoesNotExist:
+            logger.error(
+                "reconcile: 비례 업그레이드 대상 플랜 없음 plan=%s sub=%s", plan_name, sub_id
+            )
+            return
+        _apply_upgrade_state(sub_id, new_plan, count)
+    else:
+        _apply_extra_state(sub_id, count)
 
 
 def _log_summary(task_name: str, processed: int, failed: int) -> None:
@@ -431,7 +464,19 @@ def _reconcile_confirm_paid(payment, toss_payment: dict) -> None:
         _finalize_renewal_success(payment.subscription_id, payment.pk, toss_payment)
         return
 
-    # init/extra 주문 — confirm 플로우가 중단된 극히 드문 케이스. 결제만 확정하고
+    # 비례(업그레이드/추가계정) 주문 — PENDING→DONE 확정 시 구독 상태를 자동 반영.
+    # orderId 에 대상(플랜·계정수)이 담겨 있어 재적용이 결정적·멱등이다.
+    prorate = _match_prorate_order(payment.toss_order_id or "")
+    if prorate and payment.subscription_id:
+        apply_payment_success_fields(payment, toss_payment)
+        payment.save()
+        _finalize_prorate_success(payment.subscription_id, prorate)
+        logger.info(
+            "reconcile: 비례 주문 뒤늦게 확정 — 구독 자동 반영 order=%s", payment.toss_order_id
+        )
+        return
+
+    # init(신규구독 첫 결제) 주문 — confirm 플로우가 중단된 극히 드문 케이스. 결제만 확정하고
     # 구독 상태(플랜/기간/슬롯)는 수동 확인 필요 → 운영 알림.
     apply_payment_success_fields(payment, toss_payment)
     payment.save()

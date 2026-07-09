@@ -13,6 +13,7 @@ from .referral_views import (
 )
 from .subscription_views import (
     CancelSubscriptionView,
+    ChangePlanPreviewView,
     ChangeSubscriptionView,
     MySubscriptionView,
     PageActivationView,
@@ -20,6 +21,7 @@ from .subscription_views import (
     SubscriptionPlanListView,
 )
 from .toss_views import (
+    ExtraAccountsPreviewView,
     ExtraAccountsView,
     TossConfirmView,
     TossDevIssueView,
@@ -38,6 +40,11 @@ urlpatterns = router.urls + [
     path("billing/plans/", SubscriptionPlanListView.as_view(), name="subscription-plans"),
     path("billing/my-subscription/", MySubscriptionView.as_view(), name="my-subscription"),
     path("billing/change-plan/", ChangeSubscriptionView.as_view(), name="change-plan"),
+    path(
+        "billing/change-plan/preview/",
+        ChangePlanPreviewView.as_view(),
+        name="change-plan-preview",
+    ),
     path("billing/cancel/", CancelSubscriptionView.as_view(), name="cancel-subscription"),
     path("billing/resume/", ResumeSubscriptionView.as_view(), name="resume-subscription"),
     path("billing/page-activation/", PageActivationView.as_view(), name="page-activation"),
@@ -51,6 +58,11 @@ urlpatterns = router.urls + [
         name="toss-dev-issue",
     ),
     path("billing/extra-accounts/", ExtraAccountsView.as_view(), name="extra-accounts"),
+    path(
+        "billing/extra-accounts/preview/",
+        ExtraAccountsPreviewView.as_view(),
+        name="extra-accounts-preview",
+    ),
     # 결제 내역 / 환불
     path("billing/payments/history/", PaymentHistoryView.as_view(), name="payment-history"),
     path("billing/refund-eligibility/", RefundEligibilityView.as_view(), name="refund-eligibility"),
