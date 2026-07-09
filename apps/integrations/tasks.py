@@ -213,11 +213,14 @@ def _resolve_plan_name(campaign) -> str:
 
 
 def _rate_defer(log, campaign, ig_conn):
-    """발송 직전 속도 제어. defer 해야 하면 (seconds, reason), 보내도 되면 None.
+    """발송 직전 속도 제어 (v4.3 — 스무스 페이서). defer 필요 시 (seconds, reason), 발송 가능이면 None.
 
-    - per-campaign 시간당 throttle(can_send_more): rolling 1h → 짧게 재평가.
-    - per-IG-account Meta 안전속도 거버너(rate_governor): 750/hr Private Reply + 분당 버스트.
-      초과 시 다음 윈도우(시각 경계)까지 defer → requeue 워커가 created_at 순으로 순차 재투입.
+    게이트 순서:
+      1) Action Block 쿨다운 — 계정 전체 정지 (차단 중 재시도 = 차단 연장 방지).
+      2) dm_pacer — 계정×버킷 지터 슬롯 직렬화 (사설답장 3~7s / Send API 1~3s).
+         슬롯 미도래면 그 시각까지 defer → requeue 워커가 슬롯 시각에 맞춰 재투입.
+      3) rate_governor 시간당 백스톱(740) — 페이서 정상이면 절대 안 걸리는 최후 방어선.
+    v4.3 에서 제거: 캠페인 200/hr(can_send_more) — 페이서가 계정 단위로 대체(필드 deprecated).
     드랍/실패가 아니라 항상 '지연'이다.
     """
     # ★ P4: Action Block 쿨다운 중이면 그 계정 모든 발송을 defer (Meta 로 보내지 않음 → 차단 연장 방지).
@@ -227,10 +230,13 @@ def _rate_defer(log, campaign, ig_conn):
     if ab_remaining > 0:
         return (ab_remaining, "action_block_cooldown")
 
-    if not campaign.can_send_more():
-        # rolling 1h window — 슬롯이 비는 정확한 시각 계산은 비용 대비 이득이 적어
-        # 5분 후 재평가(요구사항: 초과분은 드랍하지 않고 나중에 발송).
-        return (300, "campaign_hourly_cap")
+    if getattr(settings, "DM_PACER_ENABLED", True):
+        from . import dm_pacer
+
+        gate = dm_pacer.pacer_gate(str(ig_conn.external_account_id), log)
+        if gate is not None:
+            wait, bucket = gate
+            return (wait, f"paced:{bucket}")
 
     if getattr(settings, "DM_GOVERNOR_ENABLED", True):
         from .rate_governor import check as _rate_check
@@ -240,7 +246,7 @@ def _rate_defer(log, campaign, ig_conn):
             plan=_resolve_plan_name(campaign),
         )
         if not decision.allowed:
-            # retry_after = 다음 시간/분 윈도우까지 초. 최소 30초 보장.
+            # retry_after = 다음 시간 윈도우까지 초. 최소 30초 보장.
             return (max(int(decision.retry_after), 30), f"rate_governed:{decision.reason}")
 
     return None
@@ -826,6 +832,49 @@ def _enqueue_send_dm_for_story_reply(
     }
 
 
+@shared_task
+def resolve_recipient_usernames_for_campaign(campaign_id: str, igsids: list) -> dict:
+    """수신자 목록 열람 시 트리거되는 지연(lazy) username 해석 (best-effort).
+
+    Story 답장 트리거 캠페인은 messaging 웹훅에 username 이 없어 SentDMLog.recipient_username
+    이 빈 값으로 저장된다. 프론트가 수신자 목록/상세를 실제로 열람할 때만(verification_views)
+    이 태스크를 fire-and-forget 로 enqueue 해, IG User Profile API 로 핸들을 해석하고 빈 로그에
+    채운다 — 아무도 안 보면 API 호출 0.
+
+    - IGSID→username 은 InstagramMessagingService.resolve_username 이 캐시(양성 7d/음성 1h).
+    - consent 윈도우(~24h) 밖이면 해석 실패 → 빈 값 유지(응답 계층에서 user_{igsid} 폴백 표기).
+    - 발송 파이프라인과 완전 독립 — 실패해도 조용히 skip, 아무것도 막지 않는다.
+    """
+    if not campaign_id or not igsids:
+        return {"status": "noop"}
+
+    try:
+        campaign = AutoDMCampaign.objects.select_related("ig_connection").get(id=campaign_id)
+    except (AutoDMCampaign.DoesNotExist, ValueError, TypeError):
+        return {"status": "campaign_not_found"}
+
+    ig_conn = campaign.ig_connection
+    if not ig_conn or ig_conn.status != IGAccountConnection.Status.ACTIVE:
+        return {"status": "ig_not_active"}
+
+    token = ig_conn.access_token
+    resolved = 0
+    for igsid in {str(x) for x in igsids if x}:
+        username = InstagramMessagingService.resolve_username(igsid, token)
+        if not username:
+            continue
+        # 빈(미해석) 로그에 한해서만 채움 — 이미 실제 핸들이 있으면 건드리지 않는다.
+        updated = SentDMLog.objects.filter(
+            campaign_id=campaign.id,
+            recipient_user_id=igsid,
+            recipient_username="",
+        ).update(recipient_username=username)
+        if updated:
+            resolved += 1
+
+    return {"status": "done", "resolved": resolved, "requested": len(igsids)}
+
+
 def _maybe_attach_next_media_from_webhook(
     *,
     unattached_campaigns: list,
@@ -1053,11 +1102,17 @@ def send_dm_task(self, log_id: str):
     campaign = log.campaign
     ig_conn = campaign.ig_connection
 
-    # ★ 예약 발송 창 가드 (권위 있는 단일 체크포인트):
+    # ★ 캠페인 상태 가드 (v4.3 Fix 1 — 일시중지가 백로그를 실제로 멈추게):
     # 모든 발송이 이 태스크를 거친다 — opening / reward(postback) / follow 재안내 /
-    # reconcile 재큐 / 수동 재시도. enqueue 시점 가드를 통과한 뒤라도, 실행 시점에
-    # 캠페인 활성 기간(window)이 끝났으면(또는 아직 시작 전이면) 여기서 확정 차단한다.
-    # 상태(pause/complete)는 별도 관심사라 건드리지 않고, 오직 예약 창만 본다.
+    # reconcile 재큐 / 수동 재시도. 대기(QUEUED) 중이던 건이라도 실행 시점에 캠페인이
+    # PAUSED/COMPLETED/INACTIVE 면 발송하지 않고 SKIPPED 로 종결한다(REVIVABLE → 재개 시 되살림).
+    # (이전엔 예약 창만 봐서 일시중지해도 기존 백로그가 계속 나가는 버그가 있었다.)
+    if not campaign.is_active():
+        log.mark_skipped(f"Campaign not active (status={campaign.status})")
+        return {"status": "skipped", "reason": "campaign_not_active"}
+
+    # ★ 예약 발송 창 가드 (권위 있는 단일 체크포인트):
+    # ACTIVE 여도 예약 창 밖(시작 전/종료 후)이면 여기서 확정 차단한다.
     if not campaign.is_within_schedule():
         log.mark_skipped("Campaign outside active schedule window")
         return {"status": "skipped", "reason": "outside_schedule_window"}
@@ -1416,11 +1471,17 @@ def reconcile_stuck_submitting():
 
 @shared_task
 def requeue_deferred_dms():
-    """next_retry_at 이 도래한 defer(QUEUED) 건을 send_dm_task 로 순차(FIFO) 재투입.
+    """next_retry_at 이 도래(+look-ahead)한 defer(QUEUED) 건을 send_dm_task 로 재투입.
 
-    rate-limit/transient defer(item1) + 시간당 한도·계정 거버너 defer(item2) 공통 픽커다.
-    created_at 오름차순으로 처리 = 가장 오래 기다린 건부터 → "다음 윈도우에 순차 발송".
+    rate-limit/transient defer(item1) + 페이서 슬롯/백스톱 defer(item2) 공통 픽커다.
+    created_at 오름차순으로 처리 = 가장 오래 기다린 건부터.
     next_retry_at 이 없는 채 2분+ 정체된 QUEUED(초기 dispatch 유실)도 안전 재투입한다.
+
+    v4.3 — 슬롯 스태거: beat 주기(30s)가 페이서 간격(3~7s)보다 굵어서 "도래분 일괄 발사"
+    하면 슬롯 간격이 뭉개진다(버스트 = 봇 지문). 그래서 look-ahead 창(now+35s) 안의 건까지
+    미리 픽업하되, 각 건을 **countdown = 슬롯까지 남은 초**로 예약 발사한다 → 워커가
+    슬롯 시각에 정확히 실행. 재진입한 태스크는 dm_pacer 의 claimed 플래그로 재클레임 없이
+    통과한다(포인터 이중 전진 방지).
 
     동시 픽업은 select_for_update(skip_locked) + next_retry_at=None 마킹으로 방지하고,
     send_dm_task 진입 가드(status QUEUED/SUBMITTING)가 이중 발송을 막는다.
@@ -1429,28 +1490,74 @@ def requeue_deferred_dms():
     """
     now = timezone.now()
     stale_cutoff = now - timedelta(minutes=2)
+    lookahead = now + timedelta(seconds=35)
     with transaction.atomic():
         rows = list(
             SentDMLog.objects.select_for_update(skip_locked=True)
             .filter(status=SentDMLog.Status.QUEUED)
             .filter(
-                Q(next_retry_at__lte=now)
+                Q(next_retry_at__lte=lookahead)
                 | Q(next_retry_at__isnull=True, created_at__lte=stale_cutoff)
             )
             .order_by("created_at")
-            .values_list("id", flat=True)[:200]
+            .values_list("id", "next_retry_at")[:200]
         )
-        ids = list(rows)
+        ids = [r[0] for r in rows]
         if ids:
             # 픽업 표식: next_retry_at 비워 다음 tick 중복 픽업 방지(재defer 시 send_dm_task 가 다시 채움).
             SentDMLog.objects.filter(id__in=ids).update(next_retry_at=None)
 
-    for log_id in ids:
-        send_dm_task.delay(str(log_id))
+    for log_id, retry_at in rows:
+        countdown = max(0.0, (retry_at - now).total_seconds()) if retry_at else 0.0
+        if countdown > 0.5:
+            send_dm_task.apply_async(args=[str(log_id)], countdown=countdown)
+        else:
+            send_dm_task.delay(str(log_id))
 
     if ids:
         logger.info(f"requeue_deferred_dms: requeued {len(ids)} deferred logs")
     return {"requeued": len(ids)}
+
+
+@shared_task
+def reconcile_pacer_pointers():
+    """페이서 포인터 자가치유 (v4.3 Fix 2) — 삭제/일시중지로 생긴 '빈 슬롯 홀' 회수.
+
+    캠페인 삭제(CASCADE 로 QUEUED 소멸)·일시중지(QUEUED→SKIPPED)로 대기 건이 사라져도
+    계정 페이서 포인터는 단조 증가라 앞선 채 남는다 → 새 DM 이 유휴 시간을 기다리는 문제.
+    각 계정×버킷 포인터를 '아직 대기중인 마지막 예약 슬롯(max next_retry_at)'까지만 당겨
+    그 뒤의 phantom 예약을 회수한다. 실제 예약 뒤로는 안 당기고(충돌 방지), now 아래로도
+    안 내려간다(과속 불가). slack(기본 300s)으로 클레임 write-lag 오탐을 흡수한다.
+
+    한계: 계정 내 여러 캠페인이 시간상 섞인 상태에서 일부만 삭제하면 '중간 홀'은 남는다
+    (이미 클레임된 잔존 DM 은 자기 슬롯을 유지) — 계정이 잠시 저속 발송할 뿐 무손실.
+    tail(가장 흔한 케이스: 백로그를 통째로 삭제/중지)은 완전 회수된다.
+
+    Beat: 60초. Redis 전용(LocMem 이면 no-op).
+    """
+    from django.db.models import Max
+
+    from . import dm_pacer
+
+    now = timezone.now()
+    now_ts = now.timestamp()
+    reclaimed: dict[str, float] = {}
+    for bucket, acct in dm_pacer.iter_active_pointers():
+        latest = (
+            SentDMLog.objects.filter(
+                campaign__ig_connection__external_account_id=acct,
+                status=SentDMLog.Status.QUEUED,
+            )
+            .filter(dm_pacer.bucket_q(bucket))
+            .aggregate(m=Max("next_retry_at"))["m"]
+        )
+        floor_ts = max(now_ts, latest.timestamp() if latest else 0.0)
+        secs = dm_pacer.reclaim_pointer(acct, bucket, floor_ts)
+        if secs > 0:
+            reclaimed[f"{bucket}:{acct}"] = round(secs, 1)
+    if reclaimed:
+        logger.info("reconcile_pacer_pointers: reclaimed phantom slots %s", reclaimed)
+    return {"reclaimed": reclaimed}
 
 
 @shared_task
@@ -1590,12 +1697,6 @@ def dm_infra_health_alert():
         except Exception:  # noqa: BLE001
             logger.exception("dm_infra_health_alert telegram 실패 (non-fatal)")
     return {"problems": problems, "queue_depths": depths}
-
-    return {
-        "total_queued": total,
-        "window_risk": risk,
-        "oldest_age_hours": round(oldest_age_h, 1),
-    }
 
 
 @shared_task
@@ -2407,8 +2508,12 @@ def handle_inbound_message_for_gate(
 @shared_task(bind=True, max_retries=5)
 def send_reward_dm(self, opening_log_id: str):
     """
-    Follow-gate 통과 후 본 DM(reward) 을 사용자 IGSID 로 발송.
+    Follow-gate(키워드 답장) 통과 후 본 DM(reward) 을 발송 **큐에 등록**.
 
+    v4.3 — BYPASS 수정: 이전에는 이 태스크가 send_dm_via_user_id 를 직접 호출해
+    페이서/백스톱/월쿼터를 전부 우회했다(2026-07-09 감사에서 적발). 이제 형제 헬퍼
+    (_enqueue_reward_dm)와 동일하게 QUEUED 로그를 만들고 send_dm_task 에 위임한다 —
+    모든 발송이 단일 초크포인트(send_dm_task → _rate_defer)를 지난다.
     24h 메시징 윈도우 내에서만 가능 (사용자가 우리에게 메시지 보낸 직후라 OK).
     """
     try:
@@ -2418,8 +2523,7 @@ def send_reward_dm(self, opening_log_id: str):
 
     campaign = opening.campaign
 
-    # ★ 예약 발송 창 가드: 이 경로(키워드 답장 reward)는 send_dm_task 를 거치지 않고
-    # 직접 발송하므로 별도로 창 검사. 활성 기간이 끝났으면 reward 도 발송하지 않는다.
+    # 빠른 가드(권위 체크는 send_dm_task 진입부가 다시 수행 — 여기선 무의미한 큐잉만 회피).
     if not campaign.is_within_schedule():
         return {"status": "skipped", "reason": "outside_schedule_window"}
 
@@ -2434,19 +2538,22 @@ def send_reward_dm(self, opening_log_id: str):
     # 멱등성 키 — opening 의 idempotency_key 를 시드로 sha256(64자 고정).
     # 접미사 접합(":reward")은 varchar(64) 를 초과(71자)해 DataError 를 내므로 금지 — 형제 헬퍼
     # (_enqueue_reward_dm/_enqueue_follow_retry)와 동일하게 항상 해시화한다.
+    # ★ 키 유지: 과거 직접발송 시절과 같은 파생식 → 재배포 전후 중복 발송 불가.
     import hashlib
 
     idem = hashlib.sha256(f"reward:{opening.idempotency_key}".encode()).hexdigest()
     reward_log, created = SentDMLog.create_idempotent(
         idempotency_key=idem,
         campaign=campaign,
-        comment_id=opening.comment_id,
-        comment_text=opening.comment_text,
+        # comment_id 는 비운다: reward 는 user_id(24h 윈도우) 발송이므로 _messaging_window 가
+        # 24h 로 잡히게 한다(comment_id 를 물려받으면 7일로 오판). 라우팅은 parent_log 만으로도
+        # user_id 경로가 보장되지만 윈도우 계산까지 정확히 맞춘다 (_enqueue_reward_dm 과 동일).
+        comment_id="",
+        comment_text="",
         recipient_user_id=opening.recipient_user_id,
         recipient_username=opening.recipient_username,
         message_sent=campaign.reward_message_template,
-        status=SentDMLog.Status.SUBMITTING,
-        submitted_at=timezone.now(),  # create 와 한 트랜잭션 — 별도 save 제거
+        status=SentDMLog.Status.QUEUED,
         webhook_payload=opening.webhook_payload,
         dm_kind=SentDMLog.DMKind.REWARD,
         gate_status=SentDMLog.GateStatus.NONE,
@@ -2458,33 +2565,10 @@ def send_reward_dm(self, opening_log_id: str):
             "reward_log_id": str(reward_log.id) if reward_log else None,
         }
 
-    try:
-        result = InstagramMessagingService.send_dm_via_user_id(
-            ig_user_id=ig_conn.external_account_id,
-            recipient_id=opening.recipient_user_id,
-            message_text=campaign.reward_message_template,
-            access_token=ig_conn.access_token,
-            buttons=campaign.get_link_buttons(),
-        )
-    except DMSendError as e:
-        # v3.9: rate-limit/transient 은 defer(QUEUED+next_retry_at) → requeue 워커가 send_dm_task 로
-        # 재투입(reward 는 child 라 user_id 경로로 재발송). non-retriable 은 즉시 종결.
-        # reward 는 항상 child(parent_log=opening) 이므로 _defer_or_fail 의 카운터 가드로 통계 제외.
-        return _defer_or_fail(reward_log, campaign, ig_conn, e)
-
-    reward_log.mark_accepted(
-        message_id=result["message_id"],
-        api_response=result.get("_raw") or result,
-    )
-    # reward 는 child → 캠페인 카운터 제외 (opening 이 이미 카운트됨).
-    if reward_log.parent_log_id is None:
-        campaign.increment_sent()
-    verify_dm_delivery.apply_async(args=[str(reward_log.id)], countdown=600)
-
+    send_dm_task.delay(str(reward_log.id))
     return {
-        "status": "accepted",
+        "status": "enqueued",
         "reward_log_id": str(reward_log.id),
-        "message_id": result["message_id"],
     }
 
 

@@ -197,11 +197,16 @@ class TestActionBlockCooldown:
         assert rate_governor.trip_action_block(acct) == 0  # 이미 쿨다운 중
 
 
-# ───────────────────────── P8: governor fail-closed ─────────────────────────
+# ───────────────────────── P8→v4.3: governor flush 처리 ─────────────────────────
 
 
-class TestGovernorFailClosed:
-    def test_missing_sentinel_blocks(self):
+class TestGovernorFlushHandling:
+    def test_missing_sentinel_does_not_freeze(self):
+        """v4.3 — Redis flush 시 동결하지 않는다 (dm_pacer 가 물리 rate 를 보장).
+
+        구 P8 fail-closed(시각경계까지 전 계정 차단)는 제거됐다: 페이서 포인터가 유실돼도
+        원자 클레임이 즉시 재직렬화하므로 과속이 불가능하다. 센티넬은 재설정만 한다.
+        """
         from apps.integrations import rate_governor
 
         acct = f"fc_{uuid.uuid4().hex}"
@@ -210,11 +215,8 @@ class TestGovernorFailClosed:
             cache.delete("dmrate:alive")
             cache.delete("dmrate:reset_until")
             d = rate_governor.check(acct, plan="pro")
-            assert d.allowed is False
-            assert d.reason == "redis_reset_failclosed"
-            # 이후 호출도 (다른 계정도) reset_until 로 차단
-            d2 = rate_governor.check(f"other_{uuid.uuid4().hex}", plan="pro")
-            assert d2.allowed is False
+            assert d.allowed is True  # 동결 없음
+            assert cache.get("dmrate:alive") == 1  # 센티넬 재설정
         finally:
             # 다른 테스트 오염 방지 — 정상 상태 복구
             cache.delete("dmrate:reset_until")

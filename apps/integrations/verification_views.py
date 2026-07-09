@@ -12,7 +12,9 @@ READ 의 차이를 표시하고, 실패 사유별 후속 액션(재연동/재시
     GET    /{id}/checklist/                 단건의 자가 점검 체크리스트 + 액션 가이드
     POST   /{id}/reverify/                  해당 로그 즉시 능동 재검증
     POST   /{id}/retry/                     transient 실패 건 강제 재발송 큐 등록
-    GET    /stats/?campaign_id=...          캠페인 단위 발송 통계
+    GET    /stats/?campaign_id=...          캠페인 단위 발송 통계 (이벤트 + 사람 단위 + CTR)
+    GET    /recipients/?campaign_id=...      수신자(사람) 단위로 묶은 로그 롤업
+    GET    /queue-state/?campaign_id=...     순차 발송 큐 현황 (게이지 + ETA) — v4.3 페이서
     GET    /lookup/?message_id=...          meta_message_id 또는 idempotency_key 조회
     GET    /health/?ig_connection_id=...    해당 계정의 최근 발송 보증 헬스체크
     GET    /self_check_guide/               자가 점검 체크리스트 (상태 무관, 인증 불필요)
@@ -23,9 +25,11 @@ READ 의 차이를 표시하고, 실패 사유별 후속 액션(재연동/재시
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
-from django.db.models import Count, Q
+from django.conf import settings
+from django.core.cache import cache
+from django.db.models import Count, Max, Min, Q
 from django.utils import timezone
 from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import status, viewsets
@@ -34,11 +38,14 @@ from rest_framework.exceptions import NotFound, PermissionDenied
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
+from .campaign_stats import NEEDS_ATTENTION_STATUSES, SENT_FOR_QUOTA_STATUSES
 from .dm_exceptions import DMSendError, DMTransientError
 from .dm_frontend_actions import SELF_CHECK_CHECKLIST, build_frontend_action
 from .models import AutoDMCampaign, IGAccountConnection, SentDMLog
 from .serializers import (
     DMLookupResponseSerializer,
+    DMQueueStateSerializer,
+    DMRecipientRollupSerializer,
     DMReverifyResponseSerializer,
     DMVerificationStatsSerializer,
     SentDMLogSerializer,
@@ -49,6 +56,40 @@ from .services import InstagramMessagingService
 def _user_workspaces(request):
     """현재 유저가 속한 워크스페이스 ID 집합"""
     return request.user.memberships.values_list("workspace_id", flat=True)
+
+
+def _recipient_username_display(recipient_user_id, recipient_username) -> str:
+    """수신자 표시용 username — 미해석(빈 값)이면 user_{IGSID} 폴백.
+
+    DB 컬럼(recipient_username)은 빈 채로 두고 응답에서만 폴백을 적용한다
+    (윈도우 내 재열람 시 실제 핸들로 채워질 여지 보존 · Max 롤업 무손상)."""
+    return recipient_username or f"user_{recipient_user_id}"
+
+
+def _maybe_enqueue_username_resolution(campaign_id, recipient_user_ids) -> None:
+    """수신자 목록 열람 시 빈 username 을 지연 해석하도록 Celery 태스크 enqueue (fire-and-forget).
+
+    - 설정 DM_RESOLVE_RECIPIENT_USERNAME=False 면 no-op.
+    - 폴링 storm 방지: IGSID 별 pending 플래그(cache.add, TTL 60s)로 재-enqueue 억제.
+    - 뷰에서 동기 외부 API 호출 금지(CLAUDE.md §5.3) — 실제 IG 호출은 태스크가 수행하고,
+      엔드포인트는 현재 데이터를 즉시 반환한다(핸들은 다음 로드 때 반영).
+    """
+    if not campaign_id:
+        return
+    if not getattr(settings, "DM_RESOLVE_RECIPIENT_USERNAME", True):
+        return
+
+    to_resolve = [
+        rid
+        for rid in {str(x) for x in recipient_user_ids if x}
+        if cache.add(f"dm:uname:pending:{campaign_id}:{rid}", 1, 60)
+    ]
+    if not to_resolve:
+        return
+
+    from .tasks import resolve_recipient_usernames_for_campaign
+
+    resolve_recipient_usernames_for_campaign.delay(str(campaign_id), to_resolve)
 
 
 def _get_log_for_user(request, log_id: str) -> SentDMLog:
@@ -100,17 +141,26 @@ class DMVerificationViewSet(viewsets.ViewSet):
              failed_api, failed_token, failed_window, failed_param, failed_no_trace, skipped)
         - `since` (ISO datetime, 선택): 이 시각 이후 생성된 로그만
         - `recipient_username` (str, 선택): 수신자 username 부분일치
+        - `recipient_user_id` (str, 선택): 수신자 Instagram ID **정확일치**.
+            `recipients/` 목록에서 한 계정을 클릭했을 때, 그 사람에게 간 모든 개별
+            DM(opening/reward/재안내)의 타임라인을 조회하는 "자세히보기" 용도.
+            보통 `campaign_id` 와 함께 사용합니다.
         - `page` (int): 페이지 번호 (PageNumberPagination, page_size=20)
 
         ## 비즈니스 로직
         프론트는 `display_status` 필드로 한국어 표시명을, `is_delivered` 로 진짜 도착
         여부를, `verified_via` 로 검증 경로(echo/conv_api)를 확인할 수 있습니다.
+
+        ## 참고
+        이 목록은 **개별 발송 이벤트** 단위입니다. 수신자(사람) 단위로 묶어 보려면
+        `GET /dm-verification/recipients/?campaign_id=...` 를 사용하세요.
         """,
         parameters=[
             OpenApiParameter("campaign_id", str, OpenApiParameter.QUERY, required=False),
             OpenApiParameter("status", str, OpenApiParameter.QUERY, required=False),
             OpenApiParameter("since", str, OpenApiParameter.QUERY, required=False),
             OpenApiParameter("recipient_username", str, OpenApiParameter.QUERY, required=False),
+            OpenApiParameter("recipient_user_id", str, OpenApiParameter.QUERY, required=False),
         ],
         responses={
             200: SentDMLogSerializer(many=True),
@@ -128,6 +178,7 @@ class DMVerificationViewSet(viewsets.ViewSet):
         status_filter = request.query_params.get("status")
         since = request.query_params.get("since")
         recipient_username = request.query_params.get("recipient_username")
+        recipient_user_id = request.query_params.get("recipient_user_id")
 
         if campaign_id:
             qs = qs.filter(campaign_id=campaign_id)
@@ -137,6 +188,9 @@ class DMVerificationViewSet(viewsets.ViewSet):
             qs = qs.filter(created_at__gte=since)
         if recipient_username:
             qs = qs.filter(recipient_username__icontains=recipient_username)
+        if recipient_user_id:
+            # 계정별 "자세히보기": 한 수신자에게 간 모든 개별 DM(opening/reward/재안내) 타임라인.
+            qs = qs.filter(recipient_user_id=recipient_user_id)
 
         qs = qs.order_by("-created_at")
 
@@ -148,7 +202,14 @@ class DMVerificationViewSet(viewsets.ViewSet):
         page_size = 20
         offset = (page - 1) * page_size
         total = qs.count()
-        items = qs[offset : offset + page_size]
+        items = list(qs[offset : offset + page_size])
+
+        # 지연 username 해석: 캠페인 컨텍스트가 있을 때만(태스크가 토큰을 캠페인에서 얻음).
+        if campaign_id:
+            _maybe_enqueue_username_resolution(
+                campaign_id,
+                [i.recipient_user_id for i in items if not i.recipient_username],
+            )
 
         return Response(
             {
@@ -468,10 +529,28 @@ class DMVerificationViewSet(viewsets.ViewSet):
         - `ig_connection_id` (UUID, 선택): 특정 계정 전체 캠페인 합산
         - `since` (ISO datetime, 선택, 기본: 30일 전)
 
-        ## 핵심 지표
+        ## 지표 두 계열 (중요)
+        응답에는 **① 발송 이벤트 단위** 지표와 **② 사람(수신자) 단위** 지표가 함께 옵니다.
+        follow-gate 캠페인은 1명 = DM 2건(opening+reward)이라 이벤트 단위는 부풀려 보이므로,
+        마케팅 대시보드에는 사람 단위(`unique_*`, `ctr`) 를 쓰는 것을 권장합니다.
+
+        ### ① 발송 이벤트 단위 (배송 신뢰성/디버깅)
         - `delivery_rate`: ACCEPTED 진입 건 중 DELIVERED+READ 비율 (0~1).
           이 값이 0.999 이상이면 99.9% 보증 달성.
         - `read_rate`: DELIVERED 건 중 READ 비율.
+        - `total`, `delivered`, `read`, `gate_passed` 등: 로그(이벤트) 개수.
+
+        ### ② 사람(수신자 Instagram ID) 단위 — v4.2 (마케팅)
+        - `unique_recipients`: 도달한 고유 수신자 수.
+        - `unique_sent`: DM 이 실제 발송된 고유 수신자 수 (CTR 분모).
+        - `unique_delivered` / `unique_read` / `unique_followers`: 각 단계 도달 사람 수.
+        - `unique_delivery_rate`: unique_delivered / unique_sent.
+        - `ctr`: **참여율** = 상호작용한 사람 / 발송된 사람 (0~1).
+          - 게이트형 캠페인(`follow_gate_enabled=true`): "버튼 클릭" 을 참여로 봄.
+          - 비게이트형(링크 즉시 발송): "읽음(READ)" 을 참여로 봄.
+          - `ctr_basis` 로 어느 기준인지 확인 (`click`/`read`/`mixed`).
+          - **주의**: `read` 는 messaging_seen 웹훅에 의존하는 best-effort 신호라
+            비게이트형 CTR 은 실제보다 낮게 나올 수 있음(과소집계).
 
         ## 인증
         Bearer JWT + 워크스페이스 멤버십.
@@ -485,7 +564,31 @@ class DMVerificationViewSet(viewsets.ViewSet):
             200: DMVerificationStatsSerializer,
             401: OpenApiResponse(description="인증 실패"),
             403: OpenApiResponse(description="권한 없음"),
+            500: OpenApiResponse(description="서버 오류"),
         },
+        examples=[
+            OpenApiExample(
+                "게이트형 캠페인 통계 (사람 단위 + CTR)",
+                value={
+                    "total": 1240,
+                    "delivered": 610,
+                    "read": 402,
+                    "gate_passed": 388,
+                    "delivery_rate": 0.984,
+                    "unique_recipients": 620,
+                    "unique_sent": 620,
+                    "unique_delivered": 610,
+                    "unique_read": 402,
+                    "unique_followers": 388,
+                    "unique_delivery_rate": 0.9839,
+                    "ctr": 0.6258,
+                    "ctr_basis": "click",
+                    "ctr_interacted": 388,
+                    "ctr_denominator": 620,
+                },
+                response_only=True,
+            )
+        ],
         tags=["DM Verification"],
     )
     @action(detail=False, methods=["get"], url_path="stats")
@@ -557,7 +660,561 @@ class DMVerificationViewSet(viewsets.ViewSet):
         agg["delivery_rate"] = round(delivery_rate, 4)
         agg["read_rate"] = round(read_rate, 4)
         agg["gate_passthrough_rate"] = round(gate_passthrough_rate, 4)
+
+        # ─────────────────────────────────────────────────────────────
+        # v4.2 — 사람(수신자 Instagram ID) 단위 지표 + CTR (마케팅 API)
+        #
+        # 위의 total/delivered/... 는 "발송 이벤트" 단위(디버깅·배송 신뢰성용)라
+        # follow-gate 캠페인에서 1명 = DM 2건(opening+reward)으로 부풀려 보인다.
+        # 마케터가 보는 "몇 명에게 닿았나 / 몇 명이 반응했나" 는 아래 unique_* 로 제공한다.
+        # (기존 이벤트 필드는 하위호환 위해 그대로 둔다.)
+        # ─────────────────────────────────────────────────────────────
+        def _uniq(**flt) -> int:
+            base = qs.filter(**flt) if flt else qs
+            return base.values("recipient_user_id").distinct().count()
+
+        unique_recipients = _uniq()
+        unique_sent = (
+            qs.filter(status__in=SENT_FOR_QUOTA_STATUSES)
+            .values("recipient_user_id")
+            .distinct()
+            .count()
+        )
+        unique_delivered = (
+            qs.filter(status__in=["delivered", "read"])
+            .values("recipient_user_id")
+            .distinct()
+            .count()
+        )
+        unique_read = _uniq(status="read")
+        unique_followers = _uniq(gate_status="passed")
+
+        # CTR = 상호작용한 고유 수신자 / 발송된 고유 수신자.
+        #  - 게이트형 캠페인(follow_gate_enabled=True): 버튼 1회라도 클릭 = child 로그 존재
+        #    (reward=통과 / retry=클릭했으나 미통과 둘 다 parent_log 로 opening 에 묶인다).
+        #  - 비게이트형 캠페인: 상호작용 단계가 없으므로 "읽음(READ)" 을 참여로 본다.
+        # 두 조건은 캠페인 타입으로 자연히 배타적이라 OR 하나로 집계된다.
+        ctr_interacted = (
+            qs.filter(
+                Q(campaign__follow_gate_enabled=True, parent_log__isnull=False)
+                | Q(campaign__follow_gate_enabled=False, status="read")
+            )
+            .values("recipient_user_id")
+            .distinct()
+            .count()
+        )
+        ctr = ctr_interacted / unique_sent if unique_sent else 0.0
+
+        gate_flags = set(qs.values_list("campaign__follow_gate_enabled", flat=True).distinct())
+        if gate_flags == {True}:
+            ctr_basis = "click"
+        elif gate_flags == {False} or not gate_flags:
+            ctr_basis = "read"
+        else:
+            ctr_basis = "mixed"
+
+        unique_delivery_rate = unique_delivered / unique_sent if unique_sent else 0.0
+
+        agg.update(
+            {
+                "unique_recipients": unique_recipients,
+                "unique_sent": unique_sent,
+                "unique_delivered": unique_delivered,
+                "unique_read": unique_read,
+                "unique_followers": unique_followers,
+                "unique_delivery_rate": round(unique_delivery_rate, 4),
+                "ctr": round(ctr, 4),
+                "ctr_basis": ctr_basis,
+                "ctr_interacted": ctr_interacted,
+                "ctr_denominator": unique_sent,
+            }
+        )
         return Response(agg)
+
+    # ===== 수신자(사람) 단위 로그 =====
+
+    @extend_schema(
+        summary="캠페인 DM 로그 — 수신자(사람) 단위 묶음",
+        description="""
+        ## 목적
+        캠페인의 DM 발송 로그를 **수신자 Instagram ID 기준으로 1행씩 묶어** 반환합니다.
+        기존 목록(`GET /`)이 개별 발송 이벤트(한 사람이 opening+reward 를 받으면 2행)인 반면,
+        이 엔드포인트는 **한 사람 = 1행**으로 최신 상태만 롤업해서 보여줍니다.
+        마케터용 "이 캠페인으로 몇 명에게 닿았고 각자 어디까지 진행됐나" 화면에 사용합니다.
+
+        ## 사용 시나리오
+        - 캠페인 상세의 "수신자 목록" 표 (발송/도착/읽음/팔로우 상태 컬럼)
+        - 한 행 클릭 → `GET /?campaign_id=...&recipient_user_id=<id>` 로 그 사람의
+          개별 DM 타임라인("자세히보기") 조회
+
+        ## 인증
+        Bearer JWT + 해당 캠페인이 속한 워크스페이스 멤버십.
+
+        ## 쿼리 파라미터
+        - `campaign_id` (UUID, **필수**): 대상 캠페인
+        - `recipient_username` (str, 선택): username 부분일치 검색
+        - `category` (str, 선택): 상태별 사람 단위 필터 —
+          `all`(기본)/`delivered`(성공)/`read`(읽음)/`attention`(확인 필요).
+          **페이지네이션 이전**에 적용되며 `count` 는 필터 후 총 인원이다.
+          `delivered` 는 정의상 `read` 를 포함한다. 잘못된 값은 400.
+        - `page` (int): 페이지 번호 (page_size=20)
+
+        ## 각 행 필드
+        - `recipient_user_id` / `recipient_username`: 수신자 (username 은 최신값 best-effort)
+        - `sent` (bool): DM 이 실제 발송됨 (accepted 이상)
+        - `delivered` (bool): 도착 확인됨 (delivered/read)
+        - `read` (bool): 읽음 확인됨
+        - `follower_status`: 팔로우/참여 상태 (아래 표 참고)
+        - `dm_count` (int): 이 사람에게 나간 총 DM 이벤트 수 (opening+reward+재안내 합)
+        - `needs_attention` (bool): 실패 등 사용자 조치가 필요한 로그가 있음
+        - `last_activity_at`: 마지막 활동 시각
+
+        ## follower_status 값
+        | 값 | 의미 |
+        |---|---|
+        | `verified_follower` | follow-gate 통과 + 팔로우 검증 완료 (확인 시점 팔로워) |
+        | `clicked_unverified` | 버튼은 눌렀으나 팔로우 미검증 (button-only 모드 or 검증 실패) |
+        | `not_followed` | 아직 버튼 클릭/통과 안 함 (pending/expired) |
+        | `unknown` | 게이트 미사용 캠페인 — 팔로우 여부를 알 수 없음 |
+
+        주의: 우리는 "확인 시점의 팔로우 여부" 만 알 수 있어 "원래 팔로워 vs 이 캠페인으로
+        전환" 은 구분하지 못합니다. verified_follower = 검증 시점에 팔로워였음.
+        """,
+        parameters=[
+            OpenApiParameter("campaign_id", str, OpenApiParameter.QUERY, required=True),
+            OpenApiParameter("recipient_username", str, OpenApiParameter.QUERY, required=False),
+            OpenApiParameter(
+                "category",
+                str,
+                OpenApiParameter.QUERY,
+                required=False,
+                enum=["all", "delivered", "read", "attention"],
+                description="상태별 사람 단위 필터 (페이지네이션 이전 적용, 기본 all).",
+            ),
+        ],
+        responses={
+            200: DMRecipientRollupSerializer(many=True),
+            400: OpenApiResponse(description="campaign_id 누락 또는 category 값 오류"),
+            401: OpenApiResponse(description="인증 실패"),
+            403: OpenApiResponse(description="워크스페이스 멤버 아님"),
+            404: OpenApiResponse(description="캠페인 없음"),
+            500: OpenApiResponse(description="서버 오류"),
+        },
+        examples=[
+            OpenApiExample(
+                "수신자 롤업 목록",
+                value={
+                    "count": 2,
+                    "page": 1,
+                    "page_size": 20,
+                    "campaign_id": "b1e2c3d4-0000-0000-0000-000000000000",
+                    "results": [
+                        {
+                            "recipient_user_id": "17841400000000001",
+                            "recipient_username": "buyer_a",
+                            "sent": True,
+                            "delivered": True,
+                            "read": True,
+                            "follower_status": "verified_follower",
+                            "dm_count": 2,
+                            "needs_attention": False,
+                            "last_activity_at": "2026-07-09T13:20:11+09:00",
+                        },
+                        {
+                            "recipient_user_id": "17841400000000002",
+                            "recipient_username": "user_17841400000000002",
+                            "sent": True,
+                            "delivered": True,
+                            "read": False,
+                            "follower_status": "not_followed",
+                            "dm_count": 1,
+                            "needs_attention": False,
+                            "last_activity_at": "2026-07-09T13:19:02+09:00",
+                        },
+                    ],
+                },
+                response_only=True,
+            )
+        ],
+        tags=["DM Verification"],
+    )
+    @action(detail=False, methods=["get"], url_path="recipients")
+    def recipients(self, request):
+        campaign_id = request.query_params.get("campaign_id")
+        if not campaign_id:
+            return Response(
+                {
+                    "success": False,
+                    "error": {
+                        "code": 400,
+                        "message": "campaign_id 는 필수입니다.",
+                        "details": {"field": "campaign_id"},
+                    },
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            campaign = AutoDMCampaign.objects.select_related("ig_connection__workspace").get(
+                id=campaign_id
+            )
+        except (AutoDMCampaign.DoesNotExist, ValueError, TypeError) as e:
+            raise NotFound("캠페인을 찾을 수 없습니다.") from e
+        workspace = campaign.ig_connection.workspace
+        if not workspace.memberships.filter(user=request.user).exists():
+            raise PermissionDenied("이 캠페인이 속한 워크스페이스의 멤버가 아닙니다.")
+
+        logs = SentDMLog.objects.filter(campaign=campaign)
+        recipient_username = request.query_params.get("recipient_username")
+        if recipient_username:
+            logs = logs.filter(recipient_username__icontains=recipient_username)
+
+        # 수신자별 롤업 — 한 번의 group-by 조건부 집계.
+        rows = logs.values("recipient_user_id").annotate(
+            latest_username=Max("recipient_username"),
+            dm_count=Count("id"),
+            last_activity_at=Max("created_at"),
+            sent_n=Count("id", filter=Q(status__in=SENT_FOR_QUOTA_STATUSES)),
+            delivered_n=Count("id", filter=Q(status__in=["delivered", "read"])),
+            read_n=Count("id", filter=Q(status="read")),
+            passed_n=Count("id", filter=Q(gate_status="passed")),
+            clicks_n=Count("id", filter=Q(parent_log__isnull=False)),
+            needs_n=Count("id", filter=Q(status__in=NEEDS_ATTENTION_STATUSES)),
+        )
+
+        # 사람 단위 카테고리 필터 (페이지네이션 이전 = HAVING 절).
+        # 값(delivered/read/attention)은 응답 boolean 필드와 동일 정의라 일관적이다.
+        # 원시 logs 가 아니라 annotate 결과에 filter 를 걸어야(HAVING) 롤업 카운트가
+        # 오염되지 않고, total=rows.count() 도 자동으로 필터 후 인원으로 맞는다.
+        category = request.query_params.get("category")
+        category_having = {
+            "delivered": Q(delivered_n__gt=0),  # 성공 (delivered=true, read 포함)
+            "read": Q(read_n__gt=0),  # 읽음 (read=true)
+            "attention": Q(needs_n__gt=0),  # 확인 필요 (needs_attention=true)
+        }
+        if category and category != "all":
+            if category not in category_having:
+                return Response(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": 400,
+                            "message": "category 값이 올바르지 않습니다. (all/delivered/read/attention)",
+                            "details": {
+                                "field": "category",
+                                "allowed": ["all", *category_having.keys()],
+                            },
+                        },
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            rows = rows.filter(category_having[category])
+
+        # 안정 정렬: 마지막 활동 desc + tie-break recipient_user_id
+        # (페이지 이동 시 동률로 인한 중복/누락 방지)
+        rows = rows.order_by("-last_activity_at", "recipient_user_id")
+
+        try:
+            page = int(request.query_params.get("page", 1))
+        except ValueError:
+            page = 1
+        page_size = 20
+        offset = (page - 1) * page_size
+        total = rows.count()
+        page_rows = list(rows[offset : offset + page_size])
+
+        # 지연 username 해석: 현재 페이지 중 미해석(빈 값) 수신자만 백그라운드로 해석 트리거.
+        _maybe_enqueue_username_resolution(
+            campaign.id,
+            [r["recipient_user_id"] for r in page_rows if not r["latest_username"]],
+        )
+
+        gated = campaign.follow_gate_enabled
+        verify = campaign.gate_verify_follow
+
+        def _follower_status(row) -> str:
+            if not gated:
+                return "unknown"
+            if row["passed_n"] > 0:
+                return "verified_follower" if verify else "clicked_unverified"
+            if row["clicks_n"] > 0:
+                return "clicked_unverified"
+            return "not_followed"
+
+        results = [
+            {
+                "recipient_user_id": r["recipient_user_id"],
+                "recipient_username": _recipient_username_display(
+                    r["recipient_user_id"], r["latest_username"]
+                ),
+                "sent": r["sent_n"] > 0,
+                "delivered": r["delivered_n"] > 0,
+                "read": r["read_n"] > 0,
+                "follower_status": _follower_status(r),
+                "dm_count": r["dm_count"],
+                "needs_attention": r["needs_n"] > 0,
+                "last_activity_at": r["last_activity_at"],
+            }
+            for r in page_rows
+        ]
+
+        return Response(
+            {
+                "count": total,
+                "page": page,
+                "page_size": page_size,
+                "campaign_id": str(campaign.id),
+                "results": DMRecipientRollupSerializer(results, many=True).data,
+            }
+        )
+
+    # ===== 큐 현황 (게이지 + ETA) =====
+
+    @extend_schema(
+        summary="DM 순차 발송 큐 현황 (게이지 + ETA)",
+        description="""
+        ## 목적
+        Instagram 정책상 DM 은 계정당 순차 발송(오프닝 평균 ~5.0초/건, 리워드류 ~2초/건)됩니다.
+        이 엔드포인트는 **현재 발송 대기 중인 DM 수 / 발송 완료 수 / 예상 완료 시각(ETA)** 을
+        계산해 프론트가 게이지 UI 로 사용자에게 안내할 수 있게 합니다.
+        캠페인 생성을 막거나 예약을 강제하지 않습니다 — 순수 정보 제공(read-only)입니다.
+
+        ## 사용 시나리오
+        - 캠페인 상세: "발송 512 / 대기 138 — 약 12분 후 완료 예상" 게이지 + 카운트다운
+        - 계정 대시보드: 계정 전체(모든 캠페인 합산) 발송 큐 현황
+        - 대기가 많을 때 "다른 캠페인 N건이 앞서 대기 중" 안내 (`ahead_of_this_campaign`)
+
+        ## 인증
+        Bearer JWT + 해당 리소스가 속한 워크스페이스 멤버십.
+
+        ## 쿼리 파라미터 (둘 중 정확히 1개 필수)
+        - `campaign_id` (UUID): 캠페인 스코프 게이지. ETA 는 계정 공유 대기열(타 캠페인
+          백로그 포함)을 반영해 계산됩니다.
+        - `ig_connection_id` (UUID): 계정 스코프 — 그 계정의 모든 캠페인 합산.
+
+        ## 비즈니스 로직 (v4.3 페이서)
+        - 발송은 계정 단위 **지터 슬롯**으로 직렬화됩니다(봇 지문 회피를 위해 간격이 매번
+          랜덤). 대기 건 대부분은 확정 슬롯 시각을 갖고 있어 ETA 가 정확하며, 아직 슬롯을
+          받지 않은 건은 평균 간격으로 추정합니다(`eta_is_estimate=true`).
+        - `blocking_reason`:
+          - `action_block_cooldown` — Instagram 이 일시적으로 계정 발송을 제한
+            (`action_block_cooldown_seconds` 후 자동 재개, ETA 에 반영됨)
+          - `monthly_quota_reached` — 플랜 월 DM 한도 도달 (업그레이드 전까지 신규 발송 skip)
+          - `null` — 정상 (페이싱 진행 중)
+        - 게이지: `gauge.sent / gauge.total` (= sent+waiting+in_flight). `failed` 는 분모
+          제외 — 별도 세그먼트로 표기하세요.
+
+        ## 폴링 가이드
+        5~10초 폴링 권장. `generated_at` 기준으로 클라이언트에서 카운트다운 보간.
+        """,
+        parameters=[
+            OpenApiParameter("campaign_id", str, OpenApiParameter.QUERY, required=False),
+            OpenApiParameter("ig_connection_id", str, OpenApiParameter.QUERY, required=False),
+        ],
+        responses={
+            200: DMQueueStateSerializer,
+            400: OpenApiResponse(
+                description="campaign_id / ig_connection_id 둘 다 없거나 둘 다 지정"
+            ),
+            401: OpenApiResponse(description="인증 실패"),
+            403: OpenApiResponse(description="워크스페이스 멤버 아님"),
+            404: OpenApiResponse(description="캠페인/연동 없음"),
+            500: OpenApiResponse(description="서버 오류"),
+        },
+        examples=[
+            OpenApiExample(
+                "campaign 스코프 조회",
+                value={
+                    "scope": "campaign",
+                    "campaign_id": "b1e2c3d4-0000-0000-0000-000000000000",
+                    "ig_connection_id": "a0c1b2d3-0000-0000-0000-000000000000",
+                    "external_account_id": "17841400000000000",
+                    "ig_username": "turnflow_official",
+                    "gauge": {
+                        "sent": 512,
+                        "waiting": 138,
+                        "in_flight": 2,
+                        "failed": 4,
+                        "total": 652,
+                    },
+                    "pacing": {
+                        "private_reply_avg_gap_s": 5.0,
+                        "send_api_avg_gap_s": 2.0,
+                        "hourly_backstop_cap": 740,
+                    },
+                    "account_waiting": 190,
+                    "ahead_of_this_campaign": 52,
+                    "blocking_reason": None,
+                    "action_block_cooldown_seconds": 0,
+                    "eta_seconds": 1045.0,
+                    "eta_finish_at": "2026-07-09T13:25:40+09:00",
+                    "eta_is_estimate": False,
+                    "generated_at": "2026-07-09T13:08:15+09:00",
+                },
+                response_only=True,
+            )
+        ],
+        tags=["DM Verification"],
+    )
+    @action(detail=False, methods=["get"], url_path="queue-state")
+    def queue_state(self, request):
+        import time as _time
+
+        from . import dm_pacer
+        from .rate_governor import PRIVATE_REPLY_HOURLY_CAP, action_block_cooldown_remaining
+
+        campaign_id = request.query_params.get("campaign_id")
+        ig_connection_id = request.query_params.get("ig_connection_id")
+        if bool(campaign_id) == bool(ig_connection_id):  # 둘 다 or 둘 다 아님
+            return Response(
+                {
+                    "success": False,
+                    "error": {
+                        "code": 400,
+                        "message": "campaign_id 또는 ig_connection_id 중 정확히 1개를 지정하세요.",
+                        "details": {"fields": ["campaign_id", "ig_connection_id"]},
+                    },
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        campaign = None
+        if campaign_id:
+            try:
+                campaign = AutoDMCampaign.objects.select_related("ig_connection__workspace").get(
+                    id=campaign_id
+                )
+            except (AutoDMCampaign.DoesNotExist, ValueError, TypeError) as e:
+                raise NotFound("캠페인을 찾을 수 없습니다.") from e
+            ig_conn = campaign.ig_connection
+        else:
+            try:
+                ig_conn = IGAccountConnection.objects.select_related("workspace").get(
+                    id=ig_connection_id
+                )
+            except (IGAccountConnection.DoesNotExist, ValueError, TypeError) as e:
+                raise NotFound("IG 연동을 찾을 수 없습니다.") from e
+
+        workspace = ig_conn.workspace
+        if not workspace.memberships.filter(user=request.user).exists():
+            raise PermissionDenied("이 리소스가 속한 워크스페이스의 멤버가 아닙니다.")
+
+        ext = str(ig_conn.external_account_id)
+        account_qs = SentDMLog.objects.filter(campaign__ig_connection=ig_conn)
+        scope_qs = account_qs.filter(campaign=campaign) if campaign else account_qs
+
+        hard_failed = [
+            SentDMLog.Status.FAILED_TOKEN,
+            SentDMLog.Status.FAILED_WINDOW,
+            SentDMLog.Status.FAILED_PARAM,
+            SentDMLog.Status.FAILED,  # legacy
+        ]
+        agg = scope_qs.aggregate(
+            sent=Count("id", filter=Q(status__in=SENT_FOR_QUOTA_STATUSES)),
+            waiting=Count("id", filter=Q(status=SentDMLog.Status.QUEUED)),
+            in_flight=Count("id", filter=Q(status=SentDMLog.Status.SUBMITTING)),
+            failed=Count("id", filter=Q(status__in=hard_failed)),
+        )
+        gauge = {
+            "sent": agg["sent"],
+            "waiting": agg["waiting"],
+            "in_flight": agg["in_flight"],
+            "failed": agg["failed"],
+            "total": agg["sent"] + agg["waiting"] + agg["in_flight"],
+        }
+
+        account_waiting_qs = account_qs.filter(status=SentDMLog.Status.QUEUED)
+        account_waiting = account_waiting_qs.count()
+        ahead = 0
+        if campaign:
+            my_oldest = scope_qs.filter(status=SentDMLog.Status.QUEUED).aggregate(
+                m=Min("created_at")
+            )["m"]
+            if my_oldest:
+                ahead = account_waiting_qs.filter(created_at__lt=my_oldest).count()
+
+        # ── ETA (v4.3): 대기 건 대부분은 확정 슬롯(next_retry_at)을 보유. 버킷별로
+        #    max(확정 슬롯) 과 (포인터 + 미클레임 × 평균 간격) 추정을 합성한다.
+        #    미클레임은 계정 공유 포인터를 소비하므로 **계정 단위**로 센다.
+        now_ts = _time.time()
+        finish_ts = now_ts
+        is_estimate = False
+
+        bucket_filters = {
+            dm_pacer.BUCKET_PRIVATE_REPLY: (
+                dm_pacer.bucket_q(dm_pacer.BUCKET_PRIVATE_REPLY),
+                dm_pacer.avg_gap_seconds(dm_pacer.BUCKET_PRIVATE_REPLY),
+            ),
+            dm_pacer.BUCKET_SEND_API: (
+                dm_pacer.bucket_q(dm_pacer.BUCKET_SEND_API),
+                dm_pacer.avg_gap_seconds(dm_pacer.BUCKET_SEND_API),
+            ),
+        }
+        scope_waiting_qs = scope_qs.filter(status=SentDMLog.Status.QUEUED)
+        for bucket, (bucket_q, avg_gap) in bucket_filters.items():
+            scope_bucket = scope_waiting_qs.filter(bucket_q)
+            if not scope_bucket.exists():
+                continue
+            claimed_max = scope_bucket.aggregate(m=Max("next_retry_at"))["m"]
+            if claimed_max:
+                finish_ts = max(finish_ts, claimed_max.timestamp())
+            # 미클레임(슬롯 미예약) — 계정 전체가 같은 포인터를 소비하므로 계정 단위 추정
+            unclaimed_account = account_waiting_qs.filter(
+                bucket_q, next_retry_at__isnull=True
+            ).count()
+            if unclaimed_account and scope_bucket.filter(next_retry_at__isnull=True).exists():
+                pointer = dm_pacer.peek_next_slot(ext, bucket) or now_ts
+                finish_ts = max(finish_ts, max(pointer, now_ts) + unclaimed_account * avg_gap)
+                is_estimate = True
+
+        # ── 차단 요인 ──
+        ab_remaining = action_block_cooldown_remaining(ext)
+        blocking_reason = None
+        if ab_remaining > 0:
+            blocking_reason = "action_block_cooldown"
+            finish_ts = max(finish_ts, now_ts + ab_remaining) + 0  # 쿨다운 후 재개
+            is_estimate = True
+        else:
+            from apps.billing.dm_limits import check_dm_quota
+
+            try:
+                quota_ok, _, _ = check_dm_quota(workspace.owner)
+            except Exception:  # noqa: BLE001 — 쿼터 조회 실패는 표시만 정상 취급
+                quota_ok = True
+            if not quota_ok and gauge["waiting"] > 0:
+                blocking_reason = "monthly_quota_reached"
+                is_estimate = True
+
+        eta_seconds = max(0.0, round(finish_ts - now_ts, 1)) if gauge["waiting"] else 0.0
+        eta_finish_at = (
+            datetime.fromtimestamp(finish_ts, tz=timezone.get_current_timezone())
+            if gauge["waiting"]
+            else None
+        )
+
+        cap = getattr(settings, "IG_PRIVATE_REPLY_HOURLY_CAP", PRIVATE_REPLY_HOURLY_CAP)
+        payload = {
+            "scope": "campaign" if campaign else "account",
+            "campaign_id": str(campaign.id) if campaign else None,
+            "ig_connection_id": str(ig_conn.id),
+            "external_account_id": ext,
+            "ig_username": ig_conn.username or "",
+            "gauge": gauge,
+            "pacing": {
+                "private_reply_avg_gap_s": dm_pacer.avg_gap_seconds(dm_pacer.BUCKET_PRIVATE_REPLY),
+                "send_api_avg_gap_s": dm_pacer.avg_gap_seconds(dm_pacer.BUCKET_SEND_API),
+                "hourly_backstop_cap": int(cap or 0),
+            },
+            "account_waiting": account_waiting,
+            "ahead_of_this_campaign": ahead,
+            "blocking_reason": blocking_reason,
+            "action_block_cooldown_seconds": int(ab_remaining),
+            "eta_seconds": eta_seconds,
+            "eta_finish_at": eta_finish_at,
+            "eta_is_estimate": bool(is_estimate),
+            "generated_at": timezone.now(),
+        }
+        return Response(DMQueueStateSerializer(payload).data)
 
     # ===== 룩업 (message_id / idempotency_key) =====
 

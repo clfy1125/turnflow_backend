@@ -177,6 +177,44 @@ class TestDmMonthlyLimit:
 
         assert count_owner_dms_this_month(user) == 2
 
+    def test_count_dedups_per_campaign_recipient(self):
+        """v4.2 — 같은 캠페인·같은 수신자에게 여러 DM 이 나가도 1로 카운트."""
+        from apps.billing.dm_limits import count_owner_dms_this_month
+
+        user = _user()
+        camp = _campaign(_conn(_ws(user)))
+        # 한 사람에게 3건 (opening + reward + 재안내 흉내)
+        for _ in range(3):
+            SentDMLog.objects.create(
+                campaign=camp,
+                comment_id=f"c-{uuid.uuid4().hex[:8]}",
+                recipient_user_id="same_person",
+                recipient_username="same",
+                message_sent="hi",
+                idempotency_key=f"dedup-{uuid.uuid4().hex[:8]}",
+                status=SentDMLog.Status.DELIVERED,
+            )
+        assert count_owner_dms_this_month(user) == 1
+
+    def test_same_person_across_campaigns_counts_twice(self):
+        """v4.2 — 같은 사람이 서로 다른 캠페인에서 받으면 2로 카운트."""
+        from apps.billing.dm_limits import count_owner_dms_this_month
+
+        user = _user()
+        ws = _ws(user)
+        camp1, camp2 = _campaign(_conn(ws)), _campaign(_conn(ws))
+        for camp in (camp1, camp2):
+            SentDMLog.objects.create(
+                campaign=camp,
+                comment_id=f"c-{uuid.uuid4().hex[:8]}",
+                recipient_user_id="shared_person",
+                recipient_username="shared",
+                message_sent="hi",
+                idempotency_key=f"xcamp-{uuid.uuid4().hex[:8]}",
+                status=SentDMLog.Status.DELIVERED,
+            )
+        assert count_owner_dms_this_month(user) == 2
+
 
 # ──────────────────────────────────────────────
 # 스팸필터 (pro 전용)

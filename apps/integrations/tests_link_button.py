@@ -93,7 +93,9 @@ def ig_connection(db):
     Membership.objects.create(workspace=ws, user=user, role=Membership.Role.OWNER)
     conn = IGAccountConnection.objects.create(
         workspace=ws,
-        external_account_id="ig_linkbtn_001",
+        # 테스트별 유니크 계정 ID — 고정 ID 는 dm_pacer 버킷(Redis)을 테스트 간 공유해
+        # 배치 실행 시 두 번째 발송부터 paced-defer 되는 플레이크를 만든다.
+        external_account_id=f"ig_linkbtn_{uuid.uuid4().hex[:8]}",
         username="linkbtnuser",
         account_type="BUSINESS",
         status=IGAccountConnection.Status.ACTIVE,

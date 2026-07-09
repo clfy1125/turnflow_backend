@@ -2,6 +2,7 @@
 Instagram OAuth and Mock Provider services
 """
 
+import logging
 import re
 import threading
 from datetime import datetime
@@ -10,8 +11,11 @@ from urllib.parse import urlencode
 
 import requests
 from django.conf import settings
+from django.core.cache import cache
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+logger = logging.getLogger(__name__)
 
 # ── H-9/M-22: 토큰·시크릿 마스킹 ──
 # Meta Graph API 는 access_token 을 URL 쿼리로 받으므로, requests 의 HTTPError 문자열
@@ -739,6 +743,101 @@ class InstagramMessagingService:
         if "is_user_follow_business" not in body:
             return None
         return bool(body.get("is_user_follow_business"))
+
+    # ===== User Profile: IGSID → username 해석 (수신자 목록 표시용) =====
+
+    @classmethod
+    def get_user_profile(cls, igsid: str, access_token: str, fields=("name", "username")) -> dict:
+        """
+        GET /v25.0/{IGSID}?fields=name,username — IG User Profile API.
+
+        Story 답장 messaging 웹훅은 sender IGSID 만 주고 username 이 없으므로, 표시용
+        핸들은 이 API 로 별도 해석해야 한다(댓글 웹훅은 from.username 을 이미 포함).
+        `check_user_follow_business` 와 동일 엔드포인트/권한(instagram_business_manage_messages)이며,
+        사용자가 메시지를 보낸(consent) ~24h 윈도우 내 IGSID 에 한해 조회 가능.
+
+        Returns:
+            dict — Meta 응답 JSON. 권한부족/consent 없음/잘못된 IGSID/파싱실패 → {} (best-effort).
+
+        Raises:
+            DMTokenError: code 190 등 토큰 무효.
+            DMTransientError: 5xx / 네트워크 (재시도 가능).
+        """
+        from .dm_exceptions import TOKEN_CODES, DMTokenError, DMTransientError
+
+        if not igsid:
+            return {}
+
+        url = f"{cls.GRAPH_API_BASE}/{igsid}"
+        params = {"fields": ",".join(fields)}
+
+        try:
+            resp = get_http_session().get(
+                url,
+                params=params,
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=cls.DEFAULT_TIMEOUT,
+            )
+        except requests.Timeout as e:
+            raise DMTransientError(f"get_user_profile timeout: {e}") from e
+        except requests.ConnectionError as e:
+            raise DMTransientError(f"get_user_profile connection error: {e}") from e
+
+        if resp.status_code == 404:
+            return {}
+
+        if not resp.ok:
+            try:
+                body = resp.json()
+            except ValueError:
+                body = {"error": {"message": resp.text}}
+            err = body.get("error", {}) or {}
+            code = err.get("code")
+            msg = err.get("message", f"HTTP {resp.status_code}")
+            if code in TOKEN_CODES:
+                raise DMTokenError(msg, status=resp.status_code, code=code, api_response=body)
+            if 500 <= resp.status_code < 600:
+                raise DMTransientError(msg, status=resp.status_code, code=code, api_response=body)
+            # 그 외 4xx (consent 없음 / 필드 누락 / 잘못된 IGSID) → best-effort {}
+            return {}
+
+        try:
+            return resp.json() or {}
+        except ValueError:
+            return {}
+
+    @classmethod
+    def resolve_username(cls, igsid: str, access_token: str) -> str:
+        """
+        IGSID → Instagram username 해석 (best-effort, 캐시 적용).
+
+        - Mock 모드: 실제 호출 없이 결정적 가짜 핸들 반환(로컬/테스트 UX).
+        - 캐시 `dm:uname:{igsid}`: 양성 7일 / 음성(실패·빈값) 1시간(윈도우 내 재시도 허용).
+        - **모든 실패(토큰·5xx·consent 없음·네트워크)를 흡수하고 "" 반환** — 수신자 목록 표시가
+          이 조회 때문에 절대 막히면 안 된다(호출부는 "" 를 표시용 폴백으로 처리).
+        """
+        if not igsid:
+            return ""
+
+        if cls._is_mock():
+            return f"mock_user_{str(igsid)[:8]}"
+
+        cache_key = f"dm:uname:{igsid}"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached  # "" (음성 캐시 히트) 포함
+
+        username = ""
+        try:
+            profile = cls.get_user_profile(igsid, access_token, fields=("username", "name"))
+            username = (profile.get("username") or "").strip()
+        except Exception as e:  # noqa: BLE001 — best-effort: 표시/발송 절대 미차단
+            logger.debug("resolve_username failed igsid=%s err=%s", igsid, scrub_secrets(e))
+            username = ""
+
+        # 양성 7일 / 음성 1시간
+        cache.set(cache_key, username, 7 * 24 * 3600 if username else 3600)
+        return username
 
     @classmethod
     def _post_message(cls, url: str, payload: dict, access_token: str) -> dict:

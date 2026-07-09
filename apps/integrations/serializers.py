@@ -540,8 +540,14 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
         help_text="postback 미수신 구버전 클라이언트 fallback. 이 키워드 답장도 통과로 간주.",
     )
 
-    # 운영
-    max_sends_per_hour = serializers.IntegerField(default=200, min_value=1, max_value=500)
+    # 운영 — (deprecated v4.3) 값은 수용하되 무시됨: 페이싱은 dm_pacer(계정 단위 지터 슬롯)가 담당.
+    # 하위호환(기존 프론트가 보내는 값 400 방지)을 위해 필드는 유지한다.
+    max_sends_per_hour = serializers.IntegerField(
+        default=200,
+        min_value=1,
+        max_value=500,
+        help_text="(deprecated v4.3 — 강제되지 않음) 발송 페이싱은 계정 단위 자동 조절로 대체됨.",
+    )
 
     # 예약 발송 (활성 기간 한정 + 자동 종료) — 둘 다 생략하면 기존처럼 즉시/무기한 운영
     scheduled_start_at = serializers.DateTimeField(
@@ -826,6 +832,14 @@ class SentDMLogSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = fields  # 모두 읽기 전용
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        # Story 답장 등으로 username 미해석(빈 값)이면 표시용 폴백 user_{IGSID}.
+        # DB 컬럼은 빈 채 유지 → 윈도우 내 재열람 시 실제 핸들로 채워질 여지 보존.
+        if not data.get("recipient_username"):
+            data["recipient_username"] = f"user_{instance.recipient_user_id}"
+        return data
+
     def get_is_delivered(self, obj) -> bool:
         return obj.is_delivered()
 
@@ -917,6 +931,144 @@ class DMVerificationStatsSerializer(serializers.Serializer):
 
     # 공개 답글
     public_replies_posted = serializers.IntegerField(help_text="공개 답글 게시 성공 건수")
+
+    # ── v4.2 — 사람(수신자 Instagram ID) 단위 지표 (마케팅용) ──────────────
+    # 위 필드는 모두 "발송 이벤트" 단위라 follow-gate 캠페인(1명=DM 2건)에서 부풀려 보인다.
+    # 아래 unique_* 는 수신자 계정 기준 중복 제거한 "사람 수" 지표.
+    unique_recipients = serializers.IntegerField(
+        help_text="DM 로그가 1건이라도 있는 고유 수신자 수 (도달 인원)"
+    )
+    unique_sent = serializers.IntegerField(
+        help_text="DM 이 실제 발송된 고유 수신자 수 (CTR 분모). accepted 이상 상태 기준"
+    )
+    unique_delivered = serializers.IntegerField(
+        help_text="도착(delivered/read) 경험이 있는 고유 수신자 수"
+    )
+    unique_read = serializers.IntegerField(help_text="읽음 확인된 고유 수신자 수")
+    unique_followers = serializers.IntegerField(
+        help_text="follow-gate 통과(팔로우 확인)된 고유 수신자 수"
+    )
+    unique_delivery_rate = serializers.FloatField(
+        help_text="unique_delivered / unique_sent (사람 단위 도착률, 0~1)"
+    )
+
+    # ── v4.2 — CTR(참여율) ────────────────────────────────────────────────
+    ctr = serializers.FloatField(
+        help_text=(
+            "참여율 = ctr_interacted / unique_sent (0~1). "
+            "게이트형 캠페인은 '버튼 클릭', 비게이트형은 '읽음' 을 참여로 본다."
+        )
+    )
+    ctr_basis = serializers.ChoiceField(
+        choices=["click", "read", "mixed"],
+        help_text=(
+            "CTR 참여 판정 기준. click=버튼 클릭(게이트형), read=읽음(비게이트형), "
+            "mixed=집계 범위에 두 타입이 섞임(campaign_id 로 필터하면 click/read 로 확정)."
+        ),
+    )
+    ctr_interacted = serializers.IntegerField(help_text="상호작용한 고유 수신자 수 (CTR 분자)")
+    ctr_denominator = serializers.IntegerField(help_text="CTR 분모 (= unique_sent)")
+
+
+class DMRecipientRollupSerializer(serializers.Serializer):
+    """캠페인 DM 로그 — 수신자(사람) 1명 단위 롤업 (v4.2).
+
+    개별 발송 이벤트가 아니라 recipient_user_id 로 묶은 최신 상태.
+    """
+
+    recipient_user_id = serializers.CharField(help_text="수신자 Instagram ID (묶음 키)")
+    recipient_username = serializers.CharField(
+        allow_blank=True, help_text="수신자 username (최신값 best-effort)"
+    )
+    sent = serializers.BooleanField(help_text="DM 실제 발송됨 (accepted 이상)")
+    delivered = serializers.BooleanField(help_text="도착 확인됨 (delivered/read)")
+    read = serializers.BooleanField(help_text="읽음 확인됨")
+    follower_status = serializers.ChoiceField(
+        choices=["verified_follower", "clicked_unverified", "not_followed", "unknown"],
+        help_text=(
+            "팔로우/참여 상태. verified_follower=게이트 통과+팔로우 검증됨, "
+            "clicked_unverified=버튼만 누름(미검증), not_followed=클릭/통과 안 함, "
+            "unknown=게이트 미사용 캠페인(팔로우 여부 알 수 없음)."
+        ),
+    )
+    dm_count = serializers.IntegerField(help_text="이 사람에게 나간 총 DM 이벤트 수")
+    needs_attention = serializers.BooleanField(help_text="조치 필요한 실패 로그가 있음")
+    last_activity_at = serializers.DateTimeField(allow_null=True, help_text="마지막 활동 시각")
+
+
+class DMQueueGaugeSerializer(serializers.Serializer):
+    """큐-상태 게이지 카운트 (v4.3 — 프론트 게이지 = sent / total)."""
+
+    sent = serializers.IntegerField(help_text="발송 완료 (Meta 접수 이상 — 월 쿼터와 동일 정의)")
+    waiting = serializers.IntegerField(help_text="발송 대기 (QUEUED — 페이서 슬롯/재시도 대기)")
+    in_flight = serializers.IntegerField(help_text="발송 중 (SUBMITTING — 순간값)")
+    failed = serializers.IntegerField(
+        help_text="하드 실패 (토큰/윈도우/파라미터 — 게이지 분모(total) 제외, 별도 표기용)"
+    )
+    total = serializers.IntegerField(help_text="sent + waiting + in_flight (정상 큐는 100% 도달)")
+
+
+class DMQueuePacingSerializer(serializers.Serializer):
+    """현재 발송 페이싱 정보 (v4.3 — 계정 단위 지터 슬롯)."""
+
+    private_reply_avg_gap_s = serializers.FloatField(
+        help_text="오프닝(사설답장) 평균 발송 간격 초 (지터 범위 중앙값, 기본 5.0)"
+    )
+    send_api_avg_gap_s = serializers.FloatField(
+        help_text="리워드/재안내/스토리답장 평균 발송 간격 초 (기본 2.0)"
+    )
+    hourly_backstop_cap = serializers.IntegerField(
+        help_text="계정당 시간당 백스톱 상한 (기본 740 — 정상 운영에선 걸리지 않는 최후 방어선)"
+    )
+
+
+class DMQueueStateSerializer(serializers.Serializer):
+    """DM 순차 발송 큐 현황 (게이지 + ETA) 응답 — v4.3 페이서 기반."""
+
+    scope = serializers.ChoiceField(choices=["campaign", "account"], help_text="집계 범위")
+    campaign_id = serializers.UUIDField(allow_null=True, help_text="campaign 스코프일 때만")
+    ig_connection_id = serializers.UUIDField(help_text="대상 IG 연동 ID")
+    external_account_id = serializers.CharField(help_text="IG 계정 ID")
+    ig_username = serializers.CharField(help_text="IG 계정 username")
+
+    gauge = DMQueueGaugeSerializer()
+    pacing = DMQueuePacingSerializer()
+
+    account_waiting = serializers.IntegerField(
+        help_text="이 계정 전체(모든 캠페인)의 발송 대기 수 — 계정 단위로 순차 발송되므로 공유 대기열"
+    )
+    ahead_of_this_campaign = serializers.IntegerField(
+        help_text=(
+            "이 캠페인의 가장 오래된 대기 건보다 먼저 줄 선 다른 캠페인 대기 수 (FIFO). "
+            "account 스코프면 항상 0"
+        )
+    )
+
+    blocking_reason = serializers.CharField(
+        allow_null=True,
+        help_text=(
+            "발송 정지 사유. null=정상(페이싱 진행 중), "
+            "action_block_cooldown=Instagram 일시 제한(자동 재개), "
+            "monthly_quota_reached=플랜 월 한도 도달(업그레이드 필요)"
+        ),
+    )
+    action_block_cooldown_seconds = serializers.IntegerField(
+        help_text="Action Block 쿨다운 잔여 초 (0=해당 없음)"
+    )
+
+    eta_seconds = serializers.FloatField(
+        help_text="대기 중인 DM 이 모두 발송 완료될 때까지 예상 초 (0=대기 없음)"
+    )
+    eta_finish_at = serializers.DateTimeField(
+        allow_null=True, help_text="예상 완료 시각 (ISO8601). 대기 없으면 null"
+    )
+    eta_is_estimate = serializers.BooleanField(
+        help_text=(
+            "true=추정치(미확정 슬롯/일시정지 포함 — '약 N분' 표기 권장), "
+            "false=확정 슬롯 기반(전 건 슬롯 예약 완료)"
+        )
+    )
+    generated_at = serializers.DateTimeField(help_text="집계 시각 (클라이언트 보간 기준점)")
 
 
 class DMReverifyResponseSerializer(serializers.Serializer):

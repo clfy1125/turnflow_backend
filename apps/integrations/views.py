@@ -2561,7 +2561,8 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         **선택 필드:**
         - `media_url`: 게시물 URL (비워두거나 null 가능)
         - `description`: 캠페인 설명
-        - `max_sends_per_hour`: 시간당 최대 발송 수 (기본값: 200, 최대: 500)
+        - `max_sends_per_hour`: (deprecated v4.3 — 값은 수용되나 **강제되지 않음**)
+          발송 속도는 계정 단위 자동 페이싱(사설답장 평균 ~5.0초/건)으로 대체되었습니다.
         - `scheduled_start_at`: 예약 시작일시 (ISO8601). 이 시각부터 발송 시작. 비우면 즉시.
         - `scheduled_end_at`: 예약 종료일시 (ISO8601). 이 시각 이후 자동 종료. 비우면 무기한.
           (생성 후 변경은 `POST .../{id}/schedule/` 사용 권장)
@@ -2572,8 +2573,7 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
           "media_id": "18418812427189917",
           "name": "신제품 프로모션 DM",
           "description": "신제품 게시물 댓글 작성자에게 할인 쿠폰 발송",
-          "message_template": "댓글 남겨주셔서 감사합니다! 🎁 특별 할인 링크: https://example.com/coupon",
-          "max_sends_per_hour": 150
+          "message_template": "댓글 남겨주셔서 감사합니다! 🎁 특별 할인 링크: https://example.com/coupon"
         }
         ```
 

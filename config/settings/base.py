@@ -397,6 +397,10 @@ CELERY_BEAT_SCHEDULE = {
         "task": "apps.integrations.tasks.requeue_deferred_dms",
         "schedule": 30,  # 30초 — next_retry_at 도래한 defer(QUEUED) 건 순차(FIFO) 재투입
     },
+    "dm-reconcile-pacer-pointers": {
+        "task": "apps.integrations.tasks.reconcile_pacer_pointers",
+        "schedule": 60,  # 60초 — 삭제/일시중지로 생긴 페이서 '빈 슬롯 홀' 회수(v4.3 Fix 2)
+    },
     "dm-dead-letter-alerter": {
         "task": "apps.integrations.tasks.dead_letter_alerter",
         "schedule": 60 * 10,  # 10분 — 토큰 만료/도착 미확인 누적 알림
@@ -583,13 +587,25 @@ WEBHOOK_ASYNC_MESSAGING = config("WEBHOOK_ASYNC_MESSAGING", default=True, cast=b
 WEBHOOK_HMAC_ENFORCED = config("WEBHOOK_HMAC_ENFORCED", default=False, cast=bool)
 
 # ─────────────────────────────────────────────────────────────
-# DM 발송 속도 거버너 (per-IG-account, Meta 안전속도)
+# DM 발송 속도 제어 (per-IG-account)
 # ─────────────────────────────────────────────────────────────
+# v4.3 — 스무스 페이서(dm_pacer): 계정별 발송 간격을 지터 있는 슬롯으로 직렬화.
+# Meta 버킷과 1:1 — 사설답장(오프닝, Meta 750/hr)은 3~7s(평균 5.0s ≈ 720/hr),
+# Send API(리워드/재안내/스토리답장 — 유저 개시 스레드, 시간당 캡 없음)는 1~3s(봇 지문 회피).
+# 정확히 N초 간격은 봇 지문이므로 매 간격 uniform 지터.
+DM_PACER_ENABLED = config("DM_PACER_ENABLED", default=True, cast=bool)
+DM_PACER_PRIVATE_REPLY_MIN_S = config("DM_PACER_PRIVATE_REPLY_MIN_S", default=3.0, cast=float)
+DM_PACER_PRIVATE_REPLY_MAX_S = config("DM_PACER_PRIVATE_REPLY_MAX_S", default=7.0, cast=float)
+DM_PACER_SEND_API_MIN_S = config("DM_PACER_SEND_API_MIN_S", default=1.0, cast=float)
+DM_PACER_SEND_API_MAX_S = config("DM_PACER_SEND_API_MAX_S", default=3.0, cast=float)
+
+# 시간당 백스톱(rate_governor) — 페이서가 rate 를 구조적으로 보장하므로 이제 '최후 방어선'.
 # Meta 물리 한도: 게시물/릴스 댓글 Private Reply = 계정당 750 calls/hour.
-# rate_governor 가 계정 단위로 시간당/분당 발송을 페이싱하고, 초과 시 다음 윈도우로 defer.
-# 켜는 순간 free/저플랜 발송율이 plan·캡 값으로 제한됨(운영 공지 필요).
+# 백스톱은 740 — 페이서 자연율(3~7s ≈ 720/hr) 위, Meta 750 아래에 둬서 페이서가 정상일 때는
+# 절대 걸리지 않게(=정시 버스트 재발 방지) 하되, 페이서 버그/우회 시에만 750 직전에서 막는다.
+# (v4.3: 분당 캡·Redis flush 동결은 페이서가 대체해 제거됨. 캠페인 200/hr 도 미강제.)
 DM_GOVERNOR_ENABLED = config("DM_GOVERNOR_ENABLED", default=True, cast=bool)
-IG_PRIVATE_REPLY_HOURLY_CAP = config("IG_PRIVATE_REPLY_HOURLY_CAP", default=700, cast=int)
+IG_PRIVATE_REPLY_HOURLY_CAP = config("IG_PRIVATE_REPLY_HOURLY_CAP", default=740, cast=int)
 
 # P4 — Action Block(code 368 등) 감지 시 계정별 발송 쿨다운(에스컬레이팅 24h→×2, 상한 7일).
 # 차단 중 재시도가 차단 기간을 연장시키므로, 쿨다운 동안 그 계정 DM 을 Meta 로 보내지 않는다.
@@ -604,6 +620,10 @@ DM_RECIPIENT_COOLDOWN_SECONDS = config("DM_RECIPIENT_COOLDOWN_SECONDS", default=
 # P7 — 백로그 경고 임계. window 만료 임박 판정 시간 / 가장 오래된 QUEUED 경고 시간.
 DM_BACKLOG_RISK_HOURS = config("DM_BACKLOG_RISK_HOURS", default=6, cast=int)
 DM_BACKLOG_OLDEST_ALERT_HOURS = config("DM_BACKLOG_OLDEST_ALERT_HOURS", default=2, cast=int)
+
+# 수신자 목록 열람 시 빈 username(IGSID만 있는 Story 답장 등)을 IG User Profile API 로
+# 지연 해석할지 여부. False 면 해석 호출 없이 user_{IGSID} 폴백만 표기(킬 스위치).
+DM_RESOLVE_RECIPIENT_USERNAME = config("DM_RESOLVE_RECIPIENT_USERNAME", default=True, cast=bool)
 
 # ─────────────────────────────────────────────────────────────
 # Telegram 운영 알림 (토큰 refresh / 장애 등)

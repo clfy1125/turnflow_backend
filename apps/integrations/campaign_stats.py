@@ -152,12 +152,18 @@ def compute_monthly_usage(workspace, now=None, *, user=None) -> dict:
     from apps.billing.dm_limits import get_dm_monthly_limit
 
     start, end = _month_bounds(now)
-    sent_this_month = SentDMLog.objects.filter(
-        campaign__ig_connection__workspace=workspace,
-        created_at__gte=start,
-        created_at__lt=end,
-        status__in=SENT_FOR_QUOTA_STATUSES,
-    ).count()
+    # v4.2 — 과금 정의(billing.dm_limits)와 동일하게 (캠페인 × 수신자) 고유쌍으로 집계한다.
+    sent_this_month = (
+        SentDMLog.objects.filter(
+            campaign__ig_connection__workspace=workspace,
+            created_at__gte=start,
+            created_at__lt=end,
+            status__in=SENT_FOR_QUOTA_STATUSES,
+        )
+        .values("campaign_id", "recipient_user_id")
+        .distinct()
+        .count()
+    )
 
     if is_admin_user(user):
         limit = -1  # 관리자 모드 → 무제한

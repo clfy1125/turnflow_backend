@@ -1,20 +1,19 @@
-"""P3f — 계정당/플랜별 DM 발송 안전속도 거버너 (Redis 기반).
+"""P3f — 계정당 DM 발송 시간당 **백스톱** + Action Block 서킷 브레이커 (Redis 기반).
 
-WHY: 합산 동시성을 올리면(목표 ~10-20K DM/분, 수천 계정) 한 IG 계정을 Meta 안전속도 이상으로
-과속 발송해 밴/스로틀당할 위험이 생긴다. Meta 는 "짧은 시간 버스트"에 민감하므로(예: 3분에 10건)
-**시간당 상한(플랜 quota)** 과 **분당 상한(버스트/밴 안전)** 을 동시에 본다.
+v4.3 역할 변경: 실제 발송 페이싱은 dm_pacer(계정별 지터 슬롯 직렬화 — 사설답장 평균 5.0s,
+Send API 1~3s)가 담당한다. 이 모듈은 두 가지만 남긴다:
+  1) check() — 시간당 백스톱(기본 740, 페이서 720 위·Meta 750 아래). 페이서가 정상이면
+     절대 걸리지 않는 최후 방어선. (분당 캡·Redis flush 동결은 페이서가 대체해 제거.)
+  2) Action Block(code 368) 서킷 브레이커 — 차단 중 재시도가 차단을 연장시키므로
+     계정 발송을 에스컬레이팅 쿨다운(24h→×2, 상한 7d)으로 정지. DB 듀얼라이트(DR 생존).
 
 설계 원칙:
 - 멀티테넌트 정확성: 한도는 **IG 계정 단위**로 건다(Meta 한도가 계정당이므로).
 - 발송을 "드롭"하지 않고 "지연(defer)" 한다 — 호출부는 차단 시 retry_after 만큼 뒤로 재스케줄.
 - Redis 고정 윈도우 카운터(원자적 INCR) — 단순/견고. django_redis(/1) 사용.
 
-플랜별 한도(기본값, settings.DM_RATE_LIMITS 로 오버라이드 가능):
-    free       : 시간당 60,  분당 8     (무료 = DM 자동화 500건/월 수준의 보수적 페이싱)
-    starter/pro/enterprise: 점증 (유료 = 고처리)
-
-⚠️ 이 모듈은 순수 유틸이다. 실제 발송 경로(send_dm_task) 에 wiring 하는 5줄은
-   SERVER_RUNBOOK.md 의 P3f 절차를 따라 추가 + 테스트할 것.
+플랜별 한도 테이블(_DEFAULT_LIMITS)은 캡 해제(IG_PRIVATE_REPLY_HOURLY_CAP=0) 시 시간당
+폴백값으로만 쓰인다. (분당 값은 v4.3부터 DM 경로에서 미사용 — moderation 은 별도 네임스페이스.)
 """
 
 from __future__ import annotations
@@ -42,9 +41,10 @@ _DEFAULT_LIMITS = {
 }
 
 # Meta Graph API 물리 한도: 게시물/릴스 댓글 Private Reply 는 계정당 750 calls/hour.
-# plan per_hour 값이 이를 초과(pro=1200/enterprise=5000)해도 안전마진(기본 700)으로 강제 캡한다.
+# plan per_hour 값이 이를 초과(pro=1200/enterprise=5000)해도 백스톱(기본 740)으로 강제 캡한다.
+# 740 = 페이서 자연율(≈720/hr) 위, Meta 750 아래 — 페이서 정상 시 안 걸리는 최후 방어선.
 # settings.IG_PRIVATE_REPLY_HOURLY_CAP 로 오버라이드(0/None 이면 캡 미적용).
-PRIVATE_REPLY_HOURLY_CAP = 700
+PRIVATE_REPLY_HOURLY_CAP = 740
 
 
 def _limits_for(plan: str) -> tuple[int, int]:
@@ -139,7 +139,14 @@ def trip_action_block(ig_account_id: str, base_hours: int = None, max_days: int 
 
 
 def check(ig_account_id: str, plan: str = "free") -> Decision:
-    """발송 1건이 허용되는지 검사하고 카운터를 소비한다.
+    """발송 1건이 허용되는지 검사하고 카운터를 소비한다 (v4.3 — 시간당 **백스톱** 전용).
+
+    v4.3 부터 실제 페이싱은 dm_pacer(계정별 지터 슬롯 직렬화)가 담당한다. 여기는
+    페이서 버그/우회 경로 대비 최후 방어선(시간당 740)만 남긴다:
+      - 분당 버스트 캡 제거 — 페이서 간격(지터)이 버스트를 구조적으로 차단.
+      - Redis flush fail-closed 동결 제거 — 페이서는 포인터가 유실돼도 원자 클레임이
+        즉시 재직렬화하므로 과속이 불가능하다. 카운터 유실은 worker_ready 의
+        rehydrate_from_db 가 DB 에서 재시드(백스톱 정확도 회복)한다.
 
     Returns Decision(allowed, retry_after, reason).
     차단되면 호출부는 발송하지 말고 retry_after 후 재시도(재스케줄)해야 한다.
@@ -147,38 +154,23 @@ def check(ig_account_id: str, plan: str = "free") -> Decision:
     if not ig_account_id:
         return Decision(allowed=True)  # 식별 불가 시 거버너 우회(안전 측 — 차단하지 않음)
 
-    # ★ P8: Redis flush/재시작 감지 → fail-closed (순간 과발송·밴 방지).
-    # 장기 TTL 센티넬(dmrate:alive)이 사라졌다 = 캐시 저장소가 비워졌다(카운터 전부 0으로 리셋).
-    # 이 경우 '이번 시각 경계까지 전 계정 차단'으로 고정한다(요구사항: 1시간 동안 최대치 고정).
-    # dmrate:reset_until 에 차단 종료 epoch 를 박아 그 시간까지 모든 check 가 차단되도록 한다.
     now = int(time.time())
-    reset_until = cache.get("dmrate:reset_until")
-    if reset_until and now < int(reset_until):
-        return Decision(
-            False, retry_after=int(reset_until) - now + 1, reason="redis_reset_failclosed"
-        )
+    # 카운터 유실 감지(센티넬) — v4.3: 동결하지 않고 경고 + 재시드 유도만.
     if cache.get("dmrate:alive") is None:
-        boundary = (now // 3600 + 1) * 3600  # 다음 시각 경계
         cache.set("dmrate:alive", 1, timeout=7 * 24 * 3600)
-        cache.set("dmrate:reset_until", boundary, timeout=max(boundary - now + 5, 5))
-        return Decision(False, retry_after=boundary - now + 1, reason="redis_reset_failclosed")
+        logger.warning(
+            "rate_governor: cache counters appear flushed — hourly backstop undercounts "
+            "until rehydrate_from_db; dm_pacer keeps the physical rate safe"
+        )
 
-    per_hour, per_minute = _limits_for(plan)
-    # Meta 계정당 750/hr Private Reply 가 실제 물리 상한 → plan 과 무관하게 이 값(안전마진 700)을
-    # 시간당 상한으로 사용한다. 분당(per_minute)은 plan 별 버스트 스무더로 유지(밴 회피용).
-    # 플랜별 시간당 차등이 필요하면 settings.DM_RATE_LIMITS + IG_PRIVATE_REPLY_HOURLY_CAP 로 조정.
+    per_hour, _per_minute = _limits_for(plan)
+    # Meta 계정당 750/hr Private Reply 가 실제 물리 상한 → plan 과 무관하게 이 값(백스톱 740)을
+    # 시간당 상한으로 사용한다. 0/None 이면 캡 해제 → plan per_hour 로 폴백.
     cap = getattr(settings, "IG_PRIVATE_REPLY_HOURLY_CAP", PRIVATE_REPLY_HOURLY_CAP)
     if cap and cap > 0:
         per_hour = cap
-    now = int(time.time())
+
     hour_key = f"dmrate:h:{ig_account_id}:{now // 3600}"
-    min_key = f"dmrate:m:{ig_account_id}:{now // 60}"
-
-    # 분당(버스트) 먼저 — 더 짧은 윈도우.
-    m = _incr_window(min_key, ttl=70)
-    if m > per_minute:
-        return Decision(False, retry_after=60 - (now % 60) + 1, reason="per_minute")
-
     h = _incr_window(hour_key, ttl=3700)
     if h > per_hour:
         return Decision(False, retry_after=3600 - (now % 3600) + 1, reason="per_hour")
@@ -308,13 +300,14 @@ def _restore_action_block_from_db(ig_account_id: str):
 def rehydrate_from_db() -> dict:
     """Redis 손실/DR failover 후 거버너 상태를 DB 에서 재구성하고 즉시 재개.
 
-    1) SentDMLog.submitted_at 윈도우 카운트로 dmrate:h/m 재시드 → '최대 1h 동결' 함정 제거.
+    1) SentDMLog.submitted_at 윈도우 카운트로 dmrate:h 재시드 (시간당 백스톱 정확도 회복).
+       (v4.3: 분당 카운터는 dm_pacer 가 대체해 제거 — 재시드 불필요.)
     2) DMAccountBlock 으로 dm:ab:cooldown/level 재시드 → 차단 계정 차단 유지.
-    3) dmrate:alive 세팅 + dmrate:reset_until 삭제 → fail-closed 동결 해제.
+    3) dmrate:alive 세팅 (+ 구버전 dmrate:reset_until 잔재 삭제).
 
     호출: dr_catchup STEP 0 + Celery worker_ready(active 사이트). 멱등.
     주의(DR failover): 사무실 DB 는 PITR ~RPO(1~2분) stale → 그만큼 적게 셀 수 있으나
-    700(Meta 750 마진 50) + 분당 캡이 흡수. 동일서버 Redis 재시작은 DB 최신 → 100% 정확.
+    페이싱은 dm_pacer 가 구조적으로 보장(평균 5.0s)하므로 백스톱 오차는 위험하지 않다.
     """
     from datetime import datetime
 
@@ -323,12 +316,11 @@ def rehydrate_from_db() -> dict:
     from apps.integrations.models import DMAccountBlock, SentDMLog
 
     now = int(time.time())
-    hour_epoch, min_epoch = now // 3600, now // 60
+    hour_epoch = now // 3600
     hour_start = datetime.fromtimestamp(hour_epoch * 3600, tz=UTC)
-    min_start = datetime.fromtimestamp(min_epoch * 60, tz=UTC)
     acct_field = "campaign__ig_connection__external_account_id"
 
-    seeded_h = seeded_m = 0
+    seeded_h = 0
     for r in (
         SentDMLog.objects.filter(submitted_at__gte=hour_start)
         .values(acct_field)
@@ -338,15 +330,6 @@ def rehydrate_from_db() -> dict:
         if acct:
             cache.set(f"dmrate:h:{acct}:{hour_epoch}", r["n"], timeout=3700)
             seeded_h += 1
-    for r in (
-        SentDMLog.objects.filter(submitted_at__gte=min_start)
-        .values(acct_field)
-        .annotate(n=Count("id"))
-    ):
-        acct = r[acct_field]
-        if acct:
-            cache.set(f"dmrate:m:{acct}:{min_epoch}", r["n"], timeout=70)
-            seeded_m += 1
 
     ab_count = 0
     now_dt = datetime.fromtimestamp(now, tz=UTC)
@@ -360,13 +343,7 @@ def rehydrate_from_db() -> dict:
         cache.set(lvl_key, int(row.level), timeout=30 * 24 * 3600)
         ab_count += 1
 
-    # 동결 해제: 카운터를 DB 로 정확히 복원했으므로 fail-closed 가 불필요.
     cache.set("dmrate:alive", 1, timeout=7 * 24 * 3600)
-    cache.delete("dmrate:reset_until")
-    logger.info(
-        "rate_governor rehydrated: hour_accts=%s min_accts=%s action_blocks=%s",
-        seeded_h,
-        seeded_m,
-        ab_count,
-    )
-    return {"hour_accounts": seeded_h, "minute_accounts": seeded_m, "action_blocks": ab_count}
+    cache.delete("dmrate:reset_until")  # 구버전 fail-closed 잔재 정리 (v4.3 에서 동결 제거)
+    logger.info("rate_governor rehydrated: hour_accts=%s action_blocks=%s", seeded_h, ab_count)
+    return {"hour_accounts": seeded_h, "action_blocks": ab_count}

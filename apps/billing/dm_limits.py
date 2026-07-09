@@ -6,6 +6,9 @@ DM 월간 발송 한도 (플랜 기반) — 정의의 단일 소스.
   카운트도 owner 스코프). 관리자(is_staff/superuser)는 무제한.
 - 사용량: SentDMLog 캘린더월 집계, SENT_FOR_QUOTA_STATUSES 만 소진
   (사용자에게 보이는 compute_monthly_usage 수치와 동일 정의).
+  **집계 단위 = (캠페인 × 수신자 Instagram ID) 고유쌍** (v4.2 — "사람 단위" 과금):
+  같은 캠페인에서 한 사람에게 여러 번 발송(follow-gate opening+reward, 재안내)해도 1로
+  카운트하고, 같은 사람이 서로 다른 캠페인에서 받으면 2로 카운트한다.
 - fail-open: '카운트' 실패 시 발송을 막지 않는다 (DM 무손실 원칙).
   '플랜 조회' 실패는 free(200) 취급 (_resolve_plan_name 과 동일한 보수성).
 """
@@ -38,17 +41,28 @@ def get_dm_monthly_limit(owner) -> int:
 
 
 def count_owner_dms_this_month(owner, now=None) -> int:
-    """owner 의 모든 워크스페이스에 걸친 이번 달 quota 소진 DM 수."""
+    """owner 의 모든 워크스페이스에 걸친 이번 달 quota 소진 DM 수.
+
+    v4.2 — "사람 단위" 과금: 단순 로그 count 가 아니라 **(캠페인 × 수신자) 고유쌍** 수를
+    센다. 같은 캠페인 안에서 한 수신자에게 여러 DM 이 나가도(opening+reward, 재안내) 1이고,
+    같은 수신자가 다른 캠페인에서 받으면 각각 1씩 잡힌다. distinct 는 인덱스
+    dm_log_recipient_status_idx(recipient_user_id, status, ...) 로 커버된다.
+    """
     from apps.integrations.campaign_stats import SENT_FOR_QUOTA_STATUSES, _month_bounds
     from apps.integrations.models import SentDMLog
 
     start, end = _month_bounds(now)
-    return SentDMLog.objects.filter(
-        campaign__ig_connection__workspace__owner=owner,
-        created_at__gte=start,
-        created_at__lt=end,
-        status__in=SENT_FOR_QUOTA_STATUSES,
-    ).count()
+    return (
+        SentDMLog.objects.filter(
+            campaign__ig_connection__workspace__owner=owner,
+            created_at__gte=start,
+            created_at__lt=end,
+            status__in=SENT_FOR_QUOTA_STATUSES,
+        )
+        .values("campaign_id", "recipient_user_id")
+        .distinct()
+        .count()
+    )
 
 
 def _quota_hit_cache_key(owner_id, now=None) -> str:

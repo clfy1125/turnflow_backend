@@ -3,7 +3,6 @@ Instagram Account Connection models
 """
 
 import uuid
-from datetime import timedelta
 
 from django.db import IntegrityError, models, transaction
 from django.utils import timezone
@@ -532,11 +531,10 @@ class AutoDMCampaign(models.Model):
     # 발송 제한
     max_sends_per_hour = models.IntegerField(
         default=200,
-        verbose_name="시간당 최대 발송 수",
+        verbose_name="시간당 최대 발송 수 (deprecated)",
         help_text=(
-            "캠페인별 사용자 throttle (anti-spam 관행값, 기본 200). "
-            "Meta 물리 한도는 계정당 750/hr Private Reply 이며 rate_governor 가 계정 단위로 별도 강제한다. "
-            "초과 시 드랍하지 않고 다음 시간 윈도우로 defer."
+            "(deprecated v4.3 — 더 이상 강제되지 않음) 발송 페이싱은 dm_pacer 가 계정 단위 "
+            "자동 조절로 대체했다. API 하위호환을 위해 필드만 유지하며 값은 무시된다."
         ),
     )
 
@@ -728,26 +726,12 @@ class AutoDMCampaign(models.Model):
         return "running"
 
     def can_send_more(self) -> bool:
-        """더 많은 DM을 보낼 수 있는지 확인 (시간당 제한 체크)"""
-        if not self.is_active():
-            return False
+        """(deprecated v4.3) 시간당 한도(max_sends_per_hour)는 더 이상 강제되지 않는다.
 
-        # 최근 1시간 동안 "실제 발송 시도/접수" 건수만 카운트.
-        # QUEUED(=defer 대기)·SKIPPED·실패 건을 세면 defer 누적분이 한도를 먹어
-        # 영영 안 풀리는 데드락이 생기므로 제외한다.
-        one_hour_ago = timezone.now() - timedelta(hours=1)
-        recent_sends = self.dm_logs.filter(
-            created_at__gte=one_hour_ago,
-            status__in=[
-                SentDMLog.Status.SUBMITTING,
-                SentDMLog.Status.ACCEPTED,
-                SentDMLog.Status.DELIVERED,
-                SentDMLog.Status.READ,
-                SentDMLog.Status.SENT,  # legacy
-            ],
-        ).count()
-
-        return recent_sends < self.max_sends_per_hour
+        발송 페이싱은 dm_pacer(계정 단위 지터 슬롯)가 대체했다. 시리얼라이저의
+        can_send 표시 호환을 위해 '캠페인 활성 여부'만 반환한다.
+        """
+        return self.is_active()
 
     def increment_sent(self):
         """발송 카운트 증가 (원자적 — 고동시성에서 lost update 방지)."""

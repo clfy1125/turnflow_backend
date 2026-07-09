@@ -4,9 +4,9 @@
   - send_dm_task: transient(rate-limit) → 종결 아닌 defer(QUEUED+next_retry_at), 통계 미증가
   - send_dm_task: 메시징 윈도우 만료 → FAILED_WINDOW graceful 종결
   - verify_dm_delivery 35분 cutoff → FAILED_NO_TRACE + increment_unconfirmed (total_failed 불변)
-  - can_send_more: QUEUED(=defer 대기) 는 시간당 한도 카운트에서 제외 (데드락 방지)
+  - can_send_more: (v4.3 deprecated) 시간당 한도 미강제 — 활성 여부만 반환
   - requeue_deferred_dms: next_retry_at 도래 QUEUED 를 send_dm_task 로 재투입 + next_retry_at 비움
-  - rate_governor: 계정당 시간당 상한이 Meta 700(IG_PRIVATE_REPLY_HOURLY_CAP) 으로 캡
+  - rate_governor: 계정당 시간당 **백스톱** 이 740(IG_PRIVATE_REPLY_HOURLY_CAP, Meta 750 아래) 으로 캡
 
 NOTE(test-db-not-clean): 전역 카운트 대신 내가 만든 캠페인/로그 기준으로 단언한다.
 NOTE(override-settings-broken): 클래스 데코레이터 대신 pytest `settings` 픽스처 사용.
@@ -33,9 +33,7 @@ def ig_connection(db):
     user = User.objects.create_user(
         email=f"rd_{uuid.uuid4().hex[:8]}@example.com", password="pw12345!", full_name="RD"
     )
-    ws = Workspace.objects.create(
-        name="RD WS", slug=f"rd-{uuid.uuid4().hex[:8]}", owner=user
-    )
+    ws = Workspace.objects.create(name="RD WS", slug=f"rd-{uuid.uuid4().hex[:8]}", owner=user)
     Membership.objects.create(workspace=ws, user=user, role=Membership.Role.OWNER)
     conn = IGAccountConnection.objects.create(
         workspace=ws,
@@ -110,9 +108,7 @@ class TestTransientDefer:
         campaign = _campaign(ig_connection)
         log = _log(campaign)
         # created_at 을 8일 전으로 (auto_now_add 우회 → queryset update)
-        SentDMLog.objects.filter(id=log.id).update(
-            created_at=timezone.now() - timedelta(days=8)
-        )
+        SentDMLog.objects.filter(id=log.id).update(created_at=timezone.now() - timedelta(days=8))
 
         with patch.object(InstagramMessagingService, "send_dm_via_comment") as send:
             res = send_dm_task.apply(args=[str(log.id)]).result
@@ -150,16 +146,16 @@ class TestNoTraceCounter:
 
 
 class TestCanSendMore:
-    def test_queued_not_counted(self, ig_connection):
-        """QUEUED(=defer 대기) 는 시간당 한도 카운트에서 제외되어 데드락을 막는다."""
+    def test_hourly_cap_deprecated_not_enforced(self, ig_connection):
+        """v4.3 — max_sends_per_hour 는 deprecated: 카운트와 무관하게 활성 여부만 반환."""
         campaign = _campaign(ig_connection, max_sends_per_hour=2)
         for _ in range(5):
-            _log(campaign, status=SentDMLog.Status.QUEUED)
-        assert campaign.can_send_more() is True  # QUEUED 5개여도 한도 미소진
-
-        for _ in range(2):
             _log(campaign, status=SentDMLog.Status.ACCEPTED)
-        assert campaign.can_send_more() is False  # ACCEPTED 2개로 한도 도달
+        assert campaign.can_send_more() is True  # 한도(2) 초과여도 강제 안 함 (페이서가 대체)
+
+        campaign.status = AutoDMCampaign.Status.PAUSED
+        campaign.save(update_fields=["status"])
+        assert campaign.can_send_more() is False  # 비활성 캠페인만 False
 
 
 class TestRequeueDeferred:
