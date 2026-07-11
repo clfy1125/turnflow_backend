@@ -29,6 +29,8 @@ from apps.admin_api.views.autodm import (
 )
 from apps.admin_api.views.billing import AdminSubscriptionPlanListView
 from apps.admin_api.views.dashboard import AdminMetricsOverviewView
+from apps.admin_api.views.dashboard_marketing import AdminMarketingDashboardView
+from apps.admin_api.views.dashboard_ops import AdminOpsDashboardView
 from apps.admin_api.views.identity import AdminMeView
 from apps.admin_api.views.pages import (
     AdminPageDetailView,
@@ -55,6 +57,16 @@ urlpatterns = [
     path("me/", AdminMeView.as_view(), name="me"),
     # B. 대시보드 지표
     path("metrics/overview/", AdminMetricsOverviewView.as_view(), name="metrics-overview"),
+    path(
+        "dashboard/operations/",
+        AdminOpsDashboardView.as_view(),
+        name="dashboard-operations",
+    ),
+    path(
+        "dashboard/marketing/",
+        AdminMarketingDashboardView.as_view(),
+        name="dashboard-marketing",
+    ),
     # C. 회원(계정) 관리
     path("users/", AdminUserListView.as_view(), name="user-list"),
     path("users/<int:pk>/", AdminUserDetailView.as_view(), name="user-detail"),

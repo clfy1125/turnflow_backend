@@ -1,0 +1,703 @@
+"""어드민 마케팅 대시보드(GET /api/v1/admin/dashboard/marketing/) 테스트.
+
+대상: apps/admin_api/views/dashboard_marketing.py (IsAdminUser).
+
+주의:
+- 파일명이 tests_*.py 라 **경로 명시 실행** 필요:
+  ``pytest apps/admin_api/tests_dashboard_marketing.py``.
+- 테스트 DB 가 더러울 수 있어 ``clean_slate`` 로 기존 행을 집계 창 밖으로 이동한다.
+- 어트리뷰션(apps.analytics)은 병렬 워크스트림 — 미탑재 환경에서도 나머지 테스트가
+  돌도록 채널 테스트는 skipif 가드.
+- 공유 Redis 라 cache.clear() 금지 — 대시보드 키만 삭제.
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import timedelta
+
+import pytest
+from django.contrib.auth import get_user_model
+from django.core.cache import cache
+from django.utils import timezone
+from rest_framework.test import APIClient
+
+from apps.billing.models import (
+    PaymentHistory,
+    PaymentStatus,
+    ReferralCode,
+    ReferralRedemption,
+    SubscriptionPlan,
+    SubscriptionStatus,
+    UserSubscription,
+)
+from apps.integrations.models import AutoDMCampaign, IGAccountConnection, SentDMLog, SpamCommentLog
+from apps.pages.models import BlockClick, Page, PageView
+from apps.workspace.models import Workspace
+
+# 어트리뷰션 앱은 병렬 워크스트림 — 뷰와 동일하게 가드 (미탑재 시 채널 테스트 skip)
+try:
+    from apps.analytics.models import LandingVisit, SignupAttribution
+
+    HAS_ANALYTICS = True
+except (ImportError, RuntimeError):
+    LandingVisit = None
+    SignupAttribution = None
+    HAS_ANALYTICS = False
+
+requires_analytics = pytest.mark.skipif(
+    not HAS_ANALYTICS, reason="apps.analytics 미탑재 — attribution_available=false 강등 경로"
+)
+
+User = get_user_model()
+
+URL = "/api/v1/admin/dashboard/marketing/"
+CACHE_KEYS = [f"admin:dash:mkt:{p}" for p in ("7d", "30d", "90d")]
+LONG_AGO = timedelta(days=400)
+
+# ─── 공통 픽스처 (tests_subscription.py 패턴) ─────────────────────────
+
+
+@pytest.fixture
+def client():
+    return APIClient()
+
+
+def _mk_user(email=None, joined=None, staff=False):
+    """유저 생성 — joined 지정 시 date_joined 를 강제 (코호트 제어)."""
+    user = User.objects.create_user(
+        email=email or f"u-{uuid.uuid4().hex[:8]}@test.com",
+        password="Pass1234!",
+        is_staff=staff,
+    )
+    # 지정 없으면 코호트 오염 방지를 위해 기본으로 창 밖으로 밀어낸다
+    target = joined if joined is not None else timezone.now() - LONG_AGO
+    User.objects.filter(pk=user.pk).update(date_joined=target)
+    user.refresh_from_db()
+    return user
+
+
+@pytest.fixture
+def staff_user(db):
+    return _mk_user(email="staff-mkt@example.com", staff=True)
+
+
+@pytest.fixture
+def regular_user(db):
+    return _mk_user(email="regular-mkt@example.com")
+
+
+@pytest.fixture
+def staff_client(client, staff_user):
+    client.force_authenticate(user=staff_user)
+    return client
+
+
+@pytest.fixture
+def regular_client(client, regular_user):
+    client.force_authenticate(user=regular_user)
+    return client
+
+
+@pytest.fixture(autouse=True)
+def _no_dashboard_cache(db):
+    """캐시 키만 정리 — 공유 Redis 라 cache.clear() 금지."""
+    cache.delete_many(CACHE_KEYS)
+    yield
+    cache.delete_many(CACHE_KEYS)
+
+
+@pytest.fixture
+def clean_slate(db):
+    """더러운 테스트 DB 방어 — 기존 행을 코호트/기간/월 창 밖으로 이동 (트랜잭션 내)."""
+    long_ago = timezone.now() - LONG_AGO
+    User.objects.all().update(date_joined=long_ago)
+    Page.objects.all().update(created_at=long_ago)
+    PageView.objects.all().update(viewed_at=long_ago)
+    BlockClick.objects.all().update(clicked_at=long_ago)
+    AutoDMCampaign.objects.all().update(created_at=long_ago)
+    IGAccountConnection.objects.all().update(
+        created_at=long_ago, status=IGAccountConnection.Status.REVOKED, is_active=True
+    )
+    SentDMLog.objects.all().update(created_at=long_ago)
+    SpamCommentLog.objects.all().update(created_at=long_ago)
+    PaymentHistory.objects.all().update(created_at=long_ago)
+    PaymentHistory.objects.filter(paid_at__isnull=False).update(paid_at=long_ago)
+    ReferralRedemption.objects.all().update(trial_started_at=long_ago)
+    UserSubscription.objects.all().update(
+        status=SubscriptionStatus.CANCELLED, trial_used_at=None, extra_ig_accounts=0
+    )
+    if HAS_ANALYTICS:
+        LandingVisit.objects.all().update(created_at=long_ago)
+
+
+@pytest.fixture
+def free_plan(db):
+    obj, _ = SubscriptionPlan.objects.get_or_create(
+        name="free", defaults={"display_name": "무료", "monthly_price": 0, "sort_order": 0}
+    )
+    # 업셀 쿼터 비율 계산이 결정적이도록 한도를 고정 (시드 features 와 무관하게)
+    obj.features = {**(obj.features or {}), "dm_monthly_limit": 200}
+    obj.save(update_fields=["features"])
+    return obj
+
+
+@pytest.fixture
+def pro_plan(db):
+    obj, _ = SubscriptionPlan.objects.get_or_create(
+        name="pro", defaults={"display_name": "프로", "monthly_price": 14900, "sort_order": 2}
+    )
+    # 시드된 플랜이 이미 있어도 MRR 폴백 단언이 결정적이도록 판매가 고정 (트랜잭션 내)
+    if obj.monthly_price != 14900:
+        obj.monthly_price = 14900
+        obj.save(update_fields=["monthly_price"])
+    return obj
+
+
+# ─── 헬퍼 팩토리 ──────────────────────────────────────────────────────
+
+
+def _mk_ws(owner):
+    return Workspace.objects.create(name="w", slug=f"w-{uuid.uuid4().hex[:8]}", owner=owner)
+
+
+def _mk_conn(owner, active=True):
+    return IGAccountConnection.objects.create(
+        workspace=_mk_ws(owner),
+        external_account_id=f"ig_{uuid.uuid4().hex[:10]}",
+        username=f"u_{uuid.uuid4().hex[:6]}",
+        account_type="BUSINESS",
+        status=(
+            IGAccountConnection.Status.ACTIVE if active else IGAccountConnection.Status.REVOKED
+        ),
+        is_active=True,
+    )
+
+
+def _mk_campaign(conn):
+    return AutoDMCampaign.objects.create(
+        ig_connection=conn,
+        trigger_type=AutoDMCampaign.TriggerType.ANY_MEDIA,
+        name="camp",
+        message_template="hi",
+        status=AutoDMCampaign.Status.ACTIVE,
+    )
+
+
+def _mk_page(user, public=True):
+    return Page.objects.create(user=user, slug=f"p-{uuid.uuid4().hex[:8]}", is_public=public)
+
+
+def _mk_paid_payment(user, paid_at, amount=14900):
+    return PaymentHistory.objects.create(
+        user=user, amount=amount, status=PaymentStatus.PAID, paid_at=paid_at
+    )
+
+
+def _mk_quota_dms(campaign, recipient_ids):
+    """quota 소진 상태(ACCEPTED) DM 로그 벌크 생성 — (캠페인 × 수신자) 쌍 카운트 검증용.
+
+    recipient_ids 에 같은 값이 반복되면 '같은 쌍에 여러 로그' 케이스가 된다.
+    """
+    return SentDMLog.objects.bulk_create(
+        SentDMLog(
+            campaign=campaign,
+            comment_id=f"c_{uuid.uuid4().hex[:10]}",
+            recipient_user_id=rid,
+            recipient_username="",
+            message_sent="x",
+            status=SentDMLog.Status.ACCEPTED,
+            idempotency_key=uuid.uuid4().hex,
+        )
+        for rid in recipient_ids
+    )
+
+
+def _stage(res, key):
+    return next(s for s in res.data["funnel"]["stages"] if s["key"] == key)
+
+
+# ─── 권한 / period 파라미터 ──────────────────────────────────────────
+
+
+class TestPermissionsAndParams:
+    def test_anonymous_401(self, client, db):
+        assert client.get(URL).status_code == 401
+
+    def test_non_staff_403(self, regular_client):
+        assert regular_client.get(URL).status_code == 403
+
+    def test_default_period_30d(self, staff_client):
+        res = staff_client.get(URL)
+        assert res.status_code == 200
+        assert res.data["period"] == "30d"
+
+    @pytest.mark.parametrize("period", ["7d", "30d", "90d"])
+    def test_valid_periods(self, staff_client, period):
+        res = staff_client.get(URL, {"period": period})
+        assert res.status_code == 200
+        assert res.data["period"] == period
+
+    def test_invalid_period_400_project_error_format(self, staff_client):
+        res = staff_client.get(URL, {"period": "1y"})
+        assert res.status_code == 400
+        assert res.data["success"] is False
+        assert res.data["error"]["code"] == 400
+        assert res.data["error"]["details"]["allowed"] == ["7d", "30d", "90d"]
+
+
+# ─── 빈 상태 ─────────────────────────────────────────────────────────
+
+
+class TestEmptyState:
+    def test_zeros_and_null_deltas(self, staff_client, clean_slate):
+        res = staff_client.get(URL)
+        assert res.status_code == 200
+
+        kpis = res.data["kpis"]
+        for key in (
+            "visits",
+            "unique_visitors",
+            "signups",
+            "ig_connected",
+            "first_page_published",
+            "first_dm_campaign",
+            "paid_conversions",
+        ):
+            assert kpis[key]["current"] == 0, key
+            assert kpis[key]["previous"] == 0, key
+            assert kpis[key]["delta_pct"] is None, key  # previous==0 → null
+
+        assert kpis["mrr"]["current"] == 0
+        assert kpis["mrr"]["previous"] is None
+        assert kpis["mrr"]["currency"] == "KRW"
+
+        funnel = res.data["funnel"]
+        assert funnel["semantics"] == "signup_cohort"
+        assert [s["key"] for s in funnel["stages"]] == [
+            "visit",
+            "signup",
+            "ig_connected",
+            "activated",
+            "paid",
+        ]
+        for stage in funnel["stages"]:
+            assert stage["count"] == 0  # ZeroDivisionError 없이 0/None
+
+        assert res.data["upsell_candidates"] == []
+        assert res.data["channels"]["rows"] == []
+        assert res.data["mrr_breakdown"]["total"] == 0
+        assert isinstance(res.data["attribution_available"], bool)
+
+    def test_attribution_flag_matches_app_presence(self, staff_client, clean_slate):
+        res = staff_client.get(URL)
+        assert res.data["attribution_available"] is HAS_ANALYTICS
+
+
+# ─── 코호트 퍼널 ─────────────────────────────────────────────────────
+
+
+class TestCohortFunnel:
+    def test_parallel_branches_and_union(self, staff_client, clean_slate):
+        now = timezone.now()
+        in_cohort = now - timedelta(days=5)
+
+        # 공개 페이지만 (IG 연동 없음) — 비선형 요건: activated 로 카운트돼야 함
+        u_page = _mk_user(joined=in_cohort)
+        _mk_page(u_page, public=True)
+        # 캠페인만 (연동 필요 → ig_connected 에도 포함)
+        u_camp = _mk_user(joined=in_cohort)
+        _mk_campaign(_mk_conn(u_camp))
+        # 둘 다 — 합집합에서 1회만
+        u_both = _mk_user(joined=in_cohort)
+        _mk_page(u_both, public=True)
+        _mk_campaign(_mk_conn(u_both))
+        # 아무것도 안 함
+        _mk_user(joined=in_cohort)
+
+        res = staff_client.get(URL)
+        assert _stage(res, "signup")["count"] == 4
+        assert _stage(res, "ig_connected")["count"] == 2  # u_camp, u_both
+
+        activated = _stage(res, "activated")
+        assert activated["count"] == 3  # 합집합 (u_both 는 1회만)
+        assert activated["branches"] == {
+            "page_published": 2,
+            "dm_campaign_created": 2,
+            "both": 1,
+        }
+        assert activated["rate_from_signups"] == 0.75
+
+    def test_private_page_does_not_activate(self, staff_client, clean_slate):
+        u = _mk_user(joined=timezone.now() - timedelta(days=3))
+        _mk_page(u, public=False)
+        res = staff_client.get(URL)
+        assert _stage(res, "activated")["count"] == 0
+
+    def test_cohort_boundary(self, staff_client, clean_slate):
+        now = timezone.now()
+        _mk_user(joined=now - timedelta(days=30, minutes=1))  # start 1분 전 — current 제외
+        _mk_user(joined=now - timedelta(days=45))  # previous 기간
+        _mk_user(joined=now - timedelta(days=1))  # current 기간
+
+        res = staff_client.get(URL)  # period=30d
+        assert res.data["kpis"]["signups"]["current"] == 1
+        # start 직전 유저 + 45일 전 유저 → previous 2명
+        assert res.data["kpis"]["signups"]["previous"] == 2
+        assert _stage(res, "signup")["count"] == 1
+
+
+# ─── paid_conversions (첫 PAID 결제 기준) ────────────────────────────
+
+
+class TestPaidConversions:
+    def test_first_paid_in_period_counted_once(self, staff_client, clean_slate):
+        now = timezone.now()
+        u = _mk_user()
+        _mk_paid_payment(u, paid_at=now - timedelta(days=3))
+        _mk_paid_payment(u, paid_at=now - timedelta(days=1))  # 같은 유저 2번째 — 중복 금지
+
+        res = staff_client.get(URL)
+        assert res.data["kpis"]["paid_conversions"]["current"] == 1
+
+    def test_first_paid_outside_period_not_counted(self, staff_client, clean_slate):
+        now = timezone.now()
+        u = _mk_user()
+        _mk_paid_payment(u, paid_at=now - LONG_AGO)  # 첫 결제가 기간 밖
+        _mk_paid_payment(u, paid_at=now - timedelta(days=1))  # 재결제는 기간 내여도 제외
+
+        res = staff_client.get(URL)
+        assert res.data["kpis"]["paid_conversions"]["current"] == 0
+
+    def test_pending_failed_not_counted(self, staff_client, clean_slate):
+        now = timezone.now()
+        u = _mk_user()
+        PaymentHistory.objects.create(
+            user=u, amount=100, status=PaymentStatus.PENDING, paid_at=now - timedelta(days=1)
+        )
+        PaymentHistory.objects.create(
+            user=u, amount=100, status=PaymentStatus.FAILED, paid_at=now - timedelta(days=1)
+        )
+        res = staff_client.get(URL)
+        assert res.data["kpis"]["paid_conversions"]["current"] == 0
+
+    def test_refund_nulled_pro_activated_at_still_counted(
+        self, staff_client, clean_slate, pro_plan
+    ):
+        # pro_activated_at 이 환불로 null 이어도 PAID 이력 기준이라 카운트 (소스 선택 증명)
+        now = timezone.now()
+        u = _mk_user()
+        UserSubscription.objects.create(
+            user=u, plan=pro_plan, status=SubscriptionStatus.ACTIVE, pro_activated_at=None
+        )
+        _mk_paid_payment(u, paid_at=now - timedelta(days=2))
+
+        res = staff_client.get(URL)
+        assert res.data["kpis"]["paid_conversions"]["current"] == 1
+
+
+# ─── MRR ─────────────────────────────────────────────────────────────
+
+
+class TestMrr:
+    def test_snapshot_extra_accounts_and_fallback(self, staff_client, clean_slate, pro_plan):
+        # 스냅샷 12900 + 추가계정 2개(19800)
+        u1 = _mk_user()
+        UserSubscription.objects.create(
+            user=u1,
+            plan=pro_plan,
+            status=SubscriptionStatus.ACTIVE,
+            monthly_amount_snapshot=12900,
+            extra_ig_accounts=2,
+        )
+        # 스냅샷 null → plan.monthly_price(14900) 폴백
+        u2 = _mk_user()
+        UserSubscription.objects.create(user=u2, plan=pro_plan, status=SubscriptionStatus.ACTIVE)
+
+        res = staff_client.get(URL)
+        mrr = res.data["mrr_breakdown"]
+        assert mrr["total"] == 12900 + 14900 + 2 * 9900
+        pro_row = next(r for r in mrr["by_plan"] if r["name"] == "pro")
+        assert pro_row["subscribers"] == 2
+        assert pro_row["mrr"] == 12900 + 14900
+        assert mrr["extra_ig_accounts"] == {"count": 2, "unit_price": 9900, "mrr": 19800}
+        assert res.data["kpis"]["mrr"]["current"] == mrr["total"]
+        assert res.data["kpis"]["mrr"]["previous"] is None
+
+    def test_trialing_and_free_excluded(self, staff_client, clean_slate, free_plan, pro_plan):
+        UserSubscription.objects.create(
+            user=_mk_user(),
+            plan=pro_plan,
+            status=SubscriptionStatus.TRIALING,
+            monthly_amount_snapshot=14900,
+        )
+        UserSubscription.objects.create(
+            user=_mk_user(), plan=free_plan, status=SubscriptionStatus.ACTIVE
+        )
+        res = staff_client.get(URL)
+        assert res.data["mrr_breakdown"]["total"] == 0
+
+
+# ─── 플랜 분포 ───────────────────────────────────────────────────────
+
+
+class TestPlanDistribution:
+    def test_status_columns(self, staff_client, clean_slate, db):
+        plan = SubscriptionPlan.objects.create(
+            name=f"testplan-{uuid.uuid4().hex[:6]}",
+            display_name="테스트플랜",
+            monthly_price=1000,
+            sort_order=99,
+        )
+        UserSubscription.objects.create(
+            user=_mk_user(), plan=plan, status=SubscriptionStatus.ACTIVE
+        )
+        UserSubscription.objects.create(
+            user=_mk_user(), plan=plan, status=SubscriptionStatus.TRIALING
+        )
+        UserSubscription.objects.create(
+            user=_mk_user(), plan=plan, status=SubscriptionStatus.PAST_DUE
+        )
+
+        res = staff_client.get(URL)
+        row = next(r for r in res.data["plan_distribution"] if r["name"] == plan.name)
+        assert row["display_name"] == "테스트플랜"
+        assert row["total"] == 3
+        assert row["active"] == 1
+        assert row["trialing"] == 1
+        assert row["past_due"] == 1
+        assert row["cancelled"] == 0
+
+
+# ─── 채널 (어트리뷰션 필요) ──────────────────────────────────────────
+
+
+@requires_analytics
+class TestChannels:
+    def test_attributed_unknown_and_visit_rates(self, staff_client, clean_slate):
+        now = timezone.now()
+        in_cohort = now - timedelta(days=5)
+
+        attributed = _mk_user(joined=in_cohort)
+        SignupAttribution.objects.create(
+            user=attributed, channel="instagram_organic", signup_kind="email"
+        )
+        _mk_page(attributed, public=True)  # activated
+        _mk_user(joined=in_cohort)  # 어트리뷰션 없음 → unknown
+
+        LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="instagram_organic")
+        LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="instagram_organic")
+
+        res = staff_client.get(URL)
+        assert res.data["attribution_available"] is True
+        rows = {r["channel"]: r for r in res.data["channels"]["rows"]}
+
+        ig = rows["instagram_organic"]
+        assert ig["visits"] == 2
+        assert ig["signups"] == 1
+        assert ig["signup_rate"] == 0.5
+        assert ig["activated"] == 1
+        assert ig["activation_rate"] == 1.0
+
+        unknown = rows["unknown"]
+        assert unknown["visits"] == 0
+        assert unknown["signups"] == 1
+        assert unknown["signup_rate"] is None  # 방문 0 → null
+
+    def test_referral_overlay_wins_over_stored_channel(self, staff_client, clean_slate, pro_plan):
+        now = timezone.now()
+        u = _mk_user(joined=now - timedelta(days=5))
+        SignupAttribution.objects.create(user=u, channel="meta_ads", signup_kind="email")
+        code = ReferralCode.objects.create(code=f"CR-{uuid.uuid4().hex[:6]}", target_plan=pro_plan)
+        ReferralRedemption.objects.create(
+            user=u,
+            referral_code=code,
+            trial_started_at=now - timedelta(days=4),
+            trial_ends_at=now + timedelta(days=26),
+        )
+
+        res = staff_client.get(URL)
+        rows = {r["channel"]: r for r in res.data["channels"]["rows"]}
+        assert rows["referral"]["signups"] == 1
+        assert "meta_ads" not in rows  # 저장 채널은 오버레이로 대체
+
+    def test_kpi_visits_counted(self, staff_client, clean_slate):
+        vid = uuid.uuid4()
+        LandingVisit.objects.create(visitor_id=vid, channel="direct")
+        LandingVisit.objects.create(visitor_id=vid, channel="direct")  # 같은 방문자 재방문
+
+        res = staff_client.get(URL)
+        assert res.data["kpis"]["visits"]["current"] == 2
+        assert res.data["kpis"]["unique_visitors"]["current"] == 1
+        assert _stage(res, "visit")["count"] == 2
+
+
+# ─── 업셀 후보 ───────────────────────────────────────────────────────
+
+
+class TestUpsellCandidates:
+    def _mk_owner_with_plan(self, plan):
+        owner = _mk_user()
+        UserSubscription.objects.create(user=owner, plan=plan, status=SubscriptionStatus.ACTIVE)
+        return owner
+
+    def test_dm_quota_distinct_pairs_and_80pct(self, staff_client, clean_slate, free_plan):
+        owner = self._mk_owner_with_plan(free_plan)
+        camp = _mk_campaign(_mk_conn(owner))
+        # 고유 수신자 168명 + 첫 수신자에게 중복 발송 1건(같은 캠페인×수신자 쌍)
+        _mk_quota_dms(camp, [f"rcpt_{i}" for i in range(168)] + ["rcpt_0"])
+
+        res = staff_client.get(URL)
+        cands = res.data["upsell_candidates"]
+        assert len(cands) == 1
+        cand = cands[0]
+        assert cand["user_id"] == owner.id
+        assert cand["plan"] == "free"
+        assert "dm_quota_80pct" in cand["reasons"]
+        assert cand["metrics"]["dm_used_month"] == 168  # 169 로그 → 168 고유쌍
+        assert cand["metrics"]["dm_limit"] == 200
+        assert cand["metrics"]["dm_usage_ratio"] == 0.84
+        assert cand["link"] == {"page": "/users", "params": {"id": owner.id}}
+
+    def test_pro_owner_excluded(self, staff_client, clean_slate, pro_plan):
+        owner = self._mk_owner_with_plan(pro_plan)
+        camp = _mk_campaign(_mk_conn(owner))
+        _mk_quota_dms(camp, [f"rcpt_{i}" for i in range(30)])
+        # 복수 IG 연동도 pro 라 후보 진입 금지
+        _mk_conn(owner)
+
+        res = staff_client.get(URL)
+        assert res.data["upsell_candidates"] == []
+
+    def test_multi_ig_and_ordering_by_score(self, staff_client, clean_slate, free_plan):
+        # 후보 A: 쿼터 80%+ (score 3)
+        heavy = self._mk_owner_with_plan(free_plan)
+        camp = _mk_campaign(_mk_conn(heavy))
+        _mk_quota_dms(camp, [f"h_{i}" for i in range(160)])
+        # 후보 B: 활성 IG 2개 (score 2)
+        multi = self._mk_owner_with_plan(free_plan)
+        _mk_conn(multi)
+        _mk_conn(multi)
+
+        res = staff_client.get(URL)
+        cands = res.data["upsell_candidates"]
+        assert [c["user_id"] for c in cands] == [heavy.id, multi.id]
+        assert cands[0]["score"] == 3
+        assert cands[1]["score"] == 2
+        assert cands[1]["reasons"] == ["multiple_ig_connections"]
+        assert cands[1]["metrics"]["active_ig_connections"] == 2
+
+    def test_capped_at_10(self, staff_client, clean_slate, free_plan):
+        for _ in range(12):
+            owner = self._mk_owner_with_plan(free_plan)
+            _mk_conn(owner)
+            _mk_conn(owner)
+        res = staff_client.get(URL)
+        assert len(res.data["upsell_candidates"]) == 10
+
+
+# ─── 트라이얼 / 기능 통계 ────────────────────────────────────────────
+
+
+class TestTrialsAndFeatureStats:
+    def test_trials_started_and_referral_conversion(
+        self, staff_client, clean_slate, free_plan, pro_plan
+    ):
+        now = timezone.now()
+        code = ReferralCode.objects.create(code=f"TR-{uuid.uuid4().hex[:6]}", target_plan=pro_plan)
+        # 레퍼럴 트라이얼 2건 (1건 전환)
+        for converted in (True, False):
+            u = _mk_user()
+            ReferralRedemption.objects.create(
+                user=u,
+                referral_code=code,
+                trial_started_at=now - timedelta(days=2),
+                trial_ends_at=now + timedelta(days=28),
+                converted_to_paid=converted,
+            )
+        # 카드등록 트라이얼 1건 — started 에만 포함 (전환 미추적)
+        card_user = _mk_user()
+        UserSubscription.objects.create(
+            user=card_user,
+            plan=pro_plan,
+            status=SubscriptionStatus.TRIALING,
+            trial_used_at=now - timedelta(days=1),
+        )
+
+        res = staff_client.get(URL)
+        trials = res.data["feature_stats"]["trials"]
+        assert trials["started"]["current"] == 3  # 레퍼럴 2 + 카드 1
+        assert trials["converted"] == 1
+        assert trials["conversion_rate"] == 0.5  # 레퍼럴 코호트(2) 기준
+
+        codes = res.data["channels"]["referral_codes"]
+        row = next(r for r in codes if r["code"] == code.code)
+        assert row["redemptions"] == 2
+        assert row["converted"] == 1
+        assert row["conversion_rate"] == 0.5
+
+    def test_biolink_views_clicks_and_top_pages(self, staff_client, clean_slate):
+        u = _mk_user()
+        page = _mk_page(u, public=True)
+        for _ in range(3):
+            PageView.objects.create(page=page)
+
+        res = staff_client.get(URL)
+        biolink = res.data["feature_stats"]["biolink"]
+        assert biolink["views"]["current"] == 3
+        assert biolink["new_public_pages"]["current"] == 1
+        assert biolink["top_pages"][0]["slug"] == page.slug
+        assert biolink["top_pages"][0]["views"] == 3
+        assert biolink["ctr"] == 0.0  # 클릭 0 — ZeroDivision 없이 0.0
+
+    def test_dm_feature_delivery_rate(self, staff_client, clean_slate):
+        camp = _mk_campaign(_mk_conn(_mk_user()))
+        for i in range(9):
+            SentDMLog.objects.create(
+                campaign=camp,
+                comment_id=f"c_{i}",
+                recipient_user_id=f"r_{i}",
+                recipient_username="",
+                message_sent="x",
+                status=SentDMLog.Status.DELIVERED,
+                idempotency_key=uuid.uuid4().hex,
+            )
+        SentDMLog.objects.create(
+            campaign=camp,
+            comment_id="c_x",
+            recipient_user_id="r_x",
+            recipient_username="",
+            message_sent="x",
+            status=SentDMLog.Status.ACCEPTED,
+            idempotency_key=uuid.uuid4().hex,
+        )
+
+        res = staff_client.get(URL)
+        dm = res.data["feature_stats"]["dm"]
+        assert dm["requested"]["current"] == 10
+        assert dm["delivered"]["current"] == 9
+        assert dm["delivery_rate"] == 0.9
+        assert dm["campaigns_created"]["current"] == 1
+
+
+# ─── 캐싱 ────────────────────────────────────────────────────────────
+
+
+class TestCaching:
+    def test_second_call_served_from_cache(self, staff_client, clean_slate):
+        first = staff_client.get(URL)
+        _mk_user(joined=timezone.now() - timedelta(days=1))
+
+        second = staff_client.get(URL)  # 300s TTL 내 — 캐시 히트
+        assert second.data["generated_at"] == first.data["generated_at"]
+        assert second.data["kpis"]["signups"]["current"] == 0
+
+        cache.delete("admin:dash:mkt:30d")
+        third = staff_client.get(URL)
+        assert third.data["kpis"]["signups"]["current"] == 1
+
+    def test_periods_cached_separately(self, staff_client, clean_slate):
+        res_30 = staff_client.get(URL, {"period": "30d"})
+        res_7 = staff_client.get(URL, {"period": "7d"})
+        assert res_30.data["period"] == "30d"
+        assert res_7.data["period"] == "7d"
