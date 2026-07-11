@@ -213,8 +213,23 @@ def _mk_quota_dms(campaign, recipient_ids):
     )
 
 
-def _stage(res, key):
-    return next(s for s in res.data["funnel"]["stages"] if s["key"] == key)
+def _variant(res, channel="all"):
+    """funnel.variants[channel] (분기 퍼널 구조 {head, branches, conversion})."""
+    return res.data["funnel"]["variants"][channel]
+
+
+def _node(res, key, channel="all"):
+    """분기 퍼널 노드 1개를 key 로 조회 (head + 모든 branch.steps + conversion 탐색)."""
+    v = _variant(res, channel)
+    nodes = list(v["head"])
+    for br in v["branches"]:
+        nodes.extend(br["steps"])
+    nodes.append(v["conversion"])
+    return next(n for n in nodes if n["key"] == key)
+
+
+def _branch(res, branch_key, channel="all"):
+    return next(b for b in _variant(res, channel)["branches"] if b["key"] == branch_key)
 
 
 # ─── 권한 / period 파라미터 ──────────────────────────────────────────
@@ -274,15 +289,18 @@ class TestEmptyState:
 
         funnel = res.data["funnel"]
         assert funnel["semantics"] == "signup_cohort"
-        assert [s["key"] for s in funnel["stages"]] == [
-            "visit",
-            "signup",
-            "ig_connected",
-            "activated",
-            "paid",
-        ]
-        for stage in funnel["stages"]:
-            assert stage["count"] == 0  # ZeroDivisionError 없이 0/None
+        # 어트리뷰션 유무와 무관하게 all variant 는 항상 존재
+        assert funnel["available_channels"][0] == {"value": "all", "label": "전체 채널"}
+        v = funnel["variants"]["all"]
+        assert [n["key"] for n in v["head"]] == ["visit", "signup"]
+        assert [b["key"] for b in v["branches"]] == ["dm", "biolink"]
+        assert [n["key"] for n in _branch(res, "dm")["steps"]] == ["ig_connected", "dm_campaign"]
+        assert [n["key"] for n in _branch(res, "biolink")["steps"]] == ["page_published"]
+        assert v["conversion"]["key"] == "paid"
+        for key in ("visit", "signup", "ig_connected", "dm_campaign", "page_published", "paid"):
+            assert _node(res, key)["count"] == 0  # ZeroDivisionError 없이 0/None
+        # 빈 상태: visits 0 → signup.rate null
+        assert _node(res, "signup")["rate"] is None
 
         assert res.data["upsell_candidates"] == []
         assert res.data["channels"]["rows"] == []
@@ -298,17 +316,17 @@ class TestEmptyState:
 
 
 class TestCohortFunnel:
-    def test_parallel_branches_and_union(self, staff_client, clean_slate):
+    def test_parallel_branches_nonlinear(self, staff_client, clean_slate):
         now = timezone.now()
         in_cohort = now - timedelta(days=5)
 
-        # 공개 페이지만 (IG 연동 없음) — 비선형 요건: activated 로 카운트돼야 함
+        # 공개 페이지만 (IG 연동 없음) — 비선형 요건: biolink 분기에만, dm 분기엔 미포함
         u_page = _mk_user(joined=in_cohort)
         _mk_page(u_page, public=True)
         # 캠페인만 (연동 필요 → ig_connected 에도 포함)
         u_camp = _mk_user(joined=in_cohort)
         _mk_campaign(_mk_conn(u_camp))
-        # 둘 다 — 합집합에서 1회만
+        # 둘 다
         u_both = _mk_user(joined=in_cohort)
         _mk_page(u_both, public=True)
         _mk_campaign(_mk_conn(u_both))
@@ -316,23 +334,47 @@ class TestCohortFunnel:
         _mk_user(joined=in_cohort)
 
         res = staff_client.get(URL)
-        assert _stage(res, "signup")["count"] == 4
-        assert _stage(res, "ig_connected")["count"] == 2  # u_camp, u_both
+        assert _node(res, "signup")["count"] == 4
+        ig = _node(res, "ig_connected")
+        assert ig["count"] == 2  # u_camp, u_both
+        # ig.rate = ig/signups
+        assert ig["rate"] == 0.5
+        assert ig["rate_of"] == "signup"
+        assert ig["formula"] == "IG 연동 수 ÷ 가입 수 × 100"
 
-        activated = _stage(res, "activated")
-        assert activated["count"] == 3  # 합집합 (u_both 는 1회만)
-        assert activated["branches"] == {
-            "page_published": 2,
-            "dm_campaign_created": 2,
-            "both": 1,
-        }
-        assert activated["rate_from_signups"] == 0.75
+        # dm 분기: IG-less 페이지 유저는 미포함 (u_camp, u_both 만)
+        dm = _node(res, "dm_campaign")
+        assert dm["count"] == 2
+        assert dm["rate"] == 1.0  # dm/ig = 2/2
+        assert dm["rate_of"] == "ig_connected"
 
-    def test_private_page_does_not_activate(self, staff_client, clean_slate):
+        # biolink 분기: 페이지 공개 유저 (u_page, u_both) — IG 무관
+        page = _node(res, "page_published")
+        assert page["count"] == 2
+        assert page["rate"] == 0.5  # page/signups = 2/4
+        assert page["rate_of"] == "signup"
+        assert page["formula"] == "페이지 공개 수 ÷ 가입 수 × 100"
+
+    def test_paid_rate_of_signups(self, staff_client, clean_slate):
+        now = timezone.now()
+        in_cohort = now - timedelta(days=5)
+        for _ in range(4):
+            _mk_user(joined=in_cohort)
+        u_paid = _mk_user(joined=in_cohort)
+        _mk_paid_payment(u_paid, paid_at=now - timedelta(days=2))
+
+        res = staff_client.get(URL)
+        paid = _node(res, "paid")
+        assert paid["count"] == 1
+        assert paid["rate"] == 0.2  # paid/signups = 1/5
+        assert paid["rate_of"] == "signup"
+        assert paid["formula"] == "유료 전환 수 ÷ 가입 수 × 100"
+
+    def test_private_page_not_in_biolink(self, staff_client, clean_slate):
         u = _mk_user(joined=timezone.now() - timedelta(days=3))
         _mk_page(u, public=False)
         res = staff_client.get(URL)
-        assert _stage(res, "activated")["count"] == 0
+        assert _node(res, "page_published")["count"] == 0
 
     def test_cohort_boundary(self, staff_client, clean_slate):
         now = timezone.now()
@@ -344,7 +386,7 @@ class TestCohortFunnel:
         assert res.data["kpis"]["signups"]["current"] == 1
         # start 직전 유저 + 45일 전 유저 → previous 2명
         assert res.data["kpis"]["signups"]["previous"] == 2
-        assert _stage(res, "signup")["count"] == 1
+        assert _node(res, "signup")["count"] == 1
 
 
 # ─── paid_conversions (첫 PAID 결제 기준) ────────────────────────────
@@ -481,6 +523,17 @@ class TestPlanDistribution:
         assert row["past_due"] == 1
         assert row["cancelled"] == 0
 
+    def test_admin_plan_excluded(self, staff_client, clean_slate, db):
+        admin_plan, _ = SubscriptionPlan.objects.get_or_create(
+            name="admin",
+            defaults={"display_name": "관리자", "monthly_price": 18900, "sort_order": 9},
+        )
+        UserSubscription.objects.create(
+            user=_mk_user(), plan=admin_plan, status=SubscriptionStatus.ACTIVE
+        )
+        res = staff_client.get(URL)
+        assert all(r["name"] != "admin" for r in res.data["plan_distribution"])
+
 
 # ─── 채널 (어트리뷰션 필요) ──────────────────────────────────────────
 
@@ -542,7 +595,36 @@ class TestChannels:
         res = staff_client.get(URL)
         assert res.data["kpis"]["visits"]["current"] == 2
         assert res.data["kpis"]["unique_visitors"]["current"] == 1
-        assert _stage(res, "visit")["count"] == 2
+        assert _node(res, "visit")["count"] == 2
+
+    def test_channel_variant_matches_available_channels(self, staff_client, clean_slate):
+        now = timezone.now()
+        in_cohort = now - timedelta(days=5)
+        # instagram_organic 채널로 2명 가입 (1명 페이지 공개)
+        for i in range(2):
+            u = _mk_user(joined=in_cohort)
+            SignupAttribution.objects.create(
+                user=u, channel="instagram_organic", signup_kind="email"
+            )
+            if i == 0:
+                _mk_page(u, public=True)
+        LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="instagram_organic")
+
+        res = staff_client.get(URL)
+        funnel = res.data["funnel"]
+        # available_channels 에 해당 채널 (all 다음), variants 키와 일치
+        values = [c["value"] for c in funnel["available_channels"]]
+        assert values[0] == "all"
+        assert "instagram_organic" in values
+        assert set(values) == set(funnel["variants"].keys())
+        # 채널 라벨 = CHANNEL_LABELS
+        ig_opt = next(c for c in funnel["available_channels"] if c["value"] == "instagram_organic")
+        assert ig_opt["label"] == "인스타 오가닉"
+        # 채널 variant 노드 카운트
+        assert _node(res, "signup", channel="instagram_organic")["count"] == 2
+        assert _node(res, "page_published", channel="instagram_organic")["count"] == 1
+        # signup.rate = signups/visits = 2/1 (분모=해당 채널 visits)
+        assert _node(res, "signup", channel="instagram_organic")["rate"] == 2.0
 
 
 # ─── 업셀 후보 ───────────────────────────────────────────────────────

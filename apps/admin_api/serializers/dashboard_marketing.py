@@ -61,39 +61,67 @@ class _KpisSerializer(serializers.Serializer):
     mrr = _MrrKpiSerializer(help_text="MRR (point-in-time, previous=null)")
 
 
-class _FunnelBranchesSerializer(serializers.Serializer):
-    """activated 단계의 병렬 브랜치 — 합집합 == activated.count."""
+class _FunnelNodeSerializer(serializers.Serializer):
+    """퍼널 노드 1개 — visit/signup/ig_connected/dm_campaign/page_published/paid."""
 
-    page_published = serializers.IntegerField(help_text="공개 페이지 보유 (현재 기준)")
-    dm_campaign_created = serializers.IntegerField(help_text="DM 캠페인 생성 이력 보유")
-    both = serializers.IntegerField(help_text="두 브랜치 모두 (교집합 — 합집합에서 1회만 카운트)")
-
-
-class _FunnelStageSerializer(serializers.Serializer):
-    """퍼널 단계 1개 — visit/signup/ig_connected/activated/paid."""
-
-    key = serializers.CharField(help_text="visit / signup / ig_connected / activated / paid")
+    key = serializers.CharField(
+        help_text="visit / signup / ig_connected / dm_campaign / page_published / paid"
+    )
+    label = serializers.CharField(help_text="한국어 고정 라벨 (예: 방문/가입/IG 연동/…)")
     count = serializers.IntegerField(
-        help_text="단계 도달 수. visit 만 기간-이벤트, 나머지는 가입 코호트의 '현재까지' 도달"
+        help_text="노드 도달 수. visit 만 기간-이벤트, 나머지는 가입 코호트의 '현재까지' 도달"
     )
-    rate_from_previous = serializers.FloatField(
-        allow_null=True, help_text="직전 단계 대비 전환율 (0~1, 분모 0 → null)"
+    rate = serializers.FloatField(
+        allow_null=True, help_text="rate_of 노드 대비 전환율 (0~1, 분모 0 → null)"
     )
-    rate_from_signups = serializers.FloatField(
-        allow_null=True, help_text="가입자 대비 도달율 (0~1) — 비선형 단계 비교용"
+    rate_of = serializers.CharField(
+        allow_null=True, help_text="분모가 되는 노드 key (화살표 위 % 표기용) 또는 null"
     )
-    branches = _FunnelBranchesSerializer(
-        required=False, help_text="activated 단계에만 존재 — 병렬 브랜치 분해"
+    formula = serializers.CharField(
+        allow_null=True,
+        help_text='공식 한국어 문자열 (i-아이콘 툴팁용, 예 "IG 연동 수 ÷ 가입 수 × 100")',
     )
+
+
+class _FunnelBranchSerializer(serializers.Serializer):
+    """가입 이후 분기 1개 — dm(DM 자동화) / biolink(바이오링크)."""
+
+    key = serializers.CharField(help_text="dm / biolink")
+    label = serializers.CharField(help_text='분기 라벨 ("DM 자동화" / "바이오링크")')
+    steps = _FunnelNodeSerializer(
+        many=True,
+        help_text="분기 단계 노드. dm=[ig_connected, dm_campaign], biolink=[page_published]",
+    )
+
+
+class _FunnelChannelOptionSerializer(serializers.Serializer):
+    """채널 드롭다운 옵션 1개 — variants 키와 1:1."""
+
+    value = serializers.CharField(help_text='채널 키 ("all" 또는 채널명)')
+    label = serializers.CharField(help_text="한국어 라벨 (CHANNEL_LABELS, 없는 키는 그대로)")
+
+
+class _FunnelVariantSerializer(serializers.Serializer):
+    """채널 1개 기준 분기 퍼널 — head → 분기 → conversion."""
+
+    head = _FunnelNodeSerializer(many=True, help_text="공통 head [visit, signup]")
+    branches = _FunnelBranchSerializer(many=True, help_text="병렬 분기 2개 (dm, biolink)")
+    conversion = _FunnelNodeSerializer(help_text="수렴 노드 (paid, 가입 대비)")
 
 
 class _FunnelSerializer(serializers.Serializer):
-    """가입 코호트 퍼널."""
+    """가입 코호트 분기 퍼널 — 채널별 variant 미리 계산 (드롭다운 전환 시 재요청 불필요)."""
 
     semantics = serializers.CharField(
-        help_text='항상 "signup_cohort" — date_joined ∈ 기간 코호트, 단계 도달은 현재까지 기준'
+        help_text='항상 "signup_cohort" — date_joined ∈ 기간 코호트, 도달은 현재까지 기준'
     )
-    stages = _FunnelStageSerializer(many=True, help_text="고정 순서 5단계")
+    available_channels = _FunnelChannelOptionSerializer(
+        many=True, help_text='드롭다운 옵션 — "all" 첫 항목 + signups>0 채널 (signups desc)'
+    )
+    variants = serializers.DictField(
+        child=_FunnelVariantSerializer(),
+        help_text='채널 키 → variant. "all" 항상 포함, 어트리뷰션 미탑재 시 all 만',
+    )
 
 
 class _ChannelRowSerializer(serializers.Serializer):
@@ -252,7 +280,10 @@ class _FeatureStatsSerializer(serializers.Serializer):
 
 
 class _PlanDistributionRowSerializer(serializers.Serializer):
-    """플랜 분포 1행 — 전 플랜(비활성 포함), sort_order 순."""
+    """플랜 분포 1행 — 전 플랜(비활성 포함, admin 제외), sort_order 순.
+
+    admin 은 운영용 내부 계정이라 마케팅 무관 → 제외 (MRR 과 동일 정책).
+    """
 
     name = serializers.CharField(help_text="SubscriptionPlan.name")
     display_name = serializers.CharField(help_text="SubscriptionPlan.display_name")
@@ -341,7 +372,7 @@ class AdminMarketingDashboardSerializer(serializers.Serializer):
         "visits/unique_visitors=0, channels.rows=[] 로 강등"
     )
     kpis = _KpisSerializer(help_text="핵심 KPI (전부 기간 비교)")
-    funnel = _FunnelSerializer(help_text="가입 코호트 퍼널")
+    funnel = _FunnelSerializer(help_text="가입 코호트 분기 퍼널 (채널별 variant 포함)")
     trends = _TrendsSerializer(help_text="일별 추이 (로컬 날짜 zero-fill, 항상 포함)")
     channels = _ChannelsSerializer(help_text="채널별 성과 + 레퍼럴 코드")
     upsell_candidates = _UpsellCandidateSerializer(
