@@ -45,6 +45,7 @@ INSTALLED_APPS = [
     "apps.tiktok",
     "apps.youtube",
     "apps.admin_api",
+    "apps.analytics",
 ]
 
 MIDDLEWARE = [
@@ -242,6 +243,9 @@ REST_FRAMEWORK = {
         "email_send": config("THROTTLE_EMAIL_SEND", default="5/hour"),
         "password_reset": config("THROTTLE_PASSWORD_RESET", default="10/hour"),
         "password_reset_confirm": config("THROTTLE_PASSWORD_RESET_CONFIRM", default="10/min"),
+        # 랜딩 방문 트래킹 비콘 (POST /track/visit/) — IP 기준. 한국 모바일 CGNAT(수백 명이
+        # 한 egress IP 공유) 특성상 느슨하게 — 실질 어뷰즈 방어는 visitor_id당 시간당 캡(6회).
+        "track_visit": config("THROTTLE_TRACK_VISIT", default="120/hour"),
     },
 }
 
@@ -465,6 +469,12 @@ CELERY_BEAT_SCHEDULE = {
     "cleanup-comment-ledger": {
         "task": "integrations.cleanup_comment_ledger",
         "schedule": crontab(hour=4, minute=30),  # CELERY_TIMEZONE=Asia/Seoul 기준
+    },
+    # 매일 KST 03:30 — 보존기간(기본 180일) 초과 랜딩 방문(LandingVisit) 배치 삭제.
+    "analytics-cleanup-landing-visits": {
+        "task": "analytics.cleanup_landing_visits",
+        "schedule": crontab(hour=3, minute=30),  # CELERY_TIMEZONE=Asia/Seoul 기준
+        "options": {"queue": "billing"},  # housekeeping 큐 (기존 관례)
     },
     # 매일 KST 02:00 — EventInbox 일별 파티션 유지(선생성 + 보존 초과 DROP) + (옵션)SentDMLog 아카이브. (§15.8)
     "maintain-partitions": {
@@ -735,6 +745,18 @@ UNVERIFIED_ACCOUNT_CLEANUP_DRY_RUN = config(
     "UNVERIFIED_ACCOUNT_CLEANUP_DRY_RUN", default=True, cast=bool
 )
 UNVERIFIED_ACCOUNT_RETENTION_DAYS = config("UNVERIFIED_ACCOUNT_RETENTION_DAYS", default=1, cast=int)
+
+# ─────────────────────────────────────────────────────────────
+# 랜딩 방문 트래킹 (apps.analytics — POST /api/v1/track/visit/)
+# ─────────────────────────────────────────────────────────────
+# 랜딩 방문(LandingVisit) 원시 행 보존일 — 초과분은 daily beat(analytics.cleanup_landing_visits)가
+# 배치 삭제. SignupAttribution(가입 귀속)은 업무 기록이라 TTL 없음.
+LANDING_VISIT_RETENTION_DAYS = config("LANDING_VISIT_RETENTION_DAYS", default=180, cast=int)
+# 방문자(visitor_id)당 시간당 최대 기록 수 — 초과분은 조용히 스킵(응답은 그대로 204).
+# IP 스로틀(track_visit)보다 이 캡이 실질 어뷰즈 방어선이다.
+TRACK_VISIT_MAX_WRITES_PER_VISITOR_HOUR = config(
+    "TRACK_VISIT_MAX_WRITES_PER_VISITOR_HOUR", default=6, cast=int
+)
 
 # ===== 댓글 웹훅 누락 보정 (integrations.poll_missed_comments) =====
 # Instagram comments 웹훅이 유실되면 트리거 댓글이 누락되므로, 시간당 댓글 edge 를 재조회해

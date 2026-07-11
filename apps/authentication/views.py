@@ -894,6 +894,12 @@ curl -X POST http://localhost:8000/api/v1/auth/google/ \\
         if created:
             user.set_unusable_password()
             user.save(update_fields=["password"])
+            # 가입 유입 attribution 저장 (신규 가입 시에만, 실패해도 가입/로그인은 진행)
+            from apps.analytics.attribution import capture_signup_attribution
+
+            capture_signup_attribution(
+                user, serializer.validated_data.get("attribution"), signup_kind="google"
+            )
         else:
             updates = []
             if name and not user.full_name:

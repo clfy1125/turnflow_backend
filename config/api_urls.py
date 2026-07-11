@@ -23,6 +23,7 @@ urlpatterns = [
     path("link/", include("apps.pages.link_urls", namespace="link")),
     path("ai/", include("apps.ai_jobs.urls", namespace="ai_jobs")),
     path("insights/", include("apps.insights.urls", namespace="insights")),
+    path("track/", include("apps.analytics.urls", namespace="analytics")),
     path("admin/emails/", include("apps.emails.urls_admin", namespace="admin_emails")),
     path("admin/", include("apps.pages.admin_urls", namespace="admin_pages")),
     path("admin/", include("apps.admin_api.urls", namespace="admin_api")),

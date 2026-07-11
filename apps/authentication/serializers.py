@@ -2,9 +2,9 @@
 Serializers for authentication
 """
 
-from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
+from rest_framework import serializers
 
 User = get_user_model()
 
@@ -21,10 +21,21 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
     password_confirm = serializers.CharField(
         write_only=True, required=True, style={"input_type": "password"}
     )
+    # 가입 유입 attribution — 의도적으로 느슨한 JSONField (nested serializer 아님):
+    # 어떤 JSON 형태든 통과시키고 sanitize 는 capture_signup_attribution 이 담당한다.
+    # → 잘못된 attribution 객체가 가입을 400 으로 깨뜨리는 일이 구조적으로 불가능.
+    attribution = serializers.JSONField(
+        required=False,
+        write_only=True,
+        help_text=(
+            "선택 — 가입 유입 attribution 객체 {visitor_id, utm_source, utm_medium, "
+            "utm_campaign, utm_content, referrer, landing_path}"
+        ),
+    )
 
     class Meta:
         model = User
-        fields = ["email", "full_name", "password", "password_confirm"]
+        fields = ["email", "full_name", "password", "password_confirm", "attribution"]
         extra_kwargs = {
             "full_name": {"required": False},
         }
@@ -37,12 +48,17 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         """Create user with encrypted password"""
+        attribution = validated_data.pop("attribution", None)
         validated_data.pop("password_confirm")
         user = User.objects.create_user(
             email=validated_data["email"],
             full_name=validated_data.get("full_name", ""),
             password=validated_data["password"],
         )
+        # 가입 유입 attribution 저장 — 절대 예외를 던지지 않아 가입을 막지 않는다.
+        from apps.analytics.attribution import capture_signup_attribution
+
+        capture_signup_attribution(user, attribution, signup_kind="email")
         return user
 
 
@@ -114,4 +130,8 @@ class GoogleLoginSerializer(serializers.Serializer):
     token = serializers.CharField(
         required=True,
         help_text="프론트엔드에서 Google 로그인 후 받은 ID Token",
+    )
+    attribution = serializers.JSONField(
+        required=False,
+        help_text="선택 — 가입 유입 attribution 객체 (신규 가입 시에만 저장)",
     )
