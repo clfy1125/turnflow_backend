@@ -425,7 +425,7 @@ def _recent_errors(since) -> list[dict]:
                 "subject": p.user.email,
                 "detail": detail[:200],
                 "ref_id": str(p.id),
-                "link": {"page": "/users", "params": {"id": p.user_id}},
+                "link": {"page": f"/users/{p.user_id}", "params": {}},
             }
         )
 

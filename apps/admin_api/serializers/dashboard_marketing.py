@@ -283,7 +283,7 @@ class _ExtraIgAccountsMrrSerializer(serializers.Serializer):
 
 
 class _MrrBreakdownSerializer(serializers.Serializer):
-    """MRR 브레이크다운 — point-in-time, ACTIVE 유료 구독만 (TRIALING/free 제외)."""
+    """MRR 브레이크다운 — point-in-time, ACTIVE 유료 구독만 (TRIALING/free/admin 제외)."""
 
     total = serializers.IntegerField(help_text="총 MRR (원) = by_plan 합 + 추가 IG 계정 매출")
     by_plan = _MrrByPlanRowSerializer(many=True, help_text="플랜별 기본료 MRR (sort_order 순)")

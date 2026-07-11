@@ -424,7 +424,7 @@ class TestMrr:
         assert res.data["kpis"]["mrr"]["current"] == mrr["total"]
         assert res.data["kpis"]["mrr"]["previous"] is None
 
-    def test_trialing_and_free_excluded(self, staff_client, clean_slate, free_plan, pro_plan):
+    def test_trialing_free_and_admin_excluded(self, staff_client, clean_slate, free_plan, pro_plan):
         UserSubscription.objects.create(
             user=_mk_user(),
             plan=pro_plan,
@@ -434,8 +434,21 @@ class TestMrr:
         UserSubscription.objects.create(
             user=_mk_user(), plan=free_plan, status=SubscriptionStatus.ACTIVE
         )
+        # admin 플랜은 운영용 내부 계정 — ACTIVE + 유료 가격이어도 MRR 에서 제외
+        admin_plan, _ = SubscriptionPlan.objects.get_or_create(
+            name="admin",
+            defaults={"display_name": "관리자", "monthly_price": 18900, "sort_order": 9},
+        )
+        UserSubscription.objects.create(
+            user=_mk_user(),
+            plan=admin_plan,
+            status=SubscriptionStatus.ACTIVE,
+            monthly_amount_snapshot=18900,
+        )
         res = staff_client.get(URL)
-        assert res.data["mrr_breakdown"]["total"] == 0
+        mrr = res.data["mrr_breakdown"]
+        assert mrr["total"] == 0
+        assert all(r["name"] != "admin" for r in mrr["by_plan"])
 
 
 # ─── 플랜 분포 ───────────────────────────────────────────────────────
@@ -557,7 +570,7 @@ class TestUpsellCandidates:
         assert cand["metrics"]["dm_used_month"] == 168  # 169 로그 → 168 고유쌍
         assert cand["metrics"]["dm_limit"] == 200
         assert cand["metrics"]["dm_usage_ratio"] == 0.84
-        assert cand["link"] == {"page": "/users", "params": {"id": owner.id}}
+        assert cand["link"] == {"page": f"/users/{owner.id}", "params": {}}
 
     def test_pro_owner_excluded(self, staff_client, clean_slate, pro_plan):
         owner = self._mk_owner_with_plan(pro_plan)
