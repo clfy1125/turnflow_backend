@@ -299,11 +299,40 @@ class _PeriodRangeSerializer(serializers.Serializer):
     previous_end = serializers.DateTimeField(help_text="직전 기간 끝 (미포함)")
 
 
+class _TrendBucketSerializer(serializers.Serializer):
+    """일별 추이 버킷 1개 (로컬 날짜, 제로필 — 빈 날도 0 으로 포함)."""
+
+    date = serializers.CharField(help_text="로컬(Asia/Seoul) 날짜 YYYY-MM-DD")
+    signups = serializers.IntegerField(help_text="가입 수 (User.date_joined, TruncDate)")
+    paid = serializers.IntegerField(
+        help_text="유저별 첫 PAID paid_at 이 이 날인 수 (KPI first-paid 재사용)"
+    )
+    dm_delivered = serializers.IntegerField(
+        help_text="SentDMLog status in (delivered, read), created_at TruncDate"
+    )
+    page_views = serializers.IntegerField(help_text="PageView.viewed_at TruncDate")
+    page_clicks = serializers.IntegerField(help_text="BlockClick.clicked_at TruncDate")
+    visits = serializers.IntegerField(
+        help_text="LandingVisit.created_at TruncDate — 어트리뷰션 미탑재 시 0"
+    )
+
+
+class _TrendsSerializer(serializers.Serializer):
+    """일별 추이 블록 — current 기간 전체를 로컬 날짜 단위 zero-fill (항상 포함)."""
+
+    granularity = serializers.CharField(help_text='항상 "day"')
+    buckets = _TrendBucketSerializer(
+        many=True, help_text="로컬 날짜별 제로필 버킷 (date 오름차순, 길이 = 기간 일수)"
+    )
+
+
 class AdminMarketingDashboardSerializer(serializers.Serializer):
     """마케팅 대시보드 단일 집계 응답 (전 워크스페이스 GLOBAL, Redis 5분 캐시)."""
 
-    period = serializers.CharField(help_text="적용된 기간 (7d/30d/90d)")
-    range = _PeriodRangeSerializer(help_text="현재/직전 기간 경계")
+    period = serializers.CharField(help_text="적용된 기간 (7d/30d/90d) 또는 커스텀 범위면 'custom'")
+    range = _PeriodRangeSerializer(
+        help_text="현재/직전 기간 경계 (커스텀은 previous=직전 동일 길이 구간)"
+    )
     generated_at = serializers.DateTimeField(
         help_text="집계 생성 시각 — 캐시(MARKETING_DASHBOARD_CACHE_TTL=300s) 신선도 표시용"
     )
@@ -313,6 +342,7 @@ class AdminMarketingDashboardSerializer(serializers.Serializer):
     )
     kpis = _KpisSerializer(help_text="핵심 KPI (전부 기간 비교)")
     funnel = _FunnelSerializer(help_text="가입 코호트 퍼널")
+    trends = _TrendsSerializer(help_text="일별 추이 (로컬 날짜 zero-fill, 항상 포함)")
     channels = _ChannelsSerializer(help_text="채널별 성과 + 레퍼럴 코드")
     upsell_candidates = _UpsellCandidateSerializer(
         many=True, help_text="업셀 후보 상위 UPSELL_CANDIDATES_LIMIT(10), score desc"

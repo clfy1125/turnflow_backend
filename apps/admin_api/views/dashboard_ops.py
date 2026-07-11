@@ -22,11 +22,11 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from django.core.cache import cache
 from django.db.models import Count, Q
-from django.db.models.functions import TruncHour, TruncMinute
+from django.db.models.functions import TruncDate, TruncHour, TruncMinute
 from django.utils import timezone
 from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import status as http_status
@@ -68,8 +68,10 @@ from apps.integrations.models import IGAccountConnection, SentDMLog, SpamComment
 
 logger = logging.getLogger(__name__)
 
-ALLOWED_WINDOWS = ("1h", "24h", "today")
+ALLOWED_WINDOWS = ("1h", "24h", "today", "7d", "30d")
 CACHE_KEY_TMPL = "admin:dash:ops:{window}"
+CACHE_KEY_CUSTOM_TMPL = "admin:dash:ops:custom:{start}:{end}"
+MAX_CUSTOM_SPAN_DAYS = 92  # 커스텀 범위 상한 (초과 시 400)
 
 # ── 상태 집합 ────────────────────────────────────────────────────────
 # succeeded: 도착 확정 (+ legacy sent)
@@ -99,38 +101,90 @@ _STATUS_RANK = {"ok": 0, "warning": 1, "critical": 2}
 # ── 윈도우/시계열 헬퍼 ───────────────────────────────────────────────
 
 
+def _local_midnight(d: date) -> datetime:
+    """로컬(Asia/Seoul) 날짜(date) → 그 날 자정의 aware datetime."""
+    return timezone.make_aware(
+        datetime.combine(d, datetime.min.time()), timezone.get_current_timezone()
+    )
+
+
+def _granularity_for_span(span: timedelta) -> str:
+    """범위 길이 → 시리즈 granularity (span<=2h→5m, <=2d→hour, >2d→day)."""
+    if span <= timedelta(hours=2):
+        return "5m"
+    if span <= timedelta(days=2):
+        return "hour"
+    return "day"
+
+
 def _window_bounds(window: str, now) -> tuple[datetime, str]:
-    """window 파라미터 → (since, series granularity).
+    """window 프리셋 → (since, series granularity).
 
     - "1h": now-1h, 5분 버킷("5m")
     - "24h": now-24h, 시간 버킷("hour")
     - "today": Asia/Seoul 자정 → now, 시간 버킷("hour")
+    - "7d": now-7d, 일 버킷("day")
+    - "30d": now-30d, 일 버킷("day")
     """
     if window == "1h":
         return now - timedelta(hours=1), "5m"
     if window == "today":
-        today_start = timezone.make_aware(
-            datetime.combine(timezone.localdate(), datetime.min.time()),
-            timezone.get_current_timezone(),
-        )
-        return today_start, "hour"
+        return _local_midnight(timezone.localdate()), "hour"
+    if window == "7d":
+        return now - timedelta(days=7), "day"
+    if window == "30d":
+        return now - timedelta(days=30), "day"
     return now - timedelta(hours=24), "hour"
 
 
+def _custom_bounds(start: date, end: date, now) -> tuple[datetime, datetime, str]:
+    """커스텀 범위(로컬 날짜) → (since, until, granularity).
+
+    since = start 로컬 자정, until = min(end+1일 자정, now). granularity 는 span 규칙.
+    집계 헬퍼는 since 기준 lower-bound 만 쓰므로 since 를 반환하되, until 로 상한 계산.
+    """
+    since = _local_midnight(start)
+    until = min(_local_midnight(end + timedelta(days=1)), now)
+    return since, until, _granularity_for_span(until - since)
+
+
 def _floor_bucket(dt, granularity: str):
-    """aware datetime 을 로컬(Asia/Seoul) 기준 버킷 시작 시각으로 내림."""
+    """datetime/date 를 로컬(Asia/Seoul) 기준 버킷 시작 시각으로 내림.
+
+    - TruncDate 결과는 date 객체 → day 버킷은 그 날 로컬 자정으로 승격.
+    - datetime 은 로컬 타임존으로 변환 후 granularity 별 내림.
+    """
+    if granularity == "day":
+        if isinstance(dt, date) and not isinstance(dt, datetime):
+            return _local_midnight(dt)
+        local = timezone.localtime(dt)
+        return local.replace(hour=0, minute=0, second=0, microsecond=0)
     local = timezone.localtime(dt)
     if granularity == "hour":
         return local.replace(minute=0, second=0, microsecond=0)
     return local.replace(minute=(local.minute // 5) * 5, second=0, microsecond=0)
 
 
-def _zero_filled_series(rows: dict, since, now, granularity: str, fields: tuple) -> list[dict]:
-    """[floor(since), floor(now)] 구간을 granularity 간격으로 제로필한 버킷 리스트."""
-    step = timedelta(hours=1) if granularity == "hour" else timedelta(minutes=5)
+def _series_trunc(granularity: str):
+    """granularity → Django Trunc 함수. day 는 로컬 날짜 경계 위해 현재 타임존 지정."""
+    if granularity == "day":
+        return TruncDate("created_at", tzinfo=timezone.get_current_timezone())
+    if granularity == "hour":
+        return TruncHour("created_at")
+    return TruncMinute("created_at")
+
+
+def _zero_filled_series(rows: dict, since, until, granularity: str, fields: tuple) -> list[dict]:
+    """[floor(since), floor(until)] 구간을 granularity 간격으로 제로필한 버킷 리스트."""
+    if granularity == "day":
+        step = timedelta(days=1)
+    elif granularity == "hour":
+        step = timedelta(hours=1)
+    else:
+        step = timedelta(minutes=5)
     buckets = []
     cur = _floor_bucket(since, granularity)
-    end = _floor_bucket(now, granularity)
+    end = _floor_bucket(until, granularity)
     while cur <= end:
         row = rows.get(cur)
         item = {"ts": cur.isoformat()}
@@ -155,8 +209,11 @@ def _bucketize(qs_rows, granularity: str, fields: tuple) -> dict:
 # ── 집계 헬퍼 (모두 (now, since) 시그니처) ───────────────────────────
 
 
-def _dm_quality(now, since, granularity: str) -> tuple[dict, dict]:
-    """DM 발송 품질 블록 + 원시 집계(dict) 반환 (status_summary 재사용용)."""
+def _dm_quality(until, since, granularity: str) -> tuple[dict, dict]:
+    """DM 발송 품질 블록 + 원시 집계(dict) 반환 (status_summary 재사용용).
+
+    ``until`` 은 시리즈 제로필 상한(프리셋=now, 커스텀=min(end+1일, now)).
+    """
     dm_agg = SentDMLog.objects.filter(created_at__gte=since).aggregate(
         requested=Count("id"),
         accepted=Count("id", filter=Q(status=SentDMLog.Status.ACCEPTED)),
@@ -173,11 +230,10 @@ def _dm_quality(now, since, granularity: str) -> tuple[dict, dict]:
         submitting=Count("id", filter=Q(status=SentDMLog.Status.SUBMITTING)),
     )
 
-    trunc = TruncHour if granularity == "hour" else TruncMinute
     fields = ("requested", "succeeded", "failed", "skipped")
     series_rows = (
         SentDMLog.objects.filter(created_at__gte=since)
-        .annotate(bucket=trunc("created_at"))
+        .annotate(bucket=_series_trunc(granularity))
         .values("bucket")
         .annotate(
             requested=Count("id"),
@@ -188,7 +244,7 @@ def _dm_quality(now, since, granularity: str) -> tuple[dict, dict]:
         .order_by("bucket")
     )
     buckets = _zero_filled_series(
-        _bucketize(series_rows, granularity, fields), since, now, granularity, fields
+        _bucketize(series_rows, granularity, fields), since, until, granularity, fields
     )
 
     block = {
@@ -243,7 +299,7 @@ def _ig_connections(now) -> dict:
     }
 
 
-def _spam(now, since, granularity: str) -> dict:
+def _spam(until, since, granularity: str) -> dict:
     agg = SpamCommentLog.objects.filter(created_at__gte=since).aggregate(
         checked=Count("id"),
         detected=Count("id", filter=Q(status__in=SPAM_DETECTED_STATUSES)),
@@ -251,11 +307,10 @@ def _spam(now, since, granularity: str) -> dict:
         failed=Count("id", filter=Q(status=SpamCommentLog.Status.FAILED)),
     )
 
-    trunc = TruncHour if granularity == "hour" else TruncMinute
     fields = ("detected", "hidden")
     series_rows = (
         SpamCommentLog.objects.filter(created_at__gte=since)
-        .annotate(bucket=trunc("created_at"))
+        .annotate(bucket=_series_trunc(granularity))
         .values("bucket")
         .annotate(
             detected=Count("id", filter=Q(status__in=SPAM_DETECTED_STATUSES)),
@@ -264,7 +319,7 @@ def _spam(now, since, granularity: str) -> dict:
         .order_by("bucket")
     )
     buckets = _zero_filled_series(
-        _bucketize(series_rows, granularity, fields), since, now, granularity, fields
+        _bucketize(series_rows, granularity, fields), since, until, granularity, fields
     )
 
     top_categories = [
@@ -645,6 +700,24 @@ def _status_summary(dm_agg: dict, dm_rate: float, ig_block: dict, spam_block: di
     }
 
 
+def _parse_custom_range(start_raw: str, end_raw: str, now) -> tuple[date, date]:
+    """커스텀 start/end (YYYY-MM-DD) 파싱 + 검증. 실패 시 ValueError(사유).
+
+    - 둘 중 하나만 있으면 호출 전에 걸러진다는 가정 없이 여기서도 방어.
+    - end < start / span > MAX_CUSTOM_SPAN_DAYS → ValueError.
+    """
+    try:
+        start = date.fromisoformat(start_raw)
+        end = date.fromisoformat(end_raw)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("start/end 는 YYYY-MM-DD 형식이어야 합니다") from exc
+    if end < start:
+        raise ValueError("end 는 start 이후여야 합니다")
+    if (end - start).days + 1 > MAX_CUSTOM_SPAN_DAYS:
+        raise ValueError(f"범위는 최대 {MAX_CUSTOM_SPAN_DAYS}일까지 허용됩니다")
+    return start, end
+
+
 class AdminOpsDashboardView(APIView):
     """어드민 운영 대시보드 집계 (단일 GET, Redis 30s 캐시)."""
 
@@ -672,8 +745,16 @@ DM 발송 품질 / IG 연동 / 스팸 필터 / 빌링 4개 서브시스템의 �
 
 ## 비즈니스 로직
 - **전수 집계**: request.user 소속 워크스페이스로 필터하지 않습니다 (백오피스 전역).
-- `window`: `1h`(5분 버킷) / `24h`(시간 버킷, 기본) / `today`(Asia/Seoul 자정~현재, 시간 버킷).
-  잘못된 값은 **400** — 레거시 `/metrics/overview/` 의 `since` 폴백과 달리 엄격 검증.
+- `window`: `1h`(5분 버킷) / `24h`(시간 버킷, 기본) / `today`(Asia/Seoul 자정~현재, 시간 버킷) /
+  `7d`·`30d`(일 버킷). 잘못된 값은 **400** — 레거시 `/metrics/overview/` 의 `since` 폴백과 달리 엄격 검증.
+- **커스텀 범위**: `start=YYYY-MM-DD` + `end=YYYY-MM-DD` (Asia/Seoul 로컬 날짜) 를 함께 주면
+  `window` 무시하고 커스텀 집계 — `window` 응답은 `"custom"`. since = start 로컬 자정,
+  until = min(end+1일 자정, now). granularity 는 span 자동: span ≤ 2h → `5m`, ≤ 2일 → `hour`,
+  > 2일 → `day`. **검증(400)**: start/end 중 하나만·파싱 불가·`end < start`·span > 92일 →
+  `{"success":false,"error":{code:400,message,details}}` (details 에 사유).
+- **range 무관 신호**: `recent_errors` 는 since 이후 최신 20건 유지, `risk_accounts` 는 항상
+  최근 24h 기준(range 와 무관), `action_required` 의 즉시성 신호(SUBMITTING 정체·큐 만료 임박·
+  미처리 웹훅)도 "현재" 신호로 range 무관입니다.
 - `delivery_rate` 는 `/integrations/dm-verification/stats/` 와 동일 공식:
   `(delivered+read) / (accepted+delivered+read+failed_no_trace)`.
 - **상태 판정 임계값** (단일 소스: `apps/admin_api/dashboard_constants.py`):
@@ -692,8 +773,10 @@ DM 발송 품질 / IG 연동 / 스팸 필터 / 빌링 4개 서브시스템의 �
   severity: count==0 → ok, count≥1 → warning. `link.page`/`link.params` 는 백오피스
   화면 라우팅 힌트입니다 (`expiring_within_hours` 는 목록 API 필터 추가 전까지 안내용).
 - `series` 버킷은 빈 구간을 0 으로 제로필합니다 (ts 는 Asia/Seoul 로컬 ISO 8601).
-- 응답은 Redis 에 **30초 캐시**됩니다 (키 `admin:dash:ops:{window}`) —
-  `generated_at` 으로 신선도를 표시하세요.
+  granularity 는 `5m`/`hour`/`day` — day 버킷은 로컬 날짜(자정) 기준.
+- 응답에 **`range`**(`{start, end}` ISO 8601, 선택 범위) 가 항상 포함됩니다. `since` = `range.start`.
+- 응답은 Redis 에 **30초 캐시**됩니다 (프리셋 키 `admin:dash:ops:{window}`,
+  커스텀 키 `admin:dash:ops:custom:{start}:{end}`) — `generated_at` 으로 신선도를 표시하세요.
 
 ## 주의사항
 - IG access_token / 토스 빌링키 등 비밀값은 절대 직렬화하지 않습니다.
@@ -702,8 +785,12 @@ DM 발송 품질 / IG 연동 / 스팸 필터 / 빌링 4개 서브시스템의 �
 
 ### 요청 예시
 ```bash
+# 프리셋
 curl -H "Authorization: Bearer <staff_token>" \\
-  "https://api.example.com/api/v1/admin/dashboard/operations/?window=24h"
+  "https://api.example.com/api/v1/admin/dashboard/operations/?window=7d"
+# 커스텀 범위 (Asia/Seoul 로컬 날짜, window 무시)
+curl -H "Authorization: Bearer <staff_token>" \\
+  "https://api.example.com/api/v1/admin/dashboard/operations/?start=2026-07-01&end=2026-07-10"
 ```
         """,
         parameters=[
@@ -714,7 +801,24 @@ curl -H "Authorization: Bearer <staff_token>" \\
                 required=False,
                 enum=list(ALLOWED_WINDOWS),
                 description="집계 윈도우. 1h(5분 버킷) / 24h(기본, 시간 버킷) / "
-                "today(Asia/Seoul 자정~현재). 그 외 값은 400.",
+                "today(Asia/Seoul 자정~현재) / 7d·30d(일 버킷). 그 외 값은 400. "
+                "start&end 를 함께 주면 무시됩니다.",
+            ),
+            OpenApiParameter(
+                name="start",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="커스텀 범위 시작일 (YYYY-MM-DD, Asia/Seoul 로컬 날짜). "
+                "end 와 함께 주면 window 무시. 단독 사용 시 400.",
+            ),
+            OpenApiParameter(
+                name="end",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="커스텀 범위 종료일 (YYYY-MM-DD, 포함). span 최대 92일. "
+                "end < start / 파싱불가 / 단독 사용 시 400.",
             ),
         ],
         responses={
@@ -722,7 +826,10 @@ curl -H "Authorization: Bearer <staff_token>" \\
             400: OpenApiResponse(
                 description="잘못된 window 값 — "
                 '{"success": false, "error": {"code": 400, "message": "...", '
-                '"details": {"allowed": ["1h","24h","today"]}}}'
+                '"details": {"allowed": ["1h","24h","today","7d","30d"]}}} '
+                "또는 잘못된 커스텀 범위(하나만/역순/파싱불가/span>92) — "
+                '{"success": false, "error": {"code": 400, "message": "...", '
+                '"details": {"reason": "..."}}}'
             ),
             401: OpenApiResponse(description="인증 누락/만료"),
             403: OpenApiResponse(description="관리자(is_staff) 권한 없음"),
@@ -734,6 +841,10 @@ curl -H "Authorization: Bearer <staff_token>" \\
                 response_only=True,
                 value={
                     "window": "24h",
+                    "range": {
+                        "start": "2026-07-10T14:00:00+09:00",
+                        "end": "2026-07-11T14:00:03+09:00",
+                    },
                     "since": "2026-07-10T14:00:00+09:00",
                     "generated_at": "2026-07-11T14:00:03+09:00",
                     "status_summary": {
@@ -853,35 +964,75 @@ curl -H "Authorization: Bearer <staff_token>" \\
     )
     def get(self, request, *args, **kwargs):
         request_id = getattr(request, "id", "") or ""
-        window = request.query_params.get("window", "24h")
-        if window not in ALLOWED_WINDOWS:
-            return Response(
-                {
-                    "success": False,
-                    "error": {
-                        "code": 400,
-                        "message": f"잘못된 window 값입니다: {window!r}",
-                        "details": {"allowed": list(ALLOWED_WINDOWS)},
-                    },
-                },
-                status=http_status.HTTP_400_BAD_REQUEST,
-            )
+        now = timezone.now()
+        start_raw = request.query_params.get("start")
+        end_raw = request.query_params.get("end")
+        custom = bool(start_raw or end_raw)
 
-        cache_key = CACHE_KEY_TMPL.format(window=window)
+        if custom:
+            # start/end 중 하나만 오면 400
+            if not (start_raw and end_raw):
+                return Response(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": 400,
+                            "message": "커스텀 범위는 start 와 end 를 모두 지정해야 합니다",
+                            "details": {"reason": "start 와 end 를 함께 제공하세요"},
+                        },
+                    },
+                    status=http_status.HTTP_400_BAD_REQUEST,
+                )
+            try:
+                start_d, end_d = _parse_custom_range(start_raw, end_raw, now)
+            except ValueError as exc:
+                return Response(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": 400,
+                            "message": "잘못된 커스텀 범위입니다",
+                            "details": {"reason": str(exc)},
+                        },
+                    },
+                    status=http_status.HTTP_400_BAD_REQUEST,
+                )
+            window = "custom"
+            since, until, granularity = _custom_bounds(start_d, end_d, now)
+            cache_key = CACHE_KEY_CUSTOM_TMPL.format(start=start_raw, end=end_raw)
+        else:
+            window = request.query_params.get("window", "24h")
+            if window not in ALLOWED_WINDOWS:
+                return Response(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": 400,
+                            "message": f"잘못된 window 값입니다: {window!r}",
+                            "details": {"allowed": list(ALLOWED_WINDOWS)},
+                        },
+                    },
+                    status=http_status.HTTP_400_BAD_REQUEST,
+                )
+            since, granularity = _window_bounds(window, now)
+            until = now
+            cache_key = CACHE_KEY_TMPL.format(window=window)
+
         cached = cache.get(cache_key)
         if cached is not None:
             return Response(cached)
 
-        now = timezone.now()
-        since, granularity = _window_bounds(window, now)
-
-        dm_block, dm_agg = _dm_quality(now, since, granularity)
+        dm_block, dm_agg = _dm_quality(until, since, granularity)
         ig_block = _ig_connections(now)
-        spam_block = _spam(now, since, granularity)
+        spam_block = _spam(until, since, granularity)
         billing = _billing_signals(now, since)
 
         payload = {
             "window": window,
+            "range": {
+                "start": timezone.localtime(since).isoformat(),
+                "end": timezone.localtime(until).isoformat(),
+            },
             "since": timezone.localtime(since).isoformat(),
             "generated_at": timezone.localtime(now).isoformat(),
             "status_summary": _status_summary(

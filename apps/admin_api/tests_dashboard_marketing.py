@@ -714,3 +714,114 @@ class TestCaching:
         res_7 = staff_client.get(URL, {"period": "7d"})
         assert res_30.data["period"] == "30d"
         assert res_7.data["period"] == "7d"
+
+
+# ─── trends (일별 추이) ──────────────────────────────────────────────
+
+
+class TestTrends:
+    def test_trends_present_for_presets(self, staff_client, clean_slate):
+        res = staff_client.get(URL, {"period": "7d"})
+        trends = res.data["trends"]
+        assert trends["granularity"] == "day"
+        # 7d 는 현재 시각 기준 [now-7d, now) — 로컬 날짜 zero-fill: 7 또는 8 버킷
+        assert len(trends["buckets"]) in (7, 8)
+        # 각 버킷 키 계약
+        b = trends["buckets"][0]
+        assert set(b) == {
+            "date",
+            "signups",
+            "paid",
+            "dm_delivered",
+            "page_views",
+            "page_clicks",
+            "visits",
+        }
+
+    def test_trends_buckets_zero_filled_length_equals_day_count(self, staff_client, clean_slate):
+        # 커스텀 6/1~6/30 = 30일 → 30 버킷 (전부 zero-fill 포함)
+        start, end = "2026-06-01", "2026-06-30"
+        cache.delete(f"admin:dash:mkt:custom:{start}:{end}")
+        res = staff_client.get(URL, {"start": start, "end": end})
+        buckets = res.data["trends"]["buckets"]
+        assert len(buckets) == 30
+        # 날짜 오름차순 연속
+        dates = [b["date"] for b in buckets]
+        assert dates == sorted(dates)
+        assert dates[0] == "2026-06-01"
+        assert dates[-1] == "2026-06-30"
+
+    def test_signups_land_in_correct_local_day_bucket(self, staff_client, clean_slate):
+        # 특정 로컬 날짜에 N명 가입 시드 → 그 date 버킷 signups==N
+        tz = timezone.get_current_timezone()
+        target = timezone.make_aware(timezone.datetime(2026, 6, 15, 10, 0, 0), tz)  # 로컬 6/15 오전
+        n = 3
+        for _ in range(n):
+            _mk_user(joined=target)
+
+        start, end = "2026-06-01", "2026-06-30"
+        cache.delete(f"admin:dash:mkt:custom:{start}:{end}")
+        res = staff_client.get(URL, {"start": start, "end": end})
+        bucket = next(b for b in res.data["trends"]["buckets"] if b["date"] == "2026-06-15")
+        assert bucket["signups"] == n
+        # 총합도 N (다른 날은 0)
+        assert sum(b["signups"] for b in res.data["trends"]["buckets"]) == n
+
+
+# ─── 커스텀 날짜 범위 ────────────────────────────────────────────────
+
+
+class TestCustomRange:
+    def _del_custom(self, start, end):
+        cache.delete(f"admin:dash:mkt:custom:{start}:{end}")
+
+    def test_custom_sets_period_custom_and_previous_correct(self, staff_client, clean_slate):
+        start, end = "2026-06-01", "2026-06-30"  # 30일 (6/1~6/30)
+        self._del_custom(start, end)
+        res = staff_client.get(URL, {"start": start, "end": end})
+        assert res.status_code == 200
+        assert res.data["period"] == "custom"
+
+        rng = res.data["range"]
+        # current = [6/1 자정, 7/1 자정)  (end+1일)
+        assert rng["current_start"].startswith("2026-06-01T00:00:00")
+        assert rng["current_end"].startswith("2026-07-01T00:00:00")
+        # previous = 직전 동일 길이 (span 30일) → [5/2 자정, 6/1 자정)
+        assert rng["previous_start"].startswith("2026-05-02T00:00:00")
+        assert rng["previous_end"].startswith("2026-06-01T00:00:00")
+
+    def test_custom_signups_current_and_previous(self, staff_client, clean_slate):
+        tz = timezone.get_current_timezone()
+        # current 범위(6/1~6/30) 내 2명
+        for _ in range(2):
+            _mk_user(joined=timezone.make_aware(timezone.datetime(2026, 6, 10, 9, 0), tz))
+        # previous 범위(5/2~5/31) 내 1명
+        _mk_user(joined=timezone.make_aware(timezone.datetime(2026, 5, 10, 9, 0), tz))
+
+        start, end = "2026-06-01", "2026-06-30"
+        self._del_custom(start, end)
+        res = staff_client.get(URL, {"start": start, "end": end})
+        assert res.data["kpis"]["signups"]["current"] == 2
+        assert res.data["kpis"]["signups"]["previous"] == 1
+
+    def test_only_start_400(self, staff_client):
+        res = staff_client.get(URL, {"start": "2026-06-01"})
+        assert res.status_code == 400
+        assert res.data["success"] is False
+        assert "reason" in res.data["error"]["details"]
+
+    def test_reversed_range_400(self, staff_client):
+        res = staff_client.get(URL, {"start": "2026-06-30", "end": "2026-06-01"})
+        assert res.status_code == 400
+        assert "reason" in res.data["error"]["details"]
+
+    def test_unparseable_400(self, staff_client):
+        res = staff_client.get(URL, {"start": "2026-13-40", "end": "2026-06-01"})
+        assert res.status_code == 400
+        assert "reason" in res.data["error"]["details"]
+
+    def test_span_over_366_days_400(self, staff_client):
+        # 2025-01-01 ~ 2026-06-30 = 546일 > 366
+        res = staff_client.get(URL, {"start": "2025-01-01", "end": "2026-06-30"})
+        assert res.status_code == 400
+        assert "366" in res.data["error"]["details"]["reason"]

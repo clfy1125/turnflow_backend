@@ -42,7 +42,7 @@ from apps.workspace.models import Workspace
 User = get_user_model()
 
 URL = "/api/v1/admin/dashboard/operations/"
-CACHE_KEYS = [f"admin:dash:ops:{w}" for w in ("1h", "24h", "today")]
+CACHE_KEYS = [f"admin:dash:ops:{w}" for w in ("1h", "24h", "today", "7d", "30d")]
 LONG_AGO = timedelta(days=400)  # 캘린더월/윈도우 어디에도 안 걸리게 멀리
 
 # ─── 공통 픽스처 (tests_subscription.py 패턴) ─────────────────────────
@@ -203,18 +203,95 @@ class TestWindowParam:
         assert res.status_code == 200
         assert res.data["window"] == "24h"
 
-    @pytest.mark.parametrize("window", ["1h", "24h", "today"])
+    @pytest.mark.parametrize("window", ["1h", "24h", "today", "7d", "30d"])
     def test_valid_windows(self, staff_client, window):
         res = staff_client.get(URL, {"window": window})
         assert res.status_code == 200
         assert res.data["window"] == window
 
     def test_invalid_window_400_project_error_format(self, staff_client):
-        res = staff_client.get(URL, {"window": "7d"})
+        res = staff_client.get(URL, {"window": "1y"})
         assert res.status_code == 400
         assert res.data["success"] is False
         assert res.data["error"]["code"] == 400
-        assert res.data["error"]["details"]["allowed"] == ["1h", "24h", "today"]
+        assert res.data["error"]["details"]["allowed"] == ["1h", "24h", "today", "7d", "30d"]
+
+    @pytest.mark.parametrize("window", ["7d", "30d"])
+    def test_long_presets_use_day_granularity(self, staff_client, clean_slate, window):
+        res = staff_client.get(URL, {"window": window})
+        assert res.status_code == 200
+        assert res.data["window"] == window
+        assert res.data["dm_quality"]["series"]["granularity"] == "day"
+        assert res.data["spam"]["series"]["granularity"] == "day"
+        # range 항상 포함 + since == range.start
+        assert res.data["range"]["start"] == res.data["since"]
+
+    def test_range_always_present_for_presets(self, staff_client, clean_slate):
+        res = staff_client.get(URL)  # 24h 기본
+        assert "range" in res.data
+        assert res.data["range"]["start"] == res.data["since"]
+        # 프리셋 end 는 generated_at
+        assert res.data["range"]["end"] == res.data["generated_at"]
+
+
+# ─── 커스텀 날짜 범위 ────────────────────────────────────────────────
+
+
+class TestCustomRange:
+    def _del_custom(self, start, end):
+        cache.delete(f"admin:dash:ops:custom:{start}:{end}")
+
+    def test_custom_start_end_sets_window_custom_and_range(self, staff_client, clean_slate):
+        start, end = "2026-07-01", "2026-07-10"
+        self._del_custom(start, end)
+        res = staff_client.get(URL, {"start": start, "end": end})
+        assert res.status_code == 200
+        assert res.data["window"] == "custom"
+        # range.start = start 로컬 자정, since 와 동일
+        assert res.data["range"]["start"] == res.data["since"]
+        assert res.data["range"]["start"].startswith("2026-07-01T00:00:00")
+        # since 는 start 자정, end 는 end+1일 자정 또는 now 중 작은 값 (과거라 end+1일 자정)
+        assert res.data["range"]["end"].startswith("2026-07-11T00:00:00")
+
+    def test_custom_span_over_2days_is_day_granularity(self, staff_client, clean_slate):
+        start, end = "2026-07-01", "2026-07-10"  # span 10일 > 2일 → day
+        self._del_custom(start, end)
+        res = staff_client.get(URL, {"start": start, "end": end})
+        assert res.data["dm_quality"]["series"]["granularity"] == "day"
+
+    def test_custom_span_short_is_hour_granularity(self, staff_client, clean_slate):
+        start, end = "2026-07-09", "2026-07-10"  # span 2일 → hour
+        self._del_custom(start, end)
+        res = staff_client.get(URL, {"start": start, "end": end})
+        assert res.data["dm_quality"]["series"]["granularity"] == "hour"
+
+    def test_only_start_400(self, staff_client):
+        res = staff_client.get(URL, {"start": "2026-07-01"})
+        assert res.status_code == 400
+        assert res.data["success"] is False
+        assert res.data["error"]["code"] == 400
+        assert "reason" in res.data["error"]["details"]
+
+    def test_only_end_400(self, staff_client):
+        res = staff_client.get(URL, {"end": "2026-07-10"})
+        assert res.status_code == 400
+        assert res.data["success"] is False
+
+    def test_reversed_range_400(self, staff_client):
+        res = staff_client.get(URL, {"start": "2026-07-10", "end": "2026-07-01"})
+        assert res.status_code == 400
+        assert "reason" in res.data["error"]["details"]
+
+    def test_unparseable_400(self, staff_client):
+        res = staff_client.get(URL, {"start": "not-a-date", "end": "2026-07-01"})
+        assert res.status_code == 400
+        assert "reason" in res.data["error"]["details"]
+
+    def test_span_over_92_days_400(self, staff_client):
+        # 2026-01-01 ~ 2026-05-01 = 121일 > 92
+        res = staff_client.get(URL, {"start": "2026-01-01", "end": "2026-05-01"})
+        assert res.status_code == 400
+        assert "92" in res.data["error"]["details"]["reason"]
 
 
 # ─── 빈 상태 (clean slate) ───────────────────────────────────────────

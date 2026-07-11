@@ -131,7 +131,10 @@ class _DmSeriesBucketSerializer(serializers.Serializer):
 class _DmSeriesSerializer(serializers.Serializer):
     """DM 발송 시계열."""
 
-    granularity = serializers.CharField(help_text='"hour" (24h/today) 또는 "5m" (1h 윈도우)')
+    granularity = serializers.CharField(
+        help_text='"5m"(1h 또는 span≤2h 커스텀) / "hour"(24h/today 또는 span≤2일) / '
+        '"day"(7d/30d 또는 span>2일 커스텀 — day 버킷은 로컬 날짜 자정 ts)'
+    )
     buckets = _DmSeriesBucketSerializer(many=True, help_text="제로필된 버킷 리스트 (ts 오름차순)")
 
 
@@ -183,7 +186,9 @@ class _SpamSeriesBucketSerializer(serializers.Serializer):
 class _SpamSeriesSerializer(serializers.Serializer):
     """스팸 필터 시계열."""
 
-    granularity = serializers.CharField(help_text='"hour" 또는 "5m"')
+    granularity = serializers.CharField(
+        help_text='"5m" / "hour" / "day" (dm_quality.series 와 동일)'
+    )
     buckets = _SpamSeriesBucketSerializer(many=True, help_text="제로필된 버킷 리스트")
 
 
@@ -261,10 +266,22 @@ class _RiskAccountSerializer(serializers.Serializer):
     metrics = _RiskMetricsSerializer(help_text="판정 근거 지표")
 
 
+class _OpsRangeSerializer(serializers.Serializer):
+    """선택 범위 경계 (Asia/Seoul ISO 8601). start = since, end = 집계 상한."""
+
+    start = serializers.DateTimeField(help_text="범위 시작 (= since)")
+    end = serializers.DateTimeField(
+        help_text="범위 상한 (프리셋=generated_at, 커스텀=min(end+1일 자정, now))"
+    )
+
+
 class AdminOpsDashboardSerializer(serializers.Serializer):
     """운영 대시보드 단일 집계 응답 (전 워크스페이스 GLOBAL, Redis 30s 캐시)."""
 
-    window = serializers.CharField(help_text="적용된 집계 윈도우 (1h/24h/today)")
+    window = serializers.CharField(
+        help_text="적용된 집계 윈도우 (1h/24h/today/7d/30d) 또는 커스텀 범위면 'custom'"
+    )
+    range = _OpsRangeSerializer(help_text="선택 범위 {start, end} — 항상 포함 (start = since)")
     since = serializers.DateTimeField(help_text="윈도우 시작 시각 (Asia/Seoul ISO 8601)")
     generated_at = serializers.DateTimeField(
         help_text="집계 생성 시각 — 캐시(OPS_DASHBOARD_CACHE_TTL=30s) 신선도 표시용"
