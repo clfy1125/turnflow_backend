@@ -62,10 +62,12 @@ class _KpisSerializer(serializers.Serializer):
 
 
 class _FunnelNodeSerializer(serializers.Serializer):
-    """퍼널 노드 1개 — visit/signup/ig_connected/dm_campaign/page_published/paid."""
+    """퍼널 노드 1개 — visit/signup/ig_connected/dm_campaign/page_created/page_published/paid."""
 
     key = serializers.CharField(
-        help_text="visit / signup / ig_connected / dm_campaign / page_published / paid"
+        help_text=(
+            "visit / signup / ig_connected / dm_campaign / page_created / page_published / paid"
+        )
     )
     label = serializers.CharField(help_text="한국어 고정 라벨 (예: 방문/가입/IG 연동/…)")
     count = serializers.IntegerField(
@@ -90,7 +92,7 @@ class _FunnelBranchSerializer(serializers.Serializer):
     label = serializers.CharField(help_text='분기 라벨 ("DM 자동화" / "바이오링크")')
     steps = _FunnelNodeSerializer(
         many=True,
-        help_text="분기 단계 노드. dm=[ig_connected, dm_campaign], biolink=[page_published]",
+        help_text="분기 단계 노드. dm=[ig_connected, dm_campaign], biolink=[page_created, page_published]",
     )
 
 

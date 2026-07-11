@@ -295,9 +295,20 @@ class TestEmptyState:
         assert [n["key"] for n in v["head"]] == ["visit", "signup"]
         assert [b["key"] for b in v["branches"]] == ["dm", "biolink"]
         assert [n["key"] for n in _branch(res, "dm")["steps"]] == ["ig_connected", "dm_campaign"]
-        assert [n["key"] for n in _branch(res, "biolink")["steps"]] == ["page_published"]
+        assert [n["key"] for n in _branch(res, "biolink")["steps"]] == [
+            "page_created",
+            "page_published",
+        ]
         assert v["conversion"]["key"] == "paid"
-        for key in ("visit", "signup", "ig_connected", "dm_campaign", "page_published", "paid"):
+        for key in (
+            "visit",
+            "signup",
+            "ig_connected",
+            "dm_campaign",
+            "page_created",
+            "page_published",
+            "paid",
+        ):
             assert _node(res, key)["count"] == 0  # ZeroDivisionError 없이 0/None
         # 빈 상태: visits 0 → signup.rate null
         assert _node(res, "signup")["rate"] is None
@@ -348,12 +359,18 @@ class TestCohortFunnel:
         assert dm["rate"] == 1.0  # dm/ig = 2/2
         assert dm["rate_of"] == "ig_connected"
 
-        # biolink 분기: 페이지 공개 유저 (u_page, u_both) — IG 무관
+        # biolink 분기: 페이지 생성 → 페이지 공개 2단계. 공개 유저 (u_page, u_both) — IG 무관
+        created = _node(res, "page_created")
+        assert created["count"] == 2  # u_page, u_both (둘 다 공개 페이지=생성 포함)
+        assert created["rate"] == 0.5  # created/signups = 2/4
+        assert created["rate_of"] == "signup"
+        assert created["formula"] == "페이지 생성 수 ÷ 가입 수 × 100"
+
         page = _node(res, "page_published")
         assert page["count"] == 2
-        assert page["rate"] == 0.5  # page/signups = 2/4
-        assert page["rate_of"] == "signup"
-        assert page["formula"] == "페이지 공개 수 ÷ 가입 수 × 100"
+        assert page["rate"] == 1.0  # published/created = 2/2
+        assert page["rate_of"] == "page_created"
+        assert page["formula"] == "페이지 공개 수 ÷ 페이지 생성 수 × 100"
 
     def test_paid_rate_of_signups(self, staff_client, clean_slate):
         now = timezone.now()
@@ -370,10 +387,12 @@ class TestCohortFunnel:
         assert paid["rate_of"] == "signup"
         assert paid["formula"] == "유료 전환 수 ÷ 가입 수 × 100"
 
-    def test_private_page_not_in_biolink(self, staff_client, clean_slate):
+    def test_private_page_created_but_not_published(self, staff_client, clean_slate):
+        # 비공개 페이지 = '생성'에는 포함, '공개'에는 미포함 (생성→공개 2단계 검증)
         u = _mk_user(joined=timezone.now() - timedelta(days=3))
         _mk_page(u, public=False)
         res = staff_client.get(URL)
+        assert _node(res, "page_created")["count"] == 1
         assert _node(res, "page_published")["count"] == 0
 
     def test_cohort_boundary(self, staff_client, clean_slate):
