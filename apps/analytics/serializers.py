@@ -8,7 +8,7 @@ max_length 초과(봇이 보내는 10KB utm 등)도 페이로드 전체를 inval
 
 from rest_framework import serializers
 
-from .models import CheckoutEventType
+from .models import CancellationEventType, CheckoutEventType
 
 
 class TrackVisitSerializer(serializers.Serializer):
@@ -73,3 +73,23 @@ class CheckoutEventSerializer(serializers.Serializer):
     )
     usage_count = serializers.IntegerField(required=False, allow_null=True, help_text="현재 사용량")
     limit_count = serializers.IntegerField(required=False, allow_null=True, help_text="플랜 한도")
+
+
+class CancellationEventSerializer(serializers.Serializer):
+    """POST /api/v1/track/cancellation-event/ 요청 바디 — 구독 취소 텔레메트리."""
+
+    event = serializers.ChoiceField(
+        choices=CancellationEventType.choices, help_text="이벤트 종류 (필수)"
+    )
+    reason = serializers.CharField(
+        required=False, allow_blank=True, max_length=40, help_text="해지 사유 키"
+    )
+    reason_detail = serializers.CharField(
+        required=False, allow_blank=True, max_length=300, help_text="사유 상세(자유입력)"
+    )
+    from_plan = serializers.CharField(
+        required=False, allow_blank=True, max_length=32, help_text="이전 플랜"
+    )
+    to_plan = serializers.CharField(
+        required=False, allow_blank=True, max_length=32, help_text="이후 플랜"
+    )

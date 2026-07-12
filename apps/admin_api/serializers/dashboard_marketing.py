@@ -379,6 +379,88 @@ class _PaidConversionAnalysisSerializer(serializers.Serializer):
     )
 
 
+class _CancelReasonRowSerializer(serializers.Serializer):
+    """해지 사유 1행 (CancellationEvent.reason 집계)."""
+
+    key = serializers.CharField(help_text="사유 키 (price/low_usage/no_effect/...)")
+    label = serializers.CharField(help_text="한국어 라벨 (미지정 키는 원문)")
+    count = serializers.IntegerField(help_text="해당 사유 제출 수")
+
+
+class _CancelDefenseSerializer(serializers.Serializer):
+    """취소 방어 성과 (CancellationEvent 기반). 이벤트 미탑재/0 시 전체가 null."""
+
+    tries = serializers.IntegerField(help_text="취소 버튼 클릭 고유 유저 수")
+    retained = serializers.IntegerField(help_text="중단/철회로 유지 선택한 고유 유저 수")
+    defense_rate = serializers.FloatField(allow_null=True, help_text="retained / tries")
+
+
+class _MrrMovementSerializer(serializers.Serializer):
+    """MRR 변동 (간이 워터폴 — 스냅샷 부재로 부분)."""
+
+    new_mrr = serializers.IntegerField(help_text="기간 내 첫 결제 + 현재 유료 유지 고객 월 금액 합")
+    at_risk_mrr = serializers.IntegerField(help_text="취소 예약 + past_due 월 금액 합 (예상 이탈)")
+    current_mrr = serializers.IntegerField(help_text="현재 유료 ACTIVE 월 금액 합")
+    note = serializers.CharField(help_text="완전 워터폴(업/다운그레이드·실현 해지)은 스냅샷 후")
+
+
+class _RecentCancellationSerializer(serializers.Serializer):
+    """최근 취소 예약(해지 위험) 고객 1명 — CS 액션용."""
+
+    user_id = serializers.IntegerField(help_text="User PK")
+    email = serializers.CharField(allow_blank=True, help_text="회원 이메일")
+    plan = serializers.CharField(help_text="현재 플랜 표시명")
+    monthly_amount = serializers.IntegerField(help_text="월 청구액 (원, 추가 IG 포함)")
+    days_remaining = serializers.IntegerField(
+        allow_null=True, help_text="현재 주기 종료까지 남은 일수 (되살릴 수 있는 기간)"
+    )
+    cancelled_at = serializers.DateTimeField(allow_null=True, help_text="취소 예약 시각")
+    reason = serializers.CharField(allow_blank=True, help_text="해지 사유 키 (이벤트 있을 때)")
+    reason_label = serializers.CharField(allow_blank=True, help_text="해지 사유 라벨")
+    recent_dm_7d = serializers.IntegerField(help_text="최근 7일 DM 발송 로그 수")
+    recent_clicks_30d = serializers.IntegerField(help_text="최근 30일 페이지 클릭 수")
+    link = _UpsellLinkSerializer(help_text="회원 상세 드릴다운")
+
+
+class _SubscriptionRetentionSerializer(serializers.Serializer):
+    """구독 유지·해지 분석 — 유료 전환 이후 생존 지표 ('왜 계속 남고, 왜 떠나는가').
+
+    ⚠ basis=approx_no_snapshot — 유지/해지율은 스냅샷 부재로 근사(코호트 대비 현재 생존).
+    현재-상태 카운트(취소 예약/past_due/at-risk MRR)는 정확.
+    """
+
+    basis = serializers.CharField(help_text='항상 "approx_no_snapshot" — 근사 근거 플래그')
+    window_days = serializers.IntegerField(help_text="유지율 산출 기준 기간 일수")
+    retention_rate = serializers.FloatField(
+        allow_null=True, help_text="기간 시작 전 첫 결제 고객 중 현재 유료 유지 비율 (0~1, 근사)"
+    )
+    churn_rate = serializers.FloatField(allow_null=True, help_text="1 - retention_rate")
+    paying_now = serializers.IntegerField(help_text="현재 유료 ACTIVE 고객 수 (free/admin 제외)")
+    cancel_scheduled = serializers.IntegerField(
+        help_text="취소 예약 수 — CANCELLED + 유료 + 주기 남음 (아직 살아있음, 재개 가능)"
+    )
+    payment_failed = serializers.IntegerField(help_text="결제 실패(past_due) 수 — dunning 중")
+    realized_churn = serializers.IntegerField(
+        help_text="기간 내 실제 해지 수 — free 다운그레이드 중 결제 이력 보유(트라이얼 만료 제외)"
+    )
+    at_risk_mrr = serializers.IntegerField(
+        help_text="예상 이탈 MRR (원) — 취소 예약 + past_due 월 금액 합"
+    )
+    mrr_movement = _MrrMovementSerializer(help_text="MRR 변동 (간이)")
+    cancel_reasons = _CancelReasonRowSerializer(
+        many=True, help_text="해지 사유 TOP N (CancellationEvent, 미탑재 시 [])"
+    )
+    cancel_reasons_available = serializers.BooleanField(
+        help_text="CancellationEvent 텔레메트리 수집 여부 — false 면 cancel_reasons=[]"
+    )
+    cancel_defense = _CancelDefenseSerializer(
+        allow_null=True, help_text="취소 방어 성과 (이벤트 미탑재/0 시 null)"
+    )
+    recent_cancellations = _RecentCancellationSerializer(
+        many=True, help_text="최근 취소 예약 고객 (RECENT_CANCELLATIONS_LIMIT, cancelled_at desc)"
+    )
+
+
 class _PlanDistributionRowSerializer(serializers.Serializer):
     """플랜 분포 1행 — 전 플랜(비활성 포함, admin 제외), sort_order 순.
 
@@ -484,6 +566,9 @@ class AdminMarketingDashboardSerializer(serializers.Serializer):
     )
     paid_conversion_analysis = _PaidConversionAnalysisSerializer(
         help_text="유료 전환 분석 (선택 플랜/진입 경로/결제 후 사용)"
+    )
+    subscription_retention = _SubscriptionRetentionSerializer(
+        help_text="구독 유지·해지 분석 (유지율/취소 예약/이탈 MRR/해지 사유/최근 취소)"
     )
     plan_distribution = _PlanDistributionRowSerializer(
         many=True, help_text="플랜별 구독 상태 분포 (전 플랜, sort_order 순)"

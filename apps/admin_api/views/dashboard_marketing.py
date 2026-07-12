@@ -44,10 +44,12 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.admin_api.dashboard_constants import (
+    CANCEL_REASONS_TOP,
     CHECKOUT_ATTRIBUTION_WINDOW_DAYS,
     MARKETING_DASHBOARD_CACHE_TTL,
     ONBOARDING_SAMPLE_LIMIT,
     POST_PAYMENT_WINDOW_DAYS,
+    RECENT_CANCELLATIONS_LIMIT,
     TOP_PAGES_LIMIT,
     UPSELL_CANDIDATES_LIMIT,
     UPSELL_CLICKS_HIGH,
@@ -58,6 +60,7 @@ from apps.admin_api.dashboard_constants import (
     UPSELL_SPAM_HEAVY,
 )
 from apps.admin_api.serializers.dashboard_marketing import AdminMarketingDashboardSerializer
+from apps.ai_jobs.models import AiJob
 from apps.billing.dm_limits import DEFAULT_DM_MONTHLY_LIMIT
 from apps.billing.models import (
     EXTRA_IG_ACCOUNT_PRICE,
@@ -99,6 +102,19 @@ try:
 except (ImportError, RuntimeError):
     CheckoutEvent = None
     CHECKOUT_EVENT_AVAILABLE = False
+
+# ── 구독 취소 텔레메트리 (apps.analytics.CancellationEvent) — guarded import ──
+# 해지 사유/취소 방어는 프론트 이벤트 의존 → 미탑재 시 cancel_reasons_available=false 강등.
+try:
+    from apps.analytics.models import CancellationEvent
+
+    CANCELLATION_EVENT_AVAILABLE = True
+except (ImportError, RuntimeError):
+    CancellationEvent = None
+    CANCELLATION_EVENT_AVAILABLE = False
+
+# AI 페이지 생성으로 간주하는 AiJob.job_type (라벨링·DM폼 등 비-페이지 작업 제외)
+AI_PAGE_JOB_TYPES = ("bio_remake", "theme_generation", "copy_generation", "external_import")
 
 ALLOWED_PERIODS = {"7d": 7, "30d": 30, "90d": 90}
 CACHE_KEY_TMPL = "admin:dash:mkt:{period}"
@@ -175,9 +191,24 @@ _ONBOARDING_SEGMENTS = [
 _POST_PAYMENT_FEATURES = [
     ("dm_send", "DM 발송"),
     ("page_created", "페이지 생성"),
+    ("ai_page", "페이지 AI 기능"),
     ("spam_used", "스팸 방어 사용"),
     ("extra_ig", "추가 IG 연동"),
 ]
+
+# 해지 사유(CancellationEvent.reason) → 한국어 라벨. 없는 키는 원문 표기.
+CANCEL_REASON_LABELS = {
+    "price": "가격 부담",
+    "low_usage": "사용 빈도 낮음",
+    "no_effect": "효과를 못 느낌",
+    "hard_setup": "세팅 어려움",
+    "missing_feature": "원하는 기능 없음",
+    "ig_error": "인스타 연동/DM 오류",
+    "switched": "다른 서비스 사용",
+    "paused": "잠시 중단",
+    "other": "기타",
+    "": "미지정",
+}
 
 
 # ── 공통 헬퍼 ────────────────────────────────────────────────────────
@@ -1218,6 +1249,15 @@ def _post_payment_usage(first_paid: dict) -> list[dict]:
         "page_created",
     )
     _bucket(
+        AiJob.objects.filter(
+            user_id__in=user_ids,
+            job_type__in=AI_PAGE_JOB_TYPES,
+            status=AiJob.Status.SUCCEEDED,
+            created_at__gte=min_paid,
+        ).values_list("user_id", "created_at"),
+        "ai_page",
+    )
+    _bucket(
         SpamCommentLog.objects.filter(
             spam_filter__ig_connection__workspace__owner_id__in=user_ids,
             status__in=_SPAM_BLOCKED_STATUSES,
@@ -1315,6 +1355,223 @@ def _paid_conversion_analysis(cur) -> dict:
         "entry_paths": entry_paths,
         "entry_paths_available": entry_available,
         "post_payment_window_days": POST_PAYMENT_WINDOW_DAYS,
+    }
+
+
+# ── 구독 유지·해지 분석 (왜 계속 남고, 왜 떠나는가) ──────────────────────
+
+_PAID_EXCLUDE = ("free", "admin")  # 유료 구독 판정 시 제외 (free=무료, admin=운영용)
+
+
+def _billed_amount_sum(subs) -> int:
+    """구독 QS 의 월 청구액 합 (원) — Coalesce(snapshot, plan.monthly_price) + pro 추가 IG."""
+    agg = subs.aggregate(
+        base=Sum(Coalesce("monthly_amount_snapshot", "plan__monthly_price")),
+        extra=Sum("extra_ig_accounts", filter=Q(plan__name="pro")),
+    )
+    return (agg["base"] or 0) + (agg["extra"] or 0) * EXTRA_IG_ACCOUNT_PRICE
+
+
+def _cancel_reasons(start, end) -> tuple[list[dict], bool]:
+    """해지 사유 TOP N (CancellationEvent.reason). 미탑재 시 ([], False)."""
+    if not CANCELLATION_EVENT_AVAILABLE:
+        return [], False
+    rows = (
+        CancellationEvent.objects.filter(
+            created_at__gte=start, created_at__lt=end, event="cancel_reason_submitted"
+        )
+        .values("reason")
+        .annotate(c=Count("id"))
+        .order_by("-c")[:CANCEL_REASONS_TOP]
+    )
+    reasons = [
+        {
+            "key": r["reason"],
+            "label": CANCEL_REASON_LABELS.get(r["reason"], r["reason"] or "미지정"),
+            "count": r["c"],
+        }
+        for r in rows
+    ]
+    return reasons, True
+
+
+def _cancel_defense(start, end) -> dict | None:
+    """취소 방어 — 취소 버튼 클릭 대비 유지(중단/철회) 선택. 이벤트 미탑재/0 시 None."""
+    if not CANCELLATION_EVENT_AVAILABLE:
+        return None
+    qs = CancellationEvent.objects.filter(created_at__gte=start, created_at__lt=end)
+    tries = qs.filter(event="cancel_button_clicked").order_by().values("user_id").distinct().count()
+    if tries == 0:
+        return None
+    retained = (
+        qs.filter(event__in=("subscription_cancel_aborted", "subscription_resumed"))
+        .order_by()
+        .values("user_id")
+        .distinct()
+        .count()
+    )
+    return {"tries": tries, "retained": retained, "defense_rate": _rate(retained, tries)}
+
+
+def _recent_cancellations(now) -> list[dict]:
+    """최근 취소 예약(해지 위험) 고객 — CANCELLED + 유료 + 기간 남음. CS 액션용.
+
+    아직 되살릴 수 있는 고객이라 최근 사용(7일 DM/30일 클릭)과 사유를 함께 제공한다.
+    """
+    subs = list(
+        UserSubscription.objects.filter(
+            status=SubscriptionStatus.CANCELLED, current_period_end__gt=now
+        )
+        .exclude(plan__name__in=_PAID_EXCLUDE)
+        .select_related("user", "plan")
+        .order_by("-cancelled_at")[:RECENT_CANCELLATIONS_LIMIT]
+    )
+    if not subs:
+        return []
+    owner_ids = [s.user_id for s in subs]
+    since_7d, since_30d = now - timedelta(days=7), now - timedelta(days=30)
+    dm_7d = {
+        r["campaign__ig_connection__workspace__owner_id"]: r["c"]
+        for r in SentDMLog.objects.filter(
+            campaign__ig_connection__workspace__owner_id__in=owner_ids, created_at__gte=since_7d
+        )
+        .values("campaign__ig_connection__workspace__owner_id")
+        .annotate(c=Count("id"))
+    }
+    clicks_30d = {
+        r["page__user_id"]: r["c"]
+        for r in BlockClick.objects.filter(page__user_id__in=owner_ids, clicked_at__gte=since_30d)
+        .values("page__user_id")
+        .annotate(c=Count("id"))
+    }
+    reason_by_user: dict = {}
+    if CANCELLATION_EVENT_AVAILABLE:
+        for ev in CancellationEvent.objects.filter(
+            user_id__in=owner_ids, event="cancel_reason_submitted"
+        ).order_by("user_id", "-created_at"):
+            reason_by_user.setdefault(ev.user_id, ev.reason)
+
+    result = []
+    for s in subs:
+        amount = s.monthly_amount_snapshot or (s.plan.monthly_price or 0)
+        if s.plan.name == "pro":
+            amount += (s.extra_ig_accounts or 0) * EXTRA_IG_ACCOUNT_PRICE
+        days_remaining = max(0, (s.current_period_end - now).days) if s.current_period_end else None
+        reason = reason_by_user.get(s.user_id, "")
+        result.append(
+            {
+                "user_id": s.user_id,
+                "email": s.user.email or "",
+                "plan": s.plan.display_name,
+                "monthly_amount": amount,
+                "days_remaining": days_remaining,
+                "cancelled_at": (
+                    timezone.localtime(s.cancelled_at).isoformat() if s.cancelled_at else None
+                ),
+                "reason": reason,
+                "reason_label": CANCEL_REASON_LABELS.get(reason, reason) if reason else "",
+                "recent_dm_7d": dm_7d.get(s.user_id, 0),
+                "recent_clicks_30d": clicks_30d.get(s.user_id, 0),
+                "link": {"page": f"/users/{s.user_id}", "params": {}},
+            }
+        )
+    return result
+
+
+def _subscription_retention(cur) -> dict:
+    """구독 유지·해지 분석 — '왜 계속 남고, 왜 떠나는가'.
+
+    ⚠ 스냅샷 테이블 부재로 시점 재구성 불가 → 유지/해지율은 **근사**(basis=approx_no_snapshot):
+    - denom = 기간 시작 전 첫 결제(첫 PAID paid_at < start) 유료 고객
+    - numer = 그중 현재도 유료 ACTIVE(free/admin 아님) 유지 → 코호트 대비 '현재 생존' 비율
+    현재-상태 카운트(취소 예약/past_due/at-risk MRR)는 정확. 실현 해지는 실제 결제 이력이 있는
+    회원만 카운트(트라이얼 만료 다운그레이드 오집계 방지) — 단 다운그레이드 시 금액이 소거되어
+    '실현 해지 MRR'은 복구 불가 → at_risk_mrr(취소 예약+past_due 월 금액)로 대체 제시.
+    """
+    start, now = cur
+
+    paying_before = set(
+        PaymentHistory.objects.filter(status=PaymentStatus.PAID)
+        .values("user_id")
+        .annotate(first=Min("paid_at"))
+        .filter(first__lt=start)
+        .values_list("user_id", flat=True)
+    )
+    retained = 0
+    if paying_before:
+        retained = (
+            UserSubscription.objects.filter(
+                user_id__in=paying_before, status=SubscriptionStatus.ACTIVE
+            )
+            .exclude(plan__name__in=_PAID_EXCLUDE)
+            .count()
+        )
+    denom = len(paying_before)
+    retention_rate = _rate(retained, denom)
+    churn_rate = round(1 - retention_rate, 4) if retention_rate is not None else None
+
+    paid_active = UserSubscription.objects.filter(status=SubscriptionStatus.ACTIVE).exclude(
+        plan__name__in=_PAID_EXCLUDE
+    )
+    cancel_scheduled_qs = UserSubscription.objects.filter(
+        status=SubscriptionStatus.CANCELLED, current_period_end__gt=now
+    ).exclude(plan__name__in=_PAID_EXCLUDE)
+    past_due_qs = UserSubscription.objects.filter(status=SubscriptionStatus.PAST_DUE).exclude(
+        plan__name__in=_PAID_EXCLUDE
+    )
+
+    at_risk_mrr = _billed_amount_sum(cancel_scheduled_qs) + _billed_amount_sum(past_due_qs)
+
+    # 실현 해지: 기간 내 free 로 다운그레이드된 것 중 '실제 결제 이력 보유'만
+    # (트라이얼 만료 다운그레이드도 cancelled_at 이 찍히므로 결제 이력으로 필터).
+    churned_candidates = set(
+        UserSubscription.objects.filter(
+            plan__name="free", cancelled_at__gte=start, cancelled_at__lt=now
+        ).values_list("user_id", flat=True)
+    )
+    realized_churn = 0
+    if churned_candidates:
+        ever_paid = set(
+            PaymentHistory.objects.filter(user_id__in=churned_candidates, status=PaymentStatus.PAID)
+            .values_list("user_id", flat=True)
+            .distinct()
+        )
+        realized_churn = len(churned_candidates & ever_paid)
+
+    new_paid_users = set(
+        PaymentHistory.objects.filter(status=PaymentStatus.PAID)
+        .values("user_id")
+        .annotate(first=Min("paid_at"))
+        .filter(first__gte=start, first__lt=now)
+        .values_list("user_id", flat=True)
+    )
+    new_mrr = (
+        _billed_amount_sum(paid_active.filter(user_id__in=new_paid_users)) if new_paid_users else 0
+    )
+    current_mrr = _billed_amount_sum(paid_active)
+
+    cancel_reasons, reasons_available = _cancel_reasons(start, now)
+    return {
+        "basis": "approx_no_snapshot",
+        "window_days": max(1, (now - start).days),
+        "retention_rate": retention_rate,
+        "churn_rate": churn_rate,
+        "paying_now": paid_active.count(),
+        "cancel_scheduled": cancel_scheduled_qs.count(),
+        "payment_failed": past_due_qs.count(),
+        "realized_churn": realized_churn,
+        "at_risk_mrr": at_risk_mrr,
+        "mrr_movement": {
+            "new_mrr": new_mrr,
+            "at_risk_mrr": at_risk_mrr,
+            "current_mrr": current_mrr,
+            "note": "업/다운그레이드·실현 해지 MRR 은 스냅샷 테이블 도입 후 정확 산출 "
+            "(다운그레이드 시 금액 스냅샷이 소거됨)",
+        },
+        "cancel_reasons": cancel_reasons,
+        "cancel_reasons_available": reasons_available,
+        "cancel_defense": _cancel_defense(start, now),
+        "recent_cancellations": _recent_cancellations(now),
     }
 
 
@@ -1863,6 +2120,7 @@ curl -H "Authorization: Bearer <staff_token>" \\
             "feature_stats": _feature_stats(cur, prev),
             "onboarding_dropoffs": _onboarding_dropoffs(*cur),
             "paid_conversion_analysis": _paid_conversion_analysis(cur),
+            "subscription_retention": _subscription_retention(cur),
             "plan_distribution": _plan_distribution(),
             "mrr_breakdown": mrr_breakdown,
         }

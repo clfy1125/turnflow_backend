@@ -268,3 +268,76 @@ class CheckoutEvent(models.Model):
 
     def __str__(self) -> str:
         return f"user={self.user_id} {self.event} [{self.trigger_feature}]"
+
+
+class CancellationEventType(models.TextChoices):
+    """구독 취소 여정 이벤트 종류 (서비스 프론트가 전송).
+
+    유료 이탈의 '왜 떠나는가(해지 사유)'와 '취소 화면 방어 성과'를 재구성하기 위한
+    텔레메트리다. 실제 구독 상태 전이(취소 예약/해지/결제 실패)는 백엔드
+    UserSubscription 이 이미 알고 있으므로, 여기서는 프론트만 아는 '사유'와
+    '취소 플로우 단계'를 보완 기록한다.
+    """
+
+    CANCEL_BUTTON_CLICKED = "cancel_button_clicked", "취소 버튼 클릭"
+    CANCEL_REASON_SUBMITTED = "cancel_reason_submitted", "해지 사유 제출"
+    SUBSCRIPTION_CANCEL_SCHEDULED = "subscription_cancel_scheduled", "구독 취소 예약"
+    SUBSCRIPTION_CANCEL_ABORTED = "subscription_cancel_aborted", "취소 중단(유지 선택)"
+    SUBSCRIPTION_RESUMED = "subscription_resumed", "취소 예약 철회"
+
+
+class CancellationEvent(models.Model):
+    """구독 취소 텔레메트리 (append-only raw row).
+
+    로그인 사용자가 **취소 버튼을 누르거나 해지 사유를 제출**할 때 서비스 프론트가
+    ``POST /api/v1/track/cancellation-event/`` 로 전송한다. 마케팅 대시보드는
+    이 데이터로 **해지 사유 TOP N** 과 **취소 방어율**(클릭→예약 대비 유지)을 계산한다.
+
+    실제 취소 예약/해지/결제 실패 카운트는 UserSubscription 상태에서 직접 집계하고,
+    이 모델은 그 상태로는 알 수 없는 '사유/방어 플로우'만 보완한다. 미탑재 시
+    cancel_reasons_available=false 로 강등된다 (guarded import).
+    """
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="cancellation_events",
+        verbose_name="사용자",
+    )
+    event = models.CharField(
+        max_length=40,
+        choices=CancellationEventType.choices,
+        db_index=True,
+        verbose_name="이벤트",
+    )
+    reason = models.CharField(
+        max_length=40,
+        blank=True,
+        default="",
+        db_index=True,
+        verbose_name="해지 사유",
+        help_text="price / low_usage / no_effect / hard_setup / missing_feature / "
+        "ig_error / switched / paused / other 등 (프론트 정의 어휘).",
+    )
+    reason_detail = models.CharField(
+        max_length=300, blank=True, default="", verbose_name="사유 상세(자유입력)"
+    )
+    from_plan = models.CharField(max_length=32, blank=True, default="", verbose_name="이전 플랜")
+    to_plan = models.CharField(max_length=32, blank=True, default="", verbose_name="이후 플랜")
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True, verbose_name="발생 일시")
+
+    class Meta:
+        db_table = "analytics_cancellation_event"
+        verbose_name = "구독 취소 이벤트"
+        verbose_name_plural = "구독 취소 이벤트 목록"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["user", "created_at"]),
+            models.Index(fields=["event", "created_at"]),
+            models.Index(fields=["reason", "created_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"user={self.user_id} {self.event} [{self.reason}]"

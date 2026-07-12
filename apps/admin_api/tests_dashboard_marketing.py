@@ -22,6 +22,7 @@ from django.core.cache import cache
 from django.utils import timezone
 from rest_framework.test import APIClient
 
+from apps.ai_jobs.models import AiJob
 from apps.billing.models import (
     PaymentHistory,
     PaymentStatus,
@@ -37,10 +38,16 @@ from apps.workspace.models import Workspace
 
 # 어트리뷰션 앱은 병렬 워크스트림 — 뷰와 동일하게 가드 (미탑재 시 채널 테스트 skip)
 try:
-    from apps.analytics.models import CheckoutEvent, LandingVisit, SignupAttribution
+    from apps.analytics.models import (
+        CancellationEvent,
+        CheckoutEvent,
+        LandingVisit,
+        SignupAttribution,
+    )
 
     HAS_ANALYTICS = True
 except (ImportError, RuntimeError):
+    CancellationEvent = None
     CheckoutEvent = None
     LandingVisit = None
     SignupAttribution = None
@@ -1057,3 +1064,118 @@ class TestPaidConversionAnalysis:
         pca = res.data["paid_conversion_analysis"]
         assert pca["total"] == 1  # 전환자 수엔 잡히나
         assert all(r["name"] != "admin" for r in pca["by_plan"])  # 플랜 분해엔 제외
+
+    def test_renewal_not_counted_as_new_conversion(self, staff_client, clean_slate):
+        """갱신 결제는 신규 전환으로 오집계되지 않음 — 첫 PAID 기준 코호트 정확성.
+
+        (PaymentHistory.Meta.ordering 의 GROUP BY 누수 회귀 가드: 유저별 Min(paid_at) 이
+        정확해야 창 밖 첫결제 + 창 안 갱신 유저가 전환으로 잡히지 않는다.)
+        """
+        now = timezone.now()
+        u = _mk_user(joined=now - timedelta(days=60))
+        _mk_paid_payment(u, paid_at=now - timedelta(days=45))  # 첫 결제 — 창 밖
+        _mk_paid_payment(u, paid_at=now - timedelta(days=3))  # 갱신 — 창 안
+
+        pca = staff_client.get(URL).data["paid_conversion_analysis"]
+        assert pca["total"] == 0  # 첫 결제가 창 밖이라 전환 아님
+
+    def test_ai_page_in_post_payment(self, staff_client, clean_slate):
+        """결제 후 창 내 성공한 AI 페이지 작업 → post_payment_usage.ai_page."""
+        now = timezone.now()
+        u = _mk_user(joined=now - timedelta(days=10))
+        _mk_paid_payment(u, paid_at=now - timedelta(days=3))
+        job = AiJob.objects.create(user=u, job_type="bio_remake", status=AiJob.Status.SUCCEEDED)
+        AiJob.objects.filter(pk=job.pk).update(created_at=now - timedelta(days=2))
+
+        res = staff_client.get(URL)
+        usage = {
+            r["key"]: r["users"] for r in res.data["paid_conversion_analysis"]["post_payment_usage"]
+        }
+        assert usage["ai_page"] == 1
+
+
+# ─── 구독 유지·해지 분석 (churn/retention) ───────────────────────────
+
+
+class TestSubscriptionRetention:
+    def _neutralize(self):
+        """baseline 구독의 기간/취소 시각을 지워 현재-상태 카운트 오염 제거 (트랜잭션 내)."""
+        UserSubscription.objects.update(current_period_end=None, cancelled_at=None)
+
+    def test_cancel_scheduled_at_risk_and_recent(self, staff_client, clean_slate, pro_plan):
+        now = timezone.now()
+        self._neutralize()
+        u = _mk_user(joined=now - timedelta(days=40))
+        sub = UserSubscription.objects.create(
+            user=u,
+            plan=pro_plan,
+            status=SubscriptionStatus.CANCELLED,
+            monthly_amount_snapshot=14900,
+        )
+        UserSubscription.objects.filter(pk=sub.pk).update(
+            current_period_end=now + timedelta(days=10), cancelled_at=now - timedelta(days=1)
+        )
+
+        r = staff_client.get(URL).data["subscription_retention"]
+        assert r["cancel_scheduled"] == 1
+        assert r["at_risk_mrr"] == 14900
+        assert len(r["recent_cancellations"]) == 1
+        rc = r["recent_cancellations"][0]
+        assert rc["monthly_amount"] == 14900
+        assert rc["days_remaining"] in (9, 10)
+        assert rc["email"] == u.email
+
+    def test_past_due_counted(self, staff_client, clean_slate, pro_plan):
+        now = timezone.now()
+        self._neutralize()
+        u = _mk_user(joined=now - timedelta(days=40))
+        UserSubscription.objects.create(
+            user=u, plan=pro_plan, status=SubscriptionStatus.PAST_DUE, monthly_amount_snapshot=14900
+        )
+        r = staff_client.get(URL).data["subscription_retention"]
+        assert r["payment_failed"] == 1
+        assert r["at_risk_mrr"] == 14900  # past_due 도 예상 이탈에 합산
+
+    def test_realized_churn_only_paying_users(self, staff_client, clean_slate, free_plan):
+        now = timezone.now()
+        self._neutralize()
+        # 결제 이력 있는 free 다운그레이드 (실제 해지)
+        u1 = _mk_user(joined=now - timedelta(days=40))
+        s1 = UserSubscription.objects.create(
+            user=u1, plan=free_plan, status=SubscriptionStatus.ACTIVE
+        )
+        UserSubscription.objects.filter(pk=s1.pk).update(cancelled_at=now - timedelta(days=2))
+        _mk_paid_payment(u1, paid_at=now - timedelta(days=35))
+        # 결제 이력 없는 free 다운그레이드 (트라이얼 만료 — 실제 해지 아님)
+        u2 = _mk_user(joined=now - timedelta(days=40))
+        s2 = UserSubscription.objects.create(
+            user=u2, plan=free_plan, status=SubscriptionStatus.ACTIVE
+        )
+        UserSubscription.objects.filter(pk=s2.pk).update(cancelled_at=now - timedelta(days=2))
+
+        r = staff_client.get(URL).data["subscription_retention"]
+        assert r["realized_churn"] == 1  # u1 만
+
+    @requires_analytics
+    def test_cancel_reasons_and_defense_from_events(self, staff_client, clean_slate):
+        now = timezone.now()
+        self._neutralize()
+        u = _mk_user(joined=now - timedelta(days=5))
+        CancellationEvent.objects.create(user=u, event="cancel_button_clicked")
+        CancellationEvent.objects.create(
+            user=u, event="cancel_reason_submitted", reason="low_usage"
+        )
+        u2 = _mk_user(joined=now - timedelta(days=5))
+        CancellationEvent.objects.create(user=u2, event="cancel_button_clicked")
+        CancellationEvent.objects.create(user=u2, event="subscription_cancel_aborted")
+
+        r = staff_client.get(URL).data["subscription_retention"]
+        assert r["cancel_reasons_available"] is True
+        reasons = {x["key"]: x["count"] for x in r["cancel_reasons"]}
+        assert reasons.get("low_usage") == 1
+        # 방어: 클릭 2명 중 1명 유지(중단)
+        assert r["cancel_defense"] == {
+            "tries": 2,
+            "retained": 1,
+            "defense_rate": 0.5,
+        }

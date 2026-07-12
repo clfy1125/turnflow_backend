@@ -70,6 +70,10 @@ TOP_PAGES_LIMIT = 5
 UPSELL_CANDIDATES_LIMIT = 10
 # 온보딩 이탈자 각 세그먼트에 딸려 보내는 샘플 회원 수 (CS 드릴다운용)
 ONBOARDING_SAMPLE_LIMIT = 5
+# 구독 유지·해지 — 최근 취소 예약 고객 리스트 캡 (CS 액션용)
+RECENT_CANCELLATIONS_LIMIT = 8
+# 해지 사유 TOP N
+CANCEL_REASONS_TOP = 5
 
 # ── 유료 전환 분석 ───────────────────────────────────────────────────
 # 결제 후 '실제 사용' 관찰 창 (일) — paid_at 이후 N일 내 기능 사용 여부.

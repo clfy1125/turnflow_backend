@@ -25,8 +25,8 @@ from rest_framework.views import APIView
 from apps.pages.stats import get_country, hash_ip
 
 from .channels import classify_ua, derive_channel
-from .models import CheckoutEvent, LandingVisit, UAClass
-from .serializers import CheckoutEventSerializer, TrackVisitSerializer
+from .models import CancellationEvent, CheckoutEvent, LandingVisit, UAClass
+from .serializers import CancellationEventSerializer, CheckoutEventSerializer, TrackVisitSerializer
 
 logger = logging.getLogger(__name__)
 
@@ -333,4 +333,91 @@ class TrackCheckoutEventView(APIView):
             )
         except Exception:
             logger.warning("checkout_event: insert failed user=%s", request.user.id, exc_info=True)
+        return Response(status=status.HTTP_201_CREATED)
+
+
+class TrackCancellationEventView(APIView):
+    """구독 취소 텔레메트리 수집 — 로그인 사용자 전용.
+
+    취소 버튼 클릭·해지 사유 제출·취소 예약/철회 시 서비스 프론트가 호출한다.
+    이 데이터가 마케팅 대시보드의 **해지 사유 TOP N / 취소 방어율** 원천이다.
+    실제 취소 예약/해지 카운트는 UserSubscription 상태에서 직접 집계한다.
+    """
+
+    permission_classes = [IsAuthenticated]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "checkout_event"
+
+    @extend_schema(
+        tags=["analytics"],
+        summary="구독 취소 이벤트 기록",
+        description="""
+## 개요
+로그인 사용자가 **취소 버튼을 누르거나 해지 사유를 제출**할 때 서비스 프론트가
+호출하는 텔레메트리 엔드포인트입니다. 해지 사유(`reason`)와 취소 플로우 단계(`event`)를
+기록해 마케팅 대시보드가 **왜 떠나는가(해지 사유)** 와 **취소 화면 방어율**을 계산합니다.
+
+## 인증
+`Authorization: Bearer <access_token>` 필수 (로그인 사용자). 미인증 401.
+
+## 요청 바디 필드
+| 필드 | 필수 | 설명 |
+|------|:----:|------|
+| `event` | ✅ | cancel_button_clicked / cancel_reason_submitted / subscription_cancel_scheduled / subscription_cancel_aborted / subscription_resumed |
+| `reason` | 선택 | price / low_usage / no_effect / hard_setup / missing_feature / ig_error / switched / paused / other |
+| `reason_detail` | 선택 | 자유입력 상세 |
+| `from_plan` / `to_plan` | 선택 | 플랜 컨텍스트 |
+
+## 비즈니스 로직
+- append-only 로 1행 기록. 실제 구독 상태 전이는 백엔드가 알고 있으므로, 여기서는
+  프론트만 아는 '사유/방어 플로우'만 보완합니다. 알 수 없는 `reason` 문자열도 저장됩니다.
+""",
+        request=CancellationEventSerializer,
+        examples=[
+            OpenApiExample(
+                "해지 사유 제출",
+                request_only=True,
+                value={
+                    "event": "cancel_reason_submitted",
+                    "reason": "low_usage",
+                    "from_plan": "pro",
+                },
+            ),
+        ],
+        responses={
+            201: OpenApiResponse(description="기록 완료 — 바디 없음"),
+            400: OpenApiResponse(description="잘못된 event 값 등 (프론트는 응답 무시 권장)"),
+            401: OpenApiResponse(description="인증 누락/만료"),
+            429: OpenApiResponse(description="스로틀 초과 (기본 240/hour)"),
+            500: OpenApiResponse(description="서버 오류"),
+        },
+    )
+    def post(self, request):
+        serializer = CancellationEventSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {
+                    "success": False,
+                    "error": {
+                        "code": 400,
+                        "message": "잘못된 취소 이벤트 페이로드입니다",
+                        "details": serializer.errors,
+                    },
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        data = serializer.validated_data
+        try:
+            CancellationEvent.objects.create(
+                user=request.user,
+                event=data["event"],
+                reason=data.get("reason", ""),
+                reason_detail=data.get("reason_detail", ""),
+                from_plan=data.get("from_plan", ""),
+                to_plan=data.get("to_plan", ""),
+            )
+        except Exception:
+            logger.warning(
+                "cancellation_event: insert failed user=%s", request.user.id, exc_info=True
+            )
         return Response(status=status.HTTP_201_CREATED)
