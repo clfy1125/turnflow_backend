@@ -127,7 +127,11 @@ class _FunnelSerializer(serializers.Serializer):
 
 
 class _ChannelRowSerializer(serializers.Serializer):
-    """채널 성과 1행 — SignupAttribution.channel 기준 (레퍼럴 오버레이 적용)."""
+    """채널 성과 1행 — SignupAttribution.channel 기준 (레퍼럴 오버레이 적용).
+
+    비순차 제품 특성 반영 — 단일 '활성화' 대신 분기 단계별 컬럼(IG 연동/DM 캠페인 ·
+    페이지 생성/페이지 공개) 을 제공한다 (퍼널 분기와 동일한 축).
+    """
 
     channel = serializers.CharField(
         help_text='채널 키. 어트리뷰션 없는 가입자는 "unknown", '
@@ -138,10 +142,10 @@ class _ChannelRowSerializer(serializers.Serializer):
     signup_rate = serializers.FloatField(
         allow_null=True, help_text="signups / visits (visits 0 → null)"
     )
-    activated = serializers.IntegerField(help_text="활성화 도달 수 (page ∪ campaign)")
-    activation_rate = serializers.FloatField(
-        allow_null=True, help_text="activated / signups (signups 0 → null)"
-    )
+    ig_connected = serializers.IntegerField(help_text="IG 연동 도달 수 (DM 갈래 1단계)")
+    dm_campaign = serializers.IntegerField(help_text="DM 캠페인 생성 수 (DM 갈래 2단계)")
+    page_created = serializers.IntegerField(help_text="페이지 생성 수 (바이오링크 갈래 1단계)")
+    page_published = serializers.IntegerField(help_text="페이지 공개 수 (바이오링크 갈래 2단계)")
     paid = serializers.IntegerField(help_text="유료 전환 수 (첫 PAID 결제 보유)")
     paid_rate = serializers.FloatField(allow_null=True, help_text="paid / signups")
 
@@ -229,6 +233,9 @@ class _BiolinkStatsSerializer(serializers.Serializer):
     new_public_pages = _DeltaMetricSerializer(
         help_text="⚠ 근사 — 기간 내 created_at 인 공개 페이지 수 (공개 시각 미기록)"
     )
+    active_users = _DeltaMetricSerializer(
+        help_text="기간 내 공개 페이지를 만든 고유 회원 수 (페이지 공개 사용자)"
+    )
     views = _DeltaMetricSerializer(help_text="기간 내 PageView 수")
     clicks = _DeltaMetricSerializer(help_text="기간 내 BlockClick 수")
     ctr = serializers.FloatField(help_text="clicks.current / views.current (views 0 → 0.0)")
@@ -241,6 +248,9 @@ class _DmFeatureStatsSerializer(serializers.Serializer):
     """자동 DM 기능 통계."""
 
     campaigns_created = _DeltaMetricSerializer(help_text="기간 내 생성된 캠페인 수")
+    active_users = _DeltaMetricSerializer(
+        help_text="기간 내 DM 캠페인을 만든 고유 오너 수 (DM 캠페인 생성 사용자)"
+    )
     requested = _DeltaMetricSerializer(help_text="기간 내 생성된 DM 로그 수 (전 상태)")
     delivered = _DeltaMetricSerializer(help_text="기간 내 delivered+read 수")
     delivery_rate = serializers.FloatField(
@@ -251,6 +261,9 @@ class _DmFeatureStatsSerializer(serializers.Serializer):
 class _SpamFeatureStatsSerializer(serializers.Serializer):
     """스팸 필터 기능 통계."""
 
+    active_users = _DeltaMetricSerializer(
+        help_text="기간 내 스팸 방어가 동작한 고유 오너 수 (스팸 방어 사용 사용자)"
+    )
     detected = _DeltaMetricSerializer(help_text="기간 내 스팸 판정 수 (CLEAN 제외)")
     hidden = _DeltaMetricSerializer(help_text="기간 내 숨김 처리 수")
 
@@ -279,6 +292,91 @@ class _FeatureStatsSerializer(serializers.Serializer):
     dm = _DmFeatureStatsSerializer(help_text="자동 DM")
     spam = _SpamFeatureStatsSerializer(help_text="스팸 필터")
     trials = _TrialsStatsSerializer(help_text="트라이얼")
+
+
+class _DropoffSampleSerializer(serializers.Serializer):
+    """이탈 세그먼트 샘플 회원 1명 (CS 드릴다운용)."""
+
+    user_id = serializers.IntegerField(help_text="User PK")
+    email = serializers.CharField(allow_blank=True, help_text="회원 이메일")
+    joined_at = serializers.DateTimeField(help_text="가입 일시 (Asia/Seoul ISO)")
+    link = _UpsellLinkSerializer(help_text="회원 상세 드릴다운 (/users/{id})")
+
+
+class _OnboardingSegmentSerializer(serializers.Serializer):
+    """온보딩 이탈 세그먼트 1개."""
+
+    key = serializers.CharField(
+        help_text="no_action / ig_no_campaign / page_created_not_published / "
+        "campaign_no_send / paywall_no_payment"
+    )
+    label = serializers.CharField(help_text="한국어 라벨")
+    description = serializers.CharField(help_text="세그먼트 정의 설명")
+    count = serializers.IntegerField(help_text="해당 세그먼트 회원 수 (가입 코호트 기준)")
+    available = serializers.BooleanField(
+        help_text="측정 가능 여부. paywall_no_payment 는 CheckoutEvent 미탑재 시 false"
+    )
+    samples = _DropoffSampleSerializer(
+        many=True, help_text="최근 가입 순 샘플 회원 (ONBOARDING_SAMPLE_LIMIT=5)"
+    )
+
+
+class _OnboardingDropoffsSerializer(serializers.Serializer):
+    """온보딩 이탈자 — 가입 코호트의 단계별 이탈 세그먼트 (고정 순서)."""
+
+    cohort_signups = serializers.IntegerField(help_text="기간 내 가입 코호트 총수 (분모)")
+    segments = _OnboardingSegmentSerializer(
+        many=True, help_text="이탈 세그먼트 (측정 4 + paywall_no_payment)"
+    )
+
+
+class _ConversionByPlanRowSerializer(serializers.Serializer):
+    """유료 전환 플랜 분해 1행 (admin/free 제외)."""
+
+    name = serializers.CharField(help_text="SubscriptionPlan.name (basic/pro)")
+    display_name = serializers.CharField(help_text="플랜 표시명")
+    count = serializers.IntegerField(help_text="현재 플랜이 이것인 전환자 수")
+
+
+class _PostPaymentUsageRowSerializer(serializers.Serializer):
+    """결제 후 사용 기능 1행 — 결제 후 창(기본 7일) 내 실제 사용 유저 수."""
+
+    key = serializers.CharField(help_text="dm_send / page_created / spam_used / extra_ig")
+    label = serializers.CharField(help_text="한국어 라벨")
+    users = serializers.IntegerField(help_text="결제 후 창 내 해당 기능을 쓴 전환자 수")
+
+
+class _EntryPathRowSerializer(serializers.Serializer):
+    """결제 진입 경로 1행 — trigger_feature 기준 (CheckoutEvent 귀속)."""
+
+    key = serializers.CharField(help_text="trigger_feature 키 (예: dm_limit, pricing_direct)")
+    label = serializers.CharField(help_text="한국어 라벨 (미지정 키는 원문)")
+    count = serializers.IntegerField(help_text="이 경로로 귀속된 전환자 수")
+
+
+class _PaidConversionAnalysisSerializer(serializers.Serializer):
+    """유료 전환 분석 — 선택 플랜 / 결제 진입 경로 / 결제 후 사용 (3축 분리).
+
+    '무엇 때문에 결제했나'를 단정하지 않는다 — 진입 경로는 CheckoutEvent 텔레메트리로
+    귀속하며, 프론트 이벤트 미전송 시 entry_paths_available=false 로 강등된다.
+    """
+
+    total = serializers.IntegerField(help_text="기간 내 유료 전환자 수 (유저별 첫 PAID)")
+    by_plan = _ConversionByPlanRowSerializer(
+        many=True, help_text="선택 플랜별 전환자 수 (현재 구독 플랜 기준, admin/free 제외)"
+    )
+    post_payment_usage = _PostPaymentUsageRowSerializer(
+        many=True, help_text="결제 후 창 내 실제 사용 기능별 유저 수"
+    )
+    entry_paths = _EntryPathRowSerializer(
+        many=True, help_text="결제 진입 경로(업그레이드 트리거)별 전환자 수 (count desc)"
+    )
+    entry_paths_available = serializers.BooleanField(
+        help_text="CheckoutEvent 텔레메트리 탑재/수집 여부 — false 면 entry_paths=[]"
+    )
+    post_payment_window_days = serializers.IntegerField(
+        help_text="결제 후 사용 관찰 창 (일, 기본 7)"
+    )
 
 
 class _PlanDistributionRowSerializer(serializers.Serializer):
@@ -381,6 +479,12 @@ class AdminMarketingDashboardSerializer(serializers.Serializer):
         many=True, help_text="업셀 후보 상위 UPSELL_CANDIDATES_LIMIT(10), score desc"
     )
     feature_stats = _FeatureStatsSerializer(help_text="기능별 사용 통계")
+    onboarding_dropoffs = _OnboardingDropoffsSerializer(
+        help_text="온보딩 이탈자 (단계별 이탈 세그먼트 + 샘플 회원)"
+    )
+    paid_conversion_analysis = _PaidConversionAnalysisSerializer(
+        help_text="유료 전환 분석 (선택 플랜/진입 경로/결제 후 사용)"
+    )
     plan_distribution = _PlanDistributionRowSerializer(
         many=True, help_text="플랜별 구독 상태 분포 (전 플랜, sort_order 순)"
     )

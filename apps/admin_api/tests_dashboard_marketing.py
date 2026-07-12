@@ -37,10 +37,11 @@ from apps.workspace.models import Workspace
 
 # 어트리뷰션 앱은 병렬 워크스트림 — 뷰와 동일하게 가드 (미탑재 시 채널 테스트 skip)
 try:
-    from apps.analytics.models import LandingVisit, SignupAttribution
+    from apps.analytics.models import CheckoutEvent, LandingVisit, SignupAttribution
 
     HAS_ANALYTICS = True
 except (ImportError, RuntimeError):
+    CheckoutEvent = None
     LandingVisit = None
     SignupAttribution = None
     HAS_ANALYTICS = False
@@ -567,7 +568,7 @@ class TestChannels:
         SignupAttribution.objects.create(
             user=attributed, channel="instagram_organic", signup_kind="email"
         )
-        _mk_page(attributed, public=True)  # activated
+        _mk_page(attributed, public=True)  # 페이지 생성 + 공개 (바이오링크 갈래)
         _mk_user(joined=in_cohort)  # 어트리뷰션 없음 → unknown
 
         LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="instagram_organic")
@@ -581,8 +582,11 @@ class TestChannels:
         assert ig["visits"] == 2
         assert ig["signups"] == 1
         assert ig["signup_rate"] == 0.5
-        assert ig["activated"] == 1
-        assert ig["activation_rate"] == 1.0
+        # 비순차 분기 컬럼: 페이지 생성/공개는 1, IG·DM 갈래는 0
+        assert ig["page_created"] == 1
+        assert ig["page_published"] == 1
+        assert ig["ig_connected"] == 0
+        assert ig["dm_campaign"] == 0
 
         unknown = rows["unknown"]
         assert unknown["visits"] == 0
@@ -926,3 +930,130 @@ class TestCustomRange:
         res = staff_client.get(URL, {"start": "2025-01-01", "end": "2026-06-30"})
         assert res.status_code == 400
         assert "366" in res.data["error"]["details"]["reason"]
+
+
+# ─── 기능별 사용자 수 (개선2) ────────────────────────────────────────
+
+
+class TestFeatureStatsUsers:
+    def test_active_users_counted_per_feature(self, staff_client, clean_slate):
+        now = timezone.now()
+        # 바이오링크: 서로 다른 2명이 공개 페이지 생성 → active_users == 2
+        page_a, page_b = _mk_user(joined=now), _mk_user(joined=now)
+        _mk_page(page_a, public=True)
+        _mk_page(page_b, public=True)
+        _mk_page(page_a, public=True)  # 같은 유저 추가 페이지 → 여전히 고유 2명
+
+        # DM: 오너 1명이 캠페인 생성 → dm.active_users == 1
+        owner = _mk_user(joined=now)
+        _mk_campaign(_mk_conn(owner))
+
+        res = staff_client.get(URL)
+        stats = res.data["feature_stats"]
+        assert stats["biolink"]["active_users"]["current"] == 2
+        assert stats["dm"]["active_users"]["current"] == 1
+        # 스팸 사용 없음 → 0
+        assert stats["spam"]["active_users"]["current"] == 0
+
+
+# ─── 온보딩 이탈자 (개선3) ───────────────────────────────────────────
+
+
+class TestOnboardingDropoffs:
+    def _seg(self, res, key):
+        segs = {s["key"]: s for s in res.data["onboarding_dropoffs"]["segments"]}
+        return segs[key]
+
+    def test_measurable_segments(self, staff_client, clean_slate):
+        now = timezone.now()
+        joined = now - timedelta(days=3)
+
+        _mk_user(joined=joined)  # A: 무행동
+
+        b = _mk_user(joined=joined)  # B: 페이지 생성 후 미공개
+        _mk_page(b, public=False)
+
+        c = _mk_user(joined=joined)  # C: IG 연동 후 캠페인 없음
+        _mk_conn(c)
+
+        d = _mk_user(joined=joined)  # D: 캠페인 생성 후 미발송
+        _mk_campaign(_mk_conn(d))
+
+        res = staff_client.get(URL)
+        assert res.data["onboarding_dropoffs"]["cohort_signups"] == 4
+        assert self._seg(res, "no_action")["count"] == 1
+        assert self._seg(res, "page_created_not_published")["count"] == 1
+        assert self._seg(res, "ig_no_campaign")["count"] == 1
+        assert self._seg(res, "campaign_no_send")["count"] == 1
+        # 샘플 회원 링크 존재
+        assert self._seg(res, "no_action")["samples"][0]["link"]["page"].startswith("/users/")
+
+    @requires_analytics
+    def test_paywall_segment_from_checkout_event(self, staff_client, clean_slate):
+        now = timezone.now()
+        e = _mk_user(joined=now - timedelta(days=2))
+        CheckoutEvent.objects.create(user=e, event="paywall_viewed", trigger_feature="dm_limit")
+
+        res = staff_client.get(URL)
+        seg = self._seg(res, "paywall_no_payment")
+        assert seg["available"] is True
+        assert seg["count"] == 1
+
+
+# ─── 유료 전환 분석 (개선4) ──────────────────────────────────────────
+
+
+class TestPaidConversionAnalysis:
+    @requires_analytics
+    def test_by_plan_and_post_payment_and_entry_paths(self, staff_client, clean_slate, pro_plan):
+        now = timezone.now()
+        paid_at = now - timedelta(days=3)
+
+        u = _mk_user(joined=now - timedelta(days=10))
+        UserSubscription.objects.create(user=u, plan=pro_plan, status=SubscriptionStatus.ACTIVE)
+        _mk_paid_payment(u, paid_at=paid_at)
+
+        # 결제 후 사용: DM 발송(결제 후 2일) + 페이지 생성(결제 후 2일)
+        conn = _mk_conn(u)
+        IGAccountConnection.objects.filter(pk=conn.pk).update(created_at=now - timedelta(days=5))
+        camp = _mk_campaign(conn)
+        dm = _mk_quota_dms(camp, [111])[0]
+        SentDMLog.objects.filter(pk=dm.pk).update(created_at=now - timedelta(days=2))
+        page = _mk_page(u, public=True)
+        Page.objects.filter(pk=page.pk).update(created_at=now - timedelta(days=2))
+
+        # 결제 진입 경로: 결제 이전(5일 전) paywall_viewed[dm_limit]
+        ev = CheckoutEvent.objects.create(
+            user=u, event="paywall_viewed", trigger_feature="dm_limit"
+        )
+        CheckoutEvent.objects.filter(pk=ev.pk).update(created_at=now - timedelta(days=5))
+
+        res = staff_client.get(URL)
+        pca = res.data["paid_conversion_analysis"]
+        assert pca["total"] == 1
+        assert pca["by_plan"] == [
+            {"name": "pro", "display_name": pro_plan.display_name, "count": 1}
+        ]
+
+        usage = {r["key"]: r["users"] for r in pca["post_payment_usage"]}
+        assert usage["dm_send"] == 1
+        assert usage["page_created"] == 1
+
+        assert pca["entry_paths_available"] is True
+        paths = {r["key"]: r["count"] for r in pca["entry_paths"]}
+        assert paths.get("dm_limit") == 1
+
+    def test_admin_plan_excluded_from_by_plan(self, staff_client, clean_slate):
+        """admin 플랜 전환자는 by_plan 에서 제외 (운영용 내부 계정)."""
+        now = timezone.now()
+        admin_plan, _ = SubscriptionPlan.objects.get_or_create(
+            name="admin", defaults={"display_name": "관리자", "monthly_price": 0, "sort_order": 9}
+        )
+        u = _mk_user(joined=now - timedelta(days=10))
+        UserSubscription.objects.create(user=u, plan=admin_plan, status=SubscriptionStatus.ACTIVE)
+        _mk_paid_payment(u, paid_at=now - timedelta(days=2))
+
+        res = staff_client.get(URL)
+        pca = res.data["paid_conversion_analysis"]
+        assert pca["total"] == 1  # 전환자 수엔 잡히나
+        assert all(r["name"] != "admin" for r in pca["by_plan"])  # 플랜 분해엔 제외

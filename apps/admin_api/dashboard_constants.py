@@ -68,6 +68,15 @@ RECENT_ERRORS_LIMIT = 20
 RISK_ACCOUNTS_LIMIT = 5
 TOP_PAGES_LIMIT = 5
 UPSELL_CANDIDATES_LIMIT = 10
+# 온보딩 이탈자 각 세그먼트에 딸려 보내는 샘플 회원 수 (CS 드릴다운용)
+ONBOARDING_SAMPLE_LIMIT = 5
+
+# ── 유료 전환 분석 ───────────────────────────────────────────────────
+# 결제 후 '실제 사용' 관찰 창 (일) — paid_at 이후 N일 내 기능 사용 여부.
+POST_PAYMENT_WINDOW_DAYS = 7
+# 결제 진입 경로 귀속 창 (일) — 유저별 첫 PAID 이전 N일 내 마지막 CheckoutEvent 트리거를
+# 그 전환의 진입 경로로 귀속.
+CHECKOUT_ATTRIBUTION_WINDOW_DAYS = 30
 
 # ── 캐시 ─────────────────────────────────────────────────────────────
 OPS_DASHBOARD_CACHE_TTL = 30  # 초 — 어드민 30~60s 폴링 대비

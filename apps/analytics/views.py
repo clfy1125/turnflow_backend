@@ -17,7 +17,7 @@ from django.core.cache import cache
 from django.utils import timezone
 from drf_spectacular.utils import OpenApiExample, OpenApiResponse, extend_schema
 from rest_framework import status
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
@@ -25,8 +25,8 @@ from rest_framework.views import APIView
 from apps.pages.stats import get_country, hash_ip
 
 from .channels import classify_ua, derive_channel
-from .models import LandingVisit, UAClass
-from .serializers import TrackVisitSerializer
+from .models import CheckoutEvent, LandingVisit, UAClass
+from .serializers import CheckoutEventSerializer, TrackVisitSerializer
 
 logger = logging.getLogger(__name__)
 
@@ -218,3 +218,119 @@ curl -X POST https://api.turnflow.link/api/v1/track/visit/ \\
             logger.warning("track_visit: insert failed visitor_id=%s", visitor_id, exc_info=True)
 
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class TrackCheckoutEventView(APIView):
+    """결제 진입 텔레메트리 수집 — 로그인 사용자 전용.
+
+    유료 제한 모달 노출/결제 시작 시 서비스 프론트가 호출한다. 이 데이터가
+    마케팅 대시보드의 **결제 진입 경로(entry_paths)** 원천이다.
+
+    silent 원칙(비콘): 검증 통과 → 201, 검증 실패 → 400(개발 신호)이나
+    프론트는 응답을 무시하므로 UX 에 영향 없음. 미인증은 401.
+    """
+
+    permission_classes = [IsAuthenticated]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "checkout_event"
+
+    @extend_schema(
+        tags=["analytics"],
+        summary="결제 진입 이벤트 기록",
+        description="""
+## 개요
+로그인 사용자가 **유료 제한 모달을 보거나 결제를 시작**할 때 서비스 프론트가
+호출하는 텔레메트리 엔드포인트입니다. `trigger_feature`(DM 한도/페이지 제한/
+배지 제거/스팸 방어/가격표 직접 등)와 `entry_source` 를 기록해 마케팅 대시보드가
+**유료 전환의 진입 경로(업그레이드 트리거)** 를 재구성합니다.
+
+## 사용 시나리오
+- 무료/베이직 사용자가 DM 한도 초과 모달을 볼 때 → `paywall_viewed` + `trigger_feature=dm_limit`
+- 업그레이드 버튼 클릭/결제 SDK 진입 → `checkout_started` + `selected_plan=pro`
+- 상세 이벤트/필드 규약은 `대시보드_구현_보고서.html` "프론트 이벤트 트래킹" 참고
+
+## 인증
+`Authorization: Bearer <access_token>` 필수 (로그인 사용자). 미인증 401.
+
+## 비즈니스 로직
+- 항상 append-only 로 1행 기록 (`CheckoutEvent`). '무엇 때문에 결제했나'를 단정하지
+  않고, **어디서 결제 화면에 진입했는지**만 남깁니다 (신뢰도는 대시보드가 해석).
+- `event` 만 필수, 나머지는 선택. 알 수 없는 `trigger_feature` 문자열도 저장되며
+  대시보드는 라벨 없으면 원문 표기합니다.
+
+## 요청 바디 필드
+| 필드 | 필수 | 설명 |
+|------|:----:|------|
+| `event` | ✅ | paywall_viewed / checkout_started / pricing_page_viewed / paywall_cta_clicked / plan_selected / feature_limit_reached / premium_feature_attempted |
+| `entry_source` | 선택 | paywall / pricing_page / upgrade_button / direct |
+| `trigger_feature` | 선택 | dm_limit / page_limit / badge_removal / spam_advanced / multi_ig / ai_page / analytics_export / pricing_direct |
+| `source_page` | 선택 | 발생 화면 경로 |
+| `current_plan` / `required_plan` / `selected_plan` | 선택 | 플랜 컨텍스트 |
+| `usage_count` / `limit_count` | 선택 | 한도 도달 컨텍스트 |
+""",
+        request=CheckoutEventSerializer,
+        examples=[
+            OpenApiExample(
+                "DM 한도 모달 노출",
+                request_only=True,
+                value={
+                    "event": "paywall_viewed",
+                    "entry_source": "paywall",
+                    "trigger_feature": "dm_limit",
+                    "source_page": "dm_campaign",
+                    "current_plan": "free",
+                    "required_plan": "pro",
+                    "usage_count": 200,
+                    "limit_count": 200,
+                },
+            ),
+            OpenApiExample(
+                "결제 시작",
+                request_only=True,
+                value={
+                    "event": "checkout_started",
+                    "entry_source": "paywall",
+                    "trigger_feature": "dm_limit",
+                    "selected_plan": "pro",
+                },
+            ),
+        ],
+        responses={
+            201: OpenApiResponse(description="기록 완료 — 바디 없음"),
+            400: OpenApiResponse(description="잘못된 event 값 등 (프론트는 응답 무시 권장)"),
+            401: OpenApiResponse(description="인증 누락/만료"),
+            429: OpenApiResponse(description="스로틀 초과 (기본 240/hour)"),
+            500: OpenApiResponse(description="서버 오류"),
+        },
+    )
+    def post(self, request):
+        serializer = CheckoutEventSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {
+                    "success": False,
+                    "error": {
+                        "code": 400,
+                        "message": "잘못된 결제 이벤트 페이로드입니다",
+                        "details": serializer.errors,
+                    },
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        data = serializer.validated_data
+        try:
+            CheckoutEvent.objects.create(
+                user=request.user,
+                event=data["event"],
+                entry_source=data.get("entry_source", ""),
+                trigger_feature=data.get("trigger_feature", ""),
+                source_page=data.get("source_page", ""),
+                current_plan=data.get("current_plan", ""),
+                required_plan=data.get("required_plan", ""),
+                selected_plan=data.get("selected_plan", ""),
+                usage_count=data.get("usage_count"),
+                limit_count=data.get("limit_count"),
+            )
+        except Exception:
+            logger.warning("checkout_event: insert failed user=%s", request.user.id, exc_info=True)
+        return Response(status=status.HTTP_201_CREATED)

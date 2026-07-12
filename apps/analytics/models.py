@@ -174,3 +174,97 @@ class SignupAttribution(models.Model):
 
     def __str__(self) -> str:
         return f"user={self.user_id} [{self.channel}] {self.signup_kind}"
+
+
+class CheckoutEventType(models.TextChoices):
+    """결제 여정 이벤트 종류 (서비스 프론트가 전송).
+
+    유료 전환의 '진입 경로(업그레이드 트리거)'를 재구성하기 위한 텔레메트리다.
+    payment_succeeded 는 백엔드(PaymentHistory)가 이미 알고 있으므로 프론트가
+    보낼 필요 없지만, 프론트 이벤트와 1:1 대응을 위해 열거에는 포함한다.
+    """
+
+    PRICING_PAGE_VIEWED = "pricing_page_viewed", "가격표 조회"
+    PAYWALL_VIEWED = "paywall_viewed", "유료 제한 모달 노출"
+    PAYWALL_CTA_CLICKED = "paywall_cta_clicked", "업그레이드 버튼 클릭"
+    CHECKOUT_STARTED = "checkout_started", "결제 시작"
+    PLAN_SELECTED = "plan_selected", "플랜 선택"
+    FEATURE_LIMIT_REACHED = "feature_limit_reached", "기능 한도 도달"
+    PREMIUM_FEATURE_ATTEMPTED = "premium_feature_attempted", "유료 기능 시도"
+
+
+class CheckoutEvent(models.Model):
+    """결제 진입 경로 텔레메트리 (append-only raw row).
+
+    로그인 사용자가 **유료 제한 모달을 보거나 결제를 시작**할 때 서비스 프론트가
+    ``POST /api/v1/track/checkout-event/`` 로 전송한다. 마케팅 대시보드는
+    "유저별 첫 PAID 이전 window 내 마지막 트리거"를 그 유저의 **결제 진입 경로**로
+    귀속한다 (paid_conversion_analysis.entry_paths).
+
+    ⚠ '무엇 때문에 결제했나'를 단정하지 않는다 — 어디서 결제 화면에 진입했는지를
+    기록할 뿐이다. 신뢰도는 (트리거→결제 근접성)으로 대시보드에서 해석한다.
+
+    이 모델이 마이그레이션되기 전(프론트 이벤트 미전송)이라도 대시보드는
+    entry_paths_available=false 로 강등되어 정상 동작한다 (guarded import).
+    보존: LANDING_VISIT_RETENTION_DAYS 정책 공유 (cleanup 태스크가 함께 정리).
+    """
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="checkout_events",
+        verbose_name="사용자",
+        help_text="로그인 사용자. 비로그인 가격표 조회 등은 NULL 가능.",
+    )
+    event = models.CharField(
+        max_length=32,
+        choices=CheckoutEventType.choices,
+        db_index=True,
+        verbose_name="이벤트",
+    )
+    entry_source = models.CharField(
+        max_length=40,
+        blank=True,
+        default="",
+        verbose_name="진입 소스",
+        help_text="paywall / pricing_page / upgrade_button / direct 등 (프론트 정의 어휘).",
+    )
+    trigger_feature = models.CharField(
+        max_length=40,
+        blank=True,
+        default="",
+        db_index=True,
+        verbose_name="트리거 기능",
+        help_text="dm_limit / page_limit / badge_removal / spam_advanced / multi_ig / "
+        "ai_page / analytics_export / pricing_direct 등 — 진입 경로 귀속의 핵심 축.",
+    )
+    source_page = models.CharField(max_length=80, blank=True, default="", verbose_name="발생 화면")
+    current_plan = models.CharField(max_length=32, blank=True, default="", verbose_name="현재 플랜")
+    required_plan = models.CharField(
+        max_length=32, blank=True, default="", verbose_name="필요 플랜"
+    )
+    selected_plan = models.CharField(
+        max_length=32, blank=True, default="", verbose_name="선택 플랜"
+    )
+    usage_count = models.IntegerField(
+        null=True, blank=True, verbose_name="사용량", help_text="한도 도달 시 현재 사용량."
+    )
+    limit_count = models.IntegerField(
+        null=True, blank=True, verbose_name="한도", help_text="한도 도달 시 플랜 한도."
+    )
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True, verbose_name="발생 일시")
+
+    class Meta:
+        db_table = "analytics_checkout_event"
+        verbose_name = "결제 진입 이벤트"
+        verbose_name_plural = "결제 진입 이벤트 목록"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["user", "created_at"]),
+            models.Index(fields=["trigger_feature", "created_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"user={self.user_id} {self.event} [{self.trigger_feature}]"

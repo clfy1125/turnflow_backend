@@ -246,6 +246,9 @@ REST_FRAMEWORK = {
         # 랜딩 방문 트래킹 비콘 (POST /track/visit/) — IP 기준. 한국 모바일 CGNAT(수백 명이
         # 한 egress IP 공유) 특성상 느슨하게 — 실질 어뷰즈 방어는 visitor_id당 시간당 캡(6회).
         "track_visit": config("THROTTLE_TRACK_VISIT", default="120/hour"),
+        # 결제 진입 텔레메트리 (POST /track/checkout-event/) — 로그인 사용자 기준.
+        # 유료 제한 모달을 반복적으로 마주칠 수 있어 넉넉하게.
+        "checkout_event": config("THROTTLE_CHECKOUT_EVENT", default="240/hour"),
     },
 }
 
