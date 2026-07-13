@@ -612,3 +612,47 @@ class AutoDMCampaignAiSuggestJobSerializer(serializers.Serializer):
     status = serializers.CharField(help_text="작업 상태 (queued)")
     poll_url = serializers.CharField(help_text="작업 상태 폴링 URL (GET)")
     message = serializers.CharField(help_text="안내 메시지")
+
+
+class DmOpeningDiversifyRequestSerializer(serializers.Serializer):
+    """POST /api/v1/integrations/auto-dm-campaigns/diversify-opening/ 요청 바디.
+
+    사용자가 폼에서 확정한 오프닝 DM 1개를 넘기면, gemma-4 가 톤·의미를 유지한 채 표현만 바꾼
+    변형 count 개를 생성한다(스팸 탐지 회피용 오프닝 다양화). 비동기(AiJob) — 202 로 job_id 를
+    돌려주고, 프론트는 poll_url 을 폴링해 result_json.variants 를 캠페인 opening 변형 풀로 쓴다.
+    """
+
+    opening_message = serializers.CharField(
+        max_length=2000,
+        help_text=(
+            "다양화할 원문 오프닝 DM. 이 문구의 톤·의미를 기준으로 변형이 생성된다. "
+            "실제 오프닝(버튼 640자 / 일반 1000바이트)보다 넉넉한 2000자까지 허용(과도한 입력 방어)."
+        ),
+    )
+    count = serializers.IntegerField(
+        required=False,
+        default=10,
+        min_value=2,
+        max_value=30,
+        help_text="생성할 변형 개수 (기본 10, 2~30). 많을수록 생성 시간 증가(30개 ≈ 25초).",
+    )
+    tone = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+        help_text="참고 톤 힌트 (선택). 비우면 원문 톤을 그대로 유지.",
+    )
+
+
+class DmOpeningDiversifyJobSerializer(serializers.Serializer):
+    """POST .../diversify-opening/ 의 202 응답 — 변형 생성 작업이 큐에 등록됨.
+
+    프론트는 poll_url 을 1~2초 간격 폴링해 status=succeeded 가 되면 result_json.variants
+    (문자열 배열)를 캠페인 opening 변형 풀로 쓴다.
+    """
+
+    job_id = serializers.UUIDField(help_text="변형 생성 작업 ID")
+    status = serializers.CharField(help_text="작업 상태 (queued)")
+    poll_url = serializers.CharField(help_text="작업 상태 폴링 URL (GET)")
+    requested_count = serializers.IntegerField(help_text="요청한 변형 개수 (2~30 클램프 후)")
+    message = serializers.CharField(help_text="안내 메시지")

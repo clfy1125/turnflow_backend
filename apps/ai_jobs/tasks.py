@@ -1023,3 +1023,85 @@ def run_dm_campaign_assist_job(self, job_id: str):
         job.finished_at = timezone.now()
         job.save()
         logger.exception("dm_assist 실패: %s", job_id)
+
+
+@shared_task(
+    bind=True,
+    autoretry_for=(),  # diversify_opening 은 내부 폴백으로 raise 안 함
+    time_limit=300,  # 변형 최대 30개 ≈ 25초 + 큐 지연/부하 여유 (assist 태스크와 동일)
+    soft_time_limit=270,
+)
+def run_dm_opening_diversify_job(self, job_id: str):
+    """``AiJob.JobType.DM_OPENING_DIVERSIFY`` 작업을 실행.
+
+    오프닝 DM 1개를 톤·의미 유지한 채 N개 변형으로 다양화해 ``result_json.variants`` 에 저장.
+    프론트는 ``GET /api/v1/ai/jobs/{id}/`` 로 폴링해 ``result_json.variants`` 를 읽는다.
+
+    ``input_payload`` 스키마::
+
+        {"opening_message": "원문 오프닝", "count": 10, "tone": ""}
+    """
+    from .models import AiJob
+    from .services.dm_campaign_assistant import diversify_opening
+    from .services.model_router import resolve_vision_model
+
+    try:
+        job = AiJob.objects.get(pk=job_id)
+    except AiJob.DoesNotExist:
+        logger.error("AiJob 없음: %s", job_id)
+        return
+
+    job.status = AiJob.Status.RUNNING
+    job.started_at = timezone.now()
+    job.save(update_fields=["status", "started_at", "updated_at"])
+
+    payload = job.input_payload or {}
+    try:
+        job.set_stage(AiJob.Stage.CALLING_MODEL, 40, "AI가 오프닝 문구 변형을 생성하고 있습니다.")
+        result = diversify_opening(
+            opening_message=payload.get("opening_message", ""),
+            count=int(payload.get("count", 10)),
+            tone=payload.get("tone", ""),
+            model_name=resolve_vision_model(),
+        )
+        if not result.variants:
+            logger.warning(
+                "dm_diversify 파싱 실패 job=%s raw=%s",
+                job_id,
+                (result.raw_content or "")[:500],
+            )
+            raise ValueError("변형 생성 결과가 비어 있습니다 (LLM 응답 파싱 실패).")
+
+        job.model_name = result.model
+        job.result_json = {
+            "model": result.model,
+            "elapsed_seconds": result.elapsed_seconds,
+            "variants": result.variants,
+            "count": len(result.variants),
+            "requested_count": result.requested_count,
+            "usage": {
+                "prompt_tokens": result.prompt_tokens,
+                "completion_tokens": result.completion_tokens,
+                "total_tokens": result.total_tokens,
+                "estimated_cost_usd": round(result.estimated_cost_usd, 6),
+            },
+        }
+        job.status = AiJob.Status.SUCCEEDED
+        job.stage = AiJob.Stage.COMPLETED
+        job.progress = 100
+        job.message = "오프닝 변형 생성 완료."
+        job.finished_at = timezone.now()
+        job.save()
+        logger.info(
+            "dm_diversify 완료: job=%s variants=%d %.1fs",
+            job_id,
+            len(result.variants),
+            result.elapsed_seconds,
+        )
+    except Exception as exc:  # noqa: BLE001
+        job.status = AiJob.Status.FAILED
+        job.error_message = str(exc)[:1000]
+        job.message = "오프닝 변형 생성 중 오류가 발생했습니다."
+        job.finished_at = timezone.now()
+        job.save()
+        logger.exception("dm_diversify 실패: %s", job_id)

@@ -74,8 +74,11 @@ class TestNormalizeButtons:
             text="안녕하세요!",
             buttons=[{"type": "web_url", "title": "받기", "url": "https://x.io/a"}],
         )
-        btns = msg["attachment"]["payload"]["elements"][0]["buttons"]
-        assert btns == [{"type": "web_url", "title": "받기", "url": "https://x.io/a"}]
+        # button template: payload.text + payload.buttons (generic elements[].title 아님)
+        payload = msg["attachment"]["payload"]
+        assert payload["template_type"] == "button"
+        assert payload["text"] == "안녕하세요!"
+        assert payload["buttons"] == [{"type": "web_url", "title": "받기", "url": "https://x.io/a"}]
 
 
 # ── 발송 경로: 모드별 링크 버튼 첨부 (DB 필요) ─────────────────

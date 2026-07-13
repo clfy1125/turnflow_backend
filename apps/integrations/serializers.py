@@ -6,7 +6,68 @@ from django.utils import timezone
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
-from .models import AutoDMCampaign, IGAccountConnection, SentDMLog, SpamCommentLog, SpamFilterConfig
+from .models import (
+    BUTTON_TEMPLATE_TEXT_MAX,
+    DM_TEXT_MAX_BYTES,
+    AutoDMCampaign,
+    IGAccountConnection,
+    SentDMLog,
+    SpamCommentLog,
+    SpamFilterConfig,
+)
+
+
+def _dm_body_length_errors(
+    *,
+    follow_gate_enabled: bool,
+    follow_gate_prompt: str,
+    follow_gate_retry_message: str,
+    reward_message_template: str,
+    opening_message: str,
+    link_button_url: str,
+) -> dict:
+    """우리가 보내는 DM 본문 포맷별 Meta 글자수 한도 검증(상황에 맞는 한도).
+
+    버튼(postback/web_url)이 붙는 문구 → **button template text 640자**.
+    버튼이 없는 일반 텍스트 DM → **UTF-8 1000 바이트**(한글 ≈ 333자).
+    버튼 부착 여부:
+      - follow_gate_enabled: follow_gate_prompt·follow_gate_retry_message 는 항상 버튼(팔로우 postback);
+        reward 는 link_button_url 이 있을 때만 버튼(링크).
+      - 비게이트: opening 은 link_button_url 이 있을 때만 버튼(링크), 없으면 일반 텍스트.
+    반환: {필드명: 에러메시지} (없으면 {}).
+    """
+    has_link = bool((link_button_url or "").strip())
+    errors: dict = {}
+
+    def _check(field: str, label: str, text: str, buttoned: bool) -> None:
+        t = (text or "").strip()
+        if buttoned:
+            if len(t) > BUTTON_TEMPLATE_TEXT_MAX:
+                errors[field] = (
+                    f"{label}에는 버튼이 붙어 Meta 버튼 카드 한도({BUTTON_TEMPLATE_TEXT_MAX}자)를 "
+                    f"초과할 수 없습니다 (현재 {len(t)}자)."
+                )
+        else:
+            nbytes = len(t.encode("utf-8"))
+            if nbytes > DM_TEXT_MAX_BYTES:
+                approx = DM_TEXT_MAX_BYTES // 3
+                errors[field] = (
+                    f"{label}은 Meta 텍스트 메시지 한도(UTF-8 {DM_TEXT_MAX_BYTES}바이트, 한글 약 "
+                    f"{approx}자)를 초과할 수 없습니다 (현재 {nbytes}바이트)."
+                )
+
+    if follow_gate_enabled:
+        _check("follow_gate_prompt", "팔로우 게이트 안내 DM", follow_gate_prompt, buttoned=True)
+        _check(
+            "follow_gate_retry_message",
+            "팔로우 재안내 DM",
+            follow_gate_retry_message,
+            buttoned=True,
+        )
+        _check("reward_message_template", "리워드 DM", reward_message_template, buttoned=has_link)
+    else:
+        _check("opening_message_template", "오프닝 DM", opening_message, buttoned=has_link)
+    return errors
 
 
 class IGAccountConnectionSerializer(serializers.ModelSerializer):
@@ -473,13 +534,17 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
         required=False,
         allow_blank=True,
         default="",
-        help_text="첫 인사 DM 본문 (Private Reply via comment_id)",
+        help_text=(
+            "첫 인사 DM 본문 (Private Reply via comment_id). 글자수 한도는 상황에 따라 다름: "
+            "링크 버튼(link_button_url)을 붙이면 버튼 카드로 나가 **640자**, 버튼이 없으면 "
+            "일반 텍스트라 **UTF-8 1000바이트(한글 약 333자)**. 초과 시 400."
+        ),
     )
     message_template = serializers.CharField(
         required=False,
         allow_blank=True,
         default="",
-        help_text="legacy 별칭 — opening_message_template 미사용 시 이 값 사용",
+        help_text="legacy 별칭 — opening_message_template 미사용 시 이 값 사용 (동일한 글자수 한도 적용).",
     )
 
     # 공개 답글 (v3.5)
@@ -537,6 +602,7 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
         default="",
         help_text=(
             "Opening DM 본문 (게이트 안내 문구). 비우면 기본 문구 사용. "
+            "버튼(팔로우)이 항상 붙는 버튼 카드라 **640자** 한도(초과 시 400). "
             "예: '댓글 남겨주셔서 감사해요! 팔로우도 하셨나요? 버튼을 눌러주세요!'"
         ),
     )
@@ -553,10 +619,18 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
         default="",
         help_text=(
             "팔로우 미확인 시 재안내 문구. 비우면 시스템 기본 문구 사용. "
-            "재안내 메시지에도 같은 '팔로우했어요' 버튼이 자동 첨부된다."
+            "재안내 메시지에도 같은 '팔로우했어요' 버튼이 자동 첨부되는 버튼 카드라 **640자** 한도."
         ),
     )
-    reward_message_template = serializers.CharField(required=False, allow_blank=True, default="")
+    reward_message_template = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+        help_text=(
+            "팔로우 통과 후 보내는 본 DM. 링크 버튼(link_button_url)을 붙이면 버튼 카드로 나가 "
+            "**640자**, 버튼이 없으면 일반 텍스트라 **UTF-8 1000바이트(한글 약 333자)** 한도."
+        ),
+    )
 
     # 링크 버튼 (web_url) — 발송 DM 카드에 라벨 달린 링크 버튼으로 첨부.
     # 단순 DM·버튼클릭 즉시 reward·팔로우 검증 후 reward 모두에 적용된다(콘텐츠 전달 DM에 붙음).
@@ -711,6 +785,19 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
                     "scheduled_end_at": "scheduled_end_at 은 현재 시각보다 미래여야 합니다 (과거면 즉시 종료됨)."
                 }
             )
+        # 우리가 보내는 DM 본문 포맷별 Meta 글자수 한도 검증(버튼 640자 / 일반 텍스트 1000바이트).
+        length_errors = _dm_body_length_errors(
+            follow_gate_enabled=bool(attrs.get("follow_gate_enabled")),
+            follow_gate_prompt=attrs.get("follow_gate_prompt") or "",
+            follow_gate_retry_message=attrs.get("follow_gate_retry_message") or "",
+            reward_message_template=attrs.get("reward_message_template") or "",
+            opening_message=(
+                attrs.get("opening_message_template") or attrs.get("message_template") or ""
+            ),
+            link_button_url=attrs.get("link_button_url") or "",
+        )
+        if length_errors:
+            raise serializers.ValidationError(length_errors)
         return attrs
 
 
@@ -787,6 +874,27 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
             "recovery_keyword": {"required": False, "allow_blank": True},
             "recovery_ttl_seconds": {"required": False},
         }
+
+    def validate(self, attrs):
+        # 부분 수정(PATCH)이라 attrs 에 없는 필드는 기존 인스턴스 값으로 병합해 판정한다.
+        def _resolve(field, default=""):
+            if field in attrs:
+                return attrs[field]
+            return getattr(self.instance, field, default)
+
+        length_errors = _dm_body_length_errors(
+            follow_gate_enabled=bool(_resolve("follow_gate_enabled", False)),
+            follow_gate_prompt=_resolve("follow_gate_prompt", "") or "",
+            follow_gate_retry_message=_resolve("follow_gate_retry_message", "") or "",
+            reward_message_template=_resolve("reward_message_template", "") or "",
+            opening_message=(
+                _resolve("opening_message_template", "") or _resolve("message_template", "") or ""
+            ),
+            link_button_url=_resolve("link_button_url", "") or "",
+        )
+        if length_errors:
+            raise serializers.ValidationError(length_errors)
+        return attrs
 
 
 class AutoDMCampaignScheduleSerializer(serializers.Serializer):

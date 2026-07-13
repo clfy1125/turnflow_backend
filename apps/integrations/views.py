@@ -26,6 +26,8 @@ from rest_framework.response import Response
 from apps.ai_jobs.serializers import (
     AutoDMCampaignAiSuggestJobSerializer,
     AutoDMCampaignAiSuggestRequestSerializer,
+    DmOpeningDiversifyJobSerializer,
+    DmOpeningDiversifyRequestSerializer,
 )
 from apps.core.exceptions import DuplicateActiveCampaignError
 from apps.workspace.models import Workspace
@@ -2213,6 +2215,101 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
                 "status": job.status,
                 "poll_url": f"/api/v1/ai/jobs/{job.id}/",
                 "message": "캠페인 초안 생성을 시작했어요. 잠시 후 결과를 폴링해주세요.",
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+    @extend_schema(
+        summary="오프닝 DM 다양화 (AI 변형 N개 생성)",
+        description=(
+            "폼에서 확정한 오프닝 DM 1개를 넘기면 gemma-4 가 **톤·의미를 유지한 채** 표현만 바꾼 "
+            "변형 count 개를 생성한다. 오프닝이 하나로 통일돼 있으면 Meta 가 '동일 메시지 대량 발송'으로 "
+            "보고 스팸 판정할 수 있어, 이 변형들을 캠페인 opening 변형 풀로 써서 다양화한다.\n\n"
+            "## 흐름 (비동기 — gemma 가 느려 동기 응답은 prod 타임아웃)\n"
+            "1. `POST .../diversify-opening/?workspace_id=...` → `202 { job_id, poll_url, requested_count }`\n"
+            "2. `GET /api/v1/ai/jobs/{job_id}/` 를 1~2초 간격 폴링\n"
+            '3. `status === "succeeded"` 가 되면 `result_json.variants`(문자열 배열)를 사용\n\n'
+            "## 주의\n"
+            "- 각 변형은 원문과 같은 의미·톤. 새 정보/혜택/링크를 지어내지 않는다.\n"
+            "- 각 변형은 640자 이내(버튼 카드 한도). 링크 URL 은 본문에 안 들어간다(버튼으로 첨부).\n"
+            "- count 기본 10, 2~30 (30개 ≈ 25초).\n\n"
+            "## 요청 예시\n"
+            "```js\n"
+            "const res = await fetch(\n"
+            "  `/api/v1/integrations/auto-dm-campaigns/diversify-opening/?workspace_id=${wsId}`,\n"
+            "  { method: 'POST',\n"
+            "    headers: { Authorization: `Bearer ${access}`, 'Content-Type': 'application/json' },\n"
+            "    body: JSON.stringify({ opening_message: form.opening, count: 10 }) }\n"
+            ");\n"
+            "const { job_id } = await res.json();\n"
+            "// 이후 GET /api/v1/ai/jobs/{job_id}/ 폴링 → result_json.variants (문자열 배열)\n"
+            "```\n\n"
+            "## 인증\n"
+            "JWT 필요. `workspace_id` 쿼리 파라미터 필수 + 해당 워크스페이스 멤버여야 한다."
+        ),
+        parameters=[
+            OpenApiParameter(
+                name="workspace_id",
+                location=OpenApiParameter.QUERY,
+                required=True,
+                type=str,
+                description="워크스페이스 UUID (멤버십 검증).",
+            ),
+        ],
+        request=DmOpeningDiversifyRequestSerializer,
+        responses={
+            202: OpenApiResponse(
+                response=DmOpeningDiversifyJobSerializer,
+                description="변형 생성 작업이 큐에 등록됨. poll_url 폴링 → result_json.variants.",
+            ),
+            400: OpenApiResponse(description="opening_message 누락 / count 형식 오류"),
+            401: OpenApiResponse(description="인증 실패 - 유효하지 않은 토큰"),
+            403: OpenApiResponse(description="권한 없음 - 워크스페이스 멤버가 아님"),
+            404: OpenApiResponse(description="workspace_id 에 해당하는 워크스페이스 없음"),
+            500: OpenApiResponse(description="서버 내부 오류"),
+        },
+        tags=["Auto DM"],
+    )
+    @action(detail=False, methods=["post"], url_path="diversify-opening")
+    def diversify_opening(self, request):
+        from rest_framework.exceptions import NotFound, PermissionDenied
+
+        from apps.ai_jobs.models import AiJob
+        from apps.ai_jobs.tasks import run_dm_opening_diversify_job
+
+        workspace_id = request.query_params.get("workspace_id")
+        if not workspace_id:
+            raise DRFValidationError({"workspace_id": "workspace_id 쿼리 파라미터가 필요합니다."})
+        try:
+            workspace = Workspace.objects.get(id=workspace_id)
+        except (Workspace.DoesNotExist, DjangoValidationError, ValueError, TypeError):
+            raise NotFound("Workspace 를 찾을 수 없습니다.") from None
+        if not workspace.memberships.filter(user=request.user).exists():
+            raise PermissionDenied("이 워크스페이스의 멤버가 아닙니다.")
+
+        ser = DmOpeningDiversifyRequestSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        vd = ser.validated_data
+
+        job = AiJob.objects.create(
+            user=request.user,
+            job_type=AiJob.JobType.DM_OPENING_DIVERSIFY,
+            llm_model=AiJob.LlmModel.GEMMA,
+            input_payload={
+                "opening_message": vd["opening_message"],
+                "count": vd.get("count", 10),
+                "tone": vd.get("tone", ""),
+                "workspace_id": str(workspace.id),
+            },
+        )
+        run_dm_opening_diversify_job.delay(str(job.id))
+        return Response(
+            {
+                "job_id": str(job.id),
+                "status": job.status,
+                "poll_url": f"/api/v1/ai/jobs/{job.id}/",
+                "requested_count": vd.get("count", 10),
+                "message": "오프닝 변형 생성을 시작했어요. 잠시 후 결과를 폴링해주세요.",
             },
             status=status.HTTP_202_ACCEPTED,
         )

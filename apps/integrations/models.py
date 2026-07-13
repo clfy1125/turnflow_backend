@@ -437,6 +437,19 @@ def compose_recovery_reply() -> str:
     return msg
 
 
+# Meta Instagram 메시지 포맷별 글자수 한도 (Meta 공식 문서 기준).
+#  - 버튼(postback/web_url)이 붙는 DM 은 **button template** 로 발송 → text 640자
+#    (services._build_message_payload). postback·web_url 모두 button template 지원 확인됨.
+#  - 버튼이 없는 일반 텍스트 DM 은 UTF-8 **1000 바이트**(한글 ≈ 333자).
+#  - 댓글 답글(공개답글/복구답글)은 IG 댓글 한도 2200자.
+#  - 버튼 라벨(title)은 20자.
+# 시리얼라이저 검증·AI 초안 생성·발송 페이로드가 이 상수를 공유한다.
+BUTTON_TEMPLATE_TEXT_MAX = 640  # 버튼 붙는 DM (button template text, 문자 기준)
+DM_TEXT_MAX_BYTES = 1000  # 일반 텍스트 DM (UTF-8 바이트 기준)
+COMMENT_REPLY_MAX = 2200  # IG 댓글 답글 (공개답글/복구답글)
+BUTTON_TITLE_MAX = 20  # 버튼 라벨(title)
+
+
 class AutoDMCampaign(models.Model):
     """
     자동 DM 발송 캠페인 (v3.3 — 트리거/키워드/공개답글/Follow-gate 확장).

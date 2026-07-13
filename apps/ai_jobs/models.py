@@ -17,6 +17,9 @@ class AiJob(models.Model):
         # 게시물(이미지+캡션) → AutoDM 캠페인 폼 초안. gemma-4 가 50개 답글 등 긴 출력을
         # 만드느라 수십 초가 걸려 동기 응답은 prod gunicorn 타임아웃에 걸린다 → AiJob 으로 처리.
         DM_CAMPAIGN_ASSIST = "dm_campaign_assist", "DM 캠페인 폼 자동완성"
+        # 오프닝 DM 1개를 톤·의미 유지한 채 N개 변형으로 다양화(스팸 탐지 회피). gemma-4 가
+        # 변형 N개(수십 초) 를 만들어 동기 응답은 타임아웃 → AiJob 폴링으로 처리.
+        DM_OPENING_DIVERSIFY = "dm_opening_diversify", "오프닝 DM 다양화"
 
     class LlmModel(models.TextChoices):
         GEMMA = "gemma", "Gemma (자체 H100, 폴백/오버플로우)"

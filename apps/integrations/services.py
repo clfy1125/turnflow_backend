@@ -594,30 +594,40 @@ class InstagramMessagingService:
     ) -> dict:
         """Meta IG message 페이로드 빌드.
 
-        - buttons 있음 → generic template (카드 + postback 버튼)
+        - buttons 있음 → button template (text 640자 + postback/web_url 버튼 1~3개)
         - quick_replies 있음 → plain text + quick_replies
         - 둘 다 없음 → plain text
+        발송 직전 방어 클립: 버튼 텍스트 640자, 일반 텍스트 UTF-8 1000바이트(멀티바이트 미분할).
         """
         if buttons:
             norm = cls._normalize_buttons(buttons)
             if norm:
-                # Meta IG generic: elements[0].title 필수 (80자 한도)
-                title = (text or " ").strip() or " "
+                # Meta IG **button template**: text(640자) + 버튼 1~3개(postback/web_url).
+                # generic(title 80자) 대신 button 을 써서 본문을 640자까지 보낼 수 있다.
+                # (postback·web_url 모두 button template 지원 — Meta 공식 문서 확인)
+                from .models import BUTTON_TEMPLATE_TEXT_MAX
+
+                text_val = (text or " ").strip() or " "
                 return {
                     "attachment": {
                         "type": "template",
                         "payload": {
-                            "template_type": "generic",
-                            "elements": [
-                                {
-                                    "title": title[:80],
-                                    "buttons": norm,
-                                }
-                            ],
+                            "template_type": "button",
+                            "text": text_val[:BUTTON_TEMPLATE_TEXT_MAX],
+                            "buttons": norm,
                         },
                     }
                 }
-        message: dict = {"text": text}
+        # 일반 텍스트 DM: Meta UTF-8 1000바이트 한도 → 발송 직전 바이트 안전 클립.
+        # (시리얼라이저가 생성 시 막지만, 큐 적재 후 버튼 제거 등으로 포맷이 바뀌어 평문이 될 수 있어
+        #  발송 지점에서도 2차 방어. errors="ignore" 로 끝의 잘린 멀티바이트 문자 제거.)
+        from .models import DM_TEXT_MAX_BYTES
+
+        message_text = text or ""
+        encoded = message_text.encode("utf-8")
+        if len(encoded) > DM_TEXT_MAX_BYTES:
+            message_text = encoded[:DM_TEXT_MAX_BYTES].decode("utf-8", "ignore")
+        message: dict = {"text": message_text}
         if quick_replies:
             qr = cls._normalize_quick_replies(quick_replies)
             if qr:
