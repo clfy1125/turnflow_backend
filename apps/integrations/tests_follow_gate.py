@@ -259,6 +259,150 @@ class TestFollowGateRegression:
         assert opening.gate_status == SentDMLog.GateStatus.PENDING
 
 
+# ===== 체인(재안내 경유) 게이트 통과 — 루트 마킹/중복 방어 =====
+
+
+class TestGateChainRootMarking:
+    """재안내(retry) 버튼으로 통과한 플로우의 루트 마킹/중복 방어.
+
+    prod 실측(2026-07-07, 재안내 경유 통과 플로우): PASSED 가 클릭된 재안내 행에만
+    붙고 루트 opening 은 PENDING 잔존 → 기본 로그 API 의 follow_passed=false
+    (영구 '미전환' 표시) + 원래 opening 버튼 재클릭 시 reward 중복 발송 구멍.
+    """
+
+    def _pass_via_retry(self, campaign, follow_check):
+        """opening → (미팔로우) 재안내 → (팔로우 후) 재안내 버튼으로 통과하는 공통 시나리오."""
+        opening = _make_opening(campaign)
+        follow_check.return_value = False
+        res1 = _run_postback(opening)
+        assert res1["status"] == "retry_enqueued"
+        retry = SentDMLog.objects.get(id=res1["retry_log_id"])
+
+        follow_check.return_value = True
+        res2 = _run_postback(retry)  # 사용자는 '재안내 DM 의 버튼'을 누른다
+        assert res2["status"] == "reward_enqueued"
+        return opening, retry
+
+    def test_pass_via_retry_marks_root_passed(self, ig_connection, no_real_send, follow_check):
+        campaign = _make_campaign(ig_connection)
+        opening, retry = self._pass_via_retry(campaign, follow_check)
+
+        opening.refresh_from_db()
+        retry.refresh_from_db()
+        # 핵심 회귀 지점 — 기존 버그: 루트가 PENDING 잔존해 follow_passed=false 로 표시
+        assert opening.gate_status == SentDMLog.GateStatus.PASSED
+        assert retry.gate_status == SentDMLog.GateStatus.PASSED
+
+    def test_root_button_after_retry_pass_is_noop(self, ig_connection, no_real_send, follow_check):
+        campaign = _make_campaign(ig_connection)
+        opening, _ = self._pass_via_retry(campaign, follow_check)
+
+        res = _run_postback(opening)  # 통과 후 원래 opening 버튼 재클릭
+        assert res["status"] == "already_passed"
+        assert (
+            SentDMLog.objects.filter(campaign=campaign, dm_kind=SentDMLog.DMKind.REWARD).count()
+            == 1
+        )
+
+    def test_historical_pending_root_does_not_double_reward(
+        self, ig_connection, no_real_send, follow_check
+    ):
+        """수정 배포 전 데이터 모양(루트 PENDING + 재안내 PASSED + reward 는 재안내에 부착)
+        재현 — 루트 버튼 클릭이 두 번째 reward 를 만들지 않고 루트를 PASSED 로 복구해야 한다."""
+        campaign = _make_campaign(ig_connection)
+        opening = _make_opening(campaign)  # 루트: 구버전 버그로 PENDING 잔존
+        retry = _make_opening(campaign, parent_log=opening, gate_status=SentDMLog.GateStatus.PASSED)
+        _make_opening(  # 기존 reward — 구버전 멱등키(클릭된 재안내 기준)로 발송된 상태
+            campaign,
+            parent_log=retry,
+            dm_kind=SentDMLog.DMKind.REWARD,
+            gate_status=SentDMLog.GateStatus.PASSED,
+        )
+        # postback 쿨다운(클릭 노드의 최근 자식) 회피 — 과거 플로우이므로 시간도 과거로
+        SentDMLog.objects.filter(campaign=campaign).update(
+            created_at=timezone.now() - timedelta(minutes=5)
+        )
+
+        follow_check.return_value = True
+        res = _run_postback(opening)
+
+        assert res["status"] == "duplicate_reward"
+        assert (
+            SentDMLog.objects.filter(campaign=campaign, dm_kind=SentDMLog.DMKind.REWARD).count()
+            == 1
+        )
+        opening.refresh_from_db()
+        assert opening.gate_status == SentDMLog.GateStatus.PASSED  # 데이터 자가 복구
+
+    def test_retry_throttled_within_30s_across_chain(
+        self, ig_connection, no_real_send, follow_check
+    ):
+        """재안내 직후(30초 내) 새 재안내 버튼을 또 눌러도 재안내가 중복 발송되지 않는다.
+
+        재안내마다 자기 id 의 새 버튼이 생겨 '클릭 노드의 자식' 쿨다운은 새 버튼에 무력
+        — 플로우 전체 스로틀로 막는다. 통과(reward) 경로는 스로틀 대상이 아니다.
+        """
+        campaign = _make_campaign(ig_connection)
+        opening = _make_opening(campaign)
+        follow_check.return_value = False
+        res1 = _run_postback(opening)
+        assert res1["status"] == "retry_enqueued"
+        retry = SentDMLog.objects.get(id=res1["retry_log_id"])
+
+        res2 = _run_postback(retry)  # 여전히 미팔로우 상태로 즉시 재클릭
+        assert res2["status"] == "skipped"
+        assert res2["reason"] == "retry_cooldown"
+        assert (
+            SentDMLog.objects.filter(
+                campaign=campaign, parent_log__isnull=False, dm_kind=SentDMLog.DMKind.OPENING
+            ).count()
+            == 1
+        )
+
+    def test_follow_check_result_recorded(self, ig_connection, no_real_send, follow_check):
+        """판정 근거(verification_log path=follow_check)가 클릭된 로그에 남는다."""
+        campaign = _make_campaign(ig_connection)
+        opening = _make_opening(campaign)
+        follow_check.return_value = False
+
+        _run_postback(opening)
+
+        opening.refresh_from_db()
+        entries = [e for e in opening.verification_log if e.get("path") == "follow_check"]
+        assert len(entries) == 1
+        assert entries[0]["result"] is False
+        assert entries[0]["igsid"] == IGSID
+
+
+# ===== flow_role 시리얼라이저 라벨 =====
+
+
+class TestFlowRoleSerializer:
+    def test_flow_role_labels(self, ig_connection):
+        from apps.integrations.serializers import SentDMLogSerializer
+
+        campaign = _make_campaign(ig_connection)
+        opening = _make_opening(campaign)
+        retry = _make_opening(campaign, parent_log=opening)
+        reward = _make_opening(
+            campaign,
+            parent_log=retry,
+            dm_kind=SentDMLog.DMKind.REWARD,
+            gate_status=SentDMLog.GateStatus.PASSED,
+        )
+        standalone = _make_opening(
+            campaign, dm_kind=SentDMLog.DMKind.STANDALONE, gate_status=SentDMLog.GateStatus.NONE
+        )
+
+        def role(log):
+            return SentDMLogSerializer(log).data["flow_role"]
+
+        assert role(opening) == "opening"
+        assert role(retry) == "retry"  # dm_kind 는 opening 이지만 child → retry 로 라벨
+        assert role(reward) == "reward"
+        assert role(standalone) == "standalone"
+
+
 # ===== opening DM enqueue 분류 =====
 
 

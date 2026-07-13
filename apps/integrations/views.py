@@ -9,7 +9,7 @@ from datetime import timedelta
 import requests
 from django.conf import settings
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db.models import F
+from django.db.models import Count, F, Q
 from django.http import HttpResponse
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
@@ -3572,13 +3572,35 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
 
     @extend_schema(
         summary="캠페인 통계 조회",
-        description="캠페인의 발송 통계를 조회합니다.",
-        responses={200: OpenApiResponse(description="통계 정보")},
+        description=(
+            "캠페인의 발송 통계를 조회합니다.\n\n"
+            "**인증**: JWT 필수. 해당 워크스페이스 멤버만 조회 가능.\n\n"
+            "**응답 필드**\n"
+            "- `total_sent` / `total_failed` / `total_unconfirmed`: 캠페인 누적 카운터 "
+            "(사람/댓글 단위 — 재안내·보상 DM 은 세지 않음)\n"
+            "- `last_24h`: 최근 24시간 로그 집계 (opening/standalone 부모 행만, 댓글 1건=1행)\n"
+            "  - `sent`: 발송 성공 (Meta 접수 이후 — accepted/delivered/read)\n"
+            "  - `delivered`: 그중 도착 확정 (delivered/read)\n"
+            "  - `read`: 그중 읽음 확인\n"
+            "  - `failed`: 발송 실패 (토큰만료/윈도우만료/파라미터오류 등)\n"
+            "  - `pending`: 진행 중 (큐 대기/API 호출 중/지연)\n"
+            "  - `skipped`: 건너뜀 / `unconfirmed`: 도착 미확인 (실패 아님, 자가점검 대상)\n\n"
+            "⚠️ v3 상태머신에서 성공 DM 은 accepted→delivered→read 로 전이하며 "
+            "legacy 'sent' 상태가 되지 않습니다 — sent 는 이 상태들의 합계입니다."
+        ),
+        responses={
+            200: OpenApiResponse(description="통계 정보"),
+            401: OpenApiResponse(description="인증 필요"),
+            403: OpenApiResponse(description="권한 없음 (해당 workspace 멤버 아님)"),
+            404: OpenApiResponse(description="캠페인을 찾을 수 없음"),
+        },
         tags=["Auto DM"],
     )
     @action(detail=True, methods=["get"])
     def stats(self, request, pk=None):
         """캠페인 통계"""
+        from .campaign_stats import FAILED_STATUSES, IN_FLIGHT_STATUSES, SENT_OK_STATUSES
+
         campaign = self.get_object()
 
         # 최근 24시간 통계
@@ -3586,6 +3608,19 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         # opening / standalone 행만 카운트해 "댓글 1건 = 1 row" 와 일치시킨다.
         last_24h = timezone.now() - timedelta(hours=24)
         recent_logs = campaign.dm_logs.filter(created_at__gte=last_24h, parent_log__isnull=True)
+
+        # 성공 = accepted 이후(v3) + legacy sent. status='sent' 단독 카운트는 v3 전환 후
+        # 성공할수록 0 이 되는 함정이었다 (2026-07-07 prod 실측 — delivered/read 만 존재).
+        agg = recent_logs.aggregate(
+            total=Count("id"),
+            sent=Count("id", filter=Q(status__in=SENT_OK_STATUSES)),
+            delivered=Count("id", filter=Q(status__in=SentDMLog.DELIVERED_STATUSES)),
+            read=Count("id", filter=Q(status=SentDMLog.Status.READ)),
+            failed=Count("id", filter=Q(status__in=FAILED_STATUSES)),
+            pending=Count("id", filter=Q(status__in=IN_FLIGHT_STATUSES)),
+            skipped=Count("id", filter=Q(status=SentDMLog.Status.SKIPPED)),
+            unconfirmed=Count("id", filter=Q(status=SentDMLog.Status.FAILED_NO_TRACE)),
+        )
 
         stats = {
             "total_sent": campaign.total_sent,
@@ -3597,13 +3632,7 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
                 if (campaign.total_sent + campaign.total_failed) > 0
                 else 0
             ),
-            "last_24h": {
-                "total": recent_logs.count(),
-                "sent": recent_logs.filter(status=SentDMLog.Status.SENT).count(),
-                "failed": recent_logs.filter(status=SentDMLog.Status.FAILED).count(),
-                "pending": recent_logs.filter(status=SentDMLog.Status.PENDING).count(),
-                "skipped": recent_logs.filter(status=SentDMLog.Status.SKIPPED).count(),
-            },
+            "last_24h": agg,
             "can_send_more": campaign.can_send_more(),
             "status": campaign.status,
         }

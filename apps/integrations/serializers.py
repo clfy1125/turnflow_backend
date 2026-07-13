@@ -1053,6 +1053,9 @@ class SentDMLogSerializer(serializers.ModelSerializer):
     frontend_action = serializers.SerializerMethodField()
     # v3.8: 캠페인 로그 1행 = opening 1건 기준. 그 흐름에서 팔로우 전환됐는지를 한눈에.
     follow_passed = serializers.SerializerMethodField()
+    # 이 행의 플로우 내 역할. 재안내(retry)는 quick_reply 재첨부를 위해 dm_kind=opening 으로
+    # 저장되므로 dm_kind 만으로는 오프닝과 구분 불가 — 프론트는 이 필드로 라벨링할 것.
+    flow_role = serializers.SerializerMethodField()
 
     class Meta:
         model = SentDMLog
@@ -1103,6 +1106,8 @@ class SentDMLogSerializer(serializers.ModelSerializer):
             "public_reply_posted_at",
             # v3.8: 팔로우 전환 여부 (opening 1행만 보여줄 때 핵심 지표)
             "follow_passed",
+            # 플로우 내 역할: opening / retry / reward / standalone (표시용)
+            "flow_role",
         ]
         read_only_fields = fields  # 모두 읽기 전용
 
@@ -1144,6 +1149,23 @@ class SentDMLogSerializer(serializers.ModelSerializer):
         if obj.dm_kind != SentDMLog.DMKind.OPENING:
             return None
         return obj.gate_status == SentDMLog.GateStatus.PASSED
+
+    @extend_schema_field(
+        serializers.ChoiceField(choices=["opening", "retry", "reward", "standalone"])
+    )
+    def get_flow_role(self, obj) -> str:
+        """플로우 내 역할 (include_children=true 전체 행 표시 시 행 라벨용).
+
+        - opening    : 루트 오프닝 DM (댓글 1건 = 1행)
+        - retry      : 팔로우 미확인 재안내 DM (dm_kind 는 opening 이지만 child 행)
+        - reward     : 게이트 통과 보상 DM
+        - standalone : 게이트 미사용 단발 DM
+        """
+        if obj.dm_kind == SentDMLog.DMKind.REWARD:
+            return "reward"
+        if obj.dm_kind == SentDMLog.DMKind.OPENING:
+            return "retry" if obj.parent_log_id is not None else "opening"
+        return "standalone"
 
 
 _STATUS_DISPLAY = {
