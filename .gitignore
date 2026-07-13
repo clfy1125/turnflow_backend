@@ -5,7 +5,16 @@
 
 # Backup secrets & artifacts (GATE-0) — *.example 템플릿은 추적 유지(이름이 달라 매칭 안 됨)
 .env.backup
+.env.bak*
 .deploy.prev
+
+# 이메일 템플릿 미리보기 산출물 (scripts/preview_emails.py) — 커밋 불필요
+/email_previews/
+/*_preview.png
+
+# JWT RS256 키 (개인키 포함) — 절대 커밋 금지. 공개키만 외부 전달.
+/secrets/
+*.pem
 /backups/
 *.dump.gpg
 *.sql.gz.gpg

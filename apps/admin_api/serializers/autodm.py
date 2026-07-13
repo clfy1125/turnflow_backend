@@ -78,6 +78,9 @@ def _build_stats(queryset) -> dict:
         failed_param=Count("id", filter=Q(status="failed_param")),
         failed_no_trace=Count("id", filter=Q(status="failed_no_trace")),
         skipped=Count("id", filter=Q(status="skipped")),
+        recovery_pending=Count("id", filter=Q(status="recovery_pending")),
+        recovery_delivered=Count("id", filter=Q(status="recovery_delivered")),
+        recovery_expired=Count("id", filter=Q(status="recovery_expired")),
         legacy_sent=Count("id", filter=Q(status="sent")),
         legacy_failed=Count("id", filter=Q(status="failed")),
         legacy_failed_api=Count("id", filter=Q(status="failed_api")),
@@ -92,8 +95,14 @@ def _build_stats(queryset) -> dict:
         public_replies_posted=Count("id", filter=~Q(public_reply_id="")),
     )
 
-    accepted_or_after = agg["accepted"] + agg["delivered"] + agg["read"] + agg["failed_no_trace"]
-    confirmed_delivered = agg["delivered"] + agg["read"]
+    accepted_or_after = (
+        agg["accepted"]
+        + agg["delivered"]
+        + agg["read"]
+        + agg["failed_no_trace"]
+        + agg["recovery_delivered"]  # 복구 재전송 성공 = 실제 도착 (분모·분자 포함)
+    )
+    confirmed_delivered = agg["delivered"] + agg["read"] + agg["recovery_delivered"]
 
     delivery_rate = confirmed_delivered / accepted_or_after if accepted_or_after else 0.0
     read_rate = agg["read"] / confirmed_delivered if confirmed_delivered else 0.0

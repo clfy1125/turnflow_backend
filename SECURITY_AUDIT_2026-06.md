@@ -419,7 +419,7 @@ if not (sig and hmac.compare_digest(sig, expected)):
 - 프롬프트 인젝션(concept/caption)으로 result_json 조작(URL 스킴은 차단되나 텍스트/CSS·video 환각 통과) **[↻ ❌ 미해결]**
 
 ### 로깅·PII
-- Resend 발송 실패 시 수신자 이메일(PII)을 예외 로그에 기록 — [apps/emails/services/resend_client.py:55](apps/emails/services/resend_client.py#L55) **[↻ ⚠️ 부분 — 포맷 인자로 로깅되나 `logger.exception` traceback도 기록]**
+- 이메일 발송 실패 시 수신자 이메일(PII)을 예외 로그에 기록 — [apps/emails/services/cloudflare_client.py](apps/emails/services/cloudflare_client.py) **[↻ ✅ 조치 — 2026-07-09 Cloudflare 전환 시 `_mask_email()` 로 로컬파트 마스킹(`j***@domain`). 단 `logger.exception` traceback 은 여전히 SDK 내부 표현에 따라 잔존 가능]**
 - 방문자 IP 해시가 무염(unsalted) SHA-256 → IPv4 전수 역산으로 재식별 가능 → HMAC 키드 해시로 **[↻ ❌ 미해결 [stats.py:123](apps/pages/stats.py#L123)]**
 
 ### 의존성 (버전 기반 분석, confidence medium)

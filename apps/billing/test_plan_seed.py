@@ -15,6 +15,7 @@ REQUIRED_KEYS = {
     "dm_monthly_limit",
     "analytics_export",
     "spam_filter",
+    "dm_recovery",
     "max_ig_accounts",
 }
 
@@ -27,6 +28,7 @@ EXPECTED = {
         "dm_monthly_limit": 200,
         "analytics_export": False,
         "spam_filter": False,
+        "dm_recovery": False,
         "max_ig_accounts": 1,
         "ai_unlimited": False,
         "custom_css": True,
@@ -39,6 +41,7 @@ EXPECTED = {
         "dm_monthly_limit": 200,
         "analytics_export": True,
         "spam_filter": False,
+        "dm_recovery": False,
         "max_ig_accounts": 1,
         "ai_unlimited": True,
         "custom_css": True,
@@ -51,6 +54,7 @@ EXPECTED = {
         "dm_monthly_limit": -1,
         "analytics_export": True,
         "spam_filter": True,
+        "dm_recovery": True,
         "max_ig_accounts": 1,  # 기본 1 — 추가는 구독 extra_ig_accounts
         "ai_unlimited": True,
         "custom_css": True,

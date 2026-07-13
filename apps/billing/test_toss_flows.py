@@ -402,16 +402,19 @@ class TestExtraAccounts:
         sub.refresh_from_db()
         assert sub.extra_ig_accounts == 0
 
-    def test_decrease_requires_disconnecting_first(self, user, toss):
+    def test_decrease_defers_to_next_renewal(self, user, toss):
+        """축소는 즉시 반영/거부하지 않고 다음 갱신으로 예약만 한다(초과 연동이어도)."""
         from apps.integrations.models import IGAccountConnection
         from apps.workspace.models import Workspace
 
         sub = self._pro_user(user, toss)
         sub.extra_ig_accounts = 2
         sub.save(update_fields=["extra_ig_accounts"])
+        toss.charges.clear()
 
+        # 허용량(3)을 초과해 연동돼 있어도 거부하지 않는다
         ws = Workspace.objects.create(name="w", slug=f"w-{uuid.uuid4().hex[:8]}", owner=user)
-        for i in range(3):  # 1(기본)+2(추가) = 3개 연동 중
+        for i in range(3):
             IGAccountConnection.objects.create(
                 workspace=ws,
                 external_account_id=f"ig_{uuid.uuid4().hex[:8]}",
@@ -420,9 +423,48 @@ class TestExtraAccounts:
                 status=IGAccountConnection.Status.ACTIVE,
             )
 
+        result = change_extra_accounts(user, 0)
+
+        sub = result["subscription"]
+        assert result["payment"] is None
+        assert toss.charges == []
+        assert sub.extra_ig_accounts == 2  # 이번 주기는 그대로
+        assert sub.pending_extra_ig_accounts == 0  # 다음 갱신에 0으로 예약
+        assert result["effective_at"] == sub.current_period_end
+        assert sub.renewal_amount == sub.monthly_amount_snapshot  # 축소 반영된 갱신액
+
+    def test_decrease_reservation_can_be_cancelled(self, user, toss):
+        sub = self._pro_user(user, toss)
+        sub.extra_ig_accounts = 2
+        sub.save(update_fields=["extra_ig_accounts"])
+        change_extra_accounts(user, 1)  # 축소 예약 (2 → 1)
+        assert ensure_subscription(user).pending_extra_ig_accounts == 1
+
+        result = change_extra_accounts(user, 2)  # 현재값 재요청 = 예약 취소
+
+        assert result["subscription"].pending_extra_ig_accounts is None
+        assert "취소" in result["detail"]
+
+    def test_increase_clears_pending_decrease(self, user, toss):
+        sub = self._pro_user(user, toss)
+        sub.extra_ig_accounts = 2
+        sub.save(update_fields=["extra_ig_accounts"])
+        change_extra_accounts(user, 0)  # 축소 예약 (pending=0)
+        assert ensure_subscription(user).pending_extra_ig_accounts == 0
+        toss.charges.clear()
+
+        result = change_extra_accounts(user, 3)  # 증가 → 즉시 반영 + 예약 해제
+
+        sub = result["subscription"]
+        assert sub.extra_ig_accounts == 3
+        assert sub.pending_extra_ig_accounts is None
+        assert len(toss.charges) == 1
+
+    def test_same_count_no_pending_rejected(self, user, toss):
+        self._pro_user(user, toss)
         with pytest.raises(BillingFlowError) as e:
-            change_extra_accounts(user, 0)  # 허용 1개인데 3개 연동 중
-        assert "해제" in e.value.detail
+            change_extra_accounts(user, 0)  # 현재 0, 예약 없음 → 동일
+        assert "동일" in e.value.detail
 
     def test_basic_user_rejected(self, user, toss):
         confirm_billing(user, auth_key="ak1", plan_name="basic")

@@ -34,7 +34,7 @@ class EmailTemplate(models.Model):
     from_name = models.CharField(
         max_length=100,
         blank=True,
-        help_text="비워두면 settings.RESEND_FROM_NAME 사용",
+        help_text="비워두면 settings.EMAIL_FROM_NAME 사용",
         verbose_name="발신자 이름 (override)",
     )
     is_active = models.BooleanField(default=True, verbose_name="활성화")
@@ -132,10 +132,13 @@ class EmailToken(models.Model):
         return row, raw_token
 
     @classmethod
-    def consume(cls, *, raw_token: str | None = None, code: str | None = None,
-                user=None, purpose: str) -> "EmailToken | None":
+    def consume(
+        cls, *, raw_token: str | None = None, code: str | None = None, user=None, purpose: str
+    ) -> "EmailToken | None":
         """Look up a live token by raw token OR (user + code), atomically mark used."""
-        qs = cls.objects.filter(purpose=purpose, used_at__isnull=True, expires_at__gt=timezone.now())
+        qs = cls.objects.filter(
+            purpose=purpose, used_at__isnull=True, expires_at__gt=timezone.now()
+        )
         if raw_token:
             qs = qs.filter(token_hash=cls.hash_token(raw_token))
         elif user and code:

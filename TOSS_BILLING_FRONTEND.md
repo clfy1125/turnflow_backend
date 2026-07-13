@@ -115,7 +115,7 @@ const res = await api.post('/billing/toss/confirm/', {
 | 플랜 변경 | `POST /billing/change-plan/` `{plan_name}` | 업그레이드=**남은 기간분 차액만 즉시 비례 결제 + 갱신일 유지** / 다운그레이드=`effective_at`에 적용 |
 | 플랜 변경 **견적** | `POST /billing/change-plan/preview/` `{plan_name}` | **결제 전 미리보기(부작용 0)**. `immediate_charge.amount`=지금 청구액. → §3-1 |
 | 카드 변경 | prepare → requestBillingAuth → confirm(`plan_name` 생략) | past_due면 자동 재시도됨 |
-| 추가 IG 계정 (pro) | `POST /billing/extra-accounts/` `{count}` | 증가분 × 9,900원을 **잔여일만큼 비례 즉시 결제**, 다음 갱신부터 전체 합산 |
+| 추가 IG 계정 (pro) | `POST /billing/extra-accounts/` `{count}` | **증가**=잔여일 비례 즉시 결제·즉시 반영 / **축소**=다음 갱신으로 **예약**(즉시 반영·거부 없음, `effective_at`) / 현재값 재요청=예약 취소 → §3-2 |
 | 추가 IG 계정 **견적** | `POST /billing/extra-accounts/preview/` `{count}` | **결제 전 미리보기(부작용 0)**. `unit_price`(9,900) 포함. → §3-1 |
 | 결제 내역 | `GET /billing/payments/history/` | `receipt_url` = 토스 영수증 |
 | 환불 가능 여부 | `GET /billing/refund-eligibility/` | 결제 후 7일 + 유료 기능 미사용 |
@@ -129,8 +129,18 @@ const res = await api.post('/billing/toss/confirm/', {
 
 - **업그레이드**(basic→pro): `지금 청구 = (프로 잔여분) − (기존 베이직 잔여 크레딧)`. 예) 잔여 12일이면 약 2,400원만 즉시 결제, 갱신일 그대로, 다음 달부터 프로 전액.
 - **추가 계정 증가**: `지금 청구 = 9,900 × 증가분 × (잔여일/30)`. 예) 7일차에 1개 추가(잔여 23일) → 약 7,590원.
-- **다운그레이드 / 계정 축소**: 즉시 청구·환불 **없음**. 다음 갱신부터 낮은 금액(다운그레이드는 `effective_at`에 적용).
+- **다운그레이드 / 계정 축소**: 즉시 청구·환불 **없음**. 다음 갱신부터 낮은 금액(`effective_at`=현재 주기 종료일에 적용).
 - 주기 말에 걸쳐 잔여 금액이 0이면 **무과금으로 즉시 적용**되고 `payment`/`immediate_charge.amount`는 0.
+
+#### 3-2. 추가 IG 계정 축소는 "지연 반영"입니다 (⭐신규 2026-07)
+
+- **축소 요청은 즉시 슬롯을 줄이지 않고 예약만** 합니다. 이번 주기는 그대로 쓰고, **다음 갱신일부터**
+  슬롯/금액이 낮아집니다. 연동 계정이 새 허용량을 초과해도 **거부하지 않습니다**.
+  - `my-subscription` 에 `pending_extra_ig_accounts`(예약값, 없으면 null) 노출. `extra_ig_accounts` 는 이번 주기 값 그대로.
+  - 축소 응답의 `effective_at` = 현재 주기 종료일. 확인 문구: "다음 갱신일({effective_at})부터 낮아진 금액이 적용됩니다".
+- **예약 취소**: 현재 적용값(`extra_ig_accounts`)과 같은 `count` 로 다시 요청 → 예약 해제(플랜 변경 예약 취소와 동일 관례).
+- 갱신 시 허용량이 줄어 활성 IG 계정이 초과되면 **자동 비활성** 처리되고, 사용자는
+  `GET/POST /billing/ig-account-activation/` 으로 활성 계정을 다시 고릅니다. → **`IG_ACCOUNT_ACTIVATION_FRONTEND.md` 참고.**
 
 **반드시 "견적 → 확정" 2단계로 붙이세요.** 실행 API를 바로 부르지 말고, 먼저 `preview`로
 "지금 N원이 결제됩니다"를 사용자에게 보여준 뒤 확정 시 실행 API를 호출합니다.

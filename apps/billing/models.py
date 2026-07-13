@@ -326,6 +326,12 @@ class UserSubscription(models.Model):
         blank=True,
         help_text="예약 플랜의 예약 시점 판매가",
     )
+    pending_extra_ig_accounts = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        verbose_name="예약된 추가 IG 계정 수",
+        help_text="추가 계정 '축소' 예약 — 다음 갱신 시점에 extra_ig_accounts 로 확정. null=예약 없음",
+    )
 
     # ── 트라이얼 ──
     trial_used_at = models.DateTimeField(
@@ -360,6 +366,17 @@ class UserSubscription(models.Model):
         verbose_name="페이지 활성화 변경 일시",
         help_text="하루 1회 제한용 — 마지막으로 페이지 활성화 조정한 시각",
     )
+    ig_account_activation_changed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="IG 계정 활성화 변경 일시",
+        help_text="하루 1회 제한용 — 마지막으로 IG 계정 활성화 조정한 시각",
+    )
+    ig_activation_review_needed = models.BooleanField(
+        default=False,
+        verbose_name="IG 활성 계정 재선택 필요",
+        help_text="갱신 시 허용량 초과로 자동 비활성이 발생 → 사용자가 활성 계정을 다시 고르도록 유도. POST 시 해제",
+    )
     pro_activated_at = models.DateTimeField(
         null=True,
         blank=True,
@@ -389,13 +406,27 @@ class UserSubscription(models.Model):
 
     @property
     def renewal_amount(self) -> int:
-        """다음 갱신 청구액. 예약 플랜 > 스냅샷 > 현재 플랜가 순 + 추가 계정 가산."""
+        """다음 갱신 청구액. 예약 플랜 > 스냅샷 > 현재 플랜가 순 + 추가 계정 가산.
+
+        추가 계정 '축소'가 예약돼 있으면(pending_extra_ig_accounts) 그 값 기준으로 미리 반영.
+        단, 다음 주기의 플랜이 pro 가 아니면 추가 계정 개념이 없으므로 가산하지 않는다.
+        """
         base = (
             self.pending_amount_snapshot if self.pending_plan_id else self.monthly_amount_snapshot
         )
         if base is None:
             base = self.plan.monthly_price
-        return base + EXTRA_IG_ACCOUNT_PRICE * self.extra_ig_accounts
+
+        next_plan = self.pending_plan if self.pending_plan_id else self.plan
+        if next_plan and next_plan.name != "pro":
+            return base
+
+        extra = (
+            self.pending_extra_ig_accounts
+            if self.pending_extra_ig_accounts is not None
+            else self.extra_ig_accounts
+        )
+        return base + EXTRA_IG_ACCOUNT_PRICE * extra
 
     def set_billing_key(self, billing_key: str, *, card_company: str = "", card_number: str = ""):
         """빌링키 저장 (암호화 + 해시 + 카드 표시정보). save는 호출 측 책임."""

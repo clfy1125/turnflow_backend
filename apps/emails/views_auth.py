@@ -40,7 +40,7 @@ def _client_ip(request) -> str | None:
 class SendVerificationEmailView(generics.GenericAPIView):
     permission_classes = [IsAuthenticated]
     serializer_class = ResendVerificationSerializer
-    # H-1: 인증메일 재발송 남용(메일 폭탄·Resend 비용) 방어
+    # H-1: 인증메일 재발송 남용(메일 폭탄·발송 비용) 방어
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "email_send"
 

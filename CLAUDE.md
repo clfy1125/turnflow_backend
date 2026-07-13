@@ -55,7 +55,8 @@ turnflow_backend/
 │   ├── integrations/           # Instagram OAuth/토큰 암호화(encryption.py)/Webhook
 │   ├── pages/                  # 페이지/게시물/DM 관련 뷰 (multi_views, image_views, stats, aiviews)
 │   ├── ai_jobs/                # LLM 작업 큐 + services(llm_client, model_router, prompt_builder)
-│   └── admin_api/              # 백오피스(어드민) 전용 API — 신원/대시보드/회원/워크스페이스/페이지/자동DM 모니터링 (serializers/, views/ 패키지 + AdminActionLog 감사로그). 마운트: /api/v1/admin/
+│   ├── analytics/              # 랜딩 방문 추적(LandingVisit) + 가입 어트리뷰션(SignupAttribution) — POST /api/v1/track/visit/ (공개·silent 204), 채널 파생 단일 소스 channels.derive_channel()
+│   └── admin_api/              # 백오피스(어드민) 전용 API — 신원/대시보드(overview + 운영/마케팅: dashboard_ops·dashboard_marketing, 임계값=dashboard_constants.py)/회원/워크스페이스/페이지/자동DM 모니터링 (serializers/, views/ 패키지 + AdminActionLog 감사로그). 마운트: /api/v1/admin/
 ├── config/                     # Django 프로젝트 설정
 │   ├── settings/               # base.py / local.py / prod.py
 │   ├── urls.py                 # 루트 URL (admin, api/v1, swagger, redoc)
@@ -310,12 +311,15 @@ make test-cov                             # HTML 커버리지 리포트
 - `INSTAGRAM_TEST_GUIDE.md` — IG 테스트 가이드
 - `CLOUDFLARE_TUNNEL_SETUP.md` — 개발 서버 공개(고정 URL `dev-api.turnflow.link`) Cloudflare Tunnel 셋업 (ngrok 대체)
 - `AUTODM_DELIVERY_LIFECYCLE.md` (+ `.html`) — 자동 DM 발송 라이프사이클: 웹훅 수신→발송 확정→실패 처리·무손실 하드닝(v3.10.1)
-- `TOSS_BILLING_FRONTEND.md` — 토스 빌링 프론트 연동 가이드 (SDK v2 카드등록 → prepare/confirm, 플랜 표시, 체험/해지/카드변경/추가계정 UX)
+- `TOSS_BILLING_FRONTEND.md` — 토스 빌링 프론트 연동 가이드 (SDK v2 카드등록 → prepare/confirm, 플랜 표시, 체험/해지/카드변경/추가계정 UX; 추가계정 축소=지연 반영 §3-2)
+- `IG_ACCOUNT_ACTIVATION_FRONTEND.md` — 추가 IG 계정 축소 지연 + 활성 계정 선택(소프트 비활성) 계약. `GET/POST /billing/ig-account-activation/` (page-activation IG 판), 비활성=기능 제외·토큰 보존, 허용량=활성 계정 수 기준
+- `SIGNUP_ATTRIBUTION_FRONTEND.md` — 방문→가입 채널 귀속 연동 가이드 (랜딩 스니펫 `tf_vid`/세션 1회 전송, CTA 쿼리스트링 핸드오프, register/google `attribution` 필드, 채널 매핑 표 = 마케팅팀 UTM 규칙). 어드민 마케팅 대시보드(`/api/v1/admin/dashboard/marketing/`)의 채널·퍼널 데이터 소스
 - `DR_IMPLEMENTATION_PLAN.md` — 재해복구(DR) 설계·결정 로그·코드 자산 맵
 - `deploy/dr/gcp/DRILL_RUNBOOK.md` — GCP cold-VM DR 드릴/컷오버 재현 런북 (+ `deploy/dr/gcp/README.md` 운영자 개요)
 - `SECURITY_AUDIT_2026-06.md` — 론칭 전 보안 취약점 감사(미해결 P0 포함)
 - `DM_CAMPAIGN_DUPLICATE_PREVENTION_FRONTEND.md` — 게시물당 활성 캠페인 1개(409) 프론트 가이드
 - `DM_QUEUE_STATE_FRONTEND.md` — DM 순차 발송 큐 현황(게이지+ETA) 프론트 가이드 + v4.3 페이서 메커니즘 요약 (`max_sends_per_hour` deprecated)
+- `DM_RECOVERY_FRONTEND.md` — 실패 DM 복구(recovery) 프론트 연동: 캠페인 폼 4필드 + 추천문구 30개(`GET .../recovery-reply-suggestions/`) + 프로 전용 게이트(`recovery_reply_available`/`features.dm_recovery`, fail-closed) + 로그 상태 3종(recovery_pending/delivered/expired). 기본 활성
 - `PASSWORD_RESET_GUIDE.md` — 비밀번호 재설정 플로우 프론트 가이드
 - `DISCONNECT_OTHER_DM_TOOLS_GUIDE.md` — 다른 DM 자동화 툴(매니챗 등) 연결 해제 안내 (댓글 fan-out·Private Reply 1회 충돌 / IG Login이라 Facebook 라우팅 불필요)
 - `CONNECT_CONFLICT_WARNING_FRONTEND.md` — 다른 DM 툴 충돌 경고 배너 프론트 스펙 (연결 직후 + 대시보드 상단, 닫기 규칙)

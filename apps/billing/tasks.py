@@ -106,6 +106,49 @@ def _safe_delete_billing_key(sub, reason: str) -> None:
         logger.info("%s: 빌링키 삭제 실패(무시) user=%s code=%s", reason, sub.user.email, e.code)
 
 
+def _fmt_local_date(dt) -> str:
+    return timezone.localdate(dt).isoformat() if dt else "-"
+
+
+def payment_success_email(sub, payment) -> None:
+    """결제 완료 안내 메일 enqueue (best-effort — 실패해도 결제 처리에 영향 없음)."""
+    try:
+        from apps.emails.tasks import send_payment_success_email
+
+        card = f"{sub.card_company} {sub.card_number_masked}".strip()
+        ctx = {
+            "plan_name": sub.plan.display_name,
+            "amount_str": f"{payment.amount:,}",
+            "paid_date": _fmt_local_date(payment.paid_at or timezone.now()),
+            "card_info": card or "등록된 카드",
+            "next_billing_date": _fmt_local_date(sub.current_period_end),
+        }
+        send_payment_success_email.delay(sub.user_id, ctx)
+    except Exception:  # noqa: BLE001 - 메일 enqueue 실패가 결제 확정을 막으면 안 됨
+        logger.exception("결제 완료 메일 enqueue 실패 user_id=%s", getattr(sub, "user_id", "?"))
+
+
+def payment_failed_email(sub, payment, code: str, message: str) -> None:
+    """결제 실패 안내 메일 enqueue (best-effort)."""
+    try:
+        from apps.emails.tasks import send_payment_failed_email
+
+        grace_end = (
+            sub.current_period_end + timedelta(days=GRACE_PERIOD_DAYS)
+            if sub.current_period_end
+            else None
+        )
+        ctx = {
+            "plan_name": (sub.pending_plan or sub.plan).display_name,
+            "amount_str": f"{payment.amount:,}",
+            "failure_reason": message or code or "결제 승인에 실패했습니다",
+            "grace_end_date": _fmt_local_date(grace_end),
+        }
+        send_payment_failed_email.delay(sub.user_id, ctx)
+    except Exception:  # noqa: BLE001
+        logger.exception("결제 실패 메일 enqueue 실패 user_id=%s", getattr(sub, "user_id", "?"))
+
+
 # ──────────────────────────────────────────────
 # 1) 갱신 디스패처
 # ──────────────────────────────────────────────
@@ -156,7 +199,11 @@ def process_due_renewals():
 
 
 def _renewal_amount_for(sub) -> tuple:
-    """(target_plan, amount) — 예약 플랜이 있으면 그 기준. 추가 계정은 pro만 가산."""
+    """(target_plan, amount) — 예약 플랜이 있으면 그 기준. 추가 계정은 pro만 가산.
+
+    추가 계정 '축소'가 예약돼 있으면(pending_extra_ig_accounts) 이번 청구부터 그 값으로
+    가산 — 축소가 다음 갱신액에 반영되게 한다. (charge 전에 호출되므로 여기서 반영 필수)
+    """
     from .models import EXTRA_IG_ACCOUNT_PRICE
 
     target_plan = sub.pending_plan or sub.plan
@@ -165,7 +212,12 @@ def _renewal_amount_for(sub) -> tuple:
         base = target_plan.monthly_price
     amount = base
     if target_plan.name == "pro":
-        amount += EXTRA_IG_ACCOUNT_PRICE * sub.extra_ig_accounts
+        extra = (
+            sub.pending_extra_ig_accounts
+            if sub.pending_extra_ig_accounts is not None
+            else sub.extra_ig_accounts
+        )
+        amount += EXTRA_IG_ACCOUNT_PRICE * extra
     return target_plan, amount
 
 
@@ -175,6 +227,7 @@ def _finalize_renewal_success(sub_id, payment_id, toss_payment: dict) -> None:
     from .toss_flows import PERIOD_DAYS, apply_payment_success_fields, mark_converted_to_paid
 
     now = timezone.now()
+    did_apply = False
     with transaction.atomic():
         # of=("self",): pending_plan 이 nullable FK(OUTER JOIN)라 조인행 락 불가 —
         # 구독 행만 잠근다.
@@ -212,12 +265,19 @@ def _finalize_renewal_success(sub_id, payment_id, toss_payment: dict) -> None:
                 sub.pending_amount_snapshot = None
                 if sub.plan.name != "pro":
                     sub.extra_ig_accounts = 0
+                    sub.pending_extra_ig_accounts = None  # pro 이탈 → 추가계정 개념 소멸
+            # 추가 계정 축소 예약 확정 (pro 유지 시에만 의미)
+            if sub.pending_extra_ig_accounts is not None:
+                if sub.plan.name == "pro":
+                    sub.extra_ig_accounts = sub.pending_extra_ig_accounts
+                sub.pending_extra_ig_accounts = None
             sub.renewal_attempts = 0
             sub.next_billing_retry_at = None
             sub.last_billing_error = ""
             if not sub.pro_activated_at:
                 sub.pro_activated_at = now
             sub.save()
+            did_apply = True
 
     if was_trialing:
         mark_converted_to_paid(sub.user, now)
@@ -227,6 +287,61 @@ def _finalize_renewal_success(sub_id, payment_id, toss_payment: dict) -> None:
         sub.plan.name,
         payment.amount,
         payment.toss_order_id,
+    )
+    # 실제로 기간이 연장된 경우에만 1회 안내 (웹훅/reconcile 중복 호출 시 재발송 방지)
+    if did_apply:
+        payment_success_email(sub, payment)
+        # 허용량이 줄었을 수 있으니 활성 IG 계정 초과분을 자동 비활성 (갱신 트랜잭션 밖).
+        _enforce_ig_activation_after_renewal(sub)
+
+
+def _enforce_ig_activation_after_renewal(sub) -> None:
+    """갱신 후 활성 IG 계정이 허용량을 초과하면 오래된 순으로 유지하고 초과분을 자동 비활성.
+
+    갱신 트랜잭션 커밋 후 별도로 수행 — 여기서 실패해도 갱신 자체는 유지되며,
+    GET /billing/ig-account-activation/ 이 라이브로 재계산하므로 방어가 이중화된다.
+    비활성 처리 시 해당 계정의 활성 캠페인은 PAUSE, in-flight DM 은 SKIPPED 된다.
+    """
+    from apps.integrations.models import IGAccountConnection
+
+    from .models import UserSubscription
+    from .subscription_utils import get_ig_account_allowance
+
+    try:
+        allowance = get_ig_account_allowance(sub.user)
+    except Exception:
+        logger.exception("IG 활성 계정 허용량 계산 실패: user=%s", getattr(sub.user, "email", "?"))
+        return
+    if allowance is None or allowance < 0:
+        return  # 무제한(관리자/무제한 플랜)
+
+    active = list(
+        IGAccountConnection.objects.filter(
+            workspace__owner=sub.user,
+            status=IGAccountConnection.Status.ACTIVE,
+            is_active=True,
+        ).order_by("created_at")
+    )
+    if len(active) <= allowance:
+        return
+
+    # 오래된 순으로 allowance 개 유지, 나머지 소프트 비활성.
+    excess = active[allowance:]
+    for conn in excess:
+        try:
+            conn.deactivate(reason="plan_downgrade_renewal")
+        except Exception:
+            logger.exception("IG 계정 자동 비활성 실패: conn=%s", conn.id)
+
+    with transaction.atomic():
+        locked = UserSubscription.objects.select_for_update().get(pk=sub.pk)
+        locked.ig_activation_review_needed = True
+        locked.save(update_fields=["ig_activation_review_needed", "updated_at"])
+    logger.info(
+        "갱신 후 IG 활성 계정 자동 조정: user=%s allowance=%d 비활성=%d",
+        sub.user.email,
+        allowance,
+        len(excess),
     )
 
 
@@ -283,6 +398,8 @@ def _register_renewal_failure(sub_id, payment_id, code: str, message: str) -> No
             f"💳 구독 갱신 결제 실패\n- user: {sub.user.email}\n- 사유: {code}\n"
             f"- 재시도: {sub.next_billing_retry_at:%Y-%m-%d %H:%M}"
         )
+        # 고객 안내는 첫 실패 시 1회 (유예 7일·카드 변경 안내 포함)
+        payment_failed_email(sub, payment, code, message)
 
 
 @shared_task(name="billing.charge_subscription_renewal", bind=True, max_retries=3)
@@ -821,6 +938,7 @@ def _downgrade_to_free(sub, free_plan, reason: str = ""):
     sub.extra_ig_accounts = 0
     sub.pending_plan = None
     sub.pending_amount_snapshot = None
+    sub.pending_extra_ig_accounts = None
     sub.renewal_attempts = 0
     sub.next_billing_retry_at = None
     sub.last_billing_error = ""
@@ -840,6 +958,7 @@ def _downgrade_to_free(sub, free_plan, reason: str = ""):
             "extra_ig_accounts",
             "pending_plan",
             "pending_amount_snapshot",
+            "pending_extra_ig_accounts",
             "renewal_attempts",
             "next_billing_retry_at",
             "last_billing_error",
@@ -854,6 +973,25 @@ def _downgrade_to_free(sub, free_plan, reason: str = ""):
     if active_ids:
         Page.objects.filter(user=sub.user, id__in=active_ids).update(is_active=True)
         Page.objects.filter(user=sub.user).exclude(id__in=active_ids).update(is_active=False)
+
+    # IG 계정 비활성화: 가장 먼저 연동된 max_ig_accounts개만 활성, 나머지 소프트 비활성.
+    # (하드 연결해제가 아니라 is_active=False — 토큰/데이터 보존, 활성 캠페인은 PAUSE)
+    from apps.integrations.models import IGAccountConnection
+
+    max_ig = free_plan.features.get("max_ig_accounts", 1)
+    if max_ig != -1:
+        ig_active = list(
+            IGAccountConnection.objects.filter(
+                workspace__owner=sub.user,
+                status=IGAccountConnection.Status.ACTIVE,
+                is_active=True,
+            ).order_by("created_at")
+        )
+        if len(ig_active) > max_ig:
+            for conn in ig_active[max_ig:]:
+                conn.deactivate(reason=f"downgrade_free:{reason}")
+            sub.ig_activation_review_needed = True
+            sub.save(update_fields=["ig_activation_review_needed", "updated_at"])
 
     # 로고 복원 (logoStyle: "hidden" → 제거) — 배지 제거는 basic+ 전용
     for page in user_pages:

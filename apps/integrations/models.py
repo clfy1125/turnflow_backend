@@ -106,6 +106,16 @@ class IGAccountConnection(models.Model):
     last_verified_at = models.DateTimeField(null=True, blank=True, verbose_name="Last Verified At")
     error_message = models.TextField(blank=True, verbose_name="Last Error Message")
 
+    # 소프트 활성 플래그 — status(토큰/연결 건강)와 별개로 "사용자가 이 계정을 기능에 쓸지" 의사.
+    # False 면 연결·토큰은 보존하되 DM/인사이트/스팸필터 등 계정 기반 기능에서 전부 제외.
+    # 플랜 허용량이 줄어 활성 계정이 초과되면 자동/수동으로 False 로 내림(하드 연결해제 아님).
+    is_active = models.BooleanField(
+        default=True,
+        db_index=True,
+        verbose_name="활성 여부",
+        help_text="비활성(False) 계정은 연결/토큰 보존하되 DM·인사이트·스팸필터 등 기능에서 제외됩니다.",
+    )
+
     # Additional metadata
     metadata = models.JSONField(default=dict, blank=True, verbose_name="Additional Metadata")
 
@@ -204,7 +214,35 @@ class IGAccountConnection(models.Model):
                 # 실패해도 disconnect 흐름은 계속 — 토큰이 이미 무효일 수도 있음
                 report["webhook_error"] = str(e)
 
-        # 2) 활성 캠페인 PAUSED 전환
+        # 2~3) 활성 캠페인 PAUSE + in-flight DM 정리 (disconnect/소프트 비활성 공용)
+        halt = self._halt_automation(f"IG connection disconnected ({reason})")
+        report["campaigns_paused"] = halt["campaigns_paused"]
+        report["logs_cancelled"] = halt["logs_cancelled"]
+
+        # 4) status REVOKED + 토큰 폐기 + 소프트 비활성 플래그도 내림(정합성)
+        self.status = self.Status.REVOKED
+        self.error_message = f"Disconnected: {reason}"
+        self.is_active = False
+        # 암호화된 토큰 컬럼을 빈 문자열로 — descriptor 가 자동 처리
+        self.access_token = ""
+        self.save(
+            update_fields=[
+                "status",
+                "error_message",
+                "is_active",
+                "_encrypted_access_token",
+                "updated_at",
+            ]
+        )
+
+        return report
+
+    def _halt_automation(self, reason_msg: str) -> dict:
+        """활성 캠페인 PAUSE + in-flight SentDMLog SKIPPED 정리.
+
+        disconnect(하드 연결해제)와 deactivate(소프트 비활성) 공용. 이미 발송된
+        DELIVERED/READ 는 건드리지 않는다.
+        """
         from .models import AutoDMCampaign, SentDMLog  # 로컬 import (circular 방지)
 
         paused = AutoDMCampaign.objects.filter(
@@ -214,44 +252,48 @@ class IGAccountConnection(models.Model):
             status=AutoDMCampaign.Status.PAUSED,
             updated_at=timezone.now(),
         )
-        report["campaigns_paused"] = paused
 
-        # 3) in-flight SentDMLog 정리 (이미 발송된 DELIVERED/READ 는 건드리지 않음)
         in_flight_statuses = (
             SentDMLog.Status.QUEUED,
             SentDMLog.Status.SUBMITTING,
             SentDMLog.Status.ACCEPTED,
             SentDMLog.Status.RATE_LIMITED,
+            SentDMLog.Status.RECOVERY_PENDING,  # 사용자 DM 대기 중이던 복구 건도 정리
         )
         cancelled = SentDMLog.objects.filter(
             campaign__ig_connection=self,
             status__in=in_flight_statuses,
         ).update(
             status=SentDMLog.Status.SKIPPED,
-            error_message=f"IG connection disconnected ({reason})",
+            error_message=reason_msg,
         )
-        report["logs_cancelled"] = cancelled
+        return {"campaigns_paused": paused, "logs_cancelled": cancelled}
 
-        # 4) status REVOKED + 토큰 폐기
-        self.status = self.Status.REVOKED
-        self.error_message = f"Disconnected: {reason}"
-        # 암호화된 토큰 컬럼을 빈 문자열로 — descriptor 가 자동 처리
-        self.access_token = ""
-        self.save(
-            update_fields=[
-                "status",
-                "error_message",
-                "_encrypted_access_token",
-                "updated_at",
-            ]
-        )
+    def deactivate(self, reason: str = "activation_limit") -> dict:
+        """소프트 비활성 — 토큰/웹훅 구독은 보존하되 기능에서만 제외.
 
+        플랜 허용량 초과로 활성 계정을 줄여야 할 때 하드 연결해제 대신 사용.
+        활성 캠페인을 PAUSE 하고 in-flight DM 을 정리한 뒤 is_active=False 로 내린다.
+        (재활성화 시 캠페인은 자동 재개되지 않음 — 사용자가 수동으로.)
+        """
+        report = self._halt_automation(f"IG account deactivated ({reason})")
+        if self.is_active:
+            self.is_active = False
+            self.save(update_fields=["is_active", "updated_at"])
         return report
+
+    def activate(self) -> None:
+        """소프트 재활성 — is_active 플래그만 복원. 캠페인 재개는 사용자 몫."""
+        if not self.is_active:
+            self.is_active = True
+            self.save(update_fields=["is_active", "updated_at"])
 
     @classmethod
     def get_active_connection(cls, workspace):
         """Get active connection for workspace"""
-        return cls.objects.filter(workspace=workspace, status=cls.Status.ACTIVE).first()
+        return cls.objects.filter(
+            workspace=workspace, status=cls.Status.ACTIVE, is_active=True
+        ).first()
 
 
 class IGOAuthState(models.Model):
@@ -281,6 +323,118 @@ class IGOAuthState(models.Model):
 
     def __str__(self):
         return f"IGOAuthState(state={self.state}, workspace={self.workspace_id})"
+
+
+# 실패 DM 복구 안내 대댓글 — 조합형 생성기 (매번 무작위 조합 → 봇 검사 회피).
+# 형식: "{실패 알림} {중간 이모지} {재요청 문구}"  (+ 50% 확률로 뒤에 {끝 이모지})
+# 캠페인이 recovery_reply_templates(리스트)를 지정하면 그게 우선, 없으면 이 조합기를 쓴다.
+RECOVERY_FIRST_PHRASES = [
+    "DM 전송에 실패했어요",
+    "DM 전송에 실패했네요",
+    "DM 전송이 실패했어요...",
+    "메시지 전송에 실패했어요!",
+    "DM이 도착하지 못했어요",
+    "DM 발송이 안 됐어요",
+    "DM 보낼려다 실패했어요",
+    "메시지가 전달되지 않았어요",
+    "DM이 안 보내졌어요",
+    "DM을 못 보냈어요 ㅠㅠ",
+    "전송 오류가 났어요",
+    "DM이 오류가 났네요...",
+    "메시지 발송에 실패했어요",
+    "DM 전달이 안 됐어요",
+    "DM이 일시적인 오류로 안 보내졌어요...",
+    "DM 보내는 데 실패했어요",
+    "DM이 오류로 안 간 거 같아요...",
+    "디엠이 안 갔네요 죄송합니다.",
+    "DM 전송에 실패했어요...",
+    "죄송합니다. DM 발송이 오류로 실패했어요",
+    "오류로 메시지를 못 보냈어요",
+    "오류로 DM이 도착을 안 했어요",
+    "디엠 전송에 실패했어요",
+    "DM 전송이 막혔어요...",
+    "DM이 안 보내졌네요",
+    "DM 전달에 실패했어요...",
+    "죄송합니다. 메시지 전송 오류가 일어났어요",
+    "DM 전송이 실패로 떴어요...",
+    "DM 발송이 안 됐어요",
+    "DM이 안 나갔어요 ㅠ",
+    "디엠 보내려 했는데 오류가 일어났어요...",
+    "DM 보내기에 실패했어요",
+    "DM 보내는 중 실패했어요",
+    "DM이 안 갔어요...",
+    "디엠 전송 실패가 떴네요...",
+    "인스타 오류로 DM을 못 드렸어요",
+    "디엠 전송에 실패했네요...",
+    "인스타 오류로 DM 발송이 안 된 거 같아요",
+]
+RECOVERY_MID_EMOJIS = ["😢", "🥲", "😥", "😭", "😔", "😳", "😵", "🥺"]
+RECOVERY_CLOSER_PHRASES = [
+    "이 계정으로 DM 아무거나 하나 보내주시면 다시 보내드릴게요!",
+    "제 계정으로 아무 메시지나 하나 남겨주시면 바로 다시 보내드릴게요!",
+    "이 계정으로 DM 한 번만 주시면 자료 다시 보내드릴게요!",
+    "아무 내용이나 DM 주시면 즉시 다시 보내드릴게요!",
+    "저희 계정으로 DM 하나만 보내주시면 다시 보내드릴게요!",
+    "이 계정에 아무 DM이나 남겨주시면 바로 재발송해드려요!",
+    "DM으로 아무거나 하나 보내주시면 다시 챙겨드릴게요!",
+    "제 계정으로 DM 한 개만 주시면 곧바로 다시 보내드릴게요!",
+    "이 계정에 DM 아무거나 남겨주시면 다시 보내드릴게요!",
+    "저희한테 메시지 하나만 주시면 바로 다시 보내드릴게요!",
+    "이 계정으로 DM 하나 보내주시면 재발송해드릴게요!",
+    "아무 말이나 DM 주시면 자료 다시 보내드릴게요!",
+    "저희 계정에 DM 하나만 남겨주세요, 바로 다시 드릴게요!",
+    "이 계정으로 DM 한 번 주시면 즉시 다시 보내드릴게요!",
+    "아무거나 DM 하나 보내주시면 다시 챙겨서 보내드릴게요!",
+    "제 계정으로 메시지 하나만 주시면 바로 재전송할게요!",
+    "이 계정으로 DM 아무거나 남겨주시면 다시 보내드려요!",
+    "저희 계정에 DM 한번만 주시면 곧바로 다시 보내드릴게요!",
+    "DM으로 아무 내용이나 보내주시면 자료 다시 드릴게요!",
+    "이 계정에 DM 하나만 남겨주시면 바로 다시 보내드릴게요!",
+    "저희한테 DM 아무거나 주시면 즉시 재발송해드릴게요!",
+    "이 계정으로 메시지 하나 주시면 다시 보내드릴게요!",
+    "DM 아무거나 하나만 보내주시면 자료 바로 다시 드릴게요!",
+    "저희 계정에 DM 한 번 남겨주시면 다시 챙겨드릴게요!",
+    "아무 DM이나 주시면 바로 다시 보내드릴게요!",
+    "이 계정에 메시지 하나만 주시면 재전송해드릴게요!",
+    "제 계정으로 DM 아무거나 남겨주시면 다시 보내드릴게요!",
+    "이 계정으로 DM 하나 보내주시면 곧바로 다시 드릴게요!",
+    "이 계정에 아무거나 DM 남겨주시면 다시 보내드릴게요!",
+    "제 계정으로 DM 하나만 주시면 즉시 다시 보내드릴게요!",
+    "이 계정으로 DM 아무거나 주시면 재전송해드릴게요!",
+    "아무 DM이나 하나 남겨주시면 바로 다시 드릴게요!",
+    "저희 계정에 디엠 하나 주시면 다시 보내드릴게요!!",
+    "이 계정에 DM 아무거나 보내주시면 바로 다시 보내드릴게요!",
+    "DM으로 아무 내용이나 주시면 자료 다시 보내드릴게요!",
+    "제 계정으로 DM 한 번만 주시면 바로 다시 보내드릴게요!",
+    "이 계정으로 DM 하나 남겨주시면 재발송할게요!",
+    "제 계정에 DM 아무거나 주시면 바로 재발송할게요!",
+    "아무거나 DM 주시면 즉시 다시 챙겨드릴게요!",
+]
+RECOVERY_TRAIL_EMOJIS = ["🎁", "🙌", "💌", "✨", "🎀", "💛", "🙏", "😊"]
+
+# 총 경우의 수 = FIRST × MID × CLOSER × (TRAIL + 끝이모지 없음 1)
+RECOVERY_REPLY_COMBINATIONS = (
+    len(RECOVERY_FIRST_PHRASES)
+    * len(RECOVERY_MID_EMOJIS)
+    * len(RECOVERY_CLOSER_PHRASES)
+    * (len(RECOVERY_TRAIL_EMOJIS) + 1)
+)
+
+
+def compose_recovery_reply() -> str:
+    """실패 DM 복구 안내 대댓글을 조합형으로 무작위 생성.
+
+    "{실패 알림} {중간 이모지} {재요청 문구}" 조합 + 50% 확률로 뒤에 " {끝 이모지}".
+    """
+    import random
+
+    first = random.choice(RECOVERY_FIRST_PHRASES)
+    mid = random.choice(RECOVERY_MID_EMOJIS)
+    closer = random.choice(RECOVERY_CLOSER_PHRASES)
+    msg = f"{first} {mid} {closer}"
+    if random.random() < 0.5:  # 끝 이모지는 50% 확률 (안 붙는 경우도 랜덤성의 일부)
+        msg = f"{msg} {random.choice(RECOVERY_TRAIL_EMOJIS)}"
+    return msg
 
 
 class AutoDMCampaign(models.Model):
@@ -520,6 +674,47 @@ class AutoDMCampaign(models.Model):
         help_text=(
             "postback 을 못 받는 구버전 클라이언트 fallback. "
             "이 키워드로 답장 시 gate 통과로 간주. 예: ['GO', 'YES', '네']"
+        ),
+    )
+
+    # ===== 실패 DM 복구 (recovery) =====
+    # 비팔로워가 댓글만 달면 opening 비공개답글이 채널 미개설로 실패(code=100 subcode=2534025)한다.
+    # 이때 대댓글로 "DM 주세요" 안내를 남기고, 사용자가 DM 을 보내오면(=채널 열림) opening 을 재전송한다.
+    recovery_reply_enabled = models.BooleanField(
+        default=True,
+        verbose_name="실패 DM 복구 사용",
+        help_text=(
+            "opening 비공개답글이 2534025(비팔로워 채널 미개설)로 실패하면 완전 실패로 두지 않고, "
+            "댓글에 '다시 보내드릴게요' 안내 대댓글을 남긴다. 사용자가 이 계정으로 DM 을 보내오면 "
+            "열린 24h 창으로 opening DM 을 재전송한다. **프로 전용**(dm_recovery 기능) — "
+            "미보유 플랜에서는 켜져 있어도 동작하지 않고 해당 DM 은 일반 실패로 종결된다."
+        ),
+    )
+    recovery_reply_templates = models.JSONField(
+        default=list,
+        blank=True,
+        verbose_name="복구 안내 대댓글 템플릿 목록",
+        help_text=(
+            "실패 시 무작위로 1개 골라 댓글에 게시. 봇 검사 회피를 위해 여러 문구 권장. "
+            "예: ['DM 전송에 실패했어요 😢 이 계정으로 DM 아무거나 보내주시면 다시 보내드릴게요!']"
+        ),
+    )
+    recovery_keyword = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        verbose_name="복구 트리거 키워드 (선택)",
+        help_text=(
+            "비우면 사용자의 아무 DM 이나 복구 재전송을 트리거한다. "
+            "값이 있으면 그 키워드가 포함된 DM 만 트리거."
+        ),
+    )
+    recovery_ttl_seconds = models.IntegerField(
+        default=604800,  # 7일
+        verbose_name="복구 대기 유효기간 (초)",
+        help_text=(
+            "RECOVERY_PENDING 진입 후 이 시간까지 사용자 DM 이 없으면 RECOVERY_EXPIRED 로 만료. "
+            "기본 7일(댓글 비공개답글 창과 동일). 배치/쿨다운은 공개답글 설정을 공유한다."
         ),
     )
 
@@ -821,6 +1016,33 @@ class AutoDMCampaign(models.Model):
             return random.choice(candidates)
         return (self.public_reply_template or "").strip()
 
+    def pick_recovery_reply_template(self) -> str:
+        """복구 안내 대댓글 1개 생성.
+
+        캠페인이 recovery_reply_templates 를 지정했으면 그 리스트에서 무작위 선택,
+        비어 있으면 서버 조합기(compose_recovery_reply)로 매번 무작위 조합.
+        """
+        import random
+
+        candidates = [
+            t.strip() for t in (self.recovery_reply_templates or []) if t and str(t).strip()
+        ]
+        if candidates:
+            return random.choice(candidates)
+        return compose_recovery_reply()
+
+    def matches_recovery_keyword(self, message_text: str) -> bool:
+        """인바운드 DM 텍스트가 복구 트리거 조건에 맞는지.
+
+        recovery_keyword 가 비어있으면 비지 않은 아무 DM 이나 True(느슨한 모드).
+        값이 있으면 대소문자 무시 부분/완전 일치.
+        """
+        kw = (self.recovery_keyword or "").strip()
+        text = (message_text or "").strip()
+        if not kw:
+            return bool(text)
+        return kw.lower() in text.lower()
+
     def matches_keyword(self, comment_text: str) -> bool:
         """댓글이 키워드 필터에 매칭되는지"""
         keywords = [k.strip() for k in (self.keyword_filter or []) if k and str(k).strip()]
@@ -915,6 +1137,12 @@ class SentDMLog(models.Model):
         # legacy alias — 0007 이전 코드/외부 통합과 호환 위해 유지
         FAILED_API = "failed_api", "API 실패(legacy)"
 
+        # 복구 (recovery) — 비팔로워 첫 DM 이 채널 미개설로 실패(2534025)했을 때,
+        # 대댓글로 "DM 주세요" 안내를 남기고 사용자가 DM 을 보내오면 열린 채널로 재전송한다.
+        RECOVERY_PENDING = "recovery_pending", "복구 대기 (안내 답글 게시, 사용자 DM 대기)"
+        RECOVERY_DELIVERED = "recovery_delivered", "복구 재전송 성공"
+        RECOVERY_EXPIRED = "recovery_expired", "복구 대기 만료 (사용자 무응답)"
+
     class VerifiedVia(models.TextChoices):
         ECHO = "echo", "is_echo 웹훅"
         CONV_API = "conv_api", "Conversations API"
@@ -942,6 +1170,9 @@ class SentDMLog(models.Model):
         Status.SKIPPED,
         Status.SENT,  # legacy compatibility
         Status.FAILED,  # legacy compatibility
+        Status.RECOVERY_DELIVERED,  # 복구 재전송 성공 (종결·성공)
+        Status.RECOVERY_EXPIRED,  # 복구 대기 만료 (종결·실패)
+        # 주의: RECOVERY_PENDING 은 종결 아님 — inbound DM/TTL 스윕이 전이시켜야 하므로 제외.
     )
 
     # 사용자에게 "도착함"이라고 보고할 수 있는 상태
@@ -949,6 +1180,7 @@ class SentDMLog(models.Model):
         Status.DELIVERED,
         Status.READ,
         Status.SENT,  # legacy
+        Status.RECOVERY_DELIVERED,  # 복구 경로로 실제 재전송+접수됨 = 사용자에게 도착 보고 가능
     )
 
     # 되살릴 수 있는 종결 상태 (P1 — 무손실 하드닝):
@@ -1095,6 +1327,17 @@ class SentDMLog(models.Model):
     )
     public_reply_id = models.CharField(
         max_length=255, blank=True, default="", verbose_name="공개 답글 ID"
+    )
+
+    # ===== 실패 DM 복구 (recovery) =====
+    # 2534025(비팔로워 채널 미개설) 실패 시 RECOVERY_PENDING 로 두고 복구 대댓글을 게시한 시각.
+    # TTL(캠페인 recovery_ttl_seconds) 만료 판단의 앵커이자 어드민 가시성용.
+    recovery_pending_at = models.DateTimeField(
+        null=True, blank=True, verbose_name="복구 대기 진입 시각"
+    )
+    # 복구 안내 대댓글의 comment id. 일반 성공 공개답글(public_reply_id)과 분리해 충돌 방지.
+    recovery_reply_id = models.CharField(
+        max_length=255, blank=True, default="", verbose_name="복구 안내 답글 ID"
     )
 
     # Timestamps

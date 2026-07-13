@@ -73,7 +73,9 @@ def resubscribe_active_connections(check_only: bool = False) -> dict:
         "details": [],
     }
     now = timezone.now()
-    qs = IGAccountConnection.objects.filter(status=IGAccountConnection.Status.ACTIVE)
+    qs = IGAccountConnection.objects.filter(
+        status=IGAccountConnection.Status.ACTIVE, is_active=True
+    )
     for conn in qs.iterator():
         igid = conn.external_account_id
         if not igid:
@@ -140,6 +142,7 @@ def _active_campaigns_for_account(ig_user_id: str, now=None):
     qs = (
         AutoDMCampaign.objects.filter(status=AutoDMCampaign.Status.ACTIVE)
         .filter(AutoDMCampaign.schedule_window_q(now))
+        .filter(ig_connection__is_active=True)  # 소프트 비활성 계정은 자동화 제외
         .select_related("ig_connection", "ig_connection__workspace")
     )
     if ig_user_id:
@@ -318,6 +321,90 @@ def _defer_or_fail(log, campaign, ig_conn, exc) -> dict:
         ig_conn.mark_as_error(f"DM 발송 중 토큰/세션/권한 오류: {exc}")
 
     return {"status": cls.log_status, "reason": cls.reason}
+
+
+def _maybe_enter_recovery(log, campaign, exc) -> bool:
+    """opening 비공개답글이 비팔로워 채널 미개설(code=100/subcode=2534025)로 실패했고
+    캠페인이 복구를 켰으면, 완전 실패로 종결하지 않고 RECOVERY_PENDING 로 전이하고
+    안내 대댓글을 예약한다. (사용자가 DM 을 보내오면 process_inbound_recovery_dm 이 재전송)
+
+    반환 True → 복구 경로로 처리됨(호출부는 _defer_or_fail 을 타지 않음).
+    조건 불충족(다른 subcode / reward·재안내 child / Story / 복구 비활성 / 템플릿 없음)이면
+    False → 기존대로 FAILED_PARAM 종결(회귀 없음).
+
+    카운팅: 여기서는 total_failed 를 올리지 않는다(아직 '완전 실패' 아님).
+    성공 재전송 시 increment_sent(성공 flip), TTL 만료 시 increment_failed 로 정산한다.
+    """
+    if not campaign.recovery_reply_enabled:
+        return False
+    # 프로 전용 런타임 게이트 (fail-closed). 미보유 플랜/조회 실패면 복구를 타지 않고
+    # 기존대로 FAILED_PARAM 로 종결 → 회귀 없음. (spam_filter 게이트와 동일 정책)
+    from apps.billing.subscription_utils import owner_has_feature
+
+    try:
+        workspace = campaign.ig_connection.workspace
+    except Exception:  # noqa: BLE001 - 워크스페이스 조회 실패는 미보유 취급이 안전
+        return False
+    if not owner_has_feature(workspace, "dm_recovery"):
+        return False
+    # 템플릿은 캠페인 미지정 시 서버 기본 세트(DEFAULT_RECOVERY_REPLY_TEMPLATES)로 폴백하므로
+    # 여기서 non-empty 를 요구하지 않는다 (enabled 면 항상 안내 대댓글 가능).
+    # 정확히 2534025(비팔로워/채널 미개설)만. 삭제(33)/7일초과(2018292)/기타 code=100 은 제외.
+    if getattr(exc, "code", None) != 100 or str(getattr(exc, "subcode", "") or "") != "2534025":
+        return False
+    # opening 첫 비공개답글만 (reward/재안내 child·Story·standalone 제외).
+    if log.dm_kind != SentDMLog.DMKind.OPENING:
+        return False
+    if not log.comment_id or log.parent_log_id is not None:
+        return False
+
+    log.status = SentDMLog.Status.RECOVERY_PENDING
+    log.recovery_pending_at = timezone.now()
+    log.error_code = str(getattr(exc, "code", "") or "")
+    log.error_subcode = str(getattr(exc, "subcode", "") or "")
+    log.error_message = str(exc)
+    log.api_response = getattr(exc, "api_response", {}) or {}
+    log.save(
+        update_fields=[
+            "status",
+            "recovery_pending_at",
+            "error_code",
+            "error_subcode",
+            "error_message",
+            "api_response",
+        ]
+    )
+    log.append_verification_log(
+        {"path": "recovery", "result": "pending", "reason": "comment_not_eligible_2534025"}
+    )
+    # 안내 대댓글 게시 (best-effort, 성공답글과 페이싱/배치 공유, 서킷은 분리)
+    import random as _r
+
+    post_public_reply.apply_async(
+        args=[str(log.id)], kwargs={"recovery": True}, countdown=_r.randint(5, 15)
+    )
+    return True
+
+
+def _maybe_flip_recovery_delivered(log, campaign) -> bool:
+    """복구 재전송 자식(log)이 ACCEPTED 되면 부모 opening 을 RECOVERY_DELIVERED(성공·종결)로 승격.
+
+    자식은 parent_log 가 있어 send_dm_task 의 increment_sent 를 건너뛰므로, 여기서 부모 기준
+    1회만 성공 집계한다. 부모가 RECOVERY_PENDING 인 경우에만 동작(일반 reward/재안내 child 제외).
+    반환 True 면 승격함.
+    """
+    if not log.parent_log_id:
+        return False
+    parent = log.parent_log
+    if parent is None or parent.status != SentDMLog.Status.RECOVERY_PENDING:
+        return False
+    parent.status = SentDMLog.Status.RECOVERY_DELIVERED
+    parent.save(update_fields=["status"])
+    parent.append_verification_log(
+        {"path": "recovery", "result": "resent", "child_log_id": str(log.id)}
+    )
+    campaign.increment_sent()
+    return True
 
 
 # ===== 진입점 =====
@@ -508,6 +595,7 @@ def run_spam_filter_check(self, webhook_payload: dict):
             IGAccountConnection.objects.filter(
                 external_account_id=entry_id,
                 status=IGAccountConnection.Status.ACTIVE,
+                is_active=True,  # 소프트 비활성 계정은 스팸필터 대상 제외
             ).select_related("workspace")
         )
         if not conns:
@@ -714,6 +802,7 @@ def process_story_reply_and_send_dm(self, payload: dict):
             status=AutoDMCampaign.Status.ACTIVE,
             trigger_type=AutoDMCampaign.TriggerType.STORY_REPLY,
             ig_connection__external_account_id=page_ig_user_id,
+            ig_connection__is_active=True,  # 소프트 비활성 계정 제외
         )
         # 예약 발송: 활성 기간(window) 안에 있는 캠페인만 후보
         .filter(AutoDMCampaign.schedule_window_q()).select_related(
@@ -1111,6 +1200,12 @@ def send_dm_task(self, log_id: str):
         log.mark_skipped(f"Campaign not active (status={campaign.status})")
         return {"status": "skipped", "reason": "campaign_not_active"}
 
+    # ★ 계정 소프트 비활성 가드: is_active=False 계정은 발송에서 제외(캠페인이 우연히
+    #   ACTIVE 라도 확정 차단). 활성 계정 초과 축소/재선택 시 in-flight DM 을 여기서 종결.
+    if not ig_conn.is_active:
+        log.mark_skipped("IG account deactivated")
+        return {"status": "skipped", "reason": "ig_account_inactive"}
+
     # ★ 예약 발송 창 가드 (권위 있는 단일 체크포인트):
     # ACTIVE 여도 예약 창 밖(시작 전/종료 후)이면 여기서 확정 차단한다.
     if not campaign.is_within_schedule():
@@ -1256,6 +1351,11 @@ def send_dm_task(self, log_id: str):
             # recent is False(정말 안 감) 또는 code 1/2 + recent None(확인불가) → defer+retry(무손실).
             # ⚠️ 잔여 한계: 전달됐는데 Conversations 인덱싱 지연으로 recent=False 면 재시도 시 중복 가능
             #   (기존 동작과 동일 = 회귀 아님). 완전 제거는 '재시도 직전 재확인' 후속 개선 필요.
+        # ★ 실패 DM 복구: opening 비공개답글이 비팔로워 채널 미개설(code=100/subcode=2534025)로
+        #   실패했고 캠페인이 복구를 켰다면, 완전 실패로 종결하지 않고 RECOVERY_PENDING +
+        #   안내 대댓글을 예약한다(사용자 DM 대기). 조건 불충족이면 아래 기존 종결 경로로.
+        if _maybe_enter_recovery(log, campaign, e):
+            return {"status": "recovery_pending", "log_id": str(log.id)}
         # v3.9: rate-limit/transient 은 횟수 상한으로 종결하지 않고 defer.
         # 윈도우 만료(graceful 종결)는 위 진입부 age 가드가 단일 지점에서 담당.
         # no_trace(551·기타4xx)는 실패가 아닌 '미확인'으로 분리 집계.
@@ -1269,6 +1369,9 @@ def send_dm_task(self, log_id: str):
     # v3.8: child DM 은 카운트 제외 (위 increment_failed 와 같은 정책)
     if log.parent_log_id is None:
         campaign.increment_sent()
+
+    # ★ 복구 재전송 자식이 접수되면 부모 opening 을 RECOVERY_DELIVERED(성공·종결)로 승격.
+    _maybe_flip_recovery_delivered(log, campaign)
 
     # 10분 후 첫 능동 검증 예약 (echo가 먼저 오면 skip됨; v3.9: 쿼터 절약 위해 5→10분)
     verify_dm_delivery.apply_async(args=[str(log.id)], countdown=600)
@@ -1830,6 +1933,7 @@ def poll_new_media_for_next_campaigns():
     for conn in IGAccountConnection.objects.filter(
         id__in=ig_connection_ids,
         status=IGAccountConnection.Status.ACTIVE,
+        is_active=True,
     ):
         if conn.last_polled_at and (now - conn.last_polled_at) < min_interval:
             skipped_recent += 1
@@ -1970,6 +2074,7 @@ def check_polling_anomalies():
     for conn in IGAccountConnection.objects.filter(
         id__in=list(pending_ig_ids),
         status=IGAccountConnection.Status.ACTIVE,
+        is_active=True,
     ).only("id", "external_account_id", "username", "last_polled_at"):
         if conn.last_polled_at is None:
             never_polled.append(conn)
@@ -2177,7 +2282,7 @@ def poll_missed_comments():
     conns = {
         c.id: c
         for c in IGAccountConnection.objects.filter(
-            id__in=conn_ids, status=IGAccountConnection.Status.ACTIVE
+            id__in=conn_ids, status=IGAccountConnection.Status.ACTIVE, is_active=True
         )
     }
 
@@ -2282,12 +2387,18 @@ def maintain_partitions():
 
 
 @shared_task(bind=True, max_retries=10)
-def post_public_reply(self, log_id: str):
+def post_public_reply(self, log_id: str, recovery: bool = False):
     """
-    DM ACCEPTED 후 댓글에 공개 답글 게시 (v3.5 — 봇 검사 회피).
+    댓글에 공개 답글(대댓글) 게시 (v3.5 — 봇 검사 회피).
+
+    두 가지 모드:
+      - 일반(recovery=False): DM ACCEPTED 후 "DM 보내드렸어요" 성공 답글.
+      - 복구(recovery=True): opening 비공개답글이 2534025(비팔로워 채널 미개설)로 실패했을 때
+        "DM 주세요" 안내 답글. 템플릿·enable 플래그·기록 필드·서킷브레이커 키가 분리되지만,
+        배치/쿨다운/페이싱(계정 단위 대댓글 예산)은 성공 답글과 공유한다.
 
     동작:
-      1. 템플릿 목록(public_reply_templates)에서 무작위로 1개 선택 — 다양성 확보
+      1. 템플릿 목록에서 무작위로 1개 선택 — 다양성 확보
       2. 같은 IG 계정 기준 batch_size 만큼 최근에 게시했으면 batch_pause_seconds 만큼
          대기 후 재시도 — 짧은 시간 안에 대량 답글 방지 (Instagram 봇 차단 회피)
       3. 매 답글마다 5~15초 지터 적용 — 일정한 간격 패턴 회피
@@ -2300,17 +2411,22 @@ def post_public_reply(self, log_id: str):
         return {"status": "not_found"}
 
     campaign = log.campaign
+    feature = "recovery" if recovery else "public_reply"
 
-    # 활성 여부
-    if not campaign.public_reply_enabled:
-        return {"status": "skipped", "reason": "public reply disabled"}
+    # 활성 여부 / 이미 게시 여부 / 템플릿 — 모드별 소스 분기
+    if recovery:
+        enabled = campaign.recovery_reply_enabled
+        already = bool(log.recovery_reply_id)
+        template = campaign.pick_recovery_reply_template()
+    else:
+        enabled = campaign.public_reply_enabled
+        already = bool(log.public_reply_id)
+        template = campaign.pick_public_reply_template()
 
-    # 이미 게시했으면 skip
-    if log.public_reply_id:
+    if not enabled:
+        return {"status": "skipped", "reason": f"{feature} disabled"}
+    if already:
         return {"status": "skipped", "reason": "already replied"}
-
-    # 템플릿 1개 선택 (list 우선, legacy fallback)
-    template = campaign.pick_public_reply_template()
     if not template:
         return {"status": "skipped", "reason": "no template content"}
 
@@ -2361,18 +2477,20 @@ def post_public_reply(self, log_id: str):
             {
                 "path": "public_reply",
                 "result": "abandoned_permanent",
+                "feature": feature,  # 'public_reply' | 'recovery' — 서킷 분리용
                 "error": e.message,
                 "code": e.code,
                 "subcode": e.subcode,
             }
         )
 
-        # ===== Circuit Breaker =====
-        # 같은 IG 계정에서 10분 안에 영구 에러 3건 이상 누적되면
-        # → 그 계정의 모든 캠페인 public_reply_enabled 자동 OFF.
-        # 인스타 Action Block (code=1) 이 한 번 걸리면 그 시점부터의 모든 답글이
-        # 같은 차단에 묶이는데, 그 사이에 계속 시도하면 차단 기간이 연장됨.
+        # ===== Circuit Breaker (feature 별로 분리) =====
+        # 같은 IG 계정에서 10분 안에 같은 feature 영구 에러 3건 이상 누적되면
+        # → 그 feature 의 플래그를 계정 전체에서 자동 OFF.
+        # 인스타 Action Block (code=1) 이 걸리면 계속 시도할수록 차단 기간이 연장되므로,
         # 자동 OFF 로 추가 시도를 막아 차단이 빨리 풀리게 한다.
+        # ★ 복구(recovery) 답글은 별도 서킷 — 비팔로워(스팸성) 대상이라 영구에러가 잦은데,
+        #   공유 서킷이면 정상 성공답글(public_reply)까지 꺼버리므로 feature 로 분리한다.
         try:
             ig_conn = log.campaign.ig_connection
             cutoff = timezone.now() - timedelta(minutes=10)
@@ -2385,25 +2503,29 @@ def post_public_reply(self, log_id: str):
                 for rl in recent_logs
                 if any(
                     (ev or {}).get("result") == "abandoned_permanent"
+                    # 레거시 엔트리(feature 키 없음)는 public_reply 로 간주
+                    and (ev or {}).get("feature", "public_reply") == feature
                     for ev in (rl.verification_log or [])
                 )
             )
             CB_THRESHOLD = 3
             if permanent_count >= CB_THRESHOLD:
+                flag = "recovery_reply_enabled" if recovery else "public_reply_enabled"
                 affected = AutoDMCampaign.objects.filter(
                     ig_connection=ig_conn,
-                    public_reply_enabled=True,
-                ).update(public_reply_enabled=False)
+                    **{flag: True},
+                ).update(**{flag: False})
                 logger.warning(
-                    f"Circuit breaker tripped for {ig_conn.username}: "
+                    f"Circuit breaker ({feature}) tripped for {ig_conn.username}: "
                     f"{permanent_count} permanent errors in 10min "
-                    f"→ disabled public_reply on {affected} campaign(s). "
+                    f"→ disabled {flag} on {affected} campaign(s). "
                     f"Manual re-enable required after Meta restriction clears."
                 )
                 log.append_verification_log(
                     {
                         "path": "public_reply",
                         "result": "circuit_breaker_tripped",
+                        "feature": feature,
                         "recent_permanent": permanent_count,
                         "affected_campaigns": affected,
                         "ig_account": ig_conn.username,
@@ -2424,18 +2546,27 @@ def post_public_reply(self, log_id: str):
             return {"status": "failed", "error": str(e)}
 
     reply_id = (result or {}).get("id", "")
-    log.public_reply_id = reply_id
-    log.public_reply_posted_at = timezone.now()
-    log.save(update_fields=["public_reply_id", "public_reply_posted_at"])
+    now = timezone.now()
+    if recovery:
+        # 복구 안내 답글: id 는 별도 필드. public_reply_posted_at 도 찍어 성공답글과
+        # '대댓글 배치 예산(batch window)'을 공유(계정 단위 대댓글 속도 보호).
+        log.recovery_reply_id = reply_id
+        log.public_reply_posted_at = now
+        log.save(update_fields=["recovery_reply_id", "public_reply_posted_at"])
+    else:
+        log.public_reply_id = reply_id
+        log.public_reply_posted_at = now
+        log.save(update_fields=["public_reply_id", "public_reply_posted_at"])
     log.append_verification_log(
         {
             "path": "public_reply",
             "result": "posted",
+            "feature": feature,
             "reply_id": reply_id,
             "template_used": template[:50],
         }
     )
-    return {"status": "posted", "reply_id": reply_id, "template": template[:50]}
+    return {"status": "posted", "reply_id": reply_id, "feature": feature, "template": template[:50]}
 
 
 @shared_task
@@ -2570,6 +2701,150 @@ def send_reward_dm(self, opening_log_id: str):
         "status": "enqueued",
         "reward_log_id": str(reward_log.id),
     }
+
+
+# ═════════════════════════════════════════════════════════════
+# 실패 DM 복구 (recovery): 인바운드 DM → RECOVERY_PENDING opening 재전송
+# ═════════════════════════════════════════════════════════════
+
+
+@shared_task(name="integrations.process_inbound_recovery_dm")
+def process_inbound_recovery_dm(payload: dict):
+    """사용자가 보낸 인바운드 DM 을 받아, 그 사용자의 RECOVERY_PENDING opening 을 재전송한다.
+
+    매칭은 **DB 전용**(Meta API 0회): 인바운드 웹훅의 sender.id(IGSID)가 실패 로그의
+    recipient_user_id(댓글 작성자 IGSID)와 같음이 실측 확인됨. 사용자가 먼저 DM 을 보냈으므로
+    24h 메시징 창이 열려 재전송(user_id 경로)이 정상 도착한다.
+
+    설계 결정:
+      - 재전송 내용 = 실패했던 opening 을 그대로(팔로우게이트면 버튼 포함) → 팔로우 검증 유지.
+      - 한 사람이 여러 건 대기면 **가장 최근 1건만** 재전송(Action Block 방지).
+      - 멱등: opening 당 1회(sha256 'recovery:'+opening key) → 웹훅 재전송·연타 DM 이 중복 재전송 안 됨.
+      - 모든 발송은 send_dm_task 단일 초크포인트(페이서/거버너/쿨다운) 통과.
+    """
+    page_ig_user_id = str(payload.get("page_ig_user_id") or "")
+    sender_user_id = str(payload.get("sender_user_id") or "")
+    message_text = payload.get("message_text", "") or ""
+    if not sender_user_id or not page_ig_user_id:
+        return {"status": "skipped", "reason": "missing_ids"}
+    # self-message 방어 (발신자가 페이지 자신)
+    if sender_user_id == page_ig_user_id:
+        return {"status": "skipped", "reason": "self_message"}
+
+    # DB 매칭: 이 계정에서 이 sender 의 RECOVERY_PENDING opening 중 가장 최근 1건.
+    opening = (
+        SentDMLog.objects.select_related("campaign__ig_connection")
+        .filter(
+            recipient_user_id=sender_user_id,
+            status=SentDMLog.Status.RECOVERY_PENDING,
+            parent_log__isnull=True,
+            campaign__ig_connection__external_account_id=page_ig_user_id,
+        )
+        .order_by("-recovery_pending_at")
+        .first()
+    )
+    if opening is None:
+        return {"status": "no_match"}
+
+    campaign = opening.campaign
+
+    # TTL 만료 방어(스윕이 아직 안 돌았을 수 있음): 지났으면 재전송 안 하고 만료 처리.
+    ttl = campaign.recovery_ttl_seconds or 604800
+    if (
+        opening.recovery_pending_at
+        and (timezone.now() - opening.recovery_pending_at).total_seconds() >= ttl
+    ):
+        opening.status = SentDMLog.Status.RECOVERY_EXPIRED
+        opening.save(update_fields=["status"])
+        opening.append_verification_log({"path": "recovery", "result": "expired_on_inbound"})
+        if opening.parent_log_id is None:
+            campaign.increment_failed()
+        return {"status": "expired"}
+
+    # 프로 전용 게이트 재확인 (다운그레이드 방어). RECOVERY_PENDING 진입 시점엔 프로였어도
+    # TTL(기본 7일) 내에 소유자가 강등됐을 수 있다. 미보유면 재전송하지 않고 대기 유지 →
+    # TTL 스윕(handle_recovery_pending_expiry)이 만료로 정산한다(무손실, 무추가과금).
+    from apps.billing.subscription_utils import owner_has_feature
+
+    if not owner_has_feature(campaign.ig_connection.workspace, "dm_recovery"):
+        opening.append_verification_log({"path": "recovery", "result": "plan_gated_on_inbound"})
+        return {"status": "plan_gated"}
+
+    # 키워드 필터(선택): 비어있으면 아무 DM 이나 트리거.
+    if not campaign.matches_recovery_keyword(message_text):
+        return {"status": "keyword_no_match"}
+
+    # 빠른 가드: 연결이 살아있어야 재전송(발송 페이싱/거버너/쿨다운은 send_dm_task 가 담당).
+    ig_conn = campaign.ig_connection
+    if ig_conn.status != IGAccountConnection.Status.ACTIVE:
+        return {"status": "skipped", "reason": "ig_not_active"}
+
+    # 멱등 키 — opening 당 1회. reward 키와 같은 sha256(64자) 패턴.
+    import hashlib
+
+    idem = hashlib.sha256(f"recovery:{opening.idempotency_key}".encode()).hexdigest()
+
+    # 재전송 자식: opening 을 '열린 채널(user_id)'로 다시. dm_kind/gate 는 원본을 계승 →
+    #   OPENING(gate PENDING)이면 send_dm_task 가 팔로우 버튼을 재첨부(1188), 클릭 시 정상 gate 진행.
+    #   STANDALONE 이면 링크 버튼. comment_id="" 라 user_id 24h 창으로 라우팅.
+    is_opening = opening.dm_kind == SentDMLog.DMKind.OPENING
+    child, created = SentDMLog.create_idempotent(
+        idempotency_key=idem,
+        campaign=campaign,
+        comment_id="",
+        comment_text="",
+        recipient_user_id=opening.recipient_user_id,
+        recipient_username=opening.recipient_username,
+        message_sent=opening.message_sent,
+        status=SentDMLog.Status.QUEUED,
+        webhook_payload=opening.webhook_payload,
+        dm_kind=opening.dm_kind,
+        gate_status=(SentDMLog.GateStatus.PENDING if is_opening else SentDMLog.GateStatus.NONE),
+        parent_log=opening,
+    )
+    if not created:
+        return {"status": "duplicate", "child_log_id": str(child.id) if child else None}
+
+    opening.append_verification_log(
+        {"path": "recovery", "result": "resend_enqueued", "child_log_id": str(child.id)}
+    )
+    send_dm_task.delay(str(child.id))
+    return {
+        "status": "resend_enqueued",
+        "opening_log_id": str(opening.id),
+        "child_log_id": str(child.id),
+    }
+
+
+@shared_task(name="integrations.handle_recovery_pending_expiry")
+def handle_recovery_pending_expiry():
+    """RECOVERY_PENDING 이 캠페인 recovery_ttl_seconds 를 넘기면 RECOVERY_EXPIRED 로 만료.
+
+    좀비 로우 방지 스윕(hourly). ttl 은 캠페인별이라 후보를 좁힌 뒤 개별 판정한다.
+    만료는 '완전 실패' 정산 → opening(부모) 은 increment_failed 로 집계.
+    """
+    now = timezone.now()
+    candidates = list(
+        SentDMLog.objects.select_related("campaign")
+        .filter(
+            status=SentDMLog.Status.RECOVERY_PENDING,
+            recovery_pending_at__isnull=False,
+        )
+        .order_by("recovery_pending_at")[:2000]
+    )
+    expired = 0
+    for log in candidates:
+        campaign = log.campaign
+        ttl = (campaign.recovery_ttl_seconds if campaign else 0) or 604800
+        if (now - log.recovery_pending_at).total_seconds() < ttl:
+            continue
+        log.status = SentDMLog.Status.RECOVERY_EXPIRED
+        log.save(update_fields=["status"])
+        log.append_verification_log({"path": "recovery", "result": "expired"})
+        if log.parent_log_id is None and campaign:
+            campaign.increment_failed()
+        expired += 1
+    return {"scanned": len(candidates), "expired": expired}
 
 
 # ═════════════════════════════════════════════════════════════

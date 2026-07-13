@@ -14,6 +14,8 @@ TEMPLATE_WELCOME = "welcome"
 TEMPLATE_ONBOARDING_DAY_3 = "onboarding_day_3"
 TEMPLATE_ONBOARDING_DAY_7 = "onboarding_day_7"
 TEMPLATE_ONBOARDING_DAY_14 = "onboarding_day_14"
+TEMPLATE_PAYMENT_SUCCESS = "payment_success"
+TEMPLATE_PAYMENT_FAILED = "payment_failed"
 
 TEMPLATE_KEYS = [
     TEMPLATE_EMAIL_VERIFICATION,
@@ -22,6 +24,8 @@ TEMPLATE_KEYS = [
     TEMPLATE_ONBOARDING_DAY_3,
     TEMPLATE_ONBOARDING_DAY_7,
     TEMPLATE_ONBOARDING_DAY_14,
+    TEMPLATE_PAYMENT_SUCCESS,
+    TEMPLATE_PAYMENT_FAILED,
 ]
 
 TEMPLATE_CHOICES = [(k, k) for k in TEMPLATE_KEYS]
@@ -74,5 +78,26 @@ AVAILABLE_VARIABLES: dict[str, dict[str, str]] = {
         "upgrade_url": "유료 플랜 업그레이드 URL",
         "support_email": "고객센터 이메일",
         "trial_days_left": "무료 체험 남은 일수",
+    },
+    TEMPLATE_PAYMENT_SUCCESS: {
+        "full_name": "수신자 이름",
+        "plan_name": "결제한 플랜 표시명 (예: 프로)",
+        "amount_str": "결제 금액 (천단위 콤마 포함, 예: 9,900)",
+        "paid_date": "결제일 (YYYY-MM-DD)",
+        "card_info": "결제 수단 표시 (예: 신한카드 433012******123*)",
+        "next_billing_date": "다음 결제 예정일 (YYYY-MM-DD)",
+        "billing_url": "콘솔 결제 내역 페이지 URL",
+        "service_name": "서비스명",
+        "support_email": "고객센터 이메일",
+    },
+    TEMPLATE_PAYMENT_FAILED: {
+        "full_name": "수신자 이름",
+        "plan_name": "결제 대상 플랜 표시명",
+        "amount_str": "결제 시도 금액 (천단위 콤마)",
+        "failure_reason": "실패 사유 (토스 메시지)",
+        "grace_end_date": "무료 전환 예정일 (결제 예정일 + 7일, YYYY-MM-DD)",
+        "billing_url": "콘솔 결제/카드 설정 URL",
+        "service_name": "서비스명",
+        "support_email": "고객센터 이메일",
     },
 }

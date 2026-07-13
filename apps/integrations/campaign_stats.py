@@ -26,6 +26,7 @@ from .models import AutoDMCampaign, SentDMLog
 CONFIRMED_DELIVERED_STATUSES = [
     SentDMLog.Status.DELIVERED,
     SentDMLog.Status.READ,
+    SentDMLog.Status.RECOVERY_DELIVERED,  # 복구 재전송 성공 = 확정 도착
 ]
 # delivery_rate 모수: ACCEPTED 진입 이후 종결된 건 (도착/읽음/도착미확인 포함)
 ACCEPTED_OR_AFTER_STATUSES = [
@@ -33,6 +34,7 @@ ACCEPTED_OR_AFTER_STATUSES = [
     SentDMLog.Status.DELIVERED,
     SentDMLog.Status.READ,
     SentDMLog.Status.FAILED_NO_TRACE,
+    SentDMLog.Status.RECOVERY_DELIVERED,  # 실제 발송+도착했으므로 분자·분모 양쪽 포함
 ]
 # 사용자 조치가 필요한 상태 (severity=error + 도착미확인 자가점검).
 # error: 토큰만료(재연동) / 24h윈도우만료 / 파라미터오류.  warning: 도착미확인.
@@ -51,6 +53,7 @@ SENT_FOR_QUOTA_STATUSES = [
     SentDMLog.Status.READ,
     SentDMLog.Status.FAILED_NO_TRACE,
     SentDMLog.Status.SENT,  # legacy
+    SentDMLog.Status.RECOVERY_DELIVERED,  # 실제 Meta 발송 소비 → 쿼터 집계
 ]
 
 # annotate 결과를 담는 임시 속성명 (모델 필드와 충돌 안 나게 언더스코어 프리픽스)

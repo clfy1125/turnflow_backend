@@ -285,6 +285,37 @@ SPECTACULAR_SETTINGS = {
     },
 }
 
+# ── JWT 서명 키 (RS256 전환 / M-3) ──────────────────────────────────────────
+# CS 티켓 워커 등 외부 서비스가 토큰을 검증하려면 "공개키만" 넘겨줄 수 있어야 한다.
+# HS256(대칭)은 검증 키 == 서명 키라, 그 키가 워커에서 유출되면 어드민 토큰 위조가 가능하다.
+# → RS256(비대칭)으로 전환하고 외부에는 공개키(VERIFYING_KEY)만 배포한다.
+#
+# 동작:
+#   - JWT_PRIVATE_KEY(+JWT_PUBLIC_KEY) 가 주입되면 → RS256 (권장, 운영 목표)
+#   - 둘 다 없으면                                → HS256 폴백(SECRET_KEY, 키 미주입 dev 무중단)
+# 키는 환경변수(PEM, `\n` 이스케이프) 또는 파일 경로(*_FILE)로 주입. 레포/코드 하드코딩 금지.
+# ⚠️ SIGNING_KEY 가 바뀌면 발급된 access/refresh 토큰이 전부 무효화 → 전 사용자 1회 재로그인.
+
+
+def _load_jwt_pem(inline_var, file_var):
+    """PEM 을 env 인라인(`\\n` 이스케이프) 또는 파일 경로에서 로드. 없으면 빈 문자열."""
+    inline = config(inline_var, default="").strip()
+    if inline:
+        return inline.replace("\\n", "\n")
+    path = config(file_var, default="").strip()
+    if path:
+        pem_path = Path(path)
+        if not pem_path.is_absolute():
+            pem_path = BASE_DIR / pem_path
+        if pem_path.exists():
+            return pem_path.read_text()
+    return ""
+
+
+JWT_PRIVATE_KEY = _load_jwt_pem("JWT_PRIVATE_KEY", "JWT_PRIVATE_KEY_FILE")
+JWT_PUBLIC_KEY = _load_jwt_pem("JWT_PUBLIC_KEY", "JWT_PUBLIC_KEY_FILE")
+_JWT_RS256 = bool(JWT_PRIVATE_KEY and JWT_PUBLIC_KEY)
+
 # Simple JWT Settings
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(days=1),
@@ -292,8 +323,10 @@ SIMPLE_JWT = {
     "ROTATE_REFRESH_TOKENS": True,
     "BLACKLIST_AFTER_ROTATION": True,
     "UPDATE_LAST_LOGIN": True,
-    "ALGORITHM": "HS256",
-    "SIGNING_KEY": SECRET_KEY,
+    # RS256 키가 주입되면 비대칭 서명, 아니면 기존 HS256(SECRET_KEY) 폴백.
+    "ALGORITHM": "RS256" if _JWT_RS256 else "HS256",
+    "SIGNING_KEY": JWT_PRIVATE_KEY if _JWT_RS256 else SECRET_KEY,
+    "VERIFYING_KEY": JWT_PUBLIC_KEY if _JWT_RS256 else "",
     "AUTH_HEADER_TYPES": ("Bearer",),
     "AUTH_HEADER_NAME": "HTTP_AUTHORIZATION",
     "USER_ID_FIELD": "id",
@@ -343,6 +376,8 @@ CELERY_TASK_ROUTES = {
     # 댓글 처리 + 웹훅 delivered/read 후속 UPDATE
     "apps.integrations.tasks.process_comment_and_send_dm": {"queue": "webhook_followup"},
     "apps.integrations.tasks.process_messaging_event": {"queue": "webhook_followup"},
+    # 실패 DM 복구: 인바운드 DM → RECOVERY_PENDING opening 재전송 (웹훅 후속)
+    "integrations.process_inbound_recovery_dm": {"queue": "webhook_followup"},
     # 스팸 필터 LLM 판정(3-7초 gemma) — DM 디스패치를 굶기지 않게 ai_jobs 워커로 격리.
     # celery_ai 가 이미 최대 600s LLM 작업용으로 구동중이라 신규 인프라 불필요.
     "apps.integrations.tasks.run_spam_filter_check": {"queue": "ai_jobs"},
@@ -428,6 +463,13 @@ CELERY_BEAT_SCHEDULE = {
     # 누락 DM 보정. 발송은 rate_governor 가 throttle. MISSED_COMMENT_POLL_ENABLED 로 토글.
     "dm-poll-missed-comments": {
         "task": "integrations.poll_missed_comments",
+        "schedule": 60 * 60,  # 1시간
+    },
+    # ===== 실패 DM 복구: RECOVERY_PENDING 만료 스윕 =====
+    # 안내 대댓글 게시 후 recovery_ttl_seconds(기본 7일) 내 사용자 DM 이 없으면
+    # RECOVERY_EXPIRED 로 만료(좀비 로우 방지 + total_failed 정산).
+    "dm-recovery-pending-expiry": {
+        "task": "integrations.handle_recovery_pending_expiry",
         "schedule": 60 * 60,  # 1시간
     },
     # ===== 웹훅 구독 재확정 =====
@@ -699,10 +741,15 @@ GOOGLE_OAUTH_REDIRECT_URI = config("GOOGLE_OAUTH_REDIRECT_URI", default="")
 YOUTUBE_MOCK_MODE = config("YOUTUBE_MOCK_MODE", default=True, cast=bool)
 YOUTUBE_DAILY_QUOTA = config("YOUTUBE_DAILY_QUOTA", default=10000, cast=int)
 
-# Resend (Email)
-RESEND_API_KEY = config("RESEND_API_KEY", default="")
-RESEND_FROM_EMAIL = config("RESEND_FROM_EMAIL", default="no-reply@turnflow.clfy.ai.kr")
-RESEND_FROM_NAME = config("RESEND_FROM_NAME", default="TurnFlow")
+# Cloudflare Email Sending (Cloudflare Email Service — transactional email)
+# API 토큰(cfut_…)은 "Email Sending: Edit" 권한 필요. 발신 도메인(turnflow.link)은
+# Cloudflare DNS에 온보딩되어 SPF/DKIM/DMARC 가 검증된 상태여야 실제 발송된다.
+CLOUDFLARE_EMAIL_API_KEY = config("CLOUDFLARE_EMAIL_API_KEY", default="")
+CLOUDFLARE_EMAIL_ACCOUNT_ID = config(
+    "CLOUDFLARE_EMAIL_ACCOUNT_ID", default="65a4ccd1932e500ae946fa11e5b90817"
+)
+EMAIL_FROM_ADDRESS = config("EMAIL_FROM_ADDRESS", default="contact@turnflow.link")
+EMAIL_FROM_NAME = config("EMAIL_FROM_NAME", default="TurnFlow")
 
 # Frontend URL (used in email verification / password reset links)
 FRONTEND_URL = config("FRONTEND_URL", default="http://localhost:3000")
@@ -732,7 +779,22 @@ AI_IMAGE_VLM_MODEL = config("AI_IMAGE_VLM_MODEL", default="gemma-4")
 
 # Service metadata (used as default email template variables)
 SERVICE_NAME = config("SERVICE_NAME", default="TurnFlow")
-SUPPORT_EMAIL = config("SUPPORT_EMAIL", default="support@turnflow.clfy.ai.kr")
+SUPPORT_EMAIL = config("SUPPORT_EMAIL", default="contact@turnflow.link")
+
+# Brand / company metadata (email footer, receipts). See rag-docs 01-service-overview.
+BRAND_URL = config("BRAND_URL", default="https://turnflow.link")
+# 이메일 헤더 로고(공개 PNG URL). `manage.py upload_email_logo` 로 R2 에 올린 뒤 이 값이 가리키게 한다.
+# 값이 비거나 이미지 로드 실패 시 alt="TurnFlow" 텍스트가 대신 노출된다.
+EMAIL_LOGO_URL = config(
+    "EMAIL_LOGO_URL", default="https://media.turnflow.clfy.ai.kr/branding/email-logo.png"
+)
+COMPANY_NAME = config("COMPANY_NAME", default="주식회사 씨엘에프와이 (CLFY Co., Ltd.)")
+COMPANY_CEO = config("COMPANY_CEO", default="김시현")
+COMPANY_REG_NO = config("COMPANY_REG_NO", default="582-86-03901")
+COMPANY_ADDRESS = config(
+    "COMPANY_ADDRESS", default="울산광역시 울주군 언양읍 유니스트길 50, 251동 1층 101호"
+)
+COMPANY_PHONE = config("COMPANY_PHONE", default="070-8098-7102")
 
 # Email token lifetimes
 EMAIL_VERIFICATION_TTL_MINUTES = config("EMAIL_VERIFICATION_TTL_MINUTES", default=30, cast=int)

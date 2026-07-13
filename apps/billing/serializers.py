@@ -106,6 +106,11 @@ class UserSubscriptionSerializer(serializers.ModelSerializer):
         read_only=True,
         help_text="결제 카드(빌링키) 등록 여부",
     )
+    pending_extra_ig_accounts = serializers.IntegerField(
+        read_only=True,
+        allow_null=True,
+        help_text="예약된 추가 IG 계정 축소값. 다음 갱신 시 extra_ig_accounts 로 확정. null이면 예약 없음",
+    )
 
     class Meta:
         model = None  # set below
@@ -121,12 +126,53 @@ class UserSubscriptionSerializer(serializers.ModelSerializer):
             "card_number_masked",
             "monthly_amount_snapshot",
             "extra_ig_accounts",
+            "pending_extra_ig_accounts",
             "pending_plan_name",
+            "ig_activation_review_needed",
             "trial_used_at",
             "cancelled_at",
             "created_at",
             "updated_at",
         ]
+
+
+class IGAccountActivationItemSerializer(serializers.Serializer):
+    """활성화 선택 UI 의 계정 항목 (비-REVOKED 연동)."""
+
+    id = serializers.CharField(help_text="IGAccountConnection id (문자열 UUID)")
+    username = serializers.CharField(help_text="IG username (미동기화 시 빈 문자열)")
+    name = serializers.CharField(help_text="IG 표시명 (미동기화 시 빈 문자열)")
+    profile_picture_url = serializers.CharField(
+        help_text="캐싱된 안정 프로필 이미지 URL (미동기화 시 빈 문자열)"
+    )
+    is_active = serializers.BooleanField(help_text="현재 활성 여부")
+    status = serializers.CharField(help_text="연결 상태 (active/expired/error)")
+    workspace_name = serializers.CharField(help_text="소속 워크스페이스 이름")
+
+
+class IGAccountActivationStateSerializer(serializers.Serializer):
+    """GET/POST /billing/ig-account-activation/ 응답 (계정 owner 단위)."""
+
+    needs_activation_adjustment = serializers.BooleanField(
+        help_text="활성 계정 재선택이 필요한지 (활성수>허용량 또는 갱신 자동조정 발생). 다이얼로그 트리거로 사용"
+    )
+    max_ig_accounts = serializers.IntegerField(help_text="허용량 = 1 + 추가계정. 무제한은 999999")
+    total_accounts = serializers.IntegerField(help_text="연동된(비-REVOKED) 계정 수")
+    active_accounts = serializers.IntegerField(help_text="현재 활성 계정 수")
+    can_change_today = serializers.BooleanField(
+        help_text="오늘 활성화 변경 가능 여부 (하루 1회, 강제 조정 상황은 항상 허용)"
+    )
+    accounts = IGAccountActivationItemSerializer(many=True)
+
+
+class IGAccountActivationRequestSerializer(serializers.Serializer):
+    """POST /billing/ig-account-activation/ 요청."""
+
+    active_account_ids = serializers.ListField(
+        child=serializers.CharField(),
+        allow_empty=False,
+        help_text="활성으로 둘 IG 계정 id 목록. 허용량 이하, 전부 본인 소유여야 함(최소 1개)",
+    )
 
 
 class ChangeSubscriptionRequestSerializer(serializers.Serializer):

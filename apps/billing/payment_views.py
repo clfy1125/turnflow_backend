@@ -178,6 +178,20 @@ def check_refund_eligibility(user, sub, paid_at) -> dict:
     if logo_removed_pages > 0:
         reasons.append(f"배지 제거 기능을 {logo_removed_pages}개 페이지에서 사용했습니다.")
 
+    # 4-b) DM 발송 — '무제한'은 프로 전용이므로 free/basic 기준(월 200건)을 초과해
+    # 발송했다면 유료(프로) 기능 사용으로 간주한다. 200 이하는 무료/베이직도 쓸 수 있는
+    # 범위라 환불 사유로 보지 않는다. (basic 은 200 초과가 애초에 SKIP 되어 불가능하므로
+    # 이 조건은 사실상 프로에서만 걸린다.)
+    from .dm_limits import DEFAULT_DM_MONTHLY_LIMIT, count_owner_dms_since
+
+    dms_sent = count_owner_dms_since(user, paid_at)
+    details["dms_sent_since_payment"] = dms_sent
+    if dms_sent > DEFAULT_DM_MONTHLY_LIMIT:
+        reasons.append(
+            f"결제 이후 DM을 {dms_sent}건 발송했습니다 "
+            f"(무료/베이직 기준 {DEFAULT_DM_MONTHLY_LIMIT}건 초과 — 프로 전용 기능 사용)."
+        )
+
     # 5) 프로 전용 기능 사용 (스팸필터 활성 / IG 다계정)
     if sub.plan.name == "pro":
         from apps.integrations.models import IGAccountConnection, SpamFilterConfig

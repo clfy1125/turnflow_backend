@@ -17,6 +17,8 @@ from .constants import (
     TEMPLATE_ONBOARDING_DAY_3,
     TEMPLATE_ONBOARDING_DAY_7,
     TEMPLATE_ONBOARDING_DAY_14,
+    TEMPLATE_PAYMENT_FAILED,
+    TEMPLATE_PAYMENT_SUCCESS,
     TEMPLATE_WELCOME,
 )
 from .models import EmailToken, EmailTokenPurpose, OnboardingSchedule
@@ -108,6 +110,46 @@ def send_password_reset_email(user_id: int) -> None:
         send_email(TEMPLATE_PASSWORD_RESET, user.email, ctx, user=user)
     except EmailTemplateMissing:
         logger.error("password_reset template missing")
+
+
+def _payment_context(user, extra: dict) -> dict:
+    """Base user context + billing-provided fields. `extra` values must be
+    JSON-serializable (they cross the Celery boundary from billing)."""
+    ctx = {
+        "full_name": user.full_name or user.email.split("@")[0],
+        "email": user.email,
+        "service_name": settings.SERVICE_NAME,
+        "support_email": settings.SUPPORT_EMAIL,
+        "billing_url": f"{settings.FRONTEND_URL}/billing",
+    }
+    ctx.update(extra or {})
+    return ctx
+
+
+@shared_task(name="emails.send_payment_success_email")
+def send_payment_success_email(user_id: int, ctx: dict | None = None) -> None:
+    """결제 완료 안내 메일. billing 태스크가 결제 상세(ctx)를 넘겨 호출한다."""
+    try:
+        user = User.objects.get(pk=user_id, is_active=True)
+    except User.DoesNotExist:
+        return
+    try:
+        send_email(TEMPLATE_PAYMENT_SUCCESS, user.email, _payment_context(user, ctx or {}), user=user)
+    except EmailTemplateMissing:
+        logger.error("payment_success template missing — run seed_email_templates")
+
+
+@shared_task(name="emails.send_payment_failed_email")
+def send_payment_failed_email(user_id: int, ctx: dict | None = None) -> None:
+    """결제 실패 안내 메일. billing 갱신 실패 시 호출된다."""
+    try:
+        user = User.objects.get(pk=user_id, is_active=True)
+    except User.DoesNotExist:
+        return
+    try:
+        send_email(TEMPLATE_PAYMENT_FAILED, user.email, _payment_context(user, ctx or {}), user=user)
+    except EmailTemplateMissing:
+        logger.error("payment_failed template missing — run seed_email_templates")
 
 
 @shared_task(name="emails.send_welcome_email")

@@ -65,6 +65,28 @@ def count_owner_dms_this_month(owner, now=None) -> int:
     )
 
 
+def count_owner_dms_since(owner, since) -> int:
+    """owner 의 특정 시점(since) 이후 quota 소진 DM 수 — 환불 심사용.
+
+    집계 정의(SENT_FOR_QUOTA_STATUSES + (캠페인 × 수신자) 고유쌍)는
+    count_owner_dms_this_month 과 동일하되, 창을 '캘린더월'이 아니라 'since 이후'로
+    잡는다. 환불 심사는 해당 결제(paid_at) 이후 사용량만 봐야 하기 때문이다.
+    """
+    from apps.integrations.campaign_stats import SENT_FOR_QUOTA_STATUSES
+    from apps.integrations.models import SentDMLog
+
+    return (
+        SentDMLog.objects.filter(
+            campaign__ig_connection__workspace__owner=owner,
+            created_at__gte=since,
+            status__in=SENT_FOR_QUOTA_STATUSES,
+        )
+        .values("campaign_id", "recipient_user_id")
+        .distinct()
+        .count()
+    )
+
+
 def _quota_hit_cache_key(owner_id, now=None) -> str:
     local = timezone.localtime(now or timezone.now())
     return f"dmquota:hit:{owner_id}:{local:%Y%m}"

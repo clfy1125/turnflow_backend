@@ -53,8 +53,8 @@ django-extensions==3.2.3
 boto3==1.34.50
 django-storages[s3]==1.14.4
 
-# Email (Resend)
-resend==2.4.0
+# Email (Cloudflare Email Service — email_sending.send)
+cloudflare>=5.4.0
 
 # Image Pipeline (정제·압축·EXIF 제거·SVG sanitize)
 Pillow==10.4.0

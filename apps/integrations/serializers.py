@@ -31,6 +31,7 @@ class IGAccountConnectionSerializer(serializers.ModelSerializer):
             "token_expires_at",
             "scopes",
             "status",
+            "is_active",
             "last_verified_at",
             "error_message",
             "is_expired",
@@ -48,6 +49,7 @@ class IGAccountConnectionSerializer(serializers.ModelSerializer):
             "token_expires_at",
             "scopes",
             "status",
+            "is_active",
             "last_verified_at",
             "error_message",
             "created_at",
@@ -111,6 +113,9 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
     is_runnable_now = serializers.SerializerMethodField()
     # 웹훅 누락 시 자동 보정 가능 여부 + 위험 안내 (프론트 고지용)
     miss_recovery = serializers.SerializerMethodField()
+    # 실패 DM 복구가 이 캠페인 소유자 플랜에서 실제로 동작하는지 (프로 전용).
+    # false 면 recovery_reply_enabled 가 true 여도 안내 대댓글이 게시되지 않는다 → 프론트에서 토글 잠금.
+    recovery_reply_available = serializers.SerializerMethodField()
 
     class Meta:
         model = AutoDMCampaign
@@ -145,6 +150,12 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
             "follow_gate_retry_message",
             "reward_message_template",
             "gate_trigger_keywords",
+            # 실패 DM 복구 (recovery) — 비팔로워 2534025 실패 시 안내 대댓글 + 인바운드 재전송
+            "recovery_reply_enabled",
+            "recovery_reply_templates",
+            "recovery_keyword",
+            "recovery_ttl_seconds",
+            "recovery_reply_available",
             # 링크 버튼 (web_url — DM 카드에 라벨 달린 링크 버튼으로 첨부)
             "link_button_url",
             "link_button_label",
@@ -178,11 +189,42 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
             "schedule_state",
             "is_runnable_now",
             "miss_recovery",
+            "recovery_reply_available",
             "created_at",
             "updated_at",
             "started_at",
             "ended_at",
         ]
+
+    def get_recovery_reply_available(self, obj) -> bool:
+        """이 캠페인 소유자 플랜이 실패 DM 복구(dm_recovery, 프로 전용)를 보유하는지.
+
+        런타임 게이트(_maybe_enter_recovery)와 동일한 owner_has_feature 판정이라,
+        false 면 recovery_reply_enabled 가 true 여도 실제 안내 대댓글은 게시되지 않는다.
+        스태프(어드민)는 항상 true 로 노출한다.
+
+        목록(list) 직렬화는 자식 serializer 인스턴스를 항목마다 재사용하므로 owner_id 기준으로
+        메모이즈해 owner_has_feature 의 항목당 플랜 조회(N+1)를 막는다.
+        """
+        from apps.billing.subscription_utils import owner_has_feature
+
+        from .campaign_stats import is_admin_user
+
+        request = self.context.get("request")
+        if request is not None and is_admin_user(request.user):
+            return True
+        try:
+            workspace = obj.ig_connection.workspace
+            owner_id = workspace.owner_id
+        except Exception:  # noqa: BLE001 - 조회 실패는 미보유 취급
+            return False
+        cache = self.__dict__.setdefault("_recovery_avail_cache", {})
+        if owner_id not in cache:
+            try:
+                cache[owner_id] = owner_has_feature(workspace, "dm_recovery")
+            except Exception:  # noqa: BLE001 - 조회 실패는 미보유 취급
+                cache[owner_id] = False
+        return cache[owner_id]
 
     def get_is_active(self, obj) -> bool:
         return obj.is_active()
@@ -540,6 +582,37 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
         help_text="postback 미수신 구버전 클라이언트 fallback. 이 키워드 답장도 통과로 간주.",
     )
 
+    # 실패 DM 복구 (recovery)
+    recovery_reply_enabled = serializers.BooleanField(
+        required=False,
+        default=True,
+        help_text=(
+            "opening 이 2534025(비팔로워 채널 미개설)로 실패하면 댓글에 '다시 보내드릴게요' 안내를 "
+            "게시하고, 사용자가 DM 을 보내오면 열린 채널로 재전송한다. 기본값 true. "
+            "프로 전용 — 미보유 플랜은 켜도 동작하지 않는다(recovery_reply_available 로 확인)."
+        ),
+    )
+    recovery_reply_templates = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        default=list,
+        help_text="복구 안내 대댓글 변형 목록(무작위 1개 사용). 비우면 서버 기본 세트를 자동 사용(선택).",
+    )
+    recovery_keyword = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+        max_length=255,
+        help_text="비우면 사용자의 아무 DM 이나 재전송 트리거. 값이 있으면 그 키워드 포함 DM 만.",
+    )
+    recovery_ttl_seconds = serializers.IntegerField(
+        required=False,
+        default=604800,
+        min_value=3600,
+        max_value=2592000,
+        help_text="복구 대기 유효기간(초). 기본 7일(604800), 범위 1시간~30일.",
+    )
+
     # 운영 — (deprecated v4.3) 값은 수용하되 무시됨: 페이싱은 dm_pacer(계정 단위 지터 슬롯)가 담당.
     # 하위호환(기존 프론트가 보내는 값 400 방지)을 위해 필드는 유지한다.
     max_sends_per_hour = serializers.IntegerField(
@@ -623,6 +696,8 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
                         )
                     }
                 )
+        # 복구: 템플릿은 선택 — 비우면 서버 기본 세트(DEFAULT_RECOVERY_REPLY_TEMPLATES)를
+        # 무작위로 사용하므로 recovery_reply_enabled=true 여도 필수 아님.
         # 예약 발송 창 검증
         start = attrs.get("scheduled_start_at")
         end = attrs.get("scheduled_end_at")
@@ -667,6 +742,11 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
             "follow_gate_retry_message",
             "reward_message_template",
             "gate_trigger_keywords",
+            # 실패 DM 복구 (recovery)
+            "recovery_reply_enabled",
+            "recovery_reply_templates",
+            "recovery_keyword",
+            "recovery_ttl_seconds",
             # 링크 버튼 (web_url)
             "link_button_url",
             "link_button_label",
@@ -702,6 +782,10 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
             "follow_gate_retry_message": {"required": False, "allow_blank": True},
             "reward_message_template": {"required": False, "allow_blank": True},
             "gate_trigger_keywords": {"required": False},
+            "recovery_reply_enabled": {"required": False},
+            "recovery_reply_templates": {"required": False},
+            "recovery_keyword": {"required": False, "allow_blank": True},
+            "recovery_ttl_seconds": {"required": False},
         }
 
 
@@ -888,6 +972,9 @@ _STATUS_DISPLAY = {
     "rate_limited": "Meta 응답 대기 중 (지연)",
     "failed_no_trace": "도착 미확인 (자가 점검 필요)",
     "failed_api": "API 오류(legacy)",
+    "recovery_pending": "복구 대기 (사용자 DM 응답 대기)",
+    "recovery_delivered": "복구 재전송 성공",
+    "recovery_expired": "복구 대기 만료",
 }
 
 

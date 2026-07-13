@@ -152,6 +152,53 @@ class TestRenewalCharge:
         assert sub.pending_plan is None
         assert sub.extra_ig_accounts == 0
 
+    def test_pending_extra_decrease_applied_on_renewal(self, user, monkeypatch):
+        """추가계정 축소 예약이 갱신 시 확정 — 청구액도 축소분 반영(charge 전 계산)."""
+        sub = _paid_sub(user, plan_name="pro", snapshot=9900, extra=2)
+        sub.pending_extra_ig_accounts = 0
+        sub.save(update_fields=["pending_extra_ig_accounts"])
+        mock = ChargeMock(monkeypatch)
+
+        charge_subscription_renewal.apply(args=[str(sub.id)]).get()
+
+        assert mock.calls[0]["amount"] == 9900  # 스냅샷만 (추가계정 0)
+        sub.refresh_from_db()
+        assert sub.extra_ig_accounts == 0
+        assert sub.pending_extra_ig_accounts is None
+
+    def test_renewal_auto_deactivates_excess_ig_accounts(self, user, monkeypatch):
+        """갱신 후 활성 IG 계정이 허용량 초과면 오래된 순 유지·초과분 자동 비활성 + 재선택 플래그."""
+        from apps.integrations.models import IGAccountConnection
+        from apps.workspace.models import Workspace
+
+        sub = _paid_sub(user, plan_name="pro", snapshot=9900, extra=2)  # 허용량 3
+        sub.pending_extra_ig_accounts = 0  # 갱신 후 허용량 1
+        sub.save(update_fields=["pending_extra_ig_accounts"])
+
+        ws = Workspace.objects.create(name="w", slug=f"w-{uuid.uuid4().hex[:8]}", owner=user)
+        conns = [
+            IGAccountConnection.objects.create(
+                workspace=ws,
+                external_account_id=f"ig_{uuid.uuid4().hex[:8]}",
+                username=f"u{i}",
+                account_type="BUSINESS",
+                status=IGAccountConnection.Status.ACTIVE,
+                is_active=True,
+            )
+            for i in range(3)
+        ]
+        ChargeMock(monkeypatch)
+
+        charge_subscription_renewal.apply(args=[str(sub.id)]).get()
+
+        for c in conns:
+            c.refresh_from_db()
+        active = [c for c in conns if c.is_active]
+        assert len(active) == 1  # 오래된 1개만 유지
+        assert active[0].id == conns[0].id  # 가장 먼저 연동된 것
+        sub.refresh_from_db()
+        assert sub.ig_activation_review_needed is True
+
     def test_cancelled_never_charged(self, user, monkeypatch):
         sub = _paid_sub(user, status=SubscriptionStatus.CANCELLED)
         mock = ChargeMock(monkeypatch)

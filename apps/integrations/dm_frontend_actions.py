@@ -12,12 +12,9 @@ DM 발송 결과별 프론트엔드 액션 가이드 (v3.2).
 
 from __future__ import annotations
 
-from typing import Dict, List
-
-
 # 사용자에게 항상 보여주는 자가 점검 체크리스트
 # (FAILED_NO_TRACE 또는 그에 준하는 상태에서 노출)
-SELF_CHECK_CHECKLIST: List[Dict] = [
+SELF_CHECK_CHECKLIST: list[dict] = [
     {
         "id": "message_access_allowed",
         "title": "메시지 액세스 허용 여부",
@@ -53,7 +50,7 @@ SELF_CHECK_CHECKLIST: List[Dict] = [
 ]
 
 
-def build_frontend_action(status: str) -> Dict:
+def build_frontend_action(status: str) -> dict:
     """
     SentDMLog.status 에 대응하는 프론트엔드 표시 액션을 반환.
 
@@ -74,8 +71,7 @@ def build_frontend_action(status: str) -> Dict:
             "description": (
                 "Meta 메시징 파이프라인에 메시지가 전달되었습니다."
                 if status == "delivered"
-                else "수신자가 읽었습니다." if status == "read"
-                else "발송 완료."
+                else "수신자가 읽었습니다." if status == "read" else "발송 완료."
             ),
             "checklist": None,
             "cta": None,
@@ -87,8 +83,7 @@ def build_frontend_action(status: str) -> Dict:
             "type": "wait",
             "title": "Meta 접수됨 (도착 확인 중)",
             "description": (
-                "Meta가 발송 요청을 수락했습니다. "
-                "최대 35분 내 자동으로 도착 여부를 검증합니다."
+                "Meta가 발송 요청을 수락했습니다. " "최대 35분 내 자동으로 도착 여부를 검증합니다."
             ),
             "checklist": None,
             "cta": None,
@@ -181,6 +176,45 @@ def build_frontend_action(status: str) -> Dict:
             "type": "info",
             "title": "건너뜀",
             "description": "발송 제한(시간당 한도) 또는 정책에 의해 건너뛰어진 건입니다.",
+            "checklist": None,
+            "cta": None,
+            "severity": "info",
+        }
+
+    if status == "recovery_pending":
+        return {
+            "type": "wait",
+            "title": "DM 복구 대기 중 (사용자 응답 대기)",
+            "description": (
+                "첫 DM(비공개 답글)이 전달되지 못해(비팔로워 등 채널 미개설) 댓글에 "
+                "'DM 주시면 다시 보내드릴게요' 안내를 게시했습니다. 사용자가 이 계정으로 "
+                "DM 을 보내오면 열린 채널로 자동 재전송됩니다. 아직 완전한 실패가 아닙니다."
+            ),
+            "checklist": None,
+            "cta": None,
+            "severity": "warning",
+        }
+
+    if status == "recovery_delivered":
+        return {
+            "type": "success",
+            "title": "복구 재전송 성공",
+            "description": (
+                "첫 발송은 실패했지만, 사용자가 DM 을 보내와 열린 채널로 재전송되어 도착했습니다."
+            ),
+            "checklist": None,
+            "cta": None,
+            "severity": "success",
+        }
+
+    if status == "recovery_expired":
+        return {
+            "type": "info",
+            "title": "복구 대기 만료 (사용자 무응답)",
+            "description": (
+                "안내 답글 게시 후 유효기간 내에 사용자 DM 이 없어 만료되었습니다. "
+                "계정주가 조치할 항목은 없습니다."
+            ),
             "checklist": None,
             "cta": None,
             "severity": "info",

@@ -15,6 +15,7 @@ from .subscription_views import (
     CancelSubscriptionView,
     ChangePlanPreviewView,
     ChangeSubscriptionView,
+    IGAccountActivationView,
     MySubscriptionView,
     PageActivationView,
     ResumeSubscriptionView,
@@ -48,6 +49,11 @@ urlpatterns = router.urls + [
     path("billing/cancel/", CancelSubscriptionView.as_view(), name="cancel-subscription"),
     path("billing/resume/", ResumeSubscriptionView.as_view(), name="resume-subscription"),
     path("billing/page-activation/", PageActivationView.as_view(), name="page-activation"),
+    path(
+        "billing/ig-account-activation/",
+        IGAccountActivationView.as_view(),
+        name="ig-account-activation",
+    ),
     # 토스페이먼츠 빌링
     path("billing/toss/prepare/", TossPrepareView.as_view(), name="toss-prepare"),
     path("billing/toss/confirm/", TossConfirmView.as_view(), name="toss-confirm"),

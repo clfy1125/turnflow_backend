@@ -516,8 +516,14 @@ class ExtraAccountsView(APIView):
 - **증가**: 증가분 × 9,900원을 **현재 주기 잔여일만큼 비례하여 즉시 결제**.
   결제 성공 시에만 슬롯이 늘어나며, 이후 매월 갱신 금액에 계정 전체가 합산됩니다.
   잔여 비례액이 0이면 `payment`가 null이며 무과금으로 즉시 적용됩니다.
-- **감소**: 무과금·무환불. 단, 현재 연동된 IG 계정 수가 새 허용량(기본 1 + count) 이하여야
-  합니다. 초과 상태면 먼저 연동을 해제해야 합니다.
+  대기 중이던 축소 예약이 있으면 함께 해제됩니다.
+- **감소**: 무과금·무환불이며 **즉시 반영되지 않습니다.** `pending_extra_ig_accounts`로
+  **예약**만 하고, **다음 갱신일부터** 낮아진 슬롯/금액이 적용됩니다(이번 주기는 그대로 사용).
+  초과 여부로 거부하지 않습니다. 갱신 시 허용량이 줄어 활성 계정이 초과되면 그 시점에
+  자동 비활성 처리되며, 사용자는 `GET/POST /billing/ig-account-activation/`으로 활성 계정을
+  다시 고를 수 있습니다. 응답의 `effective_at`이 적용 예정일(=현재 주기 종료일)입니다.
+- **축소 예약 취소**: 현재 적용값(`extra_ig_accounts`)과 동일한 `count`로 다시 요청하면
+  예약이 취소됩니다.
 
 ## 요청 필드
 | 필드 | 필수 | 타입 | 설명 |
@@ -539,7 +545,7 @@ const res = await fetch('/api/v1/billing/extra-accounts/', {
 ## 에러
 | 코드 | 원인 |
 |------|------|
-| 400 | 프로 플랜 아님, 카드 미등록, 동일 값, 감소 시 연동 수 초과, 미납/해지예약 상태 |
+| 400 | 프로 플랜 아님, 카드 미등록, 동일 값(예약 없음), 미납/해지예약 상태 |
 | 401 | 토큰 없음/만료 |
 | 402 | 증가분 결제 거절 |
 | 202 | 결제 결과 확인 중 |
@@ -548,20 +554,53 @@ const res = await fetch('/api/v1/billing/extra-accounts/', {
         request=ExtraAccountsRequestSerializer,
         responses={
             200: OpenApiResponse(
-                description="변경 완료",
+                description="변경 완료 (증가=즉시 반영 / 감소=예약)",
                 examples=[
                     OpenApiExample(
-                        "추가 구매 성공",
+                        "추가 구매 성공 (증가 — 즉시 반영)",
                         value={
-                            "detail": "추가 IG 계정이 2개로 변경되었습니다.",
+                            "detail": "추가 IG 계정이 2개로 즉시 반영되었습니다.",
                             "subscription": {
                                 "extra_ig_accounts": 2,
+                                "pending_extra_ig_accounts": None,
                                 "plan": {"name": "pro"},
                             },
                             "payment": {"amount": 9900, "status": "paid"},
                             "next_renewal_amount": 29700,
+                            "effective_at": None,
                         },
-                    )
+                    ),
+                    OpenApiExample(
+                        "축소 예약 (감소 — 다음 갱신 적용)",
+                        value={
+                            "detail": (
+                                "추가 IG 계정 축소(0개)가 예약되었습니다. "
+                                "다음 갱신일부터 낮아진 금액이 적용됩니다."
+                            ),
+                            "subscription": {
+                                "extra_ig_accounts": 2,
+                                "pending_extra_ig_accounts": 0,
+                                "plan": {"name": "pro"},
+                            },
+                            "payment": None,
+                            "next_renewal_amount": 9900,
+                            "effective_at": "2026-08-09T00:00:00+09:00",
+                        },
+                    ),
+                    OpenApiExample(
+                        "축소 예약 취소 (동일 값 재요청)",
+                        value={
+                            "detail": "예약된 추가 계정 축소가 취소되었습니다.",
+                            "subscription": {
+                                "extra_ig_accounts": 2,
+                                "pending_extra_ig_accounts": None,
+                                "plan": {"name": "pro"},
+                            },
+                            "payment": None,
+                            "next_renewal_amount": 29700,
+                            "effective_at": None,
+                        },
+                    ),
                 ],
             ),
             202: OpenApiResponse(description="결제 결과 확인 중"),
@@ -583,12 +622,14 @@ const res = await fetch('/api/v1/billing/extra-accounts/', {
         sub = result["subscription"]
         return Response(
             {
-                "detail": f"추가 IG 계정이 {sub.extra_ig_accounts}개로 변경되었습니다.",
+                "detail": result.get("detail")
+                or f"추가 IG 계정이 {sub.extra_ig_accounts}개로 변경되었습니다.",
                 "subscription": UserSubscriptionSerializer(sub).data,
                 "payment": (
                     PaymentHistorySerializer(result["payment"]).data if result["payment"] else None
                 ),
                 "next_renewal_amount": sub.renewal_amount,
+                "effective_at": result.get("effective_at"),
             }
         )
 

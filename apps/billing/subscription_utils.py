@@ -110,9 +110,15 @@ def get_ig_account_allowance(user) -> int:
 
 
 def count_active_ig_connections(user) -> int:
-    """user 소유 전체 워크스페이스의 활성 IG 연동 수."""
+    """user 소유 전체 워크스페이스의 '활성' IG 연동 수 (허용량/연결 게이트 기준).
+
+    허용량은 활성(is_active=True) 계정 수를 제한한다 — 소프트 비활성 계정은 슬롯을 비우므로
+    여기에 포함하지 않는다(하드 연결해제 없이 계정 교체 가능).
+    """
     from apps.integrations.models import IGAccountConnection
 
     return IGAccountConnection.objects.filter(
-        workspace__owner=user, status=IGAccountConnection.Status.ACTIVE
+        workspace__owner=user,
+        status=IGAccountConnection.Status.ACTIVE,
+        is_active=True,
     ).count()

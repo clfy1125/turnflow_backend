@@ -713,6 +713,13 @@ def confirm_billing(
 
     sub.refresh_from_db()
     logger.info("첫 결제 완료: user=%s plan=%s amount=%d", user.email, new_plan.name, amount)
+    # 첫 결제 완료 안내 메일 (best-effort)
+    try:
+        from .tasks import payment_success_email
+
+        payment_success_email(sub, payment)
+    except Exception:  # noqa: BLE001 - 메일 실패가 구독 시작을 막으면 안 됨
+        logger.exception("첫 결제 완료 메일 enqueue 실패 user=%s", user.email)
     return {
         "subscription": sub,
         "payment": payment,
@@ -765,11 +772,15 @@ def _apply_upgrade_state(sub_pk, new_plan, extra_ig_accounts: int, now=None):
 
 
 def _apply_extra_state(sub_pk, to_count: int):
-    """추가 IG 계정 수 반영 (멱등). change_extra_accounts / reconcile 공유."""
+    """추가 IG 계정 수 즉시 반영 (멱등). change_extra_accounts / reconcile 공유.
+
+    즉시 반영은 대기 중인 '축소 예약'을 무효화한다(증가로 마음을 바꾼 경우).
+    """
     with transaction.atomic():
         locked = UserSubscription.objects.select_for_update().get(pk=sub_pk)
         locked.extra_ig_accounts = to_count
-        locked.save(update_fields=["extra_ig_accounts", "updated_at"])
+        locked.pending_extra_ig_accounts = None
+        locked.save(update_fields=["extra_ig_accounts", "pending_extra_ig_accounts", "updated_at"])
     return locked
 
 
@@ -899,9 +910,12 @@ def change_plan(user, plan_name: str, extra_ig_accounts: int = 0) -> dict:
 def change_extra_accounts(user, new_count: int) -> dict:
     """프로 전용 추가 IG 계정 수 변경.
 
-    - 증가: 증가분 × 9,900원을 현재 주기 잔여일만큼 비례 즉시 청구 → 성공 시 반영.
-      다음 갱신부터 계정 전체가 합산 청구된다.
-    - 감소: 무과금·무환불. 현재 활성 연동 수가 새 허용량(1+count) 이하일 때만.
+    - 증가: 증가분 × 9,900원을 현재 주기 잔여일만큼 비례 즉시 청구 → 성공 시 즉시 반영.
+      대기 중이던 축소 예약이 있으면 함께 해제된다.
+    - 감소: **즉시 반영/거부 없음.** 다음 갱신 시점에 적용되도록 `pending_extra_ig_accounts`
+      로 예약만 한다(이번 주기는 그대로 사용). 갱신 때 허용량이 줄어 활성 계정이 초과되면
+      그 시점에 자동 비활성 + 재선택 유도(billing.tasks._enforce_ig_activation_after_renewal).
+    - 현재 적용값과 동일한 요청: 축소 예약이 있으면 예약 취소, 없으면 400.
     """
     sub = ensure_subscription(user)
 
@@ -921,11 +935,27 @@ def change_extra_accounts(user, new_count: int) -> dict:
         raise BillingFlowError("해지 예약된 구독입니다. 구독을 재개한 후 이용해주세요.")
 
     delta = new_count - sub.extra_ig_accounts
+
+    # ── 현재 적용값과 동일: 축소 예약 취소 (플랜변경 예약취소와 동일 관례) ──
     if delta == 0:
+        if sub.pending_extra_ig_accounts is not None:
+            with transaction.atomic():
+                locked = UserSubscription.objects.select_for_update().get(pk=sub.pk)
+                locked.pending_extra_ig_accounts = None
+                locked.save(update_fields=["pending_extra_ig_accounts", "updated_at"])
+            sub.refresh_from_db()
+            logger.info("추가 IG 계정 축소 예약 취소: user=%s → %d 유지", user.email, new_count)
+            return {
+                "subscription": sub,
+                "payment": None,
+                "detail": "예약된 추가 계정 축소가 취소되었습니다.",
+                "effective_at": None,
+            }
         raise BillingFlowError("현재 설정과 동일합니다.")
 
-    payment = None
+    # ── 증가: 즉시 비례 청구 + 즉시 반영 (있던 축소 예약도 해제) ──
     if delta > 0:
+        payment = None
         amount = compute_extra_accounts_charge(sub, delta, now=timezone.now())
         if amount > 0:
             payment = charge_prorated(
@@ -934,26 +964,37 @@ def change_extra_accounts(user, new_count: int) -> dict:
                 f"턴플로우 추가 IG 계정 {delta}개 (잔여기간 비례)",
                 proration_extra_order_id(sub, new_count),
             )
-    else:
-        from apps.integrations.models import IGAccountConnection
+        _apply_extra_state(sub.pk, new_count)  # extra_ig_accounts=new_count, pending 해제
+        sub.refresh_from_db()
+        logger.info("추가 IG 계정 증가: user=%s %+d → %d (즉시 반영)", user.email, delta, new_count)
+        return {
+            "subscription": sub,
+            "payment": payment,
+            "detail": f"추가 IG 계정이 {new_count}개로 즉시 반영되었습니다.",
+            "effective_at": None,
+        }
 
-        allowed_after = 1 + new_count
-        current_active = IGAccountConnection.objects.filter(
-            workspace__owner=user, status=IGAccountConnection.Status.ACTIVE
-        ).count()
-        if current_active > allowed_after:
-            raise BillingFlowError(
-                f"현재 연동된 IG 계정이 {current_active}개입니다. "
-                f"{allowed_after}개 이하로 연동을 해제한 후 축소할 수 있습니다.",
-                extra={"current_active": current_active, "allowed_after": allowed_after},
-            )
-
-    # 청구 성공(또는 0원 무과금)/감소 검증 통과 후에만 반영.
-    _apply_extra_state(sub.pk, new_count)
-
+    # ── 감소: 다음 갱신으로 예약만. 즉시 반영/초과 거부 없음. ──
+    with transaction.atomic():
+        locked = UserSubscription.objects.select_for_update().get(pk=sub.pk)
+        locked.pending_extra_ig_accounts = new_count
+        locked.save(update_fields=["pending_extra_ig_accounts", "updated_at"])
     sub.refresh_from_db()
-    logger.info("추가 IG 계정 변경: user=%s %+d → %d (잔여기간 비례)", user.email, delta, new_count)
-    return {"subscription": sub, "payment": payment}
+    logger.info(
+        "추가 IG 계정 축소 예약: user=%s %d → %d (다음 갱신 적용)",
+        user.email,
+        sub.extra_ig_accounts,
+        new_count,
+    )
+    return {
+        "subscription": sub,
+        "payment": None,
+        "detail": (
+            f"추가 IG 계정 축소({new_count}개)가 예약되었습니다. "
+            "다음 갱신일부터 낮아진 금액이 적용됩니다."
+        ),
+        "effective_at": sub.current_period_end,
+    }
 
 
 # ──────────────────────────────────────────────
@@ -1085,7 +1126,11 @@ def preview_change_extra_accounts(user, count: int, now=None) -> dict:
         raise BillingFlowError("해지 예약된 구독입니다. 구독을 재개한 후 이용해주세요.")
 
     delta = count - sub.extra_ig_accounts
-    next_renewal_amount = sub.renewal_amount + EXTRA_IG_ACCOUNT_PRICE * delta
+    # 목표 count 기준 다음 갱신액 (대기 예약 상태와 무관하게 결정적으로 계산).
+    base = sub.pending_amount_snapshot if sub.pending_plan_id else sub.monthly_amount_snapshot
+    if base is None:
+        base = sub.plan.monthly_price
+    next_renewal_amount = base + EXTRA_IG_ACCOUNT_PRICE * count
     zero = {"amount": 0, "currency": "KRW", "description": "", "proration": None}
 
     if delta == 0:
@@ -1105,7 +1150,7 @@ def preview_change_extra_accounts(user, count: int, now=None) -> dict:
                 **zero,
                 "description": "추가 계정 축소는 무과금 — 다음 갱신부터 낮은 금액으로 청구됩니다.",
             },
-            "effective_at": None,
+            "effective_at": sub.current_period_end,
             "next_renewal_amount": next_renewal_amount,
             "unit_price": EXTRA_IG_ACCOUNT_PRICE,
         }

@@ -185,6 +185,32 @@ class TestSubscriptionUpdate:
         assert sub.status == SubscriptionStatus.ACTIVE
         assert sub.cancelled_at is None
 
+    def test_downgrade_off_pro_resets_extras_and_pending(
+        self, staff_client, member, free_plan, pro_plan
+    ):
+        """pro→비-pro 수기 변경 시 추가계정 슬롯/예약을 리셋 — 허용량 부풀림 방지."""
+        from apps.billing.subscription_utils import get_ig_account_allowance
+
+        sub = UserSubscription.objects.create(
+            user=member,
+            plan=pro_plan,
+            status=SubscriptionStatus.ACTIVE,
+            extra_ig_accounts=2,
+            pending_extra_ig_accounts=1,
+        )
+
+        res = staff_client.patch(
+            f"/api/v1/admin/users/{member.id}/subscription/", {"plan": "free"}, format="json"
+        )
+
+        assert res.status_code == 200
+        sub.refresh_from_db()
+        assert sub.plan.name == "free"
+        assert sub.extra_ig_accounts == 0
+        assert sub.pending_extra_ig_accounts is None
+        # 허용량이 1 로 정확히 재계산 (예전엔 1+2=3 으로 부풀었음)
+        assert get_ig_account_allowance(member) == 1
+
     def test_accepts_plan_id(self, staff_client, member, free_plan, pro_plan):
         res = staff_client.patch(
             f"/api/v1/admin/users/{member.id}/subscription/",

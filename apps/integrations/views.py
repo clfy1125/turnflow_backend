@@ -99,7 +99,9 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         from rest_framework.exceptions import PermissionDenied
 
         if not ig_connection_id:
-            return IGAccountConnection.objects.filter(workspace=workspace, status="active").first()
+            return IGAccountConnection.objects.filter(
+                workspace=workspace, status="active", is_active=True
+            ).first()
 
         try:
             connection = IGAccountConnection.objects.get(id=ig_connection_id)
@@ -1669,7 +1671,9 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
 
         qs = AutoDMCampaign.objects.filter(
             ig_connection__workspace__in=user_workspaces
-        ).select_related("ig_connection")
+        ).select_related(
+            "ig_connection__workspace"
+        )  # workspace 는 recovery_reply_available 판정용(N+1 방지)
 
         ig_connection_id = self.request.query_params.get("ig_connection_id")
         if ig_connection_id:
@@ -1843,6 +1847,143 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         from .campaign_guides import build_campaign_guide
 
         return Response(build_campaign_guide())
+
+    @extend_schema(
+        summary="실패 DM 복구 안내 대댓글 추천 문구",
+        description=(
+            "캠페인 생성/수정 폼에서 **실패 DM 복구**(recovery) 안내 대댓글의 기본 문구를 "
+            "서버가 조합형 생성기로 무작위 생성해 내려준다. 프론트는 폼을 열 때 이 API 를 호출해 "
+            "받은 문구들로 `recovery_reply_templates` 입력란을 미리 채우면 된다(사용자는 자유롭게 "
+            "편집/추가/삭제 가능).\n\n"
+            "## 동작\n"
+            "- 매 호출마다 서로 다른 무작위 조합을 반환한다(같은 요청도 매번 다름).\n"
+            "- 형식: `{실패 알림} {이모지} {재요청 문구}` (+50% 확률로 끝 이모지). "
+            "총 조합 수는 `generator_combinations` 로 함께 내려준다.\n"
+            "- `recovery_reply_templates` 를 **비워서 저장**하면, 발송 시점에 서버가 이 생성기로 "
+            "매번 새 문구를 만들어 쓴다(사실상 무한 변형 → 봇 검사에 가장 강함). 폼에 채워 저장하면 "
+            "그 목록에서만 무작위 선택한다.\n\n"
+            "## 프로 전용\n"
+            "실패 DM 복구는 프로 플랜(`dm_recovery` 기능) 전용이다. `workspace_id` 를 넘기면 "
+            "그 워크스페이스 소유자 플랜 기준 사용 가능 여부를 `available` 로 함께 내려준다"
+            "(넘기지 않으면 `available: null`). 프론트는 이 값으로 토글을 잠그거나 업그레이드 유도.\n\n"
+            "## 인증\n"
+            "JWT 필요. `workspace_id` 를 넘긴 경우 해당 워크스페이스 멤버여야 한다.\n\n"
+            "## 요청 예시\n"
+            "```bash\n"
+            "curl -H 'Authorization: Bearer <access>' \\\n"
+            "  'https://api.turnflow.link/api/v1/integrations/auto-dm-campaigns/"
+            "recovery-reply-suggestions/?workspace_id=<uuid>&count=30'\n"
+            "```\n"
+            "```js\n"
+            "const res = await fetch(\n"
+            "  `/api/v1/integrations/auto-dm-campaigns/recovery-reply-suggestions/"
+            "?workspace_id=${wsId}&count=30`,\n"
+            "  { headers: { Authorization: `Bearer ${access}` } }\n"
+            ");\n"
+            "const { templates, available } = await res.json();\n"
+            "form.recovery_reply_templates = templates;  // 폼 프리필\n"
+            "```"
+        ),
+        parameters=[
+            OpenApiParameter(
+                name="workspace_id",
+                location=OpenApiParameter.QUERY,
+                required=False,
+                type=str,
+                description=(
+                    "사용 가능 여부(available) 계산용 워크스페이스 UUID. 생략 시 available=null. "
+                    "지정 시 멤버십 검증(비멤버 403, 없는 워크스페이스 404)."
+                ),
+            ),
+            OpenApiParameter(
+                name="count",
+                location=OpenApiParameter.QUERY,
+                required=False,
+                type=int,
+                description="생성할 추천 문구 개수(기본 30, 1~100).",
+            ),
+        ],
+        responses={
+            200: OpenApiResponse(
+                description="추천 문구 목록",
+                examples=[
+                    OpenApiExample(
+                        "추천 30개 (프로)",
+                        value={
+                            "templates": [
+                                "DM 전송에 실패했어요 😢 이 계정으로 DM 아무거나 하나 보내주시면 다시 보내드릴게요!",
+                                "앗 전송 오류가 났어요 🥲 아무 내용이나 DM 주시면 즉시 다시 보내드릴게요! 🎁",
+                                "메시지가 전달되지 않았어요 😥 저희 계정으로 DM 하나만 보내주시면 다시 보내드릴게요!",
+                            ],
+                            "count": 30,
+                            "generator_combinations": 106704,
+                            "available": True,
+                            "plan_required": "pro",
+                        },
+                    )
+                ],
+            ),
+            400: OpenApiResponse(description="count 형식 오류"),
+            401: OpenApiResponse(description="인증 실패 - 유효하지 않은 토큰"),
+            403: OpenApiResponse(description="권한 없음 - 워크스페이스 멤버가 아님"),
+            404: OpenApiResponse(description="workspace_id 에 해당하는 워크스페이스 없음"),
+            500: OpenApiResponse(
+                description="서버 내부 오류 (워크스페이스 조회/플랜 확인 실패 등)"
+            ),
+        },
+        tags=["Auto DM"],
+    )
+    @action(detail=False, methods=["get"], url_path="recovery-reply-suggestions")
+    def recovery_reply_suggestions(self, request):
+        from apps.billing.subscription_utils import owner_has_feature
+
+        from .campaign_stats import is_admin_user
+        from .models import RECOVERY_REPLY_COMBINATIONS, compose_recovery_reply
+
+        # count 파싱 (1~100, 기본 30)
+        raw = request.query_params.get("count")
+        count = 30
+        if raw is not None:
+            try:
+                count = int(raw)
+            except (TypeError, ValueError):
+                raise DRFValidationError({"count": "count 는 정수여야 합니다."}) from None
+            count = max(1, min(100, count))
+
+        # 무작위 조합을 중복 없이 count 개 생성 (조합 수가 10만+ 라 충돌은 사실상 없음).
+        seen: set[str] = set()
+        templates: list[str] = []
+        attempts = 0
+        while len(templates) < count and attempts < count * 40:
+            candidate = compose_recovery_reply()
+            attempts += 1
+            if candidate not in seen:
+                seen.add(candidate)
+                templates.append(candidate)
+
+        # available: workspace_id 를 넘긴 경우에만 소유자 플랜 기준으로 계산.
+        available = None
+        workspace_id = request.query_params.get("workspace_id")
+        if workspace_id:
+            from rest_framework.exceptions import NotFound, PermissionDenied
+
+            try:
+                workspace = Workspace.objects.get(id=workspace_id)
+            except (Workspace.DoesNotExist, DjangoValidationError, ValueError, TypeError):
+                raise NotFound("Workspace 를 찾을 수 없습니다.") from None
+            if not workspace.memberships.filter(user=request.user).exists():
+                raise PermissionDenied("이 워크스페이스의 멤버가 아닙니다.")
+            available = is_admin_user(request.user) or owner_has_feature(workspace, "dm_recovery")
+
+        return Response(
+            {
+                "templates": templates,
+                "count": len(templates),
+                "generator_combinations": RECOVERY_REPLY_COMBINATIONS,
+                "available": available,
+                "plan_required": "pro",
+            }
+        )
 
     @extend_schema(
         summary="AI 캠페인 폼 자동 채우기 (게시물 기반)",
@@ -2079,7 +2220,9 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
     def _resolve_connection_for_suggest(self, workspace, ig_connection_id):
         """ai_suggest 용 IG connection 해석. 미지정 시 첫 활성 connection."""
         if not ig_connection_id:
-            return IGAccountConnection.objects.filter(workspace=workspace, status="active").first()
+            return IGAccountConnection.objects.filter(
+                workspace=workspace, status="active", is_active=True
+            ).first()
         from rest_framework.exceptions import PermissionDenied
 
         try:
@@ -2714,6 +2857,13 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
                     {"error": "지정한 IG 계정 연동이 활성 상태가 아닙니다."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+            if not ig_connection.is_active:
+                return Response(
+                    {
+                        "error": "비활성화된 IG 계정입니다. 계정을 활성화한 후 캠페인을 만들 수 있습니다."
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
         else:
             ig_connection = IGAccountConnection.get_active_connection(workspace)
             if not ig_connection:
@@ -2830,6 +2980,15 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         resulting_status = validated_data.get("status", campaign.status)
         if resulting_status != AutoDMCampaign.Status.ACTIVE:
             return
+        # 소프트 비활성 계정으로는 캠페인을 활성 상태로 둘 수 없다.
+        if not campaign.ig_connection.is_active:
+            from rest_framework.exceptions import ValidationError as DRFValidationError
+
+            raise DRFValidationError(
+                {
+                    "error": "비활성화된 IG 계정의 캠페인은 활성화할 수 없습니다. 먼저 계정을 활성화하세요."
+                }
+            )
         self._guard_activation_conflict(
             campaign,
             media_id=validated_data.get("media_id", campaign.media_id),
@@ -2895,6 +3054,14 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
     def resume(self, request, pk=None):
         """캠페인 재개 (과거가 된 종료 예약은 해제)"""
         campaign = self.get_object()
+        # 소프트 비활성 계정의 캠페인은 재개 불가 (계정 활성화가 선행돼야 함)
+        if not campaign.ig_connection.is_active:
+            return Response(
+                {
+                    "error": "비활성화된 IG 계정의 캠페인은 재개할 수 없습니다. 먼저 계정을 활성화하세요."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         # 중복 방지: 재개하려는 게시물에 이미 다른 활성 캠페인이 있으면 409 (저장 전, status 변경 전 차단)
         self._guard_activation_conflict(campaign)
         campaign.status = AutoDMCampaign.Status.ACTIVE
@@ -3517,7 +3684,23 @@ def _process_messaging_events(entry: dict, logger) -> None:
                     f"Story reply queued: sender={sender_id}, " f"story={story_id}, mid={mid}"
                 )
             else:
-                logger.debug(f"Inbound DM received (no handler): sender={sender_id}, mid={mid}")
+                # 일반 인바운드 DM → 실패 DM 복구 재전송 트리거 후보.
+                # sender.id(IGSID) 로 DB 매칭(Meta API 0회): RECOVERY_PENDING opening 이 있으면
+                # 열린 채널로 재전송. 대기 건 없으면 태스크가 즉시 no_match 반환(경량).
+                # (EventInbox 는 echo/read 전용이라 여기선 미사용 — 멱등은 opening 당 1회 키로 보장.)
+                if not is_echo and (message.get("text") or "").strip():
+                    from .tasks import process_inbound_recovery_dm
+
+                    process_inbound_recovery_dm.delay(
+                        {
+                            "page_ig_user_id": page_ig_user_id,
+                            "sender_user_id": sender_id,
+                            "message_mid": mid or "",
+                            "message_text": message.get("text", "") or "",
+                        }
+                    )
+                else:
+                    logger.debug(f"Inbound DM received (no handler): sender={sender_id}, mid={mid}")
 
 
 def _maybe_dispatch_follow_gate(

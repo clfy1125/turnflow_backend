@@ -49,7 +49,9 @@ def sync_active_accounts_media(self):
     매 페이지 첫 결과가 이미 알고 있는 미디어면 다음 페이지로 안 넘어가도록
     구현하면 호출량을 더 줄일 수 있지만, 현재 구현은 안전하게 1~3 페이지 fetch.
     """
-    accounts = IGAccountConnection.objects.filter(status=IGAccountConnection.Status.ACTIVE)
+    accounts = IGAccountConnection.objects.filter(
+        status=IGAccountConnection.Status.ACTIVE, is_active=True
+    )
     total = 0
     errors = 0
     for account in accounts:
@@ -86,6 +88,7 @@ def refresh_recent_insights(self):
     stale TTL 통과한 건 sync_media_insights 안에서 skip 되므로 호출 비용 미증가.
     """
     from datetime import timedelta
+
     from django.db.models import Q
 
     cutoff = timezone.now() - timedelta(days=7)
@@ -93,6 +96,7 @@ def refresh_recent_insights(self):
         IGMedia.objects.filter(
             Q(published_at__gte=cutoff) | Q(insights_last_synced_at__isnull=True),
             account__status=IGAccountConnection.Status.ACTIVE,
+            account__is_active=True,
         )
         .select_related("account", "insight")
         .order_by("-published_at")
@@ -142,6 +146,7 @@ def refresh_old_insights(self):
         IGMedia.objects.filter(
             published_at__lt=cutoff,
             account__status=IGAccountConnection.Status.ACTIVE,
+            account__is_active=True,
         )
         .select_related("account", "insight")
         .order_by("-published_at")
@@ -184,7 +189,9 @@ def refresh_account_audience_insights(self, period_days: int = 30):
     "고인물 콘텐츠" 진단 룰 (rule_account_followers_dominant) 의 근거 데이터.
     1 계정 = 1 IG API call.
     """
-    accounts = IGAccountConnection.objects.filter(status=IGAccountConnection.Status.ACTIVE)
+    accounts = IGAccountConnection.objects.filter(
+        status=IGAccountConnection.Status.ACTIVE, is_active=True
+    )
     processed = 0
     errors = 0
     for account in accounts:
@@ -198,9 +205,7 @@ def refresh_account_audience_insights(self, period_days: int = 30):
         except Exception:
             errors += 1
             logger.exception("account insight unexpected account=%s", account.id)
-    logger.info(
-        "refresh_account_audience_insights processed=%d errors=%d", processed, errors
-    )
+    logger.info("refresh_account_audience_insights processed=%d errors=%d", processed, errors)
     return {"processed": processed, "errors": errors}
 
 

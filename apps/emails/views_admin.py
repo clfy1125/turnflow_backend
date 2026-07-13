@@ -9,18 +9,13 @@ from __future__ import annotations
 from django.conf import settings
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
-from drf_spectacular.utils import (
-    OpenApiExample,
-    OpenApiParameter,
-    OpenApiResponse,
-    extend_schema,
-)
+from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import filters, generics, status
 from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
 
 from .constants import AVAILABLE_VARIABLES
-from .models import EmailLog, EmailTemplate, EmailStatus
+from .models import EmailLog, EmailStatus, EmailTemplate
 from .serializers import (
     EmailLogDetailSerializer,
     EmailLogSerializer,
@@ -168,7 +163,9 @@ class EmailTemplatePreviewView(generics.GenericAPIView):
         try:
             template = EmailTemplate.objects.get(key=key)
         except EmailTemplate.DoesNotExist:
-            return Response({"detail": "템플릿을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "템플릿을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
 
         ctx = _sample_context(key)
         ctx.update(serializer.validated_data.get("context") or {})
@@ -192,9 +189,9 @@ class EmailTemplateTestSendView(generics.GenericAPIView):
         tags=["admin-emails"],
         summary="[관리자] 테스트 이메일 발송",
         description="""
-지정한 주소로 실제 Resend 발송을 수행합니다.  `EmailLog`에 기록되며 `status`가 `sent`/`failed` 로 업데이트됩니다.
+지정한 주소로 실제 이메일 발송(Cloudflare Email Sending)을 수행합니다.  `EmailLog`에 기록되며 `status`가 `sent`/`failed` 로 업데이트됩니다.
 
-**주의**: Resend는 `RESEND_FROM_EMAIL` 의 도메인이 대시보드에서 검증된 상태여야 발송됩니다.
+**주의**: 발신 도메인(`EMAIL_FROM_ADDRESS`)이 Cloudflare Email Service 에 온보딩되어 SPF/DKIM/DMARC 가 검증된 상태여야 발송됩니다.
         """,
         request=EmailTemplateTestSendSerializer,
         responses={
@@ -246,7 +243,9 @@ class EmailLogListView(generics.ListAPIView):
         parameters=[
             OpenApiParameter("status", str, description="필터: pending/sent/failed/bounced"),
             OpenApiParameter("template_key", str, description="필터: 템플릿 키"),
-            OpenApiParameter("search", str, description="to_email/subject/provider_message_id 검색"),
+            OpenApiParameter(
+                "search", str, description="to_email/subject/provider_message_id 검색"
+            ),
         ],
         responses={200: EmailLogSerializer(many=True)},
     )

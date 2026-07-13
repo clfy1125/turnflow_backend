@@ -14,11 +14,13 @@ from rest_framework.views import APIView
 from .models import SubscriptionPlan, SubscriptionStatus
 from .serializers import (
     ChangeSubscriptionRequestSerializer,
+    IGAccountActivationRequestSerializer,
+    IGAccountActivationStateSerializer,
     PaymentHistorySerializer,
     SubscriptionPlanSerializer,
     UserSubscriptionSerializer,
 )
-from .subscription_utils import ensure_subscription
+from .subscription_utils import ensure_subscription, get_ig_account_allowance
 from .toss_flows import BillingFlowError, change_plan, preview_change_plan
 
 logger = logging.getLogger(__name__)
@@ -82,6 +84,7 @@ class SubscriptionPlanListView(APIView):
   "dm_monthly_limit": 200,   // DM 자동화 월 발송 한도 (-1 = 무제한)
   "analytics_export": false, // 기간별 분석·엑셀 다운로드 제공 여부
   "spam_filter": false,      // 스팸 댓글 필터링 제공 여부
+  "dm_recovery": false,      // 실패 DM 복구(대댓글 안내→재전송) 제공 여부 (프로 전용)
   "max_ig_accounts": 1       // 연동 가능 IG 계정 수 (-1 = 무제한, 프로는 추가 구매 가능)
 }
 ```
@@ -125,6 +128,7 @@ plans.forEach(plan => {
                                     "dm_monthly_limit": 200,
                                     "analytics_export": False,
                                     "spam_filter": False,
+                                    "dm_recovery": False,
                                     "max_ig_accounts": 1,
                                 },
                                 "sort_order": 0,
@@ -144,6 +148,7 @@ plans.forEach(plan => {
                                     "dm_monthly_limit": 200,
                                     "analytics_export": True,
                                     "spam_filter": False,
+                                    "dm_recovery": False,
                                     "max_ig_accounts": 1,
                                 },
                                 "sort_order": 1,
@@ -163,6 +168,7 @@ plans.forEach(plan => {
                                     "dm_monthly_limit": -1,
                                     "analytics_export": True,
                                     "spam_filter": True,
+                                    "dm_recovery": True,
                                     "max_ig_accounts": 1,
                                 },
                                 "sort_order": 2,
@@ -995,3 +1001,254 @@ class PageActivationView(APIView):
                 "active_page_ids": active_page_ids,
             }
         )
+
+
+class IGAccountActivationView(APIView):
+    """활성 IG 계정 선택 (허용량 축소 후 어떤 계정을 활성으로 둘지 조정)
+
+    page-activation 을 IG 계정에 옮긴 형태. 비활성(is_active=False) 계정은 연결/토큰은
+    보존되지만 DM·인사이트·스팸필터 등 기능에서 제외된다(하드 연결해제 아님).
+    허용량은 '활성 계정 수'를 제한한다(비활성은 슬롯을 비움).
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    # ── 공용: 현재 상태 dict 구성 (GET/POST 응답 공유) ──
+    def _state(self, user) -> dict:
+        from apps.integrations.models import IGAccountConnection
+
+        allowance = get_ig_account_allowance(user)
+        is_unlimited = allowance < 0
+        max_ig = 999999 if is_unlimited else allowance
+        sub = ensure_subscription(user)
+
+        owned = list(
+            IGAccountConnection.objects.filter(workspace__owner=user)
+            .exclude(status=IGAccountConnection.Status.REVOKED)
+            .select_related("workspace")
+            .order_by("created_at")
+        )
+        total = len(owned)
+        active = sum(1 for c in owned if c.is_active)
+
+        needs = (not is_unlimited and active > max_ig) or bool(sub.ig_activation_review_needed)
+
+        # 하루 1회 제한 — 무제한 플랜/강제 조정 상황은 항상 허용
+        can_change = True
+        if not is_unlimited and not needs and sub.ig_account_activation_changed_at:
+            can_change = (timezone.now() - sub.ig_account_activation_changed_at).days >= 1
+
+        return {
+            "needs_activation_adjustment": needs,
+            "max_ig_accounts": max_ig,
+            "total_accounts": total,
+            "active_accounts": active,
+            "can_change_today": can_change,
+            "accounts": [
+                {
+                    "id": str(c.id),
+                    "username": c.username or "",
+                    "name": c.name or "",
+                    "profile_picture_url": c.profile_picture_url or "",
+                    "is_active": c.is_active,
+                    "status": c.status,
+                    "workspace_name": c.workspace.name,
+                }
+                for c in owned
+            ],
+        }
+
+    @extend_schema(
+        tags=["사용자플랜"],
+        summary="활성 IG 계정 조정 상태 확인",
+        description="""
+## 목적
+계정(사용자) 단위로 **활성 IG 계정 재선택이 필요한지** 확인하고, 연동된(비-REVOKED) 계정
+전체와 허용량·활성 상태를 반환합니다. 프론트는 로그인/구독 변화 시 이 API 를 호출해
+`needs_activation_adjustment=true` 이면 활성 계정 선택 다이얼로그를 엽니다.
+
+## 인증
+`Authorization: Bearer <access_token>` 헤더 필수. 워크스페이스 owner 스코프로 집계합니다.
+
+## 언제 조정이 필요한가
+- 활성 계정 수가 허용량(1 + 추가 계정)을 초과할 때
+- 갱신/다운그레이드 시 허용량이 줄어 초과분이 **자동 비활성**되고 재선택 유도 플래그가 설정됐을 때
+  (`ig_activation_review_needed`)
+
+## 응답 필드
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `needs_activation_adjustment` | bool | 활성 계정 재선택 필요 여부 (**다이얼로그 트리거로 사용**) |
+| `max_ig_accounts` | int | 허용량 = 1 + 추가 계정. 무제한(관리자/무제한 플랜)은 999999 |
+| `total_accounts` | int | 연동된(비-REVOKED) 계정 수 |
+| `active_accounts` | int | 현재 활성 계정 수 |
+| `can_change_today` | bool | 오늘 변경 가능 여부 (하루 1회, 강제 조정 상황은 항상 true) |
+| `accounts` | array | 계정 목록 (id, username, name, profile_picture_url, is_active, status, workspace_name) |
+
+## 프론트엔드 통합
+```javascript
+const res = await fetch('/api/v1/billing/ig-account-activation/', {
+  headers: { Authorization: `Bearer ${accessToken}` },
+});
+const state = await res.json();
+if (state.needs_activation_adjustment) openActivationDialog(state);
+```
+        """,
+        responses={
+            200: OpenApiResponse(
+                response=IGAccountActivationStateSerializer,
+                description="활성화 조정 상태",
+                examples=[
+                    OpenApiExample(
+                        "재선택 필요 (허용량 1, 연동 3)",
+                        value={
+                            "needs_activation_adjustment": True,
+                            "max_ig_accounts": 1,
+                            "total_accounts": 3,
+                            "active_accounts": 1,
+                            "can_change_today": True,
+                            "accounts": [
+                                {
+                                    "id": "0a1b2c3d-....",
+                                    "username": "turnflow_official",
+                                    "name": "Turnflow",
+                                    "profile_picture_url": "https://media.turnflow.link/...",
+                                    "is_active": True,
+                                    "status": "active",
+                                    "workspace_name": "내 워크스페이스",
+                                }
+                            ],
+                        },
+                    )
+                ],
+            ),
+            400: OpenApiResponse(description="(GET 에서는 미발생) 잘못된 요청"),
+            401: OpenApiResponse(description="인증 실패 — 토큰 없음/만료"),
+            403: OpenApiResponse(description="권한 없음"),
+            404: OpenApiResponse(description="(GET 에서는 미발생) 리소스 없음"),
+            500: OpenApiResponse(description="서버 오류"),
+        },
+    )
+    def get(self, request):
+        return Response(self._state(request.user))
+
+    @extend_schema(
+        tags=["사용자플랜"],
+        summary="활성 IG 계정 선택",
+        description="""
+## 목적
+허용량에 맞춰 **활성으로 둘 IG 계정을 선택**합니다. 선택되지 않은 나머지 소유 계정은
+**소프트 비활성**(is_active=False)됩니다 — 연결/토큰은 보존되지만 기능에서 제외되고,
+해당 계정의 활성 캠페인은 일시중지, 발송 대기 중이던 DM 은 취소(SKIPPED)됩니다.
+
+## 인증
+`Authorization: Bearer <access_token>` 헤더 필수.
+
+## 요청 필드
+| 필드 | 필수 | 타입 | 설명 |
+|------|------|------|------|
+| `active_account_ids` | ✅ | array[string] | 활성으로 둘 IG 계정 id 목록. 허용량 이하, 전부 본인 소유(최소 1개) |
+
+## 규칙
+- 개수는 허용량(`max_ig_accounts`) 이하여야 합니다.
+- 모든 id 는 본인 소유(비-REVOKED)여야 합니다.
+- **하루 1회** 변경 제한이 있으나, 재조정이 필요한 상황(`needs_activation_adjustment=true`)에서는
+  항상 허용됩니다. 무제한 플랜은 제한 없음.
+- 재활성화된 계정의 캠페인은 자동 재개되지 않습니다(사용자가 수동으로 재개).
+
+## 프론트엔드 통합
+```javascript
+await fetch('/api/v1/billing/ig-account-activation/', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+  body: JSON.stringify({ active_account_ids: ['0a1b2c3d-....'] }),
+});
+```
+
+## 에러
+| 코드 | 원인 |
+|------|------|
+| 400 | 허용량 초과, 존재하지 않는/타인 계정 ID, 빈 목록, 오늘 이미 변경(강제 조정 아닐 때) |
+| 401 | 토큰 없음/만료 |
+| 500 | 서버 오류 |
+        """,
+        request=IGAccountActivationRequestSerializer,
+        responses={
+            200: OpenApiResponse(
+                response=IGAccountActivationStateSerializer,
+                description="활성화 변경 완료 (GET 과 동일 스키마)",
+            ),
+            400: OpenApiResponse(description="유효성 검증 실패"),
+            401: OpenApiResponse(description="인증 실패"),
+            403: OpenApiResponse(description="권한 없음"),
+            404: OpenApiResponse(description="리소스 없음"),
+            500: OpenApiResponse(description="서버 오류"),
+        },
+    )
+    def post(self, request):
+        from apps.integrations.models import IGAccountConnection
+
+        req = IGAccountActivationRequestSerializer(data=request.data)
+        req.is_valid(raise_exception=True)
+        active_ids = {str(x) for x in req.validated_data["active_account_ids"]}
+
+        user = request.user
+        allowance = get_ig_account_allowance(user)
+        is_unlimited = allowance < 0
+        max_ig = 999999 if is_unlimited else allowance
+        sub = ensure_subscription(user)
+
+        # 강제 조정(초과/자동비활성) 상황이면 하루 1회 제한 우회
+        active_now = IGAccountConnection.objects.filter(
+            workspace__owner=user,
+            status=IGAccountConnection.Status.ACTIVE,
+            is_active=True,
+        ).count()
+        needs = (not is_unlimited and active_now > max_ig) or bool(sub.ig_activation_review_needed)
+        if not is_unlimited and not needs and sub.ig_account_activation_changed_at:
+            elapsed = (timezone.now() - sub.ig_account_activation_changed_at).total_seconds()
+            if elapsed < 86400:
+                return Response(
+                    {"detail": "IG 계정 활성화 변경은 하루에 1번만 가능합니다."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        # 허용량 초과 검사
+        if not is_unlimited and len(active_ids) > max_ig:
+            return Response(
+                {"detail": f"현재 허용량은 {max_ig}개입니다. 그 이하로만 활성화할 수 있습니다."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 소유(비-REVOKED) 계정 확인
+        owned = list(
+            IGAccountConnection.objects.filter(workspace__owner=user).exclude(
+                status=IGAccountConnection.Status.REVOKED
+            )
+        )
+        valid_ids = {str(c.id) for c in owned}
+        invalid = active_ids - valid_ids
+        if invalid:
+            return Response(
+                {"detail": f"존재하지 않거나 접근할 수 없는 계정 ID: {sorted(invalid)}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 적용: 선택 계정 활성, 나머지 소유 계정 소프트 비활성(캠페인 PAUSE + in-flight DM SKIP)
+        for conn in owned:
+            if str(conn.id) in active_ids:
+                conn.activate()
+            else:
+                conn.deactivate(reason="user_activation_choice")
+
+        sub.ig_account_activation_changed_at = timezone.now()
+        sub.ig_activation_review_needed = False
+        sub.save(
+            update_fields=[
+                "ig_account_activation_changed_at",
+                "ig_activation_review_needed",
+                "updated_at",
+            ]
+        )
+
+        return Response(self._state(user))

@@ -2,8 +2,8 @@
 High-level email sending API.
 
 `send_email()` creates an `EmailLog` row and enqueues a Celery task.  Views
-should call this, not Resend directly — it guarantees an audit trail and async
-delivery (per CLAUDE.md §5.3: views must not block on external APIs).
+should call this, not the email provider directly — it guarantees an audit
+trail and async delivery (per CLAUDE.md §5.3: views must not block on external APIs).
 
 `send_email_sync()` performs the provider call inline.  Only the Celery task
 and the admin "test send" endpoint should use this.
@@ -19,8 +19,8 @@ from django.conf import settings
 from django.utils import timezone
 
 from ..models import EmailLog, EmailStatus, EmailTemplate
+from .cloudflare_client import CloudflareSendError, send_cloudflare_email
 from .renderer import render_template
-from .resend_client import ResendSendError, send_resend_email
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +30,21 @@ class EmailTemplateMissing(Exception):
 
 
 def _default_context() -> dict[str, Any]:
-    """Variables that are always injected so admins can reference them in any template."""
+    """Variables that are always injected so admins can reference them in any template.
+
+    Includes brand/company metadata so the shared footer (logo, 사업자 정보) renders
+    on every template without each caller having to pass it.
+    """
     return {
         "service_name": settings.SERVICE_NAME,
         "support_email": settings.SUPPORT_EMAIL,
+        "brand_url": settings.BRAND_URL,
+        "logo_url": settings.EMAIL_LOGO_URL,
+        "company_name": settings.COMPANY_NAME,
+        "company_ceo": settings.COMPANY_CEO,
+        "company_reg_no": settings.COMPANY_REG_NO,
+        "company_address": settings.COMPANY_ADDRESS,
+        "company_phone": settings.COMPANY_PHONE,
     }
 
 
@@ -74,7 +85,7 @@ def send_email(
         template=template,
         template_key=template_key,
         to_email=to_email,
-        from_email=settings.RESEND_FROM_EMAIL,
+        from_email=settings.EMAIL_FROM_ADDRESS,
         subject=subject,
         rendered_html=html_body,
         rendered_text=text_body,
@@ -90,18 +101,18 @@ def send_email(
 
 
 def send_email_sync(log_id: int) -> EmailLog:
-    """Actually call Resend for a pending EmailLog. Used by the Celery task."""
+    """Actually call the email provider for a pending EmailLog. Used by the Celery task."""
     log = EmailLog.objects.select_related("template").get(pk=log_id)
 
     if log.status == EmailStatus.SENT:
         logger.info("EmailLog %s already sent — skipping", log_id)
         return log
 
-    from_name = (log.template.from_name if log.template else "") or settings.RESEND_FROM_NAME
+    from_name = (log.template.from_name if log.template else "") or settings.EMAIL_FROM_NAME
 
     log.attempts += 1
     try:
-        message_id = send_resend_email(
+        message_id = send_cloudflare_email(
             to_email=log.to_email,
             subject=log.subject,
             html_body=log.rendered_html,
@@ -114,7 +125,7 @@ def send_email_sync(log_id: int) -> EmailLog:
         log.provider_message_id = message_id
         log.sent_at = timezone.now()
         log.error_message = ""
-    except ResendSendError as exc:
+    except CloudflareSendError as exc:
         log.status = EmailStatus.FAILED
         log.error_message = str(exc)[:4000]
     log.save(
