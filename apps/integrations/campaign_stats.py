@@ -63,6 +63,7 @@ SENT_OK_STATUSES = [
     SentDMLog.Status.DELIVERED,
     SentDMLog.Status.READ,
     SentDMLog.Status.SENT,  # legacy
+    SentDMLog.Status.RECOVERY_DELIVERED,  # 복구 재전송 성공 (종결·성공)
 ]
 # "발송 실패" 표시용: 분류 실패(v3.2) + legacy. FAILED_NO_TRACE 는 '도착 미확인'이지
 # 실패가 아니므로 제외 (total_unconfirmed / unconfirmed 로 별도 노출).
@@ -72,6 +73,7 @@ FAILED_STATUSES = [
     SentDMLog.Status.FAILED_WINDOW,
     SentDMLog.Status.FAILED_PARAM,
     SentDMLog.Status.FAILED_API,  # legacy alias
+    SentDMLog.Status.RECOVERY_EXPIRED,  # 복구 대기 만료 (종결·실패)
 ]
 # "진행 중" 표시용: 아직 종결되지 않은 발송 전/중 상태 + legacy pending.
 IN_FLIGHT_STATUSES = [
@@ -79,6 +81,7 @@ IN_FLIGHT_STATUSES = [
     SentDMLog.Status.SUBMITTING,
     SentDMLog.Status.RATE_LIMITED,
     SentDMLog.Status.PENDING,  # legacy
+    SentDMLog.Status.RECOVERY_PENDING,  # 복구 대기 (미종결 — 사용자 DM/TTL 이 전이)
 ]
 
 # annotate 결과를 담는 임시 속성명 (모델 필드와 충돌 안 나게 언더스코어 프리픽스)
