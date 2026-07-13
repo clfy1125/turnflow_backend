@@ -569,6 +569,16 @@ class AutoDMCampaign(models.Model):
         help_text="댓글 작성자에게 발송될 첫 DM (Private Reply via comment_id)",
         blank=True,
     )
+    opening_message_templates = models.JSONField(
+        default=list,
+        blank=True,
+        verbose_name="Opening DM 변형 목록 (회전)",
+        help_text=(
+            "비게이트 오프닝 DM 변형 목록. 비어있지 않으면 발송 시마다 무작위로 1개 선택 "
+            "(동일 메시지 대량발송 스팸판정 회피). 비우면 opening_message_template 단일값 사용. "
+            "diversify-opening API 로 생성한 변형을 여기에 저장한다."
+        ),
+    )
 
     # 댓글에 공개 답글
     public_reply_enabled = models.BooleanField(
@@ -635,6 +645,16 @@ class AutoDMCampaign(models.Model):
         help_text=(
             "Opening DM 본문에 들어갈 follow 요청 문구. "
             "예: '댓글 남겨주셔서 감사해요! 팔로우도 하셨나요? 버튼을 눌러주세요!'"
+        ),
+    )
+    follow_gate_prompt_templates = models.JSONField(
+        default=list,
+        blank=True,
+        verbose_name="Follow-gate 안내 문구 변형 목록 (회전)",
+        help_text=(
+            "게이트 오프닝 DM 변형 목록. 비어있지 않으면 발송 시마다 무작위로 1개 선택 "
+            "(스팸판정 회피). 비우면 follow_gate_prompt 단일값 사용. "
+            "diversify-opening API 로 생성한 변형을 여기에 저장한다."
         ),
     )
     follow_gate_button_label = models.CharField(
@@ -972,16 +992,32 @@ class AutoDMCampaign(models.Model):
     # ===== 신규 로직 헬퍼 =====
 
     def get_opening_message(self) -> str:
-        """Opening DM 본문.
+        """Opening DM 본문 (발송 시마다 호출 → 변형 목록이 있으면 무작위 1개 선택 = 회전).
 
-        follow_gate_enabled 인 경우 follow_gate_prompt 가 우선 사용된다
-        (= 화면상 "팔로우도 하셨나요?" 안내). 비어 있으면 기본 템플릿으로 fallback.
-        gate 미사용 캠페인은 기존 동작 (opening_message_template / message_template) 유지.
+        follow_gate_enabled 인 경우 follow_gate_prompt(_templates) 가 우선 사용된다
+        (= 화면상 "팔로우도 하셨나요?" 안내). 비어 있으면 opening 계열로 fallback.
+        gate 미사용 캠페인은 opening_message_template(s) / message_template 사용.
+
+        회전: *_templates(리스트) 가 비어있지 않으면 random.choice, 비면 단일 필드 fallback
+        (public_reply_templates 와 동일 패턴). 발송 시점(get_opening_message 호출 = enqueue)마다
+        무작위라 수신자별로 서로 다른 오프닝이 나가 '동일 메시지 대량발송' 스팸신호를 낮춘다.
         """
+        import random
+
         if self.follow_gate_enabled:
+            gate_pool = [
+                t.strip() for t in (self.follow_gate_prompt_templates or []) if t and str(t).strip()
+            ]
+            if gate_pool:
+                return random.choice(gate_pool)
             prompt = (self.follow_gate_prompt or "").strip()
             if prompt:
                 return prompt
+        open_pool = [
+            t.strip() for t in (self.opening_message_templates or []) if t and str(t).strip()
+        ]
+        if open_pool:
+            return random.choice(open_pool)
         return self.opening_message_template or self.message_template or ""
 
     # Follow-gate 기본 문구 (필드가 비어있을 때 fallback)

@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 from apps.ai_jobs.services import dm_campaign_assistant as dca
 from apps.ai_jobs.services.dm_campaign_assistant import _normalize_meta_fields, diversify_opening
-from apps.integrations.models import BUTTON_TEMPLATE_TEXT_MAX
+from apps.integrations.models import BUTTON_TEMPLATE_TEXT_MAX, AutoDMCampaign
 from apps.integrations.serializers import AutoDMCampaignCreateSerializer, _dm_body_length_errors
 from apps.integrations.services import InstagramMessagingService
 
@@ -293,3 +293,94 @@ class TestDiversifyOpening:
         )
         res = diversify_opening(opening_message="원문", count=5)
         assert res.variants == []
+
+
+# ── 오프닝 회전(여러 개 중 1개 무작위 발송) ────────────────────
+
+
+class TestOpeningRotation:
+    def test_nogate_rotates_from_list(self):
+        c = AutoDMCampaign(
+            follow_gate_enabled=False,
+            opening_message_templates=["A", "B", "C"],
+            opening_message_template="single",
+        )
+        picks = {c.get_opening_message() for _ in range(40)}
+        assert picks <= {"A", "B", "C"}  # 목록에서만
+        assert "single" not in picks  # 목록이 단일값보다 우선
+
+    def test_nogate_empty_list_falls_back_to_single(self):
+        c = AutoDMCampaign(
+            follow_gate_enabled=False,
+            opening_message_templates=[],
+            opening_message_template="single",
+        )
+        assert c.get_opening_message() == "single"
+
+    def test_gate_rotates_from_gate_list(self):
+        c = AutoDMCampaign(
+            follow_gate_enabled=True,
+            follow_gate_prompt_templates=["G1", "G2"],
+            follow_gate_prompt="gsingle",
+        )
+        picks = {c.get_opening_message() for _ in range(40)}
+        assert picks <= {"G1", "G2"}
+        assert "gsingle" not in picks
+
+    def test_gate_empty_list_falls_back_to_prompt(self):
+        c = AutoDMCampaign(
+            follow_gate_enabled=True,
+            follow_gate_prompt_templates=[],
+            follow_gate_prompt="gsingle",
+        )
+        assert c.get_opening_message() == "gsingle"
+
+
+# ── 회전 목록 항목 길이 검증 ───────────────────────────────────
+
+
+class TestTemplateListLimits:
+    def test_gate_prompt_templates_item_over_640(self):
+        errs = _dm_body_length_errors(
+            follow_gate_enabled=True,
+            follow_gate_prompt=SHORT,
+            follow_gate_retry_message=SHORT,
+            reward_message_template=SHORT,
+            opening_message=SHORT,
+            link_button_url="",
+            follow_gate_prompt_templates=[SHORT, BUTTON_OVER],
+        )
+        assert "follow_gate_prompt_templates" in errs
+
+    def test_opening_templates_item_over_640_with_link(self):
+        errs = _dm_body_length_errors(
+            follow_gate_enabled=False,
+            follow_gate_prompt="",
+            follow_gate_retry_message="",
+            reward_message_template="",
+            opening_message=SHORT,
+            link_button_url="https://x.co",
+            opening_message_templates=[SHORT, BUTTON_OVER],
+        )
+        assert "opening_message_templates" in errs
+
+    def test_opening_templates_item_byte_limit_without_link(self):
+        errs = _dm_body_length_errors(
+            follow_gate_enabled=False,
+            follow_gate_prompt="",
+            follow_gate_retry_message="",
+            reward_message_template="",
+            opening_message=SHORT,
+            link_button_url="",
+            opening_message_templates=[PLAIN_OVER],  # 1200B
+        )
+        assert "opening_message_templates" in errs
+
+    def test_create_serializer_rejects_bad_opening_template_item(self):
+        ser = AutoDMCampaignCreateSerializer(
+            data=_base_data(
+                opening_message_templates=[BUTTON_OVER], link_button_url="https://example.com"
+            )
+        )
+        assert not ser.is_valid()
+        assert "opening_message_templates" in ser.errors

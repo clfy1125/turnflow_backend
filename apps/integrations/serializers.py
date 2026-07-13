@@ -25,6 +25,8 @@ def _dm_body_length_errors(
     reward_message_template: str,
     opening_message: str,
     link_button_url: str,
+    opening_message_templates=None,
+    follow_gate_prompt_templates=None,
 ) -> dict:
     """우리가 보내는 DM 본문 포맷별 Meta 글자수 한도 검증(상황에 맞는 한도).
 
@@ -34,27 +36,41 @@ def _dm_body_length_errors(
       - follow_gate_enabled: follow_gate_prompt·follow_gate_retry_message 는 항상 버튼(팔로우 postback);
         reward 는 link_button_url 이 있을 때만 버튼(링크).
       - 비게이트: opening 은 link_button_url 이 있을 때만 버튼(링크), 없으면 일반 텍스트.
+    회전 목록(opening_message_templates / follow_gate_prompt_templates)의 각 항목도 동일 한도로 검증.
     반환: {필드명: 에러메시지} (없으면 {}).
     """
     has_link = bool((link_button_url or "").strip())
     errors: dict = {}
 
-    def _check(field: str, label: str, text: str, buttoned: bool) -> None:
+    def _too_long(text: str, buttoned: bool) -> str | None:
         t = (text or "").strip()
         if buttoned:
             if len(t) > BUTTON_TEMPLATE_TEXT_MAX:
-                errors[field] = (
-                    f"{label}에는 버튼이 붙어 Meta 버튼 카드 한도({BUTTON_TEMPLATE_TEXT_MAX}자)를 "
-                    f"초과할 수 없습니다 (현재 {len(t)}자)."
+                return (
+                    f"버튼이 붙어 Meta 버튼 카드 한도({BUTTON_TEMPLATE_TEXT_MAX}자)를 초과할 수 "
+                    f"없습니다 (현재 {len(t)}자)."
                 )
         else:
             nbytes = len(t.encode("utf-8"))
             if nbytes > DM_TEXT_MAX_BYTES:
                 approx = DM_TEXT_MAX_BYTES // 3
-                errors[field] = (
-                    f"{label}은 Meta 텍스트 메시지 한도(UTF-8 {DM_TEXT_MAX_BYTES}바이트, 한글 약 "
-                    f"{approx}자)를 초과할 수 없습니다 (현재 {nbytes}바이트)."
+                return (
+                    f"Meta 텍스트 메시지 한도(UTF-8 {DM_TEXT_MAX_BYTES}바이트, 한글 약 {approx}자)를 "
+                    f"초과할 수 없습니다 (현재 {nbytes}바이트)."
                 )
+        return None
+
+    def _check(field: str, label: str, text: str, buttoned: bool) -> None:
+        msg = _too_long(text, buttoned)
+        if msg:
+            errors[field] = f"{label}에는 {msg}"
+
+    def _check_list(field: str, label: str, items, buttoned: bool) -> None:
+        for i, item in enumerate(items or []):
+            msg = _too_long(str(item), buttoned)
+            if msg:
+                errors[field] = f"{label} {i + 1}번째 문구에는 {msg}"
+                break
 
     if follow_gate_enabled:
         _check("follow_gate_prompt", "팔로우 게이트 안내 DM", follow_gate_prompt, buttoned=True)
@@ -67,6 +83,18 @@ def _dm_body_length_errors(
         _check("reward_message_template", "리워드 DM", reward_message_template, buttoned=has_link)
     else:
         _check("opening_message_template", "오프닝 DM", opening_message, buttoned=has_link)
+
+    # 회전 변형 목록도 각 항목 검증(모드 무관 — 저장된 값 자체가 한도를 넘으면 안 됨).
+    # follow_gate_prompt_templates: 게이트 버튼 항상 → 640자. opening_message_templates: 링크 있으면 640, 없으면 1000바이트.
+    _check_list(
+        "follow_gate_prompt_templates",
+        "팔로우 게이트 안내 DM 변형",
+        follow_gate_prompt_templates,
+        buttoned=True,
+    )
+    _check_list(
+        "opening_message_templates", "오프닝 DM 변형", opening_message_templates, buttoned=has_link
+    )
     return errors
 
 
@@ -197,6 +225,7 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
             # 메시지
             "message_template",  # legacy
             "opening_message_template",
+            "opening_message_templates",  # 오프닝 변형 회전 풀
             # 공개 답글 (v3.5)
             "public_reply_enabled",
             "public_reply_template",  # legacy 단일
@@ -207,6 +236,7 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
             "follow_gate_enabled",
             "gate_verify_follow",
             "follow_gate_prompt",
+            "follow_gate_prompt_templates",  # 게이트 오프닝 변형 회전 풀
             "follow_gate_button_label",
             "follow_gate_retry_message",
             "reward_message_template",
@@ -286,6 +316,31 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
             except Exception:  # noqa: BLE001 - 조회 실패는 미보유 취급
                 cache[owner_id] = False
         return cache[owner_id]
+
+    def validate(self, attrs):
+        # 이 시리얼라이저가 캠페인 수정(PUT/PATCH)의 실제 처리 시리얼라이저다(get_serializer_class →
+        # update/partial_update 가 self.get_serializer 사용). 그래서 글자수 한도 검증을 여기서도 건다.
+        # 부분 수정이라 attrs 에 없는 필드는 기존 인스턴스 값으로 병합해 판정(create 는 별도 시리얼라이저).
+        def _resolve(field, default=""):
+            if field in attrs:
+                return attrs[field]
+            return getattr(self.instance, field, default)
+
+        length_errors = _dm_body_length_errors(
+            follow_gate_enabled=bool(_resolve("follow_gate_enabled", False)),
+            follow_gate_prompt=_resolve("follow_gate_prompt", "") or "",
+            follow_gate_retry_message=_resolve("follow_gate_retry_message", "") or "",
+            reward_message_template=_resolve("reward_message_template", "") or "",
+            opening_message=(
+                _resolve("opening_message_template", "") or _resolve("message_template", "") or ""
+            ),
+            link_button_url=_resolve("link_button_url", "") or "",
+            opening_message_templates=_resolve("opening_message_templates", []) or [],
+            follow_gate_prompt_templates=_resolve("follow_gate_prompt_templates", []) or [],
+        )
+        if length_errors:
+            raise serializers.ValidationError(length_errors)
+        return attrs
 
     def get_is_active(self, obj) -> bool:
         return obj.is_active()
@@ -546,6 +601,16 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
         default="",
         help_text="legacy 별칭 — opening_message_template 미사용 시 이 값 사용 (동일한 글자수 한도 적용).",
     )
+    opening_message_templates = serializers.ListField(
+        child=serializers.CharField(allow_blank=False),
+        required=False,
+        default=list,
+        help_text=(
+            "오프닝 DM 변형 목록. 비어있지 않으면 발송 시마다 무작위 1개 선택(동일 메시지 대량발송 "
+            "스팸판정 회피). 각 항목은 오프닝과 동일 한도(링크 버튼 있으면 640자, 없으면 1000바이트). "
+            "diversify-opening API 로 생성한 변형을 여기에 저장한다."
+        ),
+    )
 
     # 공개 답글 (v3.5)
     public_reply_enabled = serializers.BooleanField(default=False)
@@ -604,6 +669,15 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
             "Opening DM 본문 (게이트 안내 문구). 비우면 기본 문구 사용. "
             "버튼(팔로우)이 항상 붙는 버튼 카드라 **640자** 한도(초과 시 400). "
             "예: '댓글 남겨주셔서 감사해요! 팔로우도 하셨나요? 버튼을 눌러주세요!'"
+        ),
+    )
+    follow_gate_prompt_templates = serializers.ListField(
+        child=serializers.CharField(allow_blank=False),
+        required=False,
+        default=list,
+        help_text=(
+            "게이트 오프닝(follow_gate_prompt) 변형 목록. 비어있지 않으면 발송 시마다 무작위 1개 선택. "
+            "각 항목 640자 이내(팔로우 버튼 카드). diversify-opening API 결과를 저장."
         ),
     )
     follow_gate_button_label = serializers.CharField(
@@ -795,6 +869,8 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
                 attrs.get("opening_message_template") or attrs.get("message_template") or ""
             ),
             link_button_url=attrs.get("link_button_url") or "",
+            opening_message_templates=attrs.get("opening_message_templates") or [],
+            follow_gate_prompt_templates=attrs.get("follow_gate_prompt_templates") or [],
         )
         if length_errors:
             raise serializers.ValidationError(length_errors)
@@ -815,6 +891,7 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
             "description",
             "message_template",
             "opening_message_template",
+            "opening_message_templates",
             # 공개 답글 (v3.5)
             "public_reply_enabled",
             "public_reply_template",
@@ -825,6 +902,7 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
             "follow_gate_enabled",
             "gate_verify_follow",
             "follow_gate_prompt",
+            "follow_gate_prompt_templates",  # 게이트 오프닝 변형 회전 풀
             "follow_gate_button_label",
             "follow_gate_retry_message",
             "reward_message_template",
@@ -857,6 +935,7 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
             "keyword_mode": {"required": False},
             "message_template": {"required": False, "allow_blank": True},
             "opening_message_template": {"required": False, "allow_blank": True},
+            "opening_message_templates": {"required": False},
             "public_reply_enabled": {"required": False},
             "public_reply_template": {"required": False, "allow_blank": True},
             "public_reply_templates": {"required": False},
@@ -865,6 +944,7 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
             "follow_gate_enabled": {"required": False},
             "gate_verify_follow": {"required": False},
             "follow_gate_prompt": {"required": False, "allow_blank": True},
+            "follow_gate_prompt_templates": {"required": False},
             "follow_gate_button_label": {"required": False, "allow_blank": True},
             "follow_gate_retry_message": {"required": False, "allow_blank": True},
             "reward_message_template": {"required": False, "allow_blank": True},
@@ -891,6 +971,8 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
                 _resolve("opening_message_template", "") or _resolve("message_template", "") or ""
             ),
             link_button_url=_resolve("link_button_url", "") or "",
+            opening_message_templates=_resolve("opening_message_templates", []) or [],
+            follow_gate_prompt_templates=_resolve("follow_gate_prompt_templates", []) or [],
         )
         if length_errors:
             raise serializers.ValidationError(length_errors)

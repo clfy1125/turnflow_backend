@@ -2224,7 +2224,9 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         description=(
             "폼에서 확정한 오프닝 DM 1개를 넘기면 gemma-4 가 **톤·의미를 유지한 채** 표현만 바꾼 "
             "변형 count 개를 생성한다. 오프닝이 하나로 통일돼 있으면 Meta 가 '동일 메시지 대량 발송'으로 "
-            "보고 스팸 판정할 수 있어, 이 변형들을 캠페인 opening 변형 풀로 써서 다양화한다.\n\n"
+            "보고 스팸 판정할 수 있어, 이 변형들을 캠페인 opening 변형 풀로 써서 다양화한다.\n"
+            "받은 variants 를 **캠페인 수정 API(PATCH)** 의 `opening_message_templates`(비게이트) 또는 "
+            "`follow_gate_prompt_templates`(게이트)에 저장하면, 발송 시마다 무작위 1개가 회전 발송된다.\n\n"
             "## 흐름 (비동기 — gemma 가 느려 동기 응답은 prod 타임아웃)\n"
             "1. `POST .../diversify-opening/?workspace_id=...` → `202 { job_id, poll_url, requested_count }`\n"
             "2. `GET /api/v1/ai/jobs/{job_id}/` 를 1~2초 간격 폴링\n"
