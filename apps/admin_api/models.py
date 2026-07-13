@@ -33,6 +33,9 @@ class AdminActionLog(models.Model):
         CAMPAIGN_RESUME = "campaign.resume", "캠페인 재개"
         DMLOG_RETRY = "dmlog.retry", "DM 재시도"
         DMLOG_REVERIFY = "dmlog.reverify", "DM 재검증"
+        REFERRAL_CREATE = "referral.create", "레퍼럴 코드 생성"
+        REFERRAL_UPDATE = "referral.update", "레퍼럴 코드 수정"
+        REFERRAL_DELETE = "referral.delete", "레퍼럴 코드 삭제"
 
     class Meta:
         db_table = "admin_action_logs"

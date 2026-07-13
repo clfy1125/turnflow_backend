@@ -32,6 +32,11 @@ from apps.admin_api.views.dashboard import AdminMetricsOverviewView
 from apps.admin_api.views.dashboard_marketing import AdminMarketingDashboardView
 from apps.admin_api.views.dashboard_ops import AdminOpsDashboardView
 from apps.admin_api.views.identity import AdminMeView
+from apps.admin_api.views.referral import (
+    AdminReferralCodeDetailView,
+    AdminReferralCodeListCreateView,
+    AdminReferralCodeRedemptionsView,
+)
 from apps.admin_api.views.pages import (
     AdminPageDetailView,
     AdminPageInquiryListView,
@@ -143,4 +148,20 @@ urlpatterns = [
     ),
     path("auto-dm/backlog/", AdminDMBacklogView.as_view(), name="dm-backlog"),
     path("ig-connections/", AdminIGConnectionListView.as_view(), name="ig-connection-list"),
+    # G. 레퍼럴 코드 관리 (마케팅 프로모션)
+    path(
+        "referral-codes/",
+        AdminReferralCodeListCreateView.as_view(),
+        name="referral-code-list",
+    ),
+    path(
+        "referral-codes/<uuid:pk>/",
+        AdminReferralCodeDetailView.as_view(),
+        name="referral-code-detail",
+    ),
+    path(
+        "referral-codes/<uuid:pk>/redemptions/",
+        AdminReferralCodeRedemptionsView.as_view(),
+        name="referral-code-redemptions",
+    ),
 ]
