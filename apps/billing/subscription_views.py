@@ -16,6 +16,8 @@ from .serializers import (
     ChangeSubscriptionRequestSerializer,
     IGAccountActivationRequestSerializer,
     IGAccountActivationStateSerializer,
+    PageActivationRequestSerializer,
+    PageActivationStateSerializer,
     PaymentHistorySerializer,
     SubscriptionPlanSerializer,
     UserSubscriptionSerializer,
@@ -857,63 +859,108 @@ class ResumeSubscriptionView(APIView):
 
 
 class PageActivationView(APIView):
-    """페이지 활성화 조정 (다운그레이드 후 플랜 한도에 맞춰 활성 페이지 선택)"""
+    """페이지 활성화 조정 (다운그레이드 후 플랜 한도에 맞춰 활성 페이지 선택)
+
+    ig-account-activation 의 페이지 판. 페이지에는 두 개의 독립 플래그가 있다:
+    - `is_active`: **요금제 활성 슬롯**(다운그레이드 축소 대상). billing 소유.
+    - `is_public`: **사용자 공개 토글**(게시 여부). 페이지 에디터 소유.
+    실제 외부 노출은 둘 다 True 여야 한다(`is_live = is_active AND is_public`,
+    apps/pages/views.py 참조). 활성화 선택은 이 두 값을 함께 맞춰 준다 — 선택한 페이지는
+    슬롯 확보 + 게시(is_public=True), 미선택은 슬롯 반납 + 비공개(is_public=False).
+    """
 
     permission_classes = [IsAuthenticated]
+
+    # ── 공용: 현재 상태 dict 구성 (GET/POST 응답 공유) ──
+    def _state(self, user) -> dict:
+        from apps.pages.models import Page
+
+        from .subscription_utils import get_user_plan
+
+        plan = get_user_plan(user)
+        max_pages_raw = plan.features.get("max_pages", 1)
+        is_unlimited = max_pages_raw == -1
+        max_pages = 999999 if is_unlimited else max_pages_raw
+
+        sub = ensure_subscription(user)
+        pages = list(Page.objects.filter(user=user).order_by("created_at"))
+        total = len(pages)
+        active = sum(1 for p in pages if p.is_active)
+        live = sum(1 for p in pages if p.is_active and p.is_public)
+
+        needs = total > max_pages
+
+        # 하루 1회 제한 — 무제한 플랜/강제 조정 상황은 항상 허용
+        can_change = True
+        if not is_unlimited and not needs and sub.page_activation_changed_at:
+            can_change = (timezone.now() - sub.page_activation_changed_at).days >= 1
+
+        return {
+            "needs_activation_adjustment": needs,
+            "max_pages": max_pages,
+            "total_pages": total,
+            "active_pages": active,
+            "live_pages": live,
+            "can_change_today": can_change,
+            "pages": [
+                {
+                    "id": p.id,
+                    "slug": p.slug,
+                    "title": p.title,
+                    "is_active": p.is_active,
+                    "is_public": p.is_public,
+                    "is_live": p.is_active and p.is_public,
+                }
+                for p in pages
+            ],
+        }
 
     @extend_schema(
         tags=["사용자플랜"],
         summary="활성 페이지 조정 상태 확인",
         description="""
 ## 목적
-현재 사용자의 **페이지 활성화 조정이 필요한지** 확인합니다.
-플랜 최대 페이지 수보다 보유 페이지가 많으면 조정이 필요합니다.
+현재 사용자의 **페이지 활성화 조정이 필요한지** 확인하고, 보유 페이지 전체와
+허용량·활성/공개 상태를 반환합니다. 플랜 최대 페이지 수보다 보유 페이지가 많으면
+`needs_activation_adjustment=true` 이며 프론트는 활성 페이지 선택 다이얼로그를 엽니다.
+
+## 두 개의 플래그 (중요)
+페이지에는 독립된 두 boolean 이 있습니다:
+- **`is_active`** — 요금제 활성 슬롯. 다운그레이드 축소 대상이며 billing 이 관리합니다.
+- **`is_public`** — 사용자 공개 토글(게시 여부). 페이지 에디터(PATCH /pages/multipages/{id}/)가 관리합니다.
+
+실제 외부 노출은 **둘 다 True** 여야 합니다 → `is_live = is_active AND is_public`.
+**프론트가 "이 페이지가 지금 켜져 있나"를 판단할 때는 `is_active` 단독이 아니라 `is_live` 를 쓰세요.**
+(과거 `is_active` 단독을 신뢰해 `is_public=false` 인 페이지를 "켜짐"으로 오표시하던 버그를 이 값으로 해소.)
+
+## 다운그레이드 시 페이지 처리 정책
+- **무료(free)로 다운그레이드**: 가장 먼저 생성된 `max_pages` 개만 `is_active=True` 로 남기고
+  초과분은 `is_active=False` 로 자동 비활성화합니다. `is_public` 은 건드리지 않습니다
+  (초과분은 `is_active=False` 만으로 이미 외부 노출 차단).
+- **유료 → 하위 유료(예: unlimited→pro)로 다운그레이드**: 페이지 `is_active`/`is_public` 을
+  자동으로 변경하지 않습니다. 보유수가 허용량을 초과하면 `needs_activation_adjustment=true` 로
+  내려오므로, 사용자가 이 API 의 POST 로 유지할 페이지를 직접 선택해야 합니다.
 
 ## 응답 필드
 | 필드 | 타입 | 설명 |
 |------|------|------|
-| `needs_activation_adjustment` | bool | 조정이 필요한지 여부 |
-| `max_pages` | int | 현재 플랜의 최대 페이지 수 |
+| `needs_activation_adjustment` | bool | 조정 필요 여부 (**다이얼로그 트리거**) |
+| `max_pages` | int | 현재 플랜의 최대 페이지 수. 무제한은 999999 |
 | `total_pages` | int | 보유한 전체 페이지 수 |
-| `active_pages` | int | 현재 활성 페이지 수 |
-| `can_change_today` | bool | 오늘 활성화 변경 가능 여부 (하루 1회) |
-| `pages` | array | 전체 페이지 목록 (id, slug, title, is_active) |
+| `active_pages` | int | 활성 슬롯(is_active) 페이지 수 |
+| `live_pages` | int | 실제 노출 중(is_active AND is_public) 페이지 수 |
+| `can_change_today` | bool | 오늘 변경 가능 여부 (하루 1회, 강제 조정 상황은 항상 true) |
+| `pages` | array | 전체 페이지 (id, slug, title, is_active, is_public, is_live) |
         """,
-        responses={200: OpenApiResponse(description="활성화 조정 상태")},
+        responses={
+            200: OpenApiResponse(
+                response=PageActivationStateSerializer, description="활성화 조정 상태"
+            ),
+            401: OpenApiResponse(description="인증 실패 — 토큰 없음/만료"),
+        },
     )
     def get(self, request):
-        from apps.pages.models import Page
-
-        from .subscription_utils import get_user_plan
-
-        plan = get_user_plan(request.user)
-        max_pages_raw = plan.features.get("max_pages", 1)
-        is_unlimited = max_pages_raw == -1
-        max_pages = 999999 if is_unlimited else max_pages_raw
-
-        sub = ensure_subscription(request.user)
-        pages = Page.objects.filter(user=request.user).order_by("created_at")
-        total = pages.count()
-        active = pages.filter(is_active=True).count()
-
-        # 무제한 플랜(프로 플러스)은 하루 1회 제한 없음
-        can_change = True
-        if not is_unlimited and sub.page_activation_changed_at:
-            can_change = (timezone.now() - sub.page_activation_changed_at).days >= 1
-
-        return Response(
-            {
-                "needs_activation_adjustment": total > max_pages,
-                "max_pages": max_pages,
-                "total_pages": total,
-                "active_pages": active,
-                "can_change_today": can_change,
-                "pages": [
-                    {"id": p.id, "slug": p.slug, "title": p.title, "is_active": p.is_active}
-                    for p in pages
-                ],
-            }
-        )
+        return Response(self._state(request.user))
 
     @extend_schema(
         tags=["사용자플랜"],
@@ -921,22 +968,40 @@ class PageActivationView(APIView):
         description="""
 ## 목적
 다운그레이드 후 플랜 한도에 맞춰 **활성화할 페이지를 선택**합니다.
-하루 1회만 변경 가능합니다.
+선택한 페이지는 활성 슬롯 확보 + **게시(is_public=True)**, 선택되지 않은 나머지 페이지는
+슬롯 반납 + **비공개(is_public=False)** 로 원자적으로 전환됩니다. 즉 이 한 번의 호출로
+`is_active` 와 `is_public` 이 선택과 일치하도록 함께 맞춰집니다.
 
 ## 요청 필드
 | 필드 | 필수 | 타입 | 설명 |
 |------|------|------|------|
-| `active_page_ids` | ✅ | array[int] | 활성화할 페이지 ID 목록. 플랜 최대 페이지 수 이하 |
+| `active_page_ids` | ✅ | array[int] | 활성화할 페이지 ID 목록. 플랜 최대 페이지 수 이하, 전부 본인 소유(최소 1개) |
+
+## 규칙
+- 개수는 `max_pages` 이하여야 합니다.
+- 모든 id 는 본인 소유여야 합니다.
+- **하루 1회** 변경 제한이 있으나, 재조정이 필요한 상황(`needs_activation_adjustment=true`,
+  즉 보유수>허용량)에서는 **항상 허용**됩니다(강제 조정 우회). 무제한 플랜은 제한 없음.
+- 선택한 페이지가 초안(is_public=false)이었어도 이 호출로 **게시**됩니다 — 강제 조정 다이얼로그에서
+  "유지할 페이지 선택 = 노출" 의도를 따릅니다.
+
+## 응답
+GET 과 동일 스키마의 최신 상태(`PageActivationStateSerializer`)를 반환합니다.
 
 ## 에러
-| 코드 | 메시지 |
-|------|--------|
-| 400 | 활성 페이지 수가 플랜 한도 초과, 존재하지 않는 페이지 ID, 오늘 이미 변경함 |
-| 403 | 조정이 필요하지 않은 상태 |
+| 코드 | 원인 |
+|------|------|
+| 400 | 허용량 초과, 존재하지 않는/타인 페이지 ID, 빈 목록, 오늘 이미 변경(강제 조정 아닐 때) |
+| 401 | 토큰 없음/만료 |
         """,
+        request=PageActivationRequestSerializer,
         responses={
-            200: OpenApiResponse(description="활성화 변경 완료"),
+            200: OpenApiResponse(
+                response=PageActivationStateSerializer,
+                description="활성화 변경 완료 (GET 과 동일 스키마)",
+            ),
             400: OpenApiResponse(description="유효성 검증 실패"),
+            401: OpenApiResponse(description="인증 실패"),
         },
     )
     def post(self, request):
@@ -950,19 +1015,18 @@ class PageActivationView(APIView):
 
         sub = ensure_subscription(request.user)
 
-        # 하루 1회 제한 (무제한 플랜은 제외)
-        if not is_unlimited and sub.page_activation_changed_at:
-            elapsed = (timezone.now() - sub.page_activation_changed_at).total_seconds()
-            if elapsed < 86400:
-                return Response(
-                    {"detail": "페이지 활성화 변경은 하루에 1번만 가능합니다."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
+        req = PageActivationRequestSerializer(data=request.data)
+        req.is_valid(raise_exception=True)
+        active_page_ids = req.validated_data["active_page_ids"]
 
-        active_page_ids = request.data.get("active_page_ids", [])
-        if not isinstance(active_page_ids, list):
+        # 사용자의 페이지인지 확인
+        user_pages = Page.objects.filter(user=request.user)
+        valid_ids = set(user_pages.values_list("id", flat=True))
+        total = len(valid_ids)
+        invalid = set(active_page_ids) - valid_ids
+        if invalid:
             return Response(
-                {"detail": "active_page_ids는 배열이어야 합니다."},
+                {"detail": f"존재하지 않는 페이지 ID: {sorted(invalid)}"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -972,35 +1036,25 @@ class PageActivationView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # 사용자의 페이지인지 확인
-        user_pages = Page.objects.filter(user=request.user)
-        valid_ids = set(user_pages.values_list("id", flat=True))
-        invalid = set(active_page_ids) - valid_ids
-        if invalid:
-            return Response(
-                {"detail": f"존재하지 않는 페이지 ID: {list(invalid)}"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        # 강제 조정(보유수>허용량) 상황이면 하루 1회 제한 우회 — IG 판과 동일 계약
+        needs = not is_unlimited and total > max_pages
+        if not is_unlimited and not needs and sub.page_activation_changed_at:
+            elapsed = (timezone.now() - sub.page_activation_changed_at).total_seconds()
+            if elapsed < 86400:
+                return Response(
+                    {"detail": "페이지 활성화 변경은 하루에 1번만 가능합니다."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
-        if len(active_page_ids) == 0:
-            return Response(
-                {"detail": "최소 1개의 페이지를 활성화해야 합니다."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # 활성화 적용
-        user_pages.filter(id__in=active_page_ids).update(is_active=True)
-        user_pages.exclude(id__in=active_page_ids).update(is_active=False)
+        # 적용: 선택 페이지는 활성 슬롯 + 게시, 나머지는 슬롯 반납 + 비공개.
+        # is_active 와 is_public 을 함께 맞춰 실제 노출(is_live)이 선택과 일치하게 한다.
+        user_pages.filter(id__in=active_page_ids).update(is_active=True, is_public=True)
+        user_pages.exclude(id__in=active_page_ids).update(is_active=False, is_public=False)
 
         sub.page_activation_changed_at = timezone.now()
         sub.save(update_fields=["page_activation_changed_at", "updated_at"])
 
-        return Response(
-            {
-                "detail": f"{len(active_page_ids)}개 페이지가 활성화되었습니다.",
-                "active_page_ids": active_page_ids,
-            }
-        )
+        return Response(self._state(request.user))
 
 
 class IGAccountActivationView(APIView):

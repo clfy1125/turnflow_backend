@@ -175,6 +175,49 @@ class IGAccountActivationRequestSerializer(serializers.Serializer):
     )
 
 
+class PageActivationItemSerializer(serializers.Serializer):
+    """활성화 선택 UI 의 페이지 항목."""
+
+    id = serializers.IntegerField(help_text="페이지 id")
+    slug = serializers.CharField(help_text="공개 URL slug")
+    title = serializers.CharField(help_text="페이지 제목")
+    is_active = serializers.BooleanField(
+        help_text="요금제 활성 슬롯 여부(다운그레이드 축소 대상). 공개 여부와 별개"
+    )
+    is_public = serializers.BooleanField(help_text="사용자 공개 토글(게시 여부)")
+    is_live = serializers.BooleanField(
+        help_text="실제 외부 노출 여부 = is_active AND is_public. 프론트 '켜짐' 판단은 이 값 사용"
+    )
+
+
+class PageActivationStateSerializer(serializers.Serializer):
+    """GET/POST /billing/page-activation/ 응답."""
+
+    needs_activation_adjustment = serializers.BooleanField(
+        help_text="활성 페이지 재선택이 필요한지 (보유수>허용량). 다이얼로그 트리거로 사용"
+    )
+    max_pages = serializers.IntegerField(help_text="현재 플랜의 최대 페이지 수. 무제한은 999999")
+    total_pages = serializers.IntegerField(help_text="보유한 전체 페이지 수")
+    active_pages = serializers.IntegerField(help_text="현재 활성 슬롯(is_active) 페이지 수")
+    live_pages = serializers.IntegerField(
+        help_text="실제 노출 중(is_active AND is_public) 페이지 수"
+    )
+    can_change_today = serializers.BooleanField(
+        help_text="오늘 활성화 변경 가능 여부 (하루 1회, 강제 조정 상황은 항상 허용)"
+    )
+    pages = PageActivationItemSerializer(many=True)
+
+
+class PageActivationRequestSerializer(serializers.Serializer):
+    """POST /billing/page-activation/ 요청."""
+
+    active_page_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        allow_empty=False,
+        help_text="활성으로 둘 페이지 id 목록. 플랜 최대 페이지 수 이하, 전부 본인 소유(최소 1개)",
+    )
+
+
 class ChangeSubscriptionRequestSerializer(serializers.Serializer):
     """플랜 변경 요청용 (빌링키 보유 유료 사용자 전용)"""
 
