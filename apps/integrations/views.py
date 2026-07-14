@@ -1857,9 +1857,15 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
             "서버가 조합형 생성기로 무작위 생성해 내려준다. 프론트는 폼을 열 때 이 API 를 호출해 "
             "받은 문구들로 `recovery_reply_templates` 입력란을 미리 채우면 된다(사용자는 자유롭게 "
             "편집/추가/삭제 가능).\n\n"
+            "## 복구 메커니즘 (v2, 2026-07-14 — 인바운드 DM 트리거 폐기)\n"
+            "opening 비공개답글이 2534025(비팔로워 채널 미개설)로 **확정 실패**하면 DM 은 대부분 "
+            "수신자의 숨겨진 요청/스팸함에 있다. 서버는 댓글에 'DM이 숨겨진 요청함으로 갔어요 — "
+            "**수락 후 다시 댓글** 달아주세요' 안내를 남기고, 사용자가 다시 댓글을 달면 일반 "
+            "댓글→DM 경로가 재발송한다(성공 시 이전 실패 건은 `recovery_delivered` 로 자동 승격). "
+            "`recovery_keyword` 는 deprecated — 값은 무시된다.\n\n"
             "## 동작\n"
             "- 매 호출마다 서로 다른 무작위 조합을 반환한다(같은 요청도 매번 다름).\n"
-            "- 형식: `{실패 알림} {이모지} {재요청 문구}` (+50% 확률로 끝 이모지). "
+            "- 형식: `{숨김함 고지} {이모지} {수락+재댓글 유도}` (+50% 확률로 끝 이모지). "
             "총 조합 수는 `generator_combinations` 로 함께 내려준다.\n"
             "- `recovery_reply_templates` 를 **비워서 저장**하면, 발송 시점에 서버가 이 생성기로 "
             "매번 새 문구를 만들어 쓴다(사실상 무한 변형 → 봇 검사에 가장 강함). 폼에 채워 저장하면 "
@@ -1913,9 +1919,9 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
                         "추천 30개 (프로)",
                         value={
                             "templates": [
-                                "DM 전송에 실패했어요 😢 이 계정으로 DM 아무거나 하나 보내주시면 다시 보내드릴게요!",
-                                "앗 전송 오류가 났어요 🥲 아무 내용이나 DM 주시면 즉시 다시 보내드릴게요! 🎁",
-                                "메시지가 전달되지 않았어요 😥 저희 계정으로 DM 하나만 보내주시면 다시 보내드릴게요!",
+                                "DM이 숨겨진 요청함으로 들어갔어요 🥲 메시지 요청 수락하시고 다시 댓글 남겨주시면 바로 보내드릴게요!",
+                                "메시지가 요청함으로 분류된 것 같아요 😢 요청함에서 수락 후 댓글 한 번만 더 달아주시면 다시 보내드려요! 😊",
+                                "DM이 스팸함으로 들어간 것 같아요 🙈 수락하신 다음 재댓글 남겨주시면 곧바로 다시 보내드릴게요!",
                             ],
                             "count": 30,
                             "generator_combinations": 106704,
@@ -3812,23 +3818,11 @@ def _process_messaging_events(entry: dict, logger) -> None:
                     f"Story reply queued: sender={sender_id}, " f"story={story_id}, mid={mid}"
                 )
             else:
-                # 일반 인바운드 DM → 실패 DM 복구 재전송 트리거 후보.
-                # sender.id(IGSID) 로 DB 매칭(Meta API 0회): RECOVERY_PENDING opening 이 있으면
-                # 열린 채널로 재전송. 대기 건 없으면 태스크가 즉시 no_match 반환(경량).
-                # (EventInbox 는 echo/read 전용이라 여기선 미사용 — 멱등은 opening 당 1회 키로 보장.)
-                if not is_echo and (message.get("text") or "").strip():
-                    from .tasks import process_inbound_recovery_dm
-
-                    process_inbound_recovery_dm.delay(
-                        {
-                            "page_ig_user_id": page_ig_user_id,
-                            "sender_user_id": sender_id,
-                            "message_mid": mid or "",
-                            "message_text": message.get("text", "") or "",
-                        }
-                    )
-                else:
-                    logger.debug(f"Inbound DM received (no handler): sender={sender_id}, mid={mid}")
+                # 일반 인바운드 DM — 현재 핸들러 없음 (로깅만).
+                # v1 실패 DM 복구의 인바운드 트리거(process_inbound_recovery_dm)는 폐기됨
+                # (2026-07-14): 'DM 먼저 받기'를 꺼둔 사용자에게 동작하지 않아, 복구 재발송은
+                # 안내 대댓글을 본 사용자의 **재댓글**(일반 댓글→DM 경로)로 대체됐다.
+                logger.debug(f"Inbound DM received (no handler): sender={sender_id}, mid={mid}")
 
 
 def _maybe_dispatch_follow_gate(

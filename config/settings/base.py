@@ -376,8 +376,6 @@ CELERY_TASK_ROUTES = {
     # 댓글 처리 + 웹훅 delivered/read 후속 UPDATE
     "apps.integrations.tasks.process_comment_and_send_dm": {"queue": "webhook_followup"},
     "apps.integrations.tasks.process_messaging_event": {"queue": "webhook_followup"},
-    # 실패 DM 복구: 인바운드 DM → RECOVERY_PENDING opening 재전송 (웹훅 후속)
-    "integrations.process_inbound_recovery_dm": {"queue": "webhook_followup"},
     # 스팸 필터 LLM 판정(3-7초 gemma) — DM 디스패치를 굶기지 않게 ai_jobs 워커로 격리.
     # celery_ai 가 이미 최대 600s LLM 작업용으로 구동중이라 신규 인프라 불필요.
     "apps.integrations.tasks.run_spam_filter_check": {"queue": "ai_jobs"},

@@ -730,13 +730,15 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
         help_text="postback 미수신 구버전 클라이언트 fallback. 이 키워드 답장도 통과로 간주.",
     )
 
-    # 실패 DM 복구 (recovery)
+    # 실패 DM 복구 (recovery) — v2(2026-07-14): 인바운드 DM 트리거 폐기 → 재댓글 방식
     recovery_reply_enabled = serializers.BooleanField(
         required=False,
         default=True,
         help_text=(
-            "opening 이 2534025(비팔로워 채널 미개설)로 실패하면 댓글에 '다시 보내드릴게요' 안내를 "
-            "게시하고, 사용자가 DM 을 보내오면 열린 채널로 재전송한다. 기본값 true. "
+            "opening 이 2534025(비팔로워 채널 미개설)로 **확정** 실패하면 댓글에 'DM이 숨겨진 "
+            "요청/스팸함으로 갔어요 — 수락 후 다시 댓글 달아주세요' 안내를 게시한다. 사용자가 "
+            "다시 댓글을 달면 일반 발송 경로로 재발송되고, 성공 시 이전 실패 건은 "
+            "recovery_delivered 로 자동 승격된다. 기본값 true. "
             "프로 전용 — 미보유 플랜은 켜도 동작하지 않는다(recovery_reply_available 로 확인)."
         ),
     )
@@ -744,21 +746,29 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
         child=serializers.CharField(),
         required=False,
         default=list,
-        help_text="복구 안내 대댓글 변형 목록(무작위 1개 사용). 비우면 서버 기본 세트를 자동 사용(선택).",
+        help_text=(
+            "복구 안내 대댓글 변형 목록(무작위 1개 사용). 비우면 서버 조합 생성기가 매번 새 문구를 "
+            "만든다(권장 — 봇 검사에 가장 강함). 추천 문구는 recovery-reply-suggestions API 참고."
+        ),
     )
     recovery_keyword = serializers.CharField(
         required=False,
         allow_blank=True,
         default="",
         max_length=255,
-        help_text="비우면 사용자의 아무 DM 이나 재전송 트리거. 값이 있으면 그 키워드 포함 DM 만.",
+        help_text=(
+            "(deprecated v2 — 인바운드 DM 트리거 폐기로 값은 무시된다. 하위호환용으로 수용만 함.)"
+        ),
     )
     recovery_ttl_seconds = serializers.IntegerField(
         required=False,
         default=604800,
         min_value=3600,
         max_value=2592000,
-        help_text="복구 대기 유효기간(초). 기본 7일(604800), 범위 1시간~30일.",
+        help_text=(
+            "복구 대기 유효기간(초). 이 시간 내 같은 사용자의 재댓글 발송 성공이 없으면 "
+            "recovery_expired 로 만료. 기본 7일(604800), 범위 1시간~30일."
+        ),
     )
 
     # 운영 — (deprecated v4.3) 값은 수용하되 무시됨: 페이싱은 dm_pacer(계정 단위 지터 슬롯)가 담당.
@@ -1184,8 +1194,8 @@ _STATUS_DISPLAY = {
     "rate_limited": "Meta 응답 대기 중 (지연)",
     "failed_no_trace": "도착 미확인 (자가 점검 필요)",
     "failed_api": "API 오류(legacy)",
-    "recovery_pending": "복구 대기 (사용자 DM 응답 대기)",
-    "recovery_delivered": "복구 재전송 성공",
+    "recovery_pending": "복구 대기 (요청함 수락·재댓글 대기)",
+    "recovery_delivered": "복구 성공 (재댓글 발송 도착)",
     "recovery_expired": "복구 대기 만료",
 }
 

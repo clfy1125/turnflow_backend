@@ -1314,16 +1314,21 @@ class InstagramMediaService:
         limit: int = 50,
         after: str | None = None,
     ) -> dict:
-        """미디어의 top-level 댓글을 1페이지 조회 (웹훅 누락 보정 폴링용).
+        """미디어의 최근 댓글을 1페이지 조회 (웹훅 누락 보정 폴링용).
 
-        GET /v25.0/{media_id}/comments?fields=id,text,username,timestamp
+        GET /v25.0/{media_id}/comments?fields=id,text,username,timestamp,parent_id,from
 
         Meta 사양 (v25.0): reverse-chronological(newest-first), 페이지당 최대 50,
-        **top-level 댓글만 반환**(대댓글 제외 — replies 필드 확장 미요청). cursor 페이지네이션.
-        ``from{id}`` 는 작성자 본인 토큰이 아니면 제한적이라 요청하지 않는다(username 으로 충분).
+        cursor 페이지네이션. 문서상 top-level 만 반환한다고 하나 **실측(2026-07-14)으로는
+        계정 본인이 단 답글(공개답글 등)이 응답에 섞여 들어와** 셀프 DM 루프를 유발했다 →
+        ``parent_id`` 를 요청해 호출부(_poll_one_media)가 대댓글을 걸러낸다.
+        ``from``(작성자 id) 도 요청한다 — self-comment 필터에 필요한 건 정확히 '본인 토큰
+        = 본인 댓글' 케이스라 걸러야 할 댓글에서는 IGSID 가 확정적으로 내려온다(username
+        단독 비교는 계정 핸들 변경 시 stale 위험 — 적대적 리뷰 지적). 혹시 이 필드가
+        400 을 유발하는 계정/버전이 있으면 축소 필드로 1회 재시도해 폴링 자체는 지킨다.
 
         Returns:
-            {"data": [{"id","text","username","timestamp"}, ...],
+            {"data": [{"id","text","username","timestamp","parent_id"?,"from"?}, ...],
              "paging_after": "<cursor>" | None}   # 다음 페이지 없으면 None
 
         실패(타임아웃/4xx/5xx) 시 ``{"data": [], "paging_after": None}`` 반환
@@ -1338,7 +1343,7 @@ class InstagramMediaService:
 
         url = f"{cls.GRAPH_API_BASE}/{media_id}/comments"
         params = {
-            "fields": "id,text,username,timestamp",
+            "fields": "id,text,username,timestamp,parent_id,from",
             "limit": limit,
             "access_token": access_token,
         }
@@ -1349,6 +1354,14 @@ class InstagramMediaService:
             resp = requests.get(url, params=params, timeout=cls.DEFAULT_TIMEOUT)
         except (requests.Timeout, requests.ConnectionError):
             return {"data": [], "paging_after": None}
+
+        if not resp.ok and resp.status_code == 400:
+            # `from` 필드 미지원 응답 방어 — 필드 축소 후 1회 재시도 (폴링 무음사 방지).
+            params["fields"] = "id,text,username,timestamp,parent_id"
+            try:
+                resp = requests.get(url, params=params, timeout=cls.DEFAULT_TIMEOUT)
+            except (requests.Timeout, requests.ConnectionError):
+                return {"data": [], "paging_after": None}
 
         if not resp.ok:
             return {"data": [], "paging_after": None}

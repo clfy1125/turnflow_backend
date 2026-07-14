@@ -319,7 +319,7 @@ make test-cov                             # HTML 커버리지 리포트
 - `SECURITY_AUDIT_2026-06.md` — 론칭 전 보안 취약점 감사(미해결 P0 포함)
 - `DM_CAMPAIGN_DUPLICATE_PREVENTION_FRONTEND.md` — 게시물당 활성 캠페인 1개(409) 프론트 가이드
 - `DM_QUEUE_STATE_FRONTEND.md` — DM 순차 발송 큐 현황(게이지+ETA) 프론트 가이드 + v4.3 페이서 메커니즘 요약 (`max_sends_per_hour` deprecated)
-- `DM_RECOVERY_FRONTEND.md` — 실패 DM 복구(recovery) 프론트 연동: 캠페인 폼 4필드 + 추천문구 30개(`GET .../recovery-reply-suggestions/`) + 프로 전용 게이트(`recovery_reply_available`/`features.dm_recovery`, fail-closed) + 로그 상태 3종(recovery_pending/delivered/expired). 기본 활성
+- `DM_RECOVERY_FRONTEND.md` — 실패 DM 복구(recovery) 프론트 연동 **v2(재댓글 방식, 2026-07-14)**: 확정실패→"숨김함 수락 후 재댓글" 안내 대댓글→재댓글이 일반 경로로 재발송(성공 시 recovery_delivered 자동 승격). 추천문구 30개(`GET .../recovery-reply-suggestions/`) + 프로 전용 게이트(fail-closed) + 로그 상태 3종. `recovery_keyword`=deprecated(값 무시). 기본 활성
 - `PASSWORD_RESET_GUIDE.md` — 비밀번호 재설정 플로우 프론트 가이드
 - `DISCONNECT_OTHER_DM_TOOLS_GUIDE.md` — 다른 DM 자동화 툴(매니챗 등) 연결 해제 안내 (댓글 fan-out·Private Reply 1회 충돌 / IG Login이라 Facebook 라우팅 불필요)
 - `CONNECT_CONFLICT_WARNING_FRONTEND.md` — 다른 DM 툴 충돌 경고 배너 프론트 스펙 (연결 직후 + 대시보드 상단, 닫기 규칙)

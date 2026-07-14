@@ -184,11 +184,12 @@ def build_frontend_action(status: str) -> dict:
     if status == "recovery_pending":
         return {
             "type": "wait",
-            "title": "DM 복구 대기 중 (사용자 응답 대기)",
+            "title": "DM 복구 대기 중 (요청함 수락·재댓글 대기)",
             "description": (
-                "첫 DM(비공개 답글)이 전달되지 못해(비팔로워 등 채널 미개설) 댓글에 "
-                "'DM 주시면 다시 보내드릴게요' 안내를 게시했습니다. 사용자가 이 계정으로 "
-                "DM 을 보내오면 열린 채널로 자동 재전송됩니다. 아직 완전한 실패가 아닙니다."
+                "첫 DM(비공개 답글)이 전달되지 못했습니다(비팔로워 채널 미개설 — DM 은 대부분 "
+                "상대의 숨겨진 요청/스팸함에 있음). 댓글에 '요청함에서 수락 후 다시 댓글 "
+                "달아주세요' 안내를 게시했습니다. 사용자가 다시 댓글을 달면 자동 재발송되고 "
+                "성공 시 이 건은 복구 성공으로 바뀝니다. 아직 완전한 실패가 아닙니다."
             ),
             "checklist": None,
             "cta": None,
@@ -198,9 +199,9 @@ def build_frontend_action(status: str) -> dict:
     if status == "recovery_delivered":
         return {
             "type": "success",
-            "title": "복구 재전송 성공",
+            "title": "복구 성공 (재댓글 발송 도착)",
             "description": (
-                "첫 발송은 실패했지만, 사용자가 DM 을 보내와 열린 채널로 재전송되어 도착했습니다."
+                "첫 발송은 실패했지만, 사용자가 안내를 보고 다시 댓글을 달아 재발송이 도착했습니다."
             ),
             "checklist": None,
             "cta": None,
@@ -210,9 +211,9 @@ def build_frontend_action(status: str) -> dict:
     if status == "recovery_expired":
         return {
             "type": "info",
-            "title": "복구 대기 만료 (사용자 무응답)",
+            "title": "복구 대기 만료 (수락·재댓글 없음)",
             "description": (
-                "안내 답글 게시 후 유효기간 내에 사용자 DM 이 없어 만료되었습니다. "
+                "안내 답글 게시 후 유효기간 내에 사용자의 재댓글 발송 성공이 없어 만료되었습니다. "
                 "계정주가 조치할 항목은 없습니다."
             ),
             "checklist": None,

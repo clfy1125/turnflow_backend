@@ -324,16 +324,28 @@ def _defer_or_fail(log, campaign, ig_conn, exc) -> dict:
 
 
 def _maybe_enter_recovery(log, campaign, exc) -> bool:
-    """opening 비공개답글이 비팔로워 채널 미개설(code=100/subcode=2534025)로 실패했고
+    """opening 비공개답글이 비팔로워 채널 미개설(code=100/subcode=2534025)로 **확정** 실패했고
     캠페인이 복구를 켰으면, 완전 실패로 종결하지 않고 RECOVERY_PENDING 로 전이하고
-    안내 대댓글을 예약한다. (사용자가 DM 을 보내오면 process_inbound_recovery_dm 이 재전송)
+    안내 대댓글("DM이 숨겨진 요청/스팸함으로 갔어요 — 수락 후 다시 댓글")을 예약한다.
+
+    v2(2026-07-14): 인바운드 DM 감지 폐기 — 사용자가 요청을 수락하고 **다시 댓글을 달면**
+    일반 댓글→DM 경로가 재발송하고, 성공(ACCEPTED) 시 _flip_recovery_on_success 가 이전
+    RECOVERY_PENDING 을 RECOVERY_DELIVERED 로 승격한다.
 
     반환 True → 복구 경로로 처리됨(호출부는 _defer_or_fail 을 타지 않음).
-    조건 불충족(다른 subcode / reward·재안내 child / Story / 복구 비활성 / 템플릿 없음)이면
+    조건 불충족(다른 subcode / reward·재안내 child / Story / 복구 비활성)이면
     False → 기존대로 FAILED_PARAM 종결(회귀 없음).
 
+    '확정 실패'에만 댓글을 남기기 위한 가드 (prod 실측 2026-07-14 — 이중 댓글 버그):
+      - 이 로그에 전달 흔적(accepted/echo/delivered/read)이 있으면 복구를 타지 않는다.
+        revive(제자리 되살림) 재시도가 2534025 를 맞아도 원 DM 은 이미 전달됐을 수 있다.
+      - 이 댓글에 이미 우리 답글(성공 공개답글 or 복구 답글)이 게시됐으면 추가 게시 금지.
+      - 같은 (캠페인, 수신자)에 RECOVERY_PENDING 이 이미 있으면(=안내 댓글이 이미 나감)
+        상태만 RECOVERY_PENDING 으로 두고 **댓글은 다시 달지 않는다** (재댓글이 또 실패한
+        경우 — 수락 전에 다시 댓글만 단 사용자에게 같은 안내를 반복 게시하면 스팸).
+
     카운팅: 여기서는 total_failed 를 올리지 않는다(아직 '완전 실패' 아님).
-    성공 재전송 시 increment_sent(성공 flip), TTL 만료 시 increment_failed 로 정산한다.
+    재댓글 발송 성공 시 flip(신규 로그가 increment_sent), TTL 만료 시 increment_failed 로 정산.
     """
     if not campaign.recovery_reply_enabled:
         return False
@@ -347,8 +359,6 @@ def _maybe_enter_recovery(log, campaign, exc) -> bool:
         return False
     if not owner_has_feature(workspace, "dm_recovery"):
         return False
-    # 템플릿은 캠페인 미지정 시 서버 기본 세트(DEFAULT_RECOVERY_REPLY_TEMPLATES)로 폴백하므로
-    # 여기서 non-empty 를 요구하지 않는다 (enabled 면 항상 안내 대댓글 가능).
     # 정확히 2534025(비팔로워/채널 미개설)만. 삭제(33)/7일초과(2018292)/기타 code=100 은 제외.
     if getattr(exc, "code", None) != 100 or str(getattr(exc, "subcode", "") or "") != "2534025":
         return False
@@ -357,6 +367,26 @@ def _maybe_enter_recovery(log, campaign, exc) -> bool:
         return False
     if not log.comment_id or log.parent_log_id is not None:
         return False
+    # ★ 확정 실패 가드: 전달 흔적이 있으면 '실패 확정' 이 아니다 (revive 재시도 경로 등).
+    #   이미 전달됐을 수 있는 DM 에 "못 드렸어요" 계열 댓글을 달면 사용자 혼란 + 이중 댓글.
+    if log.meta_message_id or log.echo_mid or log.accepted_at or log.delivered_at or log.read_at:
+        return False
+    # ★ 이 댓글에 이미 우리 답글이 달려 있으면(성공 공개답글/복구 답글) 추가 게시 금지.
+    if log.public_reply_id or log.recovery_reply_id:
+        return False
+
+    # 같은 (캠페인, 수신자)에 이미 복구 대기가 있으면 안내 댓글은 1회로 충분 — 상태만 전이.
+    # 매칭은 _recipient_match_q (웹훅 IGSID / 폴링 username 키 이원화 대응).
+    _guided_q = _recipient_match_q(user_id=log.recipient_user_id, username=log.recipient_username)
+    already_guided = _guided_q is not None and (
+        SentDMLog.objects.filter(
+            _guided_q,
+            campaign=campaign,
+            status=SentDMLog.Status.RECOVERY_PENDING,
+        )
+        .exclude(id=log.id)
+        .exists()
+    )
 
     log.status = SentDMLog.Status.RECOVERY_PENDING
     log.recovery_pending_at = timezone.now()
@@ -375,36 +405,74 @@ def _maybe_enter_recovery(log, campaign, exc) -> bool:
         ]
     )
     log.append_verification_log(
-        {"path": "recovery", "result": "pending", "reason": "comment_not_eligible_2534025"}
+        {
+            "path": "recovery",
+            "result": "pending",
+            "reason": "comment_not_eligible_2534025",
+            "guide_reply": "skipped_duplicate" if already_guided else "scheduled",
+        }
     )
-    # 안내 대댓글 게시 (best-effort, 성공답글과 페이싱/배치 공유, 서킷은 분리)
-    import random as _r
+    if not already_guided:
+        # 안내 대댓글 게시 (best-effort, 성공답글과 페이싱/배치 공유, 서킷은 분리)
+        import random as _r
 
-    post_public_reply.apply_async(
-        args=[str(log.id)], kwargs={"recovery": True}, countdown=_r.randint(5, 15)
-    )
+        post_public_reply.apply_async(
+            args=[str(log.id)], kwargs={"recovery": True}, countdown=_r.randint(5, 15)
+        )
     return True
 
 
-def _maybe_flip_recovery_delivered(log, campaign) -> bool:
-    """복구 재전송 자식(log)이 ACCEPTED 되면 부모 opening 을 RECOVERY_DELIVERED(성공·종결)로 승격.
+def _recipient_match_q(*, user_id: str = "", username: str = ""):
+    """같은 수신자를 recipient 키 이원화를 넘어 매칭하는 Q.
 
-    자식은 parent_log 가 있어 send_dm_task 의 increment_sent 를 건너뛰므로, 여기서 부모 기준
-    1회만 성공 집계한다. 부모가 RECOVERY_PENDING 인 경우에만 동작(일반 reward/재안내 child 제외).
-    반환 True 면 승격함.
+    recipient_user_id 의 값 공간이 경로마다 다르다: 웹훅 경로 = IGSID, 폴링 경로 =
+    username(comments edge 가 from.id 를 안 줄 때 폴백 — 2026-07-14 prod 실측).
+    IGSID/username 어느 쪽 키로 저장됐든 매칭되도록 recipient_user_id 는 두 값 모두로,
+    recipient_username 은 username 으로 본다(전부 인덱스 있는 필드).
+    매칭 불가(둘 다 빈 값)면 None.
     """
-    if not log.parent_log_id:
-        return False
-    parent = log.parent_log
-    if parent is None or parent.status != SentDMLog.Status.RECOVERY_PENDING:
-        return False
-    parent.status = SentDMLog.Status.RECOVERY_DELIVERED
-    parent.save(update_fields=["status"])
-    parent.append_verification_log(
-        {"path": "recovery", "result": "resent", "child_log_id": str(log.id)}
+    keys = [v for v in (str(user_id or "").strip(), str(username or "").strip()) if v]
+    if not keys:
+        return None
+    q = Q(recipient_user_id__in=keys)
+    uname = str(username or "").strip()
+    if uname:
+        q |= Q(recipient_username__iexact=uname)
+    return q
+
+
+def _flip_recovery_on_success(log, campaign) -> int:
+    """어떤 발송이든 같은 (캠페인, 수신자)로 ACCEPTED 되면, 그 수신자의 이전
+    RECOVERY_PENDING opening 들을 RECOVERY_DELIVERED(성공·종결)로 승격한다.
+
+    v2 재댓글 복구의 성공 정산 지점: 사용자가 숨김함 요청을 수락하고 다시 댓글을 달아
+    새 opening 이 성공하면, 실패로 대기 중이던 이전 건이 '복구 성공'으로 종결된다.
+    (v1 인바운드 재전송 자식이 배포 전환기에 늦게 ACCEPTED 되는 경우도 recipient 가 같아
+    이 경로가 자연 흡수한다.) 매칭은 _recipient_match_q — 웹훅(IGSID)/폴링(username)
+    어느 경로로 만들어진 pending 이든 승격된다.
+
+    카운팅: 여기서는 increment_sent 를 올리지 않는다 — 성공 집계는 방금 ACCEPTED 된
+    신규 로그(top-level이면 호출부에서 이미 increment_sent)가 담당하고, 승격은 상태
+    정산일 뿐이다(월 quota 는 (캠페인×수신자) 고유쌍 집계라 이중 소진 없음).
+    반환값 = 승격한 로그 수.
+    """
+    match_q = _recipient_match_q(user_id=log.recipient_user_id, username=log.recipient_username)
+    if match_q is None:
+        return 0
+    pendings = list(
+        SentDMLog.objects.filter(
+            match_q,
+            campaign=campaign,
+            status=SentDMLog.Status.RECOVERY_PENDING,
+        ).exclude(id=log.id)
     )
-    campaign.increment_sent()
-    return True
+    for parent in pendings:
+        parent.status = SentDMLog.Status.RECOVERY_DELIVERED
+        parent.save(update_fields=["status"])
+        parent.append_verification_log(
+            {"path": "recovery", "result": "recovered_by_new_send", "new_log_id": str(log.id)}
+        )
+    return len(pendings)
 
 
 # ===== 진입점 =====
@@ -445,17 +513,10 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
             logger.error(f"Missing required fields in webhook payload: {webhook_payload}")
             return {"status": "error", "reason": "Missing required fields"}
 
-        # ★ 대댓글(답글) 가드:
-        # 우리 시스템이 게시한 공개 답글이 다시 webhook 으로 들어오면 → DM 무한 루프.
-        # 외부 사용자의 답글 역시 캠페인 트리거 대상이 아님 (top-level 댓글만 트리거).
-        # parent_id 가 있으면 무조건 skip.
-        if parent_id:
-            logger.info(f"Skipping reply (대댓글): comment_id={comment_id} parent={parent_id}")
-            return {"status": "skipped", "reason": "is_reply"}
-
         # ★ Self-comment 가드:
         # 비즈니스 본인이 자기 게시물에 댓글 → 자기 자신에게 DM 가는 루프 차단.
         # webhook entry.id 는 connected page 의 IG user id 와 동일.
+        # (대댓글 가드보다 먼저 — 우리 공개/복구 답글이 어떤 분기로도 새지 않게.)
         page_ig_user_id = str(webhook_payload.get("entry_id") or "")
         if page_ig_user_id and str(from_user_id) == page_ig_user_id:
             logger.info(
@@ -463,6 +524,26 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
                 f"commented on own post (comment_id={comment_id})"
             )
             return {"status": "skipped", "reason": "self_comment"}
+
+        # ★ 대댓글(답글) 가드:
+        # 우리 시스템이 게시한 공개 답글이 다시 webhook 으로 들어오면 → DM 무한 루프.
+        # 외부 사용자의 답글 역시 캠페인 트리거 대상이 아님 (top-level 댓글만 트리거).
+        # 예외: RECOVERY_PENDING 보유 사용자의 답글은 복구 재댓글로 라우팅 —
+        #   복구 안내가 사용자 댓글의 '답글'로 달리므로, 사용자의 가장 자연스러운 응답
+        #   (스레드 답글)이 여기로 들어온다. 그 외 답글은 기존대로 무조건 skip.
+        if parent_id:
+            routed = _maybe_route_recovery_recomment(
+                page_ig_user_id=page_ig_user_id,
+                from_user_id=str(from_user_id),
+                from_username=str(from_username or ""),
+                comment_id=comment_id,
+                comment_text=comment_text,
+                source="webhook_reply",
+            )
+            if routed:
+                return {"status": "queued", "reason": "recovery_recomment_reply", "routed": routed}
+            logger.info(f"Skipping reply (대댓글): comment_id={comment_id} parent={parent_id}")
+            return {"status": "skipped", "reason": "is_reply"}
 
         # 활성 캠페인 매칭 (trigger_type + keyword 모두 평가)
         # (스팸 검사는 run_spam_filter_check 가 독립적으로 처리 — 여기서 하지 않는다)
@@ -523,7 +604,25 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
                     if c.id not in existing_ids and c.matches_keyword(comment_text):
                         matched_campaigns.append(c)
 
+        # ★ 복구 재댓글 라우팅(키워드 비적용): RECOVERY_PENDING 보유 사용자의 top-level
+        #   재댓글이 캠페인 키워드와 불일치해도("수락했어요" 등) 복구 재발송은 진행돼야 한다.
+        #   일반 매칭과 같은 캠페인이 겹치면 comment_id 단위 멱등키가 중복을 흡수한다.
+        recovery_routed = _maybe_route_recovery_recomment(
+            page_ig_user_id=page_ig_user_id,
+            from_user_id=str(from_user_id),
+            from_username=str(from_username or ""),
+            comment_id=comment_id,
+            comment_text=comment_text,
+            source="webhook",
+        )
+
         if not matched_campaigns:
+            if recovery_routed:
+                return {
+                    "status": "queued",
+                    "reason": "recovery_recomment",
+                    "routed": recovery_routed,
+                }
             return {"status": "skipped", "reason": "No campaign matched (media/keyword)"}
 
         results = []
@@ -539,7 +638,7 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
                 )
             )
 
-        return {"status": "queued", "results": results}
+        return {"status": "queued", "results": results, "recovery_routed": recovery_routed}
 
     except Exception as e:
         logger.exception(f"Error processing comment webhook: {e}")
@@ -1088,8 +1187,16 @@ def _enqueue_send_dm(
 
     # ★ Self-DM 가드 (이중 안전망):
     # 캠페인 owner = 댓글 작성자면 skip. _process_comment_and_send_dm 에서
-    # 1차 차단되지만, 다른 진입점(향후 추가)에서도 안전하게.
-    if str(from_user_id) == str(ig_conn.external_account_id):
+    # 1차 차단되지만, 다른 진입점에서도 안전하게.
+    # ⚠️ poll_missed_comments 는 comments edge 가 from.id 를 안 줘서 from_user_id 에
+    # **username** 이 들어온다 → IGSID 비교만으로는 못 거른다(2026-07-14 prod 실측:
+    # 자기 공개답글에 셀프 DM 50건). username 도 함께 비교한다.
+    own_username = (getattr(ig_conn, "username", "") or "").strip().lower()
+    if str(from_user_id) == str(ig_conn.external_account_id) or (
+        own_username
+        and own_username
+        in {str(from_user_id or "").strip().lower(), str(from_username or "").strip().lower()}
+    ):
         return {
             "campaign_id": str(campaign.id),
             "status": "skipped",
@@ -1098,13 +1205,22 @@ def _enqueue_send_dm(
 
     # ★ 동일 수신자 쿨다운(DM_RECIPIENT_COOLDOWN_SECONDS): 같은 사람이 단시간에 여러 댓글 달면
     # idempotency_key 는 comment_id 별로 다르므로 중복 방지 안 됨 → 별도 가드(계정 보호).
+    # 예외(좁게): **안내 댓글이 실제 게시된**(recovery_reply_id 있음) RECOVERY_PENDING 만
+    # 쿨다운 모수에서 제외 — 복구 안내("수락 후 다시 댓글")를 보고 사용자가 5분 내에 재댓글을
+    # 다는 것이 정상 흐름이므로. 미게시 pending(중복 실패의 silent 전이)까지 면제하면 채널이
+    # 계속 닫힌 유저의 재댓글마다 실패 시도가 무한 반복된다(페이서 소모·실패통계 증폭) —
+    # 게시된 안내는 수신자당 1회뿐이라 면제도 실질 1건으로 캡된다.
     cooldown_s = getattr(settings, "DM_RECIPIENT_COOLDOWN_SECONDS", 300)
     cooldown_cutoff = timezone.now() - timedelta(seconds=cooldown_s)
-    recent_to_same_recipient = SentDMLog.objects.filter(
-        campaign=campaign,
-        recipient_user_id=from_user_id,
-        created_at__gte=cooldown_cutoff,
-    ).exists()
+    recent_to_same_recipient = (
+        SentDMLog.objects.filter(
+            campaign=campaign,
+            recipient_user_id=from_user_id,
+            created_at__gte=cooldown_cutoff,
+        )
+        .exclude(Q(status=SentDMLog.Status.RECOVERY_PENDING) & ~Q(recovery_reply_id=""))
+        .exists()
+    )
     if recent_to_same_recipient:
         return {
             "campaign_id": str(campaign.id),
@@ -1190,6 +1306,22 @@ def send_dm_task(self, log_id: str):
 
     campaign = log.campaign
     ig_conn = campaign.ig_connection
+
+    # ★ Self-DM 최후 방어선: 수신자가 계정 자신이면 발송하지 않는다.
+    # 적재 시점 가드(_enqueue_send_dm)를 우회하는 경로(requeue_deferred_dms 재투입,
+    # SKIPPED revive, 이미 적재된 사고 백로그 — 2026-07-14 prod 셀프 DM 50건)까지
+    # 여기서 확정 차단. revive 돼도 다시 이 가드에 걸리므로 재발 불가.
+    _own_uname = (ig_conn.username or "").strip().lower()
+    if (str(log.recipient_user_id or "") == str(ig_conn.external_account_id)) or (
+        _own_uname
+        and _own_uname
+        in {
+            str(log.recipient_user_id or "").strip().lower(),
+            str(log.recipient_username or "").strip().lower(),
+        }
+    ):
+        log.mark_skipped("self recipient (account itself)")
+        return {"status": "skipped", "reason": "self_recipient"}
 
     # ★ 캠페인 상태 가드 (v4.3 Fix 1 — 일시중지가 백로그를 실제로 멈추게):
     # 모든 발송이 이 태스크를 거친다 — opening / reward(postback) / follow 재안내 /
@@ -1330,6 +1462,8 @@ def send_dm_task(self, log_id: str):
                 )
                 if log.parent_log_id is None:
                     campaign.increment_sent()
+                # 접수 확정 = 복구 성공 정산 대상 ('어떤 발송이든 같은 수신자 접수 시 승격' 계약)
+                _flip_recovery_on_success(log, campaign)
                 log.mark_delivered(via=SentDMLog.VerifiedVia.CONV_API)
                 log.append_verification_log({"path": _tag, "result": "confirmed_sent"})
                 return {"status": "delivered", "via": f"{_tag}_conv_api"}
@@ -1352,8 +1486,8 @@ def send_dm_task(self, log_id: str):
             # ⚠️ 잔여 한계: 전달됐는데 Conversations 인덱싱 지연으로 recent=False 면 재시도 시 중복 가능
             #   (기존 동작과 동일 = 회귀 아님). 완전 제거는 '재시도 직전 재확인' 후속 개선 필요.
         # ★ 실패 DM 복구: opening 비공개답글이 비팔로워 채널 미개설(code=100/subcode=2534025)로
-        #   실패했고 캠페인이 복구를 켰다면, 완전 실패로 종결하지 않고 RECOVERY_PENDING +
-        #   안내 대댓글을 예약한다(사용자 DM 대기). 조건 불충족이면 아래 기존 종결 경로로.
+        #   확정 실패했고 캠페인이 복구를 켰다면, 완전 실패로 종결하지 않고 RECOVERY_PENDING +
+        #   "숨김함 수락 후 재댓글" 안내 대댓글을 예약한다. 조건 불충족이면 아래 기존 종결 경로로.
         if _maybe_enter_recovery(log, campaign, e):
             return {"status": "recovery_pending", "log_id": str(log.id)}
         # v3.9: rate-limit/transient 은 횟수 상한으로 종결하지 않고 defer.
@@ -1370,8 +1504,9 @@ def send_dm_task(self, log_id: str):
     if log.parent_log_id is None:
         campaign.increment_sent()
 
-    # ★ 복구 재전송 자식이 접수되면 부모 opening 을 RECOVERY_DELIVERED(성공·종결)로 승격.
-    _maybe_flip_recovery_delivered(log, campaign)
+    # ★ 같은 수신자의 발송이 접수되면 이전 RECOVERY_PENDING 을 RECOVERY_DELIVERED 로 승격
+    #   (재댓글 복구의 성공 정산 — v2).
+    _flip_recovery_on_success(log, campaign)
 
     # 10분 후 첫 능동 검증 예약 (echo가 먼저 오면 skip됨; v3.9: 쿼터 절약 위해 5→10분)
     verify_dm_delivery.apply_async(args=[str(log.id)], countdown=600)
@@ -1552,6 +1687,8 @@ def reconcile_stuck_submitting():
             log.mark_accepted(message_id="", api_response={"stuck_recovery": True, "recent": True})
             if log.parent_log_id is None:
                 log.campaign.increment_sent()
+            # 접수 확정 = 복구 성공 정산 대상 ('어떤 발송이든 같은 수신자 접수 시 승격' 계약)
+            _flip_recovery_on_success(log, log.campaign)
             log.mark_delivered(via=SentDMLog.VerifiedVia.CONV_API)
             log.append_verification_log({"path": "stuck_recovery", "result": "confirmed_sent"})
             confirmed += 1
@@ -2146,6 +2283,7 @@ def _poll_one_media(conn: IGAccountConnection, media_id: str, now) -> dict:
     window_floor = now - timedelta(days=getattr(settings, "PRIVATE_REPLY_WINDOW_DAYS", 7))
     page_size = getattr(settings, "MISSED_COMMENT_POLL_PAGE_SIZE", 50)
     max_pages = getattr(settings, "MISSED_COMMENT_POLL_MAX_PAGES", 20)
+    own_username = (conn.username or "").strip().lower()
 
     misses = 0
     scanned = 0
@@ -2181,13 +2319,47 @@ def _poll_one_media(conn: IGAccountConnection, media_id: str, now) -> dict:
             if not created:
                 return {"misses": misses, "scanned": scanned, "stop": "anchor"}
 
-            # 진짜 누락분 → 트리거 평가
+            # ★ 웹훅 경로와 동일한 2대 가드 — 누락 시 셀프 DM 자기증식 루프
+            #   (2026-07-14 prod 실측: 우리가 단 공개답글을 매시간 주워 자기 자신에게
+            #    opening DM 50건 → 그 DM 의 공개답글을 다음 폴링이 또 주움).
+            # (a) self-comment 스킵(대댓글 가드보다 먼저 — 우리 답글이 어떤 분기로도 안 새게):
+            #     계정 본인 작성 댓글. comments edge 의 from.id(요청 필드) + username
+            #     (케이스 무시, from 누락 응답 대비) 이중 비교.
+            c_from_id = str((c.get("from") or {}).get("id") or "")
+            c_username = str(c.get("username") or "").strip().lower()
+            if (c_from_id and c_from_id == str(conn.external_account_id)) or (
+                own_username and c_username == own_username
+            ):
+                continue
             text = c.get("text") or ""
+            # (b) 대댓글(답글) 스킵: top-level 만 캠페인 트리거. 단 RECOVERY_PENDING 보유
+            #     사용자의 답글은 복구 재댓글로 라우팅(웹훅 경로와 동일 예외).
+            if c.get("parent_id"):
+                _maybe_route_recovery_recomment(
+                    page_ig_user_id=str(conn.external_account_id),
+                    from_user_id=c_from_id,
+                    from_username=str(c.get("username") or ""),
+                    comment_id=cid,
+                    comment_text=text,
+                    source="poll_reply",
+                )
+                continue
+
+            # 진짜 누락분 → 트리거 평가
             matched = _matched_campaigns_for_comment(
                 ig_user_id=conn.external_account_id,
                 media_id=media_id,
                 comment_text=text,
                 now=now,
+            )
+            # ★ 복구 재댓글 라우팅(키워드 비적용) — 웹훅 경로와 동일 예외.
+            _maybe_route_recovery_recomment(
+                page_ig_user_id=str(conn.external_account_id),
+                from_user_id=c_from_id,
+                from_username=str(c.get("username") or ""),
+                comment_id=cid,
+                comment_text=text,
+                source="poll",
             )
             if not matched:
                 continue
@@ -2393,9 +2565,9 @@ def post_public_reply(self, log_id: str, recovery: bool = False):
 
     두 가지 모드:
       - 일반(recovery=False): DM ACCEPTED 후 "DM 보내드렸어요" 성공 답글.
-      - 복구(recovery=True): opening 비공개답글이 2534025(비팔로워 채널 미개설)로 실패했을 때
-        "DM 주세요" 안내 답글. 템플릿·enable 플래그·기록 필드·서킷브레이커 키가 분리되지만,
-        배치/쿨다운/페이싱(계정 단위 대댓글 예산)은 성공 답글과 공유한다.
+      - 복구(recovery=True): opening 비공개답글이 2534025(비팔로워 채널 미개설)로 확정 실패했을 때
+        "숨겨진 요청함 확인·수락 후 다시 댓글" 안내 답글. 템플릿·enable 플래그·기록 필드·
+        서킷브레이커 키가 분리되지만, 배치/쿨다운/페이싱(계정 단위 대댓글 예산)은 성공 답글과 공유한다.
 
     동작:
       1. 템플릿 목록에서 무작위로 1개 선택 — 다양성 확보
@@ -2429,6 +2601,10 @@ def post_public_reply(self, log_id: str, recovery: bool = False):
         return {"status": "skipped", "reason": "already replied"}
     if not template:
         return {"status": "skipped", "reason": "no template content"}
+    # ★ 복구 안내는 게시 직전 상태 재확인 — 예약(5~15s+배치 재시도) 사이에 재댓글 발송이
+    #   성공해 RECOVERY_DELIVERED 로 승격됐다면, '못 드렸어요' 계열 안내는 이제 거짓 → 게시 취소.
+    if recovery and log.status != SentDMLog.Status.RECOVERY_PENDING:
+        return {"status": "skipped", "reason": f"no_longer_pending({log.status})"}
 
     ig_conn = campaign.ig_connection
 
@@ -2704,116 +2880,107 @@ def send_reward_dm(self, opening_log_id: str):
 
 
 # ═════════════════════════════════════════════════════════════
-# 실패 DM 복구 (recovery): 인바운드 DM → RECOVERY_PENDING opening 재전송
+# 실패 DM 복구 (recovery): 확정 실패 → 안내 대댓글 → 재댓글이 일반 경로로 재발송
 # ═════════════════════════════════════════════════════════════
+# v1 의 인바운드 DM 감지 태스크(process_inbound_recovery_dm)는 폐기됐다(2026-07-14).
+# 'DM 먼저 받기'를 꺼둔 사용자에게 동작하지 않았고, 재발송 트리거는 재댓글(일반
+# 댓글→DM 경로)로 대체됐다. 성공 정산은 _flip_recovery_on_success, 만료는 아래 스윕.
 
 
-@shared_task(name="integrations.process_inbound_recovery_dm")
-def process_inbound_recovery_dm(payload: dict):
-    """사용자가 보낸 인바운드 DM 을 받아, 그 사용자의 RECOVERY_PENDING opening 을 재전송한다.
+def _maybe_route_recovery_recomment(
+    *,
+    page_ig_user_id: str,
+    from_user_id: str,
+    from_username: str,
+    comment_id: str,
+    comment_text: str,
+    source: str,
+) -> int:
+    """RECOVERY_PENDING 보유 사용자의 재댓글을 복구 재발송으로 라우팅.
 
-    매칭은 **DB 전용**(Meta API 0회): 인바운드 웹훅의 sender.id(IGSID)가 실패 로그의
-    recipient_user_id(댓글 작성자 IGSID)와 같음이 실측 확인됨. 사용자가 먼저 DM 을 보냈으므로
-    24h 메시징 창이 열려 재전송(user_id 경로)이 정상 도착한다.
+    일반 캠페인 매칭이 놓치는 두 재댓글 형태를 구제한다(적대적 리뷰 발견):
+      1. **스레드 답글** — 안내가 사용자 댓글의 답글로 달리므로 사용자의 가장 자연스러운
+         응답은 그 스레드 답글인데, 일반 경로는 parent_id 댓글을 무조건 스킵한다.
+      2. **키워드 불일치 재댓글** — "수락했어요" 처럼 캠페인 키워드가 없는 재댓글.
+    사용자는 캠페인 트리거가 아니라 우리 안내에 응답한 것이므로 키워드 필터를 적용하지
+    않는다. RECOVERY_PENDING 이 있는 사용자에게만 동작(오남용 불가 — 이미 정당하게
+    트리거됐던 사용자다). 매칭은 _recipient_match_q(IGSID/username 키 이원화 대응).
 
-    설계 결정:
-      - 재전송 내용 = 실패했던 opening 을 그대로(팔로우게이트면 버튼 포함) → 팔로우 검증 유지.
-      - 한 사람이 여러 건 대기면 **가장 최근 1건만** 재전송(Action Block 방지).
-      - 멱등: opening 당 1회(sha256 'recovery:'+opening key) → 웹훅 재전송·연타 DM 이 중복 재전송 안 됨.
-      - 모든 발송은 send_dm_task 단일 초크포인트(페이서/거버너/쿨다운) 통과.
+    발송은 기존 _enqueue_send_dm 초크포인트를 그대로 통과(자기가드/쿨다운/멱등) —
+    일반 매칭과 같은 캠페인이 겹치면 idempotency_key(comment_id 단위)가 중복을 흡수한다.
+    반환값 = enqueue 된 캠페인 수.
     """
-    page_ig_user_id = str(payload.get("page_ig_user_id") or "")
-    sender_user_id = str(payload.get("sender_user_id") or "")
-    message_text = payload.get("message_text", "") or ""
-    if not sender_user_id or not page_ig_user_id:
-        return {"status": "skipped", "reason": "missing_ids"}
-    # self-message 방어 (발신자가 페이지 자신)
-    if sender_user_id == page_ig_user_id:
-        return {"status": "skipped", "reason": "self_message"}
+    page = str(page_ig_user_id or "")
+    if not page or not comment_id:
+        return 0
+    # self 방어 (poller 는 from.id 가 없을 수 있어 username 도 호출부 가드에 의존하지만,
+    # IGSID 가 오는 웹훅 경로는 여기서도 확실히 끊는다)
+    if from_user_id and str(from_user_id) == page:
+        return 0
+    match_q = _recipient_match_q(user_id=from_user_id, username=from_username)
+    if match_q is None:
+        return 0
 
-    # DB 매칭: 이 계정에서 이 sender 의 RECOVERY_PENDING opening 중 가장 최근 1건.
-    opening = (
+    pendings = (
         SentDMLog.objects.select_related("campaign__ig_connection")
         .filter(
-            recipient_user_id=sender_user_id,
+            match_q,
             status=SentDMLog.Status.RECOVERY_PENDING,
             parent_log__isnull=True,
-            campaign__ig_connection__external_account_id=page_ig_user_id,
+            campaign__ig_connection__external_account_id=page,
         )
         .order_by("-recovery_pending_at")
-        .first()
     )
-    if opening is None:
-        return {"status": "no_match"}
 
-    campaign = opening.campaign
-
-    # TTL 만료 방어(스윕이 아직 안 돌았을 수 있음): 지났으면 재전송 안 하고 만료 처리.
-    ttl = campaign.recovery_ttl_seconds or 604800
-    if (
-        opening.recovery_pending_at
-        and (timezone.now() - opening.recovery_pending_at).total_seconds() >= ttl
-    ):
-        opening.status = SentDMLog.Status.RECOVERY_EXPIRED
-        opening.save(update_fields=["status"])
-        opening.append_verification_log({"path": "recovery", "result": "expired_on_inbound"})
-        if opening.parent_log_id is None:
-            campaign.increment_failed()
-        return {"status": "expired"}
-
-    # 프로 전용 게이트 재확인 (다운그레이드 방어). RECOVERY_PENDING 진입 시점엔 프로였어도
-    # TTL(기본 7일) 내에 소유자가 강등됐을 수 있다. 미보유면 재전송하지 않고 대기 유지 →
-    # TTL 스윕(handle_recovery_pending_expiry)이 만료로 정산한다(무손실, 무추가과금).
     from apps.billing.subscription_utils import owner_has_feature
 
-    if not owner_has_feature(campaign.ig_connection.workspace, "dm_recovery"):
-        opening.append_verification_log({"path": "recovery", "result": "plan_gated_on_inbound"})
-        return {"status": "plan_gated"}
-
-    # 키워드 필터(선택): 비어있으면 아무 DM 이나 트리거.
-    if not campaign.matches_recovery_keyword(message_text):
-        return {"status": "keyword_no_match"}
-
-    # 빠른 가드: 연결이 살아있어야 재전송(발송 페이싱/거버너/쿨다운은 send_dm_task 가 담당).
-    ig_conn = campaign.ig_connection
-    if ig_conn.status != IGAccountConnection.Status.ACTIVE:
-        return {"status": "skipped", "reason": "ig_not_active"}
-
-    # 멱등 키 — opening 당 1회. reward 키와 같은 sha256(64자) 패턴.
-    import hashlib
-
-    idem = hashlib.sha256(f"recovery:{opening.idempotency_key}".encode()).hexdigest()
-
-    # 재전송 자식: opening 을 '열린 채널(user_id)'로 다시. dm_kind/gate 는 원본을 계승 →
-    #   OPENING(gate PENDING)이면 send_dm_task 가 팔로우 버튼을 재첨부(1188), 클릭 시 정상 gate 진행.
-    #   STANDALONE 이면 링크 버튼. comment_id="" 라 user_id 24h 창으로 라우팅.
-    is_opening = opening.dm_kind == SentDMLog.DMKind.OPENING
-    child, created = SentDMLog.create_idempotent(
-        idempotency_key=idem,
-        campaign=campaign,
-        comment_id="",
-        comment_text="",
-        recipient_user_id=opening.recipient_user_id,
-        recipient_username=opening.recipient_username,
-        message_sent=opening.message_sent,
-        status=SentDMLog.Status.QUEUED,
-        webhook_payload=opening.webhook_payload,
-        dm_kind=opening.dm_kind,
-        gate_status=(SentDMLog.GateStatus.PENDING if is_opening else SentDMLog.GateStatus.NONE),
-        parent_log=opening,
-    )
-    if not created:
-        return {"status": "duplicate", "child_log_id": str(child.id) if child else None}
-
-    opening.append_verification_log(
-        {"path": "recovery", "result": "resend_enqueued", "child_log_id": str(child.id)}
-    )
-    send_dm_task.delay(str(child.id))
-    return {
-        "status": "resend_enqueued",
-        "opening_log_id": str(opening.id),
-        "child_log_id": str(child.id),
-    }
+    now = timezone.now()
+    routed = 0
+    seen_campaigns: set = set()
+    for pending in pendings[:10]:  # 방어적 상한 (정상적으론 수신자당 소수)
+        campaign = pending.campaign
+        if campaign.id in seen_campaigns:
+            continue
+        seen_campaigns.add(campaign.id)
+        # TTL 지난 건 재발송하지 않음 — 만료 정산은 스윕이 담당(중복 정산 방지).
+        ttl = campaign.recovery_ttl_seconds or 604800
+        if (
+            pending.recovery_pending_at
+            and (now - pending.recovery_pending_at).total_seconds() >= ttl
+        ):
+            continue
+        if campaign.status != AutoDMCampaign.Status.ACTIVE or not campaign.recovery_reply_enabled:
+            continue
+        # 프로 전용 게이트 재확인 (진입 후 다운그레이드 방어, fail-closed)
+        try:
+            if not owner_has_feature(campaign.ig_connection.workspace, "dm_recovery"):
+                continue
+        except Exception:  # noqa: BLE001 - 판단 불가 시 미보유 취급
+            continue
+        res = _enqueue_send_dm(
+            campaign=campaign,
+            comment_id=comment_id,
+            comment_text=comment_text,
+            from_user_id=from_user_id or from_username,
+            from_username=from_username,
+            webhook_payload={
+                "source": source,
+                "recovery_recomment": True,
+                "pending_log_id": str(pending.id),
+                "comment_id": comment_id,
+            },
+        )
+        if res.get("status") == "enqueued":
+            pending.append_verification_log(
+                {
+                    "path": "recovery",
+                    "result": "recomment_routed",
+                    "new_log_id": res.get("log_id"),
+                    "source": source,
+                }
+            )
+            routed += 1
+    return routed
 
 
 @shared_task(name="integrations.handle_recovery_pending_expiry")

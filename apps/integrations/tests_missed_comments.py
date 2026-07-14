@@ -139,10 +139,18 @@ class TestPollMissedComments:
         assert SentDMLog.objects.filter(campaign=campaign, comment_id="cmt_dup").count() == 1
 
     def test_anchor_stops_pagination(self, ig_connection):
-        """이미 본 댓글(SeenComment) 만나면 즉시 종료 — 발송 0, API 1회 호출."""
+        """이미 본 댓글(SeenComment) 만나면 즉시 종료 — 발송 0, API 1회 호출.
+
+        NOTE(test-db-not-clean): poll 대상은 DB 전역의 활성 specific_media 캠페인이라
+        dev DB 실캠페인이 섞이면 호출 수 단언이 흔들린다 → 테스트 트랜잭션 안에서
+        내 캠페인 외 전부를 일시 pause 해 대상을 고정한다(롤백되므로 실데이터 무영향).
+        """
         from apps.integrations.tasks import poll_missed_comments
 
         campaign = _campaign(ig_connection)
+        AutoDMCampaign.objects.filter(status=AutoDMCampaign.Status.ACTIVE).exclude(
+            pk=campaign.pk
+        ).update(status=AutoDMCampaign.Status.PAUSED)
         SeenComment.objects.create(
             ig_connection=ig_connection,
             comment_id="cmt_seen",
