@@ -495,13 +495,17 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
         logger.debug(f"Processing comment webhook: {webhook_payload}")
 
         field = webhook_payload.get("field")
-        value = webhook_payload.get("value", {})
+        value = (
+            webhook_payload.get("value") or {}
+        )  # "value": null 방어 (get 기본값은 명시 null 미보정)
 
         if field != "comments":
             return {"status": "skipped", "reason": f"Unsupported field: {field}"}
 
         comment_id = value.get("id")
-        comment_text = value.get("text", "")
+        # "text": null 방어 — TextField(null=False) 라 None 이 create_idempotent 까지 가면
+        # NOT NULL IntegrityError 로 정상 매칭 댓글의 DM 이 유실된다(미디어/스티커 전용 댓글 등).
+        comment_text = str(value.get("text") or "")
         parent_id = value.get("parent_id")  # 대댓글이면 부모 comment_id, top-level이면 빈 값
         from_user = value.get("from") or {}  # 키가 null 로 오는 payload 방어
         from_user_id = str(from_user.get("id") or "")
@@ -1239,10 +1243,15 @@ def _enqueue_send_dm(
     # 게시된 안내는 수신자당 1회뿐이라 면제도 실질 1건으로 캡된다.
     cooldown_s = getattr(settings, "DM_RECIPIENT_COOLDOWN_SECONDS", 300)
     cooldown_cutoff = timezone.now() - timedelta(seconds=cooldown_s)
-    recent_to_same_recipient = (
+    # 매칭은 _recipient_match_q — recipient 키 이원화(웹훅 IGSID / 폴링·from 결측 username 폴백)를
+    # 넘어야 한다. recipient_user_id 정확일치만 보면 같은 사람의 로그가 IGSID/username 두 키공간에
+    # 갈려(예: c1 은 웹훅 IGSID 발송, c2 는 폴링 username 발송) 서로의 최근 발송을 못 봐 쿨다운이
+    # 우회된다(_flip_recovery_on_success / _maybe_route_recovery_recomment 와 동일 헬퍼로 통일).
+    _cooldown_match_q = _recipient_match_q(user_id=from_user_id, username=from_username)
+    recent_to_same_recipient = _cooldown_match_q is not None and (
         SentDMLog.objects.filter(
+            _cooldown_match_q,
             campaign=campaign,
-            recipient_user_id=from_user_id,
             created_at__gte=cooldown_cutoff,
         )
         .exclude(Q(status=SentDMLog.Status.RECOVERY_PENDING) & ~Q(recovery_reply_id=""))
@@ -3047,6 +3056,10 @@ def poll_recovery_recomments():
     # 후보: 안내가 실제 게시된(recovery_reply_id 有) 살아있는 pending 만.
     # 캠페인/연동 게이트는 여기서 1차로 좁히고, TTL·프로 게이트는 라우팅과 동일하게
     # 개별 재판정한다. 후보 상한(cap)이 곧 스레드(=API 호출) 상한의 상계.
+    # ⚠️ 정렬이 oldest-first 결정적이라, 동시에 살아있는 pending 이 cap 을 넘으면 최신
+    #    pending 은 오래된 것들이 성공/TTL 만료로 빠질 때까지 폴링에서 밀릴 수 있다
+    #    (웹훅 정상 시 무해 — 이 태스크가 필요한 웹훅 유실 대량 상황에서만 발현, minor).
+    #    cap 도달 시 아래에서 경고해 운영자가 RECOVERY_RECOMMENT_POLL_MAX_THREADS 를 올릴 수 있게 한다.
     candidates = list(
         SentDMLog.objects.select_related("campaign__ig_connection")
         .filter(
@@ -3062,6 +3075,13 @@ def poll_recovery_recomments():
         .exclude(comment_id="")
         .order_by("recovery_pending_at")[:cap]
     )
+    if len(candidates) >= cap:
+        logger.warning(
+            "poll_recovery_recomments: 후보가 cap(%s)에 도달 — 최신 RECOVERY_PENDING 이 "
+            "이번 런에서 폴링되지 않을 수 있음(웹훅 유실 대량 상황). 만료 스윕 백로그 확인 + "
+            "RECOVERY_RECOMMENT_POLL_MAX_THREADS 상향 검토.",
+            cap,
+        )
 
     # (connection, 루트 comment_id) 스레드 단위로 그룹핑 — 같은 루트를 공유하는
     # 복수 캠페인 pending 이 있어도 replies fetch 는 스레드당 1회.

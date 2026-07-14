@@ -973,6 +973,29 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
                 return attrs[field]
             return getattr(self.instance, field, default)
 
+        # trigger_type 정합성: media_id 는 이 serializer 로 편집할 수 없다(fields 에 없음).
+        # 따라서 SPECIFIC_MEDIA/STORY_REPLY 로의 **변경**은 유효한 media_id/story_id 재지정이
+        # 불가능해 matches_media()가 영구 False 인 무효 상태를 만든다(예: ANY→SPECIFIC 이면
+        # media_id="" 로 bool("")=False, →STORY_REPLY 는 댓글 웹훅에서 항상 False). 이 상태의
+        # 캠페인에 남은 RECOVERY_PENDING 은 재댓글이 와도 스코핑 게이트에서 영구 탈락한다.
+        # ANY_MEDIA 로의 변경만 허용하고(update() 에서 stray media_id 클리어), 나머지 전환은
+        # 새 캠페인 생성으로 유도한다. trigger 를 안 바꾸는 수정(이름/문구/상태)은 영향 없음.
+        if self.instance is not None:
+            new_trigger = attrs.get("trigger_type")
+            if new_trigger is not None and new_trigger != self.instance.trigger_type:
+                if new_trigger in (
+                    AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
+                    AutoDMCampaign.TriggerType.STORY_REPLY,
+                ):
+                    raise serializers.ValidationError(
+                        {
+                            "trigger_type": (
+                                "specific_media/story_reply 로의 변경은 지원하지 않습니다 "
+                                "(대상 게시물/스토리를 바꾸려면 새 캠페인을 만들어 주세요)."
+                            )
+                        }
+                    )
+
         length_errors = _dm_body_length_errors(
             follow_gate_enabled=bool(_resolve("follow_gate_enabled", False)),
             follow_gate_prompt=_resolve("follow_gate_prompt", "") or "",
@@ -988,6 +1011,16 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
         if length_errors:
             raise serializers.ValidationError(length_errors)
         return attrs
+
+    def update(self, instance, validated_data):
+        # ANY_MEDIA 로 전환 시 남아있는 media_id(직전 SPECIFIC/STORY 잔재)를 클리어한다.
+        # stray media_id 를 든 ANY_MEDIA 캠페인은 복구 재댓글 스레드의 media 추정
+        # (poll_recovery_recomments)을 오염시켜 형제 SPECIFIC 캠페인의 정당한 재댓글을
+        # 오필터할 수 있다(적대 리뷰 발견). media_id 는 fields 에 없어 super().update() 가
+        # 건드리지 않으므로 여기서 명시 클리어 후 저장한다.
+        if validated_data.get("trigger_type") == AutoDMCampaign.TriggerType.ANY_MEDIA:
+            instance.media_id = ""
+        return super().update(instance, validated_data)
 
 
 class AutoDMCampaignScheduleSerializer(serializers.Serializer):

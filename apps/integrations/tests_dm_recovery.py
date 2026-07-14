@@ -1226,3 +1226,146 @@ class TestV1TemplateCleanup:
         )
         # DM 언급 없는 커스텀 문구 보존
         assert not mig._is_v1_style("이벤트 참여 감사합니다!")
+
+
+# ===== 적대 리뷰 확정 결함 회귀 가드 (2026-07-14) =====
+
+
+class TestCooldownRecipientKeyDual:
+    """쿨다운 조회가 recipient 키 이원화(IGSID/username)를 넘어야 함 (_recipient_match_q)."""
+
+    def test_igsid_log_cools_down_username_keyed_recomment(self, ig_connection, no_real_send):
+        """웹훅(IGSID 키) 최근 발송이 폴링(username 키) 재enqueue 를 쿨다운으로 막는다.
+        정확일치만 보던 이전 동작에선 키공간이 갈려 쿨다운이 우회됐다."""
+        c = _campaign(ig_connection)
+        # 방금 웹훅 경로로 발송된 로그 — IGSID 키
+        _opening(
+            c,
+            recipient_user_id=IGSID,
+            recipient_username="buyer",
+            status=SentDMLog.Status.ACCEPTED,
+        )
+        # 같은 사람이 폴링 폴백(username 키)으로 다시 들어옴 (다른 comment_id)
+        res = tasks_mod._enqueue_send_dm(
+            campaign=c,
+            comment_id=f"cmt_dual_{uuid.uuid4().hex[:8]}",
+            comment_text="다시 댓글",
+            from_user_id="buyer",  # ← username 폴백 형태
+            from_username="buyer",
+            webhook_payload={},
+        )
+        assert res["status"] == "skipped"
+        assert res["reason"].startswith("recipient_cooldown")
+
+    def test_username_log_cools_down_igsid_keyed_recomment(self, ig_connection, no_real_send):
+        """반대 방향: 폴링(username 키) 최근 발송이 웹훅(IGSID+username) 재enqueue 를 막는다."""
+        c = _campaign(ig_connection)
+        _opening(
+            c,
+            recipient_user_id="buyer",  # ← 폴링 폴백(username) 키
+            recipient_username="buyer",
+            status=SentDMLog.Status.ACCEPTED,
+        )
+        res = tasks_mod._enqueue_send_dm(
+            campaign=c,
+            comment_id=f"cmt_dual2_{uuid.uuid4().hex[:8]}",
+            comment_text="다시 댓글",
+            from_user_id=IGSID,  # 웹훅 IGSID
+            from_username="buyer",
+            webhook_payload={},
+        )
+        assert res["status"] == "skipped"
+        assert res["reason"].startswith("recipient_cooldown")
+
+
+class TestNullPayloadDefense:
+    """text:null / value:null / from·media:null 방어 — 크래시·NOT NULL 유실 없음."""
+
+    def _payload(self, conn, value):
+        return {
+            "field": "comments",
+            "entry_id": str(conn.external_account_id),
+            "value": value,
+        }
+
+    def test_text_null_does_not_crash_and_enqueues(self, ig_connection, no_real_send):
+        """text:null 인 정상 매칭 댓글이 NOT NULL IntegrityError 없이 발송 큐에 오른다."""
+        c = _campaign(ig_connection)  # ANY_MEDIA, 키워드 필터 없음 → 전부 매칭
+        payload = self._payload(
+            ig_connection,
+            {
+                "id": f"cmt_nulltext_{uuid.uuid4().hex[:8]}",
+                "text": None,
+                "from": {"id": IGSID, "username": "buyer"},
+                "media": {"id": "media_nt"},
+            },
+        )
+        res = tasks_mod.process_comment_and_send_dm.apply(args=[payload]).result
+        assert res["status"] == "queued"
+        log = SentDMLog.objects.filter(campaign=c).get()
+        assert log.comment_text == ""
+
+    def test_value_null_no_crash(self, ig_connection, no_real_send):
+        """value:null payload 는 조용히 error 반환(AttributeError 크래시 아님)."""
+        payload = {"field": "comments", "entry_id": str(ig_connection.external_account_id)}
+        payload["value"] = None
+        res = tasks_mod.process_comment_and_send_dm.apply(args=[payload]).result
+        assert res["status"] == "error"
+
+    def test_from_and_media_null_reach_gate(self, ig_connection, no_real_send):
+        """from:null / media:null 키가 있어도 게이트까지 안전하게 도달(신원키 없어 error)."""
+        payload = self._payload(
+            ig_connection,
+            {"id": "cmt_nullfrom", "text": "hi", "from": None, "media": None},
+        )
+        res = tasks_mod.process_comment_and_send_dm.apply(args=[payload]).result
+        assert res["status"] == "error"  # 신원키 둘 다 없음
+
+
+class TestUpdateTriggerTypeIntegrity:
+    """trigger_type 편집 정합성 — 무효 상태(matches_media 영구 False) 방지 + ANY 전환 media 클리어."""
+
+    def _serializer(self, instance, data):
+        from apps.integrations.serializers import AutoDMCampaignUpdateSerializer
+
+        return AutoDMCampaignUpdateSerializer(instance, data=data, partial=True)
+
+    def test_any_to_specific_rejected(self, ig_connection):
+        """ANY_MEDIA→SPECIFIC_MEDIA 변경은 media_id 재지정 불가라 거부(무효 상태 방지)."""
+        c = _campaign(ig_connection, trigger_type=AutoDMCampaign.TriggerType.ANY_MEDIA)
+        s = self._serializer(c, {"trigger_type": "specific_media"})
+        assert s.is_valid() is False
+        assert "trigger_type" in s.errors
+
+    def test_specific_to_story_rejected(self, ig_connection):
+        c = _campaign(
+            ig_connection,
+            trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
+            media_id="media_edit_1",
+        )
+        s = self._serializer(c, {"trigger_type": "story_reply"})
+        assert s.is_valid() is False
+
+    def test_specific_to_any_clears_media_id(self, ig_connection):
+        """SPECIFIC→ANY 전환은 허용하되 stray media_id 를 클리어(복구 스코핑 오필터 방지)."""
+        c = _campaign(
+            ig_connection,
+            trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
+            media_id="media_edit_2",
+        )
+        s = self._serializer(c, {"trigger_type": "any_media"})
+        assert s.is_valid(), s.errors
+        s.save()
+        c.refresh_from_db()
+        assert c.trigger_type == AutoDMCampaign.TriggerType.ANY_MEDIA
+        assert c.media_id == ""
+
+    def test_non_trigger_edit_unaffected(self, ig_connection):
+        """트리거를 안 바꾸는 수정(이름 등)은 영향 없음."""
+        c = _campaign(
+            ig_connection,
+            trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
+            media_id="media_edit_3",
+        )
+        s = self._serializer(c, {"name": "새 이름"})
+        assert s.is_valid(), s.errors
