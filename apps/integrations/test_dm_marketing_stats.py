@@ -188,6 +188,68 @@ class TestNonGatedCampaignStats:
 
 
 @pytest.mark.django_db
+class TestPeopleProcessingStats:
+    """v4.4 — 사람 단위 처리 현황 (unique_targets/waiting/failed/unconfirmed/reach_rate).
+
+    루트 DM(오프닝/단독) 기준 — 리워드·child 제외, queue-state.people 과 동일 정의.
+    """
+
+    def _setup(self):
+        user = _user()
+        camp = _campaign(
+            _conn(_ws(user)),
+            follow_gate_enabled=True,
+            gate_verify_follow=True,
+            reward_message_template="reward!",
+        )
+        # A: 오프닝 delivered + 리워드 read → sent 1명 (리워드는 모수 제외)
+        a_open = _log(camp, "A", kind=SentDMLog.DMKind.OPENING, gate=SentDMLog.GateStatus.PASSED)
+        _log(
+            camp,
+            "A",
+            status=SentDMLog.Status.READ,
+            kind=SentDMLog.DMKind.REWARD,
+            gate=SentDMLog.GateStatus.PASSED,
+            parent=a_open,
+        )
+        # B: 오프닝 하드실패 → unique_failed (아무것도 못 받은 사람)
+        _log(camp, "B", status=SentDMLog.Status.FAILED_PARAM, kind=SentDMLog.DMKind.OPENING)
+        # C: 오프닝 큐 대기 → unique_waiting
+        _log(camp, "C", status=SentDMLog.Status.QUEUED, kind=SentDMLog.DMKind.OPENING)
+        # D: 오프닝 도착 미확인(no_trace) → 발송(쿼터 소진)됐으나 unconfirmed
+        _log(camp, "D", status=SentDMLog.Status.FAILED_NO_TRACE, kind=SentDMLog.DMKind.OPENING)
+        client = APIClient()
+        client.force_authenticate(user=user)
+        return client, camp
+
+    def test_people_processing_fields(self):
+        client, camp = self._setup()
+        resp = client.get(f"/api/v1/integrations/dm-verification/stats/?campaign_id={camp.id}")
+        assert resp.status_code == 200
+        d = resp.data
+        assert d["unique_targets"] == 4  # A,B,C,D (A의 리워드는 사람 수에 안 잡힘)
+        assert d["unique_sent"] == 2  # A + D(no_trace 는 발송됨/쿼터 소진)
+        assert d["unique_waiting"] == 1  # C
+        assert d["unique_failed"] == 1  # B — 하드실패는 delivery_rate 엔 안 잡혀도 여기 노출
+        assert d["unique_unconfirmed"] == 1  # D
+        # 항등: targets = sent + waiting + failed
+        assert d["unique_targets"] == d["unique_sent"] + d["unique_waiting"] + d["unique_failed"]
+        # 도달률 = unique_delivered / unique_targets = A(1) / 4
+        assert d["unique_delivered"] == 1
+        assert d["unique_reach_rate"] == 0.25
+
+    def test_unconfirmed_excludes_later_delivered(self):
+        """같은 사람이 no_trace 후 다른 DM 으로 확정 도착하면 unconfirmed 에서 빠진다."""
+        client, camp = self._setup()
+        # D 에게 재발송이 도착 확정된 상황
+        _log(camp, "D", status=SentDMLog.Status.DELIVERED, kind=SentDMLog.DMKind.OPENING)
+        resp = client.get(f"/api/v1/integrations/dm-verification/stats/?campaign_id={camp.id}")
+        assert resp.status_code == 200
+        assert resp.data["unique_unconfirmed"] == 0
+        assert resp.data["unique_delivered"] == 2  # A, D
+
+
+@pytest.mark.django_db
 class TestRecipientsGuards:
     def test_campaign_id_required(self):
         user = _user()

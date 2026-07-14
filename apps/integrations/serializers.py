@@ -1261,6 +1261,34 @@ class DMVerificationStatsSerializer(serializers.Serializer):
         help_text="unique_delivered / unique_sent (사람 단위 도착률, 0~1)"
     )
 
+    # ── v4.4 — 사람 단위 처리 현황 (루트 DM 기준 — queue-state.people 과 동일 정의) ──
+    unique_targets = serializers.IntegerField(
+        help_text=(
+            "전체 대상 사람 수 — 루트 DM(오프닝/단독, 리워드·재안내 제외) 기준 고유 수신자. "
+            "실패 포함 모수이며 항등 '루트 발송 + unique_waiting + unique_failed' 이 항상 성립. "
+            "unique_sent 는 리워드/재안내 수신자도 포함(전체 로그 기준)이라, 부모 오프닝이 집계 "
+            "구간(기본 30일) 밖인 드문 경우 unique_targets 와 미세하게 다를 수 있음"
+        )
+    )
+    unique_waiting = serializers.IntegerField(
+        help_text="아직 발송 대기/발송 중인 사람 수 (루트 DM 기준)"
+    )
+    unique_failed = serializers.IntegerField(
+        help_text=(
+            "아무것도 받지 못한 사람 수 — 하드실패(failed_*)·복구 대기/만료(recovery_*)·"
+            "한도 스킵(skipped) 포함. '확인 필요' 카드 = unique_failed + unique_unconfirmed"
+        )
+    )
+    unique_unconfirmed = serializers.IntegerField(
+        help_text=(
+            "발송은 됐으나 도착 미확인(failed_no_trace)만 있는 사람 수. "
+            "unique_failed 와 서로소(합산 시 중복 없음)"
+        )
+    )
+    unique_reach_rate = serializers.FloatField(
+        help_text="unique_delivered / unique_targets — 전체 대상 대비 실제 도달률 ([0,1] 클램프)"
+    )
+
     # ── v4.2 — CTR(참여율) ────────────────────────────────────────────────
     ctr = serializers.FloatField(
         help_text=(
@@ -1317,6 +1345,28 @@ class DMQueueGaugeSerializer(serializers.Serializer):
     total = serializers.IntegerField(help_text="sent + waiting + in_flight (정상 큐는 100% 도달)")
 
 
+class DMQueuePeopleGaugeSerializer(serializers.Serializer):
+    """큐-상태 사람(수신자) 단위 게이지 (v4.4 — 유저 콘솔 "N명" 표기용).
+
+    루트 DM(오프닝/단독 — 리워드·재안내 제외) 기준 고유 수신자 수.
+    follow-gate 캠페인에서 이벤트 단위 gauge 는 1명=2건 이상으로 부풀므로,
+    "전체 대상 N명 / 처리 완료" UI 는 이 블록을 쓴다. 진행바 = processed / total.
+    """
+
+    total = serializers.IntegerField(
+        help_text="전체 대상 사람 수 (실패 포함 — sent+waiting+failed)"
+    )
+    sent = serializers.IntegerField(help_text="DM 이 실제 발송된 사람 (Meta 접수 이상)")
+    waiting = serializers.IntegerField(help_text="발송 차례 대기/발송 중인 사람")
+    failed = serializers.IntegerField(
+        help_text=(
+            "아무것도 받지 못하고 종결·정체된 사람 "
+            "(하드실패·복구 대기/만료·한도 스킵 — '확인 필요' 성격)"
+        )
+    )
+    processed = serializers.IntegerField(help_text="처리 완료 = sent + failed (진행바 분자)")
+
+
 class DMQueuePacingSerializer(serializers.Serializer):
     """현재 발송 페이싱 정보 (v4.3 — 계정 단위 지터 슬롯)."""
 
@@ -1341,6 +1391,7 @@ class DMQueueStateSerializer(serializers.Serializer):
     ig_username = serializers.CharField(help_text="IG 계정 username")
 
     gauge = DMQueueGaugeSerializer()
+    people = DMQueuePeopleGaugeSerializer()
     pacing = DMQueuePacingSerializer()
 
     account_waiting = serializers.IntegerField(

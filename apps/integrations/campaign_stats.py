@@ -83,6 +83,69 @@ IN_FLIGHT_STATUSES = [
     SentDMLog.Status.PENDING,  # legacy
     SentDMLog.Status.RECOVERY_PENDING,  # 복구 대기 (미종결 — 사용자 DM/TTL 이 전이)
 ]
+# 발송 큐에서 차례를 기다리는 상태 (사람 단위 게이지의 "대기" 판정용).
+# IN_FLIGHT 와 달리 RECOVERY_PENDING 제외 — 복구 대기는 큐 진행이 아니라 사용자의
+# 재댓글을 기다리는 상태라, 대기로 세면 게이지가 영원히 100% 에 못 닿는다.
+QUEUE_WAITING_STATUSES = [
+    SentDMLog.Status.QUEUED,
+    SentDMLog.Status.SUBMITTING,
+    SentDMLog.Status.RATE_LIMITED,
+    SentDMLog.Status.PENDING,  # legacy
+]
+
+# 루트 DM(오프닝/단독) 판별 — 사람 단위 집계의 모수.
+# reward(게이트 통과 보상)·child(재안내 등 parent 가 있는 후속 DM)는 같은 사람에게 가는
+# 부가 발송이라 제외한다. "한 사람 = 루트 DM 1개" 가 유저 콘솔 합의 단위.
+# ⚠️ parent_log 는 on_delete=SET_NULL 이라, 부모 오프닝이 삭제되면 재안내 child(dm_kind=OPENING)
+#    가 parent NULL 이 되어 루트로 오인될 수 있다. 현재 로그 아카이브(retention=0)는 비활성이라
+#    무해하지만, archive_old_sentdmlogs 활성화 전 이 가정(부모 생존)을 함께 점검할 것.
+ROOT_DM_Q = Q(parent_log__isnull=True) & ~Q(dm_kind=SentDMLog.DMKind.REWARD)
+
+
+def people_rollup(log_qs) -> dict:
+    """사람(수신자) 단위 처리 현황 롤업 — 루트 DM(오프닝/단독) 기준.
+
+    한 사람이 루트 DM 을 여러 건 받아도(댓글 2회 등) 1명으로 센다.
+    버킷 우선순위: sent > waiting > failed(잔여).
+      - sent    : 루트 DM 이 1건이라도 실제 발송됨 (SENT_FOR_QUOTA — Meta 접수 이상)
+      - waiting : 발송된 건 없고, 큐에서 차례 대기/발송 중인 루트 DM 이 있음
+      - failed  : 나머지 = 아무것도 못 받고 종결·정체된 사람
+                  (하드실패 failed_* / 복구 대기·만료 recovery_* / 한도 skipped 포함)
+    total = sent + waiting + failed 항등이 항상 성립한다.
+
+    성능: 폴링 엔드포인트(queue-state 5~10초)에서 호출되므로 단일 aggregate 로 계산한다.
+    SENT_FOR_QUOTA 와 QUEUE_WAITING 은 서로소 상태집합이므로 포함-배제로
+    waiting = |sent∪waiting 사람| − |sent 사람| (= sent 없이 waiting 만 있는 사람) 이 성립한다.
+
+    ⚠️ 근사: recipient_user_id 값 공간이 경로마다 다르다(웹훅=IGSID, 폴링=username 폴백,
+    _recipient_match_q 참조). 한 사람이 두 키로 로그를 가지면(폴 보정 pending + 웹훅 재댓글
+    성공 등) 2명으로 셀 수 있다 — 재발송이 정상화되는 recovery 크로스키 케이스에 한정된
+    드문 오차이며 발송에는 영향 없다. 정확 매칭이 필요한 recovery flip 은 _recipient_match_q 사용.
+    """
+    root = log_qs.filter(ROOT_DM_Q)
+    agg = root.aggregate(
+        total=Count("recipient_user_id", distinct=True),
+        sent=Count(
+            "recipient_user_id",
+            filter=Q(status__in=SENT_FOR_QUOTA_STATUSES),
+            distinct=True,
+        ),
+        sent_or_waiting=Count(
+            "recipient_user_id",
+            filter=Q(status__in=SENT_FOR_QUOTA_STATUSES + QUEUE_WAITING_STATUSES),
+            distinct=True,
+        ),
+    )
+    total = agg["total"] or 0
+    sent = agg["sent"] or 0
+    waiting = max((agg["sent_or_waiting"] or 0) - sent, 0)
+    return {
+        "total": total,
+        "sent": sent,
+        "waiting": waiting,
+        "failed": max(total - sent - waiting, 0),
+    }
+
 
 # annotate 결과를 담는 임시 속성명 (모델 필드와 충돌 안 나게 언더스코어 프리픽스)
 _ANNO_CONFIRMED = "_confirmed_delivered"

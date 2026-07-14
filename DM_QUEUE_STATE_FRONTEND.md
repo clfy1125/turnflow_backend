@@ -1,6 +1,8 @@
-# DM 순차 발송 큐 현황 (게이지 + ETA) — 프론트엔드 연동 가이드 (v4.3)
+# DM 순차 발송 큐 현황 (게이지 + ETA) — 프론트엔드 연동 가이드 (v4.3 / v4.4)
 
 > 2026-07-09 백엔드 대규모 패치와 함께 배포. 문의: 백엔드팀.
+> **v4.4 (2026-07-14)**: 사람(수신자) 단위 `people` 블록 추가 — "전체 대상 N**명**" 표기는
+> 이제 `gauge`(이벤트 단위)가 아니라 `people` 을 쓰세요. §3.5 참고.
 
 ## 0. 발송 메커니즘이 바뀌었습니다 (배경)
 
@@ -42,6 +44,7 @@ GET /api/v1/integrations/dm-verification/queue-state/?ig_connection_id=<uuid>
   "external_account_id": "17841400000000000",
   "ig_username": "turnflow_official",
   "gauge": { "sent": 512, "waiting": 138, "in_flight": 2, "failed": 4, "total": 652 },
+  "people": { "total": 420, "sent": 330, "waiting": 86, "failed": 4, "processed": 334 },
   "pacing": {
     "private_reply_avg_gap_s": 5.0,
     "send_api_avg_gap_s": 2.0,
@@ -68,6 +71,33 @@ GET /api/v1/integrations/dm-verification/queue-state/?ig_connection_id=<uuid>
   - `eta_is_estimate=true` → **"약 12분"** 처럼 근사 표기.
   - `eta_is_estimate=false` → 확정 슬롯 기반이라 그대로 표기 가능.
   - `eta_seconds=0` → "대기 없음 / 모두 발송됨".
+
+## 3.5 사람 단위 게이지 `people` (v4.4) — "N명" 표기는 반드시 이걸로
+
+`gauge` 는 **발송 이벤트(로그) 단위**입니다. 팔로우게이트 캠페인은 1명에게 오프닝+리워드
+(+재안내) 여러 건이 나가므로, `gauge` 수치에 "명"을 붙이면 사람 수의 ~2배로 보입니다
+(실측: 대상 802명 캠페인이 "전체 대상 1,256명"으로 표기된 사례).
+
+`people` 은 **루트 DM(오프닝/단독 — 리워드·재안내 제외) 기준으로 수신자를 중복 제거한
+사람 수**입니다. 한 사람이 댓글을 2번 달아 오프닝이 2건 나가도 1명으로 셉니다.
+
+| 필드 | 의미 |
+|---|---|
+| `people.total` | 전체 대상 사람 수 (실패 포함, = sent+waiting+failed) |
+| `people.sent` | DM 이 실제 발송된 사람 (Meta 접수 이상) |
+| `people.waiting` | 발송 차례 대기/발송 중인 사람 |
+| `people.failed` | 아무것도 받지 못하고 종결·정체된 사람 (하드실패·복구 대기/만료·한도 스킵) |
+| `people.processed` | 처리 완료 = sent + failed (진행바 분자) |
+
+- **진행바**: `people.processed / people.total`, 헤드라인 "처리 완료 {processed}명".
+- **ETA·발송중 판정은 기존 `gauge`/`eta_*` 그대로** 사용하세요 (페이서 큐는 이벤트 단위로
+  돌기 때문에 남은 시간은 이벤트 수가 정확합니다). 드물게 진행바가 100%인데 ETA 가 잠깐
+  남을 수 있습니다(이미 받은 사람에게 가는 리워드/2번째 DM 잔여분) — 정상입니다.
+- `people.failed` 는 "확인 필요" 성격의 수치입니다. stats 의 `unique_failed` 와 **동일 정의**
+  (루트 DM 기준 사람 수)입니다. 단, **수치가 정확히 같으려면 집계 구간이 같아야** 합니다 —
+  queue-state 의 `people` 은 **전 기간**, stats 는 기본 **최근 30일**(`?since=` 로 조정)이라,
+  30일을 넘겨 운영한 캠페인은 두 화면이 어긋날 수 있습니다. 같은 화면에서 두 값을 나란히
+  비교한다면 stats 를 `?since=` 로 캠페인 시작일에 맞추세요.
 
 ## 4. blocking_reason 문구 매핑
 

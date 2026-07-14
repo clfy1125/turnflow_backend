@@ -68,7 +68,7 @@ def _log(campaign, *, status=SentDMLog.Status.QUEUED, retry_at=None, created_at=
         campaign=campaign,
         comment_id=kw.pop("comment_id", f"c-{uuid.uuid4().hex[:8]}"),
         comment_text="hi",
-        recipient_user_id=f"r-{uuid.uuid4().hex[:8]}",
+        recipient_user_id=kw.pop("recipient_user_id", f"r-{uuid.uuid4().hex[:8]}"),
         recipient_username="buyer",
         message_sent="msg",
         status=status,
@@ -177,6 +177,71 @@ class TestQueueStateGauge:
         assert d["gauge"]["waiting"] == 0
         assert d["eta_seconds"] == 0.0
         assert d["eta_finish_at"] is None
+
+    def test_people_gauge_person_rollup(self):
+        """people 블록(v4.4) — 루트 DM(오프닝/단독) 기준 사람 단위.
+
+        리워드/child 는 모수 제외, 같은 사람 로그 2건 = 1명(sent 우선),
+        failed = 하드실패·복구대기·스킵 잔여 버킷.
+        """
+        user = _user()
+        _, conn = _setup(user)
+        camp = _campaign(conn)
+        # A: 오프닝 delivered + 리워드 read → sent 1명 (리워드는 사람 수에 안 잡힘)
+        a_open = _log(
+            camp,
+            status=SentDMLog.Status.DELIVERED,
+            recipient_user_id="A",
+            dm_kind=SentDMLog.DMKind.OPENING,
+        )
+        _log(
+            camp,
+            status=SentDMLog.Status.READ,
+            recipient_user_id="A",
+            dm_kind=SentDMLog.DMKind.REWARD,
+            parent_log=a_open,
+        )
+        # B: 오프닝 2건(댓글 2회 — delivered + queued) → sent 1명 (sent 우선, waiting 중복 제외)
+        _log(
+            camp,
+            status=SentDMLog.Status.DELIVERED,
+            recipient_user_id="B",
+            dm_kind=SentDMLog.DMKind.OPENING,
+        )
+        _log(camp, recipient_user_id="B", dm_kind=SentDMLog.DMKind.OPENING)  # queued
+        # C: 대기만 → waiting
+        _log(camp, recipient_user_id="C", dm_kind=SentDMLog.DMKind.OPENING)
+        # D/E/F: 하드실패·복구대기·한도스킵 → failed (아무것도 못 받은 사람)
+        _log(
+            camp,
+            status=SentDMLog.Status.FAILED_PARAM,
+            recipient_user_id="D",
+            dm_kind=SentDMLog.DMKind.OPENING,
+        )
+        _log(
+            camp,
+            status=SentDMLog.Status.RECOVERY_PENDING,
+            recipient_user_id="E",
+            dm_kind=SentDMLog.DMKind.OPENING,
+        )
+        _log(
+            camp,
+            status=SentDMLog.Status.SKIPPED,
+            recipient_user_id="F",
+            dm_kind=SentDMLog.DMKind.OPENING,
+        )
+
+        resp = self._client(user).get(f"{URL}?campaign_id={camp.id}")
+        assert resp.status_code == 200
+        p = resp.data["people"]
+        assert p["total"] == 6
+        assert p["sent"] == 2  # A, B (B의 queued 2번째 오프닝은 sent 우선으로 대기 미집계)
+        assert p["waiting"] == 1  # C
+        assert p["failed"] == 3  # D(하드실패), E(복구대기), F(스킵)
+        assert p["processed"] == 5  # sent + failed
+        assert p["total"] == p["sent"] + p["waiting"] + p["failed"]
+        # 이벤트 게이지는 기존 정의 유지 (사람 게이지와 독립)
+        assert resp.data["gauge"]["waiting"] == 2  # B 2번째 오프닝 + C
 
     def test_account_scope(self):
         user = _user()

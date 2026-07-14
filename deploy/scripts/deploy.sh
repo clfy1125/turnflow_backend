@@ -28,11 +28,13 @@ APP_IMAGE="$IMAGE" $COMPOSE up -d db pgbouncer redis
 
 echo "==> 4/6 GATED migrations (one-shot, DIRECT to db:5432 — bypass PgBouncer txn pool)"
 # Session-mode connection for DDL: override DB_HOST/PORT to hit Postgres directly.
-APP_IMAGE="$IMAGE" $COMPOSE run --rm \
+# --no-deps 필수: 없으면 .env.production 변경 시 compose가 의존 서비스(db!)를 재생성해
+# 수 초간 DB 블립이 난다 (2026-07-14 실측).
+APP_IMAGE="$IMAGE" $COMPOSE run --rm --no-deps \
   -e RUN_MIGRATIONS=0 -e DB_HOST=db -e DB_PORT=5432 -e DB_CONN_MAX_AGE=0 \
   web_dashboard python manage.py migrate --noinput
 echo "==> 4b/6 collectstatic (once, shared volume)"
-APP_IMAGE="$IMAGE" $COMPOSE run --rm -e RUN_MIGRATIONS=0 web_dashboard python manage.py collectstatic --noinput
+APP_IMAGE="$IMAGE" $COMPOSE run --rm --no-deps -e RUN_MIGRATIONS=0 web_dashboard python manage.py collectstatic --noinput
 
 echo "==> 5/6 recreate web tiers one at a time (Caddy keeps routing to healthy ones)"
 for svc in web_external web_dashboard web_webhook; do
@@ -43,7 +45,7 @@ done
 
 echo "==> 6/6 recreate workers (celery_beat RETIRED — 외부 cron→/internal/scheduler/tick 으로 이관, DR §6)"
 # celery_beat 는 profiles:[fallback] 라 평상시 기동 안 함(이중 발사 방지). 긴급 폴백만 수동 기동.
-APP_IMAGE="$IMAGE" $COMPOSE up -d --no-deps celery_dm celery_followup celery_default celery_billing
+APP_IMAGE="$IMAGE" $COMPOSE up -d --no-deps celery_dm celery_followup celery_default celery_billing celery_ai
 
 echo "==> done. running images:"
 docker ps --format '  {{.Names}}\t{{.Image}}\t{{.Status}}' | grep turnflow || true

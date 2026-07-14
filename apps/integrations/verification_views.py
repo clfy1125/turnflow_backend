@@ -38,7 +38,12 @@ from rest_framework.exceptions import NotFound, PermissionDenied
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
-from .campaign_stats import NEEDS_ATTENTION_STATUSES, SENT_FOR_QUOTA_STATUSES
+from .campaign_stats import (
+    CONFIRMED_DELIVERED_STATUSES,
+    NEEDS_ATTENTION_STATUSES,
+    SENT_FOR_QUOTA_STATUSES,
+    people_rollup,
+)
 from .dm_exceptions import DMSendError, DMTransientError
 from .dm_frontend_actions import SELF_CHECK_CHECKLIST, build_frontend_action
 from .models import AutoDMCampaign, IGAccountConnection, SentDMLog
@@ -552,6 +557,20 @@ class DMVerificationViewSet(viewsets.ViewSet):
           - **주의**: `read` 는 messaging_seen 웹훅에 의존하는 best-effort 신호라
             비게이트형 CTR 은 실제보다 낮게 나올 수 있음(과소집계).
 
+        ### ③ 사람 단위 처리 현황 — v4.4 (queue-state.people 과 동일 정의)
+        루트 DM(오프닝/단독 — 리워드·재안내 제외) 기준, 수신자 중복 제거:
+        - `unique_targets`: 전체 대상 사람 수 (실패 포함 모수).
+        - `unique_waiting`: 아직 발송 대기/발송 중인 사람.
+        - `unique_failed`: **아무것도 받지 못한 사람** (하드실패·복구 대기/만료·한도 스킵).
+          "확인 필요" 카드는 이 값 + `unique_unconfirmed` 를 쓰세요 — `delivery_rate` 는
+          Meta 접수건 기준이라 하드실패가 빠져 100% 로 보일 수 있습니다.
+        - `unique_unconfirmed`: 발송은 됐으나 도착 미확인(no_trace)만 있는 사람
+          (`unique_failed` 와 서로소 — 합산 시 중복 없음).
+        - `unique_reach_rate`: unique_delivered / unique_targets ([0,1] 클램프).
+        - **집계 구간 주의**: 이 사람 단위 값들은 이 stats 의 시간 필터(기본 최근 30일,
+          `?since=` 로 조정)를 따릅니다. queue-state.`people` 은 **전 기간**이라 30일을 넘긴
+          캠페인은 두 화면 숫자가 어긋날 수 있습니다 — 나란히 비교 시 `?since=` 를 맞추세요.
+
         ## 인증
         Bearer JWT + 워크스페이스 멤버십.
         """,
@@ -581,6 +600,11 @@ class DMVerificationViewSet(viewsets.ViewSet):
                     "unique_read": 402,
                     "unique_followers": 388,
                     "unique_delivery_rate": 0.9839,
+                    "unique_targets": 700,
+                    "unique_waiting": 0,
+                    "unique_failed": 80,
+                    "unique_unconfirmed": 0,
+                    "unique_reach_rate": 0.8714,
                     "ctr": 0.6258,
                     "ctr_basis": "click",
                     "ctr_interacted": 388,
@@ -722,6 +746,29 @@ class DMVerificationViewSet(viewsets.ViewSet):
 
         unique_delivery_rate = unique_delivered / unique_sent if unique_sent else 0.0
 
+        # ── v4.4 — 사람 단위 처리 현황 (루트 DM 기준 rollup — queue-state.people 과 동일 정의)
+        # unique_failed: 아무것도 받지 못한 사람 (하드실패·복구 대기/만료·한도 스킵).
+        # "확인 필요" 카드가 이 값을 쓴다 — delivery_rate(Meta 접수건 기준)에는 하드실패가
+        # 분모에서 빠져 100% 로 보이므로, 실패 인원은 이 필드로만 노출된다.
+        people = people_rollup(qs)
+        # 도착 미확인(사람): no_trace 만 있고 확정 도착이 한 번도 없는 수신자.
+        # 발송은 됐으므로(쿼터 소진) people.failed 와는 서로소 — 합산해도 중복 없음.
+        unique_unconfirmed = (
+            qs.filter(status=SentDMLog.Status.FAILED_NO_TRACE)
+            .exclude(
+                recipient_user_id__in=qs.filter(status__in=CONFIRMED_DELIVERED_STATUSES).values(
+                    "recipient_user_id"
+                )
+            )
+            .values("recipient_user_id")
+            .distinct()
+            .count()
+        )
+        # unique_delivered(전체 qs)는 리워드/재안내 child 도 세는 반면 people.total 은 루트 DM
+        # 기준이라, 부모 오프닝이 시간창(기본 30일) 밖이고 child 만 안에 든 드문 경우 분자>분모가
+        # 될 수 있다 → [0,1] 로 클램프해 100% 초과 표기를 막는다.
+        unique_reach_rate = min(unique_delivered / people["total"], 1.0) if people["total"] else 0.0
+
         agg.update(
             {
                 "unique_recipients": unique_recipients,
@@ -730,6 +777,11 @@ class DMVerificationViewSet(viewsets.ViewSet):
                 "unique_read": unique_read,
                 "unique_followers": unique_followers,
                 "unique_delivery_rate": round(unique_delivery_rate, 4),
+                "unique_targets": people["total"],
+                "unique_waiting": people["waiting"],
+                "unique_failed": people["failed"],
+                "unique_unconfirmed": unique_unconfirmed,
+                "unique_reach_rate": round(unique_reach_rate, 4),
                 "ctr": round(ctr, 4),
                 "ctr_basis": ctr_basis,
                 "ctr_interacted": ctr_interacted,
@@ -1011,6 +1063,20 @@ class DMVerificationViewSet(viewsets.ViewSet):
         - 게이지: `gauge.sent / gauge.total` (= sent+waiting+in_flight). `failed` 는 분모
           제외 — 별도 세그먼트로 표기하세요.
 
+        ## people — 사람(수신자) 단위 게이지 (v4.4, 유저 콘솔 표기용)
+        `gauge` 는 발송 이벤트(로그) 단위라 follow-gate 캠페인에서 1명 = 오프닝+리워드
+        2건 이상으로 부풀려 보입니다. **"전체 대상 N명 / 처리 완료" 처럼 "명" 을 붙이는
+        UI 는 반드시 `people` 블록을 쓰세요.** 루트 DM(오프닝/단독, 리워드·재안내 제외)
+        기준으로 수신자를 중복 제거한 값입니다.
+        - `people.total`: 전체 대상 사람 수 (실패 포함, = sent+waiting+failed)
+        - `people.sent`: DM 이 실제 발송된 사람
+        - `people.waiting`: 아직 발송 차례를 기다리는 사람 (발송 중 포함)
+        - `people.failed`: 아무것도 받지 못하고 종결·정체된 사람
+          (하드실패·복구 대기/만료·한도 스킵 포함 — "확인 필요" 성격)
+        - `people.processed`: sent + failed (진행바 분자)
+        - 진행바: `people.processed / people.total`. ETA·발송중 여부는 기존 `gauge`/
+          `eta_*` 그대로 사용 (페이서 큐는 이벤트 단위로 돌기 때문).
+
         ## 폴링 가이드
         5~10초 폴링 권장. `generated_at` 기준으로 클라이언트에서 카운트다운 보간.
         """,
@@ -1043,6 +1109,13 @@ class DMVerificationViewSet(viewsets.ViewSet):
                         "in_flight": 2,
                         "failed": 4,
                         "total": 652,
+                    },
+                    "people": {
+                        "total": 420,
+                        "sent": 330,
+                        "waiting": 86,
+                        "failed": 4,
+                        "processed": 334,
                     },
                     "pacing": {
                         "private_reply_avg_gap_s": 5.0,
@@ -1129,6 +1202,11 @@ class DMVerificationViewSet(viewsets.ViewSet):
             "failed": agg["failed"],
             "total": agg["sent"] + agg["waiting"] + agg["in_flight"],
         }
+        # v4.4 — 사람(수신자) 단위 게이지. gauge 는 발송 이벤트 단위라 follow-gate
+        # 캠페인(1명 = 오프닝+리워드 2건 이상)에서 사람 수보다 크게 보인다.
+        # 유저 콘솔의 "전체 대상 N명 / 처리 완료" 표기는 이 블록을 쓴다.
+        people = people_rollup(scope_qs)
+        people["processed"] = people["sent"] + people["failed"]
 
         account_waiting_qs = account_qs.filter(status=SentDMLog.Status.QUEUED)
         account_waiting = account_waiting_qs.count()
@@ -1207,6 +1285,7 @@ class DMVerificationViewSet(viewsets.ViewSet):
             "external_account_id": ext,
             "ig_username": ig_conn.username or "",
             "gauge": gauge,
+            "people": people,
             "pacing": {
                 "private_reply_avg_gap_s": dm_pacer.avg_gap_seconds(dm_pacer.BUCKET_PRIVATE_REPLY),
                 "send_api_avg_gap_s": dm_pacer.avg_gap_seconds(dm_pacer.BUCKET_SEND_API),

@@ -95,7 +95,50 @@ class TestPageActivation:
         keep.refresh_from_db()
         drop.refresh_from_db()
         assert keep.is_active is True and keep.is_public is True
-        assert drop.is_active is False and drop.is_public is False
+        # 미선택은 슬롯 반납만 — is_public 보존 (업그레이드 시 _activate_all_pages 가
+        # is_active 만 되살리므로, 여기서 지우면 재업그레이드 후 영구 비노출로 남는다)
+        assert drop.is_active is False and drop.is_public is True
+
+    def test_post_preserved_public_restores_on_upgrade(self, user):
+        """미선택 페이지가 업그레이드 복원(is_active만 되살림) 후 다시 노출되는 회귀 가드."""
+        keep = _page(user, is_public=True, is_active=True)
+        drop = _page(user, is_public=True, is_active=True)
+        ensure_subscription(user)
+
+        res = self._client(user).post(
+            reverse("billing:page-activation"),
+            {"active_page_ids": [keep.id]},
+            format="json",
+        )
+        assert res.status_code == 200
+
+        # 업그레이드 복원 경로와 동일 동작 (toss_flows._activate_all_pages)
+        Page.objects.filter(user=user, is_active=False).update(is_active=True)
+        drop.refresh_from_db()
+        assert drop.is_active is True and drop.is_public is True  # 자동 재노출
+
+    def test_needs_adjustment_resolves_after_selection(self, user):
+        """needs 는 활성수 기준 일시 조건 — 초과 보유만으로 영구 true(다이얼로그 반복) 금지."""
+        keep = _page(user)
+        _page(user)  # 총 2개 보유, 둘 다 활성 → 활성 2 > max 1
+        ensure_subscription(user)
+        c = self._client(user)
+
+        assert (
+            c.get(reverse("billing:page-activation")).json()["needs_activation_adjustment"] is True
+        )
+
+        res = c.post(
+            reverse("billing:page-activation"), {"active_page_ids": [keep.id]}, format="json"
+        )
+        assert res.status_code == 200
+        assert res.json()["needs_activation_adjustment"] is False  # 선택 완료로 해소
+
+        # 해소 후에는 하루 1회 제한이 다시 적용됨 (영구 우회 회귀 가드)
+        res2 = c.post(
+            reverse("billing:page-activation"), {"active_page_ids": [keep.id]}, format="json"
+        )
+        assert res2.status_code == 400
 
     def test_post_bypasses_daily_limit_when_adjustment_needed(self, user):
         # 이미 오늘 변경한 이력이 있어도, 초과 상태면 강제 조정으로 다시 성공해야 함
