@@ -503,13 +503,20 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
         comment_id = value.get("id")
         comment_text = value.get("text", "")
         parent_id = value.get("parent_id")  # 대댓글이면 부모 comment_id, top-level이면 빈 값
-        from_user = value.get("from", {})
-        from_user_id = from_user.get("id")
-        from_username = from_user.get("username")
-        media = value.get("media", {})
-        media_id = media.get("id")
+        from_user = value.get("from") or {}  # 키가 null 로 오는 payload 방어
+        from_user_id = str(from_user.get("id") or "")
+        from_username = str(from_user.get("username") or "")
+        media = value.get("media") or {}
+        media_id = str(media.get("id") or "")
+        page_ig_user_id = str(webhook_payload.get("entry_id") or "")
 
-        if not all([comment_id, from_user_id, from_username, media_id]):
+        # 필수: comment_id + entry_id + 신원키(id/username 중 하나).
+        # from.username / media.id 결측은 허용 — 복구 재댓글 라우팅은 media 없이도,
+        # 신원키 한쪽만으로도 동작한다(_recipient_match_q 이원화). 예전 all([...]) 게이트는
+        # 이런 payload 를 복구 라우팅 도달 전에 탈락시켜 재댓글을 유실시켰다.
+        # entry_id 필수는 테넌트 가드 — 없으면 _active_campaigns_for_account("") 가
+        # 전 계정을 스캔한다.
+        if not comment_id or not page_ig_user_id or not (from_user_id or from_username):
             logger.error(f"Missing required fields in webhook payload: {webhook_payload}")
             return {"status": "error", "reason": "Missing required fields"}
 
@@ -517,8 +524,7 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
         # 비즈니스 본인이 자기 게시물에 댓글 → 자기 자신에게 DM 가는 루프 차단.
         # webhook entry.id 는 connected page 의 IG user id 와 동일.
         # (대댓글 가드보다 먼저 — 우리 공개/복구 답글이 어떤 분기로도 새지 않게.)
-        page_ig_user_id = str(webhook_payload.get("entry_id") or "")
-        if page_ig_user_id and str(from_user_id) == page_ig_user_id:
+        if from_user_id and from_user_id == page_ig_user_id:
             logger.info(
                 f"Skipping self-comment DM: page={page_ig_user_id} "
                 f"commented on own post (comment_id={comment_id})"
@@ -534,10 +540,11 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
         if parent_id:
             routed = _maybe_route_recovery_recomment(
                 page_ig_user_id=page_ig_user_id,
-                from_user_id=str(from_user_id),
-                from_username=str(from_username or ""),
+                from_user_id=from_user_id,
+                from_username=from_username,
                 comment_id=comment_id,
                 comment_text=comment_text,
+                media_id=media_id,
                 source="webhook_reply",
             )
             if routed:
@@ -545,11 +552,28 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
             logger.info(f"Skipping reply (대댓글): comment_id={comment_id} parent={parent_id}")
             return {"status": "skipped", "reason": "is_reply"}
 
+        # ★ media 결측 payload: 일반 매칭은 돌릴 수 없다 — matches_media 가 ANY_MEDIA 에서
+        #   매체 불문 True 라 오발송 위험. SeenComment/next_media attach 도 media 가 필요.
+        #   복구 재댓글 라우팅만 시도한다 (media 미상이므로 SPECIFIC_MEDIA pending 은
+        #   matches_media 스코핑이 fail-closed, ANY_MEDIA 만 라우팅 가능).
+        if not media_id:
+            routed = _maybe_route_recovery_recomment(
+                page_ig_user_id=page_ig_user_id,
+                from_user_id=from_user_id,
+                from_username=from_username,
+                comment_id=comment_id,
+                comment_text=comment_text,
+                media_id="",
+                source="webhook",
+            )
+            if routed:
+                return {"status": "queued", "reason": "recovery_recomment", "routed": routed}
+            return {"status": "skipped", "reason": "no_media_id"}
+
         # 활성 캠페인 매칭 (trigger_type + keyword 모두 평가)
         # (스팸 검사는 run_spam_filter_check 가 독립적으로 처리 — 여기서 하지 않는다)
         # webhook 의 entry.id 는 IG user id — 그 계정의 캠페인만 후보
-        ig_user_id = str(webhook_payload.get("entry_id") or "")
-        candidate_qs = _active_campaigns_for_account(ig_user_id)
+        candidate_qs = _active_campaigns_for_account(page_ig_user_id)
 
         # trigger_type 평가 + 누락 보정 장부(SeenComment) 기록 대상 수집:
         #   - matched_campaigns: 매체+키워드 매칭 → DM enqueue 대상
@@ -609,10 +633,11 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
         #   일반 매칭과 같은 캠페인이 겹치면 comment_id 단위 멱등키가 중복을 흡수한다.
         recovery_routed = _maybe_route_recovery_recomment(
             page_ig_user_id=page_ig_user_id,
-            from_user_id=str(from_user_id),
-            from_username=str(from_username or ""),
+            from_user_id=from_user_id,
+            from_username=from_username,
             comment_id=comment_id,
             comment_text=comment_text,
+            media_id=media_id,
             source="webhook",
         )
 
@@ -632,7 +657,9 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
                     campaign=campaign,
                     comment_id=comment_id,
                     comment_text=comment_text,
-                    from_user_id=from_user_id,
+                    # from.id 결측 payload 는 username 폴백 (recipient_user_id 가 NOT NULL
+                    # CharField — 폴링 경로의 recipient_key 폴백과 동일 관례)
+                    from_user_id=from_user_id or from_username,
                     from_username=from_username,
                     webhook_payload=webhook_payload,
                 )
@@ -2341,6 +2368,7 @@ def _poll_one_media(conn: IGAccountConnection, media_id: str, now) -> dict:
                     from_username=str(c.get("username") or ""),
                     comment_id=cid,
                     comment_text=text,
+                    media_id=media_id,
                     source="poll_reply",
                 )
                 continue
@@ -2359,6 +2387,7 @@ def _poll_one_media(conn: IGAccountConnection, media_id: str, now) -> dict:
                 from_username=str(c.get("username") or ""),
                 comment_id=cid,
                 comment_text=text,
+                media_id=media_id,
                 source="poll",
             )
             if not matched:
@@ -2894,6 +2923,7 @@ def _maybe_route_recovery_recomment(
     from_username: str,
     comment_id: str,
     comment_text: str,
+    media_id: str,
     source: str,
 ) -> int:
     """RECOVERY_PENDING 보유 사용자의 재댓글을 복구 재발송으로 라우팅.
@@ -2905,6 +2935,12 @@ def _maybe_route_recovery_recomment(
     사용자는 캠페인 트리거가 아니라 우리 안내에 응답한 것이므로 키워드 필터를 적용하지
     않는다. RECOVERY_PENDING 이 있는 사용자에게만 동작(오남용 불가 — 이미 정당하게
     트리거됐던 사용자다). 매칭은 _recipient_match_q(IGSID/username 키 이원화 대응).
+
+    **게시물 스코핑(media_id)**: 재댓글이 달린 media 가 캠페인의 매체 범위와 일치해야
+    라우팅한다(campaign.matches_media). 같은 계정의 **다른 게시물**에 단 댓글로 복구가
+    발동하는 과대 트리거 방지(2026-07-14 스코핑 조임). SPECIFIC_MEDIA 는 캠페인이 명시한
+    게시물만, ANY_MEDIA 는 캠페인 의미대로 모든 게시물 통과. media 미상(빈 값)이면
+    SPECIFIC_MEDIA 는 fail-closed — 다른 게시물일 가능성을 배제할 수 없으므로.
 
     발송은 기존 _enqueue_send_dm 초크포인트를 그대로 통과(자기가드/쿨다운/멱등) —
     일반 매칭과 같은 캠페인이 겹치면 idempotency_key(comment_id 단위)가 중복을 흡수한다.
@@ -2951,6 +2987,9 @@ def _maybe_route_recovery_recomment(
             continue
         if campaign.status != AutoDMCampaign.Status.ACTIVE or not campaign.recovery_reply_enabled:
             continue
+        # 게시물 스코핑: 캠페인이 명시한 media 의 재댓글만 (docstring 참고)
+        if not campaign.matches_media(media_id):
+            continue
         # 프로 전용 게이트 재확인 (진입 후 다운그레이드 방어, fail-closed)
         try:
             if not owner_has_feature(campaign.ig_connection.workspace, "dm_recovery"):
@@ -2981,6 +3020,116 @@ def _maybe_route_recovery_recomment(
             )
             routed += 1
     return routed
+
+
+@shared_task(name="integrations.poll_recovery_recomments")
+def poll_recovery_recomments():
+    """RECOVERY_PENDING 스레드의 답글을 재조회해 웹훅 유실분 재댓글을 보정 라우팅 (hourly).
+
+    복구 안내는 사용자 댓글의 '답글'로 달리므로 가장 자연스러운 응답은 그 스레드 답글인데,
+    comments 웹훅이 유실되면(Meta 구독 auto-disable 전례) 이를 영영 못 본다 —
+    미디어 폴링(poll_missed_comments)의 comments edge 는 문서상 top-level only 라
+    답글 관측이 보장되지 않고(섞여 오는 건 undocumented 실측), ANY_MEDIA 캠페인은
+    아예 미디어 폴링 대상도 아니다. 여기서는 안내 대댓글이 **실제 게시된**
+    RECOVERY_PENDING 의 원 댓글(comment_id = 스레드 루트)의 replies edge 를 직접
+    조회한다. IG 답글은 2단계 평탄화라 안내 댓글에 단 답글도 루트의 replies 로 온다.
+
+    중복 안전: 라우팅이 기존 _enqueue_send_dm 초크포인트를 통과하므로 comment_id 단위
+    idempotency_key + 수신자 쿨다운이 웹훅/반복 폴링과의 중복을 흡수한다.
+    ⚠️ SeenComment 에는 기록하지 않는다 — 답글을 기록하면 _poll_one_media 의 anchor
+    판정(created=False → 페이지네이션 중단)을 오염시켜 진짜 누락 top-level 댓글을 숨긴다.
+    """
+    if not getattr(settings, "RECOVERY_RECOMMENT_POLL_ENABLED", True):
+        return {"enabled": False}
+
+    now = timezone.now()
+    cap = getattr(settings, "RECOVERY_RECOMMENT_POLL_MAX_THREADS", 200)
+    # 후보: 안내가 실제 게시된(recovery_reply_id 有) 살아있는 pending 만.
+    # 캠페인/연동 게이트는 여기서 1차로 좁히고, TTL·프로 게이트는 라우팅과 동일하게
+    # 개별 재판정한다. 후보 상한(cap)이 곧 스레드(=API 호출) 상한의 상계.
+    candidates = list(
+        SentDMLog.objects.select_related("campaign__ig_connection")
+        .filter(
+            status=SentDMLog.Status.RECOVERY_PENDING,
+            parent_log__isnull=True,
+            recovery_pending_at__isnull=False,
+            campaign__status=AutoDMCampaign.Status.ACTIVE,
+            campaign__recovery_reply_enabled=True,
+            campaign__ig_connection__status=IGAccountConnection.Status.ACTIVE,
+            campaign__ig_connection__is_active=True,
+        )
+        .exclude(recovery_reply_id="")
+        .exclude(comment_id="")
+        .order_by("recovery_pending_at")[:cap]
+    )
+
+    # (connection, 루트 comment_id) 스레드 단위로 그룹핑 — 같은 루트를 공유하는
+    # 복수 캠페인 pending 이 있어도 replies fetch 는 스레드당 1회.
+    threads: dict = {}
+    for log in candidates:
+        campaign = log.campaign
+        ttl = campaign.recovery_ttl_seconds or 604800
+        if (now - log.recovery_pending_at).total_seconds() >= ttl:
+            continue  # 만료 정산은 handle_recovery_pending_expiry 담당
+        threads.setdefault((campaign.ig_connection_id, log.comment_id), []).append(log)
+
+    fetched = 0
+    routed = 0
+    for (_conn_id, root_comment_id), pendings in threads.items():
+        conn = pendings[0].campaign.ig_connection
+        own_igsid = str(conn.external_account_id or "")
+        own_username = (conn.username or "").strip().lower()
+        # 우리 안내 대댓글 id 집합 — 캠페인마다 각자 안내를 달 수 있으므로 집합으로.
+        guide_reply_ids = {p.recovery_reply_id for p in pendings if p.recovery_reply_id}
+        # 스레드의 media = 원 게시물. 스코핑 라우팅에 전달 (SPECIFIC_MEDIA 캠페인의
+        # media_id — 답글은 원 게시물 위이므로 이 값이 곧 답글의 media 다).
+        thread_media_id = next((p.campaign.media_id for p in pendings if p.campaign.media_id), "")
+        floor_ts = min(p.recovery_pending_at for p in pendings)
+
+        try:
+            resp = InstagramMediaService.list_comment_replies(root_comment_id, conn.access_token)
+        except Exception:  # noqa: BLE001 - best-effort 폴링, 스레드 단위 격리
+            logger.exception("poll_recovery_recomments: replies 조회 실패 root=%s", root_comment_id)
+            continue
+        fetched += 1
+        if resp.get("paging_after"):
+            logger.warning(
+                "poll_recovery_recomments: replies >1페이지 — 첫 페이지만 처리 (root=%s)",
+                root_comment_id,
+            )
+        for r in resp.get("data") or []:
+            rid = r.get("id")
+            if not rid or rid in guide_reply_ids:
+                continue
+            r_from_id = str((r.get("from") or {}).get("id") or "")
+            r_username = str(r.get("username") or "")
+            # self 답글(우리 안내 등) 스킵 — _poll_one_media 와 동일한 이중 비교
+            if (r_from_id and r_from_id == own_igsid) or (
+                own_username and r_username.strip().lower() == own_username
+            ):
+                continue
+            if not r_from_id and not r_username:
+                continue  # 신원 없음 — recipient 매칭 불가
+            # 안내(=pending 진입) 이전 답글은 우리 안내에 대한 응답이 아님.
+            # timestamp 파싱 실패 시엔 통과(fail-open) — 라우팅 쪽 가드가 재판정.
+            r_ts = _parse_iso_timestamp(r.get("timestamp"))
+            if r_ts is not None and r_ts < floor_ts:
+                continue
+            routed += _maybe_route_recovery_recomment(
+                page_ig_user_id=own_igsid,
+                from_user_id=r_from_id,
+                from_username=r_username,
+                comment_id=rid,
+                comment_text=r.get("text") or "",
+                media_id=thread_media_id,
+                source="recovery_poll",
+            )
+    return {
+        "candidates": len(candidates),
+        "threads": len(threads),
+        "fetched": fetched,
+        "routed": routed,
+    }
 
 
 @shared_task(name="integrations.handle_recovery_pending_expiry")

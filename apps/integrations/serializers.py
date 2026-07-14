@@ -6,6 +6,7 @@ from django.utils import timezone
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
+from .dm_status_groups import GROUP_DISPLAY, status_group
 from .models import (
     BUTTON_TEMPLATE_TEXT_MAX,
     DM_TEXT_MAX_BYTES,
@@ -1060,6 +1061,12 @@ class SentDMLogSerializer(serializers.ModelSerializer):
     is_delivered = serializers.SerializerMethodField()
     is_terminal = serializers.SerializerMethodField()
     display_status = serializers.SerializerMethodField()
+    # 코스 상태 그룹 (유저 콘솔 탭/배지 단일 소스 — dm_status_groups). 프론트가 status 를
+    # 다시 분류하지 않고 이 값으로 바로 탭 필터/배지를 그린다.
+    status_group = serializers.SerializerMethodField()
+    status_group_display = serializers.SerializerMethodField()
+    # 복구 대기(recovery_pending) 여부 — 숨겨진 요청·스팸 배지에 "복구 대기" 보조 칩 표시용.
+    is_recovering = serializers.SerializerMethodField()
     frontend_action = serializers.SerializerMethodField()
     # v3.8: 캠페인 로그 1행 = opening 1건 기준. 그 흐름에서 팔로우 전환됐는지를 한눈에.
     follow_passed = serializers.SerializerMethodField()
@@ -1081,6 +1088,9 @@ class SentDMLogSerializer(serializers.ModelSerializer):
             # 상태
             "status",
             "display_status",
+            "status_group",
+            "status_group_display",
+            "is_recovering",
             "is_delivered",
             "is_terminal",
             "verified_via",
@@ -1136,14 +1146,33 @@ class SentDMLogSerializer(serializers.ModelSerializer):
         return obj.is_terminal()
 
     def get_display_status(self, obj) -> str:
-        """프론트 표시용 사용자 친화적 상태"""
+        """프론트 표시용 사용자 친화적 상태 (세분화 라벨).
+
+        failed_param 은 subcode=2534025(숨김함) 면 '숨겨진 요청 · 스팸' 으로 분기한다.
+        코스 탭/배지는 status_group / status_group_display 를 쓰고, 이 값은 상세 라벨용.
+        """
+        if obj.status == "failed_param" and str(obj.error_subcode or "").strip() == "2534025":
+            return "숨겨진 요청 · 스팸"
         return _STATUS_DISPLAY.get(obj.status, obj.status)
 
+    @extend_schema_field(serializers.ChoiceField(choices=list(GROUP_DISPLAY.keys())))
+    def get_status_group(self, obj) -> str:
+        """코스 상태 그룹 머신값 (waiting/sent/read/hidden_spam/attention)."""
+        return status_group(obj.status, obj.error_subcode)
+
+    def get_status_group_display(self, obj) -> str:
+        """코스 상태 그룹 표시명 (대기중/전송됨/읽음/숨겨진 요청·스팸/확인 필요)."""
+        return GROUP_DISPLAY[status_group(obj.status, obj.error_subcode)]
+
+    def get_is_recovering(self, obj) -> bool:
+        """복구 대기(recovery_pending) 여부 — '복구 대기' 보조 칩 표시 판단용."""
+        return obj.status == SentDMLog.Status.RECOVERY_PENDING
+
     def get_frontend_action(self, obj) -> dict:
-        """v3.2 — 상태별 프론트엔드 표시/체크리스트/CTA 가이드"""
+        """v3.2 — 상태별 프론트엔드 표시/체크리스트/CTA 가이드 (failed_param 은 subcode 분기)."""
         from .dm_frontend_actions import build_frontend_action
 
-        return build_frontend_action(obj.status)
+        return build_frontend_action(obj.status, obj.error_subcode)
 
     @extend_schema_field(serializers.BooleanField(allow_null=True))
     def get_follow_passed(self, obj):
@@ -1288,6 +1317,36 @@ class DMVerificationStatsSerializer(serializers.Serializer):
     unique_reach_rate = serializers.FloatField(
         help_text="unique_delivered / unique_targets — 전체 대상 대비 실제 도달률 ([0,1] 클램프)"
     )
+    unique_sent_rate = serializers.FloatField(
+        help_text=(
+            "unique_sent / unique_targets — **전체 대상 대비 전송된 비율 ([0,1] 클램프)**. "
+            "유저 콘솔 헤드라인('N% 메시지가 성공적으로 전송됐어요')용. delivery_rate 는 "
+            "Meta 접수건만 분모라 하드실패가 빠져 100%로 부풀 수 있으니, 헤드라인엔 이 값을 쓸 것."
+        )
+    )
+
+    # ── v4.5 — 숨겨진 요청 · 스팸 / 확인 필요 분리 (유저 콘솔 카드용) ──────────
+    # '확인 필요'(unique_failed + unique_unconfirmed) 중 '숨겨진 요청/스팸함' 케이스를
+    # 별도 카드로 분리한다(비팔로워 채널 미개설 2534025 — 가장 잦은 사유). dm_status_groups 참조.
+    unique_hidden_spam = serializers.IntegerField(
+        help_text=(
+            "'숨겨진 요청 · 스팸' 인원 — 비팔로워라 채널 미개설(2534025)로 첫 DM 이 상대 "
+            "숨겨진 요청/스팸함으로 간 사람 (복구 대기·만료 recovery_* + 복구 OFF 시 "
+            "failed_param@2534025). unique_failed 의 부분집합 (아무것도 못 받은 사람)."
+        )
+    )
+    unique_needs_attention = serializers.IntegerField(
+        help_text=(
+            "기존 '확인 필요' 총합 = unique_failed + unique_unconfirmed (하위호환·다른 위치 배치용). "
+            "숨겨진 요청·스팸을 포함한 전체 조치 대상 인원."
+        )
+    )
+    unique_needs_attention_excl_hidden = serializers.IntegerField(
+        help_text=(
+            "숨겨진 요청·스팸을 뺀 '확인 필요' 인원 "
+            "(= unique_needs_attention − unique_hidden_spam). 새 '확인 필요' 카드용."
+        )
+    )
 
     # ── v4.2 — CTR(참여율) ────────────────────────────────────────────────
     ctr = serializers.FloatField(
@@ -1329,7 +1388,33 @@ class DMRecipientRollupSerializer(serializers.Serializer):
         ),
     )
     dm_count = serializers.IntegerField(help_text="이 사람에게 나간 총 DM 이벤트 수")
-    needs_attention = serializers.BooleanField(help_text="조치 필요한 실패 로그가 있음")
+    needs_attention = serializers.BooleanField(
+        help_text=(
+            "조치가 필요한 상태(= status_group == attention '확인 필요')인가. "
+            "**success-aware**: 발송/도착/읽음/복구 성공이 하나라도 있으면 false — 과거 실패 "
+            "로그(복구 전 no_trace 등)가 남아 있어도 결국 전송/복구됐으면 '확인 필요'로 보지 않는다. "
+            "숨겨진 요청·스팸(hidden_spam)은 별도이므로 여기서 false(→ status_group 로 표시)."
+        )
+    )
+    # 코스 상태 그룹 (한 사람 = 1개 그룹, 우선순위 read>sent>waiting>hidden_spam>attention).
+    # 프론트 탭/배지의 단일 소스 — 클라이언트에서 sent/delivered/read 불리언으로 재분류할 필요 없음.
+    status_group = serializers.ChoiceField(
+        choices=list(GROUP_DISPLAY.keys()),
+        help_text=(
+            "이 수신자의 코스 상태 그룹. "
+            "waiting(대기중)/sent(전송됨)/read(읽음)/hidden_spam(숨겨진 요청·스팸)/attention(확인 필요). "
+            "?status_group= 로 서버 필터 가능."
+        ),
+    )
+    status_group_display = serializers.CharField(
+        help_text="status_group 의 한국어 표시명 (대기중/전송됨/읽음/숨겨진 요청 · 스팸/확인 필요)"
+    )
+    is_recovering = serializers.BooleanField(
+        help_text=(
+            "복구 대기(recovery_pending)인 DM 이 있음. hidden_spam 배지에 '복구 대기' 보조 칩을 "
+            "붙일지 판단용 (복구 ON → true, 복구 OFF/만료 → false)."
+        )
+    )
     last_activity_at = serializers.DateTimeField(allow_null=True, help_text="마지막 활동 시각")
 
 

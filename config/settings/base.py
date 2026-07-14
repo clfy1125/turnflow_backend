@@ -470,6 +470,14 @@ CELERY_BEAT_SCHEDULE = {
         "task": "integrations.handle_recovery_pending_expiry",
         "schedule": 60 * 60,  # 1시간
     },
+    # ===== 실패 DM 복구: 재댓글(스레드 답글) 웹훅 유실 보정 =====
+    # 안내 대댓글이 게시된 RECOVERY_PENDING 의 원 댓글 replies edge 를 재조회해,
+    # 웹훅이 유실된 스레드 답글 재댓글을 복구 라우팅. RECOVERY_RECOMMENT_POLL_ENABLED 토글.
+    # 실제 구동은 core.ScheduledJob(0007 시드). CELERY_BEAT_SCHEDULE 은 fallback/문서용.
+    "dm-poll-recovery-recomments": {
+        "task": "integrations.poll_recovery_recomments",
+        "schedule": 60 * 60,  # 1시간
+    },
     # ===== 웹훅 구독 재확정 =====
     # Meta 는 콜백 실패(엣지 장애·DR 컷오버)가 쌓이면 계정별 웹훅 구독을 auto-disable →
     # 댓글 웹훅이 조용히 끊겨 캠페인 무음. 6시간마다 ACTIVE 연동의 comments/messages 구독을
@@ -832,6 +840,15 @@ MISSED_COMMENT_POLL_PAGE_SIZE = config("MISSED_COMMENT_POLL_PAGE_SIZE", default=
 # 폭주 방지 상한 — 정상 종료는 앵커 또는 7일 baseline. 소진 시 Telegram 경고.
 MISSED_COMMENT_POLL_MAX_PAGES = config("MISSED_COMMENT_POLL_MAX_PAGES", default=20, cast=int)
 MISSED_COMMENT_POLL_MAX_TARGETS = config("MISSED_COMMENT_POLL_MAX_TARGETS", default=1000, cast=int)
+
+# ===== 실패 DM 복구 재댓글 폴링 (integrations.poll_recovery_recomments) =====
+# 스레드 답글 재댓글의 comments 웹훅이 유실되면 복구가 TTL 만료까지 멈추므로,
+# 안내 대댓글이 게시된 RECOVERY_PENDING 스레드의 replies edge 를 시간당 재조회해 보정.
+# MAX_THREADS = 실행당 후보 pending 상한(≒ Meta API 호출 상한).
+RECOVERY_RECOMMENT_POLL_ENABLED = config("RECOVERY_RECOMMENT_POLL_ENABLED", default=True, cast=bool)
+RECOVERY_RECOMMENT_POLL_MAX_THREADS = config(
+    "RECOVERY_RECOMMENT_POLL_MAX_THREADS", default=200, cast=int
+)
 
 # ===== EventInbox 일별 파티션 유지 (integrations.maintain_partitions, §15.8) =====
 # 보존일 초과 일별 파티션은 즉시 DROP(WAL≈0). 행 도착 전에 파티션이 있어야 DEFAULT 로 안 새므로

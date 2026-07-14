@@ -50,9 +50,13 @@ SELF_CHECK_CHECKLIST: list[dict] = [
 ]
 
 
-def build_frontend_action(status: str) -> dict:
+def build_frontend_action(status: str, error_subcode: str = "") -> dict:
     """
-    SentDMLog.status 에 대응하는 프론트엔드 표시 액션을 반환.
+    SentDMLog.status(+error_subcode) 에 대응하는 프론트엔드 표시 액션을 반환.
+
+    error_subcode 는 failed_param 을 세분화하기 위해 받는다:
+    2534025(비팔로워 채널 미개설 → 숨겨진 요청/스팸함) 는 일반 파라미터 오류와 달리
+    '숨겨진 요청 · 스팸' 안내로 분기한다(복구 미사용/미보유로 종결된 케이스).
 
     Returns:
         {
@@ -130,6 +134,22 @@ def build_frontend_action(status: str) -> dict:
         }
 
     if status == "failed_param":
+        # 2534025 = 비팔로워 채널 미개설 → 첫 DM 이 상대의 숨겨진 요청/스팸함으로.
+        # 복구가 켜져 있었으면 recovery_pending 로 갔을 것 — 여기 오는 건 복구 OFF/미보유.
+        if str(error_subcode or "").strip() == "2534025":
+            return {
+                "type": "info",
+                "title": "숨겨진 요청 · 스팸함으로 전달됨",
+                "description": (
+                    "수신자가 아직 팔로워가 아니라 DM 채널이 열려 있지 않아, 첫 DM이 상대의 "
+                    "'숨겨진 요청/스팸함'으로 들어갔습니다(정상 도착 미확인). 실패 DM 복구를 켜면 "
+                    "댓글에 '요청함에서 수락 후 다시 댓글 달아주세요' 안내를 남겨 재발송을 "
+                    "시도합니다(프로 전용)."
+                ),
+                "checklist": None,
+                "cta": {"label": "실패 DM 복구 켜기", "action": "enable_recovery"},
+                "severity": "warning",
+            }
         return {
             "type": "info",
             "title": "메시지 발송 불가 (파라미터 오류)",

@@ -1379,6 +1379,74 @@ class InstagramMediaService:
             "paging_after": after_cursor if paging.get("next") else None,
         }
 
+    @classmethod
+    def list_comment_replies(
+        cls,
+        comment_id: str,
+        access_token: str,
+        limit: int = 50,
+    ) -> dict:
+        """댓글(스레드 루트)의 답글 1페이지 조회 (실패 DM 복구 재댓글 폴링용).
+
+        GET /v25.0/{comment_id}/replies?fields=id,text,username,timestamp,from
+
+        IG 답글은 2단계 평탄화 — 사용자가 우리 복구 안내 대댓글에 단 답글도 루트 댓글의
+        replies edge 로 내려온다. 웹훅 유실 시 poll_recovery_recomments 가 이 edge 로
+        RECOVERY_PENDING 스레드의 재댓글을 보정한다 (미디어 comments edge 는 문서상
+        top-level only 라 답글 관측이 보장되지 않음).
+
+        ``from`` 필드가 400 을 유발하는 계정/버전이 있으면 축소 필드로 1회 재시도
+        (list_media_comments 와 동일 방어). 루트 댓글 삭제(code=33)도 400 이라 재시도가
+        한 번 헛돌 수 있으나 폴링은 best-effort 라 허용.
+
+        Returns:
+            {"data": [{"id","text","username","timestamp","from"?}, ...],
+             "paging_after": "<cursor>" | None}
+
+        실패(타임아웃/4xx/5xx) 시 ``{"data": [], "paging_after": None}`` 반환.
+        """
+        if not comment_id:
+            return {"data": [], "paging_after": None}
+
+        # Mock 모드(dev): 실제 API 호출 없이 no-op. 테스트는 이 메서드를 직접 patch.
+        if MockInstagramProvider.is_mock_mode():
+            return {"data": [], "paging_after": None}
+
+        url = f"{cls.GRAPH_API_BASE}/{comment_id}/replies"
+        params = {
+            "fields": "id,text,username,timestamp,from",
+            "limit": limit,
+            "access_token": access_token,
+        }
+
+        try:
+            resp = requests.get(url, params=params, timeout=cls.DEFAULT_TIMEOUT)
+        except (requests.Timeout, requests.ConnectionError):
+            return {"data": [], "paging_after": None}
+
+        if not resp.ok and resp.status_code == 400:
+            # `from` 필드 미지원 응답 방어 — 필드 축소 후 1회 재시도.
+            params["fields"] = "id,text,username,timestamp"
+            try:
+                resp = requests.get(url, params=params, timeout=cls.DEFAULT_TIMEOUT)
+            except (requests.Timeout, requests.ConnectionError):
+                return {"data": [], "paging_after": None}
+
+        if not resp.ok:
+            return {"data": [], "paging_after": None}
+
+        try:
+            body = resp.json() or {}
+        except ValueError:
+            return {"data": [], "paging_after": None}
+
+        paging = body.get("paging") or {}
+        after_cursor = (paging.get("cursors") or {}).get("after")
+        return {
+            "data": body.get("data", []) or [],
+            "paging_after": after_cursor if paging.get("next") else None,
+        }
+
 
 class CommentReplyPermanentError(Exception):
     """

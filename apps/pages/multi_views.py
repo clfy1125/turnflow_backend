@@ -42,9 +42,8 @@ apps/pages/multi_views.py
   DELETE /api/v1/pages/multipages/{id}/media/{media_id}/    → 미디어 파일 삭제
 """
 
-from datetime import date, datetime, timedelta
-
 import json
+from datetime import date, datetime, timedelta
 
 from django.core.files.base import ContentFile
 from django.db import transaction
@@ -58,8 +57,8 @@ from drf_spectacular.utils import (
     extend_schema,
 )
 from rest_framework import status
-from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.exceptions import ValidationError
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -85,15 +84,28 @@ from .serializers import (
     ReorderSerializer,
     StatsSummarySerializer,
 )
-from .stats import get_block_stats, get_chart_data, get_link_stats, get_stats_summary, resolve_period
+from .stats import (
+    get_block_stats,
+    get_chart_data,
+    get_link_stats,
+    get_stats_summary,
+    resolve_period,
+)
 
 _MULTIPAGE_TAG = "다중 페이지 서비스"
 
 # ── 업로드 제한 (image_views.py 와 동일)
-_ALLOWED_MIME_TYPES = frozenset({
-    "image/jpeg", "image/png", "image/gif",
-    "image/webp", "image/svg+xml", "image/bmp", "image/tiff",
-})
+_ALLOWED_MIME_TYPES = frozenset(
+    {
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp",
+        "image/svg+xml",
+        "image/bmp",
+        "image/tiff",
+    }
+)
 _MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 
 # ── Swagger UI 업로드 UI 노출용 스키마 (multipart/form-data) ─────
@@ -161,12 +173,16 @@ def _resolve_stats_query_range(request) -> tuple[str, int, date | None, date | N
 
     if start_str or end_str:
         if not start_str or not end_str:
-            raise ValidationError({"detail": "start_date와 end_date는 함께 전달해야 합니다. (YYYY-MM-DD)"})
+            raise ValidationError(
+                {"detail": "start_date와 end_date는 함께 전달해야 합니다. (YYYY-MM-DD)"}
+            )
         try:
             start_date = datetime.strptime(start_str, "%Y-%m-%d").date()
             end_date = datetime.strptime(end_str, "%Y-%m-%d").date()
         except ValueError:
-            raise ValidationError({"detail": "start_date/end_date 형식은 YYYY-MM-DD 이어야 합니다."})
+            raise ValidationError(
+                {"detail": "start_date/end_date 형식은 YYYY-MM-DD 이어야 합니다."}
+            )
 
         if start_date > end_date:
             raise ValidationError({"detail": "start_date는 end_date보다 늦을 수 없습니다."})
@@ -181,6 +197,7 @@ def _resolve_stats_query_range(request) -> tuple[str, int, date | None, date | N
 # ═════════════════════════════════════════════════════════════
 # 페이지 목록 / 생성
 # ═════════════════════════════════════════════════════════════
+
 
 class MultiPageListView(APIView):
     permission_classes = [IsAuthenticated]
@@ -263,7 +280,7 @@ const { data: pages } = await api.get('/api/v1/pages/multipages/');
         summary="새 페이지 생성",
         description="""
 ## 개요
-새 블록형 링크 페이지를 생성합니다.  
+새 블록형 링크 페이지를 생성합니다.
 계정당 페이지 수에 제한은 없습니다.
 
 ## 인증
@@ -333,7 +350,11 @@ const { data: pages } = await api.get('/api/v1/pages/multipages/');
                     ),
                     OpenApiExample(
                         "slug 형식 오류",
-                        value={"slug": ["Enter a valid 'slug' consisting of letters, numbers, underscores or hyphens."]},
+                        value={
+                            "slug": [
+                                "Enter a valid 'slug' consisting of letters, numbers, underscores or hyphens."
+                            ]
+                        },
                     ),
                 ],
             ),
@@ -347,19 +368,23 @@ const { data: pages } = await api.get('/api/v1/pages/multipages/');
 
         # ── 플랜 페이지 수 제한 ──
         from apps.billing.subscription_utils import check_limit
+
         current_page_count = Page.objects.filter(user=request.user).count()
         if not check_limit(request.user, "max_pages", current_page_count):
             return Response(
-                {"detail": "현재 플랜의 최대 페이지 수에 도달했습니다. 업그레이드 후 이용해주세요."},
+                {
+                    "detail": "현재 플랜의 최대 페이지 수에 도달했습니다. 업그레이드 후 이용해주세요."
+                },
                 status=status.HTTP_403_FORBIDDEN,
             )
 
         slug = vd.get("slug") or None
         if not slug:
-            from .models import _generate_unique_slug
+
             # username 기반으로 생성하되 이미 slug가 있으면 suffix 증가
             base = request.user.username
             from django.utils.text import slugify
+
             base_slug = slugify(base) or "page"
             candidate = base_slug
             counter = 2
@@ -383,6 +408,7 @@ const { data: pages } = await api.get('/api/v1/pages/multipages/');
 # 페이지 상세 / 수정 / 삭제
 # ═════════════════════════════════════════════════════════════
 
+
 class MultiPageDetailView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -391,7 +417,7 @@ class MultiPageDetailView(APIView):
         summary="특정 페이지 조회",
         description="""
 ## 개요
-페이지 ID로 특정 페이지 정보를 조회합니다.  
+페이지 ID로 특정 페이지 정보를 조회합니다.
 **본인 소유 페이지만** 조회 가능합니다.
 
 ## 인증
@@ -410,7 +436,9 @@ class MultiPageDetailView(APIView):
         """,
         parameters=[
             OpenApiParameter(
-                name="id", type=OpenApiTypes.INT, location=OpenApiParameter.PATH,
+                name="id",
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.PATH,
                 description="조회할 페이지 ID",
             ),
         ],
@@ -440,7 +468,9 @@ class MultiPageDetailView(APIView):
     def get(self, request, page_id: int):
         page = _get_owned_page(request, page_id)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         return Response(MultiPageSerializer(page).data)
 
     @extend_schema(
@@ -448,7 +478,7 @@ class MultiPageDetailView(APIView):
         summary="특정 페이지 수정",
         description="""
 ## 개요
-특정 페이지의 메타 정보를 수정합니다. **PATCH** 방식이므로 변경할 필드만 전송하면 됩니다.  
+특정 페이지의 메타 정보를 수정합니다. **PATCH** 방식이므로 변경할 필드만 전송하면 됩니다.
 **본인 소유 페이지만** 수정 가능합니다.
 
 ## 인증
@@ -461,15 +491,29 @@ class MultiPageDetailView(APIView):
 | `is_public` | bool | `true` → 즉시 전체 공개. `false` → 비공개 전환 |
 | `data` | object | 프론트엔드 전용 설정 저장소. 전송한 값으로 **전체 덮어쓰기** |
 
-> **`slug`는 이 API로 변경 불가합니다.**  
+> **`slug`는 이 API로 변경 불가합니다.**
 > slug 변경은 `PATCH /api/v1/pages/multipages/{id}/slug/` 를 사용하세요.
+
+## 활성 슬롯(is_active) 자동 처리 — `is_public` 토글과 연동
+페이지에는 두 플래그가 있습니다(응답에 함께 내려갑니다):
+- `is_public` — **공개 토글**(이 API로 변경).
+- `is_active` — **요금제 활성 슬롯**(읽기 전용, billing 관리). 실제 노출은 `is_live = is_active AND is_public`.
+
+`is_public=true` 로 공개할 때 대상 페이지에 활성 슬롯이 없으면(`is_active=false`) 다음과 같이 동작합니다:
+- **빈 슬롯이 있으면**(활성 페이지 수 < 플랜 최대) → `is_active` 도 자동으로 `true` 가 되어 **즉시 라이브**(is_live=true).
+- **슬롯이 꽉 찼으면**(활성 페이지 수 ≥ 플랜 최대) → **409** 로 거부하고 페이지 상태는 그대로 둡니다
+  (`error.details.reason="ACTIVE_PAGE_SLOT_FULL"`). 다른 페이지를 비활성화하거나 플랜을 업그레이드해야 합니다.
+- 이 자동 부여는 `billing/page-activation` 의 **하루 1회 제한과 무관**합니다(하루에 여러 번 켜고 꺼도 됨).
+- **비공개 전환(`is_public=false`)은 `is_active`(슬롯)를 유지**합니다 — 재공개 시 스왑 없이 바로 켜집니다.
 
 ## 에러
 | 코드 | 원인 |
 |------|------|
 | 400 | 필드 타입 오류 |
 | 401 | 토큰 없음/만료 |
+| 403 | 프로 전용 기능(로고 제거 등) 권한 없음 |
 | 404 | 페이지 없음 또는 다른 사용자의 페이지 |
+| 409 | 공개하려는 페이지의 활성 슬롯이 부족 (`reason="ACTIVE_PAGE_SLOT_FULL"`) |
         """,
         request=MultiPageSerializer,
         responses={
@@ -484,6 +528,8 @@ class MultiPageDetailView(APIView):
                             "slug": "my-product-page",
                             "title": "업데이트된 제목",
                             "is_public": True,
+                            "is_active": True,
+                            "is_live": True,
                             "data": {"theme": "dark"},
                             "created_at": "2026-03-10T12:00:00Z",
                             "updated_at": "2026-03-15T09:00:00Z",
@@ -493,16 +539,40 @@ class MultiPageDetailView(APIView):
             ),
             400: OpenApiResponse(description="유효성 검증 실패"),
             401: OpenApiResponse(description="인증 실패"),
+            403: OpenApiResponse(description="프로 전용 기능 권한 없음"),
             404: OpenApiResponse(description="페이지 없음 또는 접근 권한 없음"),
+            409: OpenApiResponse(
+                description="활성 슬롯 부족 — 공개 불가",
+                examples=[
+                    OpenApiExample(
+                        "슬롯 부족",
+                        value={
+                            "success": False,
+                            "error": {
+                                "code": 409,
+                                "message": "활성 페이지 슬롯이 가득 찼습니다. 이 페이지를 공개하려면 다른 페이지를 비활성화하거나 플랜을 업그레이드하세요.",
+                                "details": {
+                                    "reason": "ACTIVE_PAGE_SLOT_FULL",
+                                    "active_pages": 5,
+                                    "max_pages": 5,
+                                },
+                            },
+                        },
+                    )
+                ],
+            ),
         },
     )
     def patch(self, request, page_id: int):
         page = _get_owned_page(request, page_id)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
 
         # ── 프로 기능 제한: 로고 제거 ──
         from apps.billing.subscription_utils import check_feature
+
         new_data = request.data.get("data")
         if new_data and isinstance(new_data, dict):
             new_logo = new_data.get("design_settings", {}).get("logoStyle")
@@ -516,7 +586,43 @@ class MultiPageDetailView(APIView):
 
         serializer = MultiPageSerializer(page, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
+
+        # ── 공개 토글 시 빈 활성 슬롯 자동 부여 / 슬롯 부족 거부 ──
+        # is_public=true 로 켜는데 페이지에 활성 슬롯(is_active)이 없으면:
+        #   빈 슬롯이 있으면(active < max_pages) is_active 도 함께 켜 바로 라이브가 되게 하고,
+        #   슬롯이 꽉 찼으면 409 로 거부한다(조용히 is_public 만 세팅돼 안 보이는 상태 방지).
+        # page-activation 의 하루 1회 제한과 무관 — 활성 집합 재편성이 아니라 빈 자리 공개일 뿐.
+        from apps.billing.subscription_utils import check_limit, get_user_plan
+
+        grant_slot = False
+        turning_public = serializer.validated_data.get("is_public") is True
+        if turning_public and not page.is_active:
+            active_count = Page.objects.filter(user=request.user, is_active=True).count()
+            if check_limit(request.user, "max_pages", active_count):
+                grant_slot = True
+            else:
+                max_pages = get_user_plan(request.user).features.get("max_pages", 1)
+                return Response(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": status.HTTP_409_CONFLICT,
+                            "message": (
+                                "활성 페이지 슬롯이 가득 찼습니다. 이 페이지를 공개하려면 다른 "
+                                "페이지를 비활성화하거나 플랜을 업그레이드하세요."
+                            ),
+                            "details": {
+                                "reason": "ACTIVE_PAGE_SLOT_FULL",
+                                "active_pages": active_count,
+                                "max_pages": max_pages,
+                            },
+                        },
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+        # 슬롯 부여 시 is_active 도 함께 켠다. 언퍼블리시(is_public=false)는 is_active 미변경(슬롯 유지).
+        serializer.save(is_active=True) if grant_slot else serializer.save()
         # 사용자 직접 편집 → 라이브가 스냅샷과 달라졌으므로 활성 슬롯 포인터 해제
         page.detach_snapshot_pointer()
         return Response(serializer.data)
@@ -526,10 +632,10 @@ class MultiPageDetailView(APIView):
         summary="특정 페이지 삭제",
         description="""
 ## 개요
-특정 페이지를 **영구 삭제**합니다.  
+특정 페이지를 **영구 삭제**합니다.
 페이지에 속한 블록, 통계, 문의, 구독자, 미디어 파일이 모두 함께 삭제됩니다.
 
-> ⚠️ **삭제 후 복구 불가**  
+> ⚠️ **삭제 후 복구 불가**
 > 공개 중인 페이지를 삭제하면 방문자는 즉시 404를 받게 됩니다.
 
 ## 인증
@@ -551,7 +657,9 @@ class MultiPageDetailView(APIView):
         """,
         parameters=[
             OpenApiParameter(
-                name="id", type=OpenApiTypes.INT, location=OpenApiParameter.PATH,
+                name="id",
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.PATH,
                 description="삭제할 페이지 ID",
             ),
         ],
@@ -564,7 +672,9 @@ class MultiPageDetailView(APIView):
     def delete(self, request, page_id: int):
         page = _get_owned_page(request, page_id)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         page.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -572,6 +682,7 @@ class MultiPageDetailView(APIView):
 # ═════════════════════════════════════════════════════════════
 # 페이지 slug 변경
 # ═════════════════════════════════════════════════════════════
+
 
 class MultiPageSlugChangeView(APIView):
     permission_classes = [IsAuthenticated]
@@ -581,7 +692,7 @@ class MultiPageSlugChangeView(APIView):
         summary="특정 페이지 slug 변경",
         description="""
 ## 개요
-특정 페이지의 공개 URL slug를 변경합니다.  
+특정 페이지의 공개 URL slug를 변경합니다.
 **변경 즉시 기존 slug는 사용 불가** — 기존 URL로 접속하는 방문자는 새 slug로 안내해주세요.
 
 ## 인증
@@ -651,10 +762,10 @@ class MultiPageSlugChangeView(APIView):
     def patch(self, request, page_id: int):
         page = _get_owned_page(request, page_id)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
-        serializer = MultiPageSlugChangeSerializer(
-            data=request.data, context={"page_id": page_id}
-        )
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
+        serializer = MultiPageSlugChangeSerializer(data=request.data, context={"page_id": page_id})
         serializer.is_valid(raise_exception=True)
         page.slug = serializer.validated_data["slug"]
         page.save(update_fields=["slug", "updated_at"])
@@ -664,6 +775,7 @@ class MultiPageSlugChangeView(APIView):
 # ═════════════════════════════════════════════════════════════
 # 커스텀 CSS 수정
 # ═════════════════════════════════════════════════════════════
+
 
 class MultiPageCustomCssView(APIView):
     permission_classes = [IsAuthenticated]
@@ -690,7 +802,9 @@ class MultiPageCustomCssView(APIView):
         """,
         parameters=[
             OpenApiParameter(
-                name="id", type=OpenApiTypes.INT, location=OpenApiParameter.PATH,
+                name="id",
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.PATH,
                 description="페이지 ID",
             ),
         ],
@@ -703,7 +817,9 @@ class MultiPageCustomCssView(APIView):
     def get(self, request, page_id: int):
         page = _get_owned_page(request, page_id)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         return Response({"custom_css": page.custom_css})
 
     @extend_schema(
@@ -711,7 +827,7 @@ class MultiPageCustomCssView(APIView):
         summary="특정 페이지 커스텀 CSS 수정",
         description="""
 ## 개요
-특정 페이지에 적용할 **커스텀 CSS**를 저장합니다.  
+특정 페이지에 적용할 **커스텀 CSS**를 저장합니다.
 프론트엔드에서 공개 페이지 렌더링 시 `<style>` 태그로 주입하여 사용합니다.
 
 ## 인증
@@ -748,13 +864,17 @@ await api.patch(`/api/v1/pages/multipages/${pageId}/css/`, { custom_css: '' });
         """,
         parameters=[
             OpenApiParameter(
-                name="id", type=OpenApiTypes.INT, location=OpenApiParameter.PATH,
+                name="id",
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.PATH,
                 description="페이지 ID",
             ),
         ],
         request=CustomCssSerializer,
         responses={
-            200: OpenApiResponse(response=MultiPageSerializer, description="수정된 페이지 전체 정보"),
+            200: OpenApiResponse(
+                response=MultiPageSerializer, description="수정된 페이지 전체 정보"
+            ),
             400: OpenApiResponse(description="유효성 검증 실패"),
             401: OpenApiResponse(description="인증 실패"),
             404: OpenApiResponse(description="페이지 없음 또는 접근 권한 없음"),
@@ -763,10 +883,13 @@ await api.patch(`/api/v1/pages/multipages/${pageId}/css/`, { custom_css: '' });
     def patch(self, request, page_id: int):
         page = _get_owned_page(request, page_id)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
 
         # ── 프로 기능 제한: 커스텀 CSS ──
         from apps.billing.subscription_utils import check_feature
+
         new_css = request.data.get("custom_css", "")
         if new_css and not check_feature(request.user, "custom_css"):
             return Response(
@@ -786,6 +909,7 @@ await api.patch(`/api/v1/pages/multipages/${pageId}/css/`, { custom_css: '' });
 # ═════════════════════════════════════════════════════════════
 # 블록 커스텀 CSS 수정
 # ═════════════════════════════════════════════════════════════
+
 
 class MultiBlockCustomCssView(APIView):
     permission_classes = [IsAuthenticated]
@@ -807,8 +931,18 @@ class MultiBlockCustomCssView(APIView):
 | `block_id` | int | 블록 ID |
         """,
         parameters=[
-            OpenApiParameter(name="id", type=OpenApiTypes.INT, location=OpenApiParameter.PATH, description="페이지 ID"),
-            OpenApiParameter(name="block_id", type=OpenApiTypes.INT, location=OpenApiParameter.PATH, description="블록 ID"),
+            OpenApiParameter(
+                name="id",
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.PATH,
+                description="페이지 ID",
+            ),
+            OpenApiParameter(
+                name="block_id",
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.PATH,
+                description="블록 ID",
+            ),
         ],
         responses={
             200: OpenApiResponse(response=CustomCssSerializer, description="현재 커스텀 CSS"),
@@ -819,10 +953,14 @@ class MultiBlockCustomCssView(APIView):
     def get(self, request, page_id: int, block_id: int):
         page = _get_owned_page(request, page_id)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         block = Block.objects.filter(pk=block_id, page=page).first()
         if not block:
-            return Response({"detail": "블록을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "블록을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         return Response({"custom_css": block.custom_css})
 
     @extend_schema(
@@ -854,8 +992,18 @@ await api.patch(`/api/v1/pages/multipages/${pageId}/blocks/${blockId}/css/`, {
 ```
         """,
         parameters=[
-            OpenApiParameter(name="id", type=OpenApiTypes.INT, location=OpenApiParameter.PATH, description="페이지 ID"),
-            OpenApiParameter(name="block_id", type=OpenApiTypes.INT, location=OpenApiParameter.PATH, description="블록 ID"),
+            OpenApiParameter(
+                name="id",
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.PATH,
+                description="페이지 ID",
+            ),
+            OpenApiParameter(
+                name="block_id",
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.PATH,
+                description="블록 ID",
+            ),
         ],
         request=CustomCssSerializer,
         responses={
@@ -868,13 +1016,18 @@ await api.patch(`/api/v1/pages/multipages/${pageId}/blocks/${blockId}/css/`, {
     def patch(self, request, page_id: int, block_id: int):
         page = _get_owned_page(request, page_id)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         block = Block.objects.filter(pk=block_id, page=page).first()
         if not block:
-            return Response({"detail": "블록을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "블록을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
 
         # ── 프로 기능 제한: 커스텀 CSS ──
         from apps.billing.subscription_utils import check_feature
+
         new_css = request.data.get("custom_css", "")
         if new_css and not check_feature(request.user, "custom_css"):
             return Response(
@@ -895,15 +1048,16 @@ await api.patch(`/api/v1/pages/multipages/${pageId}/blocks/${blockId}/css/`, {
 # 블록 목록 / 생성
 # ═════════════════════════════════════════════════════════════
 
+
 class MultiBlockListCreateView(APIView):
     permission_classes = [IsAuthenticated]
 
     @extend_schema(
         tags=[_MULTIPAGE_TAG],
         summary="특정 페이지의 블록 목록 조회",
-        description="""
+        description=r"""
 ## 개요
-특정 페이지의 **전체 블록**을 `order` 오름차순으로 반환합니다.  
+특정 페이지의 **전체 블록**을 `order` 오름차순으로 반환합니다.
 `is_enabled: false`인 비활성 블록도 포함됩니다 (편집 화면에서 표시 여부 토글 가능).
 
 ## 인증
@@ -941,7 +1095,9 @@ class MultiBlockListCreateView(APIView):
     def get(self, request, page_id: int):
         page = _get_owned_page(request, page_id)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         blocks = page.blocks.order_by("order")
         return Response(BlockSerializer(blocks, many=True).data)
 
@@ -1020,7 +1176,9 @@ class MultiBlockListCreateView(APIView):
     def post(self, request, page_id: int):
         page = _get_owned_page(request, page_id)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         serializer = BlockSerializer(data=request.data, context={"page": page})
         serializer.is_valid(raise_exception=True)
         serializer.save()
@@ -1032,6 +1190,7 @@ class MultiBlockListCreateView(APIView):
 # ═════════════════════════════════════════════════════════════
 # 블록 상세 (수정 / 삭제)
 # ═════════════════════════════════════════════════════════════
+
 
 class MultiBlockDetailView(APIView):
     permission_classes = [IsAuthenticated]
@@ -1048,7 +1207,7 @@ class MultiBlockDetailView(APIView):
         summary="특정 페이지의 블록 수정",
         description="""
 ## 개요
-블록의 콘텐츠(`data`), 표시 여부(`is_enabled`), 순서(`order`)를 수정합니다.  
+블록의 콘텐츠(`data`), 표시 여부(`is_enabled`), 순서(`order`)를 수정합니다.
 **PATCH** 방식이므로 변경할 필드만 전송하면 됩니다.
 
 ## 인증
@@ -1092,9 +1251,13 @@ class MultiBlockDetailView(APIView):
     def patch(self, request, page_id: int, block_id: int):
         page, block = self._get_block(request, page_id, block_id)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         if not block:
-            return Response({"detail": "블록을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "블록을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         serializer = BlockSerializer(block, data=request.data, partial=True, context={"page": page})
         serializer.is_valid(raise_exception=True)
         serializer.save()
@@ -1140,9 +1303,13 @@ class MultiBlockDetailView(APIView):
     def delete(self, request, page_id: int, block_id: int):
         page, block = self._get_block(request, page_id, block_id)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         if not block:
-            return Response({"detail": "블록을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "블록을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         block.delete()
         # 블록 삭제 → 라이브가 스냅샷과 달라졌으므로 활성 슬롯 포인터 해제
         page.detach_snapshot_pointer()
@@ -1153,6 +1320,7 @@ class MultiBlockDetailView(APIView):
 # 블록 순서 재정렬
 # ═════════════════════════════════════════════════════════════
 
+
 class MultiBlockReorderView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -1161,7 +1329,7 @@ class MultiBlockReorderView(APIView):
         summary="특정 페이지의 블록 순서 재정렬",
         description="""
 ## 개요
-특정 페이지의 여러 블록 `order`를 **하나의 트랜잭션**으로 원자적으로 변경합니다.  
+특정 페이지의 여러 블록 `order`를 **하나의 트랜잭션**으로 원자적으로 변경합니다.
 드래그 앤 드롭 정렬 완료 후 호출하는 것을 권장합니다.
 
 ## 인증
@@ -1213,7 +1381,9 @@ const handleDragEnd = async (reorderedBlocks: Block[]) => {
         """,
         request=ReorderSerializer,
         responses={
-            200: OpenApiResponse(response=BlockSerializer(many=True), description="재정렬된 블록 목록"),
+            200: OpenApiResponse(
+                response=BlockSerializer(many=True), description="재정렬된 블록 목록"
+            ),
             400: OpenApiResponse(description="유효성 검증 실패 또는 권한 없는 블록 포함"),
             401: OpenApiResponse(description="인증 실패"),
             404: OpenApiResponse(description="페이지 없음 또는 접근 권한 없음"),
@@ -1222,7 +1392,9 @@ const handleDragEnd = async (reorderedBlocks: Block[]) => {
     def post(self, request, page_id: int):
         page = _get_owned_page(request, page_id)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
 
         serializer = ReorderSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -1232,7 +1404,9 @@ const handleDragEnd = async (reorderedBlocks: Block[]) => {
 
         if Block.objects.filter(pk__in=requested_ids, page=page).count() != len(requested_ids):
             return Response(
-                {"detail": "요청한 블록 중 이 페이지에 속하지 않거나 존재하지 않는 블록이 있습니다."},
+                {
+                    "detail": "요청한 블록 중 이 페이지에 속하지 않거나 존재하지 않는 블록이 있습니다."
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -1252,6 +1426,7 @@ const handleDragEnd = async (reorderedBlocks: Block[]) => {
 # ═════════════════════════════════════════════════════════════
 # 통계
 # ═════════════════════════════════════════════════════════════
+
 
 class MultiPageStatsView(APIView):
     permission_classes = [IsAuthenticated]
@@ -1296,17 +1471,24 @@ class MultiPageStatsView(APIView):
         """,
         parameters=[
             OpenApiParameter(
-                name="period", type=OpenApiTypes.STR, location=OpenApiParameter.QUERY,
+                name="period",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
                 description="조회 기간. `7d`=7일, `30d`=30일, `90d`=90일",
-                required=False, enum=["7d", "30d", "90d"],
+                required=False,
+                enum=["7d", "30d", "90d"],
             ),
             OpenApiParameter(
-                name="start_date", type=OpenApiTypes.DATE, location=OpenApiParameter.QUERY,
+                name="start_date",
+                type=OpenApiTypes.DATE,
+                location=OpenApiParameter.QUERY,
                 description="커스텀 조회 시작일 (YYYY-MM-DD). period 미전달 시 end_date와 함께 필수",
                 required=False,
             ),
             OpenApiParameter(
-                name="end_date", type=OpenApiTypes.DATE, location=OpenApiParameter.QUERY,
+                name="end_date",
+                type=OpenApiTypes.DATE,
+                location=OpenApiParameter.QUERY,
                 description="커스텀 조회 종료일 (YYYY-MM-DD). period 미전달 시 start_date와 함께 필수",
                 required=False,
             ),
@@ -1320,7 +1502,9 @@ class MultiPageStatsView(APIView):
     def get(self, request, page_id: int):
         page = _get_owned_page(request, page_id)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         period_key, days, start_date, end_date = _resolve_stats_query_range(request)
         data = get_stats_summary(page, days, start_date=start_date, end_date=end_date)
         data["period"] = period_key
@@ -1368,17 +1552,24 @@ class MultiStatsChartView(APIView):
         """,
         parameters=[
             OpenApiParameter(
-                name="period", type=OpenApiTypes.STR, location=OpenApiParameter.QUERY,
+                name="period",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
                 description="조회 기간. `7d`=7일, `30d`=30일, `90d`=90일",
-                required=False, enum=["7d", "30d", "90d"],
+                required=False,
+                enum=["7d", "30d", "90d"],
             ),
             OpenApiParameter(
-                name="start_date", type=OpenApiTypes.DATE, location=OpenApiParameter.QUERY,
+                name="start_date",
+                type=OpenApiTypes.DATE,
+                location=OpenApiParameter.QUERY,
                 description="커스텀 조회 시작일 (YYYY-MM-DD). period 미전달 시 end_date와 함께 필수",
                 required=False,
             ),
             OpenApiParameter(
-                name="end_date", type=OpenApiTypes.DATE, location=OpenApiParameter.QUERY,
+                name="end_date",
+                type=OpenApiTypes.DATE,
+                location=OpenApiParameter.QUERY,
                 description="커스텀 조회 종료일 (YYYY-MM-DD). period 미전달 시 start_date와 함께 필수",
                 required=False,
             ),
@@ -1392,7 +1583,9 @@ class MultiStatsChartView(APIView):
     def get(self, request, page_id: int):
         page = _get_owned_page(request, page_id)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         period_key, days, start_date, end_date = _resolve_stats_query_range(request)
         data = get_chart_data(page, days, start_date=start_date, end_date=end_date)
         data["period"] = period_key
@@ -1443,17 +1636,24 @@ class MultiStatsBlocksView(APIView):
         """,
         parameters=[
             OpenApiParameter(
-                name="period", type=OpenApiTypes.STR, location=OpenApiParameter.QUERY,
+                name="period",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
                 description="조회 기간. `7d`=7일, `30d`=30일, `90d`=90일",
-                required=False, enum=["7d", "30d", "90d"],
+                required=False,
+                enum=["7d", "30d", "90d"],
             ),
             OpenApiParameter(
-                name="start_date", type=OpenApiTypes.DATE, location=OpenApiParameter.QUERY,
+                name="start_date",
+                type=OpenApiTypes.DATE,
+                location=OpenApiParameter.QUERY,
                 description="커스텀 조회 시작일 (YYYY-MM-DD). period 미전달 시 end_date와 함께 필수",
                 required=False,
             ),
             OpenApiParameter(
-                name="end_date", type=OpenApiTypes.DATE, location=OpenApiParameter.QUERY,
+                name="end_date",
+                type=OpenApiTypes.DATE,
+                location=OpenApiParameter.QUERY,
                 description="커스텀 조회 종료일 (YYYY-MM-DD). period 미전달 시 start_date와 함께 필수",
                 required=False,
             ),
@@ -1467,7 +1667,9 @@ class MultiStatsBlocksView(APIView):
     def get(self, request, page_id: int):
         page = _get_owned_page(request, page_id)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         period_key, days, start_date, end_date = _resolve_stats_query_range(request)
         blocks = get_block_stats(page, days, start_date=start_date, end_date=end_date)
         data = {"period": period_key, "blocks": blocks}
@@ -1484,7 +1686,7 @@ class MultiStatsLinksView(APIView):
         summary="특정 페이지 서브링크별 클릭수 (link_clicks)",
         description="""
 ## 개요
-특정 페이지의 기간 내 **서브링크별 클릭수**를 `link_clicks` 배열로 반환합니다.  
+특정 페이지의 기간 내 **서브링크별 클릭수**를 `link_clicks` 배열로 반환합니다.
 `link_id`가 있는 클릭(social, group_link 등)은 서브링크 단위로 분리되고,
 `link_id`가 없는 클릭(single_link 등)은 블록 단위로 합산됩니다.
 
@@ -1530,17 +1732,24 @@ class MultiStatsLinksView(APIView):
         """,
         parameters=[
             OpenApiParameter(
-                name="period", type=OpenApiTypes.STR, location=OpenApiParameter.QUERY,
+                name="period",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
                 description="조회 기간. `7d`=7일, `30d`=30일, `90d`=90일",
-                required=False, enum=["7d", "30d", "90d"],
+                required=False,
+                enum=["7d", "30d", "90d"],
             ),
             OpenApiParameter(
-                name="start_date", type=OpenApiTypes.DATE, location=OpenApiParameter.QUERY,
+                name="start_date",
+                type=OpenApiTypes.DATE,
+                location=OpenApiParameter.QUERY,
                 description="커스텀 조회 시작일 (YYYY-MM-DD). period 미전달 시 end_date와 함께 필수",
                 required=False,
             ),
             OpenApiParameter(
-                name="end_date", type=OpenApiTypes.DATE, location=OpenApiParameter.QUERY,
+                name="end_date",
+                type=OpenApiTypes.DATE,
+                location=OpenApiParameter.QUERY,
                 description="커스텀 조회 종료일 (YYYY-MM-DD). period 미전달 시 start_date와 함께 필수",
                 required=False,
             ),
@@ -1613,7 +1822,9 @@ class MultiStatsLinksView(APIView):
     def get(self, request, page_id: int):
         page = _get_owned_page(request, page_id)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         period_key, days, start_date, end_date = _resolve_stats_query_range(request)
         link_clicks = get_link_stats(page, days, start_date=start_date, end_date=end_date)
         total_clicks = sum(b["clicks"] for b in link_clicks)
@@ -1624,6 +1835,7 @@ class MultiStatsLinksView(APIView):
 # ═════════════════════════════════════════════════════════════
 # 문의 관리
 # ═════════════════════════════════════════════════════════════
+
 
 class MultiInquiryListView(APIView):
     permission_classes = [IsAuthenticated]
@@ -1671,9 +1883,12 @@ class MultiInquiryListView(APIView):
         """,
         parameters=[
             OpenApiParameter(
-                name="period", type=OpenApiTypes.STR, location=OpenApiParameter.QUERY,
+                name="period",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
                 description="조회 기간. `all`=전체, `6m`=6개월, `1m`=1개월, `7d`=7일",
-                required=False, enum=["all", "6m", "1m", "7d"],
+                required=False,
+                enum=["all", "6m", "1m", "7d"],
             ),
         ],
         responses={
@@ -1709,7 +1924,9 @@ class MultiInquiryListView(APIView):
     def get(self, request, page_id: int):
         page = _get_owned_page(request, page_id)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
 
         qs = ContactInquiry.objects.filter(page=page)
         period = request.query_params.get("period", "all")
@@ -1764,9 +1981,13 @@ class MultiInquiryDetailView(APIView):
     def delete(self, request, page_id: int, pk: int):
         page, inquiry = self._get_inquiry(request, page_id, pk)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         if not inquiry:
-            return Response({"detail": "문의를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "문의를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         inquiry.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -1775,7 +1996,7 @@ class MultiInquiryDetailView(APIView):
         summary="특정 페이지의 문의 메모 수정 (관리자)",
         description="""
 ## 개요
-특정 페이지의 문의에 **관리자 메모**를 작성하거나 수정합니다.  
+특정 페이지의 문의에 **관리자 메모**를 작성하거나 수정합니다.
 메모는 관리자만 볼 수 있으며 문의자에게 전달되지 않습니다.
 
 ## 인증
@@ -1800,7 +2021,9 @@ class MultiInquiryDetailView(APIView):
         """,
         request=ContactInquiryMemoSerializer,
         examples=[
-            OpenApiExample("메모 작성", request_only=True, value={"memo": "확인완료. 다음 주에 답변 예정"}),
+            OpenApiExample(
+                "메모 작성", request_only=True, value={"memo": "확인완료. 다음 주에 답변 예정"}
+            ),
             OpenApiExample("메모 삭제", request_only=True, value={"memo": ""}),
         ],
         responses={
@@ -1810,7 +2033,11 @@ class MultiInquiryDetailView(APIView):
                 examples=[
                     OpenApiExample(
                         "Success",
-                        value={"id": 5, "memo": "확인완료. 다음 주에 답변 예정", "updated_at": "2026-03-12T15:00:00Z"},
+                        value={
+                            "id": 5,
+                            "memo": "확인완료. 다음 주에 답변 예정",
+                            "updated_at": "2026-03-12T15:00:00Z",
+                        },
                     )
                 ],
             ),
@@ -1821,9 +2048,13 @@ class MultiInquiryDetailView(APIView):
     def patch(self, request, page_id: int, pk: int):
         page, inquiry = self._get_inquiry(request, page_id, pk)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         if not inquiry:
-            return Response({"detail": "문의를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "문의를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         serializer = ContactInquiryMemoSerializer(inquiry, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
@@ -1834,6 +2065,7 @@ class MultiInquiryDetailView(APIView):
 # 구독자 관리
 # ═════════════════════════════════════════════════════════════
 
+
 class MultiSubscriptionListView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -1842,7 +2074,7 @@ class MultiSubscriptionListView(APIView):
         summary="특정 페이지의 구독자 목록 조회 (관리자)",
         description="""
 ## 개요
-특정 페이지에 등록된 구독자 목록을 최신순으로 반환합니다.  
+특정 페이지에 등록된 구독자 목록을 최신순으로 반환합니다.
 기간 필터와 키워드 검색을 지원합니다.
 
 ## 인증
@@ -1880,12 +2112,17 @@ class MultiSubscriptionListView(APIView):
         """,
         parameters=[
             OpenApiParameter(
-                name="period", type=OpenApiTypes.STR, location=OpenApiParameter.QUERY,
+                name="period",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
                 description="조회 기간. `all`=전체, `6m`=6개월, `1m`=1개월, `7d`=7일",
-                required=False, enum=["all", "6m", "1m", "7d"],
+                required=False,
+                enum=["all", "6m", "1m", "7d"],
             ),
             OpenApiParameter(
-                name="q", type=OpenApiTypes.STR, location=OpenApiParameter.QUERY,
+                name="q",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
                 description="키워드 검색 — 이름, 이메일, 휴대폰번호를 통합 검색합니다.",
                 required=False,
             ),
@@ -1921,7 +2158,9 @@ class MultiSubscriptionListView(APIView):
     def get(self, request, page_id: int):
         page = _get_owned_page(request, page_id)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
 
         qs = PageSubscription.objects.filter(page=page)
 
@@ -1933,9 +2172,7 @@ class MultiSubscriptionListView(APIView):
 
         q = request.query_params.get("q", "").strip()
         if q:
-            qs = qs.filter(
-                Q(name__icontains=q) | Q(email__icontains=q) | Q(phone__icontains=q)
-            )
+            qs = qs.filter(Q(name__icontains=q) | Q(email__icontains=q) | Q(phone__icontains=q))
 
         return Response(PageSubscriptionSerializer(qs, many=True).data)
 
@@ -1983,9 +2220,13 @@ class MultiSubscriptionDetailView(APIView):
     def delete(self, request, page_id: int, pk: int):
         page, subscription = self._get_subscription(request, page_id, pk)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         if not subscription:
-            return Response({"detail": "구독자를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "구독자를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         subscription.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -1994,7 +2235,7 @@ class MultiSubscriptionDetailView(APIView):
         summary="특정 페이지의 구독자 메모 수정 (관리자)",
         description="""
 ## 개요
-특정 페이지의 구독자에 **관리자 메모**를 작성하거나 수정합니다.  
+특정 페이지의 구독자에 **관리자 메모**를 작성하거나 수정합니다.
 메모는 관리자만 볼 수 있으며 구독자에게 노출되지 않습니다.
 
 ## 인증
@@ -2019,7 +2260,9 @@ class MultiSubscriptionDetailView(APIView):
         """,
         request=PageSubscriptionMemoSerializer,
         examples=[
-            OpenApiExample("메모 작성", request_only=True, value={"memo": "VIP 구독자 — 이메일 발송 우선"}),
+            OpenApiExample(
+                "메모 작성", request_only=True, value={"memo": "VIP 구독자 — 이메일 발송 우선"}
+            ),
             OpenApiExample("메모 삭제", request_only=True, value={"memo": ""}),
         ],
         responses={
@@ -2029,7 +2272,11 @@ class MultiSubscriptionDetailView(APIView):
                 examples=[
                     OpenApiExample(
                         "Success",
-                        value={"id": 3, "memo": "VIP 구독자 — 이메일 발송 우선", "updated_at": "2026-03-12T16:00:00Z"},
+                        value={
+                            "id": 3,
+                            "memo": "VIP 구독자 — 이메일 발송 우선",
+                            "updated_at": "2026-03-12T16:00:00Z",
+                        },
                     )
                 ],
             ),
@@ -2040,9 +2287,13 @@ class MultiSubscriptionDetailView(APIView):
     def patch(self, request, page_id: int, pk: int):
         page, subscription = self._get_subscription(request, page_id, pk)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         if not subscription:
-            return Response({"detail": "구독자를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "구독자를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         serializer = PageSubscriptionMemoSerializer(subscription, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
@@ -2053,6 +2304,7 @@ class MultiSubscriptionDetailView(APIView):
 # 미디어 파일 관리
 # ═════════════════════════════════════════════════════════════
 
+
 class MultiPageMediaView(APIView):
     permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser]
@@ -2062,7 +2314,7 @@ class MultiPageMediaView(APIView):
         summary="특정 페이지의 미디어 파일 목록 조회",
         description="""
 ## 개요
-특정 페이지에 업로드된 **이미지 파일 목록**을 최신순으로 반환합니다.  
+특정 페이지에 업로드된 **이미지 파일 목록**을 최신순으로 반환합니다.
 블록 편집 화면에서 기존 업로드된 이미지를 재사용할 때 호출합니다.
 
 ## 인증
@@ -2102,7 +2354,9 @@ class MultiPageMediaView(APIView):
     def get(self, request, page_id: int):
         page = _get_owned_page(request, page_id)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         qs = PageMedia.objects.filter(page=page)
         return Response(PageMediaSerializer(qs, many=True, context={"request": request}).data)
 
@@ -2111,8 +2365,8 @@ class MultiPageMediaView(APIView):
         summary="특정 페이지에 미디어 파일 업로드 (원본 + 크롭 파라미터 포함)",
         description="""
 ## 개요
-특정 페이지에 블록에서 사용할 **이미지 파일을 서버에 업로드**합니다.  
-**이미지 편집(크롭) 기능**을 지원하기 위해 완성본, 원본 이미지, 크롭 파라미터를 함께 저장합니다.  
+특정 페이지에 블록에서 사용할 **이미지 파일을 서버에 업로드**합니다.
+**이미지 편집(크롭) 기능**을 지원하기 위해 완성본, 원본 이미지, 크롭 파라미터를 함께 저장합니다.
 업로드 완료 후 반환된 `url`을 `block.data` 의 URL 필드에 저장하는 **2단계 방식**입니다.
 
 ## 인증
@@ -2176,9 +2430,19 @@ const { data: media } = await api.post(
                 description="유효성 검증 실패",
                 examples=[
                     OpenApiExample("파일 미첨부", value={"file": ["파일을 첨부해 주세요."]}),
-                    OpenApiExample("MIME 타입 오류", value={"file": ["지원하지 않는 파일 형식입니다."]}),
-                    OpenApiExample("파일 크기 초과", value={"file": ["파일 크기가 너무 큽니다. 최대 10MB까지 업로드 가능합니다."]}),
-                    OpenApiExample("crop_data 오류", value={"crop_data": ["crop_data는 유효한 JSON이어야 합니다."]}),
+                    OpenApiExample(
+                        "MIME 타입 오류", value={"file": ["지원하지 않는 파일 형식입니다."]}
+                    ),
+                    OpenApiExample(
+                        "파일 크기 초과",
+                        value={
+                            "file": ["파일 크기가 너무 큽니다. 최대 10MB까지 업로드 가능합니다."]
+                        },
+                    ),
+                    OpenApiExample(
+                        "crop_data 오류",
+                        value={"crop_data": ["crop_data는 유효한 JSON이어야 합니다."]},
+                    ),
                 ],
             ),
             401: OpenApiResponse(description="인증 실패"),
@@ -2188,7 +2452,9 @@ const { data: media } = await api.post(
     def post(self, request, page_id: int):
         page = _get_owned_page(request, page_id)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
 
         file = request.FILES.get("file")
         if not file:
@@ -2197,7 +2463,11 @@ const { data: media } = await api.post(
         mime_type = file.content_type or ""
         if mime_type not in _ALLOWED_MIME_TYPES:
             return Response(
-                {"file": ["지원하지 않는 파일 형식입니다. 허용 타입: jpeg, png, gif, webp, svg, bmp, tiff"]},
+                {
+                    "file": [
+                        "지원하지 않는 파일 형식입니다. 허용 타입: jpeg, png, gif, webp, svg, bmp, tiff"
+                    ]
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -2219,7 +2489,11 @@ const { data: media } = await api.post(
                 )
             if original_file.size > _MAX_FILE_SIZE_BYTES:
                 return Response(
-                    {"original_file": ["파일 크기가 너무 큽니다. 최대 10MB까지 업로드 가능합니다."]},
+                    {
+                        "original_file": [
+                            "파일 크기가 너무 큽니다. 최대 10MB까지 업로드 가능합니다."
+                        ]
+                    },
                     status=status.HTTP_400_BAD_REQUEST,
                 )
             try:
@@ -2285,7 +2559,7 @@ class MultiPageMediaDetailView(APIView):
         summary="특정 페이지의 미디어 파일 상세 조회 (재편집용)",
         description="""
 ## 개요
-특정 페이지에 업로드된 미디어 파일 1건의 정보를 반환합니다.  
+특정 페이지에 업로드된 미디어 파일 1건의 정보를 반환합니다.
 **이미지 재편집** 시 이 API를 호출하여 `original_url`과 `crop_data`를 가져온 뒤
 편집기의 이전 상태를 복원합니다.
 
@@ -2332,10 +2606,14 @@ openEditor(editUrl, {
     def get(self, request, page_id: int, media_id: int):
         page = _get_owned_page(request, page_id)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         media = PageMedia.objects.filter(pk=media_id, page=page).first()
         if not media:
-            return Response({"detail": "파일을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "파일을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         return Response(PageMediaSerializer(media, context={"request": request}).data)
 
     @extend_schema(
@@ -2343,7 +2621,7 @@ openEditor(editUrl, {
         summary="특정 페이지의 미디어 파일 재편집",
         description="""
 ## 개요
-이미지 **재편집(재크롭) 완료 후** 완성본 파일과 크롭 파라미터를 업데이트합니다.  
+이미지 **재편집(재크롭) 완료 후** 완성본 파일과 크롭 파라미터를 업데이트합니다.
 원본 이미지(`original_file`)는 변경되지 않습니다.
 
 ## 인증
@@ -2392,7 +2670,9 @@ await api.patch(
         """,
         request=_MEDIA_PATCH_REQUEST,
         responses={
-            200: OpenApiResponse(response=PageMediaSerializer, description="업데이트된 미디어 파일 정보"),
+            200: OpenApiResponse(
+                response=PageMediaSerializer, description="업데이트된 미디어 파일 정보"
+            ),
             400: OpenApiResponse(description="유효성 검증 실패"),
             401: OpenApiResponse(description="인증 실패"),
             404: OpenApiResponse(description="페이지 또는 파일 없음"),
@@ -2401,10 +2681,14 @@ await api.patch(
     def patch(self, request, page_id: int, media_id: int):
         page = _get_owned_page(request, page_id)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         media = PageMedia.objects.filter(pk=media_id, page=page).first()
         if not media:
-            return Response({"detail": "파일을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "파일을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
 
         # 새 완성본 파일 (선택)
         new_file = request.FILES.get("file")
@@ -2457,7 +2741,7 @@ await api.patch(
     @extend_schema(
         description="""
 ## 개요
-특정 페이지에 업로드된 미디어 파일 1건을 **영구 삭제**합니다.  
+특정 페이지에 업로드된 미디어 파일 1건을 **영구 삭제**합니다.
 스토리지의 실제 파일과 DB 레코드가 동시에 제거됩니다.
 
 ## 인증
@@ -2470,9 +2754,9 @@ await api.patch(
 | `media_id` | int | 삭제할 미디어 파일 ID |
 
 ## 주의사항
-> ⚠️ **삭제 후 복구 불가**  
-> 삭제된 파일 URL이 이미 블록의 `data`에 저장되어 있다면,  
-> 해당 블록의 이미지는 **깨진 링크**가 됩니다.  
+> ⚠️ **삭제 후 복구 불가**
+> 삭제된 파일 URL이 이미 블록의 `data`에 저장되어 있다면,
+> 해당 블록의 이미지는 **깨진 링크**가 됩니다.
 > 새 이미지를 업로드한 뒤 블록의 URL도 업데이트하세요.
 
 ## 응답
@@ -2493,9 +2777,13 @@ await api.patch(
     def delete(self, request, page_id: int, media_id: int):
         page = _get_owned_page(request, page_id)
         if not page:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         media = PageMedia.objects.filter(pk=media_id, page=page).first()
         if not media:
-            return Response({"detail": "파일을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "파일을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         media.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)

@@ -136,3 +136,73 @@ GET /api/v1/integrations/dm-verification/queue-state/?ig_connection_id=<uuid>
 - 오프닝(댓글 트리거): 시간당 ~720건 (Meta 사설답장 한도 750/hr 아래로 자동 유지)
 - 리워드/재안내/스토리답장: 시간당 ~1,800건 (Meta 별도 트랙 — 사실상 병목 아님)
 - 예: 댓글 1,000개 몰림 → 오프닝 전량 발송에 약 1.4시간. 게이지가 이걸 그대로 보여줍니다.
+
+---
+
+# v4.5 (2026-07-14) — 통계 헤드라인 정정 · '숨겨진 요청 · 스팸' 분리 · 상태 그룹
+
+> DM 분석(통계) 화면과 캠페인 DM 로그 리스트의 상태 표기·필터가 바뀝니다.
+> 백엔드는 **추가·정정만** 했고 기존 필드는 유지됩니다(하위호환). 문의: 백엔드팀.
+
+## A. 통계 헤드라인 "N% 전송" (100% 오표기 → 실제 전송률)
+
+`GET /api/v1/integrations/dm-verification/stats/?campaign_id=<uuid>`
+
+- 헤드라인 퍼센트는 **`unique_sent_rate`** (신규, = `unique_sent / unique_targets`)를 쓰세요.
+  기존에 쓰던 `delivery_rate` 는 Meta **접수건만 분모**라 하드실패가 빠져 **100%로 부풀어** 보입니다.
+- 헤드라인 문구 예시(권장):
+  - 큰 숫자: `unique_sent_rate` → "**84.2%** 메시지가 성공적으로 전송됐어요"
+  - 보조 문구: "DM 요청 댓글 **{unique_targets}**개 중 **{unique_sent}**개가 전송됐어요 ·
+    **{unique_targets − unique_sent}**명은 아직 받지 못했어요"
+  - (예: 827개 중 696개 전송 · 131명 미수신)
+
+## B. 카드: '확인 필요' → '숨겨진 요청 · 스팸' 분리 (+ CTR 위치 스왑)
+
+신규 필드 (모두 사람 단위, `unique_failed` 의 하위 분해):
+
+| 필드 | 의미 | 카드 |
+|---|---|---|
+| `unique_hidden_spam` | **숨겨진 요청 · 스팸** 인원 (비팔로워 채널 미개설로 숨김함行) | 신규 카드(구 '확인 필요' 자리) |
+| `unique_needs_attention_excl_hidden` | 숨김함 뺀 '확인 필요' 인원 | 새 '확인 필요' 카드(다른 위치) |
+| `unique_needs_attention` | 기존 '확인 필요' 총합(= failed + unconfirmed) | 하위호환·필요 시 |
+
+- 항등: `unique_needs_attention_excl_hidden = unique_needs_attention − unique_hidden_spam` (≥ 0).
+- **카드 위치**: 기존 '확인 필요'(131) 자리에는 **`unique_hidden_spam`(숨겨진 요청 · 스팸)** 을 표시,
+  **`unique_needs_attention_excl_hidden`** 는 다른 위치로 이동. 그리고 **CTR 카드와 '숨겨진 요청 · 스팸'
+  카드 위치를 스왑**합니다(순수 레이아웃 — 백엔드 값은 그대로).
+
+## C. DM 로그 리스트 상태 — `status_group` 단일 소스 (프론트 클라 분류 제거)
+
+수신자(사람) 단위 리스트 `GET .../dm-verification/recipients/?campaign_id=<uuid>` 의 각 행에
+아래 필드가 추가됩니다. **상태 배지/탭은 이제 `status_group` 하나로 그리세요.**
+(sent/delivered/read 불리언을 조합해 직접 분류하던 로직 제거)
+
+| status_group | 표시명(`status_group_display`) | 비고 |
+|---|---|---|
+| `waiting` | **대기중** | 구 "순차발송" — 명칭 변경 |
+| `sent` | 전송됨 | Meta 접수·도착·복구 성공 |
+| `read` | 읽음 | |
+| `hidden_spam` | **숨겨진 요청 · 스팸** | 숨김함行. `is_recovering=true` 면 "복구 대기" 보조 칩 추가 |
+| `attention` | 확인 필요 | 숨김함 제외한 나머지 실패 |
+
+- `is_recovering` (bool): 복구 대기 중 → 배지를 **"숨겨진 요청 · 스팸" + "복구 대기"** 2개로.
+  복구 OFF(만료 포함)면 false → **"숨겨진 요청 · 스팸"** 만.
+- **서버 필터**: `?status_group=waiting|sent|read|hidden_spam|attention` (기본 all). 각 사람은
+  정확히 1개 그룹이라 **탭 카운트가 total 로 분할**됩니다. `recipient_username` 부분검색과 조합 가능.
+  (구 `category` 파라미터는 하위호환 유지되나 신규는 `status_group` 사용)
+- 이벤트 단위 목록 `GET .../dm-verification/?...` 에도 동일한 `status_group`/`status_group_display`/
+  `is_recovering` 필드 + `?status_group=` 필터가 추가됐습니다.
+
+## D. 버그 정정 — 복구 완료가 상태에 반영됨 (needs_attention success-aware)
+
+- 예전에는 복구/후속 도착이 끝났어도 **과거 실패 로그가 남아** 사람 단위 행이 계속 "확인 필요"로
+  보였습니다. 이제 발송/도착/읽음/복구 성공이 하나라도 있으면 `status_group` 은 `sent`/`read`,
+  `needs_attention` 은 `false` 가 됩니다. → **복구 완료 유저는 전송됨/읽음으로 정상 표기.**
+- 따라서 배지는 반드시 `status_group` 기준으로 그리세요(불리언 조합/`needs_attention` 단독 판정 금지).
+
+## E. 필드 정의 (요약)
+
+- `unique_targets` 전체 대상 · `unique_sent` 전송(Meta 접수+) · `unique_read` 읽음
+- `unique_sent_rate` = sent/targets (헤드라인) · `unique_reach_rate` = delivered/targets (도착률)
+- `unique_hidden_spam` ⊆ `unique_failed` · `unique_needs_attention(_excl_hidden)`
+- `ctr` / `ctr_basis` 는 그대로 (스왑은 레이아웃만)

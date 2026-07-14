@@ -10,6 +10,9 @@
   - 셀프 DM 루프 방어: _poll_one_media 대댓글/self-comment 스킵, _enqueue_send_dm username 가드
     (2026-07-14 prod 실측: 자기 공개답글에 매시간 셀프 opening 50건 자기증식)
   - 복구 재댓글의 수신자 쿨다운 면제
+  - 게시물 스코핑: 캠페인 명시 media 의 재댓글만 라우팅 (matches_media, 2026-07-14 조임)
+  - 웹훅 필수필드 게이트 완화: username/media 결측 payload 도 복구 라우팅 도달
+  - 재댓글 웹훅 유실 보정 폴링(poll_recovery_recomments) + replies edge 서비스
   - 상태 표시(_STATUS_DISPLAY) / 프론트 액션(build_frontend_action)
 
 NOTE(test-db-not-clean): 내가 만든 캠페인/로그 기준으로만 단언한다.
@@ -546,6 +549,7 @@ class TestRecommentRouting:
             "from_username": "buyer",
             "comment_id": f"cmt_rt_{uuid.uuid4().hex[:8]}",
             "comment_text": "수락했어요",  # 캠페인 키워드와 무관
+            "media_id": "",  # 기본 캠페인이 ANY_MEDIA 라 media 미상이어도 스코핑 통과
             "source": "test",
         }
         defaults.update(kw)
@@ -653,6 +657,402 @@ class TestRecommentRouting:
         res = tasks_mod.process_comment_and_send_dm.apply(args=[payload]).result
         assert res["status"] == "skipped"
         assert res["reason"] == "is_reply"
+
+
+# ===== 복구 재댓글 게시물 스코핑 (2026-07-14 조임) =====
+
+
+class TestRecoveryMediaScoping:
+    def _pending(self, c, **kw):
+        return _opening(
+            c,
+            status=SentDMLog.Status.RECOVERY_PENDING,
+            recovery_pending_at=timezone.now() - timedelta(minutes=10),
+            recovery_reply_id=f"rec_ms_{uuid.uuid4().hex[:6]}",
+            **kw,
+        )
+
+    def _route(self, conn, media_id):
+        return tasks_mod._maybe_route_recovery_recomment(
+            page_ig_user_id=str(conn.external_account_id),
+            from_user_id=IGSID,
+            from_username="buyer",
+            comment_id=f"cmt_ms_{uuid.uuid4().hex[:8]}",
+            comment_text="수락했어요",
+            media_id=media_id,
+            source="test",
+        )
+
+    def test_specific_media_routes_only_campaign_media(self, ig_connection, no_real_send):
+        """캠페인이 명시한 게시물의 재댓글만 라우팅 — 같은 계정 다른 게시물은 미발동."""
+        c = _campaign(
+            ig_connection,
+            trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
+            media_id="media_scope_1",
+        )
+        self._pending(c)
+        assert self._route(ig_connection, media_id="media_other") == 0
+        assert not SentDMLog.objects.filter(campaign=c, status=SentDMLog.Status.QUEUED).exists()
+        assert self._route(ig_connection, media_id="media_scope_1") == 1
+        assert SentDMLog.objects.filter(campaign=c, status=SentDMLog.Status.QUEUED).exists()
+
+    def test_specific_media_fail_closed_on_unknown_media(self, ig_connection, no_real_send):
+        """media 미상(빈 값) → SPECIFIC_MEDIA 는 fail-closed (다른 게시물 가능성 배제 불가)."""
+        c = _campaign(
+            ig_connection,
+            trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
+            media_id="media_scope_2",
+        )
+        self._pending(c)
+        assert self._route(ig_connection, media_id="") == 0
+
+    def test_any_media_campaign_routes_any_media(self, ig_connection, no_real_send):
+        """ANY_MEDIA 캠페인은 캠페인 의미대로 모든 게시물의 재댓글 통과."""
+        c = _campaign(ig_connection)  # 기본 = ANY_MEDIA
+        self._pending(c)
+        assert self._route(ig_connection, media_id="media_whatever") == 1
+
+
+# ===== 웹훅 필수필드 게이트 완화 (복구 라우팅 도달 보장) =====
+
+
+class TestRelaxedWebhookGate:
+    def _payload(
+        self,
+        conn,
+        *,
+        media="media_gate",
+        from_id=IGSID,
+        from_username="buyer",
+        parent_id="",
+        text="수락했어요",
+        comment_id=None,
+        entry_id=None,
+    ):
+        value = {"id": comment_id or f"cmt_gate_{uuid.uuid4().hex[:8]}", "text": text}
+        if parent_id:
+            value["parent_id"] = parent_id
+        frm = {}
+        if from_id:
+            frm["id"] = from_id
+        if from_username:
+            frm["username"] = from_username
+        if frm:
+            value["from"] = frm
+        if media:
+            value["media"] = {"id": media}
+        return {
+            "field": "comments",
+            "entry_id": str(conn.external_account_id) if entry_id is None else entry_id,
+            "value": value,
+        }
+
+    def _pending(self, c):
+        return _opening(
+            c,
+            status=SentDMLog.Status.RECOVERY_PENDING,
+            recovery_pending_at=timezone.now() - timedelta(minutes=10),
+            recovery_reply_id=f"rec_gate_{uuid.uuid4().hex[:6]}",
+        )
+
+    def _run(self, payload):
+        return tasks_mod.process_comment_and_send_dm.apply(args=[payload]).result
+
+    def test_reply_without_media_reaches_recovery_routing(self, ig_connection, no_real_send):
+        """media 결측 답글 payload 가 error 로 죽지 않고 복구 라우팅에 도달한다(구멍 1).
+        media 미상이므로 ANY_MEDIA pending 만 라우팅 가능."""
+        c = _campaign(ig_connection)  # ANY_MEDIA
+        self._pending(c)
+        res = self._run(self._payload(ig_connection, media="", parent_id="cmt_parent_g1"))
+        assert res["status"] == "queued"
+        assert res["reason"] == "recovery_recomment_reply"
+        assert res["routed"] == 1
+
+    def test_reply_without_media_specific_pending_fail_closed(self, ig_connection, no_real_send):
+        c = _campaign(
+            ig_connection,
+            trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
+            media_id="media_gate_sp",
+        )
+        self._pending(c)
+        res = self._run(self._payload(ig_connection, media="", parent_id="cmt_parent_g2"))
+        assert res["status"] == "skipped"
+        assert res["reason"] == "is_reply"
+        assert not SentDMLog.objects.filter(campaign=c, status=SentDMLog.Status.QUEUED).exists()
+
+    def test_toplevel_without_media_routes_but_skips_normal_matching(
+        self, ig_connection, no_real_send
+    ):
+        """media 결측 top-level: 복구 라우팅만 시도 — ANY_MEDIA 일반 매칭 오발송 없음."""
+        c = _campaign(ig_connection)  # ANY_MEDIA (키워드 필터 없음 = 전부 매칭인 캠페인)
+        self._pending(c)
+        res = self._run(self._payload(ig_connection, media=""))
+        assert res["status"] == "queued"
+        assert res["reason"] == "recovery_recomment"
+        assert res["routed"] == 1
+        new = SentDMLog.objects.filter(campaign=c, status=SentDMLog.Status.QUEUED).get()
+        # 일반 매칭이 아니라 복구 라우팅 경로로 만들어졌음을 payload 마커로 확인
+        assert new.webhook_payload.get("recovery_recomment") is True
+
+    def test_toplevel_without_media_no_pending_skipped(self, ig_connection, no_real_send):
+        c = _campaign(ig_connection)  # ANY_MEDIA — media 미상이면 일반 매칭도 하지 않아야 함
+        res = self._run(self._payload(ig_connection, media=""))
+        assert res["status"] == "skipped"
+        assert res["reason"] == "no_media_id"
+        assert not SentDMLog.objects.filter(campaign=c).exists()
+
+    def test_missing_username_still_enqueues(self, ig_connection, no_real_send):
+        """from.username 결측 payload 도 정상 처리 (NOT NULL 크래시 없음)."""
+        c = _campaign(ig_connection)
+        res = self._run(self._payload(ig_connection, from_username=""))
+        assert res["status"] == "queued"
+        log = SentDMLog.objects.filter(campaign=c).get()
+        assert log.recipient_user_id == IGSID
+        assert log.recipient_username == ""
+
+    def test_missing_from_id_falls_back_to_username(self, ig_connection, no_real_send):
+        c = _campaign(ig_connection)
+        res = self._run(self._payload(ig_connection, from_id=""))
+        assert res["status"] == "queued"
+        log = SentDMLog.objects.filter(campaign=c).get()
+        assert log.recipient_user_id == "buyer"  # 폴링 경로와 동일한 username 폴백
+
+    def test_hard_required_fields_still_error(self, ig_connection, no_real_send):
+        _campaign(ig_connection)
+        # comment_id 없음
+        p = self._payload(ig_connection)
+        p["value"]["id"] = ""
+        assert self._run(p)["status"] == "error"
+        # 신원키 둘 다 없음
+        p2 = self._payload(ig_connection, from_id="", from_username="")
+        assert self._run(p2)["status"] == "error"
+        # entry_id 없음 (테넌트 가드)
+        p3 = self._payload(ig_connection, entry_id="")
+        assert self._run(p3)["status"] == "error"
+
+    def test_self_comment_without_media_skipped(self, ig_connection, no_real_send):
+        c = _campaign(ig_connection)
+        self._pending(c)
+        res = self._run(
+            self._payload(
+                ig_connection,
+                media="",
+                from_id=str(ig_connection.external_account_id),
+                from_username=ig_connection.username,
+            )
+        )
+        assert res["status"] == "skipped"
+        assert res["reason"] == "self_comment"
+
+
+# ===== 재댓글 웹훅 유실 보정 폴링 (poll_recovery_recomments) =====
+
+
+class TestRecoveryRecommentPoll:
+    ROOT = "cmt_root_poll_1"
+    GUIDE = "rec_guide_poll_1"
+
+    def _ts(self, minutes_ago=0):
+        return (timezone.now() - timedelta(minutes=minutes_ago)).strftime("%Y-%m-%dT%H:%M:%S%z")
+
+    def _pending(self, c, *, root=None, guide=None, **kw):
+        return _opening(
+            c,
+            comment_id=root or self.ROOT,
+            status=SentDMLog.Status.RECOVERY_PENDING,
+            recovery_pending_at=kw.pop("recovery_pending_at", timezone.now() - timedelta(hours=1)),
+            recovery_reply_id=self.GUIDE if guide is None else guide,
+            **kw,
+        )
+
+    def _guide_reply(self, conn):
+        return {
+            "id": self.GUIDE,
+            "text": "DM이 숨겨진 요청함으로 갔어요, 수락 후 다시 댓글 주세요!",
+            "username": conn.username,
+            "from": {"id": str(conn.external_account_id)},
+            "timestamp": self._ts(50),
+        }
+
+    def _user_reply(self, *, rid="reply_user_1", username="buyer", from_id=IGSID, minutes_ago=5):
+        r = {
+            "id": rid,
+            "text": "DM요청 수락했어요",
+            "timestamp": self._ts(minutes_ago),
+        }
+        if username:
+            r["username"] = username
+        if from_id:
+            r["from"] = {"id": from_id}
+        return r
+
+    def _patch_replies(self, monkeypatch, replies, paging_after=None):
+        mock = MagicMock(return_value={"data": replies, "paging_after": paging_after})
+        monkeypatch.setattr(InstagramMediaService, "list_comment_replies", mock)
+        return mock
+
+    def _run(self):
+        return tasks_mod.poll_recovery_recomments.apply().result
+
+    def test_routes_missed_thread_reply(self, ig_connection, no_real_send, monkeypatch):
+        """웹훅이 유실된 스레드 답글 재댓글을 replies edge 폴링이 보정 라우팅한다."""
+        c = _campaign(
+            ig_connection,
+            trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
+            media_id="media_poll_rp",
+        )
+        self._pending(c)
+        mock = self._patch_replies(
+            monkeypatch, [self._guide_reply(ig_connection), self._user_reply()]
+        )
+        self._run()
+        # NOTE(test-db-not-clean): 전역 카운터 대신 내 스레드/캠페인 기준으로 단언
+        roots_called = [call.args[0] for call in mock.call_args_list]
+        assert roots_called.count(self.ROOT) == 1
+        new = SentDMLog.objects.filter(campaign=c, status=SentDMLog.Status.QUEUED).get()
+        assert new.comment_id == "reply_user_1"
+        assert new.webhook_payload.get("recovery_recomment") is True
+        assert new.webhook_payload.get("source") == "recovery_poll"
+
+    def test_self_replies_never_routed(self, ig_connection, no_real_send, monkeypatch):
+        """우리 안내 대댓글(id/작성자) 어떤 형태로 내려와도 셀프 라우팅 금지."""
+        c = _campaign(ig_connection)
+        self._pending(c)
+        replies = [
+            # (a) reduced-fields 재시도 형태: from 없음 — 안내 id 로 스킵
+            {"id": self.GUIDE, "text": "안내", "timestamp": self._ts(50)},
+            # (b) username 케이스 불일치 — 케이스 무시 비교로 스킵
+            self._user_reply(rid="r_self_un", username=ig_connection.username.upper(), from_id=""),
+            # (c) from.id == 페이지 IGSID
+            self._user_reply(
+                rid="r_self_id", username="whoever", from_id=str(ig_connection.external_account_id)
+            ),
+            # (d) 신원 없음 — 매칭 불가 스킵
+            {"id": "r_anon", "text": "hi", "timestamp": self._ts(5)},
+        ]
+        self._patch_replies(monkeypatch, replies)
+        self._run()
+        assert not SentDMLog.objects.filter(campaign=c, status=SentDMLog.Status.QUEUED).exists()
+
+    def test_repeat_runs_are_idempotent(self, ig_connection, no_real_send, monkeypatch):
+        c = _campaign(ig_connection)
+        self._pending(c)
+        self._patch_replies(monkeypatch, [self._user_reply()])
+        self._run()
+        assert SentDMLog.objects.filter(campaign=c, status=SentDMLog.Status.QUEUED).count() == 1
+        self._run()  # 2회차 — idempotency/쿨다운이 흡수
+        assert SentDMLog.objects.filter(campaign=c, status=SentDMLog.Status.QUEUED).count() == 1
+
+    def test_ttl_passed_thread_not_fetched(self, ig_connection, no_real_send, monkeypatch):
+        c = _campaign(ig_connection, recovery_ttl_seconds=3600)
+        self._pending(c, recovery_pending_at=timezone.now() - timedelta(hours=2))
+        mock = self._patch_replies(monkeypatch, [self._user_reply()])
+        self._run()
+        assert self.ROOT not in [call.args[0] for call in mock.call_args_list]
+        assert not SentDMLog.objects.filter(campaign=c, status=SentDMLog.Status.QUEUED).exists()
+
+    def test_unguided_pending_not_selected(self, ig_connection, no_real_send, monkeypatch):
+        """안내 미게시(recovery_reply_id="") pending 은 폴링 대상 아님 — 답글 달 안내가 없다."""
+        c = _campaign(ig_connection)
+        self._pending(c, guide="")
+        mock = self._patch_replies(monkeypatch, [self._user_reply()])
+        self._run()
+        assert self.ROOT not in [call.args[0] for call in mock.call_args_list]
+
+    def test_shared_root_fetched_once_routes_all_campaigns(
+        self, ig_connection, no_real_send, monkeypatch
+    ):
+        """같은 루트 댓글을 공유하는 캠페인 2개 — fetch 1회, 두 캠페인 모두 라우팅."""
+        c1 = _campaign(
+            ig_connection,
+            trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
+            media_id="media_share_rp",
+        )
+        c2 = _campaign(ig_connection, name="rec-campaign-2")  # ANY_MEDIA
+        self._pending(c1, guide="rec_guide_share_1")
+        self._pending(c2, guide="rec_guide_share_2")
+        mock = self._patch_replies(monkeypatch, [self._user_reply(rid="reply_share_1")])
+        self._run()
+        roots_called = [call.args[0] for call in mock.call_args_list]
+        assert roots_called.count(self.ROOT) == 1  # 스레드당 fetch 1회
+        assert SentDMLog.objects.filter(campaign=c1, status=SentDMLog.Status.QUEUED).exists()
+        assert SentDMLog.objects.filter(campaign=c2, status=SentDMLog.Status.QUEUED).exists()
+
+    def test_toggle_off_noop(self, ig_connection, no_real_send, monkeypatch, settings):
+        settings.RECOVERY_RECOMMENT_POLL_ENABLED = False
+        c = _campaign(ig_connection)
+        self._pending(c)
+        mock = self._patch_replies(monkeypatch, [self._user_reply()])
+        assert self._run() == {"enabled": False}
+        assert mock.call_count == 0
+
+    def test_username_keyed_pending_matches(self, ig_connection, no_real_send, monkeypatch):
+        """폴링 경로가 만든 pending(recipient=username 키)도 replies 폴링이 매칭."""
+        c = _campaign(ig_connection)
+        self._pending(c, recipient_user_id="buyer", recipient_username="buyer")
+        self._patch_replies(monkeypatch, [self._user_reply()])
+        self._run()
+        assert SentDMLog.objects.filter(campaign=c, status=SentDMLog.Status.QUEUED).exists()
+
+    def test_deleted_root_graceful(self, ig_connection, no_real_send, monkeypatch):
+        """루트 댓글 삭제 → 방어적 빈 응답 — 상태 변화 없이 무해하게 종료."""
+        c = _campaign(ig_connection)
+        pending = self._pending(c)
+        self._patch_replies(monkeypatch, [])
+        self._run()
+        pending.refresh_from_db()
+        assert pending.status == SentDMLog.Status.RECOVERY_PENDING  # 만료 정산은 스윕 담당
+        assert not SentDMLog.objects.filter(campaign=c, status=SentDMLog.Status.QUEUED).exists()
+
+    def test_reply_before_guidance_not_routed(self, ig_connection, no_real_send, monkeypatch):
+        """안내(pending 진입) 이전 timestamp 의 답글은 우리 안내에 대한 응답이 아님."""
+        c = _campaign(ig_connection)
+        self._pending(c)  # recovery_pending_at = 1시간 전
+        self._patch_replies(monkeypatch, [self._user_reply(minutes_ago=120)])
+        self._run()
+        assert not SentDMLog.objects.filter(campaign=c, status=SentDMLog.Status.QUEUED).exists()
+
+
+# ===== replies edge 서비스 (list_comment_replies) =====
+
+
+class TestListCommentRepliesService:
+    def _setup(self, monkeypatch):
+        from apps.integrations import services as services_mod
+
+        monkeypatch.setattr(services_mod.MockInstagramProvider, "is_mock_mode", lambda: False)
+        return services_mod
+
+    def test_400_retries_with_reduced_fields(self, monkeypatch):
+        services_mod = self._setup(monkeypatch)
+        bad = MagicMock(ok=False, status_code=400)
+        good = MagicMock(ok=True)
+        good.json.return_value = {"data": [{"id": "r1"}], "paging": {}}
+        get = MagicMock(side_effect=[bad, good])
+        monkeypatch.setattr(services_mod.requests, "get", get)
+        res = InstagramMediaService.list_comment_replies("cmt_x", "tok")
+        assert res == {"data": [{"id": "r1"}], "paging_after": None}
+        assert get.call_count == 2
+        assert "from" not in get.call_args.kwargs["params"]["fields"]
+
+    def test_timeout_returns_empty_shape(self, monkeypatch):
+        services_mod = self._setup(monkeypatch)
+        get = MagicMock(side_effect=services_mod.requests.Timeout)
+        monkeypatch.setattr(services_mod.requests, "get", get)
+        assert InstagramMediaService.list_comment_replies("cmt_x", "tok") == {
+            "data": [],
+            "paging_after": None,
+        }
+
+    def test_empty_comment_id_noop(self, monkeypatch):
+        services_mod = self._setup(monkeypatch)
+        get = MagicMock()
+        monkeypatch.setattr(services_mod.requests, "get", get)
+        assert InstagramMediaService.list_comment_replies("", "tok") == {
+            "data": [],
+            "paging_after": None,
+        }
+        assert get.call_count == 0
 
 
 # ===== 발송 시점 최후 방어선 (self recipient) =====

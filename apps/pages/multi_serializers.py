@@ -11,10 +11,10 @@ from rest_framework import serializers
 
 from .models import Page
 
-
 # ─────────────────────────────────────────────────────────────
 # 페이지 목록 / 상세
 # ─────────────────────────────────────────────────────────────
+
 
 @extend_schema_serializer(
     examples=[
@@ -37,17 +37,45 @@ from .models import Page
     ]
 )
 class MultiPageSerializer(serializers.ModelSerializer):
-    """다중 페이지 목록/상세 조회 응답."""
+    """다중 페이지 목록/상세 조회 응답.
+
+    두 플래그를 함께 노출한다:
+    - `is_public` — 사용자 공개 토글(쓰기 가능).
+    - `is_active` — 요금제 활성 슬롯(읽기 전용, billing/page-activation 이 관리).
+    - `is_live` — 실제 외부 노출 여부 = is_active AND is_public (프론트 '켜짐' 판단 기준).
+    """
+
+    is_active = serializers.BooleanField(
+        read_only=True, help_text="요금제 활성 슬롯 여부. 공개 토글로 바꿀 수 없음"
+    )
+    is_live = serializers.SerializerMethodField(
+        help_text="실제 외부 노출 여부 = is_active AND is_public"
+    )
 
     class Meta:
         model = Page
-        fields = ["id", "slug", "title", "is_public", "data", "custom_css", "created_at", "updated_at"]
+        fields = [
+            "id",
+            "slug",
+            "title",
+            "is_public",
+            "is_active",
+            "is_live",
+            "data",
+            "custom_css",
+            "created_at",
+            "updated_at",
+        ]
         read_only_fields = ["id", "slug", "created_at", "updated_at"]
+
+    def get_is_live(self, obj) -> bool:
+        return bool(obj.is_active and obj.is_public)
 
 
 # ─────────────────────────────────────────────────────────────
 # 페이지 생성
 # ─────────────────────────────────────────────────────────────
+
 
 @extend_schema_serializer(
     examples=[
@@ -129,6 +157,7 @@ class MultiPageCreateSerializer(serializers.Serializer):
 # ─────────────────────────────────────────────────────────────
 # 페이지 slug 변경 (다중 페이지용)
 # ─────────────────────────────────────────────────────────────
+
 
 class MultiPageSlugChangeSerializer(serializers.Serializer):
     """

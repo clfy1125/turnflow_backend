@@ -41,11 +41,23 @@ from rest_framework.response import Response
 from .campaign_stats import (
     CONFIRMED_DELIVERED_STATUSES,
     NEEDS_ATTENTION_STATUSES,
+    QUEUE_WAITING_STATUSES,
+    ROOT_DM_Q,
     SENT_FOR_QUOTA_STATUSES,
     people_rollup,
 )
 from .dm_exceptions import DMSendError, DMTransientError
 from .dm_frontend_actions import SELF_CHECK_CHECKLIST, build_frontend_action
+from .dm_status_groups import (
+    ATTENTION,
+    GROUP_DISPLAY,
+    HIDDEN_SPAM,
+    READ,
+    SENT,
+    VALID_GROUPS,
+    WAITING,
+    status_group_q,
+)
 from .models import AutoDMCampaign, IGAccountConnection, SentDMLog
 from .serializers import (
     DMLookupResponseSerializer,
@@ -141,9 +153,13 @@ class DMVerificationViewSet(viewsets.ViewSet):
 
         ## 쿼리 파라미터
         - `campaign_id` (UUID, 선택): 특정 캠페인만 필터
-        - `status` (str, 선택): 특정 상태만 필터
+        - `status` (str, 선택): 특정 **원시 상태** 하나만 필터
             (queued, submitting, accepted, delivered, read,
-             failed_api, failed_token, failed_window, failed_param, failed_no_trace, skipped)
+             failed_api, failed_token, failed_window, failed_param, failed_no_trace, skipped, ...)
+        - `status_group` (str, 선택): **코스 상태 그룹** 필터 (권장 — 탭/검색용).
+            `waiting`(대기중)/`sent`(전송됨)/`read`(읽음)/`hidden_spam`(숨겨진 요청·스팸)/
+            `attention`(확인 필요). 서버가 그룹 정의로 필터하므로 프론트가 상태를 다시
+            분류할 필요가 없습니다. 잘못된 값은 400. `status` 와 함께 주면 둘 다 AND.
         - `since` (ISO datetime, 선택): 이 시각 이후 생성된 로그만
         - `recipient_username` (str, 선택): 수신자 username 부분일치
         - `recipient_user_id` (str, 선택): 수신자 Instagram ID **정확일치**.
@@ -153,8 +169,12 @@ class DMVerificationViewSet(viewsets.ViewSet):
         - `page` (int): 페이지 번호 (PageNumberPagination, page_size=20)
 
         ## 비즈니스 로직
-        프론트는 `display_status` 필드로 한국어 표시명을, `is_delivered` 로 진짜 도착
-        여부를, `verified_via` 로 검증 경로(echo/conv_api)를 확인할 수 있습니다.
+        프론트는 다음 필드로 상태를 표시합니다:
+        - `status_group` / `status_group_display`: 코스 그룹(탭·주 배지). "순차발송" 은 이제
+          `waiting`(대기중)입니다. 숨겨진 요청/스팸함으로 간 DM 은 `hidden_spam`.
+        - `is_recovering`: 복구 대기(recovery_pending)면 true → "복구 대기" 보조 칩 표시.
+        - `display_status`: 세분화 라벨(상세 표시), `is_delivered`: 진짜 도착 여부,
+          `verified_via`: 검증 경로(echo/conv_api).
 
         ## 참고
         이 목록은 **개별 발송 이벤트** 단위입니다. 수신자(사람) 단위로 묶어 보려면
@@ -163,12 +183,21 @@ class DMVerificationViewSet(viewsets.ViewSet):
         parameters=[
             OpenApiParameter("campaign_id", str, OpenApiParameter.QUERY, required=False),
             OpenApiParameter("status", str, OpenApiParameter.QUERY, required=False),
+            OpenApiParameter(
+                "status_group",
+                str,
+                OpenApiParameter.QUERY,
+                required=False,
+                enum=sorted(VALID_GROUPS),
+                description="코스 상태 그룹 필터 (waiting/sent/read/hidden_spam/attention).",
+            ),
             OpenApiParameter("since", str, OpenApiParameter.QUERY, required=False),
             OpenApiParameter("recipient_username", str, OpenApiParameter.QUERY, required=False),
             OpenApiParameter("recipient_user_id", str, OpenApiParameter.QUERY, required=False),
         ],
         responses={
             200: SentDMLogSerializer(many=True),
+            400: OpenApiResponse(description="status_group 값 오류"),
             401: OpenApiResponse(description="인증 실패"),
             403: OpenApiResponse(description="워크스페이스 멤버 아님"),
         },
@@ -181,6 +210,7 @@ class DMVerificationViewSet(viewsets.ViewSet):
 
         campaign_id = request.query_params.get("campaign_id")
         status_filter = request.query_params.get("status")
+        status_group_filter = request.query_params.get("status_group")
         since = request.query_params.get("since")
         recipient_username = request.query_params.get("recipient_username")
         recipient_user_id = request.query_params.get("recipient_user_id")
@@ -189,6 +219,26 @@ class DMVerificationViewSet(viewsets.ViewSet):
             qs = qs.filter(campaign_id=campaign_id)
         if status_filter:
             qs = qs.filter(status=status_filter)
+        if status_group_filter:
+            if status_group_filter not in VALID_GROUPS:
+                return Response(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": 400,
+                            "message": (
+                                "status_group 값이 올바르지 않습니다. "
+                                "(waiting/sent/read/hidden_spam/attention)"
+                            ),
+                            "details": {
+                                "field": "status_group",
+                                "allowed": sorted(VALID_GROUPS),
+                            },
+                        },
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            qs = qs.filter(status_group_q(status_group_filter))
         if since:
             qs = qs.filter(created_at__gte=since)
         if recipient_username:
@@ -571,6 +621,19 @@ class DMVerificationViewSet(viewsets.ViewSet):
           `?since=` 로 조정)를 따릅니다. queue-state.`people` 은 **전 기간**이라 30일을 넘긴
           캠페인은 두 화면 숫자가 어긋날 수 있습니다 — 나란히 비교 시 `?since=` 를 맞추세요.
 
+        ### ④ 헤드라인 · 숨겨진 요청·스팸 분리 — v4.5 (유저 콘솔 카드)
+        - `unique_sent_rate`: **unique_sent / unique_targets ([0,1] 클램프)**.
+          헤드라인 "N% 메시지가 성공적으로 전송됐어요" 는 이 값을 쓰세요. `delivery_rate`
+          (Meta 접수건만 분모)는 하드실패가 빠져 100%로 부풀 수 있어 부적합합니다.
+          예) 전송 696 / 전체 대상 827 → `unique_sent_rate` = 0.8416 (84.2%).
+        - `unique_hidden_spam`: **'숨겨진 요청 · 스팸' 인원** — 비팔로워라 채널 미개설(2534025)로
+          첫 DM 이 상대 숨겨진 요청/스팸함으로 간 사람. `unique_failed` 의 부분집합.
+          (복구 ON → recovery_pending/expired, 복구 OFF/미보유 → failed_param@2534025)
+        - `unique_needs_attention`: 기존 '확인 필요' 총합 = `unique_failed + unique_unconfirmed`
+          (하위호환·다른 위치 배치용).
+        - `unique_needs_attention_excl_hidden`: 숨김함을 뺀 새 '확인 필요' 인원
+          (= `unique_needs_attention − unique_hidden_spam`, ≥ 0). 새 '확인 필요' 카드용.
+
         ## 인증
         Bearer JWT + 워크스페이스 멤버십.
         """,
@@ -587,28 +650,32 @@ class DMVerificationViewSet(viewsets.ViewSet):
         },
         examples=[
             OpenApiExample(
-                "게이트형 캠페인 통계 (사람 단위 + CTR)",
+                "게이트형 캠페인 통계 (사람 단위 + CTR + v4.5 카드)",
                 value={
                     "total": 1240,
                     "delivered": 610,
-                    "read": 402,
+                    "read": 458,
                     "gate_passed": 388,
-                    "delivery_rate": 0.984,
-                    "unique_recipients": 620,
-                    "unique_sent": 620,
-                    "unique_delivered": 610,
-                    "unique_read": 402,
+                    "delivery_rate": 1.0,
+                    "unique_recipients": 827,
+                    "unique_sent": 696,
+                    "unique_delivered": 696,
+                    "unique_read": 458,
                     "unique_followers": 388,
-                    "unique_delivery_rate": 0.9839,
-                    "unique_targets": 700,
+                    "unique_delivery_rate": 1.0,
+                    "unique_targets": 827,
                     "unique_waiting": 0,
-                    "unique_failed": 80,
+                    "unique_failed": 131,
                     "unique_unconfirmed": 0,
-                    "unique_reach_rate": 0.8714,
-                    "ctr": 0.6258,
+                    "unique_reach_rate": 0.8416,
+                    "unique_sent_rate": 0.8416,
+                    "unique_hidden_spam": 98,
+                    "unique_needs_attention": 131,
+                    "unique_needs_attention_excl_hidden": 33,
+                    "ctr": 0.6508,
                     "ctr_basis": "click",
-                    "ctr_interacted": 388,
-                    "ctr_denominator": 620,
+                    "ctr_interacted": 453,
+                    "ctr_denominator": 696,
                 },
                 response_only=True,
             )
@@ -768,6 +835,30 @@ class DMVerificationViewSet(viewsets.ViewSet):
         # 기준이라, 부모 오프닝이 시간창(기본 30일) 밖이고 child 만 안에 든 드문 경우 분자>분모가
         # 될 수 있다 → [0,1] 로 클램프해 100% 초과 표기를 막는다.
         unique_reach_rate = min(unique_delivered / people["total"], 1.0) if people["total"] else 0.0
+        # 헤드라인 "N% 메시지가 성공적으로 전송됐어요" = 전체 대상 대비 전송된 비율.
+        # delivery_rate(Meta 접수건만 분모)는 하드실패가 빠져 100%로 부풀므로 헤드라인엔 부적합 →
+        # people.total(전체 대상) 을 분모로 하는 이 값을 쓴다. [0,1] 클램프(위와 동일 사유).
+        unique_sent_rate = min(unique_sent / people["total"], 1.0) if people["total"] else 0.0
+
+        # ── v4.5 — '숨겨진 요청 · 스팸' 분리 (아무것도 못 받은 사람 = people.failed 의 부분집합)
+        # 비팔로워 채널 미개설(2534025)로 숨김함으로 간 케이스: 복구 대기/만료(recovery_*) +
+        # 복구 OFF 시 failed_param@2534025. failed 버킷(발송·대기 없음)에 든 사람만 센다
+        # (같은 사람이 다른 댓글로 발송/대기 중이면 sent/waiting 버킷이므로 여기서 제외).
+        root = qs.filter(ROOT_DM_Q)
+        sent_or_waiting_ids = root.filter(
+            status__in=SENT_FOR_QUOTA_STATUSES + QUEUE_WAITING_STATUSES
+        ).values("recipient_user_id")
+        unique_hidden_spam = (
+            root.filter(status_group_q(HIDDEN_SPAM))
+            .exclude(recipient_user_id__in=sent_or_waiting_ids)
+            .values("recipient_user_id")
+            .distinct()
+            .count()
+        )
+        # 기존 '확인 필요' 총합(= failed + 도착미확인) 과, 숨김함을 뺀 새 '확인 필요'.
+        # hidden_spam ⊆ failed 이므로 excl 은 항상 ≥ 0.
+        unique_needs_attention = people["failed"] + unique_unconfirmed
+        unique_needs_attention_excl_hidden = max(unique_needs_attention - unique_hidden_spam, 0)
 
         agg.update(
             {
@@ -782,6 +873,10 @@ class DMVerificationViewSet(viewsets.ViewSet):
                 "unique_failed": people["failed"],
                 "unique_unconfirmed": unique_unconfirmed,
                 "unique_reach_rate": round(unique_reach_rate, 4),
+                "unique_sent_rate": round(unique_sent_rate, 4),
+                "unique_hidden_spam": unique_hidden_spam,
+                "unique_needs_attention": unique_needs_attention,
+                "unique_needs_attention_excl_hidden": unique_needs_attention_excl_hidden,
                 "ctr": round(ctr, 4),
                 "ctr_basis": ctr_basis,
                 "ctr_interacted": ctr_interacted,
@@ -812,14 +907,22 @@ class DMVerificationViewSet(viewsets.ViewSet):
         ## 쿼리 파라미터
         - `campaign_id` (UUID, **필수**): 대상 캠페인
         - `recipient_username` (str, 선택): username 부분일치 검색
-        - `category` (str, 선택): 상태별 사람 단위 필터 —
-          `all`(기본)/`delivered`(성공)/`read`(읽음)/`attention`(확인 필요).
-          **페이지네이션 이전**에 적용되며 `count` 는 필터 후 총 인원이다.
-          `delivered` 는 정의상 `read` 를 포함한다. 잘못된 값은 400.
+        - `status_group` (str, 선택, **권장**): 코스 상태 그룹 필터 —
+          `all`(기본)/`waiting`(대기중)/`sent`(전송됨)/`read`(읽음)/
+          `hidden_spam`(숨겨진 요청·스팸)/`attention`(확인 필요).
+          각 사람은 정확히 1개 그룹에 속하므로(응답 `status_group` 과 1:1) **탭 카운트가
+          total 로 분할**된다. 프론트에서 상태를 재분류할 필요가 없다. 잘못된 값은 400.
+        - `category` (str, 선택, legacy): `all`/`delivered`(성공, read 포함·중첩)/`read`/
+          `attention`. 하위호환용. 신규 화면은 `status_group` 을 쓸 것.
         - `page` (int): 페이지 번호 (page_size=20)
+        필터는 **페이지네이션 이전**에 적용되며 `count` 는 필터 후 총 인원이다.
 
         ## 각 행 필드
         - `recipient_user_id` / `recipient_username`: 수신자 (username 은 최신값 best-effort)
+        - `status_group` / `status_group_display`: **코스 상태 그룹(주 배지·탭)**.
+          waiting(대기중)/sent(전송됨)/read(읽음)/hidden_spam(숨겨진 요청·스팸)/attention(확인 필요).
+          "순차발송" 은 이제 `waiting`(대기중)이다.
+        - `is_recovering` (bool): 복구 대기 DM 이 있는 숨김함 케이스 → "복구 대기" 보조 칩.
         - `sent` (bool): DM 이 실제 발송됨 (accepted 이상)
         - `delivered` (bool): 도착 확인됨 (delivered/read)
         - `read` (bool): 읽음 확인됨
@@ -843,17 +946,28 @@ class DMVerificationViewSet(viewsets.ViewSet):
             OpenApiParameter("campaign_id", str, OpenApiParameter.QUERY, required=True),
             OpenApiParameter("recipient_username", str, OpenApiParameter.QUERY, required=False),
             OpenApiParameter(
+                "status_group",
+                str,
+                OpenApiParameter.QUERY,
+                required=False,
+                enum=["all", *sorted(VALID_GROUPS)],
+                description=(
+                    "코스 상태 그룹 필터 (권장, 페이지네이션 이전 적용, 기본 all). "
+                    "waiting/sent/read/hidden_spam/attention — 응답 status_group 과 1:1."
+                ),
+            ),
+            OpenApiParameter(
                 "category",
                 str,
                 OpenApiParameter.QUERY,
                 required=False,
                 enum=["all", "delivered", "read", "attention"],
-                description="상태별 사람 단위 필터 (페이지네이션 이전 적용, 기본 all).",
+                description="[legacy] 상태별 사람 단위 필터 (중첩 정의). 신규는 status_group 사용.",
             ),
         ],
         responses={
             200: DMRecipientRollupSerializer(many=True),
-            400: OpenApiResponse(description="campaign_id 누락 또는 category 값 오류"),
+            400: OpenApiResponse(description="campaign_id 누락 또는 status_group/category 값 오류"),
             401: OpenApiResponse(description="인증 실패"),
             403: OpenApiResponse(description="워크스페이스 멤버 아님"),
             404: OpenApiResponse(description="캠페인 없음"),
@@ -877,17 +991,23 @@ class DMVerificationViewSet(viewsets.ViewSet):
                             "follower_status": "verified_follower",
                             "dm_count": 2,
                             "needs_attention": False,
+                            "status_group": "read",
+                            "status_group_display": "읽음",
+                            "is_recovering": False,
                             "last_activity_at": "2026-07-09T13:20:11+09:00",
                         },
                         {
-                            "recipient_user_id": "17841400000000002",
-                            "recipient_username": "user_17841400000000002",
-                            "sent": True,
-                            "delivered": True,
+                            "recipient_user_id": "17841400000000003",
+                            "recipient_username": "user_17841400000000003",
+                            "sent": False,
+                            "delivered": False,
                             "read": False,
                             "follower_status": "not_followed",
                             "dm_count": 1,
                             "needs_attention": False,
+                            "status_group": "hidden_spam",
+                            "status_group_display": "숨겨진 요청 · 스팸",
+                            "is_recovering": True,
                             "last_activity_at": "2026-07-09T13:19:02+09:00",
                         },
                     ],
@@ -939,12 +1059,53 @@ class DMVerificationViewSet(viewsets.ViewSet):
             passed_n=Count("id", filter=Q(gate_status="passed")),
             clicks_n=Count("id", filter=Q(parent_log__isnull=False)),
             needs_n=Count("id", filter=Q(status__in=NEEDS_ATTENTION_STATUSES)),
+            # v4.5 — 코스 상태 그룹 판정용 (대기중 / 숨겨진 요청·스팸 / 복구 대기).
+            waiting_n=Count("id", filter=Q(status__in=QUEUE_WAITING_STATUSES)),
+            hidden_spam_n=Count("id", filter=status_group_q(HIDDEN_SPAM)),
+            recovering_n=Count("id", filter=Q(status=SentDMLog.Status.RECOVERY_PENDING)),
         )
 
-        # 사람 단위 카테고리 필터 (페이지네이션 이전 = HAVING 절).
-        # 값(delivered/read/attention)은 응답 boolean 필드와 동일 정의라 일관적이다.
+        # 사람 단위 필터 (페이지네이션 이전 = HAVING 절).
         # 원시 logs 가 아니라 annotate 결과에 filter 를 걸어야(HAVING) 롤업 카운트가
         # 오염되지 않고, total=rows.count() 도 자동으로 필터 후 인원으로 맞는다.
+        #
+        # (A) status_group (권장, v4.5) — 아래 _person_status_group 과 **정확히 1:1**.
+        #     각 사람은 정확히 1개 그룹에 속하므로 탭 카운트가 total 로 분할된다.
+        # (B) category (legacy) — 하위호환용 중첩 정의(delivered ⊇ read). 프론트 마이그레이션
+        #     전까지 유지. 둘 다 주면 각각 AND 로 적용된다.
+        status_group_having = {
+            WAITING: Q(sent_n=0) & Q(waiting_n__gt=0),  # 대기중 (아직 Meta 미접수)
+            SENT: Q(sent_n__gt=0) & Q(read_n=0),  # 전송됨 (Meta 접수+, 아직 안읽음)
+            READ: Q(read_n__gt=0),  # 읽음
+            HIDDEN_SPAM: (  # 숨겨진 요청·스팸 (아무것도 못받음 + 숨김함 사유)
+                Q(sent_n=0) & Q(waiting_n=0) & Q(hidden_spam_n__gt=0)
+            ),
+            ATTENTION: (  # 확인 필요 (숨김함 제외한 나머지 실패)
+                Q(sent_n=0) & Q(waiting_n=0) & Q(hidden_spam_n=0)
+            ),
+        }
+        status_group_param = request.query_params.get("status_group")
+        if status_group_param and status_group_param != "all":
+            if status_group_param not in status_group_having:
+                return Response(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": 400,
+                            "message": (
+                                "status_group 값이 올바르지 않습니다. "
+                                "(all/waiting/sent/read/hidden_spam/attention)"
+                            ),
+                            "details": {
+                                "field": "status_group",
+                                "allowed": ["all", *status_group_having.keys()],
+                            },
+                        },
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            rows = rows.filter(status_group_having[status_group_param])
+
         category = request.query_params.get("category")
         category_having = {
             "delivered": Q(delivered_n__gt=0),  # 성공 (delivered=true, read 포함)
@@ -1000,22 +1161,47 @@ class DMVerificationViewSet(viewsets.ViewSet):
                 return "clicked_unverified"
             return "not_followed"
 
-        results = [
-            {
-                "recipient_user_id": r["recipient_user_id"],
-                "recipient_username": _recipient_username_display(
-                    r["recipient_user_id"], r["latest_username"]
-                ),
-                "sent": r["sent_n"] > 0,
-                "delivered": r["delivered_n"] > 0,
-                "read": r["read_n"] > 0,
-                "follower_status": _follower_status(r),
-                "dm_count": r["dm_count"],
-                "needs_attention": r["needs_n"] > 0,
-                "last_activity_at": r["last_activity_at"],
-            }
-            for r in page_rows
-        ]
+        def _person_status_group(row) -> str:
+            """수신자 1명의 코스 상태 그룹 (우선순위: read > sent > waiting > hidden_spam > attention).
+
+            people_rollup 버킷(sent>waiting>failed)과 정합 — read/sent 는 sent 버킷,
+            waiting 은 waiting 버킷, hidden_spam/attention 은 failed 버킷을 쪼갠 것.
+            위 status_group_having 필터와 1:1 로 대응한다.
+            """
+            if row["sent_n"] > 0:
+                return READ if row["read_n"] > 0 else SENT
+            if row["waiting_n"] > 0:
+                return WAITING
+            if row["hidden_spam_n"] > 0:
+                return HIDDEN_SPAM
+            return ATTENTION
+
+        results = []
+        for r in page_rows:
+            grp = _person_status_group(r)
+            results.append(
+                {
+                    "recipient_user_id": r["recipient_user_id"],
+                    "recipient_username": _recipient_username_display(
+                        r["recipient_user_id"], r["latest_username"]
+                    ),
+                    "sent": r["sent_n"] > 0,
+                    "delivered": r["delivered_n"] > 0,
+                    "read": r["read_n"] > 0,
+                    "follower_status": _follower_status(r),
+                    "dm_count": r["dm_count"],
+                    # ★ 성공 우선(success-aware): 발송/도착/읽음/복구성공(sent 버킷)이 하나라도
+                    #   있으면 조치 불필요로 본다. 과거 실패 로그(예: 복구 전 no_trace)가 남아 있어도
+                    #   결국 전송/도착/복구됐다면 '확인 필요'로 오표시하지 않는다(복구 반영 버그 수정).
+                    #   grp==ATTENTION 일 때만 true = 새 '확인 필요' 버킷과 정확히 일치.
+                    "needs_attention": grp == ATTENTION,
+                    "status_group": grp,
+                    "status_group_display": GROUP_DISPLAY[grp],
+                    # 복구 대기 DM 이 있고, 아직 아무것도 못 받은(숨김함) 사람일 때만 "복구 대기" 칩.
+                    "is_recovering": r["recovering_n"] > 0 and grp == HIDDEN_SPAM,
+                    "last_activity_at": r["last_activity_at"],
+                }
+            )
 
         return Response(
             {

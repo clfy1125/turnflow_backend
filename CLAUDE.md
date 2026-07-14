@@ -318,7 +318,7 @@ make test-cov                             # HTML 커버리지 리포트
 - `deploy/dr/gcp/DRILL_RUNBOOK.md` — GCP cold-VM DR 드릴/컷오버 재현 런북 (+ `deploy/dr/gcp/README.md` 운영자 개요)
 - `SECURITY_AUDIT_2026-06.md` — 론칭 전 보안 취약점 감사(미해결 P0 포함)
 - `DM_CAMPAIGN_DUPLICATE_PREVENTION_FRONTEND.md` — 게시물당 활성 캠페인 1개(409) 프론트 가이드
-- `DM_QUEUE_STATE_FRONTEND.md` — DM 순차 발송 큐 현황(게이지+ETA) 프론트 가이드 + v4.3 페이서 메커니즘 요약 (`max_sends_per_hour` deprecated) + v4.4 사람 단위 `people` 블록("N명" 표기는 이벤트 단위 `gauge` 말고 이걸로; stats 의 `unique_targets/failed/unconfirmed/reach_rate` 와 동일 정의 = `campaign_stats.people_rollup`)
+- `DM_QUEUE_STATE_FRONTEND.md` — DM 순차 발송 큐 현황(게이지+ETA) 프론트 가이드 + v4.3 페이서 메커니즘 요약 (`max_sends_per_hour` deprecated) + v4.4 사람 단위 `people` 블록("N명" 표기는 이벤트 단위 `gauge` 말고 이걸로; stats 의 `unique_targets/failed/unconfirmed/reach_rate` 와 동일 정의 = `campaign_stats.people_rollup`) + **v4.5(2026-07-14)**: 통계 헤드라인=`unique_sent_rate`(구 100% 오표기 정정), '확인 필요'→'숨겨진 요청·스팸'(`unique_hidden_spam`) 분리 + `unique_needs_attention[_excl_hidden]`, 로그 상태 그룹 `status_group`(대기중/전송됨/읽음/숨겨진 요청·스팸/확인 필요 — 단일 소스 `dm_status_groups.py`)·`is_recovering`·서버 필터, needs_attention success-aware(복구 반영)
 - `DM_RECOVERY_FRONTEND.md` — 실패 DM 복구(recovery) 프론트 연동 **v2(재댓글 방식, 2026-07-14)**: 확정실패→"숨김함 수락 후 재댓글" 안내 대댓글→재댓글이 일반 경로로 재발송(성공 시 recovery_delivered 자동 승격). 추천문구 30개(`GET .../recovery-reply-suggestions/`) + 프로 전용 게이트(fail-closed) + 로그 상태 3종. `recovery_keyword`=deprecated(값 무시). 기본 활성
 - `PASSWORD_RESET_GUIDE.md` — 비밀번호 재설정 플로우 프론트 가이드
 - `DISCONNECT_OTHER_DM_TOOLS_GUIDE.md` — 다른 DM 자동화 툴(매니챗 등) 연결 해제 안내 (댓글 fan-out·Private Reply 1회 충돌 / IG Login이라 Facebook 라우팅 불필요)
