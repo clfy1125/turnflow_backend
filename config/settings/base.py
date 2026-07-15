@@ -682,6 +682,11 @@ DM_RECIPIENT_COOLDOWN_SECONDS = config("DM_RECIPIENT_COOLDOWN_SECONDS", default=
 DM_BACKLOG_RISK_HOURS = config("DM_BACKLOG_RISK_HOURS", default=6, cast=int)
 DM_BACKLOG_OLDEST_ALERT_HOURS = config("DM_BACKLOG_OLDEST_ALERT_HOURS", default=2, cast=int)
 
+# v3.4 — 일시(transient) 재시도 상한. 이 횟수를 넘도록 계속 실패하면 사실상 영구로 보고
+# FAILED_NO_TRACE 로 종결(무한 defer 루프·백로그 경고 스팸 방지). 초반 백오프(60s~1h)로
+# ≈16~24h 시도 후 종결 → 진짜 일시 오류엔 무영향, user_id 24h 윈도우와 정렬.
+DM_MAX_TRANSIENT_RETRIES = config("DM_MAX_TRANSIENT_RETRIES", default=24, cast=int)
+
 # 수신자 목록 열람 시 빈 username(IGSID만 있는 Story 답장 등)을 IG User Profile API 로
 # 지연 해석할지 여부. False 면 해석 호출 없이 user_{IGSID} 폴백만 표기(킬 스위치).
 DM_RESOLVE_RECIPIENT_USERNAME = config("DM_RESOLVE_RECIPIENT_USERNAME", default=True, cast=bool)

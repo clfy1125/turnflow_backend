@@ -349,13 +349,30 @@ def _defer_or_fail(log, campaign, ig_conn, exc) -> dict:
             except Exception:  # noqa: BLE001
                 logger.exception("action_block telegram 알림 실패 (non-fatal)")
 
-    if cls.retriable:
+    if cls.retriable and log.retry_count < settings.DM_MAX_TRANSIENT_RETRIES:
         exp = min(log.retry_count, 10)
         backoff = min(60 * (2**exp), 3600)  # 상한 1h (쿼터는 시각경계로 풀림)
         log.next_retry_at = timezone.now() + timedelta(seconds=backoff)
         log.status = SentDMLog.Status.QUEUED
         log.save(update_fields=["retry_count", "next_retry_at", "status"])
         return {"status": "deferred", "reason": cls.reason, "retry_count": log.retry_count}
+
+    # ★ 재시도 상한 소진(v3.4): 일시(transient)로 분류됐지만 상한을 넘도록 계속 실패 =
+    # 사실상 영구(예: Meta code 1 로 오는 "댓글에 이미 답글 있음" 같은 조건)로 보고 종결한다.
+    # 무한 defer 루프 + 백로그 경고 스팸을 막는 일반 안전망 — 진짜 일시 오류는 상한 훨씬 전에
+    # 성공하므로 무영향, user_id 24h 윈도우와도 자연 정렬. FAILED_NO_TRACE(비-revivable)로 종결.
+    if cls.retriable:
+        logger.warning(
+            "DM transient retries exhausted → terminate: log=%s retry=%s last=%s",
+            log.id,
+            log.retry_count,
+            cls.reason,
+        )
+        cls = ErrorClassification(
+            log_status=SentDMLog.Status.FAILED_NO_TRACE,
+            retriable=False,
+            reason=f"transient retries exhausted ({log.retry_count}); permanent-presumed ({cls.reason})",
+        )
 
     # non-retriable → 종결
     # ★ verify-before-brick (v3.3): 단발 수신자/권한 오류로 연결 전체를 죽이지 않는다.

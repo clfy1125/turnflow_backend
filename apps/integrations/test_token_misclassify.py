@@ -23,6 +23,7 @@ from django.utils import timezone
 from apps.integrations.dm_exceptions import (
     DMRecipientUnreachableError,
     DMTokenError,
+    DMTransientError,
     classify_api_error,
     exception_to_classification,
 )
@@ -141,4 +142,36 @@ class TestVerifyBeforeBrick:
         log.refresh_from_db()
         conn.refresh_from_db()
         assert res["status"] == SentDMLog.Status.FAILED_NO_TRACE
+        assert conn.status == IGAccountConnection.Status.ACTIVE
+
+
+# ───────── 일시(transient) 재시도 상한 (v3.4 — 무한 defer 루프 종결) ─────────
+
+
+class TestTransientRetryCap:
+    def test_transient_under_cap_defers(self, conn):
+        """상한 미만이면 기존대로 defer(QUEUED) — 진짜 일시 오류 무영향."""
+        campaign = _campaign(conn)
+        log = _log(campaign)  # retry_count 기본 0 → 증가 후 1
+        exc = DMTransientError("generic unexpected (code1)", status=400, code=1)
+        res = _defer_or_fail(log, campaign, conn, exc)
+        log.refresh_from_db()
+        assert res["status"] == "deferred"
+        assert log.status == SentDMLog.Status.QUEUED
+
+    def test_transient_exhausted_terminates_no_trace(self, conn):
+        """상한 도달 시 FAILED_NO_TRACE 로 종결(무한 루프 방지), 연결은 브릭 안 함."""
+        from django.conf import settings
+
+        campaign = _campaign(conn)
+        log = _log(campaign)
+        # 증가 후 상한에 도달하도록 직전 값으로 세팅
+        log.retry_count = settings.DM_MAX_TRANSIENT_RETRIES - 1
+        log.save(update_fields=["retry_count"])
+        exc = DMTransientError("comment already has reply (code1)", status=400, code=1)
+        res = _defer_or_fail(log, campaign, conn, exc)
+        log.refresh_from_db()
+        conn.refresh_from_db()
+        assert res["status"] == SentDMLog.Status.FAILED_NO_TRACE
+        assert log.status == SentDMLog.Status.FAILED_NO_TRACE
         assert conn.status == IGAccountConnection.Status.ACTIVE
