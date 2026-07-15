@@ -124,6 +124,10 @@ def archive_old_sentdmlogs(retention_days: int | None = None, batch_size: int = 
 
     ⚠️ SentDMLog 는 업무기록(도착 증빙)이다. R2 export 미구현 상태에서 DELETE 만 하면 손실이므로
     기본 비활성(SENTDMLOG_ARCHIVE_RETENTION_DAYS=0). 활성화 전 반드시 R2 COPY/업로드 선행을 붙일 것(§15.8 (c)).
+
+    ⚠️ 부수효과: 이 삭제는 campaign_stats.new_requester_timeseries 의 사람별 MIN(created_at)
+    파생을 왜곡한다('전체 기간' 신규 요청자 차트 축소·재계산 오류). 활성화 전 절차는
+    config/settings/base.py 의 SENTDMLOG_ARCHIVE_RETENTION_DAYS 주석(롤업 백필 등)을 반드시 따를 것.
     """
     if retention_days is None:
         retention_days = getattr(settings, "SENTDMLOG_ARCHIVE_RETENTION_DAYS", 0)

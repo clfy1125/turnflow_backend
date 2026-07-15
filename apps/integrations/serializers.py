@@ -26,6 +26,7 @@ def _dm_body_length_errors(
     reward_message_template: str,
     opening_message: str,
     link_button_url: str,
+    link_buttons=None,
     opening_message_templates=None,
     follow_gate_prompt_templates=None,
 ) -> dict:
@@ -35,12 +36,13 @@ def _dm_body_length_errors(
     버튼이 없는 일반 텍스트 DM → **UTF-8 1000 바이트**(한글 ≈ 333자).
     버튼 부착 여부:
       - follow_gate_enabled: follow_gate_prompt·follow_gate_retry_message 는 항상 버튼(팔로우 postback);
-        reward 는 link_button_url 이 있을 때만 버튼(링크).
-      - 비게이트: opening 은 link_button_url 이 있을 때만 버튼(링크), 없으면 일반 텍스트.
+        reward 는 링크 버튼(link_buttons 목록 또는 legacy link_button_url)이 있을 때만 버튼(링크).
+      - 비게이트: opening 은 링크 버튼이 있을 때만 버튼(링크), 없으면 일반 텍스트.
+    링크 버튼 개수(1~3)는 640자 text 한도에 영향을 주지 않는다(버튼 title 은 별도 20자 한도).
     회전 목록(opening_message_templates / follow_gate_prompt_templates)의 각 항목도 동일 한도로 검증.
     반환: {필드명: 에러메시지} (없으면 {}).
     """
-    has_link = bool((link_button_url or "").strip())
+    has_link = bool(link_buttons) or bool((link_button_url or "").strip())
     errors: dict = {}
 
     def _too_long(text: str, buttoned: bool) -> str | None:
@@ -191,6 +193,36 @@ class ConnectionCallbackResponseSerializer(serializers.Serializer):
     connection = IGAccountConnectionSerializer(required=False)
 
 
+class LinkButtonItemSerializer(serializers.Serializer):
+    """link_buttons 항목 — 발송 DM 버튼 카드의 web_url 버튼 1개."""
+
+    url = serializers.URLField(max_length=2048, help_text="버튼이 여는 URL (http/https 만 허용).")
+    label = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+        max_length=20,
+        help_text="버튼 글자 (Meta 한도 20자). 비우면 '자세히 보기'.",
+    )
+
+    class Meta:
+        ref_name = "AutoDMLinkButtonItem"
+
+    def validate_url(self, value):
+        v = (value or "").strip()
+        # Django URLValidator 는 ftp/ftps 도 허용하므로 스킴을 명시적으로 좁힌다.
+        if not (v.startswith("http://") or v.startswith("https://")):
+            raise serializers.ValidationError("http:// 또는 https:// URL 만 허용됩니다.")
+        return v
+
+
+def _validate_link_buttons_len(value):
+    """link_buttons 최대 3개(Meta button template 한도) 검증 공통 헬퍼."""
+    if value and len(value) > 3:
+        raise serializers.ValidationError("링크 버튼은 최대 3개까지 가능합니다 (Meta 한도).")
+    return value
+
+
 class AutoDMCampaignSerializer(serializers.ModelSerializer):
     """Serializer for Auto DM Campaign (v3.3 — 트리거/키워드/공개답글/Follow-gate 포함)"""
 
@@ -206,6 +238,12 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
     # 실패 DM 복구가 이 캠페인 소유자 플랜에서 실제로 동작하는지 (프로 전용).
     # false 면 recovery_reply_enabled 가 true 여도 안내 대댓글이 게시되지 않는다 → 프론트에서 토글 잠금.
     recovery_reply_available = serializers.SerializerMethodField()
+    # 공개 답글 상한 도달 여부 (읽기 전용 — 프론트 UX 표시용)
+    public_reply_limit_reached = serializers.SerializerMethodField()
+    # 링크 버튼 목록 (쓰기 가능, list 우선, 최대 3개). writable nested → update() 에서 별도 처리.
+    link_buttons = LinkButtonItemSerializer(many=True, required=False)
+    # 실제 발송 시 첨부될 버튼(link_buttons 우선, 없으면 legacy fallback) — 읽기 전용 편의값.
+    effective_link_buttons = serializers.SerializerMethodField()
 
     class Meta:
         model = AutoDMCampaign
@@ -233,6 +271,9 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
             "public_reply_templates",  # 신규 리스트
             "public_reply_batch_size",
             "public_reply_batch_pause_seconds",
+            "public_reply_limit",  # 공개 답글 누적 상한 (0=무제한, 기본 200)
+            "public_reply_posted_count",  # 게시 누계 (read-only)
+            "public_reply_limit_reached",  # 상한 도달 여부 (read-only)
             # Follow-gate (v3.8 — is_user_follow_business silent verify)
             "follow_gate_enabled",
             "gate_verify_follow",
@@ -249,8 +290,10 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
             "recovery_ttl_seconds",
             "recovery_reply_available",
             # 링크 버튼 (web_url — DM 카드에 라벨 달린 링크 버튼으로 첨부)
-            "link_button_url",
-            "link_button_label",
+            "link_button_url",  # legacy 단일
+            "link_button_label",  # legacy 단일
+            "link_buttons",  # 신규 리스트 (최대 3개, list 우선)
+            "effective_link_buttons",  # 실제 첨부될 버튼 (read-only)
             # 운영
             "status",
             "max_sends_per_hour",
@@ -276,6 +319,9 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
             "ig_username",
             "total_sent",
             "total_failed",
+            "public_reply_posted_count",
+            "public_reply_limit_reached",
+            "effective_link_buttons",
             "is_active",
             "can_send",
             "schedule_state",
@@ -318,30 +364,26 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
                 cache[owner_id] = False
         return cache[owner_id]
 
-    def validate(self, attrs):
-        # 이 시리얼라이저가 캠페인 수정(PUT/PATCH)의 실제 처리 시리얼라이저다(get_serializer_class →
-        # update/partial_update 가 self.get_serializer 사용). 그래서 글자수 한도 검증을 여기서도 건다.
-        # 부분 수정이라 attrs 에 없는 필드는 기존 인스턴스 값으로 병합해 판정(create 는 별도 시리얼라이저).
-        def _resolve(field, default=""):
-            if field in attrs:
-                return attrs[field]
-            return getattr(self.instance, field, default)
+    def validate_link_buttons(self, value):
+        return _validate_link_buttons_len(value)
 
-        length_errors = _dm_body_length_errors(
-            follow_gate_enabled=bool(_resolve("follow_gate_enabled", False)),
-            follow_gate_prompt=_resolve("follow_gate_prompt", "") or "",
-            follow_gate_retry_message=_resolve("follow_gate_retry_message", "") or "",
-            reward_message_template=_resolve("reward_message_template", "") or "",
-            opening_message=(
-                _resolve("opening_message_template", "") or _resolve("message_template", "") or ""
-            ),
-            link_button_url=_resolve("link_button_url", "") or "",
-            opening_message_templates=_resolve("opening_message_templates", []) or [],
-            follow_gate_prompt_templates=_resolve("follow_gate_prompt_templates", []) or [],
-        )
-        if length_errors:
-            raise serializers.ValidationError(length_errors)
-        return attrs
+    def update(self, instance, validated_data):
+        # link_buttons 는 writable nested serializer 라 기본 ModelSerializer.update()의
+        # 중첩쓰기 가드에 걸린다 → pop 후 super().update() 를 호출하고 직접 대입한다.
+        link_buttons = validated_data.pop("link_buttons", None)
+        instance = super().update(instance, validated_data)
+        if link_buttons is not None:
+            instance.link_buttons = link_buttons
+            instance.save(update_fields=["link_buttons", "updated_at"])
+        return instance
+
+    @extend_schema_field(LinkButtonItemSerializer(many=True))
+    def get_effective_link_buttons(self, obj) -> list:
+        """실제 발송 시 첨부될 버튼 목록 (get_link_buttons 결과를 {url,label} 형태로)."""
+        return [{"url": b["url"], "label": b["title"]} for b in (obj.get_link_buttons() or [])]
+
+    def get_public_reply_limit_reached(self, obj) -> bool:
+        return obj.public_reply_limit_reached()
 
     def get_is_active(self, obj) -> bool:
         return obj.is_active()
@@ -642,6 +684,15 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
         max_value=3600,
         help_text="배치 도달 후 다음 답글까지 대기 시간 (초, 기본 300)",
     )
+    public_reply_limit = serializers.IntegerField(
+        default=200,
+        min_value=0,
+        max_value=1_000_000,
+        help_text=(
+            "공개 답글(대댓글) 누적 상한 (기본 200, 0=무제한). 도달 시 이후 공개 답글을 "
+            "게시하지 않는다(DM 발송엔 영향 없음). 복구 안내 대댓글은 상한 차단·집계에서 제외."
+        ),
+    )
 
     # Follow-gate (v3.8 — is_user_follow_business silent verify)
     follow_gate_enabled = serializers.BooleanField(
@@ -721,7 +772,17 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
         allow_blank=True,
         default="",
         max_length=20,
-        help_text="링크 버튼 글자 (Meta 한도 20자). link_button_url 있고 비우면 '자세히 보기'.",
+        help_text="[legacy] 단일 링크 버튼 글자 (Meta 한도 20자). 비우면 '자세히 보기'.",
+    )
+    link_buttons = LinkButtonItemSerializer(
+        many=True,
+        required=False,
+        default=list,
+        help_text=(
+            "링크 버튼 목록 (최대 3개, Meta button template 한도). 비어있지 않으면 legacy "
+            "link_button_url/link_button_label 보다 우선한다. 하나라도 있으면 DM 은 버튼 "
+            '카드(본문 640자 한도)로 발송된다. 각 항목: {"url": "https://...", "label": "받기"}.'
+        ),
     )
 
     gate_trigger_keywords = serializers.ListField(
@@ -800,6 +861,9 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
             "비우면 무기한. scheduled_start_at 보다 미래여야 함. 예: '2026-07-31T23:59:59+09:00'"
         ),
     )
+
+    def validate_link_buttons(self, value):
+        return _validate_link_buttons_len(value)
 
     def validate(self, attrs):
         trigger = attrs.get("trigger_type", AutoDMCampaign.TriggerType.SPECIFIC_MEDIA)
@@ -880,6 +944,7 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
                 attrs.get("opening_message_template") or attrs.get("message_template") or ""
             ),
             link_button_url=attrs.get("link_button_url") or "",
+            link_buttons=attrs.get("link_buttons") or [],
             opening_message_templates=attrs.get("opening_message_templates") or [],
             follow_gate_prompt_templates=attrs.get("follow_gate_prompt_templates") or [],
         )
@@ -890,6 +955,8 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
 
 class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
     """Auto DM Campaign 수정 (Swagger/edit form 용 — v3.3)"""
+
+    link_buttons = LinkButtonItemSerializer(many=True, required=False)
 
     class Meta:
         model = AutoDMCampaign
@@ -909,6 +976,7 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
             "public_reply_templates",
             "public_reply_batch_size",
             "public_reply_batch_pause_seconds",
+            "public_reply_limit",
             # Follow-gate (v3.8)
             "follow_gate_enabled",
             "gate_verify_follow",
@@ -926,6 +994,7 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
             # 링크 버튼 (web_url)
             "link_button_url",
             "link_button_label",
+            "link_buttons",
             "max_sends_per_hour",
             "status",
             # 예약 발송
@@ -952,6 +1021,7 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
             "public_reply_templates": {"required": False},
             "public_reply_batch_size": {"required": False},
             "public_reply_batch_pause_seconds": {"required": False},
+            "public_reply_limit": {"required": False},
             "follow_gate_enabled": {"required": False},
             "gate_verify_follow": {"required": False},
             "follow_gate_prompt": {"required": False, "allow_blank": True},
@@ -1005,6 +1075,7 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
                 _resolve("opening_message_template", "") or _resolve("message_template", "") or ""
             ),
             link_button_url=_resolve("link_button_url", "") or "",
+            link_buttons=_resolve("link_buttons", []) or [],
             opening_message_templates=_resolve("opening_message_templates", []) or [],
             follow_gate_prompt_templates=_resolve("follow_gate_prompt_templates", []) or [],
         )
@@ -1012,15 +1083,24 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(length_errors)
         return attrs
 
+    def validate_link_buttons(self, value):
+        return _validate_link_buttons_len(value)
+
     def update(self, instance, validated_data):
         # ANY_MEDIA 로 전환 시 남아있는 media_id(직전 SPECIFIC/STORY 잔재)를 클리어한다.
         # stray media_id 를 든 ANY_MEDIA 캠페인은 복구 재댓글 스레드의 media 추정
         # (poll_recovery_recomments)을 오염시켜 형제 SPECIFIC 캠페인의 정당한 재댓글을
         # 오필터할 수 있다(적대 리뷰 발견). media_id 는 fields 에 없어 super().update() 가
         # 건드리지 않으므로 여기서 명시 클리어 후 저장한다.
+        # link_buttons 는 writable nested → 중첩쓰기 가드 회피 위해 pop 후 직접 대입.
+        link_buttons = validated_data.pop("link_buttons", None)
         if validated_data.get("trigger_type") == AutoDMCampaign.TriggerType.ANY_MEDIA:
             instance.media_id = ""
-        return super().update(instance, validated_data)
+        instance = super().update(instance, validated_data)
+        if link_buttons is not None:
+            instance.link_buttons = link_buttons
+            instance.save(update_fields=["link_buttons", "updated_at"])
+        return instance
 
 
 class AutoDMCampaignScheduleSerializer(serializers.Serializer):
@@ -1695,3 +1775,60 @@ class SpamDashboardSerializer(serializers.Serializer):
     summary = SpamDashboardSummarySerializer()
     chart_14d = SpamDashboardChartPointSerializer(many=True)
     biweekly = SpamDashboardBiweeklySerializer()
+
+
+# ===== 캠페인 신규 요청자 시계열 (timeseries) =====
+
+
+class CampaignTimeseriesPointSerializer(serializers.Serializer):
+    """시계열 1개 버킷 — 버킷 시작시각(KST) + 그 버킷의 신규 요청자 수."""
+
+    bucket = serializers.DateTimeField(
+        help_text="버킷 시작시각 (ISO8601, +09:00). granularity 에 따라 정시/자정 정렬."
+    )
+    new_requesters = serializers.IntegerField(
+        help_text="이 버킷에 '처음' 요청한 사람 수 (사람 단위, 최초 트리거 시점 기준)."
+    )
+
+
+class CampaignTimeseriesTotalsSerializer(serializers.Serializer):
+    """시계열 합계 블록."""
+
+    lifetime_unique_requesters = serializers.IntegerField(
+        help_text="캠페인 전 기간 고유 요청자 수 (stats people.total 과 동일 정의)."
+    )
+    window_new_requesters = serializers.IntegerField(
+        help_text=(
+            "조회 범위(range) 내 신규 요청자 수 = sum(series[].new_requesters). "
+            "range=all 이면 lifetime_unique_requesters 와 같다."
+        )
+    )
+    first_request_at = serializers.DateTimeField(
+        allow_null=True, help_text="가장 이른 요청 시각 (KST). 요청 없으면 null."
+    )
+    last_request_at = serializers.DateTimeField(
+        allow_null=True,
+        help_text="가장 최근 루트 요청 시각 (KST, 반복 댓글 포함 — '진행 여부' 신호). 없으면 null.",
+    )
+
+
+class CampaignTimeseriesSerializer(serializers.Serializer):
+    """캠페인 신규 요청자 시계열 응답 (진행 추이 차트용)."""
+
+    campaign_id = serializers.UUIDField(help_text="캠페인 UUID.")
+    campaign_status = serializers.CharField(help_text="캠페인 상태 (active/paused/completed 등).")
+    is_active = serializers.BooleanField(help_text="현재 active 상태인지.")
+    range = serializers.CharField(help_text="조회 범위: all | 24h | 7d.")
+    granularity = serializers.CharField(help_text="버킷 단위: day(all·7d) | hour(24h).")
+    timezone = serializers.CharField(help_text="버킷 기준 타임존 (Asia/Seoul 고정).")
+    totals = CampaignTimeseriesTotalsSerializer()
+    series = CampaignTimeseriesPointSerializer(
+        many=True,
+        help_text="시간순 버킷 배열 (빈 버킷은 0 으로 채워짐). 마지막 버킷은 진행 중(partial).",
+    )
+    history_complete = serializers.BooleanField(
+        help_text=(
+            "로그 보존정책이 과거 데이터를 잘라내지 않아 전 기간 집계가 정확한지. "
+            "false 면 과거 구간이 불완전할 수 있으니 차트에 안내 배지를 권장."
+        )
+    )

@@ -4,6 +4,7 @@ Instagram Account Connection models
 
 import uuid
 
+from django.core.validators import MinValueValidator
 from django.db import IntegrityError, models, transaction
 from django.utils import timezone
 
@@ -620,6 +621,24 @@ class AutoDMCampaign(models.Model):
         verbose_name="공개 답글 배치 쿨다운 (초)",
         help_text="배치 크기 도달 시 다음 답글까지 대기 시간 (Instagram 봇 검사 회피)",
     )
+    public_reply_limit = models.IntegerField(
+        default=200,
+        validators=[MinValueValidator(0)],
+        verbose_name="공개 답글 최대 게시 수",
+        help_text=(
+            "이 캠페인이 게시하는 성공 공개 답글(대댓글)의 누적 상한. 도달하면 이후 공개 "
+            "답글을 더 게시하지 않는다(DM 발송 자체엔 영향 없음). 0 = 무제한. "
+            "복구 안내 대댓글(recovery)은 이 상한의 집계·차단 대상에서 제외된다."
+        ),
+    )
+    public_reply_posted_count = models.IntegerField(
+        default=0,
+        verbose_name="공개 답글 게시 누계",
+        help_text=(
+            "성공적으로 게시된 공개 답글(대댓글) 누적 수 — public_reply_limit 판정 기준. "
+            "복구 안내 대댓글은 포함하지 않는다. 원자적으로 증가한다."
+        ),
+    )
 
     # Follow-gate (v3.8 — is_user_follow_business silent verify)
     follow_gate_enabled = models.BooleanField(
@@ -688,8 +707,10 @@ class AutoDMCampaign(models.Model):
     # 링크 버튼 (web_url) — 발송되는 DM 카드에 "라벨 달린 링크 버튼"으로 첨부된다.
     # - 단순 DM(STANDALONE): opening/단발 DM 에 첨부
     # - follow-gate(버튼클릭 즉시 / 팔로우 검증 후): reward DM 에 첨부
-    # URL 본문에 직접 박는 대신 Meta generic-template 의 web_url 버튼으로 보내 깔끔하고
+    # URL 본문에 직접 박는 대신 Meta button template 의 web_url 버튼으로 보내 깔끔하고
     # 정책상 안전(첫 DM 텍스트 URL 스팸 판정 회피). 비우면 버튼 미첨부.
+    # ⚠️ legacy 단일 버튼 필드 — 새 캠페인은 link_buttons(list, 최대 3개)를 쓴다.
+    #    link_buttons 가 비어있을 때만 fallback 으로 사용된다(get_link_buttons 참조).
     link_button_url = models.URLField(
         max_length=2048,
         blank=True,
@@ -703,6 +724,17 @@ class AutoDMCampaign(models.Model):
         default="",
         verbose_name="링크 버튼 라벨",
         help_text="링크 버튼 글자 (Meta 한도 20자). link_button_url 있고 비우면 '자세히 보기'.",
+    )
+    link_buttons = models.JSONField(
+        default=list,
+        blank=True,
+        verbose_name="링크 버튼 목록 (최대 3개)",
+        help_text=(
+            "발송 DM 카드에 붙일 web_url 링크 버튼 목록. 형식: "
+            '[{"url": "https://...", "label": "자세히 보기"}] (최대 3개 — Meta button '
+            "template 한도). 비어있지 않으면 legacy link_button_url/link_button_label 보다 "
+            "우선한다. label 은 각 20자, url 은 http/https 만 유효(초과/무효 항목은 무시)."
+        ),
     )
 
     gate_trigger_keywords = models.JSONField(
@@ -1001,6 +1033,28 @@ class AutoDMCampaign(models.Model):
             total_unconfirmed=F("total_unconfirmed") + 1, updated_at=timezone.now()
         )
 
+    def increment_public_reply_posted(self):
+        """성공 공개 답글(대댓글) 게시 누계 증가 (원자적).
+
+        복구 안내 대댓글(recovery)에는 호출하지 않는다 — 복구는 상한 집계에서 제외한다.
+        post_public_reply 성공(비복구) 시점에만 호출한다.
+        """
+        from django.db.models import F
+
+        type(self).objects.filter(pk=self.pk).update(
+            public_reply_posted_count=F("public_reply_posted_count") + 1,
+            updated_at=timezone.now(),
+        )
+
+    def public_reply_limit_reached(self) -> bool:
+        """성공 공개 답글 상한 도달 여부. limit=0 이면 무제한(항상 False).
+
+        고동시성에서 몇 건 오버슈트할 수 있으나(안티스팸 쿼터라 허용), 배치 스로틀
+        (public_reply_batch_size)이 추가로 동시 게시를 제한한다.
+        """
+        limit = self.public_reply_limit or 0
+        return limit > 0 and self.public_reply_posted_count >= limit
+
     # ===== 신규 로직 헬퍼 =====
 
     def get_opening_message(self) -> str:
@@ -1051,11 +1105,31 @@ class AutoDMCampaign(models.Model):
     DEFAULT_LINK_BUTTON_LABEL = "자세히 보기"
 
     def get_link_buttons(self) -> list | None:
-        """발송 DM 에 첨부할 web_url 링크 버튼 1개를 Meta 버튼 형태로 반환.
+        """발송 DM 에 첨부할 web_url 링크 버튼(최대 3개)을 Meta 버튼 형태로 반환.
 
-        link_button_url 이 설정돼 있을 때만 ``[{"type":"web_url","title","url"}]`` 반환.
-        없으면 None (버튼 미첨부). 단순 DM / reward DM 발송 시 send 태스크가 사용한다.
+        우선순위: link_buttons(list) 에 유효 항목이 하나라도 있으면 그것을 쓰고,
+        비어있으면 legacy link_button_url/link_button_label(단일)로 fallback 한다
+        (pick_public_reply_template 등과 동일한 "list 우선, legacy fallback" 관례).
+
+        각 항목은 dict {"url","label"} 이며 url 은 http/https 여야 한다(그 외/비-dict 는 무시).
+        label 은 비면 DEFAULT_LINK_BUTTON_LABEL, Meta 한도 20자로 자른다. 최대 3개(초과분 무시).
+        유효 버튼이 하나도 없으면 None(버튼 미첨부). 단순 DM / reward DM 발송 시 send 태스크가 사용.
         """
+        buttons: list = []
+        for item in self.link_buttons or []:
+            if len(buttons) >= 3:
+                break
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or "").strip()
+            if not (url.startswith("http://") or url.startswith("https://")):
+                continue
+            label = str(item.get("label") or "").strip() or self.DEFAULT_LINK_BUTTON_LABEL
+            buttons.append({"type": "web_url", "title": label[:20], "url": url})
+        if buttons:
+            return buttons
+
+        # legacy 단일 버튼 fallback (link_buttons 가 비었거나 유효 항목이 없을 때)
         url = (self.link_button_url or "").strip()
         if not url:
             return None

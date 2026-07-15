@@ -864,6 +864,12 @@ EVENTINBOX_PARTITION_RETENTION_DAYS = config(
 # 14일 선생성 버퍼 — maintain_partitions(일1회 beat)가 며칠 누락돼도 DEFAULT 로 새지 않게 여유.
 EVENTINBOX_PARTITION_DAYS_AHEAD = config("EVENTINBOX_PARTITION_DAYS_AHEAD", default=14, cast=int)
 # SentDMLog 배치 아카이브 — 0 이면 비활성(기본). ⚠️ 활성화 전 R2 export 선행 필수(업무기록 손실 방지).
+# ⚠️ 캠페인 신규 요청자 시계열(integrations.campaign_stats.new_requester_timeseries)은
+#    사람별 MIN(created_at) 파생값이라, 이 값이 0 보다 커져 과거 로그가 삭제되면 '전체 기간' 차트와
+#    최초 요청자 판정이 조용히 왜곡된다(응답 history_complete=false 로 노출). 활성화 전 필수 절차:
+#    (1) R2 export 구현 → (2) 롤업 테이블(CampaignRequesterFirstSeen: campaign+recipient_user_id
+#    unique, first_seen_at) 생성·백필 → (3) timeseries 를 롤업 기반으로 전환 →
+#    (4) parent_log SET_NULL 루트 오인(campaign_stats.py:99-101) 해소 → 그 다음에만 이 값을 올릴 것.
 SENTDMLOG_ARCHIVE_RETENTION_DAYS = config("SENTDMLOG_ARCHIVE_RETENTION_DAYS", default=0, cast=int)
 
 # Onboarding drip campaign offsets (days after signup)

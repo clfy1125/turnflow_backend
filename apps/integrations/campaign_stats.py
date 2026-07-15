@@ -15,7 +15,11 @@ N+1 통계 호출을 제거하고 정의를 단일화한다.
 
 from __future__ import annotations
 
-from django.db.models import Count, Max, Q
+from collections import Counter
+from datetime import timedelta
+
+from django.conf import settings
+from django.db.models import Count, Max, Min, Q
 from django.utils import timezone
 
 from .models import AutoDMCampaign, SentDMLog
@@ -297,4 +301,101 @@ def build_delivery_summary(campaign_qs) -> dict:
         "success_rate": success_rate,
         "needs_attention_total": agg["needs"],
         "_last_activity_at": agg["last"],
+    }
+
+
+# ── 신규 요청자 시계열 (캠페인 진행 추이) ─────────────────────────────────────
+# range → 버킷 단위. 고정 매핑(적응형 없음)이라 프론트 렌더가 예측 가능하다.
+TIMESERIES_RANGES = {"all": "day", "24h": "hour", "7d": "day"}
+
+
+def new_requester_timeseries(campaign, range_key: str = "all", now=None) -> dict:
+    """캠페인 '신규 요청자' 시계열 — x=시간 버킷, y=그 버킷에 처음 요청한 사람 수.
+
+    사람 단위: 한 사람의 **최초 트리거(루트 DM) 시각**을 그 사람의 요청 시점으로 본다
+    (ROOT_DM_Q 기준 = people_rollup 과 동일한 사람 키공간). 같은 사람이 여러 번 댓글을
+    달아도(재요청·복구 재댓글 포함) 최초 1회만 집계한다.
+
+    핵심 정확성 규칙: first_at 은 캠페인 **전 생애** 루트 로그에서 사람별 MIN(created_at)
+    으로 구한 뒤에야 윈도우로 거른다. 3일 전 첫 요청 + 1시간 전 재요청한 사람은 24h 뷰에서
+    '신규'가 아니어야 하기 때문이다.
+
+    시각 근사: created_at 은 웹훅 수신 시각(댓글 작성 후 수 초). 폴링 보정 댓글은 최대
+    ~1시간 늦을 수 있다. IG 댓글 원본 작성시각은 저장하지 않으므로 created_at 이 프록시다.
+
+    버킷·윈도우 정렬: 윈도우 = 버킷 그리드. 24h=현재(진행 중) 시각으로 끝나는 24개 시간
+    버킷, 7d=오늘로 끝나는 7개 일 버킷, all=최초 요청일~오늘 일 버킷. 따라서 항상
+    ``sum(series[].new_requesters) == totals.window_new_requesters`` 이고, all 이면
+    ``== totals.lifetime_unique_requesters`` (stats people.total 과 동일 정의).
+
+    KST(Asia/Seoul, DST 없음) 기준 벽시계 절단. 반환 datetime 은 전부 KST-aware.
+    """
+    if range_key not in TIMESERIES_RANGES:
+        range_key = "all"
+    tz = timezone.get_current_timezone()  # Asia/Seoul
+    now_local = timezone.localtime(now or timezone.now(), tz)
+
+    root_qs = campaign.dm_logs.filter(ROOT_DM_Q)
+    # 사람별 전 생애 최초 요청 시각. "" recipient_user_id 는 people_rollup 과 동일하게 한
+    # 행으로 collapse 되어 총계가 stats people.total 과 일치한다. 수천 규모라 Python 버킷팅으로 충분.
+    first_ats = [
+        row["first_at"]
+        for row in root_qs.values("recipient_user_id").annotate(first_at=Min("created_at"))
+        if row["first_at"] is not None
+    ]
+    last_request_at = root_qs.aggregate(m=Max("created_at"))["m"]
+    lifetime_total = len(first_ats)
+    first_request_at = min(first_ats) if first_ats else None
+
+    granularity = TIMESERIES_RANGES[range_key]
+
+    def _trunc(d):
+        if granularity == "hour":
+            return d.replace(minute=0, second=0, microsecond=0)
+        return d.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # KST 정렬 그리드(양끝 포함). 가장 오래된 버킷 시작 == 윈도우 시작.
+    if range_key == "24h":
+        end_b = _trunc(now_local)
+        grid = [end_b - timedelta(hours=i) for i in range(23, -1, -1)]
+        window_start = grid[0]
+    elif range_key == "7d":
+        end_b = _trunc(now_local)
+        grid = [end_b - timedelta(days=i) for i in range(6, -1, -1)]
+        window_start = grid[0]
+    else:  # all — 최초 요청일부터 오늘까지
+        grid = []
+        if first_request_at is not None:
+            start_b = _trunc(timezone.localtime(first_request_at, tz))
+            end_b = _trunc(now_local)
+            grid = [start_b + timedelta(days=i) for i in range((end_b - start_b).days + 1)]
+        window_start = None  # 전 기간 = 윈도우 필터 없음
+
+    counter: Counter = Counter()
+    window_new = 0
+    for dt in first_ats:
+        b = _trunc(timezone.localtime(dt, tz))
+        if window_start is None or b >= window_start:
+            counter[b] += 1
+            window_new += 1
+
+    return {
+        "range": range_key,
+        "granularity": granularity,
+        "timezone": "Asia/Seoul",
+        "series": [{"bucket": b, "new_requesters": counter.get(b, 0)} for b in grid],
+        "totals": {
+            "lifetime_unique_requesters": lifetime_total,
+            "window_new_requesters": window_new,
+            "first_request_at": (
+                timezone.localtime(first_request_at, tz) if first_request_at else None
+            ),
+            # 반복 댓글 포함 최신 루트 로그 시각 = '아직 움직이나' 신호(series 의 최초요청과 구분).
+            "last_request_at": (
+                timezone.localtime(last_request_at, tz) if last_request_at else None
+            ),
+        },
+        # 로그 보존정책(SENTDMLOG_ARCHIVE_RETENTION_DAYS>0)이 켜지면 과거 first_at 이 왜곡되므로
+        # false. 활성화 전 필수 절차는 config/settings/base.py 의 SENTDMLOG_ARCHIVE_* 주석 참조.
+        "history_complete": not getattr(settings, "SENTDMLOG_ARCHIVE_RETENTION_DAYS", 0),
     }

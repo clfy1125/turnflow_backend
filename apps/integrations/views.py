@@ -34,10 +34,12 @@ from apps.workspace.models import Workspace
 
 from . import oauth_callback_pages
 from .campaign_stats import (
+    TIMESERIES_RANGES,
     annotate_campaign_stats,
     build_counts,
     build_delivery_summary,
     compute_monthly_usage,
+    new_requester_timeseries,
 )
 from .models import (
     AutoDMCampaign,
@@ -58,6 +60,7 @@ from .serializers import (
     AutoDMCampaignUpdateSerializer,
     CampaignBulkActionRequestSerializer,
     CampaignBulkActionResponseSerializer,
+    CampaignTimeseriesSerializer,
     ConnectionCallbackResponseSerializer,
     ConnectionStartResponseSerializer,
     DisconnectResponseSerializer,
@@ -2860,12 +2863,15 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         }
         ```
 
-        ### 링크 버튼 (선택 — DM 카드에 라벨 달린 web_url 버튼)
+        ### 링크 버튼 (선택 — DM 카드에 라벨 달린 web_url 버튼, 최대 3개)
         URL 을 본문 텍스트에 박는 대신, 발송 DM 카드에 **"라벨 달린 링크 버튼"** 으로 첨부합니다
-        (Meta generic-template `web_url` 버튼). 인스타 앱에서 버튼 형태로 보이고, 첫 DM 텍스트에
-        URL 직박 시 스팸 판정되는 문제를 피합니다.
-        - `link_button_url`: 버튼이 여는 URL (http/https). 비우면 버튼 미첨부.
-        - `link_button_label`: 버튼 글자 (최대 20자). 비우면 "자세히 보기".
+        (Meta **button template** 의 `web_url` 버튼, **최대 3개**). 인스타 앱에서 버튼 형태로 보이고,
+        첫 DM 텍스트에 URL 직박 시 스팸 판정되는 문제를 피합니다.
+        - `link_buttons` (권장): 버튼 목록. 각 항목 `{"url": "https://...", "label": "받기"}`,
+          **최대 3개**. url 은 http/https, label 은 20자. 비어있지 않으면 아래 legacy 보다 우선.
+        - `link_button_url` / `link_button_label` (legacy 단일): `link_buttons` 가 비었을 때만 fallback.
+        - **버튼 개수는 640자 한도와 무관** — 버튼이 1개라도 있으면 본문은 button template 라 640자
+          한도(버튼 title 은 개당 20자 별도), 버튼이 없으면 일반 텍스트 1000바이트.
         - **적용 위치**: 단순 DM(게이트 off)은 그 DM 에, follow-gate(검증/버튼즉시)는 **reward DM** 에 붙습니다
           (opening/재안내 DM 에는 게이트 버튼이 붙으므로 링크 버튼은 reward 에만).
         ```json
@@ -2873,10 +2879,19 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
           "media_id": "18418812427189917",
           "name": "무료 가이드 배포",
           "opening_message_template": "안녕하세요! 무료 가이드 보내드려요 😊",
-          "link_button_url": "https://example.com/guide",
-          "link_button_label": "가이드 받기"
+          "link_buttons": [
+            {"url": "https://example.com/guide", "label": "가이드 받기"},
+            {"url": "https://open.kakao.com/o/abcd", "label": "채널 입장"}
+          ]
         }
         ```
+
+        ### 공개 답글(대댓글) 상한 (선택)
+        `public_reply_enabled=true` 로 대댓글을 달 때 누적 게시 상한을 둘 수 있습니다.
+        - `public_reply_limit`: 성공 대댓글 누적 상한 (기본 **200**, `0`=무제한). 도달하면 이후
+          공개 답글을 게시하지 않습니다 (**DM 발송 자체엔 영향 없음**). 다시 늘리거나 0 으로 두면 재개.
+        - `public_reply_posted_count` (읽기전용): 지금까지 게시된 대댓글 누계.
+        - **복구 안내 대댓글(recovery)은 이 상한과 무관** — 항상 게시되고 카운트되지 않습니다.
 
         ## 동작 방식
         1. 캠페인 생성 후 자동으로 `ACTIVE` 상태로 설정
@@ -3029,7 +3044,10 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
             "**중복 방지**: 이 수정으로 캠페인이 `status=active` 가 되는데 같은 게시물(`media_id`)에 "
             "이미 다른 활성 캠페인이 있으면 **HTTP 409** 로 거부됩니다 "
             "(`error.details.code='duplicate_active_campaign'`). status 가 active 로 바뀌지 않는 "
-            "수정(이름만 변경, 일시정지 등)은 차단되지 않습니다."
+            "수정(이름만 변경, 일시정지 등)은 차단되지 않습니다.\n\n"
+            "**링크 버튼**: `link_buttons`(최대 3개 `{url,label}`)가 legacy `link_button_url/label` 보다 "
+            "우선합니다. **공개 답글 상한**: `public_reply_limit`(0=무제한)을 올리거나 0 으로 두면 "
+            "상한에 걸린 캠페인의 대댓글 게시가 재개됩니다."
         ),
         request=AutoDMCampaignUpdateSerializer,
         responses={
@@ -3061,7 +3079,13 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
             "`POST .../{id}/schedule/` 를 사용하세요.\n\n"
             "**중복 방지**: 이 수정으로 캠페인이 `status=active` 가 되는데 같은 게시물(`media_id`)에 "
             "이미 다른 활성 캠페인이 있으면 **HTTP 409** 로 거부됩니다 "
-            "(`error.details.code='duplicate_active_campaign'`)."
+            "(`error.details.code='duplicate_active_campaign'`).\n\n"
+            "**링크 버튼(PATCH 의미)**: `link_buttons` 는 **리스트를 통째로 교체**합니다(부분 병합 아님). "
+            "버튼을 모두 없애려면 `link_buttons: []` 를 보내고, legacy 단일 버튼까지 지우려면 "
+            '`link_button_url: ""` 도 함께 보내세요. `link_buttons` 가 비어있으면 legacy 단일 버튼으로 '
+            "fallback 됩니다.\n\n"
+            "**공개 답글 상한**: `public_reply_limit`(0=무제한)을 올리거나 0 으로 두면 상한에 걸린 "
+            "캠페인의 대댓글 게시가 재개됩니다. `public_reply_posted_count` 는 읽기전용(리셋되지 않음)."
         ),
         request=AutoDMCampaignUpdateSerializer,
         responses={
@@ -3655,6 +3679,99 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         }
 
         return Response(stats)
+
+    @extend_schema(
+        summary="캠페인 신규 요청자 시계열 조회",
+        description=(
+            "캠페인의 **신규 요청자 추이**를 시간 버킷별로 반환합니다 (진행/모멘텀 차트용).\n\n"
+            "**인증**: JWT 필수. 해당 워크스페이스 멤버만 조회 가능.\n\n"
+            "**집계 정의 (사람 단위)**\n"
+            "- y축 `new_requesters` = 그 버킷에 **처음** 요청한 사람 수. 한 사람의 '최초 트리거 "
+            "댓글(루트 DM) 시각'을 그 사람의 요청 시점으로 본다. 같은 사람이 여러 번 댓글을 "
+            "달거나 복구 재댓글을 보내도 **최초 1회만** 집계한다(재발송·보상 DM 제외).\n"
+            "- 사람 판정은 stats 응답의 `people.total` 과 동일한 키공간 → 합계가 일치한다.\n\n"
+            "**범위·버킷 (KST · Asia/Seoul)**\n"
+            "- `range=all`(기본): 최초 요청일~오늘, **일(day)** 버킷\n"
+            "- `range=24h`: 현재 시각으로 끝나는 24개 **시간(hour)** 버킷\n"
+            "- `range=7d`: 오늘로 끝나는 7개 **일(day)** 버킷\n"
+            "- 윈도우 = 버킷 그리드라 항상 `sum(series[].new_requesters) == totals.window_new_requesters` "
+            "이고, `all` 이면 `== totals.lifetime_unique_requesters`.\n"
+            "- 빈 버킷은 0 으로 채워 반환(연속 렌더). **마지막 버킷은 진행 중(partial)**.\n\n"
+            "**주의사항**\n"
+            "- `bucket`/`*_at` 은 서버 로그 `created_at`(웹훅 수신 시각) 기준 — 실제 댓글 작성보다 "
+            "수 초, 폴링 보정 건은 최대 ~1시간 늦을 수 있는 근사값이다.\n"
+            "- `history_complete=false` 면 로그 보존정책으로 과거 구간이 불완전할 수 있으니 "
+            "차트에 안내 배지를 권장(현재는 항상 true).\n\n"
+            "**예시**\n"
+            "```bash\n"
+            "curl -H 'Authorization: Bearer <JWT>' \\\n"
+            "  'https://api.turnflow.link/api/v1/integrations/auto-dm-campaigns/<id>/timeseries/?range=7d'\n"
+            "```"
+        ),
+        parameters=[
+            OpenApiParameter(
+                name="range",
+                description="조회 범위: all(전체·기본) | 24h(최근 24시간) | 7d(최근 7일)",
+                required=False,
+                type=str,
+                enum=["all", "24h", "7d"],
+                location=OpenApiParameter.QUERY,
+            ),
+        ],
+        responses={
+            200: CampaignTimeseriesSerializer,
+            400: OpenApiResponse(description="range 값이 잘못됨 (허용: all | 24h | 7d)"),
+            401: OpenApiResponse(description="인증 필요"),
+            403: OpenApiResponse(description="권한 없음 (해당 workspace 멤버 아님)"),
+            404: OpenApiResponse(description="캠페인을 찾을 수 없음"),
+            500: OpenApiResponse(description="서버 오류"),
+        },
+        examples=[
+            OpenApiExample(
+                "7일 추이 응답",
+                value={
+                    "campaign_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                    "campaign_status": "active",
+                    "is_active": True,
+                    "range": "7d",
+                    "granularity": "day",
+                    "timezone": "Asia/Seoul",
+                    "totals": {
+                        "lifetime_unique_requesters": 1280,
+                        "window_new_requesters": 342,
+                        "first_request_at": "2026-07-01T09:12:03+09:00",
+                        "last_request_at": "2026-07-15T18:44:51+09:00",
+                    },
+                    "series": [
+                        {"bucket": "2026-07-09T00:00:00+09:00", "new_requesters": 51},
+                        {"bucket": "2026-07-10T00:00:00+09:00", "new_requesters": 63},
+                        {"bucket": "2026-07-11T00:00:00+09:00", "new_requesters": 0},
+                        {"bucket": "2026-07-12T00:00:00+09:00", "new_requesters": 47},
+                        {"bucket": "2026-07-13T00:00:00+09:00", "new_requesters": 58},
+                        {"bucket": "2026-07-14T00:00:00+09:00", "new_requesters": 41},
+                        {"bucket": "2026-07-15T00:00:00+09:00", "new_requesters": 81},
+                    ],
+                    "history_complete": True,
+                },
+                response_only=True,
+            ),
+        ],
+        tags=["Auto DM"],
+    )
+    @action(detail=True, methods=["get"])
+    def timeseries(self, request, pk=None):
+        """캠페인 신규 요청자 시계열 (x=시간, y=신규 요청자 수)"""
+        range_key = request.query_params.get("range", "all")
+        if range_key not in TIMESERIES_RANGES:
+            raise DRFValidationError({"range": "허용값: all | 24h | 7d"})
+        campaign = self.get_object()  # workspace 스코핑 → 타 워크스페이스는 404
+        data = new_requester_timeseries(campaign, range_key)
+        data.update(
+            campaign_id=campaign.id,
+            campaign_status=campaign.status,
+            is_active=campaign.status == AutoDMCampaign.Status.ACTIVE,
+        )
+        return Response(CampaignTimeseriesSerializer(data).data)
 
 
 @extend_schema(

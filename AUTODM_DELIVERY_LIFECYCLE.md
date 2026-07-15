@@ -184,8 +184,15 @@
 
 ### 3.2 메시지 종류·버튼 결정
 - **OPENING + gate PENDING** → postback 버튼 `[{type:postback, title:follow_gate_button_label, payload:'fg:{log_id}'}]`.
-- **STANDALONE / REWARD** → `campaign.get_link_buttons()`(web_url 링크 버튼).
-- 버튼이 있으면 generic template(카드+버튼)으로, 없으면 plain text(+quick_replies)로 전송. 버튼은 최대 3개, quick_replies 최대 13개.
+- **STANDALONE / REWARD** → `campaign.get_link_buttons()`(web_url 링크 버튼, **최대 3개**).
+  - `get_link_buttons()`는 `campaign.link_buttons`(list, `[{"url","label"}]`) 에 유효 항목이 있으면 그것을 우선 사용하고, 비어있으면 legacy `link_button_url`/`link_button_label`(단일)로 fallback 한다. url 은 http/https 만, label 은 20자로 잘리며, 최대 3개(초과분 무시).
+- 버튼이 있으면 **button template**(text 640자 + web_url/postback 버튼 1~3개)으로, 없으면 plain text(+quick_replies)로 전송한다. **버튼 개수(1~3)는 640자 본문 한도에 영향 없음**(버튼 title 은 개당 20자 별도 한도). quick_replies 최대 13개.
+
+### 3.2.1 공개 답글(대댓글) 상한
+- `public_reply_enabled` 캠페인은 DM 성공 시 댓글에 공개 답글을 게시한다(`post_public_reply`, best-effort).
+- **누적 상한** `public_reply_limit`(기본 200, 0=무제한): `post_public_reply`(비복구)는 배치 스로틀·API 호출 **전에** `campaign.public_reply_limit_reached()`를 검사하고, 도달했으면 `verification_log`에 `limit_skipped`를 남기고 게시하지 않는다(로그는 failed 로 만들지 않음 — DM 은 이미 발송됨). `send_dm_task` 의 enqueue 지점에도 동일 프리체크가 있어 무의미한 태스크 적재를 막는다(best-effort).
+- 성공 게시 시에만 `campaign.increment_public_reply_posted()`로 `public_reply_posted_count`를 원자적 증가한다.
+- **복구 안내 대댓글(recovery=True)은 이 상한과 무관** — 항상 게시되고 카운트되지 않는다(배치 윈도우만 `public_reply_posted_at`로 공유).
 
 ### 3.3 실제 API 호출 (2가지 경로)
 | 함수 | 엔드포인트 | recipient | 사용 시점 |

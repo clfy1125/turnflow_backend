@@ -1648,6 +1648,7 @@ def send_dm_task(self, log_id: str):
         and has_reply_content
         and log.comment_id  # Story 답장은 comment_id 없음 → 공개 답글 skip
         and log.dm_kind != SentDMLog.DMKind.REWARD
+        and not campaign.public_reply_limit_reached()  # 상한 도달 시 무의미한 태스크 미적재(best-effort)
     ):
         # 5~15초 지터를 enqueue 시점에서 적용 (Instagram 봇 검사 회피)
         import random as _r
@@ -2734,6 +2735,20 @@ def post_public_reply(self, log_id: str, recovery: bool = False):
     if recovery and log.status != SentDMLog.Status.RECOVERY_PENDING:
         return {"status": "skipped", "reason": f"no_longer_pending({log.status})"}
 
+    # ★ 캠페인별 성공 공개 답글 상한 — 복구 안내(recovery)는 항상 예외(차단·집계 제외).
+    #   배치 스로틀·API 호출 전에 검사해 상한 도달 건이 COUNT 쿼리/retry 슬롯을 낭비하지
+    #   않게 한다. 로그는 failed 로 만들지 않는다(DM 은 이미 정상 발송, 대댓글은 부가 기능).
+    if not recovery and campaign.public_reply_limit_reached():
+        log.append_verification_log(
+            {
+                "path": "public_reply",
+                "result": "limit_skipped",
+                "limit": campaign.public_reply_limit,
+                "posted_count": campaign.public_reply_posted_count,
+            }
+        )
+        return {"status": "skipped", "reason": "public_reply_limit_reached"}
+
     ig_conn = campaign.ig_connection
 
     # ★ 배치 카운트 체크 — 같은 IG 계정에서 최근 N건 이상 게시했으면 일시 정지
@@ -2861,6 +2876,8 @@ def post_public_reply(self, log_id: str, recovery: bool = False):
         log.public_reply_id = reply_id
         log.public_reply_posted_at = now
         log.save(update_fields=["public_reply_id", "public_reply_posted_at"])
+        # 성공 공개 답글 누계 증가 (원자적). 복구는 상한 집계 제외 → 여기서만 증가.
+        campaign.increment_public_reply_posted()
     log.append_verification_log(
         {
             "path": "public_reply",

@@ -47,6 +47,75 @@ class TestGetLinkButtons:
         assert len(c.get_link_buttons()[0]["title"]) <= 20
 
 
+class TestGetLinkButtonsList:
+    """link_buttons(list, 최대 3개) 우선순위 + fallback + 필터링."""
+
+    def test_multiple_buttons_in_order(self):
+        c = AutoDMCampaign(
+            link_buttons=[
+                {"url": "https://a.io", "label": "A"},
+                {"url": "https://b.io", "label": "B"},
+                {"url": "https://c.io", "label": "C"},
+            ]
+        )
+        assert c.get_link_buttons() == [
+            {"type": "web_url", "title": "A", "url": "https://a.io"},
+            {"type": "web_url", "title": "B", "url": "https://b.io"},
+            {"type": "web_url", "title": "C", "url": "https://c.io"},
+        ]
+
+    def test_capped_to_3(self):
+        c = AutoDMCampaign(
+            link_buttons=[{"url": f"https://x.io/{i}", "label": str(i)} for i in range(5)]
+        )
+        assert len(c.get_link_buttons()) == 3
+
+    def test_invalid_items_skipped_valid_survive(self):
+        c = AutoDMCampaign(
+            link_buttons=[
+                "not-a-dict",
+                {"label": "no-url"},
+                {"url": "ftp://x.io", "label": "bad-scheme"},
+                {"url": "https://ok.io", "label": "OK"},
+            ]
+        )
+        assert c.get_link_buttons() == [{"type": "web_url", "title": "OK", "url": "https://ok.io"}]
+
+    def test_label_default_and_cap(self):
+        c = AutoDMCampaign(
+            link_buttons=[{"url": "https://a.io"}, {"url": "https://b.io", "label": "가" * 50}]
+        )
+        out = c.get_link_buttons()
+        assert out[0]["title"] == "자세히 보기"
+        assert len(out[1]["title"]) <= 20
+
+    def test_list_wins_over_legacy(self):
+        c = AutoDMCampaign(
+            link_buttons=[{"url": "https://new.io", "label": "새"}],
+            link_button_url="https://legacy.io",
+            link_button_label="구",
+        )
+        assert c.get_link_buttons() == [{"type": "web_url", "title": "새", "url": "https://new.io"}]
+
+    def test_empty_list_falls_back_to_legacy(self):
+        c = AutoDMCampaign(
+            link_buttons=[], link_button_url="https://legacy.io", link_button_label="구"
+        )
+        assert c.get_link_buttons() == [
+            {"type": "web_url", "title": "구", "url": "https://legacy.io"}
+        ]
+
+    def test_all_invalid_list_falls_back_to_legacy(self):
+        c = AutoDMCampaign(
+            link_buttons=[{"url": "ftp://x"}, "junk"],
+            link_button_url="https://legacy.io",
+            link_button_label="구",
+        )
+        assert c.get_link_buttons() == [
+            {"type": "web_url", "title": "구", "url": "https://legacy.io"}
+        ]
+
+
 # ── 메시징 서비스 버튼 정규화 (DB 불필요) ──────────────────────
 
 
@@ -212,3 +281,73 @@ class TestSendAttachesLinkButton:
         log = _log(campaign, dm_kind=SentDMLog.DMKind.STANDALONE)
         _run_send(log)
         assert capture_send.call_args.kwargs["buttons"] is None
+
+    def test_standalone_gets_multiple_link_buttons(self, ig_connection, capture_send):
+        campaign = _campaign(
+            ig_connection,
+            follow_gate_enabled=False,
+            link_buttons=[
+                {"url": "https://a.io", "label": "A"},
+                {"url": "https://b.io", "label": "B"},
+                {"url": "https://c.io", "label": "C"},
+            ],
+        )
+        log = _log(campaign, dm_kind=SentDMLog.DMKind.STANDALONE)
+        _run_send(log)
+        buttons = capture_send.call_args.kwargs["buttons"]
+        assert buttons == [
+            {"type": "web_url", "title": "A", "url": "https://a.io"},
+            {"type": "web_url", "title": "B", "url": "https://b.io"},
+            {"type": "web_url", "title": "C", "url": "https://c.io"},
+        ]
+
+
+class TestLinkButtonsSerializer:
+    """AutoDMCampaignCreateSerializer 의 link_buttons 검증 + 버튼 부착 시 640자 한도."""
+
+    def _base(self, **extra):
+        data = {"trigger_type": "any_media", "name": "t", "message_template": "hi"}
+        data.update(extra)
+        from apps.integrations.serializers import AutoDMCampaignCreateSerializer
+
+        return AutoDMCampaignCreateSerializer(data=data)
+
+    def test_accepts_up_to_3(self):
+        s = self._base(
+            link_buttons=[
+                {"url": "https://a.io", "label": "a"},
+                {"url": "https://b.io", "label": "b"},
+                {"url": "https://c.io", "label": "c"},
+            ]
+        )
+        assert s.is_valid(), s.errors
+        assert len(s.validated_data["link_buttons"]) == 3
+
+    def test_rejects_4(self):
+        s = self._base(link_buttons=[{"url": f"https://x.io/{i}"} for i in range(4)])
+        assert not s.is_valid()
+        assert "link_buttons" in s.errors
+
+    def test_rejects_non_http_scheme(self):
+        s = self._base(link_buttons=[{"url": "ftp://x.io", "label": "a"}])
+        assert not s.is_valid()
+        assert "link_buttons" in s.errors
+
+    def test_rejects_label_over_20(self):
+        s = self._base(link_buttons=[{"url": "https://a.io", "label": "가" * 21}])
+        assert not s.is_valid()
+        assert "link_buttons" in s.errors
+
+    def test_buttoned_body_over_640_rejected(self):
+        # 버튼이 붙으면 button template → 640자 한도
+        s = self._base(
+            opening_message_template="a" * 700,
+            link_buttons=[{"url": "https://a.io", "label": "a"}],
+        )
+        assert not s.is_valid()
+        assert "opening_message_template" in s.errors
+
+    def test_same_body_without_buttons_ok(self):
+        # 버튼 없으면 일반 텍스트 1000바이트 → 700 ASCII 통과
+        s = self._base(opening_message_template="a" * 700)
+        assert s.is_valid(), s.errors

@@ -294,6 +294,21 @@ class TestDiversifyOpening:
         res = diversify_opening(opening_message="원문", count=5)
         assert res.variants == []
 
+    def test_preserves_newlines_and_bullets(self, monkeypatch):
+        """멀티라인 변형(줄바꿈·불릿 가격표)이 한 줄로 눌리지 않고 구조 보존."""
+        import json as _json
+
+        multiline = "<가격 정보>\n· 얼굴 전체: 249만원 → 199만원\n· 눈가: 149만원 → 119만원\n7월 31일까지 진행됩니다."
+        monkeypatch.setattr(
+            dca,
+            "call_llm_messages_with_usage",
+            lambda **kw: _fake_llm(_json.dumps({"variants": [multiline]})),
+        )
+        res = diversify_opening(opening_message="원문\n둘째줄", count=5)
+        assert res.variants == [multiline]
+        assert res.variants[0].count("\n") == 3  # 원문과 동일한 줄 수
+        assert "· 얼굴" in res.variants[0]  # 선행 불릿 보존(_clean_list_item 였다면 소실)
+
 
 # ── 오프닝 회전(여러 개 중 1개 무작위 발송) ────────────────────
 
