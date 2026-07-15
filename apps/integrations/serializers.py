@@ -1157,6 +1157,10 @@ class SentDMLogSerializer(serializers.ModelSerializer):
             "parent_log",
             "public_reply_id",
             "public_reply_posted_at",
+            # 복구 안내 대댓글(숨겨진 요청·스팸 → "수락 후 재댓글" 안내). public_reply_* 와
+            # 대칭으로 노출 → 프론트가 숨겨진 요청·스팸 탭에서 "복구 안내 댓글 게시됨"을 표시 가능.
+            "recovery_reply_id",
+            "recovery_pending_at",
             # v3.8: 팔로우 전환 여부 (opening 1행만 보여줄 때 핵심 지표)
             "follow_passed",
             # 플로우 내 역할: opening / retry / reward / standalone (표시용)

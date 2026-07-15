@@ -175,3 +175,19 @@ class TestTransientRetryCap:
         assert res["status"] == SentDMLog.Status.FAILED_NO_TRACE
         assert log.status == SentDMLog.Status.FAILED_NO_TRACE
         assert conn.status == IGAccountConnection.Status.ACTIVE
+
+
+# ───────── 복구 안내 댓글 필드 노출 (로그 API 에서 recovery_reply_* 보이게) ─────────
+
+
+def test_log_serializer_exposes_recovery_reply_fields():
+    """복구 안내 대댓글(recovery_reply_id/recovery_pending_at)이 로그 직렬화기에 노출되는지.
+
+    이전엔 public_reply_id 만 노출되고 복구 안내 댓글은 응답에 없어 프론트가 표시 불가였음.
+    """
+    from apps.integrations.serializers import SentDMLogSerializer
+
+    fields = set(SentDMLogSerializer().fields.keys())
+    assert "recovery_reply_id" in fields
+    assert "recovery_pending_at" in fields
+    assert "public_reply_id" in fields  # 성공 공개답글도 여전히 노출(회귀 방지)
