@@ -966,13 +966,17 @@ def _downgrade_to_free(sub, free_plan, reason: str = ""):
         ]
     )
 
-    # 페이지 비활성화: 가장 먼저 생성된 max_pages개만 활성, 나머지 비활성
+    # 페이지 비활성화: 가장 먼저 생성된 max_pages개만 활성, 나머지 비활성.
+    # 불변식(is_public ⟹ is_active): 슬롯을 뺏는 초과분은 is_public 도 함께 내려
+    # "슬롯 없는데 공개(서빙)되는" 페이지가 생기지 않게 한다. 재업그레이드 후엔 사용자가 직접 재공개.
     max_pages = free_plan.features.get("max_pages", 1)
     user_pages = Page.objects.filter(user=sub.user).order_by("created_at")
     active_ids = list(user_pages.values_list("id", flat=True)[:max_pages])
     if active_ids:
         Page.objects.filter(user=sub.user, id__in=active_ids).update(is_active=True)
-        Page.objects.filter(user=sub.user).exclude(id__in=active_ids).update(is_active=False)
+        Page.objects.filter(user=sub.user).exclude(id__in=active_ids).update(
+            is_active=False, is_public=False
+        )
 
     # IG 계정 비활성화: 가장 먼저 연동된 max_ig_accounts개만 활성, 나머지 소프트 비활성.
     # (하드 연결해제가 아니라 is_active=False — 토큰/데이터 보존, 활성 캠페인은 PAUSE)

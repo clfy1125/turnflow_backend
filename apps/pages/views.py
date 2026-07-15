@@ -52,15 +52,16 @@ from .stats import (
     resolve_period,
 )
 
-
 # ─────────────────────────────────────────────────────────────
 # 내 페이지 (GET / PATCH)
 # ─────────────────────────────────────────────────────────────
 
+
 class MyPageView(APIView):
     permission_classes = [IsAuthenticated]
 
-    @extend_schema(tags=["페이지 서비스"],
+    @extend_schema(
+        tags=["페이지 서비스"],
         summary="내 페이지 조회 (없으면 자동 생성)",
         description="""
 ## 개요
@@ -151,7 +152,7 @@ const publicUrl = `https://yourdomain.com/@${page.slug}`;
                             "created_at": "2026-03-01T00:00:00Z",
                             "updated_at": "2026-03-01T00:00:00Z",
                         },
-                    )
+                    ),
                 ],
             ),
             401: OpenApiResponse(description="인증 실패"),
@@ -161,7 +162,8 @@ const publicUrl = `https://yourdomain.com/@${page.slug}`;
         page, _ = Page.get_or_create_for_user(request.user)
         return Response(PageSerializer(page).data)
 
-    @extend_schema(tags=["페이지 서비스"],
+    @extend_schema(
+        tags=["페이지 서비스"],
         summary="내 페이지 수정",
         description="""
 ## 개요
@@ -245,6 +247,7 @@ await api.patch('/api/pages/me/', { is_public: false });
 
         # ── 프로 기능 제한: 로고 제거 ──
         from apps.billing.subscription_utils import check_feature
+
         new_data = request.data.get("data")
         if new_data and isinstance(new_data, dict):
             new_logo = new_data.get("design_settings", {}).get("logoStyle")
@@ -268,10 +271,12 @@ await api.patch('/api/pages/me/', { is_public: false });
 # 공개 페이지 조회 (slug 기반)
 # ─────────────────────────────────────────────────────────────
 
+
 class PublicPageView(APIView):
     permission_classes = [AllowAny]
 
-    @extend_schema(tags=["페이지 서비스"],
+    @extend_schema(
+        tags=["페이지 서비스"],
         summary="공개 페이지 조회 (slug 기반)",
         description="""
 ## 개요
@@ -345,7 +350,9 @@ export async function getServerSideProps({ params }) {
         try:
             page = Page.objects.get(slug=slug)
         except Page.DoesNotExist:
-            return Response({"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
 
         # 비활성 페이지 접근 차단 (소유자에게도 비활성은 공개 불가)
         if not page.is_active:
@@ -368,6 +375,7 @@ export async function getServerSideProps({ params }) {
 # 내 블록 목록 / 생성
 # ─────────────────────────────────────────────────────────────
 
+
 class BlockListCreateView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -375,7 +383,8 @@ class BlockListCreateView(APIView):
         page, _ = Page.get_or_create_for_user(user)
         return page
 
-    @extend_schema(tags=["페이지 서비스"],
+    @extend_schema(
+        tags=["페이지 서비스"],
         summary="내 블록 목록 조회",
         description="""
 ## 개요
@@ -407,7 +416,8 @@ class BlockListCreateView(APIView):
         blocks = page.blocks.order_by("order")
         return Response(BlockSerializer(blocks, many=True).data)
 
-    @extend_schema(tags=["페이지 서비스"],
+    @extend_schema(
+        tags=["페이지 서비스"],
         summary="블록 생성",
         description="""
 ## 개요
@@ -498,6 +508,7 @@ class BlockListCreateView(APIView):
 # 내 블록 상세 (PATCH / DELETE)
 # ─────────────────────────────────────────────────────────────
 
+
 class BlockDetailView(APIView):
     permission_classes = [IsAuthenticated, IsPageOwner]
 
@@ -509,7 +520,8 @@ class BlockDetailView(APIView):
         self.check_object_permissions(request, block)
         return block
 
-    @extend_schema(tags=["페이지 서비스"],
+    @extend_schema(
+        tags=["페이지 서비스"],
         summary="블록 수정",
         description="""
 ## 개요
@@ -577,7 +589,9 @@ await api.patch(`/api/pages/me/blocks/${blockId}/`, {
     def patch(self, request, pk):
         block = self._get_block(request, pk)
         if not block:
-            return Response({"detail": "블록을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "블록을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
 
         page, _ = Page.get_or_create_for_user(request.user)
         serializer = BlockSerializer(block, data=request.data, partial=True, context={"page": page})
@@ -587,7 +601,8 @@ await api.patch(`/api/pages/me/blocks/${blockId}/`, {
         block.page.detach_snapshot_pointer()
         return Response(serializer.data)
 
-    @extend_schema(tags=["페이지 서비스"],
+    @extend_schema(
+        tags=["페이지 서비스"],
         summary="블록 삭제",
         description="""
 ## 개요
@@ -615,7 +630,9 @@ await api.patch(`/api/pages/me/blocks/${blockId}/`, {
     def delete(self, request, pk):
         block = self._get_block(request, pk)
         if not block:
-            return Response({"detail": "블록을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "블록을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         page = block.page
         block.delete()
         # 블록 삭제 → 라이브가 스냅샷과 달라졌으므로 활성 슬롯 포인터 해제
@@ -627,10 +644,12 @@ await api.patch(`/api/pages/me/blocks/${blockId}/`, {
 # Reorder
 # ─────────────────────────────────────────────────────────────
 
+
 class BlockReorderView(APIView):
     permission_classes = [IsAuthenticated]
 
-    @extend_schema(tags=["페이지 서비스"],
+    @extend_schema(
+        tags=["페이지 서비스"],
         summary="블록 순서 재정렬",
         description="""
 ## 개요
@@ -675,7 +694,9 @@ const handleDragEnd = async (reorderedBlocks: Block[]) => {
         """,
         request=ReorderSerializer,
         responses={
-            200: OpenApiResponse(response=BlockSerializer(many=True), description="재정렬된 블록 목록"),
+            200: OpenApiResponse(
+                response=BlockSerializer(many=True), description="재정렬된 블록 목록"
+            ),
             400: OpenApiResponse(description="유효성 검증 실패 or 권한 없는 블록 포함"),
             401: OpenApiResponse(description="인증 실패"),
         },
@@ -692,7 +713,9 @@ const handleDragEnd = async (reorderedBlocks: Block[]) => {
         # 다른 페이지 블록 포함 여부 검증
         if Block.objects.filter(pk__in=requested_ids, page=page).count() != len(requested_ids):
             return Response(
-                {"detail": "요청한 블록 중 이 페이지에 속하지 않거나 존재하지 않는 블록이 있습니다."},
+                {
+                    "detail": "요청한 블록 중 이 페이지에 속하지 않거나 존재하지 않는 블록이 있습니다."
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -714,6 +737,7 @@ const handleDragEnd = async (reorderedBlocks: Block[]) => {
 # ─────────────────────────────────────────────────────────────
 # slug 중복 확인 / slug 변경
 # ─────────────────────────────────────────────────────────────
+
 
 class SlugCheckView(APIView):
     permission_classes = [IsAuthenticated]
@@ -760,11 +784,19 @@ const checkSlug = useDebouncedCallback(async (value: string) => {
                 examples=[
                     OpenApiExample(
                         "Available",
-                        value={"slug": "my-brand", "available": True, "message": "사용 가능한 slug입니다."},
+                        value={
+                            "slug": "my-brand",
+                            "available": True,
+                            "message": "사용 가능한 slug입니다.",
+                        },
                     ),
                     OpenApiExample(
                         "Taken",
-                        value={"slug": "clfy", "available": False, "message": "이미 사용 중인 slug입니다."},
+                        value={
+                            "slug": "clfy",
+                            "available": False,
+                            "message": "이미 사용 중인 slug입니다.",
+                        },
                     ),
                 ],
             ),
@@ -781,7 +813,9 @@ const checkSlug = useDebouncedCallback(async (value: string) => {
             )
         taken = Page.objects.filter(slug=slug).exclude(user=request.user).exists()
         if taken:
-            return Response({"slug": slug, "available": False, "message": "이미 사용 중인 slug입니다."})
+            return Response(
+                {"slug": slug, "available": False, "message": "이미 사용 중인 slug입니다."}
+            )
         return Response({"slug": slug, "available": True, "message": "사용 가능한 slug입니다."})
 
 
@@ -861,7 +895,11 @@ const newPublicUrl = `https://yourdomain.com/@${res.data.slug}`;
                     ),
                     OpenApiExample(
                         "Format Error",
-                        value={"slug": ["Enter a valid \u2018slug\u2019 consisting of letters, numbers, underscores or hyphens."]},
+                        value={
+                            "slug": [
+                                "Enter a valid \u2018slug\u2019 consisting of letters, numbers, underscores or hyphens."
+                            ]
+                        },
                     ),
                 ],
             ),
@@ -870,9 +908,7 @@ const newPublicUrl = `https://yourdomain.com/@${res.data.slug}`;
     )
     def patch(self, request):
         page, _ = Page.get_or_create_for_user(request.user)
-        serializer = SlugChangeSerializer(
-            data=request.data, context={"user": request.user}
-        )
+        serializer = SlugChangeSerializer(data=request.data, context={"user": request.user})
         serializer.is_valid(raise_exception=True)
         page.slug = serializer.validated_data["slug"]
         page.save(update_fields=["slug", "updated_at"])
@@ -882,6 +918,7 @@ const newPublicUrl = `https://yourdomain.com/@${res.data.slug}`;
 # ─────────────────────────────────────────────────────────────
 # 커스텀 CSS 수정 (단일 페이지)
 # ─────────────────────────────────────────────────────────────
+
 
 class CustomCssView(APIView):
     permission_classes = [IsAuthenticated]
@@ -970,6 +1007,7 @@ if (page.custom_css) {
 
         # ── 프로 기능 제한: 커스텀 CSS ──
         from apps.billing.subscription_utils import check_feature
+
         new_css = request.data.get("custom_css", "")
         if new_css and not check_feature(request.user, "custom_css"):
             return Response(
@@ -989,6 +1027,7 @@ if (page.custom_css) {
 # ─────────────────────────────────────────────────────────────
 # 블록 커스텀 CSS 수정 (단일 페이지)
 # ─────────────────────────────────────────────────────────────
+
 
 class BlockCustomCssView(APIView):
     permission_classes = [IsAuthenticated]
@@ -1010,7 +1049,9 @@ class BlockCustomCssView(APIView):
         """,
         parameters=[
             OpenApiParameter(
-                name="block_id", type=OpenApiTypes.INT, location=OpenApiParameter.PATH,
+                name="block_id",
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.PATH,
                 description="블록 ID",
             ),
         ],
@@ -1024,7 +1065,9 @@ class BlockCustomCssView(APIView):
         page, _ = Page.get_or_create_for_user(request.user)
         block = Block.objects.filter(pk=pk, page=page).first()
         if not block:
-            return Response({"detail": "블록을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "블록을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
         return Response({"custom_css": block.custom_css})
 
     @extend_schema(
@@ -1056,7 +1099,9 @@ await api.patch(`/api/v1/pages/me/blocks/${blockId}/css/`, {
         """,
         parameters=[
             OpenApiParameter(
-                name="block_id", type=OpenApiTypes.INT, location=OpenApiParameter.PATH,
+                name="block_id",
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.PATH,
                 description="블록 ID",
             ),
         ],
@@ -1072,10 +1117,13 @@ await api.patch(`/api/v1/pages/me/blocks/${blockId}/css/`, {
         page, _ = Page.get_or_create_for_user(request.user)
         block = Block.objects.filter(pk=pk, page=page).first()
         if not block:
-            return Response({"detail": "블록을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"detail": "블록을 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
+            )
 
         # ── 프로 기능 제한: 커스텀 CSS ──
         from apps.billing.subscription_utils import check_feature
+
         new_css = request.data.get("custom_css", "")
         if new_css and not check_feature(request.user, "custom_css"):
             return Response(
@@ -1095,6 +1143,7 @@ await api.patch(`/api/v1/pages/me/blocks/${blockId}/css/`, {
 # ─────────────────────────────────────────────────────────────
 # 페이지 조회 기록 (공개 — 프론트가 렌더링 시 호출)
 # ─────────────────────────────────────────────────────────────
+
 
 class PageViewRecordView(APIView):
     permission_classes = [AllowAny]
@@ -1185,7 +1234,7 @@ useEffect(() => {
         },
     )
     def post(self, request, slug):
-        page = Page.objects.filter(slug=slug, is_public=True).first()
+        page = Page.objects.filter(slug=slug, is_public=True, is_active=True).first()
         if not page:
             return Response(status=status.HTTP_404_NOT_FOUND)
         referer_url = request.data.get("referer", "") or request.META.get("HTTP_REFERER", "")
@@ -1201,6 +1250,7 @@ useEffect(() => {
 # ─────────────────────────────────────────────────────────────
 # 블록 클릭 기록 (공개)
 # ─────────────────────────────────────────────────────────────
+
 
 class BlockClickRecordView(APIView):
     permission_classes = [AllowAny]
@@ -1303,7 +1353,7 @@ const handleBlockClick = async (block: Block) => {
         },
     )
     def post(self, request, slug, block_id):
-        page = Page.objects.filter(slug=slug, is_public=True).first()
+        page = Page.objects.filter(slug=slug, is_public=True, is_active=True).first()
         if not page:
             return Response(status=status.HTTP_404_NOT_FOUND)
         block = Block.objects.filter(pk=block_id, page=page).first()
@@ -1324,6 +1374,7 @@ const handleBlockClick = async (block: Block) => {
 # ─────────────────────────────────────────────────────────────
 # 통계 요약 (인증 필수 — 페이지 소유자)
 # ─────────────────────────────────────────────────────────────
+
 
 class PageStatsView(APIView):
     permission_classes = [IsAuthenticated]
@@ -1353,6 +1404,7 @@ class PageStatsView(APIView):
 # 차트 데이터 (인증 필수)
 # ─────────────────────────────────────────────────────────────
 
+
 class StatsChartView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -1381,6 +1433,7 @@ class StatsChartView(APIView):
 # 블록별 통계 (인증 필수)
 # ─────────────────────────────────────────────────────────────
 
+
 class StatsBlocksView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -1408,6 +1461,7 @@ class StatsBlocksView(APIView):
 # ─────────────────────────────────────────────────────────────
 # 문의 — 방문자 제출 (AllowAny)
 # ─────────────────────────────────────────────────────────────
+
 
 class ContactInquirySubmitView(APIView):
     permission_classes = [AllowAny]
@@ -1465,7 +1519,9 @@ await fetch(`/api/pages/@${slug}/inquiries/`, {
 """,
         parameters=[
             OpenApiParameter(
-                name="slug", type=OpenApiTypes.STR, location=OpenApiParameter.PATH,
+                name="slug",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.PATH,
                 description="공개 페이지의 slug",
             ),
         ],
@@ -1509,7 +1565,11 @@ await fetch(`/api/pages/@${slug}/inquiries/`, {
                 examples=[
                     OpenApiExample(
                         "동의 누락",
-                        value={"agreed_to_terms": ["이용약관 및 개인정보 처리방침에 동의해야 문의를 보낼 수 있습니다."]},
+                        value={
+                            "agreed_to_terms": [
+                                "이용약관 및 개인정보 처리방침에 동의해야 문의를 보낼 수 있습니다."
+                            ]
+                        },
                     ),
                     OpenApiExample(
                         "휴대폰 누락",
@@ -1521,7 +1581,7 @@ await fetch(`/api/pages/@${slug}/inquiries/`, {
         },
     )
     def post(self, request, slug):
-        page = Page.objects.filter(slug=slug, is_public=True).first()
+        page = Page.objects.filter(slug=slug, is_public=True, is_active=True).first()
         if not page:
             return Response(status=status.HTTP_404_NOT_FOUND)
         serializer = ContactInquirySubmitSerializer(data=request.data)
@@ -1578,9 +1638,12 @@ class ContactInquiryListView(APIView):
 """,
         parameters=[
             OpenApiParameter(
-                name="period", type=OpenApiTypes.STR, location=OpenApiParameter.QUERY,
+                name="period",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
                 description="조회 기간. `all`=전체, `6m`=6개월, `1m`=1개월, `7d`=7일",
-                required=False, enum=["all", "6m", "1m", "7d"],
+                required=False,
+                enum=["all", "6m", "1m", "7d"],
             ),
         ],
         responses={
@@ -1648,7 +1711,9 @@ class ContactInquiryDetailView(APIView):
 """,
         parameters=[
             OpenApiParameter(
-                name="id", type=OpenApiTypes.INT, location=OpenApiParameter.PATH,
+                name="id",
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.PATH,
                 description="삭제할 문의 ID",
             ),
         ],
@@ -1690,7 +1755,9 @@ await api.patch(`/api/pages/me/inquiries/${id}/memo/`, {
 """,
         parameters=[
             OpenApiParameter(
-                name="id", type=OpenApiTypes.INT, location=OpenApiParameter.PATH,
+                name="id",
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.PATH,
                 description="메모를 수정할 문의 ID",
             ),
         ],
@@ -1714,7 +1781,11 @@ await api.patch(`/api/pages/me/inquiries/${id}/memo/`, {
                 examples=[
                     OpenApiExample(
                         "Success",
-                        value={"id": 1, "memo": "확인완료. 다음 주에 답변 예정", "updated_at": "2026-03-10T15:00:00Z"},
+                        value={
+                            "id": 1,
+                            "memo": "확인완료. 다음 주에 답변 예정",
+                            "updated_at": "2026-03-10T15:00:00Z",
+                        },
                     )
                 ],
             ),
@@ -1735,6 +1806,7 @@ await api.patch(`/api/pages/me/inquiries/${id}/memo/`, {
 # ─────────────────────────────────────────────────────────────
 # 구독 제출 (AllowAny — 방문자)
 # ─────────────────────────────────────────────────────────────
+
 
 class PageSubscriptionSubmitView(APIView):
     permission_classes = [AllowAny]
@@ -1788,7 +1860,9 @@ await fetch(`/api/pages/@${slug}/subscriptions/`, {
 """,
         parameters=[
             OpenApiParameter(
-                name="slug", type=OpenApiTypes.STR, location=OpenApiParameter.PATH,
+                name="slug",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.PATH,
                 description="공개 페이지의 slug",
             ),
         ],
@@ -1828,7 +1902,11 @@ await fetch(`/api/pages/@${slug}/subscriptions/`, {
                 examples=[
                     OpenApiExample(
                         "동의 누락",
-                        value={"agreed_to_terms": ["개인정보 수집 및 이용에 동의해야 구독할 수 있습니다."]},
+                        value={
+                            "agreed_to_terms": [
+                                "개인정보 수집 및 이용에 동의해야 구독할 수 있습니다."
+                            ]
+                        },
                     ),
                     OpenApiExample(
                         "이메일 누락",
@@ -1840,7 +1918,7 @@ await fetch(`/api/pages/@${slug}/subscriptions/`, {
         },
     )
     def post(self, request, slug):
-        page = Page.objects.filter(slug=slug, is_public=True).first()
+        page = Page.objects.filter(slug=slug, is_public=True, is_active=True).first()
         if not page:
             return Response(status=status.HTTP_404_NOT_FOUND)
         serializer = PageSubscriptionSubmitSerializer(data=request.data)
@@ -1896,12 +1974,17 @@ class PageSubscriptionListView(APIView):
 """,
         parameters=[
             OpenApiParameter(
-                name="period", type=OpenApiTypes.STR, location=OpenApiParameter.QUERY,
+                name="period",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
                 description="조회 기간. `all`=전체, `6m`=6개월, `1m`=1개월, `7d`=7일",
-                required=False, enum=["all", "6m", "1m", "7d"],
+                required=False,
+                enum=["all", "6m", "1m", "7d"],
             ),
             OpenApiParameter(
-                name="q", type=OpenApiTypes.STR, location=OpenApiParameter.QUERY,
+                name="q",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
                 description="키워드 검색 — 이름, 이메일, 휴대폰번호를 통합 검색합니다.",
                 required=False,
             ),
@@ -1948,9 +2031,8 @@ class PageSubscriptionListView(APIView):
         q = request.query_params.get("q", "").strip()
         if q:
             from django.db.models import Q as DQ
-            qs = qs.filter(
-                DQ(name__icontains=q) | DQ(email__icontains=q) | DQ(phone__icontains=q)
-            )
+
+            qs = qs.filter(DQ(name__icontains=q) | DQ(email__icontains=q) | DQ(phone__icontains=q))
 
         return Response(PageSubscriptionSerializer(qs, many=True).data)
 
@@ -1978,7 +2060,9 @@ class PageSubscriptionDetailView(APIView):
 """,
         parameters=[
             OpenApiParameter(
-                name="id", type=OpenApiTypes.INT, location=OpenApiParameter.PATH,
+                name="id",
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.PATH,
                 description="삭제할 구독자 ID",
             ),
         ],
@@ -2020,7 +2104,9 @@ await api.patch(`/api/pages/me/subscriptions/${id}/`, {
 """,
         parameters=[
             OpenApiParameter(
-                name="id", type=OpenApiTypes.INT, location=OpenApiParameter.PATH,
+                name="id",
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.PATH,
                 description="메모를 수정할 구독자 ID",
             ),
         ],
@@ -2044,7 +2130,11 @@ await api.patch(`/api/pages/me/subscriptions/${id}/`, {
                 examples=[
                     OpenApiExample(
                         "Success",
-                        value={"id": 1, "memo": "VIP 고객, 뉴스레터 별도 발송 예정", "updated_at": "2026-03-11T10:00:00Z"},
+                        value={
+                            "id": 1,
+                            "memo": "VIP 고객, 뉴스레터 별도 발송 예정",
+                            "updated_at": "2026-03-11T10:00:00Z",
+                        },
                     )
                 ],
             ),
@@ -2060,4 +2150,3 @@ await api.patch(`/api/pages/me/subscriptions/${id}/`, {
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(serializer.data)
-

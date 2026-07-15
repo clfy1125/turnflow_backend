@@ -512,6 +512,33 @@ class TestApplyRefund:
         assert page.custom_css == ".a{color:red}"  # CSS 는 지우지 않는다
         assert sub.trial_used_at is not None  # 트라이얼 사용 이력 유지
 
+    def test_downgrade_to_free_enforces_public_requires_active(self, user, toss):
+        """free 다운그레이드 축소 시 비활성화되는 초과 페이지는 is_public 도 함께 내려간다
+        (불변식 is_public ⟹ is_active — 슬롯 없는데 공개되는 페이지 방지). free max_pages=1."""
+        from apps.pages.models import Page
+
+        result = confirm_billing(user, auth_key="ak1", plan_name="basic")
+        # 3개 모두 공개+활성. 가장 먼저 생성된 1개만 살아남아야 함(free max_pages=1).
+        pages = [
+            Page.objects.create(
+                user=user,
+                slug=f"p-{uuid.uuid4().hex[:8]}",
+                title="t",
+                is_public=True,
+                is_active=True,
+            )
+            for _ in range(3)
+        ]
+
+        apply_refund(result["payment"], downgrade=True)
+
+        for p in pages:
+            p.refresh_from_db()
+        keep, *dropped = pages
+        assert keep.is_active is True and keep.is_public is True
+        for d in dropped:
+            assert d.is_active is False and d.is_public is False  # 불변식
+
 
 # ──────────────────────────────────────────────
 # 비례배분 (proration) 계산 헬퍼 — 순수 함수, now 주입으로 정확값 단언

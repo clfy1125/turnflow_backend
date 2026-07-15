@@ -95,12 +95,12 @@ class TestPageActivation:
         keep.refresh_from_db()
         drop.refresh_from_db()
         assert keep.is_active is True and keep.is_public is True
-        # 미선택은 슬롯 반납만 — is_public 보존 (업그레이드 시 _activate_all_pages 가
-        # is_active 만 되살리므로, 여기서 지우면 재업그레이드 후 영구 비노출로 남는다)
-        assert drop.is_active is False and drop.is_public is True
+        # 불변식(is_public ⟹ is_active): 미선택은 슬롯 반납 + 비공개 (둘 다 False).
+        assert drop.is_active is False and drop.is_public is False
 
-    def test_post_preserved_public_restores_on_upgrade(self, user):
-        """미선택 페이지가 업그레이드 복원(is_active만 되살림) 후 다시 노출되는 회귀 가드."""
+    def test_post_deselected_stays_private_after_upgrade(self, user):
+        """계약 변경 회귀 가드: 미선택 페이지는 is_public=False 로 내려가고,
+        업그레이드 복원(is_active 만 되살림) 후에도 비공개로 남아 사용자가 직접 재공개해야 한다."""
         keep = _page(user, is_public=True, is_active=True)
         drop = _page(user, is_public=True, is_active=True)
         ensure_subscription(user)
@@ -111,11 +111,13 @@ class TestPageActivation:
             format="json",
         )
         assert res.status_code == 200
+        drop.refresh_from_db()
+        assert drop.is_active is False and drop.is_public is False  # 슬롯 반납 + 비공개
 
-        # 업그레이드 복원 경로와 동일 동작 (toss_flows._activate_all_pages)
+        # 업그레이드 복원 경로와 동일 동작 (toss_flows._activate_all_pages 는 is_active 만 되살림)
         Page.objects.filter(user=user, is_active=False).update(is_active=True)
         drop.refresh_from_db()
-        assert drop.is_active is True and drop.is_public is True  # 자동 재노출
+        assert drop.is_active is True and drop.is_public is False  # 재공개는 사용자 몫
 
     def test_needs_adjustment_resolves_after_selection(self, user):
         """needs 는 활성수 기준 일시 조건 — 초과 보유만으로 영구 true(다이얼로그 반복) 금지."""
