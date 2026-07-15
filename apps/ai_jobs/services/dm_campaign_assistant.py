@@ -403,6 +403,25 @@ def _clean_list_item(s: object) -> str:
     return t.strip()
 
 
+def _clean_multiline_item(s: object) -> str:
+    """리스트 항목 1개 정리(멀티라인 보존): 감싼 따옴표 한 겹 제거 + 각 줄 우측 공백 정리.
+
+    ``_clean_list_item`` 과 달리 **내부 개행을 공백으로 합치지 않고**, 선행 불릿(·/-/•/* 등)도
+    콘텐츠로 보존한다. 오프닝 DM 변형은 원문의 줄바꿈·불릿(가격표 등) 구조를 그대로 유지해야
+    하므로(수신자에게 그대로 발송) 이 정리기를 쓴다. 개행은 살리되 CRLF 정규화 + 줄별 우측 트림만.
+    """
+    if not isinstance(s, str):
+        return ""
+    t = s.strip()
+    for lq, rq in _QUOTE_PAIRS:
+        if len(t) >= 2 and t[0] == lq and t[-1] == rq:
+            t = t[1:-1].strip()
+            break
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [ln.rstrip() for ln in t.split("\n")]
+    return "\n".join(lines).strip()
+
+
 def _clip(text: str, max_chars: int, ellipsis: bool = True) -> str:
     t = (text or "").strip()
     if len(t) <= max_chars:
@@ -599,8 +618,20 @@ _DIVERSIFY_SYSTEM = (
     "(1) 각 변형은 원문과 **같은 의미·같은 정중함/발랄함(톤)**. 새 정보·혜택·가격·링크를 지어내지 마라. "
     "(2) 각 변형은 640자 이내, 원문과 비슷한 길이. "
     "(3) 자연스러운 한국어, 과장/허위 금지, 이모지는 원문 수준(0~2개). "
-    "(4) 서로 최대한 다르게(어휘·어순·문장부호). 링크 URL 은 넣지 마라(버튼으로 붙는다). "
-    '(5) JSON 객체 {"variants": ["...", "..."]} 만 출력. 코드펜스·설명·주석 금지.'
+    "(4) 서로 최대한 다르게(어휘·어순). 링크 URL 은 넣지 마라(버튼으로 붙는다). "
+    "(5) **[가장 중요] 원문의 줄 구조를 글자 그대로 복제하라.** 원문이 몇 줄이면 모든 변형도 "
+    "정확히 같은 줄 수. 원문에서 줄이 나뉜 자리(\\n)는 변형에서도 반드시 같은 자리에서 나뉜다. "
+    "각 줄의 '문구'만 바꾸고, 줄의 '개수·경계'는 절대 바꾸지 마라. 여러 줄을 공백이나 "
+    "'·'/'-' 같은 인라인 구분자로 이어붙여 한 줄로 만드는 것은 금지. 원문에 빈 줄이 있으면 "
+    "빈 줄도 유지. 원문이 한 줄이면 변형도 한 줄. "
+    "(6) 변형 안의 줄바꿈은 JSON 문자열에서 반드시 \\n 으로 이스케이프하라. "
+    '(7) JSON 객체 {"variants": ["...", "..."]} 만 출력. 코드펜스·설명·주석 금지.\n'
+    "# 줄 구조 유지 예시 (반드시 이 방식)\n"
+    '원문: "<메뉴>\\n· 아메리카노 4000원\\n· 라떼 5000원\\n오늘까지 할인!"\n'
+    '올바른 변형: "<메뉴 안내>\\n· 아메리카노 4천원\\n· 카페라떼 5천원\\n금일 한정 할인!" '
+    "(줄 4개 그대로, \\n 위치 동일)\n"
+    '잘못된 변형(금지): "<메뉴 안내> · 아메리카노 4천원 · 카페라떼 5천원 오늘까지 할인!" '
+    "(줄바꿈이 사라지고 한 줄로 합쳐짐 — 절대 이렇게 하지 마라)"
 )
 
 
@@ -626,19 +657,25 @@ def diversify_opening(
     max_tokens: int = 4000,
     temperature: float = 0.7,
 ) -> DmDiversifyResult:
-    """오프닝 DM 1개를 톤·의미 유지한 채 count 개 변형으로 다양화.
+    """오프닝 DM 1개를 톤·의미 유지한 채 count 개 변형으로 다양화(단일 LLM 호출).
 
     폼 생성(suggest_campaign_fields)은 오프닝 1개만 만들고, 프론트가 사용자가 확정한 오프닝을
     이 함수로 넘겨 변형 N개를 받아 캠페인의 opening 변형 풀로 쓴다(스팸 탐지 회피).
     절대 raise 하지 않는다 — 파싱 실패 시 빈 리스트를 담아 돌려준다(호출 태스크가 판정).
+
+    **구조 보존:** 원문의 줄바꿈·불릿 구조 유지는 (1) 프롬프트 지시와 (2) 개행을 죽이지 않는
+    파서(``_clean_multiline_item``)로 처리한다. (구조 붕괴분을 폐기 후 재생성하는 방식은 gemma
+    다중 호출로 너무 느려 채택하지 않음 — 단일 호출 + 프롬프트로 간다.)
     """
     n = max(DIVERSIFY_MIN_COUNT, min(int(count or DIVERSIFY_DEFAULT_COUNT), DIVERSIFY_MAX_COUNT))
     src = (opening_message or "").strip()
     tone_hint = (tone or "").strip() or "원문 그대로"
     user = (
-        f'원문 오프닝 DM:\n"{src}"\n\n'
+        "원문 오프닝 DM (아래 [START]~[END] 사이 텍스트 — 줄바꿈·불릿 구조까지 그대로 포함):\n"
+        f"[START]\n{src}\n[END]\n\n"
         f"(참고 톤: {tone_hint})\n"
-        f"위 문구의 변형 {n}개를 서로 다르게 만들어 JSON 객체로만 출력해줘."
+        f"위 문구의 변형 {n}개를 서로 다르게 만들되 원문의 줄바꿈·불릿 구조를 그대로 유지해 "
+        "JSON 객체로만 출력해줘."
     )
     messages = [
         {"role": "system", "content": _DIVERSIFY_SYSTEM},
@@ -656,7 +693,7 @@ def diversify_opening(
         if not isinstance(raw_list, list):
             raw_list = parsed if isinstance(parsed, list) else []
         for item in raw_list:
-            v = _clip(_clean_list_item(item), _BUTTON_TEXT_MAX, ellipsis=False)
+            v = _clip(_clean_multiline_item(item), _BUTTON_TEXT_MAX, ellipsis=False)
             v = _strip_link_lines(v)
             if v and v not in seen:
                 seen.add(v)
