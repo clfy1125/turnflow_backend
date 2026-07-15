@@ -143,7 +143,7 @@ def _mk_campaign(conn):
     )
 
 
-def _mk_dms(campaign, status, n=1, comment_id=None, error_message=""):
+def _mk_dms(campaign, status, n=1, comment_id=None, error_message="", error_subcode=""):
     logs = SentDMLog.objects.bulk_create(
         SentDMLog(
             campaign=campaign,
@@ -153,6 +153,7 @@ def _mk_dms(campaign, status, n=1, comment_id=None, error_message=""):
             message_sent="x",
             status=status,
             error_message=error_message,
+            error_subcode=error_subcode,
             idempotency_key=uuid.uuid4().hex,
         )
         for _ in range(n)
@@ -311,6 +312,7 @@ class TestEmptyState:
         assert dm["requested"] == 0
         assert dm["succeeded"] == 0
         assert dm["failed"] == 0
+        assert dm["hidden_spam"] == 0
         assert dm["delivery_rate"] == 0.0
 
         assert res.data["spam"]["checked"] == 0
@@ -563,6 +565,70 @@ class TestRiskAccounts:
         assert len(risks) == 1
         assert risks[0]["reasons"] == ["repeated_param_errors"]
         assert risks[0]["metrics"]["failed_param_24h"] == 5
+
+    def test_hidden_spam_2534025_not_repeated_param_risk(self, staff_client, clean_slate):
+        # 비팔로워 채널 미개설(2534025)은 계정 위험(repeated_param_errors)이 아니다.
+        conn = _mk_conn(username="cold_audience_acc")
+        camp = _mk_campaign(conn)
+        _mk_dms(camp, SentDMLog.Status.FAILED_PARAM, 5, error_subcode="2534025")
+        res = staff_client.get(URL)
+        assert res.data["risk_accounts"] == []
+
+
+# ─── 숨겨진 요청·스팸 분리 (복구/2534025 는 실패 아님) ────────────────
+
+
+class TestHiddenSpamSeparation:
+    def test_failed_excludes_hidden_spam_and_recovery(self, staff_client, clean_slate):
+        camp = _mk_campaign(_mk_conn())
+        # 진짜 실패(확인 필요)
+        _mk_dms(camp, SentDMLog.Status.FAILED_TOKEN, 2)
+        _mk_dms(camp, SentDMLog.Status.FAILED_PARAM, 3)  # subcode 없음 → 실패
+        # 숨겨진 요청·스팸 (실패 아님)
+        _mk_dms(camp, SentDMLog.Status.FAILED_PARAM, 4, error_subcode="2534025")
+        _mk_dms(camp, SentDMLog.Status.RECOVERY_PENDING, 5)
+        _mk_dms(camp, SentDMLog.Status.RECOVERY_EXPIRED, 1)
+
+        dm = staff_client.get(URL).data["dm_quality"]
+        assert dm["failed"] == 5  # 2 token + 3 param(비-2534025)
+        assert dm["hidden_spam"] == 10  # 4 param@2534025 + 5 pending + 1 expired
+        assert dm["requested"] == 15
+
+    def test_recovery_delivered_counts_as_succeeded(self, staff_client, clean_slate):
+        camp = _mk_campaign(_mk_conn())
+        _mk_dms(camp, SentDMLog.Status.RECOVERY_DELIVERED, 3)
+        dm = staff_client.get(URL).data["dm_quality"]
+        assert dm["succeeded"] == 3
+        assert dm["failed"] == 0
+        assert dm["hidden_spam"] == 0
+
+    def test_action_required_failed_param_excludes_2534025(self, staff_client, clean_slate):
+        camp = _mk_campaign(_mk_conn())
+        _mk_dms(camp, SentDMLog.Status.FAILED_PARAM, 4, error_subcode="2534025")
+        _mk_dms(camp, SentDMLog.Status.FAILED_PARAM, 2)  # 진짜 파라미터 오류
+        res = staff_client.get(URL)
+        assert _item(res, "failed_param_recent")["count"] == 2
+
+    def test_recent_errors_excludes_hidden_spam(self, staff_client, clean_slate):
+        camp = _mk_campaign(_mk_conn(username="hidden_acc"))
+        _mk_dms(camp, SentDMLog.Status.FAILED_PARAM, 2, error_subcode="2534025")
+        _mk_dms(camp, SentDMLog.Status.RECOVERY_PENDING, 2)
+        _mk_dms(camp, SentDMLog.Status.RECOVERY_EXPIRED, 1)
+        _mk_dms(camp, SentDMLog.Status.FAILED_TOKEN, 1, error_message="token dead")
+
+        errors = staff_client.get(URL).data["recent_errors"]
+        dm_errors = [e for e in errors if e["type"] == "dm_failure"]
+        assert len(dm_errors) == 1
+        assert dm_errors[0]["detail"].startswith("failed_token")
+
+    def test_series_splits_hidden_spam_from_failed(self, staff_client, clean_slate):
+        camp = _mk_campaign(_mk_conn())
+        _mk_dms(camp, SentDMLog.Status.RECOVERY_PENDING, 2)
+        _mk_dms(camp, SentDMLog.Status.FAILED_TOKEN, 1)
+
+        buckets = staff_client.get(URL, {"window": "24h"}).data["dm_quality"]["series"]["buckets"]
+        assert sum(b["hidden_spam"] for b in buckets) == 2
+        assert sum(b["failed"] for b in buckets) == 1
 
 
 # ─── 시계열 제로필 ───────────────────────────────────────────────────

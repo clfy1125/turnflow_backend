@@ -121,9 +121,15 @@ class _DmSeriesBucketSerializer(serializers.Serializer):
 
     ts = serializers.DateTimeField(help_text="버킷 시작 시각 (Asia/Seoul ISO 8601)")
     requested = serializers.IntegerField(help_text="버킷 내 생성된 DM 로그 수 (전 상태)")
-    succeeded = serializers.IntegerField(help_text="delivered+read (+legacy sent)")
+    succeeded = serializers.IntegerField(
+        help_text="delivered+read (+legacy sent, +recovery_delivered)"
+    )
     failed = serializers.IntegerField(
-        help_text="failed_token+failed_window+failed_param+failed_no_trace (+legacy failed)"
+        help_text="확인 필요(진짜 실패)만: failed_token+failed_window+failed_no_trace"
+        "+failed_param(2534025 제외) (+legacy failed). 숨겨진 요청·스팸은 제외."
+    )
+    hidden_spam = serializers.IntegerField(
+        help_text="숨겨진 요청·스팸: failed_param@2534025 + recovery_pending + recovery_expired"
     )
     skipped = serializers.IntegerField(help_text="skipped (한도 초과 등)")
 
@@ -142,12 +148,21 @@ class _DmQualitySerializer(serializers.Serializer):
     """DM 발송 품질 블록 (SentDMLog, created_at >= since)."""
 
     requested = serializers.IntegerField(help_text="윈도우 내 생성된 DM 로그 수 (전 상태)")
-    succeeded = serializers.IntegerField(help_text="delivered+read (+legacy sent)")
+    succeeded = serializers.IntegerField(
+        help_text="delivered+read (+legacy sent, +recovery_delivered=복구 재전송 성공)"
+    )
     accepted_pending = serializers.IntegerField(
         help_text="accepted — Meta 접수 후 도착 미확정(in-flight)"
     )
     failed = serializers.IntegerField(
-        help_text="failed_token+failed_window+failed_param+failed_no_trace (+legacy failed)"
+        help_text="확인 필요(진짜 실패)만: failed_token+failed_window+failed_no_trace"
+        "+failed_param(2534025 제외) (+legacy failed). "
+        "★ 숨겨진 요청·스팸(2534025·복구 대기/만료)은 실패가 아니라 hidden_spam 으로 분리."
+    )
+    hidden_spam = serializers.IntegerField(
+        help_text="숨겨진 요청·스팸(실패 아님): 비팔로워 채널 미개설(2534025)로 첫 DM 이 상대 "
+        "숨김함/스팸함으로 간 건 + 복구 대기/만료. = failed_param@2534025 + "
+        "recovery_pending + recovery_expired (복구 재댓글 대상 사유)."
     )
     skipped = serializers.IntegerField(help_text="skipped (한도 초과 등)")
     queued = serializers.IntegerField(help_text="queued (발송 대기)")
