@@ -496,6 +496,17 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 except Exception as e:
                     logger.warning(f"Failed to enqueue profile sync (non-fatal): {e}")
 
+                # 재연동(토큰 교체) 직후 — 토큰 오류(FAILED_TOKEN)로 막혀 있던 발송을
+                # 메시징 윈도우 내라면 자동 되살림. 신규 연동엔 대상이 없어 no-op(안전).
+                # (기존: 자동 갱신 태스크만 revive 를 호출 → 수동 재연동으론 복구 안 됐음)
+                try:
+                    from .tasks import revive_failed_token_logs
+
+                    revive_failed_token_logs.delay(str(connection.id))
+                    logger.info(f"Enqueued failed-token revive after reconnect for {connection.id}")
+                except Exception as e:
+                    logger.warning(f"Failed to enqueue reconnect revive (non-fatal): {e}")
+
             # Clean up persisted state
             try:
                 state_obj.delete()

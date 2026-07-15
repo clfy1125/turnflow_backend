@@ -920,9 +920,13 @@ class InstagramMessagingService:
             # 24h 메시징 윈도우 만료 (subcode 2534022 또는 2018278)
             if code == 10 and subcode in (2534022, 2018278):
                 raise DMWindowExpiredError(msg, **kwargs)
-            # 토큰 / 세션 / 권한 (190은 모든 subcode 포함)
+            # 토큰 / 세션 (190은 모든 subcode 포함, 102 세션) → 연결 브릭 대상
             if code in TOKEN_CODES:
                 raise DMTokenError(msg, **kwargs)
+            # code 200: 권한/수신자 단위 오류(예: subcode 2534066 "대상 ID 유효 확인").
+            # 연결 전체 토큰 문제가 아니므로 개별 발송 실패(FAILED_NO_TRACE)로 처리한다(v3.3).
+            if code == 200:
+                raise DMRecipientUnreachableError(msg, **kwargs)
             # 잘못된 파라미터 (Private Reply 7일 초과 포함)
             if code == 100:
                 raise DMInvalidParamError(msg, **kwargs)

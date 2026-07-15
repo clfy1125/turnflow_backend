@@ -21,7 +21,12 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
-from .dm_exceptions import DMSendError, DMTransientError, exception_to_classification
+from .dm_exceptions import (
+    DMSendError,
+    DMTransientError,
+    ErrorClassification,
+    exception_to_classification,
+)
 from .models import (
     AutoDMCampaign,
     EventInbox,
@@ -37,6 +42,7 @@ from .services import (
     InstagramMessagingService,
     InstagramOAuthService,
     MockInstagramProvider,
+    get_http_session,
     scrub_secrets,
 )
 
@@ -255,6 +261,54 @@ def _rate_defer(log, campaign, ig_conn):
     return None
 
 
+# 토큰 라이브 확인 캐시 TTL(초): 진짜 토큰 사망 시 실패 배치가 /me 를 폭주시키지 않도록.
+_TOKEN_DEAD_CHECK_TTL = 300
+
+
+def _ig_token_confirmed_dead(ig_conn) -> bool:
+    """라이브 GET /me 로 IG 토큰이 '확실히' 죽었는지 확인 (verify-before-brick).
+
+    단발 수신자/권한 오류(예: code 200/2534066)나 일시적 190 으로 분류가 흔들려도,
+    실제 토큰이 살아있으면 연결 전체를 error 로 브릭하지 않기 위한 최종 방어선.
+
+    판정:
+      - /me 2xx                      → 살아있음 → False (브릭 금지)
+      - /me 4xx + OAuth 에러코드      → 진짜 사망 → True (mark_as_error 허용)
+        (190 만료/회수, 102 세션, 104/2500 토큰 필요)
+      - 네트워크/타임아웃/5xx/애매     → False (fail-safe: 브릭 금지)
+
+    연결당 5분 1회만 확인(Redis 캐시). Mock 모드/자격증명 미설정이면 확인 불가 →
+    보수적으로 True(=기존 동작 유지, 진짜 토큰오류일 때 브릭)로 폴백.
+    """
+    from django.core.cache import cache
+
+    ck = f"ig_token_dead:{ig_conn.id}"
+    cached = cache.get(ck)
+    if cached is not None:
+        return cached
+
+    dead = False
+    try:
+        resp = get_http_session().get(
+            f"{InstagramOAuthService.GRAPH_API_BASE}/me",
+            params={"fields": "id", "access_token": ig_conn.access_token},
+            timeout=10,
+        )
+        if resp.status_code in (400, 401, 403):
+            try:
+                err = (resp.json() or {}).get("error", {}) or {}
+            except ValueError:
+                err = {}
+            if err.get("code") in (190, 102, 104, 2500):
+                dead = True
+        # 2xx 또는 그 외 → dead=False (살아있음 / 애매하면 브릭 안 함)
+    except Exception:  # noqa: BLE001 - 애매하면 브릭하지 않는다(가용성 우선)
+        dead = False
+
+    cache.set(ck, dead, _TOKEN_DEAD_CHECK_TTL)
+    return dead
+
+
 def _defer_or_fail(log, campaign, ig_conn, exc) -> dict:
     """발송 예외를 분류해 defer(재시도 대기) 또는 종결 처리하고 결과 dict 반환.
 
@@ -304,6 +358,25 @@ def _defer_or_fail(log, campaign, ig_conn, exc) -> dict:
         return {"status": "deferred", "reason": cls.reason, "retry_count": log.retry_count}
 
     # non-retriable → 종결
+    # ★ verify-before-brick (v3.3): 단발 수신자/권한 오류로 연결 전체를 죽이지 않는다.
+    # 토큰 오류(FAILED_TOKEN)로 분류됐더라도 라이브 /me 로 토큰이 실제 살아있으면
+    # FAILED_NO_TRACE 로 강등하고 mark_as_error(연결 브릭)를 건너뛴다.
+    # (과거: code=200 한 건이 연결을 error 로 브릭 → 이후 전 DM 이 pre-send 에서 정지)
+    if cls.log_status == SentDMLog.Status.FAILED_TOKEN and not _ig_token_confirmed_dead(ig_conn):
+        logger.warning(
+            "DM token-error but token alive → downgrade to no_trace (no brick): "
+            "conn=%s log=%s code=%s sub=%s",
+            ig_conn.id,
+            log.id,
+            getattr(exc, "code", None),
+            getattr(exc, "subcode", None),
+        )
+        cls = ErrorClassification(
+            log_status=SentDMLog.Status.FAILED_NO_TRACE,
+            retriable=False,
+            reason=f"token still valid; per-recipient/permission error ({cls.reason})",
+        )
+
     log.mark_failed(
         status=cls.log_status,
         error_message=str(exc),
@@ -318,7 +391,7 @@ def _defer_or_fail(log, campaign, ig_conn, exc) -> dict:
             campaign.increment_failed()
 
     if cls.log_status == SentDMLog.Status.FAILED_TOKEN:
-        ig_conn.mark_as_error(f"DM 발송 중 토큰/세션/권한 오류: {exc}")
+        ig_conn.mark_as_error(f"DM 발송 중 토큰/세션 오류(라이브 확인됨): {exc}")
 
     return {"status": cls.log_status, "reason": cls.reason}
 
