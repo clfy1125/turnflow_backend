@@ -296,6 +296,28 @@ class IGAccountConnection(models.Model):
             workspace=workspace, status=cls.Status.ACTIVE, is_active=True
         ).first()
 
+    @classmethod
+    def find_conflicting_connection(cls, external_account_id: str, workspace):
+        """다른 워크스페이스에서 이 IG 계정을 아직 점유하고 있는 연동을 반환(없으면 None).
+
+        전서비스 유일성 게이트용: 하나의 IG 계정은 하나의 워크스페이스에만 연결한다.
+        점유 판정 = status != REVOKED. ACTIVE/EXPIRED/ERROR 는 물론 소프트 비활성
+        (is_active=False, 토큰·웹훅 구독 보존) 도 점유로 본다. disconnect() 로 토큰까지
+        폐기(REVOKED)한 연동만 점유를 해제한다.
+
+        NOTE: prod 기존 중복 때문에 조건부 UNIQUE 제약(external_account_id where
+        status != REVOKED)은 아직 도입하지 않았다. audit_ig_duplicates 로 현황을
+        정리한 뒤 별도 마이그레이션에서 uq_igconn_account_live 를 추가할 예정.
+        """
+        return (
+            cls.objects.filter(external_account_id=external_account_id)
+            .exclude(workspace=workspace)
+            .exclude(status=cls.Status.REVOKED)
+            .select_related("workspace", "workspace__owner")
+            .order_by("-created_at")
+            .first()
+        )
+
 
 class IGOAuthState(models.Model):
     """
@@ -800,16 +822,6 @@ class AutoDMCampaign(models.Model):
         max_length=20, choices=Status.choices, default=Status.ACTIVE, verbose_name="상태"
     )
 
-    # 발송 제한
-    max_sends_per_hour = models.IntegerField(
-        default=200,
-        verbose_name="시간당 최대 발송 수 (deprecated)",
-        help_text=(
-            "(deprecated v4.3 — 더 이상 강제되지 않음) 발송 페이싱은 dm_pacer 가 계정 단위 "
-            "자동 조절로 대체했다. API 하위호환을 위해 필드만 유지하며 값은 무시된다."
-        ),
-    )
-
     # 통계
     total_sent = models.IntegerField(default=0, verbose_name="총 발송 수")
     total_failed = models.IntegerField(default=0, verbose_name="총 실패 수")
@@ -998,9 +1010,10 @@ class AutoDMCampaign(models.Model):
         return "running"
 
     def can_send_more(self) -> bool:
-        """(deprecated v4.3) 시간당 한도(max_sends_per_hour)는 더 이상 강제되지 않는다.
+        """캠페인이 지금 발송 가능한 상태인지 (= 활성 여부).
 
-        발송 페이싱은 dm_pacer(계정 단위 지터 슬롯)가 대체했다. 시리얼라이저의
+        과거의 캠페인 시간당 한도는 제거됐다(v4.3~). 발송 페이싱은
+        dm_pacer(계정 단위 지터 슬롯)가 담당하며, 이 메서드는 시리얼라이저의
         can_send 표시 호환을 위해 '캠페인 활성 여부'만 반환한다.
         """
         return self.is_active()

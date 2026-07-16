@@ -190,7 +190,41 @@ function InstagramConnectButton({ workspaceId }) {
 | `NO_FACEBOOK_PAGE` | Facebook Page 없음 | [Page 생성](https://facebook.com/pages/create) 안내 |
 | `NO_INSTAGRAM_BUSINESS_ACCOUNT` | Instagram 계정 미연결 | [비즈니스 계정 전환](https://help.instagram.com/502981923235522) 안내 |
 | `FACEBOOK_API_ERROR` | Meta API 오류 | 잠시 후 재시도 안내 |
+| `PLAN_LIMIT_EXCEEDED` | 요금제 IG 계정 수 한도 초과 | 업그레이드/추가 계정 안내 (재인증은 아래 `reconnect_connection_id` 사용) |
+| `ALREADY_CONNECTED_ELSEWHERE` | 이 IG 계정이 **다른 워크스페이스에 이미 연결됨** | 전용 모달 — "기존 워크스페이스에서 연결 해제 후 다시 시도". 구매 CTA 아님. `message` 에 마스킹된 소유자 이메일 포함 |
 | `INTERNAL_ERROR` | 서버 오류 | 잠시 후 재시도 안내 |
+
+> **하나의 IG 계정 = 하나의 워크스페이스.** 같은 Instagram 계정을 둘 이상의 워크스페이스에
+> 연결하려 하면 콜백이 `ALREADY_CONNECTED_ELSEWHERE` 로 거부한다(점유 해제는 기존 연결 해제로만).
+
+---
+
+## 기존 계정 재연결(재인증)
+
+시작(`connect/start`) 시점엔 어떤 IG 계정을 인증할지 알 수 없으므로(콜백에서야 확정),
+재연동을 막지 않기 위해 **최종 판정은 콜백**이 한다(신규 계정이면 그때 한도 초과로 거부).
+백엔드가 재연동을 통과시키는 조건은 두 가지:
+
+1. **자동(권장)** — owner 가 이미 살아있는(비-REVOKED) 연동을 1개 이상 보유하면,
+   `connect/start` 는 **파라미터 없이도** 시작을 허용한다. → 한도를 채운 사용자가
+   "재연동"을 눌러도 429 가 뜨지 않는다. 프론트 추가 작업 불필요.
+2. **명시(선택)** — `reconnect_connection_id` 로 재연동 의도를 명시하면 게이트를 확실히 우회.
+   ```javascript
+   await fetch(`/api/v1/integrations/instagram/workspaces/${workspaceId}/connect/start/`, {
+     method: 'POST',
+     headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+     body: JSON.stringify({ reconnect_connection_id: connectionId }),
+   });
+   ```
+   값이 이 워크스페이스 소속이 아니거나 이미 해제(revoked)된 연동이면 **400**.
+
+- ⚠️ **한도 우회 불가**: 어느 경로든 OAuth 에서 **신규 계정**을 인증하면 콜백에서
+  `PLAN_LIMIT_EXCEEDED` HTML 페이지로 거부된다. 시작만 열릴 뿐 실제 슬롯은 콜백이 지킨다.
+  (그래서 "새 계정 추가" 시엔 프론트가 구독 정보로 미리 업셀을 띄우는 걸 권장 — start 는
+  더 이상 사전 429 를 주지 않으므로.)
+- 이미 이 워크스페이스가 보유한 계정의 재연동은 **유일-연동 규칙(§위)에도 막히지 않는다**
+  (다른 워크스페이스에 중복이 남아있어도 내 기존 연동의 토큰 갱신은 허용).
+- 재연결로 살아난 연동은 콜백에서 **자동으로 활성(is_active) 복구**된다(활성 슬롯이 남을 때).
 
 ---
 

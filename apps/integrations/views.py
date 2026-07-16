@@ -20,6 +20,7 @@ from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.filters import SearchFilter
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import UserRateThrottle
 
 # AI 폼-작성 도움(게시물→캠페인 초안) 요청/작업 시리얼라이저. @extend_schema 가 클래스 정의 시점에
 # 시리얼라이저 객체를 요구하므로 최상단 import (ai_jobs→integrations 의존이 없어 순환 없음).
@@ -62,7 +63,9 @@ from .serializers import (
     CampaignBulkActionResponseSerializer,
     CampaignTimeseriesSerializer,
     ConnectionCallbackResponseSerializer,
+    ConnectionHealthResponseSerializer,
     ConnectionStartResponseSerializer,
+    ConnectStartRequestSerializer,
     DisconnectResponseSerializer,
     IGAccountConnectionSerializer,
     SentDMLogSerializer,
@@ -70,10 +73,23 @@ from .serializers import (
     SpamDashboardSerializer,
     SpamFilterConfigSerializer,
     SpamFilterConfigUpdateSerializer,
+    WebhookResubscribeResponseSerializer,
 )
 from .services import InstagramOAuthService, MockInstagramProvider
 
 logger = logging.getLogger(__name__)
+
+
+class IGHealthCheckThrottle(UserRateThrottle):
+    """연결 헬스체크 — 요청당 Meta 라이브 2콜(/me + subscribed_apps). 사용자별."""
+
+    scope = "ig_health"
+
+
+class IGResubscribeThrottle(UserRateThrottle):
+    """웹훅 수동 재구독 — beat 자동 재구독이 있어 수동은 드물어야 정상."""
+
+    scope = "ig_resubscribe"
 
 
 class InstagramIntegrationViewSet(viewsets.ViewSet):
@@ -132,6 +148,15 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         4. Callback URL로 리디렉션됨
         5. 백엔드에서 토큰 교환 및 Instagram 계정 정보 조회
 
+        ## 재연결(재인증) — `reconnect_connection_id` (선택)
+        이미 연결된 계정의 **토큰만 재인증**(만료/오류 복구)하려는 경우, 그 연동의
+        id 를 body 로 함께 보내면 요금제 IG 계정 수 게이트를 우회합니다.
+        (파라미터 없이 요청하면 '신규 계정 추가'로 간주해 한도 초과 시 429.)
+        - 값은 **해당 워크스페이스 소속 + 아직 해제되지 않은(status != revoked)** 연동이어야 합니다.
+          불일치/미존재/이미 해제된 값이면 **400** 을 반환합니다.
+        - ⚠️ 한도 우회는 불가합니다: 재연결로 시작했더라도 OAuth 에서 **다른(신규) 계정**을
+          인증하면 콜백 단계에서 요금제 게이트가 다시 거절합니다.
+
         ## 필요한 Facebook 권한
         - `pages_show_list` - Facebook Page 목록 조회
         - `pages_read_engagement` - Page 정보 및 engagement 읽기
@@ -142,7 +167,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
 
         ## 사용 예시
         ```javascript
-        // 프론트엔드에서 새 창으로 OAuth 시작
+        // 신규 연동
         const response = await fetch(
             `/api/v1/integrations/instagram/workspaces/${workspaceId}/connect/start/`,
             {
@@ -151,6 +176,19 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                     'Authorization': `Bearer ${accessToken}`,
                     'Content-Type': 'application/json'
                 }
+            }
+        );
+
+        // 기존 계정 재연결(재인증) — 한도 게이트 우회
+        const response = await fetch(
+            `/api/v1/integrations/instagram/workspaces/${workspaceId}/connect/start/`,
+            {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${accessToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ reconnect_connection_id: connectionId })
             }
         );
 
@@ -168,14 +206,19 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         }
         ```
         """,
+        request=ConnectStartRequestSerializer,
         responses={
             200: ConnectionStartResponseSerializer,
+            400: OpenApiResponse(
+                description="reconnect_connection_id 가 이 워크스페이스 소속이 아니거나 이미 해제된 연동"
+            ),
             401: OpenApiResponse(description="인증 실패 - 유효하지 않은 토큰"),
             403: OpenApiResponse(description="권한 없음 - 워크스페이스 멤버가 아님"),
             429: OpenApiResponse(
                 description=(
                     "PLAN_LIMIT_EXCEEDED — 플랜 IG 계정 연동 한도 초과 "
-                    "(무료/베이직/프로 기본 1개, 프로는 추가 계정 구매로 확장 가능)"
+                    "(무료/베이직/프로 기본 1개, 프로는 추가 계정 구매로 확장 가능). "
+                    "기존 계정 재인증은 reconnect_connection_id 로 우회."
                 )
             ),
         },
@@ -189,9 +232,48 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         """Start Instagram OAuth flow"""
         workspace = self.get_workspace(workspace_id)
 
+        # 재연결(재인증) 의도 여부 — 기존 살아있는 연동의 토큰만 갱신하려는 경우
+        # 요금제 IG 계정 수 게이트를 우회한다. 시작 시점엔 어떤 계정을 인증할지 알 수 없으므로
+        # 게이트를 풀되, 최종 방어선은 콜백(신규 계정이면 그때 한도 초과 거부)이다.
+        reconnect_id = (request.data.get("reconnect_connection_id") or "").strip() or None
+        is_reconnect = False
+        if reconnect_id:
+            from django.core.exceptions import ValidationError as _DjValidationError
+
+            try:
+                target = IGAccountConnection.objects.get(id=reconnect_id)
+            except (IGAccountConnection.DoesNotExist, _DjValidationError, ValueError, TypeError):
+                target = None
+            if (
+                target is None
+                or target.workspace_id != workspace.id
+                or target.status == IGAccountConnection.Status.REVOKED
+            ):
+                return Response(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": 400,
+                            "message": (
+                                "재연결 대상 연동을 찾을 수 없습니다. " "새 연동으로 시도해 주세요."
+                            ),
+                        },
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            is_reconnect = True
+
         # ★ 플랜 IG 계정 수 게이트 — OAuth 팝업을 열기 전에 깔끔한 JSON(429)으로 차단.
         # 허용 수 = features.max_ig_accounts(-1=무제한) + 구독 extra_ig_accounts(프로 추가 구매).
         # 동일 계정 재연동은 슬롯을 안 늘리므로 callback 쪽 안전망이 따로 판별한다.
+        #
+        # 시작 시점엔 어떤 계정을 인증할지 알 수 없다(콜백에서야 확정). 따라서 재연동을
+        # 막지 않기 위해 아래 두 경우엔 게이트를 열고 **최종 판정은 콜백**에 맡긴다
+        # (콜백은 이 워크스페이스에 없는 신규 계정만 한도로 거른다):
+        #   1) reconnect_connection_id 로 재연동 의도를 명시한 경우(is_reconnect)
+        #   2) owner 가 이미 살아있는(비-REVOKED) 연동을 1개 이상 보유한 경우
+        #      → 한도 찬 사용자의 '재연동'을 프론트 파라미터 없이도 통과시킨다.
+        #        (신규 계정 추가 의도라면 콜백에서 plan_limit 페이지로 거부된다.)
         from apps.billing.subscription_utils import (
             count_active_ig_connections,
             get_ig_account_allowance,
@@ -201,14 +283,26 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
 
         owner = workspace.owner
         allowance = get_ig_account_allowance(owner)
-        if allowance != -1:
+        if not is_reconnect and allowance != -1:
             current_active = count_active_ig_connections(owner)
             if current_active >= allowance:
-                raise PlanLimitExceededError(
-                    metric="ig_accounts",
-                    limit=allowance,
-                    current=current_active,
-                    plan=get_user_plan(owner).name,
+                owner_has_live_connection = (
+                    IGAccountConnection.objects.filter(workspace__owner=owner)
+                    .exclude(status=IGAccountConnection.Status.REVOKED)
+                    .exists()
+                )
+                if not owner_has_live_connection:
+                    raise PlanLimitExceededError(
+                        metric="ig_accounts",
+                        limit=allowance,
+                        current=current_active,
+                        plan=get_user_plan(owner).name,
+                    )
+                logger.info(
+                    "connect_start 한도 초과이나 재연동 가능(비-REVOKED 연동 보유) → 시작 허용, "
+                    "콜백에서 신규 계정 최종 판정: ws=%s owner=%s",
+                    workspace.id,
+                    owner.id,
                 )
 
         # Generate state for CSRF protection
@@ -407,12 +501,21 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 expires_in = long_lived_response.get("expires_in", 5184000)  # Default 60 days
                 expires_at = timezone.now() + timedelta(seconds=expires_in)
 
+                from apps.billing.subscription_utils import (
+                    count_active_ig_connections,
+                    get_ig_account_allowance,
+                )
+
                 # 재연동 = 완전 교체 (멱등):
                 # 같은 (workspace, 계정) 의 기존 연동이 있으면 — revoked/error/expired 포함 —
                 # 새 행을 만들지 않고 그 행을 그대로 재활성화하고 토큰/메타데이터를 덮어쓴다.
                 # P5: (workspace, external_account_id) 에 UNIQUE 제약(uq_igconn_ws_account)을 추가해
                 # 중복 행 생성을 DB 레벨에서 막았다(캠페인 고아화 방지). 기존 데이터는 마이그레이션
                 # 0026 이 dedupe 했다. filter().first() 는 이제 항상 ≤1 행을 안전하게 잡는다.
+                #
+                # ★ 먼저 revive 조회로 신규/재연동을 판별한다. 유일성 게이트(아래)와 플랜 게이트는
+                #   '이 워크스페이스가 이 계정을 처음 붙이는' 신규에만 적용한다 — 이미 보유한 계정의
+                #   토큰 재인증(재연동)은 어떤 게이트로도 막지 않는다.
                 connection = (
                     IGAccountConnection.objects.filter(
                         workspace=workspace,
@@ -421,7 +524,32 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                     .order_by("-created_at")
                     .first()
                 )
-                if connection is None:
+                is_new_row = connection is None
+
+                # ★ 전서비스 유일성 게이트 — 하나의 IG 계정은 하나의 워크스페이스에만.
+                # **신규 클레임일 때만** 검사한다: 다른 워크스페이스가 이 계정을 아직
+                # 점유(status != REVOKED)하고 있으면 거부. 이미 이 워크스페이스가 보유한
+                # 계정의 재연동은 (prod 에 중복이 남아있어도) 절대 막지 않는다.
+                # NOTE: prod 기존 중복 때문에 조건부 UNIQUE 제약은 아직 미도입.
+                #       audit_ig_duplicates 로 정리 후 별도 마이그레이션에서 추가 예정.
+                if is_new_row:
+                    conflict = IGAccountConnection.find_conflicting_connection(
+                        account_info["id"], workspace
+                    )
+                    if conflict is not None:
+                        logger.warning(
+                            "IG 연동 차단(글로벌 중복): ig=%s ws=%s conflict_ws=%s conflict_conn=%s",
+                            account_info["id"],
+                            workspace.id,
+                            conflict.workspace_id,
+                            conflict.id,
+                        )
+                        return HttpResponse(
+                            oauth_callback_pages.already_connected_elsewhere(
+                                owner_email=conflict.workspace.owner.email,
+                                username=account_info.get("username", ""),
+                            )
+                        )
                     connection = IGAccountConnection(
                         workspace=workspace,
                         external_account_id=account_info["id"],
@@ -430,20 +558,16 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 # ★ 플랜 IG 계정 수 게이트 (TOCTOU 안전망 — connect_start 이후 상황이
                 # 바뀌었을 수 있음): 슬롯을 새로 차지하는 경우(신규 행 또는 비활성 행의
                 # 재활성화)에만 검사한다. 동일 계정 ACTIVE 재연동(토큰 갱신)은 항상 허용.
+                # ⚠️ IGAccountConnection 은 UUID PK(default=uuid4)라 미저장 인스턴스도 pk 가
+                #    채워지고 status 기본값이 ACTIVE 다 → `pk is None`/status 로는 신규를
+                #    가릴 수 없다. 신규 여부는 revive 조회 결과(is_new_row)로 판정한다.
+                allowance = get_ig_account_allowance(workspace.owner)
+                current_active = count_active_ig_connections(workspace.owner)
                 takes_new_slot = (
-                    connection.pk is None or connection.status != IGAccountConnection.Status.ACTIVE
+                    is_new_row or connection.status != IGAccountConnection.Status.ACTIVE
                 )
                 if takes_new_slot:
-                    from apps.billing.subscription_utils import (
-                        count_active_ig_connections,
-                        get_ig_account_allowance,
-                    )
-
-                    allowance = get_ig_account_allowance(workspace.owner)
-                    if (
-                        allowance != -1
-                        and count_active_ig_connections(workspace.owner) >= allowance
-                    ):
+                    if allowance != -1 and current_active >= allowance:
                         logger.warning(
                             "IG 연동 차단(플랜 한도): workspace=%s allowance=%d",
                             workspace.id,
@@ -464,6 +588,12 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 connection.status = IGAccountConnection.Status.ACTIVE
                 connection.last_verified_at = timezone.now()
                 connection.error_message = ""
+                # 재연결 시 소프트 비활성 자동 복구 — 단, 활성 슬롯이 남을 때만.
+                # disconnect→재연결(REVOKED)은 활성 카운트에서 빠져 있어 슬롯이 남으므로
+                # 항상 되살아난다. 활성 계정 재선택(activation choice)으로 의도적으로 꺼둔
+                # 계정을 허용량 초과 상태에서 억지로 켜지는 않는다.
+                if not connection.is_active and (allowance == -1 or current_active < allowance):
+                    connection.is_active = True
                 connection.save()
 
                 # Enable webhook subscriptions for this account (per-account requirement)
@@ -1337,6 +1467,262 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 },
             },
             status=status.HTTP_202_ACCEPTED,
+        )
+
+    def _resolve_member_connection(self, request, ig_connection_id):
+        """헬스/재구독 공용: 연동 조회 + 워크스페이스 멤버십 검사.
+
+        Returns: (connection, None) 성공 / (None, error_response) 404·403.
+        """
+        try:
+            connection = IGAccountConnection.objects.select_related("workspace").get(
+                id=ig_connection_id
+            )
+        except (IGAccountConnection.DoesNotExist, DjangoValidationError, ValueError, TypeError):
+            return None, Response(
+                {
+                    "success": False,
+                    "error": {"code": 404, "message": "IG 연동을 찾을 수 없습니다."},
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        if not connection.workspace.memberships.filter(user=request.user).exists():
+            return None, Response(
+                {
+                    "success": False,
+                    "error": {
+                        "code": 403,
+                        "message": "이 IG 연동이 속한 워크스페이스의 멤버가 아닙니다.",
+                    },
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        return connection, None
+
+    @extend_schema(
+        summary="Instagram 연결 건강 진단",
+        description="""
+        ## 목적
+        연결된 Instagram 계정의 **종합 건강 상태**를 한 번에 진단합니다. 사용자 콘솔의
+        '연결 점검' 버튼이 호출하며, 다음을 라이브로 확인합니다:
+        - **토큰 생사** (GET /me) — 만료·회수 여부
+        - **웹훅 구독** (subscribed_apps) — 실시간 댓글·메시지 수신 필드(comments, messages) 누락 여부
+        - **토큰 만료일 / 연동 status / 활성(is_active)** — DB 신호
+
+        > Meta 는 콜백 반복 실패 시 웹훅 구독을 자동 해제(auto-disable)하고, 토큰은 약 60일 후
+        > 만료됩니다. 이 진단으로 '캠페인이 조용히 멈추는' 상황을 사용자가 스스로 발견·복구할 수 있습니다.
+
+        ## 부작용 없음 (report-only)
+        진단은 연동을 **죽이지 않습니다**. 토큰이 살아있음을 확인하면 `last_verified_at` 만
+        갱신하고 status 는 그대로 둡니다. Meta 통신 오류도 5xx 가 아니라 200 + issue 로 응답합니다.
+
+        ## 인증
+        - Bearer JWT 필수, 해당 연동이 속한 workspace 멤버여야 함
+        - 스로틀: 사용자별 `ig_health` (기본 20/min)
+
+        ## issues 코드 → 프론트 액션
+        | code | 의미 | action |
+        |------|------|--------|
+        | `TOKEN_INVALID` | 토큰 만료/회수(라이브 확인) | reconnect |
+        | `TOKEN_EXPIRED` | 만료일 지남 | reconnect |
+        | `TOKEN_UNVERIFIED` | 판정 불가(일시 통신) | retry |
+        | `WEBHOOK_NOT_SUBSCRIBED` | 웹훅 미구독 | resubscribe |
+        | `WEBHOOK_FIELDS_MISSING` | 필수 필드 일부 누락 | resubscribe |
+        | `CONNECTION_REVOKED` | 연동 해제됨 | reconnect |
+        | `CONNECTION_ERROR` | 연동 오류 status | reconnect |
+        | `CONNECTION_INACTIVE` | 비활성(요금제 슬롯) | activate |
+        | `META_API_UNREACHABLE` | Meta 통신 실패 | retry |
+
+        `healthy=true` 면 모든 신호 정상입니다.
+
+        ## 사용 예시
+        ```javascript
+        const res = await fetch(
+          `/api/v1/integrations/instagram/connections/${connId}/health/`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        const { data } = await res.json();
+        if (!data.healthy) showIssues(data.issues);  // issue.action 으로 CTA 분기
+        ```
+
+        ## 응답 예시 (정상)
+        ```json
+        {
+          "success": true,
+          "data": {
+            "connection": {"id": "uuid", "username": "myshop", "status": "active", "is_active": true},
+            "token": {"valid": true, "expires_at": "2026-09-01T00:00:00Z", "is_expired": false,
+                      "expires_in_days": 47, "last_verified_at": "2026-07-16T09:00:00Z"},
+            "webhook": {"subscribed": true, "fields": ["comments", "messages"], "missing_fields": []},
+            "healthy": true, "issues": [], "checked_at": "2026-07-16T09:00:00Z", "mode": "live"
+          }
+        }
+        ```
+
+        ## 응답 예시 (토큰 사망)
+        ```json
+        {
+          "success": true,
+          "data": {
+            "connection": {"id": "uuid", "username": "myshop", "status": "active", "is_active": true},
+            "token": {"valid": false, "expires_at": "2026-05-01T00:00:00Z", "is_expired": false,
+                      "expires_in_days": 12, "last_verified_at": "2026-06-01T00:00:00Z"},
+            "webhook": {"subscribed": null, "fields": [], "missing_fields": []},
+            "healthy": false,
+            "issues": [{"code": "TOKEN_INVALID", "message": "Instagram 토큰이 ...", "action": "reconnect"}],
+            "checked_at": "2026-07-16T09:00:00Z", "mode": "live"
+          }
+        }
+        ```
+        """,
+        responses={
+            200: ConnectionHealthResponseSerializer,
+            401: OpenApiResponse(description="인증 실패"),
+            403: OpenApiResponse(description="워크스페이스 멤버 아님"),
+            404: OpenApiResponse(description="해당 IG 연동 없음"),
+            429: OpenApiResponse(description="요청 한도 초과 (ig_health 스로틀)"),
+            500: OpenApiResponse(description="서버 오류"),
+        },
+        tags=["Integrations"],
+    )
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="connections/(?P<ig_connection_id>[^/.]+)/health",
+        throttle_classes=[IGHealthCheckThrottle],
+    )
+    def connection_health(self, request, ig_connection_id=None):
+        """연결 종합 건강 진단 (부작용 없음)."""
+        from .connection_health import build_connection_health
+
+        connection, err = self._resolve_member_connection(request, ig_connection_id)
+        if err is not None:
+            return err
+        return Response({"success": True, "data": build_connection_health(connection)})
+
+    @extend_schema(
+        summary="Instagram 웹훅 수동 재구독",
+        description="""
+        ## 목적
+        연결된 Instagram 계정의 웹훅 구독(comments, messages)을 **수동으로 재확정**합니다.
+        Meta 가 콜백 실패로 구독을 auto-disable 했을 때 사용자가 직접 복구할 수 있습니다.
+        (주기 beat 자동 재구독도 있으나, 즉시 복구용 수동 경로.)
+
+        ## 동작
+        1. 연동/토큰 상태 확인 — 해제(revoked)·토큰 없음·만료면 **409** (재연동 필요, `action: reconnect`)
+        2. Meta `subscribed_apps` 재구독 호출 (comments, messages)
+        3. **재구독 직후 헬스체크를 다시 계산해 함께 반환** → 프론트는 추가 GET 없이 최신 상태 반영
+
+        ## 인증
+        - Bearer JWT 필수, 해당 연동이 속한 workspace 멤버여야 함
+        - 스로틀: 사용자별 `ig_resubscribe` (기본 6/hour)
+
+        ## 사용 예시
+        ```javascript
+        const res = await fetch(
+          `/api/v1/integrations/instagram/connections/${connId}/resubscribe-webhooks/`,
+          { method: 'POST', headers: { Authorization: `Bearer ${token}` } }
+        );
+        const body = await res.json();
+        if (body.success) applyHealth(body.data);  // 재구독 후 최신 헬스
+        ```
+
+        ## 응답 예시 (성공)
+        ```json
+        {
+          "success": true,
+          "resubscribed": true,
+          "data": { "...": "GET .../health 와 동일한 헬스 페이로드" }
+        }
+        ```
+        """,
+        request=None,
+        responses={
+            200: WebhookResubscribeResponseSerializer,
+            401: OpenApiResponse(description="인증 실패"),
+            403: OpenApiResponse(description="워크스페이스 멤버 아님"),
+            404: OpenApiResponse(description="해당 IG 연동 없음"),
+            409: OpenApiResponse(description="연동 해제/토큰 없음/만료 — 재연동 필요"),
+            429: OpenApiResponse(description="요청 한도 초과 (ig_resubscribe 스로틀)"),
+            502: OpenApiResponse(description="Meta 재구독 호출 실패"),
+        },
+        tags=["Integrations"],
+    )
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="connections/(?P<ig_connection_id>[^/.]+)/resubscribe-webhooks",
+        throttle_classes=[IGResubscribeThrottle],
+    )
+    def resubscribe_webhooks(self, request, ig_connection_id=None):
+        """웹훅 수동 재구독 + 재구독 후 헬스 반환."""
+        from .connection_health import build_connection_health
+        from .services import scrub_secrets
+        from .tasks import REQUIRED_WEBHOOK_FIELDS
+
+        connection, err = self._resolve_member_connection(request, ig_connection_id)
+        if err is not None:
+            return err
+
+        # 재구독 불가 상태 — 재연동이 필요하다.
+        token = connection.access_token or ""
+        if connection.status == IGAccountConnection.Status.REVOKED or not token:
+            return Response(
+                {
+                    "success": False,
+                    "error": {
+                        "code": 409,
+                        "message": "연동이 해제된 계정입니다. 다시 연동해 주세요.",
+                        "action": "reconnect",
+                    },
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        if connection.is_token_expired():
+            return Response(
+                {
+                    "success": False,
+                    "error": {
+                        "code": 409,
+                        "message": "Instagram 토큰이 만료되었습니다. 다시 연동해 주세요.",
+                        "action": "reconnect",
+                    },
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        # Mock 분기 — 실제 Meta 호출 없이 성공 처리.
+        if not (MockInstagramProvider.is_mock_mode() or MockInstagramProvider.is_mock_token(token)):
+            try:
+                InstagramOAuthService.subscribe_to_webhooks(
+                    ig_user_id=connection.external_account_id,
+                    access_token=token,
+                    fields=",".join(REQUIRED_WEBHOOK_FIELDS),
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "수동 웹훅 재구독 실패 ig=%s: %s",
+                    connection.external_account_id,
+                    scrub_secrets(e),
+                )
+                return Response(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": 502,
+                            "message": f"웹훅 재구독에 실패했습니다: {scrub_secrets(e)}",
+                        },
+                    },
+                    status=status.HTTP_502_BAD_GATEWAY,
+                )
+
+        # 재구독 직후 최신 헬스 계산해 반환 (프론트 추가 GET 불필요).
+        return Response(
+            {
+                "success": True,
+                "resubscribed": True,
+                "data": build_connection_health(connection),
+            }
         )
 
     @extend_schema(
@@ -2823,8 +3209,6 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         **선택 필드:**
         - `media_url`: 게시물 URL (비워두거나 null 가능)
         - `description`: 캠페인 설명
-        - `max_sends_per_hour`: (deprecated v4.3 — 값은 수용되나 **강제되지 않음**)
-          발송 속도는 계정 단위 자동 페이싱(사설답장 평균 ~5.0초/건)으로 대체되었습니다.
         - `scheduled_start_at`: 예약 시작일시 (ISO8601). 이 시각부터 발송 시작. 비우면 즉시.
         - `scheduled_end_at`: 예약 종료일시 (ISO8601). 이 시각 이후 자동 종료. 비우면 무기한.
           (생성 후 변경은 `POST .../{id}/schedule/` 사용 권장)

@@ -42,7 +42,6 @@ from .services import (
     InstagramMessagingService,
     InstagramOAuthService,
     MockInstagramProvider,
-    get_http_session,
     scrub_secrets,
 )
 
@@ -287,23 +286,10 @@ def _ig_token_confirmed_dead(ig_conn) -> bool:
     if cached is not None:
         return cached
 
-    dead = False
-    try:
-        resp = get_http_session().get(
-            f"{InstagramOAuthService.GRAPH_API_BASE}/me",
-            params={"fields": "id", "access_token": ig_conn.access_token},
-            timeout=10,
-        )
-        if resp.status_code in (400, 401, 403):
-            try:
-                err = (resp.json() or {}).get("error", {}) or {}
-            except ValueError:
-                err = {}
-            if err.get("code") in (190, 102, 104, 2500):
-                dead = True
-        # 2xx 또는 그 외 → dead=False (살아있음 / 애매하면 브릭 안 함)
-    except Exception:  # noqa: BLE001 - 애매하면 브릭하지 않는다(가용성 우선)
-        dead = False
+    # 판정 자체는 InstagramOAuthService.verify_token 이 단일 소스.
+    # 여기서는 캐시(5분 1회) + fail-safe(valid is False 일 때만 dead) 만 얹는다.
+    # valid None(네트워크/애매)/True → dead=False (애매하면 브릭하지 않는다, 가용성 우선).
+    dead = InstagramOAuthService.verify_token(ig_conn.access_token)["valid"] is False
 
     cache.set(ck, dead, _TOKEN_DEAD_CHECK_TTL)
     return dead

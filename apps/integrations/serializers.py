@@ -153,6 +153,20 @@ class IGAccountConnectionSerializer(serializers.ModelSerializer):
         return obj.is_token_expired()
 
 
+class ConnectStartRequestSerializer(serializers.Serializer):
+    """연동 시작 요청 body (선택 필드)."""
+
+    reconnect_connection_id = serializers.UUIDField(
+        required=False,
+        allow_null=True,
+        help_text=(
+            "기존 연동의 토큰만 재인증(재연결)하려는 경우 그 연동 id. 지정 시 요금제 IG 계정 수 "
+            "게이트를 우회한다(해당 워크스페이스 소속 + 미해제 연동이어야 함; 콜백에서 신규 계정은 재차단). "
+            "생략하면 신규 연동으로 간주."
+        ),
+    )
+
+
 class ConnectionStartResponseSerializer(serializers.Serializer):
     """Response for connection start endpoint"""
 
@@ -191,6 +205,83 @@ class ConnectionCallbackResponseSerializer(serializers.Serializer):
     success = serializers.BooleanField()
     message = serializers.CharField()
     connection = IGAccountConnectionSerializer(required=False)
+
+
+# ---------------------------------------------------------------------------
+# 연결 헬스체크 / 웹훅 재구독 (문서 스키마 전용 — 뷰는 dict 를 그대로 반환)
+# ---------------------------------------------------------------------------
+
+
+class ConnectionHealthConnectionSerializer(serializers.Serializer):
+    """헬스체크 응답의 connection 블록."""
+
+    id = serializers.UUIDField()
+    username = serializers.CharField(allow_blank=True)
+    status = serializers.CharField(help_text="active / expired / revoked / error")
+    is_active = serializers.BooleanField(help_text="소프트 활성 플래그 (요금제 슬롯)")
+
+
+class ConnectionHealthTokenSerializer(serializers.Serializer):
+    """헬스체크 응답의 token 블록 (라이브 /me 검증 결과)."""
+
+    valid = serializers.BooleanField(
+        allow_null=True,
+        help_text="true=라이브 /me 통과, false=사망(OAuth 에러코드), null=판정불가(네트워크/mock)",
+    )
+    expires_at = serializers.DateTimeField(allow_null=True)
+    is_expired = serializers.BooleanField()
+    expires_in_days = serializers.IntegerField(
+        allow_null=True, help_text="만료까지 남은 일수(음수=이미 만료)"
+    )
+    last_verified_at = serializers.DateTimeField(allow_null=True)
+
+
+class ConnectionHealthWebhookSerializer(serializers.Serializer):
+    """헬스체크 응답의 webhook 블록 (라이브 subscribed_apps 조회 결과)."""
+
+    subscribed = serializers.BooleanField(
+        allow_null=True,
+        help_text="true=필수 필드 구독됨, false=미구독, null=조회 실패(Meta 통신 오류)",
+    )
+    fields = serializers.ListField(child=serializers.CharField(), help_text="현재 구독 중인 필드")
+    missing_fields = serializers.ListField(
+        child=serializers.CharField(), help_text="필수인데 빠진 필드 (comments/messages)"
+    )
+
+
+class ConnectionHealthIssueSerializer(serializers.Serializer):
+    """헬스체크가 감지한 개별 이슈 (프론트 CTA 매핑용)."""
+
+    code = serializers.CharField(help_text="TOKEN_INVALID / WEBHOOK_FIELDS_MISSING 등")
+    message = serializers.CharField(help_text="사용자 대면 한국어 설명")
+    action = serializers.CharField(help_text="reconnect / resubscribe / activate / retry")
+
+
+class ConnectionHealthDataSerializer(serializers.Serializer):
+    """헬스체크 data 페이로드."""
+
+    connection = ConnectionHealthConnectionSerializer()
+    token = ConnectionHealthTokenSerializer()
+    webhook = ConnectionHealthWebhookSerializer()
+    healthy = serializers.BooleanField(help_text="모든 신호 정상이면 true")
+    issues = ConnectionHealthIssueSerializer(many=True)
+    checked_at = serializers.DateTimeField()
+    mode = serializers.CharField(help_text="live / mock")
+
+
+class ConnectionHealthResponseSerializer(serializers.Serializer):
+    """GET .../health 응답."""
+
+    success = serializers.BooleanField()
+    data = ConnectionHealthDataSerializer()
+
+
+class WebhookResubscribeResponseSerializer(serializers.Serializer):
+    """POST .../resubscribe-webhooks 응답 (재구독 후 최신 헬스 포함)."""
+
+    success = serializers.BooleanField()
+    resubscribed = serializers.BooleanField(help_text="Meta 재구독 호출 성공 여부")
+    data = ConnectionHealthDataSerializer(help_text="재구독 직후 다시 계산한 헬스 상태")
 
 
 class LinkButtonItemSerializer(serializers.Serializer):
@@ -296,7 +387,6 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
             "effective_link_buttons",  # 실제 첨부될 버튼 (read-only)
             # 운영
             "status",
-            "max_sends_per_hour",
             "total_sent",
             "total_failed",
             "is_active",
@@ -833,15 +923,6 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
         ),
     )
 
-    # 운영 — (deprecated v4.3) 값은 수용하되 무시됨: 페이싱은 dm_pacer(계정 단위 지터 슬롯)가 담당.
-    # 하위호환(기존 프론트가 보내는 값 400 방지)을 위해 필드는 유지한다.
-    max_sends_per_hour = serializers.IntegerField(
-        default=200,
-        min_value=1,
-        max_value=500,
-        help_text="(deprecated v4.3 — 강제되지 않음) 발송 페이싱은 계정 단위 자동 조절로 대체됨.",
-    )
-
     # 예약 발송 (활성 기간 한정 + 자동 종료) — 둘 다 생략하면 기존처럼 즉시/무기한 운영
     scheduled_start_at = serializers.DateTimeField(
         required=False,
@@ -995,7 +1076,6 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
             "link_button_url",
             "link_button_label",
             "link_buttons",
-            "max_sends_per_hour",
             "status",
             # 예약 발송
             "scheduled_start_at",
@@ -1008,7 +1088,6 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
             "scheduled_start_at": {"required": False, "allow_null": True},
             "scheduled_end_at": {"required": False, "allow_null": True},
             "description": {"required": False, "allow_blank": True},
-            "max_sends_per_hour": {"required": False},
             "status": {"required": False},
             "trigger_type": {"required": False},
             "keyword_filter": {"required": False},

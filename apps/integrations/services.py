@@ -222,6 +222,42 @@ class InstagramOAuthService:
         raise_for_status_clean(response)
         return response.json()
 
+    # 토큰이 확실히 죽었다고 볼 OAuth 에러코드 (190 만료/회수, 102 세션, 104/2500 토큰필요).
+    OAUTH_DEAD_ERROR_CODES = (190, 102, 104, 2500)
+
+    @classmethod
+    def verify_token(cls, access_token: str) -> dict:
+        """라이브 GET /me 로 액세스 토큰 생사를 판정한다 (verify-before-brick 과 동일 기준).
+
+        Returns:
+            {"valid": True|False|None, "error_code": int|None}
+            - True : /me 2xx (살아있음)
+            - False: /me 4xx + OAuth 사망 에러코드 (진짜 죽음)
+            - None : 네트워크/타임아웃/5xx/애매 (판정 불가 — 보수적으로 살아있다 취급 X, 미확인)
+        """
+        try:
+            resp = get_http_session().get(
+                f"{cls.GRAPH_API_BASE}/me",
+                params={"fields": "id", "access_token": access_token},
+                timeout=10,
+            )
+        except requests.RequestException:
+            return {"valid": None, "error_code": None}
+
+        if resp.ok:
+            return {"valid": True, "error_code": None}
+
+        code = None
+        if resp.status_code in (400, 401, 403):
+            try:
+                code = ((resp.json() or {}).get("error", {}) or {}).get("code")
+            except ValueError:
+                code = None
+            if code in cls.OAUTH_DEAD_ERROR_CODES:
+                return {"valid": False, "error_code": code}
+        # 그 외 4xx/5xx/애매 → 판정 불가
+        return {"valid": None, "error_code": code}
+
     @classmethod
     def subscribe_to_webhooks(
         cls, ig_user_id: str, access_token: str, fields: str = "comments,messages"

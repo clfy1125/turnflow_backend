@@ -249,6 +249,12 @@ REST_FRAMEWORK = {
         # 결제 진입 텔레메트리 (POST /track/checkout-event/) — 로그인 사용자 기준.
         # 유료 제한 모달을 반복적으로 마주칠 수 있어 넉넉하게.
         "checkout_event": config("THROTTLE_CHECKOUT_EVENT", default="240/hour"),
+        # IG 연결 헬스 진단 (GET .../health) — 요청당 Meta 라이브 2콜(/me + subscribed_apps).
+        # 사용자별. 설정 화면에서 수동 새로고침을 반복해도 여유 있게.
+        "ig_health": config("THROTTLE_IG_HEALTH", default="20/min"),
+        # IG 웹훅 수동 재구독 (POST .../resubscribe-webhooks) — beat 자동 재구독이 있어
+        # 수동은 드물어야 정상. 어뷰즈 방어 + 정상 복구 모두 OK.
+        "ig_resubscribe": config("THROTTLE_IG_RESUBSCRIBE", default="6/hour"),
     },
 }
 

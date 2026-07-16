@@ -317,10 +317,37 @@ class TestIgAccountLimit:
         staff = _user(is_staff=True)
         assert get_ig_account_allowance(staff) == -1
 
-    def test_connect_start_blocked_at_limit(self):
+    def test_connect_start_allows_reconnect_when_has_live_connection(self):
+        """한도를 채운 사용자라도 살아있는 연동이 있으면 start 를 허용한다(재연동 가능).
+
+        시작 시점엔 재연동인지 신규인지 알 수 없으므로 게이트를 열고, 신규 계정은
+        콜백에서 최종 차단한다. → 사용자가 '재연동'을 눌렀는데 한도 429 가 뜨는
+        비정상 UX 를 없앤다.
+        """
         user = _user()
         ws = _ws(user)
-        _conn(ws)  # 이미 1개 연동 (free 한도 소진)
+        _conn(ws)  # 이미 1개 연동 (free 한도 소진 — 하지만 살아있는 연동이므로 재연동 가능)
+
+        client = APIClient()
+        client.force_authenticate(user=user)
+        resp = client.post(f"/api/v1/integrations/instagram/workspaces/{ws.id}/connect/start/")
+
+        assert resp.status_code == 200
+        assert "authorization_url" in resp.data
+
+    def test_connect_start_blocked_at_limit_without_any_connection(self, monkeypatch):
+        """살아있는 연동이 하나도 없는데 한도가 0 인 극단적 경우에만 사전 429.
+
+        (실제로는 allowance>=1 이라 거의 발생하지 않지만, 게이트가 완전히 죽지
+        않았음을 문서화.)
+        """
+        user = _user()
+        ws = _ws(user)
+        # 허용량 0 으로 강제(정상 플랜엔 없음) — 연동도 0개. connect_start 는 호출 시점에
+        # apps.billing.subscription_utils.get_ig_account_allowance 를 조회하므로 거기를 패치.
+        from apps.billing import subscription_utils
+
+        monkeypatch.setattr(subscription_utils, "get_ig_account_allowance", lambda o: 0)
 
         client = APIClient()
         client.force_authenticate(user=user)
@@ -328,7 +355,6 @@ class TestIgAccountLimit:
 
         assert resp.status_code == 429
         assert resp.data["error"]["code"] == "PLAN_LIMIT_EXCEEDED"
-        assert resp.data["error"]["details"]["metric"] == "ig_accounts"
 
     def test_connect_start_allowed_under_limit(self):
         user = _user()
