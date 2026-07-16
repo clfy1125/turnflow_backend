@@ -32,7 +32,6 @@ class AutoDMCampaignAdmin(admin.ModelAdmin):
         "status",
         "total_sent",
         "total_failed",
-        "max_sends_per_hour",
         "created_at",
         "started_at",
         "scheduled_start_at",
@@ -53,7 +52,7 @@ class AutoDMCampaignAdmin(admin.ModelAdmin):
     fieldsets = (
         ("기본 정보", {"fields": ("name", "description", "ig_connection")}),
         ("타겟 게시물", {"fields": ("media_id", "media_url")}),
-        ("메시지 설정", {"fields": ("message_template", "max_sends_per_hour")}),
+        ("메시지 설정", {"fields": ("message_template",)}),
         (
             "버튼 게이트 (follow / button-only)",
             {

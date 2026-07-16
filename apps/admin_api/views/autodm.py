@@ -24,12 +24,7 @@ from django.db.models import Count, Min
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
-from drf_spectacular.utils import (
-    OpenApiExample,
-    OpenApiParameter,
-    OpenApiResponse,
-    extend_schema,
-)
+from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import filters, generics, status
 from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
@@ -183,7 +178,6 @@ class AdminCampaignListView(generics.ListAPIView):
                             "trigger_type": "specific_media",
                             "total_sent": 1280,
                             "total_failed": 3,
-                            "max_sends_per_hour": 200,
                             "created_at": "2026-05-01T09:00:00+09:00",
                             "started_at": "2026-05-01T09:05:00+09:00",
                         }

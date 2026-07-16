@@ -392,8 +392,8 @@
       <span class="state s-green">QUEUED INSERT<small>→ send_dm_task</small></span>
     </div>
     <div class="note warn">
-      <b>⚠️ v3.9: 시간당 한도는 enqueue에서 빠짐</b>
-      과거엔 <code>can_send_more()==False</code>면 <code>SentDMLog(SKIPPED)</code>로 <b>드랍</b>했습니다. 이제 한도/계정 거버너 평가는 <b><code>send_dm_task</code> 단일 지점으로 이동</b>해 초과 시 드랍이 아니라 <b>defer</b>합니다. <code>can_send_more()</code>도 QUEUED를 세지 않아 데드락을 방지합니다.
+      <b>⚠️ v3.9: 속도 제어는 enqueue에서 빠짐 / v4.3: 캠페인 시간당 한도 제거</b>
+      과거엔 <code>can_send_more()==False</code>면 <code>SentDMLog(SKIPPED)</code>로 <b>드랍</b>했습니다. 이제 계정 거버너/페이싱 평가는 <b><code>send_dm_task</code> 단일 지점으로 이동</b>해 초과 시 드랍이 아니라 <b>defer</b>합니다. <b>v4.3</b> 부터 캠페인별 시간당 한도(<code>max_sends_per_hour</code>)는 <b>완전히 제거</b>(필드·DB 컬럼 삭제)됐고, 발송 속도는 계정 단위 스무스 페이서(<code>dm_pacer</code>)가 담당합니다. <code>can_send_more()</code>는 "캠페인 활성 여부"만 반환하는 표시용으로만 남았습니다.
     </div>
     <div class="note info">
       <b>한 댓글 → 여러 캠페인 매칭 시</b>

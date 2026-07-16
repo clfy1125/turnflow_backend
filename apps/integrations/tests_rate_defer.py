@@ -4,7 +4,7 @@
   - send_dm_task: transient(rate-limit) → 종결 아닌 defer(QUEUED+next_retry_at), 통계 미증가
   - send_dm_task: 메시징 윈도우 만료 → FAILED_WINDOW graceful 종결
   - verify_dm_delivery 35분 cutoff → FAILED_NO_TRACE + increment_unconfirmed (total_failed 불변)
-  - can_send_more: (v4.3 deprecated) 시간당 한도 미강제 — 활성 여부만 반환
+  - can_send_more: 캠페인 시간당 한도 제거됨(v4.3~) — 활성 여부만 반환
   - requeue_deferred_dms: next_retry_at 도래 QUEUED 를 send_dm_task 로 재투입 + next_retry_at 비움
   - rate_governor: 계정당 시간당 **백스톱** 이 740(IG_PRIVATE_REPLY_HOURLY_CAP, Meta 750 아래) 으로 캡
 
@@ -146,12 +146,12 @@ class TestNoTraceCounter:
 
 
 class TestCanSendMore:
-    def test_hourly_cap_deprecated_not_enforced(self, ig_connection):
-        """v4.3 — max_sends_per_hour 는 deprecated: 카운트와 무관하게 활성 여부만 반환."""
-        campaign = _campaign(ig_connection, max_sends_per_hour=2)
+    def test_can_send_more_reflects_active_state_only(self, ig_connection):
+        """캠페인 시간당 한도는 제거됨(v4.3~): can_send_more 는 활성 여부만 반영한다."""
+        campaign = _campaign(ig_connection)
         for _ in range(5):
             _log(campaign, status=SentDMLog.Status.ACCEPTED)
-        assert campaign.can_send_more() is True  # 한도(2) 초과여도 강제 안 함 (페이서가 대체)
+        assert campaign.can_send_more() is True  # 발송량과 무관 — 페이서가 속도를 대체
 
         campaign.status = AutoDMCampaign.Status.PAUSED
         campaign.save(update_fields=["status"])

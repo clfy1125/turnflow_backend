@@ -15,12 +15,10 @@ ACCEPTED 까지 진행하므로, 측정되는 건 **서버측 처리 능력**(Ce
 from __future__ import annotations
 
 import time
-import uuid
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.management.base import BaseCommand, CommandError
-from django.utils import timezone
 
 from apps.integrations.models import AutoDMCampaign, IGAccountConnection, SentDMLog
 from apps.workspace.models import Workspace
@@ -28,14 +26,20 @@ from apps.workspace.models import Workspace
 EMAIL = "loadtest@turnflow.local"
 EXT_ACCOUNT = "loadtest_ig"
 CAMPAIGN_PREFIX = "loadtest-campaign"
-COMMENT_PREFIX = "lt-"               # 모든 부하 SentDMLog.comment_id 접두사 (cleanup/측정 필터)
+COMMENT_PREFIX = "lt-"  # 모든 부하 SentDMLog.comment_id 접두사 (cleanup/측정 필터)
 TERMINAL = (
-    SentDMLog.Status.ACCEPTED, SentDMLog.Status.DELIVERED, SentDMLog.Status.READ,
+    SentDMLog.Status.ACCEPTED,
+    SentDMLog.Status.DELIVERED,
+    SentDMLog.Status.READ,
 )
 FAILED = (
-    SentDMLog.Status.FAILED_TOKEN, SentDMLog.Status.FAILED_WINDOW,
-    SentDMLog.Status.FAILED_PARAM, SentDMLog.Status.FAILED_NO_TRACE,
-    SentDMLog.Status.FAILED_API, SentDMLog.Status.FAILED, SentDMLog.Status.SKIPPED,
+    SentDMLog.Status.FAILED_TOKEN,
+    SentDMLog.Status.FAILED_WINDOW,
+    SentDMLog.Status.FAILED_PARAM,
+    SentDMLog.Status.FAILED_NO_TRACE,
+    SentDMLog.Status.FAILED_API,
+    SentDMLog.Status.FAILED,
+    SentDMLog.Status.SKIPPED,
 )
 
 
@@ -43,10 +47,14 @@ class Command(BaseCommand):
     help = "DM 파이프라인 합성 부하 측정 (스테이징/mock 전용)"
 
     def add_arguments(self, parser):
-        parser.add_argument("--seed", action="store_true", help="테스트 워크스페이스/연동/캠페인 생성")
+        parser.add_argument(
+            "--seed", action="store_true", help="테스트 워크스페이스/연동/캠페인 생성"
+        )
         parser.add_argument("--cleanup", action="store_true", help="모든 부하 테스트 데이터 삭제")
         parser.add_argument("--count", type=int, default=0, help="발송할 DM 개수")
-        parser.add_argument("--campaigns", type=int, default=20, help="부하를 분산할 캠페인 수(핫로우 완화)")
+        parser.add_argument(
+            "--campaigns", type=int, default=20, help="부하를 분산할 캠페인 수(핫로우 완화)"
+        )
         parser.add_argument("--timeout", type=int, default=180, help="처리 완료 대기 한도(초)")
 
     def handle(self, *args, **o):
@@ -88,7 +96,7 @@ class Command(BaseCommand):
                 status=IGAccountConnection.Status.ACTIVE,
                 scopes=["instagram_business_manage_messages"],
             )
-            conn.access_token = "mock_token_loadtest"   # EncryptedTextField 디스크립터가 암호화 저장
+            conn.access_token = "mock_token_loadtest"  # EncryptedTextField 디스크립터가 암호화 저장
             conn.save()
         have = AutoDMCampaign.objects.filter(
             ig_connection=conn, name__startswith=CAMPAIGN_PREFIX
@@ -100,11 +108,12 @@ class Command(BaseCommand):
                 trigger_type=AutoDMCampaign.TriggerType.ANY_MEDIA,
                 status=AutoDMCampaign.Status.ACTIVE,
                 opening_message_template="load test message",
-                max_sends_per_hour=10_000_000,   # 측정 중 시간당 제한에 안 걸리도록
             )
-        self.stdout.write(self.style.SUCCESS(
-            f"seed OK: workspace={ws.slug} conn={conn.external_account_id} campaigns={max(k, have)}"
-        ))
+        self.stdout.write(
+            self.style.SUCCESS(
+                f"seed OK: workspace={ws.slug} conn={conn.external_account_id} campaigns={max(k, have)}"
+            )
+        )
 
     # ---------- run ----------
     def _run(self, count: int, k: int, timeout: int):
@@ -122,24 +131,28 @@ class Command(BaseCommand):
             raise CommandError("캠페인이 없습니다. 먼저 --seed 하세요.")
 
         run_tag = f"{COMMENT_PREFIX}{int(time.time())}"
-        self.stdout.write(f"run={run_tag} count={count} campaigns={len(campaigns)} dm_send 워커로 enqueue…")
+        self.stdout.write(
+            f"run={run_tag} count={count} campaigns={len(campaigns)} dm_send 워커로 enqueue…"
+        )
 
         # 1) SentDMLog QUEUED 대량 생성 (캠페인 라운드로빈 → 단일 핫로우 완화)
         rows = []
         for i in range(count):
             camp = campaigns[i % len(campaigns)]
             key = f"{run_tag}-{i}"
-            rows.append(SentDMLog(
-                campaign=camp,
-                comment_id=key,
-                recipient_user_id=f"u{i}",
-                recipient_username=f"user{i}",
-                message_sent="load test",
-                idempotency_key=key,
-                status=SentDMLog.Status.QUEUED,
-                dm_kind=SentDMLog.DMKind.STANDALONE,
-                gate_status=SentDMLog.GateStatus.NONE,
-            ))
+            rows.append(
+                SentDMLog(
+                    campaign=camp,
+                    comment_id=key,
+                    recipient_user_id=f"u{i}",
+                    recipient_username=f"user{i}",
+                    message_sent="load test",
+                    idempotency_key=key,
+                    status=SentDMLog.Status.QUEUED,
+                    dm_kind=SentDMLog.DMKind.STANDALONE,
+                    gate_status=SentDMLog.GateStatus.NONE,
+                )
+            )
         SentDMLog.objects.bulk_create(rows, batch_size=1000)
 
         # 2) enqueue + 타이머 시작
@@ -182,13 +195,21 @@ class Command(BaseCommand):
         self.stdout.write(f"  enqueue 소요    : {enqueue_done - t0:.2f}s")
         self.stdout.write(f"  전체 wall       : {total_elapsed:.2f}s")
         if total_elapsed > 0:
-            self.stdout.write(self.style.SUCCESS(
-                f"  처리량          : {acc/total_elapsed:.1f} DM/s  (≈ {acc/total_elapsed*60:.0f} DM/분)"
-            ))
+            self.stdout.write(
+                self.style.SUCCESS(
+                    f"  처리량          : {acc/total_elapsed:.1f} DM/s  (≈ {acc/total_elapsed*60:.0f} DM/분)"
+                )
+            )
         if lat:
-            self.stdout.write(f"  지연 p50/p95/max: {lat['p50']:.0f} / {lat['p95']:.0f} / {lat['max']:.0f} ms (created→accepted)")
+            self.stdout.write(
+                f"  지연 p50/p95/max: {lat['p50']:.0f} / {lat['p95']:.0f} / {lat['max']:.0f} ms (created→accepted)"
+            )
         if fail:
-            self.stdout.write(self.style.WARNING(f"  ⚠ 실패 {fail}건 — status 분포 확인 필요 (mock 모드에선 0이어야 정상)"))
+            self.stdout.write(
+                self.style.WARNING(
+                    f"  ⚠ 실패 {fail}건 — status 분포 확인 필요 (mock 모드에선 0이어야 정상)"
+                )
+            )
 
     def _latency_pcts(self, qs):
         vals = []
@@ -208,6 +229,7 @@ class Command(BaseCommand):
     def _qlen(self, queue: str) -> int:
         try:
             from redis import Redis
+
             r = Redis(host=settings.REDIS_HOST, port=int(settings.REDIS_PORT), db=0)
             return r.llen(queue)
         except Exception:
@@ -218,7 +240,9 @@ class Command(BaseCommand):
         n_logs = SentDMLog.objects.filter(comment_id__startswith=COMMENT_PREFIX).delete()[0]
         ws = Workspace.objects.filter(slug="loadtest").first()
         if ws:
-            ws.delete()   # CASCADE: ig_connection → campaigns → 남은 logs
+            ws.delete()  # CASCADE: ig_connection → campaigns → 남은 logs
         User = get_user_model()
         User.objects.filter(email=EMAIL).delete()
-        self.stdout.write(self.style.SUCCESS(f"cleanup OK (logs deleted ~{n_logs}, workspace/user 제거)"))
+        self.stdout.write(
+            self.style.SUCCESS(f"cleanup OK (logs deleted ~{n_logs}, workspace/user 제거)")
+        )

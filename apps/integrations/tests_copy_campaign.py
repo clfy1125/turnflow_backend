@@ -96,7 +96,6 @@ class TestCopyCampaign:
             name="원본 캠페인",
             keyword_filter=["가격", "구매"],
             keyword_mode=AutoDMCampaign.KeywordMode.ANY,
-            max_sends_per_hour=123,
             total_sent=42,
             total_failed=7,
         )
@@ -123,7 +122,6 @@ class TestCopyCampaign:
         assert data["keyword_filter"] == ["가격", "구매"]
         assert data["keyword_mode"] == source.keyword_mode
         assert data["message_template"] == source.message_template
-        assert data["max_sends_per_hour"] == 123
         # 동일 IG 연동 승계
         assert data["ig_connection_id"] == str(ig_connection.id)
 

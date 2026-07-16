@@ -165,7 +165,9 @@
   6. `transaction.atomic` 안에서 **`SentDMLog(status=QUEUED)` INSERT** → IntegrityError(중복 `idempotency_key`)면 `duplicate` 반환.
   7. `send_dm_task.delay(log.id)`.
 
-> **v3.9 변경**: 시간당 한도/계정 거버너 평가는 **enqueue가 아니라 `send_dm_task` 단일 지점**으로 이동했다. 과거엔 한도 초과 시 `SentDMLog(SKIPPED)`로 **드랍**했지만, 이제는 항상 `QUEUED`로 적재하고 발송 직전에 초과 판정되면 **defer**한다(드랍 없음). `can_send_more()`도 `QUEUED`를 세지 않도록 고쳐 "큐에 쌓인 것이 한도를 먹어 영원히 못 나가는" 데드락을 방지한다.
+> **v3.9 변경**: 계정 거버너/페이싱 평가는 **enqueue가 아니라 `send_dm_task` 단일 지점**으로 이동했다. 과거엔 초과 시 `SentDMLog(SKIPPED)`로 **드랍**했지만, 이제는 항상 `QUEUED`로 적재하고 발송 직전에 초과 판정되면 **defer**한다(드랍 없음).
+>
+> **v4.3~ 변경**: 캠페인별 시간당 한도(`max_sends_per_hour` / `can_send_more()` 게이트)는 **완전히 제거**됐다(필드·DB 컬럼 삭제). 발송 속도는 계정 단위 스무스 페이서(`dm_pacer`)가 담당하며, `can_send_more()`는 "캠페인 활성 여부"만 반환하는 표시용으로만 남았다(발송 경로는 이 값을 보지 않음).
 
 ---
 
@@ -179,7 +181,7 @@
 2. **`campaign.is_within_schedule() == False` → `mark_skipped`** — opening/reward/follow재안내/reconcile재큐/수동재시도 **모든 발송 경로가 거치는 단일 권위 차단점**.
 3. `ig_conn.status != ACTIVE` → `mark_failed(FAILED_TOKEN)` + `increment_failed`.
 4. **★ 메시징 윈도우 age 가드(graceful 종결의 단일 지점)**: `now - created_at >= _messaging_window(log)` (comment Private Reply 7일 / user_id DM 24h)면 `mark_failed(FAILED_WINDOW)`. rate-limit으로 아무리 오래 defer돼도 Meta가 어차피 거부할 시점이 오면 여기서만 종결한다.
-5. **★ 발송 속도 제어 `_rate_defer`(재진입 포함)**: ⓐ `campaign.can_send_more()==False`(캠페인 시간당 `max_sends_per_hour`) → 300초 후 재평가. ⓑ `DM_GOVERNOR_ENABLED`면 `rate_governor.check(ig_account, plan)` — 계정당 **750/hr(안전마진 700) Private Reply + 분당 버스트** 초과 시 다음 시각/분 경계까지 defer. 어느 쪽이든 `status=QUEUED + next_retry_at` 기록 후 반환(**드랍/실패 아님**).
+5. **★ 발송 속도 제어 `_rate_defer`(재진입 포함)**: ⓐ **Action Block 쿨다운** 중이면 그 계정 전체 발송을 defer(차단 중 재시도 = 차단 연장 방지). ⓑ `DM_PACER_ENABLED`면 `dm_pacer.pacer_gate` — 계정×버킷 지터 슬롯(사설답장 3~7s / Send API 1~3s), 슬롯 미도래면 그 시각까지 defer(requeue 워커가 슬롯 시각에 맞춰 재투입). ⓒ `DM_GOVERNOR_ENABLED`면 `rate_governor.check(ig_account, plan)` — 계정당 시간당 백스톱(740, Meta 750 아래) 초과 시 다음 시각/분 경계까지 defer. 어느 쪽이든 `status=QUEUED + next_retry_at` 기록 후 반환(**드랍/실패 아님**). (캠페인 시간당 한도 `can_send_more` 게이트는 v4.3 에서 제거됨.)
 6. `mark_submitting()` → 상태 `SUBMITTING`, `submitted_at` 기록.
 
 ### 3.2 메시지 종류·버튼 결정

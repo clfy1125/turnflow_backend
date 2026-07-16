@@ -145,7 +145,6 @@ class AdminCampaignListSerializer(serializers.ModelSerializer):
             "total_sent",
             "total_failed",
             "total_unconfirmed",
-            "max_sends_per_hour",
             "created_at",
             "started_at",
         ]
@@ -203,7 +202,6 @@ class AdminCampaignDetailSerializer(serializers.ModelSerializer):
             "link_button_url",
             "link_button_label",
             "link_buttons",
-            "max_sends_per_hour",
             "total_sent",
             "total_failed",
             "total_unconfirmed",
