@@ -68,6 +68,21 @@ class TestIGAccountActivation:
             data["accounts"][0].keys()
         )
 
+    def test_get_flags_adjustment_when_all_inactive(self, user, workspace):
+        # 연동 1개인데 전부 비활성(활성 0) → 재선택 유도 (버그 B 안전망)
+        c0 = _conn(workspace, 0)
+        c0.is_active = False
+        c0.save(update_fields=["is_active"])
+        ensure_subscription(user)
+
+        res = self._client(user).get(reverse("billing:ig-account-activation"))
+
+        assert res.status_code == 200
+        data = res.json()
+        assert data["total_accounts"] == 1
+        assert data["active_accounts"] == 0
+        assert data["needs_activation_adjustment"] is True
+
     def test_post_selects_active_and_deactivates_rest(self, user, workspace):
         c0 = _conn(workspace, 0)
         c1 = _conn(workspace, 1)

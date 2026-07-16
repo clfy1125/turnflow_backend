@@ -41,7 +41,7 @@ direction:"decrease"` 이며, 이제 `effective_at`(현재 주기 종료일)도 
 ### GET `/api/v1/billing/ig-account-activation/`
 ```jsonc
 {
-  "needs_activation_adjustment": true, // 활성수 > 허용량 또는 갱신 자동조정 발생. ★다이얼로그 트리거로 이것 사용★
+  "needs_activation_adjustment": true, // 활성수>허용량 OR (연동≥1 & 활성0) OR 갱신 자동조정. ★다이얼로그 트리거로 이것 사용★
   "max_ig_accounts": 1,                // 무제한은 999999
   "total_accounts": 3,                 // 연동된(비-REVOKED) 계정 수
   "active_accounts": 3,
@@ -86,6 +86,9 @@ direction:"decrease"` 이며, 이제 `effective_at`(현재 주기 종료일)도 
 1. **다이얼로그 트리거는 `active_accounts > max_ig_accounts` 가 아니라 `needs_activation_adjustment` 를 사용**하세요.
    갱신 시 초과분을 **자동 비활성**하므로 보통 `active == max` 가 되어 단순 비교로는 다이얼로그가 안 뜹니다.
    백엔드가 `ig_activation_review_needed` 를 세워 `needs_activation_adjustment=true` 로 유지하니, 이 필드로 여세요.
+   또한 **연동이 1개 이상인데 활성 계정이 0개**여도 `true` 로 내려옵니다(전부 비활성 = 기능 전면
+   정지 → 최소 1개 켜도록 유도). 재연결 시 자동 활성 복구가 정상 동작하면 이 상태엔 잘 빠지지 않지만,
+   과거에 이미 빠진 사용자를 구제하기 위한 안전망입니다.
 2. **허용량 기준 = 활성 계정 수**. 비활성 계정은 OAuth 연결 슬롯을 비웁니다(하드 해제 없이 계정 교체 가능).
 3. **재활성화된 계정의 캠페인은 자동 재개되지 않습니다.** 사용자가 캠페인을 직접 다시 활성화해야 합니다(안내 문구 권장).
 
