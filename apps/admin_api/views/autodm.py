@@ -365,6 +365,25 @@ class AdminCampaignResumeView(APIView):
                 status=status.HTTP_409_CONFLICT,
             )
 
+        # ★ '한 게시물 = 활성 캠페인 1개' 불변식 — 사용자 경로(create/resume)와 동일하게
+        #   관리자 재개도 같은 게시물에 이미 활성 캠페인이 있으면 거부한다(중복 opening DM 방지).
+        conflict = AutoDMCampaign.find_active_conflict(
+            ig_connection_id=campaign.ig_connection_id,
+            media_id=campaign.media_id,
+            trigger_type=campaign.trigger_type,
+            exclude_id=campaign.id,
+        )
+        if conflict is not None:
+            return Response(
+                {
+                    "detail": "같은 게시물에 이미 활성 캠페인이 있어 재개할 수 없습니다. "
+                    "기존 활성 캠페인을 먼저 일시정지하세요.",
+                    "code": "duplicate_active_campaign",
+                    "conflict_campaign_id": str(conflict.id),
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
         before = campaign.status
         campaign.status = AutoDMCampaign.Status.ACTIVE
         campaign.save(update_fields=["status", "updated_at"])

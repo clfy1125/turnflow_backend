@@ -1235,14 +1235,13 @@ def _maybe_attach_next_media_from_webhook(
         # baseline 없음 → 첫 사용 케이스 (확실히 가장 최신 게시물로 간주)
         new_media_at = timezone.now()
 
-    # ★ Attach: 모든 unattached next_media 캠페인에 media_id 부착 + 트리거 전환
-    updated_count = AutoDMCampaign.objects.filter(
-        id__in=[c.id for c in unattached_campaigns],
-        media_id="",  # 동시성 안전: 이미 다른 webhook 이 attach 했으면 skip
-    ).update(
+    # ★ Attach: '한 게시물 = 활성 캠페인 1개' 불변식 유지 — 후보 1개만 attach 하고 나머지는
+    #   자동 일시정지(paused). (예전엔 전부 bulk attach 돼 댓글당 opening DM 이 중복 발송되고
+    #   Meta code 1 "이미 답글 있음" 으로 무한 재시도하며 백로그를 부풀렸다.)
+    result = AutoDMCampaign.attach_next_media_single_active(
+        ig_connection_id=ig_conn.id,
+        candidate_ids=[c.id for c in unattached_campaigns],
         media_id=webhook_media_id,
-        trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
-        updated_at=timezone.now(),
     )
 
     # baseline 갱신
@@ -1250,17 +1249,19 @@ def _maybe_attach_next_media_from_webhook(
     ig_conn.last_seen_media_at = new_media_at
     ig_conn.save(update_fields=["last_seen_media_id", "last_seen_media_at"])
 
-    if updated_count:
+    if result["attached"] or result["paused"]:
         logger.info(
-            f"next_media webhook attach: attached {updated_count} campaign(s) "
-            f"on ig_conn={ig_conn.id} to media={webhook_media_id}"
+            "next_media webhook attach: ig_conn=%s media=%s attached=%s paused_dup=%s",
+            ig_conn.id,
+            webhook_media_id,
+            result["attached"],
+            result["paused"],
         )
 
-    # refresh 후 반환 (호출자가 즉시 매칭 사용)
+    # refresh 후 반환 (호출자가 즉시 매칭 사용) — attach 된 1개만
     return list(
         AutoDMCampaign.objects.filter(
-            id__in=[c.id for c in unattached_campaigns],
-            media_id=webhook_media_id,
+            id__in=result["attached"],
         ).select_related("ig_connection")
     )
 
@@ -1339,6 +1340,35 @@ def _enqueue_send_dm(
             "status": "skipped",
             "reason": f"recipient_cooldown_{cooldown_s}s",
         }
+
+    # ★ 한 댓글 = 비공개답글(Private Reply) 1회 (Meta 제약). 다른 캠페인이 같은 댓글에 이미
+    #   opening/standalone DM 을 발송 중이거나 성공했으면 중복 발송을 막는다. '한 게시물 = 활성
+    #   캠페인 1개' 가드가 우회돼 같은 게시물에 활성 캠페인이 2개로 새는 경우에도, code 1
+    #   ("이미 답글 있음") 무한 재시도로 백로그가 부풀지 않게 하는 최종 안전망이다.
+    #   실패(failed_*)·skipped·recovery_pending 로그는 슬롯을 점유하지 않으므로(재시도 여지)
+    #   점유 상태에서 제외한다.
+    if comment_id:
+        _slot_occupying = (
+            SentDMLog.Status.QUEUED,
+            SentDMLog.Status.SUBMITTING,
+            SentDMLog.Status.PENDING,
+            SentDMLog.Status.SENT,
+            SentDMLog.Status.ACCEPTED,
+            SentDMLog.Status.DELIVERED,
+            SentDMLog.Status.READ,
+            SentDMLog.Status.RECOVERY_DELIVERED,
+        )
+        already_claimed = (
+            SentDMLog.objects.filter(comment_id=comment_id, status__in=_slot_occupying)
+            .exclude(campaign=campaign)
+            .exists()
+        )
+        if already_claimed:
+            return {
+                "campaign_id": str(campaign.id),
+                "status": "skipped",
+                "reason": "duplicate_comment_private_reply",
+            }
 
     idempotency_key = InstagramMessagingService.build_idempotency_key(
         workspace_id=ig_conn.workspace_id,
@@ -2243,23 +2273,35 @@ def poll_new_media_for_next_campaigns():
 
         attached_for_account = 0
         for _mts, mid, media_obj in new_medias:
-            # 이 계정의 모든 next_media 캠페인에 attach (한번에 같은 미디어로)
-            updated = AutoDMCampaign.objects.filter(
+            # '한 게시물 = 활성 캠페인 1개' 불변식 유지 — 1개만 attach, 나머지 후보는 자동 일시정지.
+            candidate_ids = list(
+                AutoDMCampaign.objects.filter(
+                    ig_connection_id=conn.id,
+                    trigger_type=AutoDMCampaign.TriggerType.NEXT_MEDIA,
+                    status=AutoDMCampaign.Status.ACTIVE,
+                    media_id="",
+                ).values_list("id", flat=True)
+            )
+            result = AutoDMCampaign.attach_next_media_single_active(
                 ig_connection_id=conn.id,
-                trigger_type=AutoDMCampaign.TriggerType.NEXT_MEDIA,
-                status=AutoDMCampaign.Status.ACTIVE,
-                media_id="",
-            ).update(
+                candidate_ids=candidate_ids,
                 media_id=mid,
                 media_url=media_obj.get("permalink") or None,
-                trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
-                updated_at=timezone.now(),
             )
-            attached_for_account += updated
-            attached_total += updated
+            n_attached = len(result["attached"])
+            attached_for_account += n_attached
+            attached_total += n_attached
+            if result["paused"]:
+                logger.info(
+                    "poll_new_media: paused %s duplicate next_media campaign(s) "
+                    "on ig_conn=%s media=%s",
+                    len(result["paused"]),
+                    conn.id,
+                    mid,
+                )
 
-            # 한 미디어에 attach 됐으면 나머지 next 캠페인은 더 없음 → loop 탈출
-            if updated == 0:
+            # 첫 새 미디어에 1개 attach(+나머지 pause)했으면 남은 후보가 없음 → loop 탈출
+            if n_attached == 0:
                 break
 
             # last_seen 갱신은 마지막(=가장 최신) 미디어로

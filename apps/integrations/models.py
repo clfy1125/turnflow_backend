@@ -925,6 +925,74 @@ class AutoDMCampaign(models.Model):
             qs = qs.exclude(id=exclude_id)
         return qs.first()
 
+    @classmethod
+    def attach_next_media_single_active(
+        cls, *, ig_connection_id, candidate_ids, media_id: str, media_url: str | None = None
+    ) -> dict:
+        """새 게시물에 next_media 캠페인을 붙이되 '한 게시물 = 활성 캠페인 1개' 불변식을 지킨다.
+
+        한 계정에 미부착 next_media 캠페인이 둘 이상이면, 예전엔 새 게시물이 뜰 때 그 전부가
+        같은 게시물에 attach(bulk)돼 댓글 하나마다 opening DM 이 여러 건 나갔다. Meta 는 댓글당
+        비공개답글(Private Reply)을 1회만 허용하므로 하나만 성공하고 나머지는 code 1
+        ("이미 답글 있음")로 무한 재시도하며 QUEUED 백로그를 부풀렸다. 이를 막기 위해:
+          - 대상 게시물이 (후보 밖) 다른 활성 캠페인에 이미 점유돼 있으면 아무도 attach 하지 않는다.
+          - 아니면 가장 오래된(created_at) 후보 1개만 attach(specific_media·active)하고,
+            나머지 후보는 status=paused 로 내린다(자동 일시정지 — 사용자가 UI 에서 재조정).
+
+        동시성: 후보 행을 select_for_update 로 잠그고 media_id="" 인 것만 처리하므로,
+        다른 webhook 이 먼저 attach 했으면 자연히 건너뛴다.
+
+        Returns:
+            {"attached": [uuid, ...], "paused": [uuid, ...]}
+        """
+        from django.db import transaction
+
+        media_id = (media_id or "").strip()
+        candidate_ids = list(candidate_ids or [])
+        if not media_id or not candidate_ids:
+            return {"attached": [], "paused": []}
+
+        with transaction.atomic():
+            already_occupied = (
+                cls.objects.filter(
+                    ig_connection_id=ig_connection_id,
+                    media_id=media_id,
+                    status=cls.Status.ACTIVE,
+                )
+                .exclude(id__in=candidate_ids)
+                .exists()
+            )
+            pending = list(
+                cls.objects.select_for_update()
+                .filter(
+                    id__in=candidate_ids,
+                    media_id="",
+                    trigger_type=cls.TriggerType.NEXT_MEDIA,
+                    status=cls.Status.ACTIVE,
+                )
+                .order_by("created_at", "id")
+            )
+            # 슬롯이 이미 점유됐거나 붙일 후보가 없으면 아무것도 하지 않는다(후보는 대기 유지).
+            if already_occupied or not pending:
+                return {"attached": [], "paused": []}
+
+            winner, losers = pending[0], pending[1:]
+            winner.media_id = media_id
+            fields = ["media_id", "trigger_type", "updated_at"]
+            if media_url:
+                winner.media_url = media_url
+                fields.append("media_url")
+            winner.trigger_type = cls.TriggerType.SPECIFIC_MEDIA
+            winner.save(update_fields=fields)
+
+            paused_ids = []
+            for loser in losers:
+                loser.status = cls.Status.PAUSED
+                loser.save(update_fields=["status", "updated_at"])
+                paused_ids.append(loser.id)
+
+            return {"attached": [winner.id], "paused": paused_ids}
+
     def copy(self, new_name: str | None = None) -> "AutoDMCampaign":
         """이 캠페인을 비활성(INACTIVE) 복사본으로 복제해 저장 후 반환.
 
