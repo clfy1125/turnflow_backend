@@ -80,8 +80,15 @@ class ValidateReferralCodeView(APIView):
 |------|------|------|
 | `valid` | bool | 사용 가능 여부 |
 | `reason` | string | 사용 불가 사유 (valid=false일 때만) |
-| `trial_days` | int | 부여될 트라이얼 일수 (valid=true) |
+| `trial_days` | int | 코드가 추가로 주는 **보너스** 일수 (valid=true) |
+| `base_trial_days` | int | 카드 등록 시 기본 무료 일수 (코드 없이도 프로 최초 구독이 받는 값, 보통 30) |
+| `total_trial_days` | int | **카드 등록 시 이 코드로 받는 총 무료 일수** = `base_trial_days + trial_days` |
 | `plan` | object | 트라이얼로 부여될 플랜 정보 (valid=true) |
+
+> 💡 **표기 주의**: 카드 등록(`POST /billing/toss/confirm/` 에 `referral_code` 동봉) 흐름에서는
+> "원래 1개월 무료 → 코드 적용 시 **N개월 무료**" 를 보여줄 때 `total_trial_days` 를 사용하세요
+> (예: base 30 + 보너스 30 = **60일 = 2개월 무료**). 반면 카드 없이 `POST /billing/referral/redeem/`
+> 로 사용하면 base 없이 `trial_days` 만 적용됩니다.
 
 ## 프론트엔드 통합
 ```typescript
@@ -91,7 +98,9 @@ const res = await fetch(
 const data = await res.json();
 
 if (data.valid) {
-  showHint(`${data.plan.display_name} ${data.trial_days}일 무료 체험!`);
+  // 카드 등록(체험 시작) 화면: 총 무료 기간을 개월로 환산해 노출
+  const months = Math.round(data.total_trial_days / 30);
+  showHint(`${data.plan.display_name} ${months}개월 무료 체험! (${data.total_trial_days}일)`);
 } else {
   showError(data.reason);
 }
@@ -123,10 +132,12 @@ if (data.valid) {
                 description="검증 결과 — valid 필드로 사용 가능 여부 확인",
                 examples=[
                     OpenApiExample(
-                        "사용 가능",
+                        "사용 가능 (카드 등록 시 2개월 무료)",
                         value={
                             "valid": True,
                             "trial_days": 30,
+                            "base_trial_days": 30,
+                            "total_trial_days": 60,
                             "plan": {
                                 "id": "550e8400-e29b-41d4-a716-446655440002",
                                 "name": "pro",
@@ -202,10 +213,16 @@ if (data.valid) {
         if not ok:
             return Response({"valid": False, "reason": reason})
 
+        # 카드 등록(toss confirm) 시나리오 기준 총 무료 일수 = 기본 체험 + 코드 보너스.
+        # (카드 없이 /referral/redeem/ 로 쓰면 base 없이 trial_days 만 적용됨)
+        from .toss_flows import TRIAL_BASE_DAYS
+
         return Response(
             {
                 "valid": True,
                 "trial_days": code.trial_days,
+                "base_trial_days": TRIAL_BASE_DAYS,
+                "total_trial_days": TRIAL_BASE_DAYS + code.trial_days,
                 "plan": SubscriptionPlanSerializer(code.target_plan).data,
             }
         )

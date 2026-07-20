@@ -365,7 +365,18 @@ class ReferralCodeValidateResponseSerializer(serializers.Serializer):
         required=False, allow_blank=True, help_text="사용 불가 사유 (valid=false일 때)"
     )
     trial_days = serializers.IntegerField(
-        required=False, help_text="트라이얼 부여 일수 (valid=true일 때)"
+        required=False,
+        help_text="코드가 추가로 주는 보너스 일수 (= 카드 등록 시 base에 가산되는 일수)",
+    )
+    base_trial_days = serializers.IntegerField(
+        required=False,
+        help_text="카드 등록 시 기본 무료 일수 (코드 없이도 프로 최초 구독이 받는 값, 보통 30)",
+    )
+    total_trial_days = serializers.IntegerField(
+        required=False,
+        help_text="카드 등록 시 이 코드로 받는 총 무료 일수 (= base_trial_days + trial_days). "
+        "프론트 '총 N개월 무료' 표기는 이 값 사용. "
+        "※ 카드 없이 /referral/redeem/ 로 쓰면 trial_days 만 적용됨",
     )
     plan = SubscriptionPlanSerializer(
         required=False, help_text="트라이얼로 부여될 플랜 (valid=true일 때)"
