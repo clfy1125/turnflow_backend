@@ -75,7 +75,9 @@ class TestAttachSingleActive:
         )
         assert res["attached"] == [a.id]  # 가장 오래된 1개
         assert set(res["paused"]) == {b.id, c.id}
-        a.refresh_from_db(); b.refresh_from_db(); c.refresh_from_db()
+        a.refresh_from_db()
+        b.refresh_from_db()
+        c.refresh_from_db()
         assert a.status == AutoDMCampaign.Status.ACTIVE
         assert a.media_id == "newpost1"
         assert a.trigger_type == AutoDMCampaign.TriggerType.SPECIFIC_MEDIA
@@ -120,6 +122,70 @@ class TestAttachSingleActive:
         ) == {"attached": [], "paused": []}
 
 
+# ===== '진짜 다음 게시물' 가드 (media_published_at) =====
+#
+# "다음 새 게시물"은 캠페인을 만든 뒤 올라온 게시물만 대상이어야 한다. baseline 이 뒤처져
+# 있을 때 이미 존재하던 최신 게시물에 잘못 attach 되던 회귀(2026-07-20 mini_ai_)를 막는다.
+
+
+class TestPublishedAfterCreationGuard:
+    def _set_created(self, campaign, when):
+        AutoDMCampaign.objects.filter(id=campaign.id).update(created_at=when)
+        campaign.refresh_from_db()
+        return campaign
+
+    def test_skips_media_older_than_campaign(self, ig_connection):
+        # 캠페인은 지금 만들었는데, 게시물은 하루 전에 올라온 것 → attach 안 함(대기 유지)
+        camp = self._set_created(_next_media(ig_connection, "waiter"), timezone.now())
+        older = timezone.now() - timezone.timedelta(days=1)
+        res = AutoDMCampaign.attach_next_media_single_active(
+            ig_connection_id=ig_connection.id,
+            candidate_ids=[camp.id],
+            media_id="old_post",
+            media_published_at=older,
+        )
+        assert res == {"attached": [], "paused": []}
+        camp.refresh_from_db()
+        assert camp.status == AutoDMCampaign.Status.ACTIVE
+        assert camp.media_id == ""  # 여전히 미부착 — 다음 게시물을 기다린다
+        assert camp.trigger_type == AutoDMCampaign.TriggerType.NEXT_MEDIA
+
+    def test_attaches_media_newer_than_campaign(self, ig_connection):
+        camp = self._set_created(
+            _next_media(ig_connection, "waiter"), timezone.now() - timezone.timedelta(hours=2)
+        )
+        newer = timezone.now()  # 캠페인 생성 이후 게시
+        res = AutoDMCampaign.attach_next_media_single_active(
+            ig_connection_id=ig_connection.id,
+            candidate_ids=[camp.id],
+            media_id="fresh_post",
+            media_published_at=newer,
+        )
+        assert res["attached"] == [camp.id]
+        camp.refresh_from_db()
+        assert camp.media_id == "fresh_post"
+        assert camp.trigger_type == AutoDMCampaign.TriggerType.SPECIFIC_MEDIA
+
+    def test_guard_only_attaches_eligible_and_leaves_others_waiting(self, ig_connection):
+        # A(월) B(수) 두 캠페인. 게시물은 화요일 게시 → A 만 자격(생성 이후), B 는 대기.
+        now = timezone.now()
+        a = self._set_created(_next_media(ig_connection, "A_mon"), now - timezone.timedelta(days=5))
+        b = self._set_created(_next_media(ig_connection, "B_wed"), now - timezone.timedelta(days=3))
+        tue = now - timezone.timedelta(days=4)  # A 이후, B 이전
+        res = AutoDMCampaign.attach_next_media_single_active(
+            ig_connection_id=ig_connection.id,
+            candidate_ids=[a.id, b.id],
+            media_id="tue_post",
+            media_published_at=tue,
+        )
+        assert res["attached"] == [a.id]
+        # B 는 자격 미달 → paused 되면 안 되고 대기 유지
+        assert res["paused"] == []
+        b.refresh_from_db()
+        assert b.status == AutoDMCampaign.Status.ACTIVE
+        assert b.media_id == "" and b.trigger_type == AutoDMCampaign.TriggerType.NEXT_MEDIA
+
+
 # ===== 발송 중복차단: _enqueue_send_dm =====
 
 
@@ -150,12 +216,20 @@ class TestEnqueueDedup:
         from apps.integrations.tasks import _enqueue_send_dm
 
         camp_a = AutoDMCampaign.objects.create(
-            ig_connection=ig_connection, trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
-            media_id="m1", name="A", message_template="hi", status=AutoDMCampaign.Status.ACTIVE,
+            ig_connection=ig_connection,
+            trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
+            media_id="m1",
+            name="A",
+            message_template="hi",
+            status=AutoDMCampaign.Status.ACTIVE,
         )
         camp_b = AutoDMCampaign.objects.create(
-            ig_connection=ig_connection, trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
-            media_id="m1", name="B", message_template="hi", status=AutoDMCampaign.Status.ACTIVE,
+            ig_connection=ig_connection,
+            trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
+            media_id="m1",
+            name="B",
+            message_template="hi",
+            status=AutoDMCampaign.Status.ACTIVE,
         )
         cid = f"cmt_{uuid.uuid4().hex[:10]}"
         self._occupying_log(camp_a, cid, occ_status)
@@ -178,19 +252,31 @@ class TestEnqueueDedup:
         from apps.integrations.tasks import _enqueue_send_dm
 
         camp_a = AutoDMCampaign.objects.create(
-            ig_connection=ig_connection, trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
-            media_id="m2", name="A2", message_template="hi", status=AutoDMCampaign.Status.ACTIVE,
+            ig_connection=ig_connection,
+            trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
+            media_id="m2",
+            name="A2",
+            message_template="hi",
+            status=AutoDMCampaign.Status.ACTIVE,
         )
         camp_b = AutoDMCampaign.objects.create(
-            ig_connection=ig_connection, trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
-            media_id="m2", name="B2", message_template="hi", status=AutoDMCampaign.Status.ACTIVE,
+            ig_connection=ig_connection,
+            trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
+            media_id="m2",
+            name="B2",
+            message_template="hi",
+            status=AutoDMCampaign.Status.ACTIVE,
         )
         cid = f"cmt_{uuid.uuid4().hex[:10]}"
         self._occupying_log(camp_a, cid, SentDMLog.Status.FAILED_NO_TRACE)
 
         res = _enqueue_send_dm(
-            campaign=camp_b, comment_id=cid, comment_text="주세요",
-            from_user_id="99999", from_username="commenter", webhook_payload={},
+            campaign=camp_b,
+            comment_id=cid,
+            comment_text="주세요",
+            from_user_id="99999",
+            from_username="commenter",
+            webhook_payload={},
         )
         assert res["status"] == "enqueued", res
         assert SentDMLog.objects.filter(campaign=camp_b, comment_id=cid).exists()
@@ -214,13 +300,19 @@ class TestAdminResumeGuard:
 
     def test_admin_resume_blocked_on_conflict(self, ig_connection):
         AutoDMCampaign.objects.create(
-            ig_connection=ig_connection, trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
-            media_id="am1", name="incumbent", message_template="x",
+            ig_connection=ig_connection,
+            trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
+            media_id="am1",
+            name="incumbent",
+            message_template="x",
             status=AutoDMCampaign.Status.ACTIVE,
         )
         paused = AutoDMCampaign.objects.create(
-            ig_connection=ig_connection, trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
-            media_id="am1", name="paused", message_template="x",
+            ig_connection=ig_connection,
+            trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
+            media_id="am1",
+            name="paused",
+            message_template="x",
             status=AutoDMCampaign.Status.PAUSED,
         )
         resp = self._staff_client().post(
@@ -233,8 +325,11 @@ class TestAdminResumeGuard:
 
     def test_admin_resume_ok_when_no_conflict(self, ig_connection):
         paused = AutoDMCampaign.objects.create(
-            ig_connection=ig_connection, trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
-            media_id="am_solo", name="solo", message_template="x",
+            ig_connection=ig_connection,
+            trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
+            media_id="am_solo",
+            name="solo",
+            message_template="x",
             status=AutoDMCampaign.Status.PAUSED,
         )
         resp = self._staff_client().post(
