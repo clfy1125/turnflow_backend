@@ -58,6 +58,36 @@ class TestClassifyCode200:
         assert exception_to_classification(exc).log_status == "failed_no_trace"
 
 
+# ─────────────── 댓글에 이미 답글 존재(subcode 2534023) 무한 재시도 방지 ───────────────
+#
+# 배경(2026-07-21 3dragon_pd): 팔로우게이트 오프닝(비공개답글)이 "이미 답글이 있습니다"
+# (subcode 2534023, http 500)로 실패. http 500 → 서비스가 DMTransientError 로 raise →
+# retriable 로 분류돼 1h defer 를 24회 반복(유령 QUEUED·허위 ETA/백로그 경고). 리워드는
+# 이미 전달됐는데 오프닝만 좀비로 남음. → 구조적 영구 실패라 즉시 종결해야 한다.
+
+
+class TestAlreadyRepliedSubcode:
+    def test_classify_already_replied_not_retriable(self):
+        cls = classify_api_error(http_status=500, code=-1, subcode=2534023)
+        assert cls.log_status == "failed_no_trace"
+        assert cls.retriable is False
+
+    def test_subcode_wins_over_retriable_code(self):
+        # code 1 은 RETRIABLE_CODES 지만 subcode 2534023 이면 재시도 불가로 종결.
+        cls = classify_api_error(http_status=500, code=1, subcode=2534023)
+        assert cls.log_status == "failed_no_trace" and cls.retriable is False
+
+    def test_transient_exc_with_subcode_intercepted(self):
+        # ★ 핵심: http 500 → DMTransientError 로 와도 subcode 2534023 이면 isinstance 체인보다
+        #    먼저 가로채 non-retriable 로 분류(예전 무한 재시도 루프의 실제 진입 경로).
+        exc = DMTransientError(
+            "답글을 달려는 댓글에 이미 답글이 있습니다.", status=500, code=-1, subcode=2534023
+        )
+        cls = exception_to_classification(exc)
+        assert cls.log_status == "failed_no_trace"
+        assert cls.retriable is False
+
+
 # ───────────────────── verify-before-brick (_defer_or_fail) ─────────────────────
 
 
