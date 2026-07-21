@@ -392,6 +392,8 @@ CELERY_TASK_ROUTES = {
     # AI 작업 격리(#5): run_ai_job(최대 600s)·campaign-assist 를 전용 워커(celery_ai)로 라우팅해
     # snapshot/DM-reconcile 가 도는 celery_default 8슬롯과 head-of-line blocking 분리.
     "apps.ai_jobs.tasks.*": {"queue": "ai_jobs"},
+    # DM 캠페인 이전 분석(최대 ~25분 LLM/IO) — dm_send/webhook 큐 블로킹 방지 위해 ai_jobs 로.
+    "integrations.run_dm_migration_job": {"queue": "ai_jobs"},
 }
 
 # Celery Beat Schedule (정기 결제 + DM 발송 보증 워커)
@@ -539,6 +541,12 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": crontab(hour=2, minute=0),  # CELERY_TIMEZONE=Asia/Seoul 기준
         "options": {"queue": "billing"},
     },
+    # 매일 KST 05:00 — DM 캠페인 이전 원본(타인 댓글·DM) 7일 파기 + 스테일 잡 스위퍼.
+    # 실제 구동은 core.ScheduledJob(seed migration). CELERY_BEAT_SCHEDULE 은 dev 패리티/문서용.
+    "dm-migration-purge-raw": {
+        "task": "integrations.purge_dm_migration_raw",
+        "schedule": crontab(hour=5, minute=0),  # CELERY_TIMEZONE=Asia/Seoul 기준
+    },
     # ===== Instagram Insights 동기화 (임시 비활성) =====
     # insights 기능 출시 보류 — Meta IG insights API 호출이 발생하지 않도록 4개 beat 모두 주석 처리.
     # 활성화 시점에 아래 4개를 복원 + INSIGHTS_API_ENABLED=True 로 전환.
@@ -642,6 +650,10 @@ INSTAGRAM_WEBHOOK_VERIFY_TOKEN = config(
 # Meta App (Facebook Login for Instagram Business)
 META_APP_ID = config("META_APP_ID", default="")
 META_APP_SECRET = config("META_APP_SECRET", default="")
+
+# DM 캠페인 이전(마이그레이션) — dev/CI 전용: True 면 LLM(deepseek) 대신 휴리스틱 분류/초안
+# 생성기로 전 파이프라인을 돌린다(LLM 의존 없이 mock 데이터로 e2e 검증). 운영은 반드시 False.
+DM_MIGRATION_FAKE_LLM = config("DM_MIGRATION_FAKE_LLM", default=False, cast=bool)
 
 # P2c — 웹훅 echo/read 이벤트를 EventInbox 멱등 INSERT + Celery(webhook_followup) 비동기 처리.
 # True(기본): 동시 UPDATE 레이스 제거 + webhook 응답 빨라짐.

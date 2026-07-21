@@ -4,6 +4,7 @@ Instagram Account Connection models
 
 import uuid
 
+from django.conf import settings
 from django.core.validators import MinValueValidator
 from django.db import IntegrityError, models, transaction
 from django.utils import timezone
@@ -2114,3 +2115,314 @@ class DMAccountBlock(models.Model):
         return (
             f"DMAccountBlock({self.external_account_id} until={self.cooldown_until} L{self.level})"
         )
+
+
+class DMMigrationJob(models.Model):
+    """DM 캠페인 이전(마이그레이션) 분석 잡 — 타 툴(매니챗 등)에서 넘어온 사용자의 IG 계정을
+    분석해 기존 DM 캠페인을 TurnFlow 초안(INACTIVE)으로 재구성한다.
+
+    파이프라인(비동기 Celery, 10~20분): 최근 게시물 수집 → 댓글 수집 → LLM 캠페인 판정 →
+    발신 DM 대화 수집 → DM 템플릿 군집화 → 게시물↔템플릿 매칭 → 초안 생성. 각 단계 출력은
+    ``stage_data`` 에 체크포인트되어(재개 가능) 워커 크래시/레이트리밋 pause 후 이어서 실행한다.
+
+    개인정보 최소보관: ``stage_data`` 와 후보의 ``evidence_raw`` 에 담기는 **타인 댓글·DM 원문**은
+    완료 7일 뒤 ``purge_dm_migration_raw`` 가 파기한다(집계 근거·초안은 유지).
+
+    남용 방지(전 플랜 개방): (ig_connection)당 **비종결 잡 1개**(부분 UNIQUE 제약) + 완료 결과
+    24h 재사용 + ``force`` 재분석은 종료 후 1h 쿨다운(뷰에서 판정).
+    """
+
+    class Status(models.TextChoices):
+        QUEUED = "queued", "대기"
+        RUNNING = "running", "분석 중"
+        PAUSED_RATE_LIMITED = "paused_rate_limited", "레이트리밋 대기(자동 재개)"
+        READY = "ready", "완료"
+        PARTIAL = "partial", "부분 완료"
+        FAILED = "failed", "실패"
+        CANCELED = "canceled", "취소됨"
+
+    # 비종결(=아직 돌고 있거나 재개 예정) 상태 — 부분 UNIQUE 제약/재사용 판정의 단일 진실.
+    NON_TERMINAL_STATUSES = (
+        Status.QUEUED,
+        Status.RUNNING,
+        Status.PAUSED_RATE_LIMITED,
+    )
+    # 24h 재사용 대상(완료 결과) 상태.
+    REUSABLE_STATUSES = (Status.READY, Status.PARTIAL)
+
+    class Stage(models.TextChoices):
+        QUEUED = "queued", "대기"
+        COLLECTING_MEDIA = "collecting_media", "게시물 수집 중"
+        COLLECTING_COMMENTS = "collecting_comments", "댓글 수집 중"
+        CLASSIFYING_POSTS = "classifying_posts", "게시물 분류 중"
+        COLLECTING_TARGETED_DMS = "collecting_targeted_dms", "타겟 DM 복원 중"
+        COLLECTING_DM_CONVERSATIONS = "collecting_dm_conversations", "DM 기록 수집 중"
+        CLUSTERING_DM_TEMPLATES = "clustering_dm_templates", "DM 패턴 분석 중"
+        MATCHING_CAMPAIGNS = "matching_campaigns", "게시물-DM 매칭 중"
+        GENERATING_DRAFTS = "generating_drafts", "캠페인 초안 생성 중"
+        COMPLETED = "completed", "완료"
+
+    class Meta:
+        db_table = "dm_migration_jobs"
+        verbose_name = "DM Migration Job"
+        verbose_name_plural = "DM Migration Jobs"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["ig_connection", "status"]),
+            models.Index(fields=["status", "raw_expires_at"]),  # 파기 스캔
+        ]
+        constraints = [
+            # 연결당 비종결 잡 1개 — 경합은 IntegrityError → 뷰가 기존 잡 재조회.
+            models.UniqueConstraint(
+                fields=["ig_connection"],
+                condition=models.Q(status__in=["queued", "running", "paused_rate_limited"]),
+                name="uniq_nonterminal_migration_per_connection",
+            )
+        ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    ig_connection = models.ForeignKey(
+        IGAccountConnection,
+        on_delete=models.CASCADE,
+        related_name="migration_jobs",
+        verbose_name="Instagram Connection",
+    )
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="dm_migration_jobs",
+        verbose_name="요청자",
+    )
+
+    status = models.CharField(
+        max_length=24, choices=Status.choices, default=Status.QUEUED, verbose_name="상태"
+    )
+    stage = models.CharField(
+        max_length=32, choices=Stage.choices, default=Stage.QUEUED, verbose_name="진행 단계"
+    )
+    progress = models.PositiveSmallIntegerField(
+        default=0, verbose_name="진행률 (%)", help_text="0~100"
+    )
+    message = models.CharField(max_length=200, blank=True, default="", verbose_name="진행 메시지")
+
+    # 파라미터
+    media_limit = models.IntegerField(
+        default=50,
+        validators=[MinValueValidator(10)],
+        verbose_name="분석 게시물 수",
+        help_text="최근 게시물 몇 개까지 분석할지 (10~100).",
+    )
+    llm_model = models.CharField(
+        max_length=20, default="deepseek", verbose_name="LLM 모델", help_text="AiJob.LlmModel 값"
+    )
+
+    # 카운터 (관측용)
+    media_scanned = models.IntegerField(default=0)
+    comments_collected = models.IntegerField(default=0)
+    conversations_scanned = models.IntegerField(default=0)
+    dm_messages_collected = models.IntegerField(default=0)
+    templates_found = models.IntegerField(default=0)
+    candidates_created = models.IntegerField(default=0)
+
+    # API/LLM 예산 상태 — {caps, made, throttle_events, aborted_stages, resume_state}
+    api_budget_state = models.JSONField(default=dict, blank=True, verbose_name="API 예산 상태")
+    llm_calls = models.IntegerField(default=0)
+    llm_tokens_used = models.IntegerField(default=0)
+    rate_limit_pauses = models.IntegerField(
+        default=0, verbose_name="레이트리밋 pause 횟수", help_text="3회 초과 시 partial 종결"
+    )
+
+    # 에러
+    error_code = models.CharField(max_length=50, blank=True, default="", verbose_name="에러 코드")
+    error_message = models.TextField(blank=True, default="", verbose_name="에러 메시지")
+
+    # 제어
+    cancel_requested = models.BooleanField(default=False, verbose_name="취소 요청됨")
+    resume_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="재개 예정 시각",
+        help_text="paused_rate_limited 시 설정",
+    )
+    celery_task_id = models.CharField(
+        max_length=255, blank=True, default="", verbose_name="Celery Task ID"
+    )
+
+    # ── 파기 대상 원본(타인 댓글·DM 원문 체크포인트) ──
+    stage_data = models.JSONField(
+        default=dict,
+        blank=True,
+        verbose_name="단계별 체크포인트(원본 포함 — 7일 후 파기)",
+        help_text=(
+            "media 목록·media별 댓글(캡 250·200자 절단)·발신 DM(캡 500)·판정/클러스터/매칭 결과. "
+            "재개 가능하도록 단계키별로 누적된다. purge_dm_migration_raw 가 {} 로 파기."
+        ),
+    )
+
+    # 보존
+    raw_expires_at = models.DateTimeField(
+        null=True, blank=True, db_index=True, verbose_name="원본 파기 예정 시각(완료+7일)"
+    )
+    raw_purged_at = models.DateTimeField(null=True, blank=True, verbose_name="원본 파기 완료 시각")
+
+    # 타임스탬프
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    started_at = models.DateTimeField(null=True, blank=True, verbose_name="실행 시작")
+    finished_at = models.DateTimeField(null=True, blank=True, verbose_name="실행 종료")
+
+    def __str__(self):
+        return f"DMMigrationJob({self.id}) {self.status} @ {self.ig_connection_id}"
+
+    def set_stage(self, stage: str, progress: int, message: str = ""):
+        """단계·진행률·메시지를 한 번에 업데이트 (AiJob.set_stage 패턴)."""
+        self.stage = stage
+        self.progress = progress
+        if message:
+            self.message = message
+        self.save(update_fields=["stage", "progress", "message", "updated_at"])
+
+
+class DMCampaignCandidate(models.Model):
+    """DMMigrationJob 이 감지한 캠페인 후보 1건 — 검수 후 apply 하면 AutoDMCampaign(INACTIVE) 이 된다.
+
+    보존 정책:
+        - 영구 보존(사용자 본인 콘텐츠·제품 가치): 게시물 신원, 감지 키워드, LLM 초안,
+          매칭 템플릿 숫자, ``evidence_aggregates``.
+        - 7일 후 파기(타인 원문): ``evidence_raw`` (댓글/DM 샘플·대표 문구) → None.
+    """
+
+    class Status(models.TextChoices):
+        DETECTED = "detected", "감지됨"
+        APPLIED = "applied", "적용됨(초안 생성)"
+        DISMISSED = "dismissed", "무시됨"
+
+    class Band(models.TextChoices):
+        AUTO_DRAFT = "auto_draft", "자동 초안(강한 후보)"
+        NEEDS_REVIEW = "needs_review", "검수 필요"
+        TEMPLATE_ONLY = "template_only", "템플릿만(게시물 미상)"
+        EXCLUDED = "excluded", "제외"
+
+    class Meta:
+        db_table = "dm_campaign_candidates"
+        verbose_name = "DM Campaign Candidate"
+        verbose_name_plural = "DM Campaign Candidates"
+        ordering = ["-confidence", "-created_at"]
+        indexes = [
+            models.Index(fields=["job", "status"]),
+            models.Index(fields=["ig_connection", "status"]),
+            models.Index(fields=["media_id"]),
+        ]
+        constraints = [
+            # 초안 생성이 update_or_create(job, media_id) 로 멱등하도록 — media_id 있는 후보만.
+            models.UniqueConstraint(
+                fields=["job", "media_id"],
+                condition=~models.Q(media_id=""),
+                name="uniq_candidate_per_job_media",
+            )
+        ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    job = models.ForeignKey(
+        DMMigrationJob,
+        on_delete=models.CASCADE,
+        related_name="candidates",
+        verbose_name="마이그레이션 잡",
+    )
+    # 비정규화 — 후보 엔드포인트가 job 조인 없이 워크스페이스 검사를 하도록.
+    ig_connection = models.ForeignKey(
+        IGAccountConnection,
+        on_delete=models.CASCADE,
+        related_name="migration_candidates",
+        verbose_name="Instagram Connection",
+    )
+
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.DETECTED, verbose_name="상태"
+    )
+    band = models.CharField(
+        max_length=16, choices=Band.choices, default=Band.NEEDS_REVIEW, verbose_name="매칭 밴드"
+    )
+
+    # 게시물 신원(영구 보존 — 본인 콘텐츠). template_only 후보는 media_id 빈 문자열.
+    media_id = models.CharField(
+        max_length=255, blank=True, default="", db_index=True, verbose_name="게시물 ID"
+    )
+    media_permalink = models.URLField(blank=True, default="", verbose_name="게시물 URL")
+    media_caption_excerpt = models.CharField(
+        max_length=300, blank=True, default="", verbose_name="캡션 발췌"
+    )
+    media_timestamp = models.DateTimeField(null=True, blank=True, verbose_name="게시물 작성 시각")
+
+    # 감지 결과(보존)
+    suggested_keywords = models.JSONField(
+        default=list, blank=True, verbose_name="추천 트리거 키워드"
+    )
+    suggested_keyword_mode = models.CharField(
+        max_length=10,
+        choices=AutoDMCampaign.KeywordMode.choices,
+        default=AutoDMCampaign.KeywordMode.ANY,
+        verbose_name="키워드 매칭 방식",
+    )
+    confidence = models.FloatField(default=0.0, verbose_name="신뢰도 (0~1)")
+
+    # 초안(보존 — 제품 가치)
+    draft_name = models.CharField(
+        max_length=255, blank=True, default="", verbose_name="초안 캠페인명"
+    )
+    draft_description = models.TextField(blank=True, default="", verbose_name="초안 설명")
+    draft_opening_message = models.TextField(blank=True, default="", verbose_name="초안 첫 DM")
+    draft_public_reply_templates = models.JSONField(
+        default=list, blank=True, verbose_name="초안 공개답글 목록"
+    )
+    follow_up_candidates = models.JSONField(
+        default=list,
+        blank=True,
+        verbose_name="후속 DM 후보",
+        help_text='[{"text", "confidence", "source_template_id", "cluster_size"}]',
+    )
+
+    # 템플릿 매칭(보존, 숫자만 — 원문은 evidence_raw 에)
+    matched_template = models.JSONField(
+        default=dict,
+        blank=True,
+        verbose_name="매칭 템플릿 메타",
+        help_text='{"template_id","cluster_size","variable_slots","first_sent_at","last_sent_at"}',
+    )
+
+    # ── 근거(2컬럼 분리 — 파기를 컬럼 write 로) ──
+    evidence_aggregates = models.JSONField(
+        default=dict,
+        blank=True,
+        verbose_name="근거 집계(영구 보존)",
+        help_text=(
+            "matched/total 댓글 수, keyword_hit_counts, account_replied_publicly, "
+            "dm_burst_overlap_ratio, time_window, has_existing_campaign, own_sends_excluded."
+        ),
+    )
+    evidence_raw = models.JSONField(
+        null=True,
+        blank=True,
+        verbose_name="근거 원본(7일 후 파기 → None)",
+        help_text="sample_comments(≤5)·sample_outbound_dms(≤3)·template_representative_text.",
+    )
+
+    # 적용/무시
+    applied_campaign = models.ForeignKey(
+        AutoDMCampaign,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="migration_candidates",
+        verbose_name="생성된 캠페인",
+    )
+    applied_at = models.DateTimeField(null=True, blank=True, verbose_name="적용 시각")
+    dismissed_at = models.DateTimeField(null=True, blank=True, verbose_name="무시 시각")
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"DMCampaignCandidate({self.id}) {self.band} conf={self.confidence:.2f}"

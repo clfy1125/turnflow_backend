@@ -95,3 +95,7 @@ nul
 # 루트의 디버그 PNG(baseline-*, exp-*, kim-seg*, gb-* 등)와 playwright 페이지 스냅샷.
 /*.png
 /.playwright-mcp/
+
+# DM 캠페인 이전 실데이터 실험 산출물(외부 유저 IG 데이터 — 커밋 금지)
+/_miniai_raw.json
+/DM_MIGRATION_EXPERIMENT_*.html

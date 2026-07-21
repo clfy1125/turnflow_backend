@@ -325,6 +325,7 @@ make test-cov                             # HTML 커버리지 리포트
 - `PASSWORD_RESET_GUIDE.md` — 비밀번호 재설정 플로우 프론트 가이드
 - `DISCONNECT_OTHER_DM_TOOLS_GUIDE.md` — 다른 DM 자동화 툴(매니챗 등) 연결 해제 안내 (댓글 fan-out·Private Reply 1회 충돌 / IG Login이라 Facebook 라우팅 불필요)
 - `CONNECT_CONFLICT_WARNING_FRONTEND.md` — 다른 DM 툴 충돌 경고 배너 프론트 스펙 (연결 직후 + 대시보드 상단, 닫기 규칙)
+- `DM_CAMPAIGN_MIGRATION_FRONTEND.md` — DM 캠페인 이전(매니챗 등→TurnFlow) 프론트 가이드. 연동 IG 계정의 최근 게시물·댓글·발신 DM(Conversations API) 분석→기존 DM 캠페인 추론→**비활성(INACTIVE) 초안 후보** 생성→검수·apply→활성화. `POST/GET /integrations/dm-migration/jobs/`(시작·폴링 3s·취소, 비종결1개+24h재사용+force쿨다운1h·429), `.../jobs/{id}/candidates/`(band=auto_draft/needs_review/template_only/excluded), `.../candidates/{id}/apply|dismiss/`(apply=AutoDMCampaignCreateSerializer 재사용·status=INACTIVE·활성 중복은 활성화 시점 발동). 전 플랜·v1 토큰차감 없음. 파이프라인=`apps/integrations/dm_migration/`(collect·analyze·llm·pipeline), 태스크 `integrations.run_dm_migration_job`(ai_jobs 큐, 체크포인트 재개·rate-pause)·`integrations.purge_dm_migration_raw`(원본 7일 파기+스테일 스위퍼, core 0008 시드). 자기발송 제외(SentDMLog mid/지문), Mock 픽스처+`DM_MIGRATION_FAKE_LLM`로 오프라인 e2e
 - `SERVICE_DIFFERENTIATION.md` — 서비스 차별점/경쟁 비교 (세일즈·마케팅)
 - `개인정보처리방침_변호사_전달자료.md`, `이용약관_변호사_전달자료.md` — 법무 자료 (수정 금지, 요청 시에만)
 - `api-mcp/README.md` — 사내 API 문서 검색 MCP 서버
