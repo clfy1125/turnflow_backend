@@ -850,6 +850,28 @@ def run_spam_filter_check(self, webhook_payload: dict):
         raise
 
 
+def _comment_triggers_active_campaign(conn, *, media_id: str, comment_text: str) -> bool:
+    """이 댓글이 계정의 **활성 auto-DM 캠페인을 실제로 발동**시키는지(media+keyword 매칭).
+
+    발동 조건은 발송 경로(``_process_comment_and_send_dm``)와 동일하게
+    ``matches_media(media_id) and matches_keyword(comment_text)`` 로 맞춘다.
+
+    이런 댓글은 사용자가 **원해서 유치한** 트리거 댓글이므로 스팸 분류에서 제외해야 한다.
+    (트리거 키워드 "가이드🔥"·"비밀코드"·"풀버전"·"스킬"·"클로드(ㅋㄹㄷ)" 등이 gemma 에
+     promo/adult/scam 으로 오분류돼, DM 을 정상 받은 팬 댓글이 스팸으로 감지되던 회귀 방지 —
+     2026-07-21 3dragon_pd: detected 36건 중 최소 10건이 실제 DM 발송(read/delivered)된 댓글.)
+    """
+    from .models import AutoDMCampaign
+
+    campaigns = AutoDMCampaign.objects.filter(
+        ig_connection=conn, status=AutoDMCampaign.Status.ACTIVE
+    )
+    for campaign in campaigns:
+        if campaign.matches_media(media_id) and campaign.matches_keyword(comment_text):
+            return True
+    return False
+
+
 def _run_spam_for_connection(
     conn,
     spam_filter,
@@ -889,6 +911,18 @@ def _run_spam_for_connection(
             "conn_id": str(conn.id),
             "spam_log_id": str(log.id),
             "prior_status": log.status,
+        }
+
+    # ── ★ 캠페인 트리거 댓글 면제 (규칙/LLM 판정보다 우선) ──
+    # 이 댓글이 활성 캠페인을 발동시키면(=사용자가 원한 댓글) 스팸 분류를 건너뛰고 CLEAN 유지.
+    if _comment_triggers_active_campaign(conn, media_id=media_id, comment_text=comment_text):
+        log.engine = "campaign_trigger_exempt"
+        log.save(update_fields=["engine"])
+        return {
+            "status": "clean",
+            "engine": "campaign_trigger_exempt",
+            "conn_id": str(conn.id),
+            "spam_log_id": str(log.id),
         }
 
     # ── 하이브리드 판정 (규칙 즉시차단 + 애매하면 gemma, fail-open) ──

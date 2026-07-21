@@ -17,7 +17,12 @@ from rest_framework.test import APIClient
 
 from apps.billing.models import SubscriptionPlan, UserSubscription
 from apps.integrations import spam_classifier
-from apps.integrations.models import IGAccountConnection, SpamCommentLog, SpamFilterConfig
+from apps.integrations.models import (
+    AutoDMCampaign,
+    IGAccountConnection,
+    SpamCommentLog,
+    SpamFilterConfig,
+)
 from apps.integrations.spam_classifier import classify_comment
 from apps.integrations.tasks import run_spam_filter_check
 from apps.workspace.models import Membership, Workspace
@@ -319,6 +324,83 @@ class TestRunSpamFilterCheck:
             "entry_id": "ig_nonexistent_999",
         }
         assert _run(payload)["reason"] == "no_active_connection"
+
+
+# ───────────────────────── 캠페인 트리거 댓글 면제 ─────────────────────────
+#
+# 회귀(2026-07-21 3dragon_pd): 활성 캠페인 트리거 키워드("풀버전"·"가이드🔥"·"비밀코드"·
+# "ㅋㄹㄷ" 등)로 댓글을 단 팬이 gemma 에 adult/scam/promo 로 오분류돼 스팸 감지됨(DM 은 정상
+# 발송). 캠페인을 실제 발동시키는 댓글(media+keyword)은 스팸 분류에서 제외해야 한다.
+
+
+@pytest.mark.django_db
+class TestCampaignTriggerExempt:
+    def _setup(self, *, kw="풀버전", media="m1"):
+        user = _user()
+        _give_plan(user, "pro")
+        ws = _ws(user)
+        conn = _conn(ws, token="live_token_not_mock")  # 실토큰 → 숨김 시 (mock 처리된) Meta 호출
+        sf = SpamFilterConfig.objects.create(
+            ig_connection=conn,
+            status=CfgStatus.ACTIVE,
+            spam_keywords=["아이돌"],
+            auto_hide_enabled=True,  # 면제가 없으면 숨김까지 갔을 상황
+            use_llm=True,
+        )
+        AutoDMCampaign.objects.create(
+            ig_connection=conn,
+            trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
+            media_id=media,
+            keyword_filter=[kw],
+            name="trigger camp",
+            message_template="hi",
+            status=AutoDMCampaign.Status.ACTIVE,
+        )
+        return conn, sf
+
+    def test_trigger_keyword_comment_is_exempt(self):
+        """캠페인 트리거 댓글은 LLM 이 스팸이라 해도 분류 자체를 건너뛰고 CLEAN 유지."""
+        conn, sf = self._setup(kw="풀버전", media="m1")
+        spam = _fake_llm('{"is_spam": true, "confidence": 0.95, "category": "adult"}')
+        with (
+            mock.patch(
+                "apps.integrations.spam_classifier.call_llm_messages_with_usage", return_value=spam
+            ) as llm,
+            mock.patch("apps.integrations.tasks.InstagramCommentService.hide_comment") as hide,
+        ):
+            r = _run(_payload(conn, "cx1", "풀버전", media_id="m1"))
+        assert r["status"] == "clean"
+        assert r["engine"] == "campaign_trigger_exempt"
+        llm.assert_not_called()  # 분류 자체를 하지 않음
+        hide.assert_not_called()  # 숨김도 없음
+        log = SpamCommentLog.objects.get(spam_filter=sf, comment_id="cx1")
+        assert log.status == Status.CLEAN
+
+    def test_nonmatching_media_still_classified(self):
+        """캠페인은 m1 인데 댓글이 다른 게시물(m2)이면 면제 안 됨 → 정상 분류."""
+        conn, sf = self._setup(kw="풀버전", media="m1")
+        spam = _fake_llm('{"is_spam": true, "confidence": 0.95, "category": "adult"}')
+        with (
+            mock.patch(
+                "apps.integrations.spam_classifier.call_llm_messages_with_usage", return_value=spam
+            ),
+            mock.patch(
+                "apps.integrations.tasks.InstagramCommentService.hide_comment",
+                return_value={"success": True},
+            ),
+        ):
+            r = _run(_payload(conn, "cx2", "풀버전", media_id="m2"))
+        assert r["status"] == "hidden"  # 면제 없음 → LLM 스팸 → auto_hide
+
+    def test_non_trigger_comment_still_classified(self):
+        """트리거 키워드가 아닌 진짜 스팸 댓글은 그대로 분류/감지된다."""
+        conn, sf = self._setup(kw="풀버전", media="m1")
+        with mock.patch(
+            "apps.integrations.tasks.InstagramCommentService.hide_comment",
+            return_value={"success": True},
+        ):
+            r = _run(_payload(conn, "cx3", "아이돌 영상 원본", media_id="m1"))
+        assert r["status"] == "hidden"  # 규칙 키워드 "아이돌" 스팸 (면제 대상 아님)
 
 
 # ───────────────────────── 대시보드 ─────────────────────────
