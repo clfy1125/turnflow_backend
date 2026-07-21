@@ -927,7 +927,13 @@ class AutoDMCampaign(models.Model):
 
     @classmethod
     def attach_next_media_single_active(
-        cls, *, ig_connection_id, candidate_ids, media_id: str, media_url: str | None = None
+        cls,
+        *,
+        ig_connection_id,
+        candidate_ids,
+        media_id: str,
+        media_url: str | None = None,
+        media_published_at=None,
     ) -> dict:
         """새 게시물에 next_media 캠페인을 붙이되 '한 게시물 = 활성 캠페인 1개' 불변식을 지킨다.
 
@@ -938,6 +944,16 @@ class AutoDMCampaign(models.Model):
           - 대상 게시물이 (후보 밖) 다른 활성 캠페인에 이미 점유돼 있으면 아무도 attach 하지 않는다.
           - 아니면 가장 오래된(created_at) 후보 1개만 attach(specific_media·active)하고,
             나머지 후보는 status=paused 로 내린다(자동 일시정지 — 사용자가 UI 에서 재조정).
+
+        ★ '진짜 다음 게시물' 가드 (``media_published_at`` 제공 시):
+          "다음 새 게시물"의 의미는 **캠페인을 만든 뒤에 올라온 게시물**이다. 연결(connection)
+          단위 baseline(``last_seen_media_id``)은 특정 게시물(specific_media) 캠페인으로는
+          전진하지 않아 며칠씩 뒤처질 수 있고, 그 사이 이미 존재하던 최신 게시물이 baseline
+          보다 새롭다는 이유만으로 "다음 게시물"로 오인돼 attach 되는 사고가 있었다
+          (2026-07-20 mini_ai_: 07-18 게시물에 07-20 새벽 생성 캠페인이 중복 attach).
+          그래서 후보 중 ``created_at <= media_published_at`` 인 것만(=이 게시물이 캠페인
+          생성 이후에 게시된 것만) 대상으로 삼는다. 생성 전부터 있던 더 오래된 게시물은 건너뛰고
+          후보는 대기(ACTIVE·미부착) 상태로 남겨 진짜 다음 게시물을 기다린다.
 
         동시성: 후보 행을 select_for_update 로 잠그고 media_id="" 인 것만 처리하므로,
         다른 webhook 이 먼저 attach 했으면 자연히 건너뛴다.
@@ -972,6 +988,10 @@ class AutoDMCampaign(models.Model):
                 )
                 .order_by("created_at", "id")
             )
+            # ★ '진짜 다음 게시물' 가드: 캠페인 생성 이후 게시된 게시물만 대상. 생성 전부터 있던
+            #   게시물엔 붙지 않고, 걸러진 후보는 손대지 않아 다음 게시물을 계속 기다린다.
+            if media_published_at is not None:
+                pending = [c for c in pending if c.created_at <= media_published_at]
             # 슬롯이 이미 점유됐거나 붙일 후보가 없으면 아무것도 하지 않는다(후보는 대기 유지).
             if already_occupied or not pending:
                 return {"attached": [], "paused": []}

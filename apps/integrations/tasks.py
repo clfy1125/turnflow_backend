@@ -850,6 +850,28 @@ def run_spam_filter_check(self, webhook_payload: dict):
         raise
 
 
+def _comment_triggers_active_campaign(conn, *, media_id: str, comment_text: str) -> bool:
+    """이 댓글이 계정의 **활성 auto-DM 캠페인을 실제로 발동**시키는지(media+keyword 매칭).
+
+    발동 조건은 발송 경로(``_process_comment_and_send_dm``)와 동일하게
+    ``matches_media(media_id) and matches_keyword(comment_text)`` 로 맞춘다.
+
+    이런 댓글은 사용자가 **원해서 유치한** 트리거 댓글이므로 스팸 분류에서 제외해야 한다.
+    (트리거 키워드 "가이드🔥"·"비밀코드"·"풀버전"·"스킬"·"클로드(ㅋㄹㄷ)" 등이 gemma 에
+     promo/adult/scam 으로 오분류돼, DM 을 정상 받은 팬 댓글이 스팸으로 감지되던 회귀 방지 —
+     2026-07-21 3dragon_pd: detected 36건 중 최소 10건이 실제 DM 발송(read/delivered)된 댓글.)
+    """
+    from .models import AutoDMCampaign
+
+    campaigns = AutoDMCampaign.objects.filter(
+        ig_connection=conn, status=AutoDMCampaign.Status.ACTIVE
+    )
+    for campaign in campaigns:
+        if campaign.matches_media(media_id) and campaign.matches_keyword(comment_text):
+            return True
+    return False
+
+
 def _run_spam_for_connection(
     conn,
     spam_filter,
@@ -889,6 +911,18 @@ def _run_spam_for_connection(
             "conn_id": str(conn.id),
             "spam_log_id": str(log.id),
             "prior_status": log.status,
+        }
+
+    # ── ★ 캠페인 트리거 댓글 면제 (규칙/LLM 판정보다 우선) ──
+    # 이 댓글이 활성 캠페인을 발동시키면(=사용자가 원한 댓글) 스팸 분류를 건너뛰고 CLEAN 유지.
+    if _comment_triggers_active_campaign(conn, media_id=media_id, comment_text=comment_text):
+        log.engine = "campaign_trigger_exempt"
+        log.save(update_fields=["engine"])
+        return {
+            "status": "clean",
+            "engine": "campaign_trigger_exempt",
+            "conn_id": str(conn.id),
+            "spam_log_id": str(log.id),
         }
 
     # ── 하이브리드 판정 (규칙 즉시차단 + 애매하면 gemma, fail-open) ──
@@ -1181,12 +1215,16 @@ def _maybe_attach_next_media_from_webhook(
     검증한 뒤, 맞으면 next_media 캠페인들에 즉시 attach (v3.6).
 
     검증 룰:
-        1. ig_conn.last_seen_media_id 가 비어있으면 → 첫 사용자 케이스, 무조건 attach
-        2. media_id 가 last_seen_media_id 와 동일 → baseline 게시물, attach 안 함
-        3. GET /v25.0/{media_id}?fields=timestamp 호출
-           - timestamp > last_seen_media_at → 진짜 새 게시물, attach
-           - timestamp <= last_seen_media_at → 옛날 게시물, attach 안 함
-           - API 실패 → 안전하게 attach 안 함 (false negative > 잘못된 attach)
+        1. media_id 가 last_seen_media_id 와 동일 → baseline 게시물, attach 안 함
+        2. GET /v25.0/{media_id}?fields=timestamp 호출로 게시 시각 확보
+           - API 실패/무응답 → 안전하게 attach 안 함 (false negative > 잘못된 attach)
+        3. baseline(last_seen_media_at) 이 있으면 그보다 새 게시물만 후보
+        4. ★ 가장 중요 — 게시 시각이 **각 캠페인 생성 시각 이후**여야 attach.
+           "다음 새 게시물"은 캠페인을 만든 뒤 올라온 게시물을 뜻하므로, 생성 전부터
+           존재하던 (baseline 보다는 새롭지만) 게시물엔 붙지 않는다. 이 가드는
+           ``attach_next_media_single_active(media_published_at=...)`` 가 후보별로 적용한다.
+           (baseline 은 specific_media 캠페인으로는 전진하지 않아 며칠씩 뒤처질 수 있어,
+            baseline 비교만으로는 이미 존재하던 최신 게시물을 "다음 게시물"로 오인한다.)
 
     Returns:
         attach 된 AutoDMCampaign 인스턴스 리스트 (refresh 된 상태)
@@ -1197,54 +1235,52 @@ def _maybe_attach_next_media_from_webhook(
     # 모든 unattached 캠페인은 같은 IG 계정 소유 (호출자가 보장)
     ig_conn = unattached_campaigns[0].ig_connection
 
-    # 룰 2: baseline 과 동일 미디어면 skip
+    # 룰 1: baseline 과 동일 미디어면 skip
     if ig_conn.last_seen_media_id and ig_conn.last_seen_media_id == webhook_media_id:
         return []
 
-    # baseline 없으면 룰 1: 무조건 attach (첫 사용자)
-    # baseline 있으면 timestamp 비교 필요
-    if ig_conn.last_seen_media_id and ig_conn.last_seen_media_at:
-        try:
-            media_ts = InstagramMediaService.get_media_timestamp(
-                media_id=webhook_media_id,
-                access_token=ig_conn.access_token,
-            )
-        except Exception as e:
-            logger.warning(
-                f"next_media webhook attach: timestamp fetch failed for "
-                f"media={webhook_media_id}: {e}"
-            )
-            return []
+    # 룰 2: 이 게시물의 실제 게시 시각 확보 (baseline 비교 + '캠페인 생성 이후' 가드 공용).
+    #   실패하면 안전하게 skip — 잘못된 attach 보다 놓치는 편이 낫다.
+    try:
+        media_ts = InstagramMediaService.get_media_timestamp(
+            media_id=webhook_media_id,
+            access_token=ig_conn.access_token,
+        )
+    except Exception as e:
+        logger.warning(
+            f"next_media webhook attach: timestamp fetch failed for "
+            f"media={webhook_media_id}: {e}"
+        )
+        return []
+    if media_ts is None:
+        logger.warning(
+            f"next_media webhook attach: no timestamp for media={webhook_media_id} "
+            "(API returned no data or 404) — skip"
+        )
+        return []
 
-        if media_ts is None:
-            logger.warning(
-                f"next_media webhook attach: no timestamp for media={webhook_media_id} "
-                "(API returned no data or 404) — skip"
-            )
-            return []
+    # 룰 3: baseline 보다 오래된 게시물이면 skip
+    if ig_conn.last_seen_media_at and media_ts <= ig_conn.last_seen_media_at:
+        logger.info(
+            f"next_media webhook attach: media={webhook_media_id} is older than "
+            f"baseline ({media_ts.isoformat()} <= "
+            f"{ig_conn.last_seen_media_at.isoformat()}) — skip"
+        )
+        return []
+    new_media_at = media_ts
 
-        if media_ts <= ig_conn.last_seen_media_at:
-            logger.info(
-                f"next_media webhook attach: media={webhook_media_id} is older than "
-                f"baseline ({media_ts.isoformat()} <= "
-                f"{ig_conn.last_seen_media_at.isoformat()}) — skip"
-            )
-            return []
-        new_media_at = media_ts
-    else:
-        # baseline 없음 → 첫 사용 케이스 (확실히 가장 최신 게시물로 간주)
-        new_media_at = timezone.now()
-
-    # ★ Attach: '한 게시물 = 활성 캠페인 1개' 불변식 유지 — 후보 1개만 attach 하고 나머지는
-    #   자동 일시정지(paused). (예전엔 전부 bulk attach 돼 댓글당 opening DM 이 중복 발송되고
-    #   Meta code 1 "이미 답글 있음" 으로 무한 재시도하며 백로그를 부풀렸다.)
+    # ★ Attach: '한 게시물 = 활성 캠페인 1개' 불변식 + '진짜 다음 게시물' 가드 유지.
+    #   media_published_at 로 후보 중 생성 시각이 이 게시물보다 이른(=이 게시물이 생성 이후) 것만
+    #   attach 되고, 나머지는 대기 유지. (예전엔 baseline 만 비교해 이미 존재하던 최신 게시물에
+    #   중복 attach 됐고 댓글당 opening DM 이 중복 발송돼 Meta code 1 무한 재시도로 이어졌다.)
     result = AutoDMCampaign.attach_next_media_single_active(
         ig_connection_id=ig_conn.id,
         candidate_ids=[c.id for c in unattached_campaigns],
         media_id=webhook_media_id,
+        media_published_at=media_ts,
     )
 
-    # baseline 갱신
+    # baseline 갱신 (관측된 최신 게시물로 전진 — attach 여부와 무관)
     ig_conn.last_seen_media_id = webhook_media_id
     ig_conn.last_seen_media_at = new_media_at
     ig_conn.save(update_fields=["last_seen_media_id", "last_seen_media_at"])
@@ -2287,6 +2323,7 @@ def poll_new_media_for_next_campaigns():
                 candidate_ids=candidate_ids,
                 media_id=mid,
                 media_url=media_obj.get("permalink") or None,
+                media_published_at=_mts,
             )
             n_attached = len(result["attached"])
             attached_for_account += n_attached

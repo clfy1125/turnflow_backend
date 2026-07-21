@@ -104,6 +104,11 @@ class ErrorClassification:
     reason: str
 
 
+# 댓글에 이미 답글이 존재 — "답글을 달려는 댓글에 이미 답글이 있습니다"(Meta subcode).
+# Meta 는 이걸 code 1/-1 + http 500 등 재시도성처럼 오지만, 같은 댓글에 비공개답글 재발송은
+# 구조적으로 영구 실패(댓글엔 이미 답글이 있음)라 재시도로 절대 성공하지 못한다. → 즉시 종결.
+ALREADY_REPLIED_SUBCODE = 2534023
+
 # 명시적으로 retriable인 코드 (rate limit + transient)
 RETRIABLE_CODES = {1, 2, 4, 17, 32, 368, 613}
 
@@ -122,6 +127,14 @@ def classify_api_error(
     """
     Meta Graph API 에러를 SentDMLog 상태로 매핑 (v3.2 단순화).
     """
+    # 댓글에 이미 답글 존재(subcode 2534023) — 재시도 불가(영구). code/http 조합보다 우선.
+    if subcode == ALREADY_REPLIED_SUBCODE:
+        return ErrorClassification(
+            log_status="failed_no_trace",
+            retriable=False,
+            reason="Comment already has a reply (subcode 2534023) — not retriable",
+        )
+
     # 24시간 메시징 윈도우 만료 (subcode 2534022 또는 2018278)
     if code == 10 and subcode in (2534022, 2018278):
         return ErrorClassification(
@@ -198,6 +211,16 @@ def classify_api_error(
 
 def exception_to_classification(exc: DMSendError) -> ErrorClassification:
     """DMSendError 인스턴스를 분류"""
+    # ★ subcode 2534023(댓글에 이미 답글 존재)은 예외 타입보다 먼저 가로챈다.
+    # Meta 가 http 500 으로 주면 서비스가 DMTransientError 로 raise 하는데, 그러면 아래
+    # isinstance 체인에서 retriable 로 분류돼 1h defer 를 24회 반복(유령 백로그·허위 ETA)했다.
+    # 같은 댓글 재발송은 영구 실패라 즉시 종결한다. (2026-07-21 3dragon_pd 유령 오프닝 루프)
+    if getattr(exc, "subcode", None) == ALREADY_REPLIED_SUBCODE:
+        return ErrorClassification(
+            "failed_no_trace",
+            False,
+            "Comment already has a reply (subcode 2534023) — not retriable",
+        )
     if isinstance(exc, DMTokenError):
         return ErrorClassification("failed_token", False, exc.message)
     if isinstance(exc, DMWindowExpiredError):
