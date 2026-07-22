@@ -16,6 +16,8 @@ TEMPLATE_ONBOARDING_DAY_7 = "onboarding_day_7"
 TEMPLATE_ONBOARDING_DAY_14 = "onboarding_day_14"
 TEMPLATE_PAYMENT_SUCCESS = "payment_success"
 TEMPLATE_PAYMENT_FAILED = "payment_failed"
+TEMPLATE_PAUSE_RESUME_REMINDER = "pause_resume_reminder"
+TEMPLATE_WINBACK = "winback"
 
 TEMPLATE_KEYS = [
     TEMPLATE_EMAIL_VERIFICATION,
@@ -26,6 +28,8 @@ TEMPLATE_KEYS = [
     TEMPLATE_ONBOARDING_DAY_14,
     TEMPLATE_PAYMENT_SUCCESS,
     TEMPLATE_PAYMENT_FAILED,
+    TEMPLATE_PAUSE_RESUME_REMINDER,
+    TEMPLATE_WINBACK,
 ]
 
 TEMPLATE_CHOICES = [(k, k) for k in TEMPLATE_KEYS]
@@ -98,6 +102,23 @@ AVAILABLE_VARIABLES: dict[str, dict[str, str]] = {
         "grace_end_date": "무료 전환 예정일 (결제 예정일 + 7일, YYYY-MM-DD)",
         "billing_url": "콘솔 결제/카드 설정 URL",
         "service_name": "서비스명",
+        "support_email": "고객센터 이메일",
+    },
+    TEMPLATE_PAUSE_RESUME_REMINDER: {
+        "full_name": "수신자 이름",
+        "plan_name": "재개될 플랜 표시명 (예: 프로)",
+        "amount_str": "재개 시 결제 예정 금액 (천단위 콤마)",
+        "resume_date": "자동 재개(결제) 예정일 (YYYY-MM-DD)",
+        "card_info": "결제 수단 표시 (예: 신한카드 433012******123*)",
+        "billing_url": "콘솔 결제/구독 설정 URL",
+        "service_name": "서비스명",
+        "support_email": "고객센터 이메일",
+    },
+    TEMPLATE_WINBACK: {
+        "full_name": "수신자 이름",
+        "service_name": "서비스명",
+        "resubscribe_url": "다시 구독하러 가는 URL (요금제/결제 페이지)",
+        "billing_url": "콘솔 결제 설정 URL",
         "support_email": "고객센터 이메일",
     },
 }

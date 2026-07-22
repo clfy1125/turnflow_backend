@@ -43,7 +43,15 @@ class User(AbstractUser):
     email = models.EmailField(unique=True, verbose_name="Email Address")
     full_name = models.CharField(max_length=255, blank=True, verbose_name="Full Name")
     is_email_verified = models.BooleanField(default=False, verbose_name="Email Verified")
-    email_verified_at = models.DateTimeField(null=True, blank=True, verbose_name="Email Verified At")
+    email_verified_at = models.DateTimeField(
+        null=True, blank=True, verbose_name="Email Verified At"
+    )
+    # 마케팅(광고성) 수신 동의 — 정보통신망법. 윈백 등 마케팅 메일 발송의 필수 게이트.
+    # 현재 수집 경로(가입/설정)가 연결되기 전까지 기본 False → 마케팅 발송 dormant.
+    marketing_opt_in = models.BooleanField(default=False, verbose_name="마케팅 수신 동의")
+    marketing_opt_in_at = models.DateTimeField(
+        null=True, blank=True, verbose_name="마케팅 수신 동의 시각"
+    )
     username = None  # Remove username field
 
     # Override username to use email

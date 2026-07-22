@@ -818,6 +818,8 @@ def change_plan(user, plan_name: str, extra_ig_accounts: int = 0) -> dict:
         )
     if sub.status == SubscriptionStatus.CANCELLED:
         raise BillingFlowError("해지 예약된 구독입니다. 구독을 재개한 후 변경해주세요.")
+    if sub.status == SubscriptionStatus.PAUSED:
+        raise BillingFlowError("일시정지 중인 구독입니다. 정지를 해제한 후 변경해주세요.")
 
     try:
         new_plan = SubscriptionPlan.objects.get(name=plan_name, is_active=True)
@@ -933,6 +935,8 @@ def change_extra_accounts(user, new_count: int) -> dict:
         )
     if sub.status == SubscriptionStatus.CANCELLED:
         raise BillingFlowError("해지 예약된 구독입니다. 구독을 재개한 후 이용해주세요.")
+    if sub.status == SubscriptionStatus.PAUSED:
+        raise BillingFlowError("일시정지 중인 구독입니다. 정지를 해제한 후 이용해주세요.")
 
     delta = new_count - sub.extra_ig_accounts
 
@@ -1036,6 +1040,8 @@ def preview_change_plan(user, plan_name: str, extra_ig_accounts: int = 0, now=No
         )
     if sub.status == SubscriptionStatus.CANCELLED:
         raise BillingFlowError("해지 예약된 구독입니다. 구독을 재개한 후 변경해주세요.")
+    if sub.status == SubscriptionStatus.PAUSED:
+        raise BillingFlowError("일시정지 중인 구독입니다. 정지를 해제한 후 변경해주세요.")
 
     try:
         new_plan = SubscriptionPlan.objects.get(name=plan_name, is_active=True)
@@ -1124,6 +1130,8 @@ def preview_change_extra_accounts(user, count: int, now=None) -> dict:
         )
     if sub.status == SubscriptionStatus.CANCELLED:
         raise BillingFlowError("해지 예약된 구독입니다. 구독을 재개한 후 이용해주세요.")
+    if sub.status == SubscriptionStatus.PAUSED:
+        raise BillingFlowError("일시정지 중인 구독입니다. 정지를 해제한 후 이용해주세요.")
 
     delta = count - sub.extra_ig_accounts
     # 목표 count 기준 다음 갱신액 (대기 예약 상태와 무관하게 결정적으로 계산).

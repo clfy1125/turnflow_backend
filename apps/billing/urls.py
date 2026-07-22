@@ -18,7 +18,9 @@ from .subscription_views import (
     IGAccountActivationView,
     MySubscriptionView,
     PageActivationView,
+    PauseSubscriptionView,
     ResumeSubscriptionView,
+    RetentionOfferApplyView,
     SubscriptionPlanListView,
 )
 from .toss_views import (
@@ -48,6 +50,13 @@ urlpatterns = router.urls + [
     ),
     path("billing/cancel/", CancelSubscriptionView.as_view(), name="cancel-subscription"),
     path("billing/resume/", ResumeSubscriptionView.as_view(), name="resume-subscription"),
+    # 리텐션(해지 방어)
+    path("billing/pause/", PauseSubscriptionView.as_view(), name="pause-subscription"),
+    path(
+        "billing/retention-offer/apply/",
+        RetentionOfferApplyView.as_view(),
+        name="retention-offer-apply",
+    ),
     path("billing/page-activation/", PageActivationView.as_view(), name="page-activation"),
     path(
         "billing/ig-account-activation/",

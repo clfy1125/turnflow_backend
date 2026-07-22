@@ -23,9 +23,11 @@ from apps.emails.constants import (
     TEMPLATE_ONBOARDING_DAY_7,
     TEMPLATE_ONBOARDING_DAY_14,
     TEMPLATE_PASSWORD_RESET,
+    TEMPLATE_PAUSE_RESUME_REMINDER,
     TEMPLATE_PAYMENT_FAILED,
     TEMPLATE_PAYMENT_SUCCESS,
     TEMPLATE_WELCOME,
+    TEMPLATE_WINBACK,
 )
 
 _GRADIENT = "linear-gradient(90deg,#152a64 0%,#7a3cff 45%,#b948b2 72%,#fd546b 100%)"
@@ -93,7 +95,7 @@ def _detail_rows(rows: list[tuple[str, str]]) -> str:
     trs = ""
     for label, value in rows:
         trs += (
-            '<tr>'
+            "<tr>"
             '<td style="padding:9px 0;color:#6b7280;font-size:13px;white-space:nowrap;">'
             f"{label}</td>"
             '<td style="padding:9px 0;color:#111827;font-size:14px;font-weight:600;text-align:right;">'
@@ -249,6 +251,51 @@ DEFAULTS: dict[str, dict[str, str]] = {
             preheader="{{ plan_name }} 구독 결제 실패 — 카드 확인 필요",
         ),
     },
+    TEMPLATE_PAUSE_RESUME_REMINDER: {
+        "subject": "[{{ service_name }}] 일시정지가 곧 해제됩니다 — {{ resume_date }} 자동 재개",
+        "html_body": _wrap(
+            """
+<p style="font-size:18px;font-weight:700;color:#111827;margin:0 0 4px;">일시정지가 곧 해제돼요 ⏰</p>
+<p style="margin:0 0 6px;color:#4b5563;"><strong>{{ full_name }}</strong>님, 잠시 멈춰 두셨던 {{ plan_name }} 구독이 곧 자동으로 재개됩니다.</p>
+"""
+            + _detail_rows(
+                [
+                    ("재개 플랜", "{{ plan_name }} 플랜"),
+                    ("자동 재개(결제)일", "{{ resume_date }}"),
+                    ("결제 예정 금액", "{{ amount_str }}원"),
+                    ("결제 수단", "{{ card_info }}"),
+                ]
+            )
+            + """
+<div style="margin:16px 0;padding:14px 18px;background:#f5f3ff;border:1px solid #ede9fe;border-radius:12px;color:#5b21b6;font-size:13px;line-height:1.7;">
+  <strong>{{ resume_date }}</strong>에 등록된 카드로 자동 결제되며, 프로 기능이 다시 켜집니다.<br>
+  더 쉬고 싶거나 재개를 원치 않으시면 아래에서 정지 연장 또는 해지를 선택할 수 있어요.
+</div>
+"""
+            + _btn("{{ billing_url }}", "구독 설정 확인하기")
+            + """
+<p style="font-size:13px;color:#9ca3af;margin:0;">도움이 필요하시면 <a href="mailto:{{ support_email }}" style="color:#7C3AED;">{{ support_email }}</a>로 문의해 주세요.</p>
+""",
+            preheader="{{ resume_date }} 구독이 자동 재개됩니다 (사전 안내)",
+        ),
+    },
+    TEMPLATE_WINBACK: {
+        "subject": "{{ full_name }}님, {{ service_name }}에서 기다리고 있어요 💜",
+        "html_body": _wrap(
+            """
+<p style="font-size:18px;font-weight:700;color:#111827;margin:0 0 4px;">다시 만나요 💜</p>
+<p style="margin:0 0 6px;color:#4b5563;"><strong>{{ full_name }}</strong>님, 그동안 {{ service_name }}를 떠나 계셨네요. 다시 돌아오시면 멈춰 두었던 자동화를 바로 이어갈 수 있어요.</p>
+<div style="margin:16px 0;padding:14px 18px;background:#f5f3ff;border:1px solid #ede9fe;border-radius:12px;color:#5b21b6;font-size:13px;line-height:1.7;">
+  캠페인·설정·분석 데이터는 안전하게 보관돼 있어, 다시 구독하시면 이전 그대로 시작할 수 있습니다.
+</div>
+"""
+            + _btn("{{ resubscribe_url }}", "다시 시작하기")
+            + """
+<p style="font-size:13px;color:#9ca3af;margin:0;">더 이상 이런 안내를 원치 않으시면 <a href="mailto:{{ support_email }}" style="color:#7C3AED;">{{ support_email }}</a>로 알려주세요. 마케팅 수신에 동의하신 분께만 발송됩니다.</p>
+""",
+            preheader="{{ service_name }} 캠페인 데이터가 그대로 보관돼 있어요",
+        ),
+    },
 }
 
 
@@ -282,6 +329,9 @@ SAMPLE_CONTEXT: dict[str, str] = {
     "next_billing_date": "2026-08-09",
     "failure_reason": "카드 한도 초과",
     "grace_end_date": "2026-08-16",
+    # pause resume / winback
+    "resume_date": "2026-12-03",
+    "resubscribe_url": "https://app.turnflow.link/billing/plans",
     # company footer
     "company_name": "주식회사 씨엘에프와이 (CLFY Co., Ltd.)",
     "company_ceo": "김시현",

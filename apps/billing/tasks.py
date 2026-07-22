@@ -36,6 +36,8 @@ GRACE_PERIOD_DAYS = 7
 DUNNING_RETRY_OFFSET_DAYS = {1: 1, 2: 3, 3: 5}
 MAX_RENEWAL_ATTEMPTS = 3
 PENDING_RECONCILE_AFTER_MINUTES = 30
+# 정지 자동 재개 사전 고지: 재개 며칠 전에 자동 결제 재개를 알릴지 (법정 안전요건)
+PAUSE_RESUME_REMINDER_DAYS = 3
 
 _RENEWAL_ORDER_RE = re.compile(r"^tfsub-[0-9a-f]{10}-\d{8}-a\d+$")
 # 비례(proration) 즉시청구 주문 — PENDING→DONE 확정 시 구독 상태 자동 반영 근거.
@@ -128,6 +130,35 @@ def payment_success_email(sub, payment) -> None:
         logger.exception("결제 완료 메일 enqueue 실패 user_id=%s", getattr(sub, "user_id", "?"))
 
 
+def pause_resume_reminder_email(sub) -> None:
+    """정지 자동 재개 3일 전 사전 고지 메일 enqueue (best-effort)."""
+    try:
+        from apps.emails.tasks import send_pause_resume_reminder_email
+
+        card = f"{sub.card_company} {sub.card_number_masked}".strip()
+        ctx = {
+            "plan_name": sub.plan.display_name,
+            "amount_str": f"{sub.renewal_amount:,}",
+            "resume_date": _fmt_local_date(sub.pause_ends_at),
+            "card_info": card or "등록된 카드",
+        }
+        send_pause_resume_reminder_email.delay(sub.user_id, ctx)
+    except Exception:  # noqa: BLE001 - 고지 메일 실패가 재개 처리를 막으면 안 됨
+        logger.exception(
+            "정지 재개 고지 메일 enqueue 실패 user_id=%s", getattr(sub, "user_id", "?")
+        )
+
+
+def winback_email(user) -> None:
+    """해지 후 복귀 유도(윈백) 메일 enqueue (best-effort)."""
+    try:
+        from apps.emails.tasks import send_winback_email
+
+        send_winback_email.delay(user.id)
+    except Exception:  # noqa: BLE001
+        logger.exception("윈백 메일 enqueue 실패 user_id=%s", getattr(user, "id", "?"))
+
+
 def payment_failed_email(sub, payment, code: str, message: str) -> None:
     """결제 실패 안내 메일 enqueue (best-effort)."""
     try:
@@ -204,7 +235,7 @@ def _renewal_amount_for(sub) -> tuple:
     추가 계정 '축소'가 예약돼 있으면(pending_extra_ig_accounts) 이번 청구부터 그 값으로
     가산 — 축소가 다음 갱신액에 반영되게 한다. (charge 전에 호출되므로 여기서 반영 필수)
     """
-    from .models import EXTRA_IG_ACCOUNT_PRICE
+    from .models import EXTRA_IG_ACCOUNT_PRICE, apply_retention_discount
 
     target_plan = sub.pending_plan or sub.plan
     base = sub.pending_amount_snapshot if sub.pending_plan_id else sub.monthly_amount_snapshot
@@ -218,6 +249,8 @@ def _renewal_amount_for(sub) -> tuple:
             else sub.extra_ig_accounts
         )
         amount += EXTRA_IG_ACCOUNT_PRICE * extra
+    # 리텐션 할인(다음 1회) — 대기 중이면 이번 청구에 적용. 소멸은 성공 확정 시.
+    amount = apply_retention_discount(amount, pending=sub.retention_discount_pending)
     return target_plan, amount
 
 
@@ -274,6 +307,9 @@ def _finalize_renewal_success(sub_id, payment_id, toss_payment: dict) -> None:
             sub.renewal_attempts = 0
             sub.next_billing_retry_at = None
             sub.last_billing_error = ""
+            # 리텐션 할인은 1회성 — 이번 갱신에 반영됐으니 소멸(used_at 은 1인1회로 보존).
+            if sub.retention_discount_pending:
+                sub.retention_discount_pending = False
             if not sub.pro_activated_at:
                 sub.pro_activated_at = now
             sub.save()
@@ -753,10 +789,24 @@ def _webhook_billing_deleted(log) -> None:
             "card_number_masked",
             "updated_at",
         ]
-        if locked.status in (SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIALING):
+        if locked.status in (
+            SubscriptionStatus.ACTIVE,
+            SubscriptionStatus.TRIALING,
+            SubscriptionStatus.PAUSED,
+        ):
+            # paused 중 카드 삭제 → 재개 과금이 불가하므로 해지로 전환(정지 필드는 정리).
             locked.status = SubscriptionStatus.CANCELLED
             locked.cancelled_at = timezone.now()
             update_fields += ["status", "cancelled_at"]
+            if locked.pause_ends_at or locked.paused_months:
+                locked.pause_ends_at = None
+                locked.paused_months = None
+                locked.pause_resume_reminder_sent_at = None
+                update_fields += [
+                    "pause_ends_at",
+                    "paused_months",
+                    "pause_resume_reminder_sent_at",
+                ]
         locked.next_billing_retry_at = None
         update_fields.append("next_billing_retry_at")
         locked.save(update_fields=update_fields)
@@ -1013,3 +1063,163 @@ def _downgrade_to_free(sub, free_plan, reason: str = ""):
         sub.user.email,
         old_plan,
     )
+
+
+# ──────────────────────────────────────────────
+# 7) 리텐션: 일시정지 자동 재개 + 사전 고지 + 윈백
+# ──────────────────────────────────────────────
+
+
+@shared_task(name="billing.handle_pause_expiry")
+def handle_pause_expiry():
+    """paused 구독의 정지 기간(pause_ends_at) 만료 → 자동 유료 재개 + 갱신 과금 트리거.
+
+    상태를 ACTIVE 로 되돌리고 current_period_end 를 pause_ends_at(과거 시각)으로 맞춰
+    process_due_renewals 가 즉시 과금 대상으로 집도록 한다. 여기서 charge 를 직접 디스패치해
+    재개를 앞당기며, 과금은 결정적 orderId 로 idempotent 하다. 과금 실패(카드 거절)는 일반
+    갱신과 동일하게 dunning(past_due) 진입. 정지 중 카드가 사라진 경우 무료로 정리한다.
+    """
+    from .models import SubscriptionStatus, UserSubscription
+    from .subscription_utils import get_free_plan
+
+    now = timezone.now()
+    due_ids = list(
+        UserSubscription.objects.filter(
+            status=SubscriptionStatus.PAUSED,
+            pause_ends_at__isnull=False,
+            pause_ends_at__lte=now,
+        ).values_list("id", flat=True)[:500]
+    )
+
+    processed, failed = 0, 0
+    for sub_id in due_ids:
+        try:
+            sub = UserSubscription.objects.select_related("plan", "user").get(pk=sub_id)
+            if sub.status != SubscriptionStatus.PAUSED or not sub.pause_ends_at:
+                continue
+            if sub.pause_ends_at > timezone.now():
+                continue
+
+            if not sub.has_billing_key:
+                # 정지 중 카드가 삭제됨 → 재개 과금 불가. 무료로 정리.
+                free_plan = get_free_plan()
+                if free_plan:
+                    with transaction.atomic():
+                        locked = UserSubscription.objects.select_for_update().get(pk=sub_id)
+                        _downgrade_to_free(locked, free_plan, reason="pause_no_card")
+                processed += 1
+                continue
+
+            with transaction.atomic():
+                locked = UserSubscription.objects.select_for_update().get(pk=sub_id)
+                if locked.status != SubscriptionStatus.PAUSED or not locked.pause_ends_at:
+                    continue
+                locked.status = SubscriptionStatus.ACTIVE
+                locked.current_period_end = locked.pause_ends_at  # 과거 시각 → 즉시 갱신 대상
+                locked.paused_months = None
+                locked.pause_ends_at = None
+                locked.pause_resume_reminder_sent_at = None
+                locked.save(
+                    update_fields=[
+                        "status",
+                        "current_period_end",
+                        "paused_months",
+                        "pause_ends_at",
+                        "pause_resume_reminder_sent_at",
+                        "updated_at",
+                    ]
+                )
+            charge_subscription_renewal.delay(str(sub_id))
+            processed += 1
+        except Exception:
+            failed += 1
+            logger.exception("handle_pause_expiry: sub=%s 처리 오류", sub_id)
+
+    _log_summary("handle_pause_expiry", processed, failed)
+    return {"processed": processed, "failed": failed}
+
+
+@shared_task(name="billing.notify_pause_resume_reminder")
+def notify_pause_resume_reminder():
+    """정지 자동 재개 PAUSE_RESUME_REMINDER_DAYS(3일) 전 사전 고지 메일.
+
+    자동 결제 재개를 미리 알리는 법정 안전요건. pause_resume_reminder_sent_at 로
+    1회만 발송(멱등). 매일 1회 실행되며 창(window) 안의 미발송 건만 처리.
+    """
+    from .models import SubscriptionStatus, UserSubscription
+
+    now = timezone.now()
+    window_end = now + timedelta(days=PAUSE_RESUME_REMINDER_DAYS)
+    subs = list(
+        UserSubscription.objects.filter(
+            status=SubscriptionStatus.PAUSED,
+            pause_ends_at__isnull=False,
+            pause_ends_at__gt=now,
+            pause_ends_at__lte=window_end,
+            pause_resume_reminder_sent_at__isnull=True,
+        ).select_related("plan", "user")[:500]
+    )
+
+    sent = 0
+    for sub in subs:
+        # 먼저 dedup 마킹(경합 시 1건만) → 성공한 것만 메일 enqueue.
+        marked = UserSubscription.objects.filter(
+            pk=sub.pk, pause_resume_reminder_sent_at__isnull=True
+        ).update(pause_resume_reminder_sent_at=now)
+        if not marked:
+            continue
+        pause_resume_reminder_email(sub)
+        sent += 1
+
+    if sent:
+        logger.info("notify_pause_resume_reminder: %d건 고지", sent)
+    return {"sent": sent}
+
+
+@shared_task(name="billing.send_winback_emails")
+def send_winback_emails():
+    """해지 후 WINBACK_AFTER_DAYS(기본 30) 일 경과한 이탈자에게 복귀 유도(윈백) 메일.
+
+    - 마케팅 수신 동의자(user.marketing_opt_in)에게만 발송 (정보통신망법).
+    - 과거 유료 결제 이력이 있는 실이탈자만 (무료-only 사용자 제외).
+    - EmailLog(template_key=winback) 로 1인 1회 중복 방지.
+    - 전체가 settings.WINBACK_ENABLED 로 게이팅 — 동의 수집 연결 전까지 dormant(기본 False).
+    """
+    from django.conf import settings
+
+    if not getattr(settings, "WINBACK_ENABLED", False):
+        return {"skipped": "disabled"}
+
+    from apps.emails.constants import TEMPLATE_WINBACK
+    from apps.emails.models import EmailLog
+
+    from .models import PaymentHistory, PaymentStatus, UserSubscription
+
+    n = int(getattr(settings, "WINBACK_AFTER_DAYS", 30))
+    now = timezone.now()
+    lo = now - timedelta(days=n + 1)
+    hi = now - timedelta(days=n)
+
+    candidates = list(
+        UserSubscription.objects.filter(
+            plan__name="free",
+            cancelled_at__gte=lo,
+            cancelled_at__lt=hi,
+            user__marketing_opt_in=True,
+            user__is_active=True,
+        ).select_related("user")[:500]
+    )
+
+    sent = 0
+    for sub in candidates:
+        user = sub.user
+        if not PaymentHistory.objects.filter(user=user, status=PaymentStatus.PAID).exists():
+            continue  # 유료 결제 이력 없는 무료-only 사용자 제외
+        if EmailLog.objects.filter(user=user, template_key=TEMPLATE_WINBACK).exists():
+            continue  # 이미 윈백 발송됨
+        winback_email(user)
+        sent += 1
+
+    if sent:
+        logger.info("send_winback_emails: %d건 발송", sent)
+    return {"sent": sent}

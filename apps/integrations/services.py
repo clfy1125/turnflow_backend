@@ -2,16 +2,19 @@
 Instagram OAuth and Mock Provider services
 """
 
+import hashlib
 import logging
+import random
 import re
 import threading
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Optional
 from urllib.parse import urlencode
 
 import requests
 from django.conf import settings
 from django.core.cache import cache
+from django.utils import timezone
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -514,6 +517,222 @@ class MockInstagramProvider:
             True if token starts with MOCK_TOKEN_PREFIX
         """
         return token.startswith(cls.MOCK_TOKEN_PREFIX)
+
+    # ===== DM 캠페인 이전(마이그레이션) 분석용 mock 픽스처 =====
+    # 실 Graph 호출 없이 dev/CI 에서 전체 파이프라인을 돌리기 위한 결정적 합성 데이터.
+    # 연결(ig_user_id)/미디어(media_id) 시드로 sha1→Random 을 만들어, 재실행해도 동일 결과.
+    # media_id 규약: "mm-{ig}-{i}"(일반) / "mm-{ig}-{i}-camp{k}"(캠페인형, k=키워드 인덱스).
+    #   ig 는 언더스코어만 포함(하이픈 없음)이라 '-' split 으로 안전 파싱된다.
+    _MOCK_KEYWORDS = ["링크", "정보", "신청", "자료", "가격"]
+    _MOCK_DM_TEMPLATES = [
+        "요청하신 {kw} 보내드려요! {url} 에서 확인해주세요 😊",
+        "안녕하세요! {kw} 안내드립니다 👉 {url}",
+        "감사합니다 :) 아래에서 {kw} 확인 가능해요 {url}",
+    ]
+    _MOCK_GENERIC_COMMENTS = [
+        "좋아요",
+        "예뻐요",
+        "대박이에요",
+        "멋져요 ㅎㅎ",
+        "잘 봤습니다",
+        "👍",
+        "❤️",
+        "화이팅",
+        "오 신기하네요",
+    ]
+    _MOCK_MEDIA_POOL = 100  # 고정 풀 — media_page 는 앞 limit 개, conversations 는 전체에 정렬.
+
+    @staticmethod
+    def _mock_rng(seed_str: str) -> random.Random:
+        """seed 문자열로 결정적 Random 생성 (Date.now/Math.random 미사용 재현성)."""
+        h = hashlib.sha1(seed_str.encode("utf-8")).hexdigest()
+        return random.Random(int(h[:16], 16))
+
+    @staticmethod
+    def _mock_graph_ts(dt) -> str:
+        """Graph API 형식 timestamp('2026-05-07T03:14:15+0000')."""
+        return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S+0000")
+
+    @classmethod
+    def _mock_campaign_media(cls, ig_user_id: str) -> list:
+        """고정 크기(_MOCK_MEDIA_POOL) 합성 미디어 풀 — media_page/conversations 공유 진실.
+
+        Returns: [{"index","id","is_campaign","kw_idx","timestamp"(aware dt)}, ...] (newest first).
+        """
+        rng = cls._mock_rng(f"media:{ig_user_id}")
+        now = timezone.now()
+        items = []
+        for i in range(cls._MOCK_MEDIA_POOL):
+            is_camp = rng.random() < 0.4
+            kw_idx = rng.randrange(len(cls._MOCK_KEYWORDS))
+            days_ago = i * (60.0 / cls._MOCK_MEDIA_POOL) + rng.uniform(0, 0.5)
+            ts = now - timedelta(days=days_ago, hours=rng.uniform(0, 12))
+            mid = f"mm-{ig_user_id}-{i}-camp{kw_idx}" if is_camp else f"mm-{ig_user_id}-{i}"
+            items.append(
+                {"index": i, "id": mid, "is_campaign": is_camp, "kw_idx": kw_idx, "timestamp": ts}
+            )
+        return items
+
+    @classmethod
+    def mock_list_media_page(
+        cls, ig_user_id: str, limit: int = 50, after: str | None = None
+    ) -> dict:
+        """합성 미디어 목록 1페이지 (InstagramMediaService.list_media_page 대응 mock)."""
+        pool = cls._mock_campaign_media(ig_user_id)[: max(1, min(limit, cls._MOCK_MEDIA_POOL))]
+        data = []
+        for m in pool:
+            is_camp = m["is_campaign"]
+            kw = cls._MOCK_KEYWORDS[m["kw_idx"]]
+            rng = cls._mock_rng(f"cnt:{m['id']}")
+            caption = (
+                f'오늘 콘텐츠 준비했어요! 궁금하면 댓글에 "{kw}" 남겨주세요 :)'
+                if is_camp
+                else "오늘의 일상 기록 📷 봐주셔서 감사해요"
+            )
+            comments_count = rng.randint(30, 120) if is_camp else rng.randint(0, 10)
+            data.append(
+                {
+                    "id": m["id"],
+                    "caption": caption,
+                    "timestamp": cls._mock_graph_ts(m["timestamp"]),
+                    "media_type": "VIDEO" if is_camp and rng.random() < 0.5 else "IMAGE",
+                    "media_product_type": "REELS" if is_camp and rng.random() < 0.5 else "FEED",
+                    "permalink": f"https://www.instagram.com/p/{m['id']}/",
+                    "comments_count": comments_count,
+                }
+            )
+        return {"data": data, "paging_after": None}
+
+    @classmethod
+    def mock_list_media_comments(cls, media_id: str, after: str | None = None) -> dict:
+        """합성 댓글 1페이지 (InstagramMediaService.list_media_comments 대응 mock).
+
+        캠페인형 media("-camp{k}")는 키워드 댓글 70% + 일반 + 계정 본인 공개답글 몇 개,
+        일반 media 는 소량의 일반 댓글만.
+        """
+        parts = media_id.split("-")
+        # "mm-{ig}-{i}[-camp{k}]" — ig 는 하이픈 없음이라 parts[1] 이 ig.
+        ig = parts[1] if len(parts) > 1 else "mock_ig_x"
+        is_camp = "camp" in media_id
+        kw_idx = 0
+        if is_camp:
+            for p in parts:
+                if p.startswith("camp") and p[4:].isdigit():
+                    kw_idx = int(p[4:]) % len(cls._MOCK_KEYWORDS)
+        kw = cls._MOCK_KEYWORDS[kw_idx]
+        rng = cls._mock_rng(f"cmt:{media_id}")
+        now = timezone.now()
+        total = rng.randint(30, 120) if is_camp else rng.randint(0, 10)
+        data = []
+        for j in range(total):
+            r = rng.random()
+            if is_camp and r < 0.7:
+                text = rng.choice(
+                    [kw, f"{kw}이요", f"{kw} 주세요", f"{kw} 부탁드려요", f"저도 {kw}!"]
+                )
+            else:
+                text = rng.choice(cls._MOCK_GENERIC_COMMENTS)
+            data.append(
+                {
+                    "id": f"c-{media_id}-{j}",
+                    "text": text,
+                    "username": f"user_{rng.randrange(100000)}",
+                    "timestamp": cls._mock_graph_ts(now - timedelta(hours=rng.uniform(0, 72))),
+                    "parent_id": None,
+                    "from": {"id": f"igsid_{rng.randrange(10**9)}"},
+                }
+            )
+        # 캠페인형엔 계정 본인 공개답글(대댓글) 몇 개 — owner-reply 신호 exercise.
+        if is_camp:
+            for k in range(rng.randint(1, 3)):
+                data.append(
+                    {
+                        "id": f"c-{media_id}-self-{k}",
+                        "text": rng.choice(
+                            ["DM 보내드렸어요! 확인해주세요 :)", "디엠 확인 부탁드려요~"]
+                        ),
+                        "username": f"acct_{ig[-6:]}",
+                        "timestamp": cls._mock_graph_ts(now - timedelta(hours=rng.uniform(0, 48))),
+                        "parent_id": f"c-{media_id}-0",
+                        "from": {"id": ig},
+                    }
+                )
+        return {"data": data, "paging_after": None}
+
+    @classmethod
+    def mock_list_conversations(cls, ig_user_id: str, after: str | None = None) -> dict:
+        """합성 대화 목록 1페이지 (InstagramMessagingService.list_conversations 대응 mock).
+
+        캠페인형 미디어마다 ~10~15개 대화의 발신 메시지가 2~3개 템플릿을 재사용하고
+        (min-support≥3 클러스터 형성), 발송 시각이 해당 미디어 timestamp 직후로 버스트.
+        + 수동 상담형 노이즈 대화 소량.
+        """
+        media = cls._mock_campaign_media(ig_user_id)
+        rng = cls._mock_rng(f"conv:{ig_user_id}")
+        data = []
+        conv_i = 0
+        for m in media:
+            if not m["is_campaign"]:
+                continue
+            kw = cls._MOCK_KEYWORDS[m["kw_idx"]]
+            tmpl = cls._MOCK_DM_TEMPLATES[m["index"] % len(cls._MOCK_DM_TEMPLATES)]
+            for _ in range(rng.randint(10, 15)):
+                sent_at = m["timestamp"] + timedelta(
+                    days=rng.uniform(0, 3), hours=rng.uniform(0, 12)
+                )
+                url = f"https://ex.co/{rng.randrange(10**6)}"
+                out_msg = tmpl.format(kw=kw, url=url)
+                recipient = f"igsid_{rng.randrange(10**9)}"
+                data.append(
+                    {
+                        "id": f"conv-{ig_user_id}-{conv_i}",
+                        "updated_time": cls._mock_graph_ts(sent_at),
+                        "messages": {
+                            "data": [
+                                {
+                                    "id": f"m-{conv_i}-out",
+                                    "created_time": cls._mock_graph_ts(sent_at),
+                                    "from": {"id": ig_user_id},
+                                    "to": {"data": [{"id": recipient}]},
+                                    "message": out_msg,
+                                },
+                                {
+                                    "id": f"m-{conv_i}-in",
+                                    "created_time": cls._mock_graph_ts(
+                                        sent_at - timedelta(minutes=rng.uniform(1, 30))
+                                    ),
+                                    "from": {"id": recipient},
+                                    "to": {"data": [{"id": ig_user_id}]},
+                                    "message": kw,
+                                },
+                            ]
+                        },
+                    }
+                )
+                conv_i += 1
+        # 수동 상담형 노이즈(발신 1개, 템플릿 아님) — 자기발송/클러스터 최소지지 미달로 제외돼야 정상.
+        for _ in range(rng.randint(3, 6)):
+            recipient = f"igsid_{rng.randrange(10**9)}"
+            sent_at = timezone.now() - timedelta(days=rng.uniform(0, 30))
+            data.append(
+                {
+                    "id": f"conv-{ig_user_id}-noise-{conv_i}",
+                    "updated_time": cls._mock_graph_ts(sent_at),
+                    "messages": {
+                        "data": [
+                            {
+                                "id": f"m-noise-{conv_i}",
+                                "created_time": cls._mock_graph_ts(sent_at),
+                                "from": {"id": ig_user_id},
+                                "to": {"data": [{"id": recipient}]},
+                                "message": f"네 {rng.randrange(100)}번 주문 건은 오늘 발송했습니다. 감사합니다!",
+                            }
+                        ]
+                    },
+                }
+            )
+            conv_i += 1
+        return {"data": data, "paging_after": None}
 
 
 class InstagramMessagingService:
@@ -1138,6 +1357,94 @@ class InstagramMessagingService:
             return None
 
     @classmethod
+    def list_conversations(
+        cls,
+        ig_user_id: str,
+        access_token: str,
+        limit: int = 25,
+        after: str | None = None,
+        message_limit: int = 20,
+    ) -> dict:
+        """대화 목록 1페이지 + 각 대화의 최근 메시지(네스티드) 조회 — DM 캠페인 이전 분석용.
+
+        GET /{ig}/conversations?platform=instagram
+            &fields=id,updated_time,messages.limit(N){id,created_time,from,to,message}&limit=25
+
+        네스티드 ``messages`` 필드 문법은 ``has_recent_message_to_recipient``
+        (messages.limit(5)) 에서 이미 검증됨. Meta 는 대화당 최근 ~20개 메시지 본문만
+        제공하므로(오래된 최초 DM 누락 가능) 대화는 '표본'으로 다룬다.
+
+        Returns:
+            {"data": [{"id","updated_time","messages": {"data": [{"id","created_time",
+                       "from","to","message"}, ...]}}, ...],
+             "paging_after": "<cursor>" | None}
+
+        Raises:
+            requests.HTTPError — non-2xx (호출부가 code/subcode 로 분류; 권한 없음이면 스코프
+                누락으로 판단해 DM 분석을 건너뛰고 partial 종결).
+            requests.RequestException — 네트워크 오류.
+        """
+        url = f"{cls.GRAPH_API_BASE}/{ig_user_id}/conversations"
+        params = {
+            "platform": "instagram",
+            "fields": (
+                f"id,updated_time,messages.limit({message_limit})"
+                "{id,created_time,from,to,message}"
+            ),
+            "limit": limit,
+            "access_token": access_token,
+        }
+        if after:
+            params["after"] = after
+        resp = get_http_session().get(url, params=params, timeout=cls.DEFAULT_TIMEOUT)
+        raise_for_status_clean(resp)
+        body = resp.json() or {}
+        paging = body.get("paging") or {}
+        after_cursor = (paging.get("cursors") or {}).get("after")
+        return {
+            "data": body.get("data", []) or [],
+            "paging_after": after_cursor if paging.get("next") else None,
+        }
+
+    @classmethod
+    def list_user_conversation(
+        cls,
+        ig_user_id: str,
+        access_token: str,
+        user_id: str,
+        message_limit: int = 25,
+    ) -> list:
+        """특정 상대(user_id=IGSID)와의 대화 1건의 메시지 목록 조회 — 타겟 DM 복원용.
+
+        GET /{ig}/conversations?platform=instagram&user_id={IGSID}
+            &fields=messages.limit(N){id,created_time,from,to,message}
+
+        댓글 작성자 IGSID(comments 스코프 from.id)와 메시징 user_id 가 **같은 ID 공간**임이
+        실측 확인됨(2026-07-21, 겹침 11/20) → 캠페인 게시물 댓글러 → 그가 받은 발신 DM 을
+        직접 복원(3만 개 대화방 페이징 불필요). 대화 없으면 빈 리스트.
+
+        Returns:
+            [{"id","created_time","from","to","message"}, ...]  (없으면 [])
+
+        Raises:
+            requests.HTTPError — non-2xx (호출부 분류), requests.RequestException — 네트워크.
+        """
+        url = f"{cls.GRAPH_API_BASE}/{ig_user_id}/conversations"
+        params = {
+            "platform": "instagram",
+            "user_id": str(user_id),
+            "fields": (f"id,messages.limit({message_limit})" "{id,created_time,from,to,message}"),
+            "access_token": access_token,
+        }
+        resp = get_http_session().get(url, params=params, timeout=cls.DEFAULT_TIMEOUT)
+        raise_for_status_clean(resp)
+        body = resp.json() or {}
+        data = body.get("data") or []
+        if not data:
+            return []
+        return (data[0].get("messages") or {}).get("data") or []
+
+    @classmethod
     def check_messaging_window(cls, comment_timestamp: datetime) -> bool:
         """
         24시간 메시징 윈도우 체크
@@ -1266,6 +1573,46 @@ class InstagramMediaService:
         return body.get("data", []) or []
 
     @classmethod
+    def list_media_page(
+        cls,
+        ig_user_id: str,
+        access_token: str,
+        limit: int = 50,
+        after: str | None = None,
+        fields: str = (
+            "id,timestamp,media_type,media_product_type,caption,permalink,comments_count"
+        ),
+    ) -> dict:
+        """미디어 목록 1페이지 (커서 페이지네이션) — DM 캠페인 이전 분석용.
+
+        ``list_recent_media`` 와 달리 ``comments_count``·``media_product_type`` 를 포함하고
+        커서를 반환한다. (list_recent_media 는 next_media baseline 스냅샷 전용이라 시그니처를
+        건드리지 않는다 — 회귀 방지.)
+
+        Returns:
+            {"data": [{"id","timestamp","media_type","media_product_type","caption",
+                       "permalink","comments_count"}, ...],
+             "paging_after": "<cursor>" | None}
+
+        Raises:
+            requests.HTTPError — non-2xx (호출부가 code/subcode 로 분류·재시도/pause).
+            requests.RequestException — 네트워크 오류.
+        """
+        url = f"{cls.GRAPH_API_BASE}/{ig_user_id}/media"
+        params = {"fields": fields, "limit": limit, "access_token": access_token}
+        if after:
+            params["after"] = after
+        resp = get_http_session().get(url, params=params, timeout=cls.DEFAULT_TIMEOUT)
+        raise_for_status_clean(resp)
+        body = resp.json() or {}
+        paging = body.get("paging") or {}
+        after_cursor = (paging.get("cursors") or {}).get("after")
+        return {
+            "data": body.get("data", []) or [],
+            "paging_after": after_cursor if paging.get("next") else None,
+        }
+
+    @classmethod
     def list_stories(
         cls,
         ig_user_id: str,
@@ -1353,6 +1700,7 @@ class InstagramMediaService:
         access_token: str,
         limit: int = 50,
         after: str | None = None,
+        raise_on_error: bool = False,
     ) -> dict:
         """미디어의 최근 댓글을 1페이지 조회 (웹훅 누락 보정 폴링용).
 
@@ -1367,18 +1715,26 @@ class InstagramMediaService:
         단독 비교는 계정 핸들 변경 시 stale 위험 — 적대적 리뷰 지적). 혹시 이 필드가
         400 을 유발하는 계정/버전이 있으면 축소 필드로 1회 재시도해 폴링 자체는 지킨다.
 
+        Args:
+            raise_on_error: True 면 실패를 삼키지 않고 requests 예외를 올린다 (DM 캠페인 이전
+                수집기가 레이트리밋/토큰 오류를 분류해 pause/fail 하도록). 이때는 mock no-op
+                도 건너뛴다(수집기가 mock 여부를 스스로 판단해 mock 픽스처를 호출하므로,
+                이 경로로 오는 건 항상 실 API 호출이다). 기본 False = 폴링용 best-effort.
+
         Returns:
             {"data": [{"id","text","username","timestamp","parent_id"?,"from"?}, ...],
              "paging_after": "<cursor>" | None}   # 다음 페이지 없으면 None
 
         실패(타임아웃/4xx/5xx) 시 ``{"data": [], "paging_after": None}`` 반환
-        (get_media_timestamp 와 동일한 방어적 처리 — 폴링은 best-effort).
+        (get_media_timestamp 와 동일한 방어적 처리 — 폴링은 best-effort). raise_on_error=True
+        면 대신 requests.HTTPError/RequestException 을 올린다.
         """
         if not media_id:
             return {"data": [], "paging_after": None}
 
         # Mock 모드(dev): 실제 API 호출 없이 no-op. 테스트는 이 메서드를 직접 patch.
-        if MockInstagramProvider.is_mock_mode():
+        # raise_on_error(마이그레이션 수집기)는 실 API 만 태우므로 no-op 을 건너뛴다.
+        if MockInstagramProvider.is_mock_mode() and not raise_on_error:
             return {"data": [], "paging_after": None}
 
         url = f"{cls.GRAPH_API_BASE}/{media_id}/comments"
@@ -1393,6 +1749,8 @@ class InstagramMediaService:
         try:
             resp = requests.get(url, params=params, timeout=cls.DEFAULT_TIMEOUT)
         except (requests.Timeout, requests.ConnectionError):
+            if raise_on_error:
+                raise
             return {"data": [], "paging_after": None}
 
         if not resp.ok and resp.status_code == 400:
@@ -1401,9 +1759,13 @@ class InstagramMediaService:
             try:
                 resp = requests.get(url, params=params, timeout=cls.DEFAULT_TIMEOUT)
             except (requests.Timeout, requests.ConnectionError):
+                if raise_on_error:
+                    raise
                 return {"data": [], "paging_after": None}
 
         if not resp.ok:
+            if raise_on_error:
+                raise_for_status_clean(resp)
             return {"data": [], "paging_after": None}
 
         try:

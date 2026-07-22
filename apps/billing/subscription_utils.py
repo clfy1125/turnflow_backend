@@ -35,12 +35,15 @@ def ensure_subscription(user):
 def get_effective_plan(user):
     """
     User의 현재 실질적으로 적용할 SubscriptionPlan 반환.
-    cancelled 상태여도 current_period_end 전이면 기존 유료 플랜을 반환.
+    cancelled/paused 상태여도 current_period_end 전이면 기존 유료 플랜을 반환.
     """
     from .models import SubscriptionStatus
 
     sub = ensure_subscription(user)
-    if sub.status == SubscriptionStatus.CANCELLED:
+    if sub.status in (SubscriptionStatus.CANCELLED, SubscriptionStatus.PAUSED):
+        # 해지 예약·일시정지 모두 '잔여 유료기간'은 그대로 유료 기능 유지.
+        # 그 이후(해지 만료 / 정지 개시)부터 무료 수준으로 강등된다.
+        # paused: plan 은 pro 로 보존하되(재개 시 복원) 정지 개시 후엔 무료 기능만 게이팅.
         if sub.current_period_end and sub.current_period_end > timezone.now():
             return sub.plan  # 기간 내 → 유료 기능 유지
         return get_free_plan()

@@ -87,6 +87,12 @@ class CancellationEventSerializer(serializers.Serializer):
     reason_detail = serializers.CharField(
         required=False, allow_blank=True, max_length=300, help_text="사유 상세(자유입력)"
     )
+    offer = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=40,
+        help_text="offer_* 이벤트의 대상 오퍼 키 (예: downgrade_basic / pause / discount_50)",
+    )
     from_plan = serializers.CharField(
         required=False, allow_blank=True, max_length=32, help_text="이전 플랜"
     )

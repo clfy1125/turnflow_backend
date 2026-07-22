@@ -29,6 +29,8 @@ from .dm_exceptions import (
 )
 from .models import (
     AutoDMCampaign,
+    DMCampaignCandidate,
+    DMMigrationJob,
     EventInbox,
     IGAccountConnection,
     SeenComment,
@@ -4058,3 +4060,93 @@ def process_messaging_event(self, event_key: str):
     evt.save(update_fields=["processed_at"])
     logger.info("process_messaging_event %s: matched=%s", event_key, matched)
     return {"status": "ok", "matched": matched}
+
+
+# ══════════════ DM 캠페인 이전(마이그레이션) ══════════════
+
+
+@shared_task(
+    bind=True,
+    name="integrations.run_dm_migration_job",
+    acks_late=True,
+    reject_on_worker_lost=True,
+    max_retries=0,
+    soft_time_limit=1500,  # 25분 — 전역 30분 한도 내
+    time_limit=1560,
+)
+def run_dm_migration_job(self, job_id: str):
+    """DM 캠페인 이전 분석 파이프라인 실행/재개 (라우팅: ai_jobs 큐).
+
+    체크포인트 재개(stage_data)·취소·레이트리밋 pause 는 pipeline 이 관리한다. 레이트리밋
+    시 pipeline 이 아래 redispatch 로 countdown 후 재개를 예약한다(celery retry state 를
+    들고 있지 않음 — acks_late 재전달과 함께 체크포인트에서 이어서 실행).
+    """
+    from .dm_migration.pipeline import run_migration
+
+    try:
+        DMMigrationJob.objects.filter(id=job_id).update(celery_task_id=self.request.id or "")
+    except Exception:  # noqa: BLE001 — 관측용 필드라 실패해도 진행
+        pass
+
+    def _redispatch(jid: str, countdown: int):
+        run_dm_migration_job.apply_async(args=[jid], countdown=countdown)
+
+    return run_migration(job_id, redispatch=_redispatch)
+
+
+@shared_task(name="integrations.purge_dm_migration_raw")
+def purge_dm_migration_raw():
+    """DM 이전 원본(타인 댓글·DM 원문) 7일 파기 + 스테일 스위퍼 (ScheduledJob: 매일).
+
+    1) 파기: ``raw_expires_at`` 지난 미파기 잡 → stage_data={}, 후보 evidence_raw=None.
+       (초안·집계 근거·매칭 숫자는 유지 — 개인정보 최소보관.)
+    2) 스테일 스위퍼: 비종결인데 2h+ 갱신 없는 잡(크래시·재전달 실패)을 failed(stalled)로
+       종결 — 부분 UNIQUE 제약이 연결을 영구 잠그지 못하게 보장.
+    """
+    now = timezone.now()
+    purged = 0
+    stalled = 0
+
+    due = DMMigrationJob.objects.filter(raw_expires_at__lte=now, raw_purged_at__isnull=True)
+    for job in due.iterator():
+        DMCampaignCandidate.objects.filter(job=job).update(evidence_raw=None)
+        job.stage_data = {}
+        job.raw_purged_at = now
+        job.save(update_fields=["stage_data", "raw_purged_at", "updated_at"])
+        purged += 1
+
+    stale_cutoff = now - timedelta(hours=2)
+    stuck = DMMigrationJob.objects.filter(
+        status__in=list(DMMigrationJob.NON_TERMINAL_STATUSES),
+        updated_at__lt=stale_cutoff,
+    )
+    for job in stuck.iterator():
+        # 정상 대기(재개 예정 시각이 아직 미래)인 pause 는 스킵.
+        if (
+            job.status == DMMigrationJob.Status.PAUSED_RATE_LIMITED
+            and job.resume_at
+            and job.resume_at > now
+        ):
+            continue
+        job.status = DMMigrationJob.Status.FAILED
+        job.error_code = "stalled"
+        job.error_message = "분석이 예기치 않게 중단되었습니다."
+        job.finished_at = now
+        job.raw_expires_at = now + timedelta(days=7)
+        job.message = "분석이 중단되었습니다. 다시 시도해주세요."
+        job.save(
+            update_fields=[
+                "status",
+                "error_code",
+                "error_message",
+                "finished_at",
+                "raw_expires_at",
+                "message",
+                "updated_at",
+            ]
+        )
+        stalled += 1
+
+    if purged or stalled:
+        logger.info("purge_dm_migration_raw: purged=%s stalled=%s", purged, stalled)
+    return {"purged": purged, "stalled": stalled}

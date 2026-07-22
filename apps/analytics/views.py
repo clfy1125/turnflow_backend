@@ -363,9 +363,10 @@ class TrackCancellationEventView(APIView):
 ## 요청 바디 필드
 | 필드 | 필수 | 설명 |
 |------|:----:|------|
-| `event` | ✅ | cancel_button_clicked / cancel_reason_submitted / subscription_cancel_scheduled / subscription_cancel_aborted / subscription_resumed |
+| `event` | ✅ | cancel_button_clicked / cancel_reason_submitted / subscription_cancel_scheduled / subscription_cancel_aborted / subscription_resumed / **offer_shown** / **offer_accepted** / **offer_declined** |
 | `reason` | 선택 | price / low_usage / no_effect / hard_setup / missing_feature / ig_error / switched / paused / other |
 | `reason_detail` | 선택 | 자유입력 상세 |
+| `offer` | 선택 | offer_* 이벤트의 대상 오퍼 키 (예: downgrade_basic / pause / discount_50) — 오퍼별 방어율 퍼널 축 |
 | `from_plan` / `to_plan` | 선택 | 플랜 컨텍스트 |
 
 ## 비즈니스 로직
@@ -413,6 +414,7 @@ class TrackCancellationEventView(APIView):
                 event=data["event"],
                 reason=data.get("reason", ""),
                 reason_detail=data.get("reason_detail", ""),
+                offer=data.get("offer", ""),
                 from_plan=data.get("from_plan", ""),
                 to_plan=data.get("to_plan", ""),
             )

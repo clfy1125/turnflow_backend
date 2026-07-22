@@ -4,6 +4,7 @@ Billing models: Plans and Usage tracking
 
 import hashlib
 import uuid
+from datetime import timedelta
 
 from django.conf import settings
 from django.db import models
@@ -222,9 +223,26 @@ class SubscriptionStatus(models.TextChoices):
     CANCELLED = "cancelled", "Cancelled"
     PAST_DUE = "past_due", "Past Due"
     TRIALING = "trialing", "Trialing"
+    PAUSED = "paused", "Paused"  # 리텐션 일시정지 — 잔여 유료기간 후 무과금 정지, 만료 시 자동 재개
 
 
 EXTRA_IG_ACCOUNT_PRICE = 9900  # 프로 추가 IG 계정 단가 (원/월)
+
+# ── 리텐션(해지 방어) 정책 ──
+PAUSE_ALLOWED_MONTHS = (1, 2, 3)  # 허용 정지 개월 수
+PAUSE_MIN_INTERVAL_DAYS = 365  # 정지 재사용 최소 간격 (연 1회)
+RETENTION_DISCOUNT_PERCENT = 50  # 리텐션 할인율 (다음 1회 갱신)
+
+
+def apply_retention_discount(amount: int, *, pending: bool) -> int:
+    """리텐션 할인 적용 (다음 1회 갱신에만). pending=False면 원금 그대로.
+
+    갱신 청구액 계산(_renewal_amount_for)과 표시용 renewal_amount 프로퍼티가
+    같은 규칙을 쓰도록 단일 소스로 둔다.
+    """
+    if not pending:
+        return amount
+    return amount * (100 - RETENTION_DISCOUNT_PERCENT) // 100
 
 
 def hash_billing_key(billing_key: str) -> str:
@@ -359,6 +377,46 @@ class UserSubscription(models.Model):
         help_text="마지막 과금 실패 사유 (토스 code: message)",
     )
 
+    # ── 리텐션: 일시정지(Pause) ──
+    pause_ends_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="정지 자동 재개 예정일",
+        help_text="paused 구독의 자동 유료 재개(+과금) 시각. = 잔여 유료기간 종료일 + paused_months",
+    )
+    paused_months = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        verbose_name="정지 개월 수",
+        help_text="1/2/3. paused 상태에서만 유효",
+    )
+    last_pause_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="마지막 정지 요청 시각",
+        help_text="연 1회 제한(can_pause) 판정용 — 재개해도 지우지 않음",
+    )
+    pause_resume_reminder_sent_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="재개 3일 전 고지 발송 시각",
+        help_text="자동 결제 재개 사전 고지 중복 방지",
+    )
+
+    # ── 리텐션: 다음 1회 할인 쿠폰 ──
+    retention_discount_pending = models.BooleanField(
+        default=False,
+        verbose_name="다음 갱신 할인 대기",
+        help_text="True면 다음 1회 갱신에 RETENTION_DISCOUNT_PERCENT 적용 후 자동 소멸",
+    )
+    retention_discount_used_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="리텐션 할인 사용 시각",
+        help_text="1인 1회 — 부여되면 기록, 재부여 차단(어뷰징 방어)",
+    )
+
     cancelled_at = models.DateTimeField(null=True, blank=True)
     page_activation_changed_at = models.DateTimeField(
         null=True,
@@ -410,6 +468,7 @@ class UserSubscription(models.Model):
 
         추가 계정 '축소'가 예약돼 있으면(pending_extra_ig_accounts) 그 값 기준으로 미리 반영.
         단, 다음 주기의 플랜이 pro 가 아니면 추가 계정 개념이 없으므로 가산하지 않는다.
+        리텐션 할인이 대기 중이면 다음 1회에 한해 할인 적용(표시·청구 동일 규칙).
         """
         base = (
             self.pending_amount_snapshot if self.pending_plan_id else self.monthly_amount_snapshot
@@ -419,14 +478,46 @@ class UserSubscription(models.Model):
 
         next_plan = self.pending_plan if self.pending_plan_id else self.plan
         if next_plan and next_plan.name != "pro":
-            return base
+            amount = base
+        else:
+            extra = (
+                self.pending_extra_ig_accounts
+                if self.pending_extra_ig_accounts is not None
+                else self.extra_ig_accounts
+            )
+            amount = base + EXTRA_IG_ACCOUNT_PRICE * extra
+        return apply_retention_discount(amount, pending=self.retention_discount_pending)
 
-        extra = (
-            self.pending_extra_ig_accounts
-            if self.pending_extra_ig_accounts is not None
-            else self.extra_ig_accounts
-        )
-        return base + EXTRA_IG_ACCOUNT_PRICE * extra
+    @property
+    def can_pause(self) -> bool:
+        """이번에 구독 일시정지가 가능한지 (연 1회·active 유료·카드 보유).
+
+        프론트 리텐션 위저드의 정지 오퍼 노출 조건이자 POST /billing/pause/ 의 서버 게이트.
+        """
+        if self.plan.name in ("free", "admin"):
+            return False
+        if self.status != SubscriptionStatus.ACTIVE:
+            return False
+        if not self.has_billing_key:
+            return False
+        if self.current_period_end is None:
+            return False
+        if self.last_pause_at and (timezone.now() - self.last_pause_at) < timedelta(
+            days=PAUSE_MIN_INTERVAL_DAYS
+        ):
+            return False
+        return True
+
+    @property
+    def retention_discount_available(self) -> bool:
+        """리텐션 할인(다음 1회 50%) 을 지금 받을 수 있는지 (1인 1회·active 유료·카드 보유)."""
+        if self.plan.name in ("free", "admin"):
+            return False
+        if self.status != SubscriptionStatus.ACTIVE:
+            return False
+        if not self.has_billing_key:
+            return False
+        return self.retention_discount_used_at is None
 
     def set_billing_key(self, billing_key: str, *, card_company: str = "", card_number: str = ""):
         """빌링키 저장 (암호화 + 해시 + 카드 표시정보). save는 호출 측 책임."""
