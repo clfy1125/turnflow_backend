@@ -111,6 +111,18 @@ class UserSubscriptionSerializer(serializers.ModelSerializer):
         allow_null=True,
         help_text="예약된 추가 IG 계정 축소값. 다음 갱신 시 extra_ig_accounts 로 확정. null이면 예약 없음",
     )
+    renewal_amount = serializers.IntegerField(
+        read_only=True,
+        help_text="다음 갱신 청구 예정액(원). 리텐션 할인 대기 중이면 할인 반영값",
+    )
+    can_pause = serializers.BooleanField(
+        read_only=True,
+        help_text="이번에 일시정지 가능 여부(연 1회·active 유료·카드 보유). 정지 오퍼 노출 조건",
+    )
+    retention_discount_available = serializers.BooleanField(
+        read_only=True,
+        help_text="리텐션 할인(다음 1회 50%) 지금 받을 수 있는지(1인 1회·active 유료·카드 보유)",
+    )
 
     class Meta:
         model = None  # set below
@@ -125,12 +137,20 @@ class UserSubscriptionSerializer(serializers.ModelSerializer):
             "card_company",
             "card_number_masked",
             "monthly_amount_snapshot",
+            "renewal_amount",
             "extra_ig_accounts",
             "pending_extra_ig_accounts",
             "pending_plan_name",
             "ig_activation_review_needed",
             "trial_used_at",
             "cancelled_at",
+            # 리텐션: 일시정지
+            "pause_ends_at",
+            "paused_months",
+            "can_pause",
+            # 리텐션: 할인 쿠폰
+            "retention_discount_pending",
+            "retention_discount_available",
             "created_at",
             "updated_at",
         ]
@@ -232,6 +252,37 @@ class ChangeSubscriptionRequestSerializer(serializers.Serializer):
         default=0,
         help_text="pro 업그레이드 시 함께 설정할 추가 IG 계정 수 (계정당 +9,900원/월)",
     )
+
+
+class PauseRequestSerializer(serializers.Serializer):
+    """POST /billing/pause/ 요청 — 구독 일시정지 (리텐션)."""
+
+    months = serializers.ChoiceField(
+        choices=[1, 2, 3],
+        help_text="정지 기간(개월). 잔여 유료기간 종료 후부터 이 기간만큼 무과금 정지",
+    )
+
+
+class RetentionOfferApplyRequestSerializer(serializers.Serializer):
+    """POST /billing/retention-offer/apply/ 요청 — 다음 1회 할인 쿠폰."""
+
+    offer = serializers.ChoiceField(
+        choices=["discount_50"],
+        default="discount_50",
+        required=False,
+        help_text="적용할 리텐션 오퍼 코드. 현재 discount_50(다음 1회 50%)만 지원",
+    )
+
+
+class RetentionOfferApplyResponseSerializer(serializers.Serializer):
+    """POST /billing/retention-offer/apply/ 응답."""
+
+    applied = serializers.BooleanField(help_text="적용 성공 여부")
+    next_charge_amount = serializers.IntegerField(help_text="다음 갱신 청구 예정액(할인 반영, 원)")
+    next_charge_date = serializers.DateTimeField(
+        allow_null=True, help_text="다음 갱신 예정일(= current_period_end)"
+    )
+    subscription = UserSubscriptionSerializer(help_text="갱신된 구독 상태")
 
 
 class PaymentHistorySerializer(serializers.ModelSerializer):

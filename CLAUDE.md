@@ -250,6 +250,9 @@ make test-cov                             # HTML 커버리지 리포트
   - `billing.reconcile_pending_payments` — 30분 (모호 실패 PENDING 결제 확정)
   - `billing.check_missed_payments` — 매시간 (갱신 파이프라인 고장 감시)
   - `billing.handle_grace_period_expiry` / `handle_cancelled_expiry` / `handle_trial_expiry` — 매시간
+  - `billing.handle_pause_expiry` — 매시간 (리텐션 정지 만료 → 자동 유료 재개 + 갱신 과금)
+  - `billing.notify_pause_resume_reminder` — 매일 09:30 KST (정지 재개 3일 전 사전 고지 메일)
+  - `billing.send_winback_emails` — 매일 10:00 KST (해지 후 복귀 유도, `WINBACK_ENABLED` 게이트·기본 dormant)
 - 태스크 타임 리밋: 30분 (`CELERY_TASK_TIME_LIMIT`)
 - 큐: billing 등 기능별 `options: {queue: "..."}` 지정
 
@@ -322,6 +325,7 @@ make test-cov                             # HTML 커버리지 리포트
 - `DM_QUEUE_STATE_FRONTEND.md` — DM 순차 발송 큐 현황(게이지+ETA) 프론트 가이드 + v4.3 페이서 메커니즘 요약 (`max_sends_per_hour` 필드·DB 컬럼 완전 제거 — 마이그 0042) + v4.4 사람 단위 `people` 블록("N명" 표기는 이벤트 단위 `gauge` 말고 이걸로; stats 의 `unique_targets/failed/unconfirmed/reach_rate` 와 동일 정의 = `campaign_stats.people_rollup`) + **v4.5(2026-07-14)**: 통계 헤드라인=`unique_sent_rate`(구 100% 오표기 정정), '확인 필요'→'숨겨진 요청·스팸'(`unique_hidden_spam`) 분리 + `unique_needs_attention[_excl_hidden]`, 로그 상태 그룹 `status_group`(대기중/전송됨/읽음/숨겨진 요청·스팸/확인 필요 — 단일 소스 `dm_status_groups.py`)·`is_recovering`·서버 필터, needs_attention success-aware(복구 반영)
 - `DM_RECOVERY_FRONTEND.md` — 실패 DM 복구(recovery) 프론트 연동 **v2(재댓글 방식, 2026-07-14)**: 확정실패→"숨김함 수락 후 재댓글" 안내 대댓글→재댓글이 일반 경로로 재발송(성공 시 recovery_delivered 자동 승격). 추천문구 30개(`GET .../recovery-reply-suggestions/`) + 프로 전용 게이트(fail-closed) + 로그 상태 3종. `recovery_keyword`=deprecated(값 무시). 기본 활성
 - `CAMPAIGN_TIMESERIES_FRONTEND.md` — 캠페인 신규 요청자 시계열(진행/모멘텀 차트) 프론트 가이드. `GET .../auto-dm-campaigns/{id}/timeseries/?range=all|24h|7d`, 사람 단위(최초 트리거 시점 1회, `stats` people.total 과 동일), KST 버킷(all·7d=day/24h=hour)·제로필·마지막 버킷 partial, `history_complete`(로그 보존정책 가드). 집계=`campaign_stats.new_requester_timeseries`
+- `CANCEL_RETENTION_FRONTEND.md` — 구독 해지 리텐션 플로우 백엔드 구현 응답. ①일시정지 `POST /billing/pause/`(months 1/2/3, 잔여기간 후 무과금 정지·자동재개+3일전 고지, 재개=기존 resume 재사용, status "paused"·pause_ends_at·paused_months·can_pause) ②리텐션할인 `POST /billing/retention-offer/apply/`(다음1회 50%, 1인1회·active유료, next_charge_amount 응답) ③트래킹 offer_shown/accepted/declined + offer 필드 ④윈백메일(WINBACK_ENABLED 게이트·dormant, marketing_opt_in 동의). 정책: 데이터 무기한 보존·정지 연1회·할인 1인1회. 마이그 billing0019/analytics0004/auth0004/core0009
 - `PASSWORD_RESET_GUIDE.md` — 비밀번호 재설정 플로우 프론트 가이드
 - `DISCONNECT_OTHER_DM_TOOLS_GUIDE.md` — 다른 DM 자동화 툴(매니챗 등) 연결 해제 안내 (댓글 fan-out·Private Reply 1회 충돌 / IG Login이라 Facebook 라우팅 불필요)
 - `CONNECT_CONFLICT_WARNING_FRONTEND.md` — 다른 DM 툴 충돌 경고 배너 프론트 스펙 (연결 직후 + 대시보드 상단, 닫기 규칙)

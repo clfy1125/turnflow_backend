@@ -432,6 +432,26 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": 60 * 60,  # 매시간
         "options": {"queue": "billing"},
     },
+    # ===== 리텐션(해지 방어) 파이프라인 =====
+    # 실제 구동은 core.ScheduledJob(0009 시드). CELERY_BEAT_SCHEDULE 은 fallback/문서용.
+    # 정지 자동 재개: pause_ends_at 도래한 paused 구독을 유료 재개 + 갱신 과금 트리거.
+    "billing-handle-pause-expiry": {
+        "task": "billing.handle_pause_expiry",
+        "schedule": 60 * 60,  # 매시간
+        "options": {"queue": "billing"},
+    },
+    # 정지 자동 재개 3일 전 사전 고지 메일 (자동 결제 재개 법정 안전요건).
+    "billing-notify-pause-resume-reminder": {
+        "task": "billing.notify_pause_resume_reminder",
+        "schedule": crontab(hour=9, minute=30),  # 매일 KST 09:30
+        "options": {"queue": "billing"},
+    },
+    # 윈백: 해지 N일 후 복귀 유도 메일 (WINBACK_ENABLED 게이트, 기본 dormant).
+    "billing-send-winback-emails": {
+        "task": "billing.send_winback_emails",
+        "schedule": crontab(hour=10, minute=0),  # 매일 KST 10:00
+        "options": {"queue": "billing"},
+    },
     # ===== DM 발송 99.9% 보증 시스템 =====
     "dm-reconcile-accepted": {
         "task": "apps.integrations.tasks.reconcile_accepted_dms",
@@ -572,6 +592,11 @@ CELERY_BEAT_SCHEDULE = {
     #   - dm-poll-new-media-for-next-campaigns: next_media 가 webhook 기반으로 전환
     #   - dm-check-polling-anomalies: 폴링 자체가 사라져 감시 불필요
 }
+
+# 윈백(해지 후 복귀 유도) 마케팅 메일 — 정보통신망법상 수신 동의자에게만.
+# 동의 수집 경로(가입/설정)와 문구가 준비되기 전까지 기본 False(dormant).
+WINBACK_ENABLED = config("WINBACK_ENABLED", default=False, cast=bool)
+WINBACK_AFTER_DAYS = config("WINBACK_AFTER_DAYS", default=30, cast=int)
 
 # TossPayments 빌링(정기결제) 연동
 # 라이브 전환 = 키만 test_* → live_* 로 교체 (+ 개발자센터 웹훅 URL 등록)

@@ -284,6 +284,10 @@ class CancellationEventType(models.TextChoices):
     SUBSCRIPTION_CANCEL_SCHEDULED = "subscription_cancel_scheduled", "구독 취소 예약"
     SUBSCRIPTION_CANCEL_ABORTED = "subscription_cancel_aborted", "취소 중단(유지 선택)"
     SUBSCRIPTION_RESUMED = "subscription_resumed", "취소 예약 철회"
+    # 리텐션 위저드 오퍼 퍼널 (오퍼별 방어율 측정: shown → accepted vs declined)
+    OFFER_SHOWN = "offer_shown", "오퍼 단계 노출"
+    OFFER_ACCEPTED = "offer_accepted", "오퍼 수락"
+    OFFER_DECLINED = "offer_declined", "오퍼 거절(계속 해지)"
 
 
 class CancellationEvent(models.Model):
@@ -324,6 +328,15 @@ class CancellationEvent(models.Model):
     reason_detail = models.CharField(
         max_length=300, blank=True, default="", verbose_name="사유 상세(자유입력)"
     )
+    offer = models.CharField(
+        max_length=40,
+        blank=True,
+        default="",
+        db_index=True,
+        verbose_name="리텐션 오퍼",
+        help_text="offer_* 이벤트의 대상 오퍼 (예: downgrade_basic / pause / discount_50). "
+        "오퍼별 방어율 퍼널의 축.",
+    )
     from_plan = models.CharField(max_length=32, blank=True, default="", verbose_name="이전 플랜")
     to_plan = models.CharField(max_length=32, blank=True, default="", verbose_name="이후 플랜")
     created_at = models.DateTimeField(auto_now_add=True, db_index=True, verbose_name="발생 일시")
@@ -337,6 +350,7 @@ class CancellationEvent(models.Model):
             models.Index(fields=["user", "created_at"]),
             models.Index(fields=["event", "created_at"]),
             models.Index(fields=["reason", "created_at"]),
+            models.Index(fields=["offer", "created_at"]),
         ]
 
     def __str__(self) -> str:

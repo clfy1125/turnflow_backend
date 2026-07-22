@@ -696,9 +696,7 @@ curl -X DELETE http://localhost:8000/api/v1/auth/me/delete/ \\
                 description="계정 삭제 완료 — 바디 없음. 이후 모든 토큰이 무효화됩니다."
             ),
             401: OpenApiResponse(description="인증 실패 — 토큰이 없거나 유효하지 않음"),
-            409: OpenApiResponse(
-                description="유료 구독 중이라 탈퇴 불가 — 구독 해지 후 재시도"
-            ),
+            409: OpenApiResponse(description="유료 구독 중이라 탈퇴 불가 — 구독 해지 후 재시도"),
         },
     )
     def delete(self, request):
@@ -713,6 +711,7 @@ curl -X DELETE http://localhost:8000/api/v1/auth/me/delete/ \\
             SubscriptionStatus.ACTIVE,
             SubscriptionStatus.TRIALING,
             SubscriptionStatus.PAST_DUE,
+            SubscriptionStatus.PAUSED,  # 정지도 잔여기간/빌링키 보유 → 먼저 해지해야 탈퇴
         )
         if sub and sub.is_paid_plan and sub.status in blocking_statuses:
             return Response(

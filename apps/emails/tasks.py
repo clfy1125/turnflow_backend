@@ -17,9 +17,11 @@ from .constants import (
     TEMPLATE_ONBOARDING_DAY_3,
     TEMPLATE_ONBOARDING_DAY_7,
     TEMPLATE_ONBOARDING_DAY_14,
+    TEMPLATE_PAUSE_RESUME_REMINDER,
     TEMPLATE_PAYMENT_FAILED,
     TEMPLATE_PAYMENT_SUCCESS,
     TEMPLATE_WELCOME,
+    TEMPLATE_WINBACK,
 )
 from .models import EmailToken, EmailTokenPurpose, OnboardingSchedule
 from .services.sender import EmailTemplateMissing, send_email, send_email_sync
@@ -134,7 +136,9 @@ def send_payment_success_email(user_id: int, ctx: dict | None = None) -> None:
     except User.DoesNotExist:
         return
     try:
-        send_email(TEMPLATE_PAYMENT_SUCCESS, user.email, _payment_context(user, ctx or {}), user=user)
+        send_email(
+            TEMPLATE_PAYMENT_SUCCESS, user.email, _payment_context(user, ctx or {}), user=user
+        )
     except EmailTemplateMissing:
         logger.error("payment_success template missing — run seed_email_templates")
 
@@ -147,9 +151,49 @@ def send_payment_failed_email(user_id: int, ctx: dict | None = None) -> None:
     except User.DoesNotExist:
         return
     try:
-        send_email(TEMPLATE_PAYMENT_FAILED, user.email, _payment_context(user, ctx or {}), user=user)
+        send_email(
+            TEMPLATE_PAYMENT_FAILED, user.email, _payment_context(user, ctx or {}), user=user
+        )
     except EmailTemplateMissing:
         logger.error("payment_failed template missing — run seed_email_templates")
+
+
+@shared_task(name="emails.send_pause_resume_reminder_email")
+def send_pause_resume_reminder_email(user_id: int, ctx: dict | None = None) -> None:
+    """정지 자동 재개 3일 전 사전 고지 메일. billing 태스크가 재개 상세(ctx)를 넘긴다."""
+    try:
+        user = User.objects.get(pk=user_id, is_active=True)
+    except User.DoesNotExist:
+        return
+    try:
+        send_email(
+            TEMPLATE_PAUSE_RESUME_REMINDER, user.email, _payment_context(user, ctx or {}), user=user
+        )
+    except EmailTemplateMissing:
+        logger.error("pause_resume_reminder template missing — run seed_email_templates")
+
+
+@shared_task(name="emails.send_winback_email")
+def send_winback_email(user_id: int) -> None:
+    """해지 후 복귀 유도(윈백) 메일. billing.send_winback_emails 배치가 호출한다.
+
+    마케팅 수신 동의·중복 방지는 호출 측(billing)이 이미 판정하므로 여기서는 발송만 한다.
+    """
+    try:
+        user = User.objects.get(pk=user_id, is_active=True)
+    except User.DoesNotExist:
+        return
+    ctx = {
+        "full_name": user.full_name or user.email.split("@")[0],
+        "service_name": settings.SERVICE_NAME,
+        "support_email": settings.SUPPORT_EMAIL,
+        "resubscribe_url": f"{settings.FRONTEND_URL}/billing/plans",
+        "billing_url": f"{settings.FRONTEND_URL}/billing",
+    }
+    try:
+        send_email(TEMPLATE_WINBACK, user.email, ctx, user=user)
+    except EmailTemplateMissing:
+        logger.error("winback template missing — run seed_email_templates")
 
 
 @shared_task(name="emails.send_welcome_email")
@@ -184,9 +228,7 @@ def send_onboarding_drip(user_id: int, day: int) -> None:
     except User.DoesNotExist:
         return
 
-    schedule = OnboardingSchedule.objects.filter(
-        user=user, template_key=template_key
-    ).first()
+    schedule = OnboardingSchedule.objects.filter(user=user, template_key=template_key).first()
     if not schedule or schedule.sent_at or schedule.cancelled_at:
         return
 
@@ -229,6 +271,4 @@ def schedule_onboarding(user_id: int) -> None:
             template_key=template_key,
             defaults={"scheduled_for": scheduled_for, "sent_at": None, "cancelled_at": None},
         )
-        send_onboarding_drip.apply_async(
-            args=[user.id, day], eta=scheduled_for
-        )
+        send_onboarding_drip.apply_async(args=[user.id, day], eta=scheduled_for)

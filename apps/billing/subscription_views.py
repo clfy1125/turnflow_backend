@@ -3,6 +3,7 @@ Subscription API views — 구독 관리
 """
 
 import logging
+from datetime import timedelta
 
 from django.db import transaction
 from django.utils import timezone
@@ -12,19 +13,28 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import SubscriptionPlan, SubscriptionStatus
+from .models import (
+    PAUSE_ALLOWED_MONTHS,
+    PAUSE_MIN_INTERVAL_DAYS,
+    SubscriptionPlan,
+    SubscriptionStatus,
+    UserSubscription,
+)
 from .serializers import (
     ChangeSubscriptionRequestSerializer,
     IGAccountActivationRequestSerializer,
     IGAccountActivationStateSerializer,
     PageActivationRequestSerializer,
     PageActivationStateSerializer,
+    PauseRequestSerializer,
     PaymentHistorySerializer,
+    RetentionOfferApplyRequestSerializer,
+    RetentionOfferApplyResponseSerializer,
     SubscriptionPlanSerializer,
     UserSubscriptionSerializer,
 )
 from .subscription_utils import ensure_subscription, get_ig_account_allowance
-from .toss_flows import BillingFlowError, change_plan, preview_change_plan
+from .toss_flows import PERIOD_DAYS, BillingFlowError, change_plan, preview_change_plan
 
 logger = logging.getLogger(__name__)
 
@@ -790,9 +800,16 @@ if (res.ok) {
         # 토스 호출 불필요 — 갱신 스케줄러가 CANCELLED 구독을 과금하지 않는 것이 곧 해지.
         # 빌링키는 유지해 기간 내 재개(resume)를 즉시 가능하게 한다.
         # 기간 만료 시 handle_cancelled_expiry 가 다운그레이드 + 빌링키 삭제를 수행.
+        update_fields = ["status", "cancelled_at", "updated_at"]
         sub.status = SubscriptionStatus.CANCELLED
         sub.cancelled_at = timezone.now()
-        sub.save(update_fields=["status", "cancelled_at", "updated_at"])
+        # 정지 중 완전 해지 — 정지 예약 필드 정리(자동 재개 방지).
+        if sub.pause_ends_at or sub.paused_months:
+            sub.pause_ends_at = None
+            sub.paused_months = None
+            sub.pause_resume_reminder_sent_at = None
+            update_fields += ["pause_ends_at", "paused_months", "pause_resume_reminder_sent_at"]
+        sub.save(update_fields=update_fields)
 
         return Response(UserSubscriptionSerializer(sub).data)
 
@@ -832,9 +849,13 @@ class ResumeSubscriptionView(APIView):
     def post(self, request):
         sub = ensure_subscription(request.user)
 
+        # 일시정지(paused) 재개 — 취소 재개와 만료 규칙이 다르므로 분기.
+        if sub.status == SubscriptionStatus.PAUSED:
+            return self._resume_from_pause(sub)
+
         if sub.status != SubscriptionStatus.CANCELLED:
             return Response(
-                {"detail": "취소된 구독만 재개할 수 있습니다."},
+                {"detail": "취소 또는 일시정지된 구독만 재개할 수 있습니다."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -857,6 +878,335 @@ class ResumeSubscriptionView(APIView):
         sub.save(update_fields=["status", "cancelled_at", "updated_at"])
 
         return Response(UserSubscriptionSerializer(sub).data)
+
+    def _resume_from_pause(self, sub):
+        """정지 해제. 잔여 유료기간 내면 무과금으로 정지 예약만 취소,
+        이미 정지 개시(기간 경과) 후면 재개 즉시 갱신 과금을 디스패치한다."""
+        if not sub.has_billing_key:
+            return Response(
+                {"detail": "결제 카드가 등록되어 있지 않습니다. 카드 등록 후 재개해주세요."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        now = timezone.now()
+        with transaction.atomic():
+            locked = UserSubscription.objects.select_for_update().get(pk=sub.pk)
+            if locked.status != SubscriptionStatus.PAUSED:
+                return Response(
+                    {"detail": "일시정지 상태가 아닙니다."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            # current_period_end 는 유지: 잔여 유료기간 내면 미래(→무과금 재개),
+            # 정지 개시 후면 과거(→process_due_renewals/아래 디스패치가 즉시 과금).
+            locked.status = SubscriptionStatus.ACTIVE
+            locked.paused_months = None
+            locked.pause_ends_at = None
+            locked.pause_resume_reminder_sent_at = None
+            locked.save(
+                update_fields=[
+                    "status",
+                    "paused_months",
+                    "pause_ends_at",
+                    "pause_resume_reminder_sent_at",
+                    "updated_at",
+                ]
+            )
+        if locked.current_period_end and locked.current_period_end <= now:
+            from .tasks import charge_subscription_renewal
+
+            charge_subscription_renewal.delay(str(locked.pk))
+        return Response(UserSubscriptionSerializer(locked).data)
+
+
+class PauseSubscriptionView(APIView):
+    """구독 일시정지 (리텐션)"""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["사용자플랜"],
+        summary="구독 일시정지",
+        description="""
+## 목적
+유료 구독을 **완전 해지 대신 일시정지**합니다(리텐션). 잔여 유료기간은 그대로 이용하고,
+그 이후부터 지정한 개월 수만큼 **무과금**으로 멈췄다가 만료 시 자동으로 유료 재개(+과금)됩니다.
+
+## 인증
+`Authorization: Bearer <access_token>` 헤더 필수
+
+## 동작
+- 정지 시작: **현재 결제주기 종료일부터** (잔여 유료기간은 유료로 그대로 이용)
+- 정지 중: 프로 기능 비활성(무료 플랜 수준), 단 **데이터·설정·캠페인은 전부 보존**
+- 자동 재개: `pause_ends_at` 도래 시 자동 유료 재개 + 과금. **재개 3일 전 이메일 사전 고지**
+- 정지 중 언제든 완전 해지 가능(`POST /billing/cancel/`) / 조기 재개 가능(`POST /billing/resume/`)
+
+## 정지 가능 조건 (`can_pause`)
+| 조건 | 불가 시 |
+|------|---------|
+| 활성(active) 유료 구독 | 400 — 체험/미납/취소/이미 정지 상태 불가 |
+| 결제 카드(빌링키) 보유 | 400 |
+| **연 1회** (마지막 정지 후 365일 경과) | 400 |
+
+## 요청 바디
+| 필드 | 필수 | 설명 |
+|------|:----:|------|
+| `months` | ✅ | 정지 기간(개월). `1` / `2` / `3` 중 하나 |
+
+## 프론트엔드 통합
+```javascript
+const res = await fetch('/api/v1/billing/pause/', {
+  method: 'POST',
+  headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ months: 2 }),
+});
+const sub = await res.json();  // { status: "paused", pause_ends_at, paused_months, can_pause, ... }
+```
+""",
+        request=PauseRequestSerializer,
+        responses={
+            200: OpenApiResponse(
+                response=UserSubscriptionSerializer,
+                description="일시정지된 구독 정보",
+                examples=[
+                    OpenApiExample(
+                        "정지 성공",
+                        value={
+                            "status": "paused",
+                            "pause_ends_at": "2026-12-03T00:00:00Z",
+                            "paused_months": 2,
+                            "can_pause": False,
+                            "current_period_end": "2026-10-03T00:00:00Z",
+                        },
+                    )
+                ],
+            ),
+            400: OpenApiResponse(
+                description="정지 불가",
+                examples=[
+                    OpenApiExample("이미 정지", value={"detail": "이미 일시정지된 구독입니다."}),
+                    OpenApiExample(
+                        "연 1회 초과",
+                        value={
+                            "detail": "일시정지는 연 1회만 가능합니다.",
+                            "code": "pause_limit_reached",
+                        },
+                    ),
+                    OpenApiExample(
+                        "활성 아님", value={"detail": "활성 구독만 일시정지할 수 있습니다."}
+                    ),
+                ],
+            ),
+            401: OpenApiResponse(description="인증 실패"),
+        },
+    )
+    def post(self, request):
+        req = PauseRequestSerializer(data=request.data)
+        if not req.is_valid():
+            return Response(
+                {"detail": "정지 개월 수는 1/2/3 중 하나여야 합니다.", "details": req.errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        months = int(req.validated_data["months"])
+        if months not in PAUSE_ALLOWED_MONTHS:
+            return Response(
+                {"detail": "정지 개월 수는 1/2/3 중 하나여야 합니다."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        base = ensure_subscription(request.user)
+        now = timezone.now()
+        with transaction.atomic():
+            sub = (
+                UserSubscription.objects.select_for_update().select_related("plan").get(pk=base.pk)
+            )
+
+            if sub.plan.name in ("free", "admin"):
+                return Response(
+                    {"detail": "무료/관리자 플랜은 일시정지할 수 없습니다."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if sub.status == SubscriptionStatus.PAUSED:
+                return Response(
+                    {"detail": "이미 일시정지된 구독입니다."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if sub.status != SubscriptionStatus.ACTIVE:
+                return Response(
+                    {
+                        "detail": "활성 구독만 일시정지할 수 있습니다. "
+                        "(무료 체험·미납·해지 예약 상태 불가)"
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if not sub.has_billing_key:
+                return Response(
+                    {"detail": "결제 카드가 등록되어 있지 않습니다. 카드 등록 후 이용해주세요."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if not sub.current_period_end:
+                return Response(
+                    {"detail": "결제 주기 정보가 없어 일시정지할 수 없습니다."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if sub.last_pause_at and (now - sub.last_pause_at) < timedelta(
+                days=PAUSE_MIN_INTERVAL_DAYS
+            ):
+                return Response(
+                    {
+                        "detail": "일시정지는 연 1회만 가능합니다.",
+                        "code": "pause_limit_reached",
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            sub.status = SubscriptionStatus.PAUSED
+            sub.paused_months = months
+            sub.pause_ends_at = sub.current_period_end + timedelta(days=PERIOD_DAYS * months)
+            sub.last_pause_at = now
+            sub.pause_resume_reminder_sent_at = None
+            sub.save(
+                update_fields=[
+                    "status",
+                    "paused_months",
+                    "pause_ends_at",
+                    "last_pause_at",
+                    "pause_resume_reminder_sent_at",
+                    "updated_at",
+                ]
+            )
+
+        logger.info(
+            "구독 일시정지: user=%s months=%d resume_at=%s",
+            request.user.email,
+            months,
+            sub.pause_ends_at.isoformat() if sub.pause_ends_at else "-",
+        )
+        return Response(UserSubscriptionSerializer(sub).data)
+
+
+class RetentionOfferApplyView(APIView):
+    """리텐션 할인 쿠폰 적용 (다음 1회 50%)"""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        tags=["사용자플랜"],
+        summary="리텐션 할인 적용",
+        description="""
+## 목적
+해지 플로우에서 **다음 결제 1회를 50% 할인**하는 리텐션 오퍼를 적용합니다.
+그 이후 갱신은 정상가로 진행됩니다(1회성 할인이라 숨은갱신 이슈 없음).
+
+## 인증
+`Authorization: Bearer <access_token>` 헤더 필수
+
+## 동작
+- **다음 1회 갱신에만** `RETENTION_DISCOUNT_PERCENT`(50%) 적용 → 성공 시 자동 소멸
+- **1인 1회** — 이미 사용했으면 400 (`retention_offer_already_used`)
+- 활성(active) 유료 구독 + 카드 보유만 대상 (체험/취소/미납/정지 제외)
+
+## 요청 바디
+| 필드 | 필수 | 설명 |
+|------|:----:|------|
+| `offer` | 선택 | 오퍼 코드. 현재 `discount_50` 만 지원(기본값) |
+
+## 응답 (금액/일자는 하드코딩 말고 응답값 사용)
+```json
+{
+  "applied": true,
+  "next_charge_amount": 7950,
+  "next_charge_date": "2026-09-03T00:00:00Z",
+  "subscription": { "...": "UserSubscription" }
+}
+```
+""",
+        request=RetentionOfferApplyRequestSerializer,
+        responses={
+            200: OpenApiResponse(
+                response=RetentionOfferApplyResponseSerializer,
+                description="할인 적용 완료",
+            ),
+            400: OpenApiResponse(
+                description="적용 불가",
+                examples=[
+                    OpenApiExample(
+                        "이미 사용",
+                        value={
+                            "detail": "이미 리텐션 할인을 사용했습니다.",
+                            "code": "retention_offer_already_used",
+                        },
+                    ),
+                    OpenApiExample(
+                        "대상 아님",
+                        value={"detail": "활성 유료 구독만 할인을 받을 수 있습니다."},
+                    ),
+                ],
+            ),
+            401: OpenApiResponse(description="인증 실패"),
+        },
+    )
+    def post(self, request):
+        req = RetentionOfferApplyRequestSerializer(data=request.data)
+        if not req.is_valid():
+            return Response(
+                {"detail": "지원하지 않는 오퍼입니다.", "details": req.errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        base = ensure_subscription(request.user)
+        now = timezone.now()
+        with transaction.atomic():
+            sub = (
+                UserSubscription.objects.select_for_update().select_related("plan").get(pk=base.pk)
+            )
+
+            if sub.plan.name in ("free", "admin"):
+                return Response(
+                    {"detail": "무료/관리자 플랜은 할인 대상이 아닙니다."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if sub.status != SubscriptionStatus.ACTIVE:
+                return Response(
+                    {
+                        "detail": "활성 유료 구독만 할인을 받을 수 있습니다. "
+                        "(무료 체험·미납·해지 예약·정지 상태 불가)"
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if not sub.has_billing_key:
+                return Response(
+                    {"detail": "결제 카드가 등록되어 있지 않습니다."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if sub.retention_discount_used_at is not None:
+                return Response(
+                    {
+                        "detail": "이미 리텐션 할인을 사용했습니다.",
+                        "code": "retention_offer_already_used",
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            sub.retention_discount_pending = True
+            sub.retention_discount_used_at = now
+            sub.save(
+                update_fields=[
+                    "retention_discount_pending",
+                    "retention_discount_used_at",
+                    "updated_at",
+                ]
+            )
+
+        logger.info(
+            "리텐션 할인 적용: user=%s next_amount=%d", request.user.email, sub.renewal_amount
+        )
+        return Response(
+            {
+                "applied": True,
+                "next_charge_amount": sub.renewal_amount,
+                "next_charge_date": sub.current_period_end,
+                "subscription": UserSubscriptionSerializer(sub).data,
+            }
+        )
 
 
 class PageActivationView(APIView):
