@@ -159,6 +159,17 @@ class TestClassifier:
             v = classify_comment("한번 보고 가세요 좋은 상품", spam_keywords=[], block_urls=True)
         assert not v.is_spam and v.engine == "llm_lowconf"
 
+    def test_llm_085_confidence_suppressed_by_threshold(self):
+        """문턱 0.9 회귀 가드: 실제 오탐("설치링크 부탁드려요"→phishing 0.85)이 억제돼야 한다.
+
+        2026-07-22 3dragon_pd: gemma 가 짧은 리드젠 요청을 phishing 0.85 로 오탐 → detected.
+        프롬프트 개선과 함께 문턱을 0.9 로 올려 0.7~0.9 구간 오탐을 자동 fail-open 시킨다.
+        """
+        fake = _fake_llm('{"is_spam": true, "category": "phishing", "confidence": 0.85}')
+        with mock.patch.object(spam_classifier, "call_llm_messages_with_usage", return_value=fake):
+            v = classify_comment("설치링크 부탁드려요.", spam_keywords=[], block_urls=True)
+        assert not v.is_spam and v.engine == "llm_lowconf"
+
     def test_llm_failopen_on_exception(self):
         with mock.patch.object(
             spam_classifier, "call_llm_messages_with_usage", side_effect=RuntimeError("timeout")
@@ -175,6 +186,24 @@ class TestClassifier:
                 "애매한 댓글 무엇일까요 판단 필요", spam_keywords=[], block_urls=True
             )
         assert not v.is_spam and v.engine == "llm_failopen"
+
+    def test_prompt_biases_leadgen_short_comments_clean(self):
+        """프롬프트 회귀 가드(2026-07-22 3dragon_pd 오탐).
+
+        리드젠/짧은 요청 댓글을 스팸으로 몰던 원인이 프롬프트였으므로, 시스템 프롬프트가
+        리드젠 맥락·짧은 키워드/요청·이모지를 NOT SPAM 으로 안내하는지 고정한다. 특히
+        옛 프롬프트의 "'DM 주세요' 유인 = SPAM" 프라이밍이 되살아나지 않게 한다.
+        """
+        p = spam_classifier._SPAM_SYSTEM_PROMPT
+        # 리드젠/이벤트 맥락을 명시
+        assert "lead-generation" in p and "giveaway" in p
+        # 짧은 키워드/요청/이모지를 NOT SPAM 으로 안내
+        assert "REQUESTS for themselves" in p or "REQUESTS" in p
+        assert "emoji-only" in p
+        # 애매하면 정상으로
+        assert "default is_spam=false" in p
+        # 옛 프롬프트의 위험한 프라이밍(무조건 'DM 주세요'=스팸)이 남아있지 않아야 함
+        assert "'DM 주세요' 유인)" not in p
 
 
 # ───────────────────────── run_spam_filter_check ─────────────────────────
