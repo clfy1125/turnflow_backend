@@ -9,7 +9,7 @@ import re
 import threading
 from datetime import UTC, datetime, timedelta
 from typing import Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import requests
 from django.conf import settings
@@ -33,6 +33,28 @@ _SECRET_QS_RE = re.compile(
 def scrub_secrets(text) -> str:
     """URL 쿼리스트링/예외 문자열에서 토큰·시크릿 값을 ``name=***`` 로 마스킹."""
     return _SECRET_QS_RE.sub(r"\1=***", str(text))
+
+
+# 인스타그램 게시물 영구 링크(permalink) 호스트 — CDN(cdninstagram.com)·자유 입력 URL 과 구분.
+_IG_PERMALINK_HOSTS = frozenset(("instagram.com", "www.instagram.com", "m.instagram.com"))
+
+
+def is_instagram_permalink(url: str | None) -> bool:
+    """url 이 인스타그램 게시물 permalink 인지 (host 정확 판정).
+
+    ``https://www.instagram.com/p/{shortcode}/`` (또는 /reel//tv/) 만 True.
+    ``scontent.cdninstagram.com/...`` 같은 CDN 이미지 URL 은 host 가 달라 False —
+    단순 substring("instagram.com") 검사는 CDN 도메인을 오탐하므로 netloc 로 판정한다.
+    """
+    if not url:
+        return False
+    try:
+        netloc = urlparse(url).netloc.lower()
+    except (ValueError, TypeError):
+        return False
+    # 포트/인증정보가 붙은 경우 방어적으로 host 만 취함
+    host = netloc.split("@")[-1].split(":")[0]
+    return host in _IG_PERMALINK_HOSTS
 
 
 def raise_for_status_clean(response) -> None:
@@ -1727,6 +1749,48 @@ class InstagramMediaService:
             return _dt.fromisoformat(v)
         except ValueError:
             return None
+
+    @classmethod
+    def get_media_permalink(cls, media_id: str, access_token: str) -> "str | None":
+        """단일 미디어의 permalink(인스타그램 영구 링크) 조회 (캠페인 게시물 링크 백필용).
+
+        GET /v25.0/{media-id}?fields=permalink
+        → ``https://www.instagram.com/p/{shortcode}/`` (또는 릴스 /reel/...) 형태.
+
+        permalink 는 media_id(숫자 Graph ID)로부터 계산 불가하고 Graph 조회가 유일한 경로다
+        (get_media_timestamp 와 동일한 best-effort 방어 — 실패 시 None). Mock 모드에선 실제
+        호출 없이 그럴듯한 permalink 를 만들어 dev/테스트에서도 링크가 채워지게 한다.
+
+        Args:
+            media_id: Instagram 미디어 ID (댓글 웹훅의 media.id).
+
+        Returns:
+            permalink 문자열, 또는 None (media_id 없음/API 실패/필드 부재).
+        """
+        if not media_id:
+            return None
+
+        # Mock 모드(dev): 실제 API 호출 없이 게시물 permalink 를 합성 (line 600 mock 규약과 동일).
+        if MockInstagramProvider.is_mock_mode():
+            return f"https://www.instagram.com/p/{media_id}/"
+
+        url = f"{cls.GRAPH_API_BASE}/{media_id}"
+        params = {"fields": "permalink", "access_token": access_token}
+
+        try:
+            resp = requests.get(url, params=params, timeout=cls.DEFAULT_TIMEOUT)
+        except (requests.Timeout, requests.ConnectionError):
+            return None
+
+        if not resp.ok:
+            return None
+
+        try:
+            body = resp.json() or {}
+        except ValueError:
+            return None
+
+        return body.get("permalink") or None
 
     @classmethod
     def list_media_comments(

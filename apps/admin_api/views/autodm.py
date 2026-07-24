@@ -20,12 +20,13 @@ from __future__ import annotations
 import logging
 from datetime import timedelta
 
-from django.db.models import Count, Min
+from django.db.models import Count, Max, Min, Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import filters, generics, status
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -37,10 +38,21 @@ from apps.admin_api.serializers.autodm import (
     AdminCampaignListSerializer,
     AdminDMLogDetailSerializer,
     AdminDMLogListSerializer,
+    AdminDMRecipientSerializer,
     AdminIGConnectionListSerializer,
     _build_stats,
 )
+from apps.integrations.campaign_stats import QUEUE_WAITING_STATUSES, SENT_FOR_QUOTA_STATUSES
 from apps.integrations.dm_exceptions import DMSendError, DMTransientError
+from apps.integrations.dm_status_groups import (
+    ATTENTION,
+    GROUP_DISPLAY,
+    HIDDEN_SPAM,
+    READ,
+    SENT,
+    WAITING,
+    status_group_q,
+)
 from apps.integrations.models import AutoDMCampaign, IGAccountConnection, SentDMLog
 from apps.integrations.serializers import DMVerificationStatsSerializer
 from apps.integrations.services import InstagramMessagingService
@@ -425,10 +437,18 @@ class AdminDMLogListView(generics.ListAPIView):
         recipient = params.get("recipient")
         ig_connection_id = params.get("ig_connection_id")
         since = params.get("since")
+        # 수신자 타임라인 펼침용 exact 필터 — recipients 목록의 한 행을 클릭했을 때
+        # 그 사람에게 간 모든 발송을 시간순으로 조회. recipient(부분일치)와 별개 파라미터.
+        recipient_user_id = params.get("recipient_user_id")
+        recipient_username = params.get("recipient_username")
         if campaign_id:
             qs = qs.filter(campaign_id=campaign_id)
         if recipient:
             qs = qs.filter(recipient_username__icontains=recipient)
+        if recipient_user_id:
+            qs = qs.filter(recipient_user_id=recipient_user_id)
+        if recipient_username:
+            qs = qs.filter(recipient_username=recipient_username)
         if ig_connection_id:
             qs = qs.filter(campaign__ig_connection_id=ig_connection_id)
         if since:
@@ -458,6 +478,10 @@ class AdminDMLogListView(generics.ListAPIView):
 
 ## 주의사항
 - `recipient` 는 수신자 username 부분일치(icontains) 입니다.
+- `recipient_user_id` / `recipient_username` 는 **정확일치(exact)** 로, 수신자 목록
+  (`GET /admin/auto-dm/recipients/`)의 한 행을 클릭해 그 사람의 발송 타임라인을 펼칠 때
+  사용합니다 (부분일치 `recipient` 와 별개 파라미터). `recipient_user_id` 가 1순위 키이며
+  비어 있는 수신자는 `recipient_username` exact 로 폴백하세요.
 - `since` 는 ISO datetime (예: `2026-05-01T00:00:00Z`).
         """,
         parameters=[
@@ -494,7 +518,22 @@ class AdminDMLogListView(generics.ListAPIView):
                 str,
                 OpenApiParameter.QUERY,
                 required=False,
-                description="수신자 username 부분일치 검색.",
+                description="수신자 username 부분일치(icontains) 검색.",
+            ),
+            OpenApiParameter(
+                "recipient_user_id",
+                str,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="수신자 Instagram ID 정확일치 — 수신자 타임라인 펼침용 1순위 키.",
+            ),
+            OpenApiParameter(
+                "recipient_username",
+                str,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="수신자 username 정확일치(exact) — recipient_user_id 가 빈 수신자 폴백. "
+                "부분일치 검색은 `recipient` 사용.",
             ),
             OpenApiParameter(
                 "ig_connection_id",
@@ -545,9 +584,11 @@ class AdminDMLogListView(generics.ListAPIView):
                                 "id": "8b1c0e2a-1111-4a2b-9c3d-aaaaaaaaaaaa",
                                 "name": "신상 런칭 자동 DM",
                             },
+                            "recipient_user_id": "17841400000000001",
                             "recipient_username": "buyer01",
                             "status": "delivered",
                             "dm_kind": "opening",
+                            "flow_role": "opening",
                             "gate_status": "passed",
                             "error_code": "",
                             "created_at": "2026-05-02T10:00:00+09:00",
@@ -946,6 +987,316 @@ ACCEPTED 상태에서 echo 웹훅 누락이 의심될 때, `GET /{message_id}` �
                 ),
             }
         )
+
+
+# ===== DM 수신자(사람) 단위 목록 =====
+
+
+class _RecipientPagination(PageNumberPagination):
+    """수신자 목록 전용 — 표준 page_size=20, {count,next,previous,results}."""
+
+    page_size = 20
+
+
+class AdminDMRecipientListView(APIView):
+    """DM 수신자(사람) 단위 목록 (cross-workspace).
+
+    ``SentDMLog`` 를 **(campaign_id, recipient_user_id)** 로 묶어 한 사람이 한 캠페인에서
+    받은 모든 발송(오프닝+리워드+재시도)을 1행으로 접는다. 사용자용
+    ``GET /integrations/dm-verification/recipients/`` 와 **동일한 status_group 판정**을
+    쓰되, 어드민 교차-워크스페이스 스코프 + 캠페인/계정/소유자 nested 를 얹었다.
+    """
+
+    permission_classes = [IsAdminUser]
+    serializer_class = AdminDMRecipientSerializer
+
+    # ordering= 화이트리스트 (annotate 이름). 기본 -last_activity_at.
+    ALLOWED_ORDERING = {"-last_activity_at", "last_activity_at", "dm_count", "-dm_count"}
+
+    # 사람 단위 status_group 필터(HAVING) — 사용자용 recipients 뷰와 1:1 로 동일하게 유지.
+    #   (parity: apps.integrations.verification_views.DMVerificationViewSet.recipients)
+    @staticmethod
+    def _status_group_having() -> dict:
+        return {
+            WAITING: Q(sent_n=0) & Q(waiting_n__gt=0),
+            SENT: Q(sent_n__gt=0) & Q(read_n=0),
+            READ: Q(read_n__gt=0),
+            HIDDEN_SPAM: Q(sent_n=0) & Q(waiting_n=0) & Q(hidden_spam_n__gt=0),
+            ATTENTION: Q(sent_n=0) & Q(waiting_n=0) & Q(hidden_spam_n=0),
+        }
+
+    @staticmethod
+    def _person_status_group(row: dict) -> str:
+        """수신자 1명의 코스 상태 그룹 (read > sent > waiting > hidden_spam > attention)."""
+        if row["sent_n"] > 0:
+            return READ if row["read_n"] > 0 else SENT
+        if row["waiting_n"] > 0:
+            return WAITING
+        if row["hidden_spam_n"] > 0:
+            return HIDDEN_SPAM
+        return ATTENTION
+
+    @extend_schema(
+        tags=[TAG],
+        summary="[관리자] DM 수신자(사람) 목록",
+        description="""
+## 개요
+전체 워크스페이스의 DM 발송 로그를 **수신자 1명 = 1행**으로 접어 조회합니다. 그룹핑 키는
+**(campaign_id, recipient_user_id)** — 한 사람이 한 캠페인에서 받은 모든 발송(오프닝 + 리워드 +
+재시도)이 1행으로 롤업됩니다. 같은 사람이 다른 캠페인에서도 받았으면 캠페인당 별도 행입니다
+("수신자는 캠페인당 1개"). 발송 로그 목록(`/admin/auto-dm/logs/`)이 발송 이벤트 단위라 한
+사람에게 여러 행이 생기던 문제를, 사용자용 콘솔과 동일한 수신자 단위 UX 로 맞춥니다.
+
+## 사용 시나리오
+- 운영자가 "이 사람에게 결국 DM 이 갔나?" 를 한 행에서 확인
+- 한 행을 클릭 → `GET /admin/auto-dm/logs/?recipient_user_id=<id>`(+`campaign_id`) 로
+  그 사람의 발송 타임라인(오프닝 → 재시도 → 리워드)을 펼침
+- `status_group` 탭(대기중/전송됨/읽음/숨겨진 요청·스팸/확인 필요)으로 드릴다운
+
+## 인증
+- `Authorization: Bearer <staff_access_token>` (is_staff=True)
+
+## 비즈니스 로직
+- 전역 조회 — request.user 워크스페이스로 필터링하지 않습니다.
+- **행 키**: `recipient_user_id` (그룹 키). 표시상 username 이 비면 `user_{IGSID}` 폴백.
+- **status_group 판정은 사용자용 `/integrations/dm-verification/recipients/` 와 100% 동일**한
+  어휘·우선순위(read > sent > waiting > hidden_spam > attention)를 재사용합니다.
+- `opening_count` = dm_kind ∈ {opening, standalone}, `interaction_count` = dm_kind = reward
+  (오프닝 + 상호작용 = dm_count, 재시도는 원 dm_kind 유지).
+- `latest_status` 는 그 사람 가장 최근 발송의 원시 `SentDMLog.status` (현재 페이지 행에 한해 조회).
+- 표준 PageNumberPagination(page_size=20) → `{count, next, previous, results}`.
+  정렬 tie-break 로 (campaign_id, recipient_user_id) 를 덧붙여 페이지 경계 안정.
+
+## 주의사항
+- `campaign_id` 미지정 시 전역 `(campaign, recipient)` 그룹 집계라 대용량에서 무거울 수 있습니다.
+  캠페인/계정 진입 동선에서는 `campaign_id` 또는 `ig_connection_id` 로 좁혀 호출하세요.
+- IG access_token 등 비밀값은 노출되지 않습니다.
+
+### 요청 예시
+```bash
+curl -H "Authorization: Bearer <staff_token>" \\
+  "https://api.example.com/api/v1/admin/auto-dm/recipients/?campaign_id=<uuid>&status_group=read"
+```
+        """,
+        parameters=[
+            OpenApiParameter(
+                "campaign_id",
+                str,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="특정 캠페인(UUID)만. 없으면 전역이되 여전히 (campaign, recipient) 그룹.",
+            ),
+            OpenApiParameter(
+                "status_group",
+                str,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="코스 상태 그룹 필터 — all(기본)/waiting/sent/read/hidden_spam/attention. "
+                "사용자용 recipients 와 동일 어휘·판정.",
+            ),
+            OpenApiParameter(
+                "recipient",
+                str,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="수신자 username 부분일치(icontains) 검색.",
+            ),
+            OpenApiParameter(
+                "ig_connection_id",
+                str,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="특정 IG 계정 연동(UUID)의 수신자만 필터.",
+            ),
+            OpenApiParameter(
+                "owner",
+                int,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="워크스페이스 소유자(User) PK 로 필터.",
+            ),
+            OpenApiParameter(
+                "ordering",
+                str,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="정렬 — -last_activity_at(기본)/last_activity_at/dm_count/-dm_count.",
+            ),
+            OpenApiParameter(
+                "page",
+                int,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="페이지 번호 (page_size=20).",
+            ),
+        ],
+        responses={
+            200: AdminDMRecipientSerializer(many=True),
+            400: OpenApiResponse(description="status_group 값 오류 (프로젝트 에러 포맷)"),
+            401: OpenApiResponse(description="인증 누락/만료"),
+            403: OpenApiResponse(description="관리자 권한 없음"),
+        },
+        examples=[
+            OpenApiExample(
+                "수신자 목록 응답 예시",
+                value={
+                    "count": 1,
+                    "next": None,
+                    "previous": None,
+                    "results": [
+                        {
+                            "recipient_user_id": "17841400000000000",
+                            "recipient_username": "buyer_a",
+                            "campaign": {
+                                "id": "8b1c0e2a-1111-4a2b-9c3d-aaaaaaaaaaaa",
+                                "name": "여름 공구 오픈",
+                            },
+                            "ig_connection_id": "1a2b3c4d-3333-4c5d-9e6f-cccccccccccc",
+                            "ig_username": "brand_official",
+                            "owner": {"id": 42, "email": "owner@example.com"},
+                            "status_group": "read",
+                            "status_group_display": "읽음",
+                            "sent": True,
+                            "delivered": True,
+                            "read": True,
+                            "needs_attention": False,
+                            "dm_count": 3,
+                            "opening_count": 1,
+                            "interaction_count": 2,
+                            "latest_status": "read",
+                            "first_sent_at": "2026-07-20T10:00:00+09:00",
+                            "last_activity_at": "2026-07-20T10:05:00+09:00",
+                        }
+                    ],
+                },
+                response_only=True,
+            )
+        ],
+    )
+    def get(self, request):
+        params = request.query_params
+        qs = SentDMLog.objects.all()
+
+        campaign_id = params.get("campaign_id")
+        if campaign_id:
+            qs = qs.filter(campaign_id=campaign_id)
+        recipient = params.get("recipient")
+        if recipient:
+            qs = qs.filter(recipient_username__icontains=recipient)
+        ig_connection_id = params.get("ig_connection_id")
+        if ig_connection_id:
+            qs = qs.filter(campaign__ig_connection_id=ig_connection_id)
+        owner = params.get("owner")
+        if owner:
+            try:
+                qs = qs.filter(campaign__ig_connection__workspace__owner_id=int(owner))
+            except (TypeError, ValueError):
+                pass  # 숫자 아니면 무시 (빈 결과 대신 필터 미적용 — 기존 목록 뷰 관례)
+
+        opening_kinds = [SentDMLog.DMKind.OPENING, SentDMLog.DMKind.STANDALONE]
+        delivered_statuses = [SentDMLog.Status.DELIVERED, SentDMLog.Status.READ]
+
+        rows = qs.values(
+            "campaign_id",
+            "recipient_user_id",
+            "campaign__name",
+            "campaign__ig_connection_id",
+            "campaign__ig_connection__username",
+            "campaign__ig_connection__workspace__owner_id",
+            "campaign__ig_connection__workspace__owner__email",
+        ).annotate(
+            latest_username=Max("recipient_username"),
+            dm_count=Count("id"),
+            last_activity_at=Max("created_at"),
+            first_sent_at=Min("created_at"),
+            sent_n=Count("id", filter=Q(status__in=SENT_FOR_QUOTA_STATUSES)),
+            delivered_n=Count("id", filter=Q(status__in=delivered_statuses)),
+            read_n=Count("id", filter=Q(status=SentDMLog.Status.READ)),
+            waiting_n=Count("id", filter=Q(status__in=QUEUE_WAITING_STATUSES)),
+            hidden_spam_n=Count("id", filter=status_group_q(HIDDEN_SPAM)),
+            opening_count=Count("id", filter=Q(dm_kind__in=opening_kinds)),
+            interaction_count=Count("id", filter=Q(dm_kind=SentDMLog.DMKind.REWARD)),
+        )
+
+        # status_group 필터 (HAVING — annotate 결과에 걸어야 롤업 카운트 오염 없이 total 도 정확).
+        having = self._status_group_having()
+        status_group_param = params.get("status_group")
+        if status_group_param and status_group_param != "all":
+            if status_group_param not in having:
+                return Response(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": 400,
+                            "message": (
+                                "status_group 값이 올바르지 않습니다. "
+                                "(all/waiting/sent/read/hidden_spam/attention)"
+                            ),
+                            "details": {
+                                "field": "status_group",
+                                "allowed": ["all", *having.keys()],
+                            },
+                        },
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            rows = rows.filter(having[status_group_param])
+
+        ordering = params.get("ordering", "-last_activity_at")
+        if ordering not in self.ALLOWED_ORDERING:
+            ordering = "-last_activity_at"
+        # tie-break 로 그룹 키를 덧붙여 페이지 경계 안정(동률 중복/누락 방지).
+        rows = rows.order_by(ordering, "campaign_id", "recipient_user_id")
+
+        paginator = _RecipientPagination()
+        page_rows = paginator.paginate_queryset(rows, request, view=self)
+
+        # latest_status: 현재 페이지 (campaign, recipient) 쌍의 최신 로그 상태 1건씩
+        # (Postgres DISTINCT ON — over-fetch 후 정확 매칭). 페이지 20행이라 부담 없음.
+        latest_status_map: dict = {}
+        if page_rows:
+            camp_ids = {r["campaign_id"] for r in page_rows}
+            rcpt_ids = {r["recipient_user_id"] for r in page_rows}
+            for row in (
+                SentDMLog.objects.filter(campaign_id__in=camp_ids, recipient_user_id__in=rcpt_ids)
+                .order_by("campaign_id", "recipient_user_id", "-created_at")
+                .distinct("campaign_id", "recipient_user_id")
+                .values("campaign_id", "recipient_user_id", "status")
+            ):
+                latest_status_map[(row["campaign_id"], row["recipient_user_id"])] = row["status"]
+
+        results = []
+        for r in page_rows:
+            grp = self._person_status_group(r)
+            rid = r["recipient_user_id"]
+            results.append(
+                {
+                    "recipient_user_id": rid,
+                    "recipient_username": r["latest_username"] or (f"user_{rid}" if rid else ""),
+                    "campaign": {"id": r["campaign_id"], "name": r["campaign__name"]},
+                    "ig_connection_id": r["campaign__ig_connection_id"],
+                    "ig_username": r["campaign__ig_connection__username"] or "",
+                    "owner": {
+                        "id": r["campaign__ig_connection__workspace__owner_id"],
+                        "email": r["campaign__ig_connection__workspace__owner__email"] or "",
+                    },
+                    "status_group": grp,
+                    "status_group_display": GROUP_DISPLAY[grp],
+                    "sent": r["sent_n"] > 0,
+                    "delivered": r["delivered_n"] > 0,
+                    "read": r["read_n"] > 0,
+                    "needs_attention": grp == ATTENTION,
+                    "dm_count": r["dm_count"],
+                    "opening_count": r["opening_count"],
+                    "interaction_count": r["interaction_count"],
+                    "latest_status": latest_status_map.get((r["campaign_id"], rid), ""),
+                    "first_sent_at": r["first_sent_at"],
+                    "last_activity_at": r["last_activity_at"],
+                }
+            )
+
+        data = AdminDMRecipientSerializer(results, many=True).data
+        return paginator.get_paginated_response(data)
 
 
 # ===== 통계 =====

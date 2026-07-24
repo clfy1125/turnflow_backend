@@ -143,7 +143,9 @@ def _mk_campaign(conn):
     )
 
 
-def _mk_dms(campaign, status, n=1, comment_id=None, error_message="", error_subcode=""):
+def _mk_dms(
+    campaign, status, n=1, comment_id=None, error_message="", error_subcode="", error_code=""
+):
     logs = SentDMLog.objects.bulk_create(
         SentDMLog(
             campaign=campaign,
@@ -153,6 +155,7 @@ def _mk_dms(campaign, status, n=1, comment_id=None, error_message="", error_subc
             message_sent="x",
             status=status,
             error_message=error_message,
+            error_code=error_code,
             error_subcode=error_subcode,
             idempotency_key=uuid.uuid4().hex,
         )
@@ -695,3 +698,65 @@ class TestCaching:
         res_1h = staff_client.get(URL, {"window": "1h"})
         assert res_24h.data["window"] == "24h"
         assert res_1h.data["window"] == "1h"
+
+
+# ─── J-1: 오류 세분화(failure_breakdown) + 복구 퍼널(recovery) ─────────
+
+
+class TestFailureBreakdown:
+    def test_breakdown_groups_by_code_subcode_status(self, staff_client, clean_slate):
+        camp = _mk_campaign(_mk_conn())
+        _mk_dms(camp, SentDMLog.Status.FAILED_TOKEN, 12, error_code="190")
+        _mk_dms(camp, SentDMLog.Status.FAILED_NO_TRACE, 5)  # code 없음
+        _mk_dms(camp, SentDMLog.Status.FAILED_PARAM, 4, error_code="100", error_subcode="2534025")
+        # 성공/스킵/in-flight 는 breakdown 에서 제외돼야 함
+        _mk_dms(camp, SentDMLog.Status.DELIVERED, 3)
+        _mk_dms(camp, SentDMLog.Status.SKIPPED, 2)
+
+        bd = staff_client.get(URL).data["dm_quality"]["failure_breakdown"]
+        by_status = {r["status"]: r for r in bd}
+        assert by_status["failed_token"]["code"] == "190"
+        assert by_status["failed_token"]["count"] == 12
+        assert by_status["failed_token"]["recoverable"] is False
+        # code 없는 실패 → 빈 문자열
+        assert by_status["failed_no_trace"]["code"] == ""
+        assert by_status["failed_no_trace"]["recoverable"] is True
+        # failed_param@2534025 → subcode 노출 + recoverable
+        assert by_status["failed_param"]["subcode"] == "2534025"
+        assert by_status["failed_param"]["recoverable"] is True
+        # 성공/스킵 상태는 breakdown 에 없음
+        assert "delivered" not in by_status and "skipped" not in by_status
+        # count desc 정렬
+        counts = [r["count"] for r in bd]
+        assert counts == sorted(counts, reverse=True)
+
+    def test_recovery_funnel(self, staff_client, clean_slate):
+        camp = _mk_campaign(_mk_conn())
+        _mk_dms(camp, SentDMLog.Status.RECOVERY_PENDING, 5)
+        _mk_dms(camp, SentDMLog.Status.RECOVERY_DELIVERED, 12)
+        _mk_dms(camp, SentDMLog.Status.RECOVERY_EXPIRED, 3)
+
+        rec = staff_client.get(URL).data["dm_quality"]["recovery"]
+        assert rec["recoverable_total"] == 20
+        assert rec["pending"] == 5
+        assert rec["recovered"] == 12
+        assert rec["expired"] == 3
+        assert rec["recovery_rate"] == 0.8  # 12 / (12+3)
+
+    def test_recovery_rate_null_when_no_settled(self, staff_client, clean_slate):
+        camp = _mk_campaign(_mk_conn())
+        _mk_dms(camp, SentDMLog.Status.RECOVERY_PENDING, 3)  # 진행 중만 — 분모 0
+        rec = staff_client.get(URL).data["dm_quality"]["recovery"]
+        assert rec["recoverable_total"] == 3
+        assert rec["recovery_rate"] is None
+
+    def test_empty_state_blocks_present(self, staff_client, clean_slate):
+        data = staff_client.get(URL).data["dm_quality"]
+        assert data["failure_breakdown"] == []
+        assert data["recovery"] == {
+            "recoverable_total": 0,
+            "pending": 0,
+            "recovered": 0,
+            "expired": 0,
+            "recovery_rate": None,
+        }

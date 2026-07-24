@@ -24,6 +24,7 @@ from apps.admin_api.views.autodm import (
     AdminDMLogListView,
     AdminDMLogRetryView,
     AdminDMLogReverifyView,
+    AdminDMRecipientListView,
     AdminDMVerificationStatsView,
     AdminIGConnectionListView,
 )
@@ -32,16 +33,16 @@ from apps.admin_api.views.dashboard import AdminMetricsOverviewView
 from apps.admin_api.views.dashboard_marketing import AdminMarketingDashboardView
 from apps.admin_api.views.dashboard_ops import AdminOpsDashboardView
 from apps.admin_api.views.identity import AdminMeView
-from apps.admin_api.views.referral import (
-    AdminReferralCodeDetailView,
-    AdminReferralCodeListCreateView,
-    AdminReferralCodeRedemptionsView,
-)
 from apps.admin_api.views.pages import (
     AdminPageDetailView,
     AdminPageInquiryListView,
     AdminPageListView,
     AdminPageSubscriptionListView,
+)
+from apps.admin_api.views.referral import (
+    AdminReferralCodeDetailView,
+    AdminReferralCodeListCreateView,
+    AdminReferralCodeRedemptionsView,
 )
 from apps.admin_api.views.users import (
     AdminUserDetailView,
@@ -129,6 +130,7 @@ urlpatterns = [
         AdminCampaignResumeView.as_view(),
         name="campaign-resume",
     ),
+    path("auto-dm/recipients/", AdminDMRecipientListView.as_view(), name="dm-recipient-list"),
     path("auto-dm/logs/", AdminDMLogListView.as_view(), name="dmlog-list"),
     path("auto-dm/logs/<uuid:pk>/", AdminDMLogDetailView.as_view(), name="dmlog-detail"),
     path(

@@ -45,6 +45,7 @@ from .services import (
     InstagramMessagingService,
     InstagramOAuthService,
     MockInstagramProvider,
+    is_instagram_permalink,
     scrub_secrets,
 )
 
@@ -2249,6 +2250,40 @@ def snapshot_baseline_for_account(ig_connection_id: str):
         ]
     )
     return {"status": "ok", "baseline_media_id": conn.last_seen_media_id}
+
+
+@shared_task(name="integrations.backfill_campaign_media_permalink")
+def backfill_campaign_media_permalink(campaign_id: str) -> dict:
+    """특정 게시물(specific_media) 캠페인의 ``media_url`` 을 IG permalink 로 백필 (best-effort).
+
+    media_url 은 원래 참고용 자유 입력이라 permalink 가 아닐 수 있다. 어드민/표시용으로 실제
+    게시물 링크를 확보하기 위해, media_id 로 Graph permalink 를 조회해 채운다. 이미 permalink 가
+    들어 있으면 skip. 캠페인 생성/attach 직후 비동기 enqueue (요청 경로를 막지 않음).
+    """
+    campaign = AutoDMCampaign.objects.select_related("ig_connection").filter(id=campaign_id).first()
+    if campaign is None or not campaign.media_id:
+        return {"status": "skipped", "reason": "no campaign or media_id"}
+    if is_instagram_permalink(campaign.media_url):
+        return {"status": "skipped", "reason": "already permalink"}
+
+    conn = campaign.ig_connection
+    if conn is None or conn.status != IGAccountConnection.Status.ACTIVE:
+        return {"status": "skipped", "reason": "ig connection not active"}
+
+    try:
+        permalink = InstagramMediaService.get_media_permalink(
+            media_id=campaign.media_id, access_token=conn.access_token
+        )
+    except Exception as e:  # best-effort — 표시용 보강이라 실패해도 캠페인엔 무해
+        logger.warning("backfill_campaign_media_permalink: API failed cid=%s: %s", campaign_id, e)
+        return {"status": "api_error", "error": str(e)}
+
+    if not permalink:
+        return {"status": "no_permalink"}
+
+    campaign.media_url = permalink
+    campaign.save(update_fields=["media_url", "updated_at"])
+    return {"status": "ok", "permalink": permalink}
 
 
 @shared_task
