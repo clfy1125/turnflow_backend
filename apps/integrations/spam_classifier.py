@@ -37,43 +37,46 @@ SPAM_CONFIDENCE_THRESHOLD = 0.9
 # 판정 JSON 은 매우 짧으므로 출력 토큰을 작게 → 빠르고 이어받기(continuation) 불필요.
 GEMMA_MAX_TOKENS = 64
 
-# 스팸 판정 시스템 프롬프트.
+# 스팸 판정 시스템 프롬프트 — spam-lab v3 (2026.07.23-v3, sha 5e6b06680d30, 실측 590 tokens).
+# ⚠ 이식 규칙(PORT.md): lab `spam_filter/prompt.py` 의 SPAM_SYSTEM_PROMPT 와 **바이트 동일**
+#   유지. 수정은 lab 에서 A/B 검증(CFPR 비악화·clean→spam FLIP 0) 후 여기로만 복사한다.
 #
-# 핵심 원칙: "댓글이 홍보처럼 들리는가"가 아니라 "댓글 작성자가 **다른 독자를 상대로**
-# 스팸/사기/유인 행위를 하는가"를 판정한다. 이 계정들은 대부분 리드젠/이벤트 캠페인
-# ("댓글에 키워드 달면 DM 으로 가이드/링크/자료 드려요")을 돌리므로, 팬들은 **의도적으로**
-# 아주 짧은 댓글(키워드 한 단어·자료 요청·칭찬·이모지)을 단다 = 원하는 반응이지 스팸이 아님.
-#
-# 회귀 방지(2026-07-21~22 3dragon_pd): "설치링크 부탁드려요"→phishing, 짧은 리드젠 키워드
-# ("가이드"·"용피디"·"클로드")·이모지가 promo/scam/adult 로 오분류되던 문제. 특히 이전 프롬프트가
-# 'DM 주세요' 유인 을 SPAM 예시로 넣어, 가장 흔한 정상 리드젠 요청을 스팸으로 유도했음.
+# 판정 정책(POLICY.md): "진짜 스팸만 잡는다" — 사기·성인유인·피싱·무관광고·외부유인 뿐.
+# ① 악플(욕설·조롱·혐오)은 무례해도 스팸이 아님 → 절대 숨기지 않음(운영자 정책 2026-07-23,
+#    v2 의 abuse 검출은 정책과 반대라 폐기. 실측: golden CFPR 7.9%→0%, 스팸 recall 100%).
+# ② 리드젠 팬 댓글(짧은 키워드·자료요청·이모지)은 원하는 반응 = NOT SPAM (2026-07-22 회귀 픽스:
+#    옛 프롬프트의 'DM 주세요' 유인=SPAM 프라이밍이 "설치링크 부탁드려요"→phishing 오탐 유발).
+# ③ 판정축 = "작성자가 **다른 독자를 상대로** 유인/사기하는가" (홍보처럼 들리는지가 아님).
 _SPAM_SYSTEM_PROMPT = (
     "You are a spam/scam moderation classifier for Instagram comments (Korean + English). "
-    "Judge ONE comment: decide whether the COMMENTER is spamming — trying to scam, phish, "
-    "mass-advertise, or lure OTHER readers somewhere. Do NOT judge whether the comment merely "
+    "Judge ONE comment: is the COMMENTER spamming — scamming, phishing, mass-advertising, "
+    "or luring OTHER readers somewhere? Do NOT judge whether it merely "
     "'sounds' promotional.\n"
     "CONTEXT: These accounts run lead-generation / giveaway campaigns — the creator says "
     "'comment a keyword to get a guide/link/freebie via DM'. So fans intentionally leave VERY "
-    "SHORT comments: a single keyword, a request for the offered item, praise, or an emoji. "
+    "SHORT comments — a keyword, a request, praise, or an emoji. "
     "That is the DESIRED response, NOT spam.\n"
     "NOT SPAM (is_spam=false):\n"
     "- Short comments, a single word/keyword, or emoji-only "
-    "(e.g. '가이드', '신청', '클로드', '용피디', '60분', '🔥', '👏').\n"
+    "(e.g. '가이드', '신청', '용피디', '🔥').\n"
     "- Asking for what the creator offered: '링크 주세요', 'DM 주세요', '가이드 부탁드려요', "
-    "'설치링크 알려주세요', '자료 공유 부탁드립니다' — the commenter REQUESTS for themselves, "
-    "they are not luring others.\n"
-    "- Genuine questions, interest, praise, criticism, normal talk, tagging a friend, "
-    "giveaway participation.\n"
-    "SPAM (is_spam=true) — ONLY when the commenter clearly acts against other readers:\n"
+    "'설치링크 알려주세요' — the commenter REQUESTS for themselves, "
+    "not luring others.\n"
+    "- Genuine questions, praise, criticism, normal talk, "
+    "tagging a friend, giveaway participation.\n"
+    "- Insults, mockery, or hate toward the creator or readers "
+    "('관종짓 그만해라', 'you are a fraud') — abusive but NOT spam. Never hide these.\n"
+    "SPAM (is_spam=true) — ONLY when the commenter lures, scams, or mass-advertises "
+    "to the creator's audience:\n"
     "- Posts scam/betting/investment/adult links, or drives traffic elsewhere "
     "('주소창 ○○', '실시간검색 ○○', '원본영상' 프사 유인, telegram/kakao open-chat to third parties).\n"
-    "- Phishing or impersonation (fake giveaway / fake support account harvesting info).\n"
-    "- Mass unsolicited advertising of an unrelated product or service.\n"
-    "- Sexual solicitation / adult-content baiting aimed at readers; abuse, hate, harassment.\n"
-    "RULES: A short comment with NO link, NO third-party @handle, and NO lure aimed at others "
-    "is CLEAN — default is_spam=false. 'Requesting X for myself' is CLEAN; only 'DM me / click "
-    "here to get X' from an unrelated promoter is SPAM. When unsure, choose is_spam=false. "
-    "Set is_spam=true only at high confidence.\n"
+    "- Phishing or impersonation (fake giveaway/support account harvesting info).\n"
+    "- Mass unsolicited ads for an unrelated product/service → promo.\n"
+    "- Sexual solicitation / adult-content baiting aimed at readers.\n"
+    "RULES: A comment with NO link, NO third-party @handle and NO lure aimed at others is "
+    "CLEAN — default is_spam=false, even if rude or angry. 'Requesting X for myself' is "
+    "CLEAN; only 'DM me / click here to get X' from an unrelated promoter is SPAM. "
+    "When unsure choose is_spam=false; set true only at high confidence.\n"
     "Reply with ONLY a compact JSON object, no prose, no code fence:\n"
     '{"is_spam": <true|false>, '
     '"category": "<clean|scam|adult|phishing|promo|abuse>", '

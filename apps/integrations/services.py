@@ -1466,17 +1466,52 @@ class InstagramMessagingService:
 
 class SpamDetectionService:
     """
-    스팸 댓글 감지 서비스
+    스팸 댓글 감지 서비스 (규칙 pre-filter — LLM 이전 즉시차단)
+
+    규칙 히트는 authoritative(신뢰도 1.0·gemma 미호출)라 오탐이 fail-open 으로 구제되지
+    않는 가장 비싼 오류다. 그래서 기본 키워드는 2-티어로 나눈다(spam-lab 검증 2026-07-23,
+    실측 rule precision 50%→100%·recall 100% 유지, lab PORT.md):
+
+    - HARD_BLOCK: 스팸 특이 표현만 즉시차단. 일상 대화에서 쓰일 수 있는 단어 금지.
+    - SOFT_SIGNAL: 일상어("무슨 사건이에요?" 같은 정상 댓글에 등장) — 차단하지 않고
+      gemma 판정으로 위임한다(threshold 0.9 + fail-open 이 지배).
+
+    계정별 ``spam_keywords`` 는 오너의 명시적 선택이므로 그대로 authoritative 하드블록.
     """
 
-    # 기본 스팸 키워드 (관리자 설정에서 추가 가능)
-    DEFAULT_SPAM_KEYWORDS = [
-        "아이돌",
-        "주소창",
-        "사건",
+    # 즉시차단 티어 — 스팸 특이 표현만
+    HARD_BLOCK_KEYWORDS = [
         "원본영상",
         "실시간검색",
     ]
+    # 일상어 티어 — 차단 금지, gemma 위임 (진단 참고용 목록)
+    SOFT_SIGNAL_KEYWORDS = [
+        "아이돌",
+        "주소창",
+        "사건",
+    ]
+    # 하위호환 별칭(구 단일 목록 참조 코드용). ⚠ 차단에는 HARD_BLOCK_KEYWORDS 만 쓰인다.
+    DEFAULT_SPAM_KEYWORDS = HARD_BLOCK_KEYWORDS + SOFT_SIGNAL_KEYWORDS
+
+    # 순수 ASCII '단어형' 키워드 판별용 (양끝이 단어문자)
+    _ASCII_WORDLIKE_RE = re.compile(r"^\w(?:.*\w)?$", re.ASCII)
+
+    @classmethod
+    def _keyword_hit(cls, low_text: str, keyword: str) -> bool:
+        """키워드 매칭 — ASCII 단어형은 단어경계(\\b), CJK 는 substring.
+
+        'ad' 가 'download' 에 오매치되지 않게 ASCII 단어형 키워드는 \\b 경계를 요구한다.
+        한국어는 공백 경계가 없으므로 substring 유지. '18+'·'@vip' 처럼 양끝이 단어문자가
+        아닌 ASCII 키워드는 \\b 성립이 불가라 substring 으로 처리(안 그러면 영원히 미적중).
+        한계: Python \\b 는 유니코드 기준이라 'bet모집' 처럼 ASCII+한글이 붙으면 매치되지
+        않는다 — 규칙 miss 는 gemma 가 이어받는 값싼 오류라 수용(spam-lab 2-2).
+        """
+        k = keyword.lower()
+        if k.isascii():
+            if cls._ASCII_WORDLIKE_RE.match(k):
+                return re.search(rf"\b{re.escape(k)}\b", low_text) is not None
+            return k in low_text
+        return k in low_text
 
     @classmethod
     def is_spam(
@@ -1487,7 +1522,7 @@ class SpamDetectionService:
 
         Args:
             text: 검사할 댓글 텍스트
-            spam_keywords: 검사할 스팸 키워드 리스트
+            spam_keywords: 계정별 차단 키워드(없거나 빈 리스트면 기본 HARD_BLOCK 티어 사용)
             check_urls: URL 포함 여부 검사
 
         Returns:
@@ -1503,10 +1538,10 @@ class SpamDetectionService:
         if check_urls and cls._contains_url(text_lower):
             reasons.append("contains_url")
 
-        # 2. 스팸 키워드 검사
-        keywords_to_check = spam_keywords if spam_keywords else cls.DEFAULT_SPAM_KEYWORDS
+        # 2. 스팸 키워드 검사 — 기본 티어는 HARD 만 차단, SOFT 일상어는 gemma 로 위임
+        keywords_to_check = spam_keywords if spam_keywords else cls.HARD_BLOCK_KEYWORDS
         for keyword in keywords_to_check:
-            if keyword.lower() in text_lower:
+            if keyword and cls._keyword_hit(text_lower, keyword):
                 reasons.append(f"keyword:{keyword}")
 
         return len(reasons) > 0, reasons
