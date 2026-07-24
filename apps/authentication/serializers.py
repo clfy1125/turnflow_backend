@@ -32,10 +32,24 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
             "utm_campaign, utm_content, referrer, landing_path}"
         ),
     )
+    # 마케팅(광고성) 수신 동의 — 정보통신망법상 별도 동의. 미체크(False) 기본.
+    # True 로 가입하면 동의 시각(marketing_opt_in_at)까지 함께 기록한다.
+    marketing_opt_in = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="선택 — 마케팅(광고성) 정보 수신 동의 여부. 기본 False.",
+    )
 
     class Meta:
         model = User
-        fields = ["email", "full_name", "password", "password_confirm", "attribution"]
+        fields = [
+            "email",
+            "full_name",
+            "password",
+            "password_confirm",
+            "attribution",
+            "marketing_opt_in",
+        ]
         extra_kwargs = {
             "full_name": {"required": False},
         }
@@ -49,11 +63,20 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         """Create user with encrypted password"""
         attribution = validated_data.pop("attribution", None)
+        marketing_opt_in = validated_data.pop("marketing_opt_in", False)
         validated_data.pop("password_confirm")
+        # 동의한 경우에만 동의 시각을 기록해 단일 INSERT 로 생성한다.
+        extra_fields = {}
+        if marketing_opt_in:
+            from django.utils import timezone
+
+            extra_fields["marketing_opt_in"] = True
+            extra_fields["marketing_opt_in_at"] = timezone.now()
         user = User.objects.create_user(
             email=validated_data["email"],
             full_name=validated_data.get("full_name", ""),
             password=validated_data["password"],
+            **extra_fields,
         )
         # 가입 유입 attribution 저장 — 절대 예외를 던지지 않아 가입을 막지 않는다.
         from apps.analytics.attribution import capture_signup_attribution
@@ -75,6 +98,8 @@ class UserSerializer(serializers.ModelSerializer):
             "email_verified_at",
             "date_joined",
             "last_login",
+            "marketing_opt_in",
+            "marketing_opt_in_at",
         ]
         read_only_fields = [
             "id",
@@ -82,6 +107,10 @@ class UserSerializer(serializers.ModelSerializer):
             "email_verified_at",
             "date_joined",
             "last_login",
+            # 동의 자체(marketing_opt_in)는 이 출력용 시리얼라이저로 수정하지 않는다
+            # (수정은 UserUpdateSerializer). 동의 시각은 서버가 파생하므로 항상 read-only.
+            "marketing_opt_in",
+            "marketing_opt_in_at",
         ]
 
 
@@ -90,7 +119,25 @@ class UserUpdateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = User
-        fields = ["full_name"]
+        fields = ["full_name", "marketing_opt_in"]
+
+    def update(self, instance, validated_data):
+        """full_name/marketing_opt_in 갱신.
+
+        marketing_opt_in 이 바뀌면 동의 시각(marketing_opt_in_at)을 서버가 파생한다:
+        - False→True: 지금 시각을 동의 시각으로 기록
+        - True→False: 동의 철회 → 동의 시각 제거
+        (수신거부 링크·설정 토글이 모두 이 한 필드로 수렴한다.)
+        """
+        from django.utils import timezone
+
+        if "marketing_opt_in" in validated_data:
+            new_val = validated_data["marketing_opt_in"]
+            if new_val and not instance.marketing_opt_in:
+                instance.marketing_opt_in_at = timezone.now()
+            elif not new_val:
+                instance.marketing_opt_in_at = None
+        return super().update(instance, validated_data)
 
 
 class TokenSerializer(serializers.Serializer):
@@ -134,4 +181,9 @@ class GoogleLoginSerializer(serializers.Serializer):
     attribution = serializers.JSONField(
         required=False,
         help_text="선택 — 가입 유입 attribution 객체 (신규 가입 시에만 저장)",
+    )
+    marketing_opt_in = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="선택 — 마케팅 수신 동의 (신규 가입 시에만 반영). 기본 False.",
     )

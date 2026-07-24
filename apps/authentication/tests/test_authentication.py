@@ -32,7 +32,7 @@ class TestAuthenticationFlow:
 
     def test_user_registration_success(self, api_client, test_user_data):
         """Test successful user registration"""
-        url = "/api/v1/auth/register"
+        url = "/api/v1/auth/register/"
         response = api_client.post(url, test_user_data, format="json")
 
         assert response.status_code == status.HTTP_201_CREATED
@@ -48,7 +48,7 @@ class TestAuthenticationFlow:
     def test_user_registration_password_mismatch(self, api_client, test_user_data):
         """Test registration with password mismatch"""
         test_user_data["password_confirm"] = "DifferentPass123!"
-        url = "/api/v1/auth/register"
+        url = "/api/v1/auth/register/"
         response = api_client.post(url, test_user_data, format="json")
 
         assert response.status_code == status.HTTP_400_BAD_REQUEST
@@ -56,13 +56,10 @@ class TestAuthenticationFlow:
     def test_user_registration_duplicate_email(self, api_client, test_user_data):
         """Test registration with duplicate email"""
         # Create first user
-        User.objects.create_user(
-            email=test_user_data["email"], username="firstuser", password=test_user_data["password"]
-        )
+        User.objects.create_user(email=test_user_data["email"], password=test_user_data["password"])
 
         # Try to register with same email
-        test_user_data["username"] = "seconduser"
-        url = "/api/v1/auth/register"
+        url = "/api/v1/auth/register/"
         response = api_client.post(url, test_user_data, format="json")
 
         assert response.status_code == status.HTTP_400_BAD_REQUEST
@@ -72,12 +69,11 @@ class TestAuthenticationFlow:
         # Create user first
         User.objects.create_user(
             email=test_user_data["email"],
-            username=test_user_data["username"],
             password=test_user_data["password"],
         )
 
         # Login
-        url = "/api/v1/auth/login"
+        url = "/api/v1/auth/login/"
         login_data = {"email": test_user_data["email"], "password": test_user_data["password"]}
         response = api_client.post(url, login_data, format="json")
 
@@ -89,7 +85,7 @@ class TestAuthenticationFlow:
 
     def test_user_login_invalid_credentials(self, api_client, test_user_data):
         """Test login with invalid credentials"""
-        url = "/api/v1/auth/login"
+        url = "/api/v1/auth/login/"
         login_data = {"email": test_user_data["email"], "password": "WrongPassword123!"}
         response = api_client.post(url, login_data, format="json")
 
@@ -100,7 +96,6 @@ class TestAuthenticationFlow:
         # Create and login user
         user = User.objects.create_user(
             email=test_user_data["email"],
-            username=test_user_data["username"],
             password=test_user_data["password"],
             full_name=test_user_data["full_name"],
         )
@@ -113,17 +108,16 @@ class TestAuthenticationFlow:
 
         # Access /me endpoint
         api_client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token}")
-        url = "/api/v1/auth/me"
+        url = "/api/v1/auth/me/"
         response = api_client.get(url)
 
         assert response.status_code == status.HTTP_200_OK
         assert response.data["email"] == test_user_data["email"]
-        assert response.data["username"] == test_user_data["username"]
         assert response.data["full_name"] == test_user_data["full_name"]
 
     def test_me_endpoint_unauthenticated(self, api_client):
         """Test /me endpoint without authentication"""
-        url = "/api/v1/auth/me"
+        url = "/api/v1/auth/me/"
         response = api_client.get(url)
 
         assert response.status_code == status.HTTP_401_UNAUTHORIZED
@@ -131,12 +125,12 @@ class TestAuthenticationFlow:
     def test_complete_flow_register_login_me(self, api_client, test_user_data):
         """Test complete flow: Register → Login → Get Profile"""
         # Step 1: Register
-        register_url = "/api/v1/auth/register"
+        register_url = "/api/v1/auth/register/"
         register_response = api_client.post(register_url, test_user_data, format="json")
         assert register_response.status_code == status.HTTP_201_CREATED
 
         # Step 2: Login
-        login_url = "/api/v1/auth/login"
+        login_url = "/api/v1/auth/login/"
         login_data = {"email": test_user_data["email"], "password": test_user_data["password"]}
         login_response = api_client.post(login_url, login_data, format="json")
         assert login_response.status_code == status.HTTP_200_OK
@@ -145,18 +139,17 @@ class TestAuthenticationFlow:
 
         # Step 3: Get profile
         api_client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token}")
-        me_url = "/api/v1/auth/me"
+        me_url = "/api/v1/auth/me/"
         me_response = api_client.get(me_url)
 
         assert me_response.status_code == status.HTTP_200_OK
         assert me_response.data["email"] == test_user_data["email"]
 
     def test_update_profile(self, api_client, test_user_data):
-        """Test updating user profile"""
+        """Test updating user profile — PATCH 는 갱신된 프로필 전체를 반환한다."""
         # Create user and get token
         user = User.objects.create_user(
             email=test_user_data["email"],
-            username=test_user_data["username"],
             password=test_user_data["password"],
         )
 
@@ -167,10 +160,80 @@ class TestAuthenticationFlow:
 
         # Update profile
         api_client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token}")
-        url = "/api/v1/auth/me"
-        update_data = {"full_name": "Updated Name", "username": "updatedusername"}
+        url = "/api/v1/auth/me/"
+        update_data = {"full_name": "Updated Name"}
         response = api_client.patch(url, update_data, format="json")
 
         assert response.status_code == status.HTTP_200_OK
         assert response.data["full_name"] == "Updated Name"
-        assert response.data["username"] == "updatedusername"
+        # 응답은 프로필 전체 (GET /me 와 동일 형식)
+        assert response.data["email"] == test_user_data["email"]
+        assert "marketing_opt_in" in response.data
+
+    def test_register_with_marketing_opt_in_records_consent(self, api_client, test_user_data):
+        """marketing_opt_in=true 가입 시 동의와 동의 시각이 기록된다."""
+        url = "/api/v1/auth/register/"
+        payload = {**test_user_data, "marketing_opt_in": True}
+        response = api_client.post(url, payload, format="json")
+
+        assert response.status_code == status.HTTP_201_CREATED
+        assert response.data["user"]["marketing_opt_in"] is True
+
+        user = User.objects.get(email=test_user_data["email"])
+        assert user.marketing_opt_in is True
+        assert user.marketing_opt_in_at is not None
+
+    def test_register_defaults_marketing_opt_in_false(self, api_client, test_user_data):
+        """marketing_opt_in 미전송 시 기본 False, 동의 시각 없음."""
+        url = "/api/v1/auth/register/"
+        response = api_client.post(url, test_user_data, format="json")
+
+        assert response.status_code == status.HTTP_201_CREATED
+        assert response.data["user"]["marketing_opt_in"] is False
+
+        user = User.objects.get(email=test_user_data["email"])
+        assert user.marketing_opt_in is False
+        assert user.marketing_opt_in_at is None
+
+    def test_me_response_exposes_marketing_opt_in(self, api_client, test_user_data):
+        """GET /me 응답에 marketing_opt_in 필드가 노출된다 (프론트 토글 fail-closed 게이트)."""
+        user = User.objects.create_user(
+            email=test_user_data["email"], password=test_user_data["password"]
+        )
+        from rest_framework_simplejwt.tokens import RefreshToken
+
+        access_token = str(RefreshToken.for_user(user).access_token)
+        api_client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token}")
+
+        response = api_client.get("/api/v1/auth/me/", format="json")
+        assert response.status_code == status.HTTP_200_OK
+        assert response.data["marketing_opt_in"] is False
+        assert "marketing_opt_in_at" in response.data
+
+    def test_patch_marketing_opt_in_toggles_consent_timestamp(self, api_client, test_user_data):
+        """PATCH 로 동의를 켜면 시각 기록, 끄면(수신거부) 시각 제거."""
+        user = User.objects.create_user(
+            email=test_user_data["email"], password=test_user_data["password"]
+        )
+        from rest_framework_simplejwt.tokens import RefreshToken
+
+        access_token = str(RefreshToken.for_user(user).access_token)
+        api_client.credentials(HTTP_AUTHORIZATION=f"Bearer {access_token}")
+        url = "/api/v1/auth/me/"
+
+        # 동의 ON
+        on = api_client.patch(url, {"marketing_opt_in": True}, format="json")
+        assert on.status_code == status.HTTP_200_OK
+        assert on.data["marketing_opt_in"] is True
+        user.refresh_from_db()
+        assert user.marketing_opt_in is True
+        assert user.marketing_opt_in_at is not None
+
+        # 수신거부 OFF → 동의 시각 제거
+        off = api_client.patch(url, {"marketing_opt_in": False}, format="json")
+        assert off.status_code == status.HTTP_200_OK
+        assert off.data["marketing_opt_in"] is False
+        assert off.data["marketing_opt_in_at"] is None
+        user.refresh_from_db()
+        assert user.marketing_opt_in is False
+        assert user.marketing_opt_in_at is None
