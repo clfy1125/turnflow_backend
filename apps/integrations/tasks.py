@@ -22,6 +22,7 @@ from django.db.models import Q
 from django.utils import timezone
 
 from .dm_exceptions import (
+    ALREADY_REPLIED_SUBCODE,
     DMSendError,
     DMTransientError,
     ErrorClassification,
@@ -551,6 +552,22 @@ def _flip_recovery_on_success(log, campaign) -> int:
             {"path": "recovery", "result": "recovered_by_new_send", "new_log_id": str(log.id)}
         )
     return len(pendings)
+
+
+def _confirm_delivered_via_conv(log, campaign, tag: str) -> dict:
+    """Conversations 로 '이미 우리가 이 수신자에게 보냈음'이 확인된 발송을 도착 확정 처리.
+
+    사설답장(댓글당 1회·비멱등)의 500-but-delivered / 2534023("이미 답글") 오탐을 '도착'으로
+    승격하는 단일 지점 — 재시도 전 재확인 게이트와 except 블록의 recent=True 처리가 공유한다.
+    (성공 ack 유실로 message_id 를 못 받았어도, 실제 도착이 확인되면 도착으로 집계한다.)
+    """
+    log.mark_accepted(message_id="", api_response={"verify_via": tag, "recent": True})
+    if log.parent_log_id is None:
+        campaign.increment_sent()
+    _flip_recovery_on_success(log, campaign)
+    log.mark_delivered(via=SentDMLog.VerifiedVia.CONV_API)
+    log.append_verification_log({"path": tag, "result": "confirmed_sent"})
+    return {"status": "delivered", "via": f"{tag}_conv_api"}
 
 
 # ===== 진입점 =====
@@ -1575,6 +1592,27 @@ def send_dm_task(self, log_id: str):
         log.save(update_fields=["next_retry_at", "status"])
         return {"status": "deferred", "reason": reason, "retry_after": retry_after}
 
+    # ★ P0 (2534023 오탐 방지 — 사설답장 재시도 멱등화):
+    # 사설답장(첫 DM: comment_id 有 + parent 無)은 '댓글당 1회'라 비멱등이다. 1차 발송이 실제로
+    # 도착했는데 Meta 가 500/타임아웃을 반환하면(=성공 ack 유실) 재시도가 돌고, 그 재시도는
+    # 2534023("이미 답글")을 받아 '이미 도착한 DM'을 '도착 미확인'으로 잃는다(실측: ellisa_levelup).
+    # 재시도(retry_count>0)면 재발송 전에 Conversations 로 이미 보냈는지 재확인한다 — 백오프 뒤라
+    # 인덱싱이 끝나 신뢰도가 높다. 확인되면 도착 확정하고 재POST 를 건너뛴다.
+    is_private_reply = bool(log.comment_id) and log.parent_log_id is None
+    if is_private_reply and (log.retry_count or 0) > 0:
+        _since = int((timezone.now() - log.created_at).total_seconds()) + 120
+        recent = InstagramMessagingService.has_recent_message_to_recipient(
+            ig_user_id=ig_conn.external_account_id,
+            recipient_id=log.recipient_user_id,
+            access_token=ig_conn.access_token,
+            since_seconds=_since,
+        )
+        if recent is True:
+            return _confirm_delivered_via_conv(log, campaign, "verify_before_resend")
+        # recent False(정말 미도착)/None(확인 불가) → 정상 발송 진행. 사설답장은 Meta 가 댓글당
+        # 1회를 강제하므로 설령 이미 도착했더라도 재POST 는 2534023 을 받아 아래 except 에서 다시
+        # 도착으로 흡수된다 → 실제 중복 DM 은 발생하지 않는다(무손실 우선).
+
     log.mark_submitting()
 
     # Follow-gate: opening DM + PENDING 이면 generic template 버튼 첨부.
@@ -1626,7 +1664,22 @@ def send_dm_task(self, log_id: str):
         # 명시적 rate-limit(4/17/32/368/613)은 '요청 거부' 라 전달 없음 → 검증 없이 정상 defer.
         from .dm_exceptions import DMAnomalyError
 
-        maybe_delivered = isinstance(e, DMAnomalyError) or e.code in (1, 2)
+        # 사설답장(댓글당 1회·비멱등)은 5xx/타임아웃에도 실제로는 도착한 경우가 잦고
+        # (delivered-but-500), 2534023("이미 답글")은 우리 1차가 이미 성공했다는 강한 증거다.
+        # 이들도 blind 재발송 대신 도착 확인 대상에 넣는다. 단, 명시적 rate-limit(4/17/32/368/613)은
+        # '요청 거부 → 미전달'이라 제외(검증 없이 정상 defer).
+        already_replied = getattr(e, "subcode", None) == ALREADY_REPLIED_SUBCODE
+        _rate_limit_codes = {4, 17, 32, 368, 613}
+        maybe_delivered = (
+            isinstance(e, DMAnomalyError)
+            or e.code in (1, 2)
+            or already_replied
+            or (
+                is_private_reply
+                and isinstance(e, DMTransientError)
+                and e.code not in _rate_limit_codes
+            )
+        )
         if maybe_delivered:
             _tag = "anomaly" if isinstance(e, DMAnomalyError) else f"err_code_{e.code}"
             recent = InstagramMessagingService.has_recent_message_to_recipient(
@@ -1637,16 +1690,7 @@ def send_dm_task(self, log_id: str):
             )
             if recent is True:
                 # 발송 확인됨 → 재발송 금지, 도착 확정 처리(conv_api 로 확인).
-                log.mark_accepted(
-                    message_id="", api_response={"maybe_delivered": _tag, "recent": True}
-                )
-                if log.parent_log_id is None:
-                    campaign.increment_sent()
-                # 접수 확정 = 복구 성공 정산 대상 ('어떤 발송이든 같은 수신자 접수 시 승격' 계약)
-                _flip_recovery_on_success(log, campaign)
-                log.mark_delivered(via=SentDMLog.VerifiedVia.CONV_API)
-                log.append_verification_log({"path": _tag, "result": "confirmed_sent"})
-                return {"status": "delivered", "via": f"{_tag}_conv_api"}
+                return _confirm_delivered_via_conv(log, campaign, _tag)
             if recent is None and isinstance(e, DMAnomalyError):
                 # 200-no-mid + 확인 불가 → 중복 방지 우선: 재발송 안 함('미확인' 분리 집계).
                 # (code 1/2 는 여기서 종결하지 않고 아래 defer+retry 로 흘린다 — 무손실 우선.
