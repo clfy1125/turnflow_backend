@@ -3415,6 +3415,13 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
 
             snapshot_baseline_for_account.delay(str(ig_connection.id))
 
+        # specific_media: media_url 이 참고용 자유입력이라 permalink 가 아닐 수 있음 →
+        # 어드민/표시용 게시물 링크(IG permalink)를 비동기 백필 (best-effort, 요청 경로 비차단).
+        if campaign.trigger_type == AutoDMCampaign.TriggerType.SPECIFIC_MEDIA and campaign.media_id:
+            from .tasks import backfill_campaign_media_permalink
+
+            backfill_campaign_media_permalink.delay(str(campaign.id))
+
         response_serializer = AutoDMCampaignSerializer(campaign)
         return Response(response_serializer.data, status=status.HTTP_201_CREATED)
 

@@ -108,9 +108,10 @@ offer_shown      offer_accepted      offer_declined
 - 해지 후 `WINBACK_AFTER_DAYS`(기본 30) 일 경과한 **유료 이탈자**에게 복귀 유도 메일 발송.
 - **마케팅 수신 동의자**(`user.marketing_opt_in`)에게만(정보통신망법). 발송 이력(EmailLog)으로 중복 방지.
 - 매일 배치(`billing.send_winback_emails`) + 전용 이메일 템플릿(`winback`) 구현.
-- **현재 dormant**: `WINBACK_ENABLED=False`(기본) + 동의 수집 경로 미연결이라 실발송 0.
-  → **동의 수집(가입/설정 체크박스 → `marketing_opt_in`)** 이 붙고 `WINBACK_ENABLED=True` 전환 시 활성화됩니다.
-  프론트에서 마케팅 동의 UI를 추가할 계획이면 알려주세요(auth 필드/엔드포인트 연결).
+- **현재 dormant**: `WINBACK_ENABLED=False`(기본) → 실발송 0. **2026-07-23 제품 결정: 계속 dormant 유지**
+  (이메일 리텐션 대신 인앱 즉시 50% 할인 API `retention-offer/apply` 사용). 코드/템플릿은 존치.
+- **동의 수집(`marketing_opt_in`)은 2026-07-23 연결 완료** — register / GET·PATCH me / google.
+  윈백과 무관하게 정보통신망법상 필수라 연결함. 상세: [MARKETING_OPT_IN_FRONTEND.md](MARKETING_OPT_IN_FRONTEND.md).
 
 ---
 

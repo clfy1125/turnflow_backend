@@ -121,6 +121,12 @@ class _DmSeriesBucketSerializer(serializers.Serializer):
 
     ts = serializers.DateTimeField(help_text="버킷 시작 시각 (Asia/Seoul ISO 8601)")
     requested = serializers.IntegerField(help_text="버킷 내 생성된 DM 로그 수 (전 상태)")
+    opening = serializers.IntegerField(
+        help_text="오프닝 요청 (dm_kind ∈ {opening, standalone}). requested 를 2색 스택 분해용."
+    )
+    interaction = serializers.IntegerField(
+        help_text="상호작용 요청 (dm_kind = reward). opening + interaction == requested."
+    )
     succeeded = serializers.IntegerField(
         help_text="delivered+read (+legacy sent, +recovery_delivered)"
     )
@@ -144,10 +150,55 @@ class _DmSeriesSerializer(serializers.Serializer):
     buckets = _DmSeriesBucketSerializer(many=True, help_text="제로필된 버킷 리스트 (ts 오름차순)")
 
 
+class _DmFailureBreakdownSerializer(serializers.Serializer):
+    """오류 1종 — (error_code, error_subcode, status) 묶음 카운트 (J-1)."""
+
+    code = serializers.CharField(
+        allow_blank=True,
+        help_text="SentDMLog.error_code (예: '190','10','100'). 코드 없는 실패는 빈 문자열.",
+    )
+    subcode = serializers.CharField(
+        allow_blank=True,
+        help_text="SentDMLog.error_subcode (예: '2534025'=숨김채널). 없으면 빈 문자열.",
+    )
+    status = serializers.CharField(
+        help_text="SentDMLog.status (failed_token/failed_window/failed_param/"
+        "failed_no_trace/recovery_pending/recovery_expired/legacy). 프론트 dmLogStatus 라벨로 렌더."
+    )
+    count = serializers.IntegerField(help_text="윈도우 내 해당 (code,subcode,status) 건 수")
+    recoverable = serializers.BooleanField(
+        help_text="복구/재검증 경로가 있는 실패인가. failed_no_trace(재검증)·recovery_*·"
+        "failed_param@2534025(숨김채널 복구)=true, 나머지 하드 실패=false."
+    )
+
+
+class _DmRecoverySerializer(serializers.Serializer):
+    """복구 퍼널 — 숨김채널 재댓글 복구(recovery_*) 상태 집계 (J-1)."""
+
+    recoverable_total = serializers.IntegerField(
+        help_text="복구 경로에 들어온 총계 = pending + recovered + expired"
+    )
+    pending = serializers.IntegerField(help_text="recovery_pending — 복구 진행 중(안내 답글 게시)")
+    recovered = serializers.IntegerField(help_text="recovery_delivered — 복구 재전송 성공")
+    expired = serializers.IntegerField(help_text="recovery_expired — 복구 대기 만료(실패)")
+    recovery_rate = serializers.FloatField(
+        allow_null=True,
+        help_text="recovered / (recovered + expired). 진행 중(pending) 제외, 표본 없으면 null.",
+    )
+
+
 class _DmQualitySerializer(serializers.Serializer):
     """DM 발송 품질 블록 (SentDMLog, created_at >= since)."""
 
     requested = serializers.IntegerField(help_text="윈도우 내 생성된 DM 로그 수 (전 상태)")
+    opening_requested = serializers.IntegerField(
+        help_text="오프닝 요청 수 — 트리거로 나간 첫 DM. dm_kind ∈ {opening, standalone} "
+        "(게이트 미사용 단발 포함). null/legacy dm_kind 는 오프닝 범주로 귀속."
+    )
+    interaction_requested = serializers.IntegerField(
+        help_text="상호작용 요청 수 — 오프닝 이후 같은 DM창 후속 발송. dm_kind = reward. "
+        "불변식: opening_requested + interaction_requested == requested."
+    )
     succeeded = serializers.IntegerField(
         help_text="delivered+read (+legacy sent, +recovery_delivered=복구 재전송 성공)"
     )
@@ -171,6 +222,11 @@ class _DmQualitySerializer(serializers.Serializer):
         help_text="(delivered+read) / (accepted+delivered+read+failed_no_trace) — "
         "dm-verification/stats 와 동일 공식"
     )
+    failure_breakdown = _DmFailureBreakdownSerializer(
+        many=True,
+        help_text="오류 세분화 — (code,subcode,status) 묶음 카운트 (count desc). KPI 드릴다운용.",
+    )
+    recovery = _DmRecoverySerializer(help_text="복구 퍼널 (recovery_* 상태 집계).")
     series = _DmSeriesSerializer(help_text="시계열 (제로필)")
 
 

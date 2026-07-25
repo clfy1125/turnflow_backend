@@ -159,6 +159,17 @@ class TestClassifier:
             v = classify_comment("한번 보고 가세요 좋은 상품", spam_keywords=[], block_urls=True)
         assert not v.is_spam and v.engine == "llm_lowconf"
 
+    def test_llm_085_confidence_suppressed_by_threshold(self):
+        """문턱 0.9 회귀 가드: 실제 오탐("설치링크 부탁드려요"→phishing 0.85)이 억제돼야 한다.
+
+        2026-07-22 3dragon_pd: gemma 가 짧은 리드젠 요청을 phishing 0.85 로 오탐 → detected.
+        프롬프트 개선과 함께 문턱을 0.9 로 올려 0.7~0.9 구간 오탐을 자동 fail-open 시킨다.
+        """
+        fake = _fake_llm('{"is_spam": true, "category": "phishing", "confidence": 0.85}')
+        with mock.patch.object(spam_classifier, "call_llm_messages_with_usage", return_value=fake):
+            v = classify_comment("설치링크 부탁드려요.", spam_keywords=[], block_urls=True)
+        assert not v.is_spam and v.engine == "llm_lowconf"
+
     def test_llm_failopen_on_exception(self):
         with mock.patch.object(
             spam_classifier, "call_llm_messages_with_usage", side_effect=RuntimeError("timeout")
@@ -175,6 +186,135 @@ class TestClassifier:
                 "애매한 댓글 무엇일까요 판단 필요", spam_keywords=[], block_urls=True
             )
         assert not v.is_spam and v.engine == "llm_failopen"
+
+    def test_prompt_biases_leadgen_short_comments_clean(self):
+        """프롬프트 회귀 가드(2026-07-22 3dragon_pd 오탐).
+
+        리드젠/짧은 요청 댓글을 스팸으로 몰던 원인이 프롬프트였으므로, 시스템 프롬프트가
+        리드젠 맥락·짧은 키워드/요청·이모지를 NOT SPAM 으로 안내하는지 고정한다. 특히
+        옛 프롬프트의 "'DM 주세요' 유인 = SPAM" 프라이밍이 되살아나지 않게 한다.
+        """
+        p = spam_classifier._SPAM_SYSTEM_PROMPT
+        # 리드젠/이벤트 맥락을 명시
+        assert "lead-generation" in p and "giveaway" in p
+        # 짧은 키워드/요청/이모지를 NOT SPAM 으로 안내
+        assert "REQUESTS for themselves" in p or "REQUESTS" in p
+        assert "emoji-only" in p
+        # 애매하면 정상으로
+        assert "default is_spam=false" in p
+        # 옛 프롬프트의 위험한 프라이밍(무조건 'DM 주세요'=스팸)이 남아있지 않아야 함
+        assert "'DM 주세요' 유인)" not in p
+
+    def test_prompt_v3_policy_abuse_is_not_spam(self):
+        """프롬프트 v3 정책 핀(spam-lab 2026-07-23, 운영자 확정): 악플은 스팸이 아니다.
+
+        욕설·조롱·혐오는 무례해도 절대 숨기지 않는다 — 스팸(유인·사기·광고)만 잡는다.
+        abuse 검출 버전(lab v2)이 정책과 반대라 폐기된 이력이 있어 회귀를 여기서 고정한다.
+        """
+        p = spam_classifier._SPAM_SYSTEM_PROMPT
+        assert "Never hide these" in p
+        assert "even if rude or angry" in p
+
+    def test_prompt_v3_byte_identical_to_lab(self):
+        """이식 드리프트 가드(lab PORT.md): 운영 프롬프트는 lab v3 와 바이트 동일해야 한다.
+
+        sha 는 lab `spam_filter/prompt.py` 의 PROMPT_SHA256(2026.07.23-v3). 프롬프트를
+        정당하게 갱신할 때는 lab 에서 A/B 검증(CFPR 비악화) 후 이 sha 도 함께 올린다.
+        """
+        import hashlib
+
+        p = spam_classifier._SPAM_SYSTEM_PROMPT
+        assert hashlib.sha256(p.encode("utf-8")).hexdigest()[:12] == "5e6b06680d30"
+
+
+# ───────────────────────── 규칙 키워드 2-티어 (spam-lab 2-1·2-2 이식) ─────────────────────────
+#
+# 규칙 히트는 gemma 이전 short-circuit 이라 오탐이 fail-open 으로 구제 불가(가장 비싼 오류).
+# 기본 키워드에서 일상어('사건'·'아이돌'·'주소창')를 하드블록에서 빼고 gemma 로 위임한다.
+# lab 실측(2026-07-23): rule precision 50%→100%, 같은 키워드 진짜 스팸은 gemma recall 100%.
+
+
+class TestKeywordTiering:
+    def test_soft_everyday_words_not_rule_blocked_by_default(self):
+        """기본 티어에서 일상어는 하드블록 금지 → gemma 위임(여기선 rule_only 로 통과 확인)."""
+        for text in [
+            "무슨 사건이에요? 궁금하네요",
+            "아이돌 덕질 10년차인데 이 꿀팁 유용해요",
+            "링크가 안 열리는데 주소창에 뭐라고 쳐야 하나요?",
+        ]:
+            v = classify_comment(text, spam_keywords=[], block_urls=True, use_llm=False)
+            assert not v.is_spam and v.engine == "rule_only", text
+
+    def test_hard_keywords_still_block_by_default(self):
+        """스팸 특이어(원본영상·실시간검색)는 기본 티어에서 여전히 즉시차단."""
+        v = classify_comment(
+            "그 사건 원본영상 삭제되기 전에 프로필에서 확인",
+            spam_keywords=[],
+            block_urls=False,
+            use_llm=False,
+        )
+        assert v.is_spam and v.engine == "rule"
+        assert "keyword:원본영상" in v.reasons
+
+    def test_account_keywords_remain_authoritative(self):
+        """오너가 직접 넣은 키워드는 일상어여도 그대로 하드블록(명시적 선택 존중)."""
+        v = classify_comment(
+            "무슨 사건이에요?", spam_keywords=["사건"], block_urls=False, use_llm=False
+        )
+        assert v.is_spam and v.engine == "rule"
+
+    def test_ascii_wordlike_keyword_uses_word_boundary(self):
+        """ASCII 단어형 키워드는 \\b 경계 — 'ad' 가 'download' 에 오매치되지 않아야."""
+        from apps.integrations.services import SpamDetectionService
+
+        assert not SpamDetectionService._keyword_hit("please download this", "ad")
+        assert SpamDetectionService._keyword_hit("best ad here", "ad")
+
+    def test_ascii_nonwordlike_keyword_falls_back_to_substring(self):
+        """'18+' 처럼 양끝이 단어문자가 아닌 ASCII 키워드는 substring(아니면 영원히 미적중)."""
+        from apps.integrations.services import SpamDetectionService
+
+        assert SpamDetectionService._keyword_hit("무료 18+ 컨텐츠 있음", "18+")
+
+    def test_default_alias_is_hard_plus_soft(self):
+        """하위호환 별칭 검증 — 차단에는 HARD 만 쓰이는 게 계약."""
+        from apps.integrations.services import SpamDetectionService as S
+
+        assert S.DEFAULT_SPAM_KEYWORDS == S.HARD_BLOCK_KEYWORDS + S.SOFT_SIGNAL_KEYWORDS
+
+
+@pytest.mark.django_db
+class TestSeededKeywordMigration:
+    """마이그 0045: 프론트가 시드한 옛 기본 5키워드 행만 [] 리셋, 커스텀 행은 보존."""
+
+    def _cfg(self, keywords):
+        user = _user()
+        _give_plan(user, "pro")
+        conn = _conn(_ws(user))
+        return SpamFilterConfig.objects.create(
+            ig_connection=conn, status=CfgStatus.ACTIVE, spam_keywords=keywords
+        )
+
+    def test_exact_seed_reset_custom_kept(self):
+        import importlib
+
+        from django.apps import apps as django_apps
+
+        mig = importlib.import_module(
+            "apps.integrations.migrations.0045_spamfilter_reset_seeded_default_keywords"
+        )
+        seeded = self._cfg(["주소창", "아이돌", "사건", "원본영상", "실시간검색"])  # 순서 무관
+        custom = self._cfg(["아이돌", "주소창", "사건", "원본영상", "실시간검색", "검색"])
+        empty = self._cfg([])
+
+        mig.reset_seeded_keywords(django_apps, None)
+
+        seeded.refresh_from_db()
+        custom.refresh_from_db()
+        empty.refresh_from_db()
+        assert seeded.spam_keywords == []
+        assert custom.spam_keywords[-1] == "검색" and len(custom.spam_keywords) == 6
+        assert empty.spam_keywords == []
 
 
 # ───────────────────────── run_spam_filter_check ─────────────────────────

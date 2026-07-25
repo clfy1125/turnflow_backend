@@ -111,6 +111,46 @@ SPAM_DETECTED_STATUSES = (
     SpamCommentLog.Status.FAILED,
 )
 
+# ── J-1: 오류 세분화(failure_breakdown) ─────────────────────────────
+# failure_breakdown 에 포함할 '오류/문제' 상태 — failed(확인 필요) + hidden_spam 계열(복구 대기/만료)
+# 을 모두 포괄한다. 성공(succeeded)·in-flight(accepted/queued/submitting)·한도 스킵(skipped)·
+# 복구 성공(recovery_delivered)은 오류가 아니므로 제외.
+DM_ERROR_STATUSES = (
+    SentDMLog.Status.FAILED_TOKEN,
+    SentDMLog.Status.FAILED_WINDOW,
+    SentDMLog.Status.FAILED_PARAM,
+    SentDMLog.Status.FAILED_NO_TRACE,
+    SentDMLog.Status.FAILED,  # legacy
+    SentDMLog.Status.FAILED_API,  # legacy
+    SentDMLog.Status.RECOVERY_PENDING,
+    SentDMLog.Status.RECOVERY_EXPIRED,
+)
+# recoverable=true 판정 대상 상태 — 복구/재검증 경로가 있는 실패.
+#   - failed_no_trace: 능동 재검증(GET /{message_id})으로 delivered 승격 가능
+#   - recovery_pending/expired: 숨김채널 재댓글 복구 플로우 대상
+#   - failed_param@2534025(HIDDEN_SPAM_SUBCODE): 숨김채널 복구 대상 (아래 함수가 subcode 분기)
+DM_RECOVERABLE_STATUSES = frozenset(
+    (
+        SentDMLog.Status.FAILED_NO_TRACE,
+        SentDMLog.Status.RECOVERY_PENDING,
+        SentDMLog.Status.RECOVERY_EXPIRED,
+    )
+)
+
+
+def _error_is_recoverable(status: str, error_subcode: str) -> bool:
+    """이 실패가 복구/재검증 경로를 갖는지 (failure_breakdown.recoverable).
+
+    recovery 퍼널(recovery_*)보다 넓은 개념 — failed_no_trace(재검증)와
+    failed_param@2534025(숨김채널 복구)도 recoverable=true 로 본다.
+    """
+    if status in DM_RECOVERABLE_STATUSES:
+        return True
+    return status == SentDMLog.Status.FAILED_PARAM and str(error_subcode or "").strip() == (
+        HIDDEN_SPAM_SUBCODE
+    )
+
+
 _STATUS_RANK = {"ok": 0, "warning": 1, "critical": 2}
 
 
@@ -230,8 +270,16 @@ def _dm_quality(until, since, granularity: str) -> tuple[dict, dict]:
 
     ``until`` 은 시리즈 제로필 상한(프리셋=now, 커스텀=min(end+1일, now)).
     """
+    # 오프닝/상호작용 분할: dm_kind 로만 requested 를 쪼갠다 (동일 window). 용어 정의 —
+    #   오프닝 = opening + standalone (트리거로 나간 첫 DM, 게이트 미사용 단발 포함),
+    #   상호작용 = reward (오프닝 이후 같은 DM창 후속). 재시도는 원 dm_kind 유지 → 합계 보존.
+    #   dm_kind 는 non-null(default=standalone)이라 null/legacy 는 오프닝 범주로 자연 귀속.
+    #   불변식: opening_requested + interaction_requested == requested.
+    _opening_kinds = [SentDMLog.DMKind.OPENING, SentDMLog.DMKind.STANDALONE]
     dm_agg = SentDMLog.objects.filter(created_at__gte=since).aggregate(
         requested=Count("id"),
+        opening_requested=Count("id", filter=Q(dm_kind__in=_opening_kinds)),
+        interaction_requested=Count("id", filter=Q(dm_kind=SentDMLog.DMKind.REWARD)),
         accepted=Count("id", filter=Q(status=SentDMLog.Status.ACCEPTED)),
         delivered=Count("id", filter=Q(status=SentDMLog.Status.DELIVERED)),
         read=Count("id", filter=Q(status=SentDMLog.Status.READ)),
@@ -254,13 +302,23 @@ def _dm_quality(until, since, granularity: str) -> tuple[dict, dict]:
         submitting=Count("id", filter=Q(status=SentDMLog.Status.SUBMITTING)),
     )
 
-    fields = ("requested", "succeeded", "failed", "hidden_spam", "skipped")
+    fields = (
+        "requested",
+        "opening",
+        "interaction",
+        "succeeded",
+        "failed",
+        "hidden_spam",
+        "skipped",
+    )
     series_rows = (
         SentDMLog.objects.filter(created_at__gte=since)
         .annotate(bucket=_series_trunc(granularity))
         .values("bucket")
         .annotate(
             requested=Count("id"),
+            opening=Count("id", filter=Q(dm_kind__in=_opening_kinds)),
+            interaction=Count("id", filter=Q(dm_kind=SentDMLog.DMKind.REWARD)),
             succeeded=Count("id", filter=Q(status__in=DM_SUCCEEDED_STATUSES)),
             failed=Count("id", filter=DM_FAILED_Q),
             hidden_spam=Count("id", filter=DM_HIDDEN_SPAM_Q),
@@ -272,11 +330,48 @@ def _dm_quality(until, since, granularity: str) -> tuple[dict, dict]:
         _bucketize(series_rows, granularity, fields), since, until, granularity, fields
     )
 
+    # J-1: 오류 세분화 — 선택 범위의 오류를 (error_code, error_subcode, status) 로 묶는다.
+    #   프론트는 status.ts 의 dmErrorCode/dmLogStatus 라벨로 렌더 → label 은 서버가 안 준다.
+    #   code 없는 실패(failed_no_trace 등)는 code="" 로 식별. count desc 정렬.
+    failure_breakdown = [
+        {
+            "code": row["error_code"] or "",
+            "subcode": row["error_subcode"] or "",
+            "status": row["status"],
+            "count": row["count"],
+            "recoverable": _error_is_recoverable(row["status"], row["error_subcode"]),
+        }
+        for row in (
+            SentDMLog.objects.filter(created_at__gte=since, status__in=DM_ERROR_STATUSES)
+            .values("error_code", "error_subcode", "status")
+            .annotate(count=Count("id"))
+            .order_by("-count", "status")
+        )
+    ]
+
+    # J-1: 복구 퍼널 — 숨김채널 재댓글 복구(recovery_*) 상태만으로 집계 (Open Q1 답).
+    #   recoverable_total = pending + recovered + expired (복구 경로에 들어온 총계).
+    #   recovery_rate = recovered / (recovered + expired) — 진행 중(pending) 제외, 표본 없으면 null.
+    rp = dm_agg["recovery_pending"]
+    rd = dm_agg["recovery_delivered"]
+    re_ = dm_agg["recovery_expired"]
+    settled = rd + re_
+    recovery = {
+        "recoverable_total": rp + rd + re_,
+        "pending": rp,
+        "recovered": rd,
+        "expired": re_,
+        "recovery_rate": round(rd / settled, 4) if settled else None,
+    }
+
     # failed = 진짜 실패(확인 필요)만 — failed_param 은 2534025(숨김함)를 뺀 나머지.
     # delivery_rate 는 공유 공식(_delivery_rate)이라 recovery_delivered 를 포함하지 않는다
     # (overview 대시보드와 동일 정의 유지 — 여기서 바꾸지 않음).
     block = {
         "requested": dm_agg["requested"],
+        # 요청 수 오프닝/상호작용 분할 (합 == requested). 프론트 KPI '요청' 카드 2분할용.
+        "opening_requested": dm_agg["opening_requested"],
+        "interaction_requested": dm_agg["interaction_requested"],
         "succeeded": (
             dm_agg["delivered"]
             + dm_agg["read"]
@@ -298,6 +393,9 @@ def _dm_quality(until, since, granularity: str) -> tuple[dict, dict]:
         "queued": dm_agg["queued"],
         "submitting": dm_agg["submitting"],
         "delivery_rate": _delivery_rate(dm_agg),
+        # J-1: 오류 세분화(코드·상태별) + 복구 퍼널. series 는 변경 없음(KPI/드릴다운용 스칼라).
+        "failure_breakdown": failure_breakdown,
+        "recovery": recovery,
         "series": {"granularity": granularity, "buckets": buckets},
     }
     return block, dm_agg
@@ -810,6 +908,20 @@ DM 발송 품질 / IG 연동 / 스팸 필터 / 빌링 4개 서브시스템의 �
   분리 집계됩니다 (정의의 단일 소스 = `dm_status_groups` 의 hidden_spam 그룹). 따라서
   `action_required.failed_param_recent` 와 `recent_errors` 의 DM 실패에서도 2534025 는 빠집니다.
   `succeeded` 는 복구 재전송 성공(`recovery_delivered`)을 포함합니다.
+- **`dm_quality.requested` 는 오프닝/상호작용으로 분할됩니다** — `opening_requested`(dm_kind ∈
+  {opening, standalone}, 트리거로 나간 첫 DM) + `interaction_requested`(dm_kind = reward,
+  오프닝 이후 같은 DM창 후속). 불변식 `opening_requested + interaction_requested == requested`.
+  시계열 버킷에도 `opening`/`interaction` 이 포함돼 '요청' 시리즈를 2색 스택으로 분해할 수 있습니다.
+  (dm_kind 는 non-null default=standalone 이라 null/legacy 행은 오프닝 범주로 귀속.)
+- **`dm_quality.failure_breakdown[]`**: 선택 범위의 오류를 `(code, subcode, status)` 로 묶은 카운트
+  (count 내림차순). `code`=`error_code`(예: 190=토큰 만료), `subcode`=`error_subcode`
+  (예: 2534025=숨김채널), 코드 없는 실패(`failed_no_trace` 등)는 `code:""`. 라벨은 서버가 주지
+  않으므로 프론트가 `status.ts` 의 `dmErrorCode`/`dmLogStatus` 로 렌더합니다. `recoverable` 은
+  복구/재검증 경로가 있는 실패(`failed_no_trace`·`recovery_*`·`failed_param@2534025`)면 true.
+  포함 상태 = `failed`(확인 필요) + `hidden_spam`(복구 대기/만료) 계열(성공·in-flight·skipped 제외).
+- **`dm_quality.recovery`**: 숨김채널 재댓글 복구 퍼널 — `recoverable_total`(=pending+recovered+
+  expired), `pending`(recovery_pending), `recovered`(recovery_delivered), `expired`(recovery_expired),
+  `recovery_rate`(=recovered/(recovered+expired), 표본 없으면 null). 시계열은 변경 없음.
 - **상태 판정 임계값** (단일 소스: `apps/admin_api/dashboard_constants.py`):
 
 | 서브시스템 | warning | critical |
@@ -944,6 +1056,8 @@ curl -H "Authorization: Bearer <staff_token>" \\
                     ],
                     "dm_quality": {
                         "requested": 1500,
+                        "opening_requested": 1120,
+                        "interaction_requested": 380,
                         "succeeded": 1410,
                         "accepted_pending": 13,
                         "failed": 27,
@@ -952,12 +1066,44 @@ curl -H "Authorization: Bearer <staff_token>" \\
                         "queued": 5,
                         "submitting": 0,
                         "delivery_rate": 0.9932,
+                        "failure_breakdown": [
+                            {
+                                "code": "190",
+                                "subcode": "",
+                                "status": "failed_token",
+                                "count": 12,
+                                "recoverable": False,
+                            },
+                            {
+                                "code": "",
+                                "subcode": "",
+                                "status": "failed_no_trace",
+                                "count": 5,
+                                "recoverable": True,
+                            },
+                            {
+                                "code": "100",
+                                "subcode": "2534025",
+                                "status": "recovery_expired",
+                                "count": 3,
+                                "recoverable": True,
+                            },
+                        ],
+                        "recovery": {
+                            "recoverable_total": 20,
+                            "pending": 5,
+                            "recovered": 12,
+                            "expired": 3,
+                            "recovery_rate": 0.8,
+                        },
                         "series": {
                             "granularity": "hour",
                             "buckets": [
                                 {
                                     "ts": "2026-07-10T14:00:00+09:00",
                                     "requested": 63,
+                                    "opening": 47,
+                                    "interaction": 16,
                                     "succeeded": 60,
                                     "failed": 1,
                                     "hidden_spam": 1,

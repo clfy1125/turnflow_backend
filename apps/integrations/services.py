@@ -9,7 +9,7 @@ import re
 import threading
 from datetime import UTC, datetime, timedelta
 from typing import Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import requests
 from django.conf import settings
@@ -33,6 +33,28 @@ _SECRET_QS_RE = re.compile(
 def scrub_secrets(text) -> str:
     """URL 쿼리스트링/예외 문자열에서 토큰·시크릿 값을 ``name=***`` 로 마스킹."""
     return _SECRET_QS_RE.sub(r"\1=***", str(text))
+
+
+# 인스타그램 게시물 영구 링크(permalink) 호스트 — CDN(cdninstagram.com)·자유 입력 URL 과 구분.
+_IG_PERMALINK_HOSTS = frozenset(("instagram.com", "www.instagram.com", "m.instagram.com"))
+
+
+def is_instagram_permalink(url: str | None) -> bool:
+    """url 이 인스타그램 게시물 permalink 인지 (host 정확 판정).
+
+    ``https://www.instagram.com/p/{shortcode}/`` (또는 /reel//tv/) 만 True.
+    ``scontent.cdninstagram.com/...`` 같은 CDN 이미지 URL 은 host 가 달라 False —
+    단순 substring("instagram.com") 검사는 CDN 도메인을 오탐하므로 netloc 로 판정한다.
+    """
+    if not url:
+        return False
+    try:
+        netloc = urlparse(url).netloc.lower()
+    except (ValueError, TypeError):
+        return False
+    # 포트/인증정보가 붙은 경우 방어적으로 host 만 취함
+    host = netloc.split("@")[-1].split(":")[0]
+    return host in _IG_PERMALINK_HOSTS
 
 
 def raise_for_status_clean(response) -> None:
@@ -1466,17 +1488,52 @@ class InstagramMessagingService:
 
 class SpamDetectionService:
     """
-    스팸 댓글 감지 서비스
+    스팸 댓글 감지 서비스 (규칙 pre-filter — LLM 이전 즉시차단)
+
+    규칙 히트는 authoritative(신뢰도 1.0·gemma 미호출)라 오탐이 fail-open 으로 구제되지
+    않는 가장 비싼 오류다. 그래서 기본 키워드는 2-티어로 나눈다(spam-lab 검증 2026-07-23,
+    실측 rule precision 50%→100%·recall 100% 유지, lab PORT.md):
+
+    - HARD_BLOCK: 스팸 특이 표현만 즉시차단. 일상 대화에서 쓰일 수 있는 단어 금지.
+    - SOFT_SIGNAL: 일상어("무슨 사건이에요?" 같은 정상 댓글에 등장) — 차단하지 않고
+      gemma 판정으로 위임한다(threshold 0.9 + fail-open 이 지배).
+
+    계정별 ``spam_keywords`` 는 오너의 명시적 선택이므로 그대로 authoritative 하드블록.
     """
 
-    # 기본 스팸 키워드 (관리자 설정에서 추가 가능)
-    DEFAULT_SPAM_KEYWORDS = [
-        "아이돌",
-        "주소창",
-        "사건",
+    # 즉시차단 티어 — 스팸 특이 표현만
+    HARD_BLOCK_KEYWORDS = [
         "원본영상",
         "실시간검색",
     ]
+    # 일상어 티어 — 차단 금지, gemma 위임 (진단 참고용 목록)
+    SOFT_SIGNAL_KEYWORDS = [
+        "아이돌",
+        "주소창",
+        "사건",
+    ]
+    # 하위호환 별칭(구 단일 목록 참조 코드용). ⚠ 차단에는 HARD_BLOCK_KEYWORDS 만 쓰인다.
+    DEFAULT_SPAM_KEYWORDS = HARD_BLOCK_KEYWORDS + SOFT_SIGNAL_KEYWORDS
+
+    # 순수 ASCII '단어형' 키워드 판별용 (양끝이 단어문자)
+    _ASCII_WORDLIKE_RE = re.compile(r"^\w(?:.*\w)?$", re.ASCII)
+
+    @classmethod
+    def _keyword_hit(cls, low_text: str, keyword: str) -> bool:
+        """키워드 매칭 — ASCII 단어형은 단어경계(\\b), CJK 는 substring.
+
+        'ad' 가 'download' 에 오매치되지 않게 ASCII 단어형 키워드는 \\b 경계를 요구한다.
+        한국어는 공백 경계가 없으므로 substring 유지. '18+'·'@vip' 처럼 양끝이 단어문자가
+        아닌 ASCII 키워드는 \\b 성립이 불가라 substring 으로 처리(안 그러면 영원히 미적중).
+        한계: Python \\b 는 유니코드 기준이라 'bet모집' 처럼 ASCII+한글이 붙으면 매치되지
+        않는다 — 규칙 miss 는 gemma 가 이어받는 값싼 오류라 수용(spam-lab 2-2).
+        """
+        k = keyword.lower()
+        if k.isascii():
+            if cls._ASCII_WORDLIKE_RE.match(k):
+                return re.search(rf"\b{re.escape(k)}\b", low_text) is not None
+            return k in low_text
+        return k in low_text
 
     @classmethod
     def is_spam(
@@ -1487,7 +1544,7 @@ class SpamDetectionService:
 
         Args:
             text: 검사할 댓글 텍스트
-            spam_keywords: 검사할 스팸 키워드 리스트
+            spam_keywords: 계정별 차단 키워드(없거나 빈 리스트면 기본 HARD_BLOCK 티어 사용)
             check_urls: URL 포함 여부 검사
 
         Returns:
@@ -1503,10 +1560,10 @@ class SpamDetectionService:
         if check_urls and cls._contains_url(text_lower):
             reasons.append("contains_url")
 
-        # 2. 스팸 키워드 검사
-        keywords_to_check = spam_keywords if spam_keywords else cls.DEFAULT_SPAM_KEYWORDS
+        # 2. 스팸 키워드 검사 — 기본 티어는 HARD 만 차단, SOFT 일상어는 gemma 로 위임
+        keywords_to_check = spam_keywords if spam_keywords else cls.HARD_BLOCK_KEYWORDS
         for keyword in keywords_to_check:
-            if keyword.lower() in text_lower:
+            if keyword and cls._keyword_hit(text_lower, keyword):
                 reasons.append(f"keyword:{keyword}")
 
         return len(reasons) > 0, reasons
@@ -1692,6 +1749,48 @@ class InstagramMediaService:
             return _dt.fromisoformat(v)
         except ValueError:
             return None
+
+    @classmethod
+    def get_media_permalink(cls, media_id: str, access_token: str) -> "str | None":
+        """단일 미디어의 permalink(인스타그램 영구 링크) 조회 (캠페인 게시물 링크 백필용).
+
+        GET /v25.0/{media-id}?fields=permalink
+        → ``https://www.instagram.com/p/{shortcode}/`` (또는 릴스 /reel/...) 형태.
+
+        permalink 는 media_id(숫자 Graph ID)로부터 계산 불가하고 Graph 조회가 유일한 경로다
+        (get_media_timestamp 와 동일한 best-effort 방어 — 실패 시 None). Mock 모드에선 실제
+        호출 없이 그럴듯한 permalink 를 만들어 dev/테스트에서도 링크가 채워지게 한다.
+
+        Args:
+            media_id: Instagram 미디어 ID (댓글 웹훅의 media.id).
+
+        Returns:
+            permalink 문자열, 또는 None (media_id 없음/API 실패/필드 부재).
+        """
+        if not media_id:
+            return None
+
+        # Mock 모드(dev): 실제 API 호출 없이 게시물 permalink 를 합성 (line 600 mock 규약과 동일).
+        if MockInstagramProvider.is_mock_mode():
+            return f"https://www.instagram.com/p/{media_id}/"
+
+        url = f"{cls.GRAPH_API_BASE}/{media_id}"
+        params = {"fields": "permalink", "access_token": access_token}
+
+        try:
+            resp = requests.get(url, params=params, timeout=cls.DEFAULT_TIMEOUT)
+        except (requests.Timeout, requests.ConnectionError):
+            return None
+
+        if not resp.ok:
+            return None
+
+        try:
+            body = resp.json() or {}
+        except ValueError:
+            return None
+
+        return body.get("permalink") or None
 
     @classmethod
     def list_media_comments(

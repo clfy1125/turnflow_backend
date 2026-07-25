@@ -16,6 +16,11 @@ from rest_framework import serializers
 
 from apps.pages.models import ContactInquiry, Page, PageSubscription
 
+# 공개 페이지 URL 조립의 단일 소스 — 스냅샷 캡쳐가 실제로 여는 URL(`{base}/@{slug}`)과 동일.
+#   base = SNAPSHOT_BASE_URL → FRONTEND_URL → localhost 폴백. (Playwright 는 함수 내부 지연 import
+#   라 이 헬퍼만 가져와도 무거운 의존성은 딸려오지 않는다.)
+from apps.pages.services.snapshot import _resolve_target_url
+
 
 class _OwnerSerializer(serializers.Serializer):
     """페이지 소유자(User) 최소 정보. ``source=page.user`` 로 주입."""
@@ -61,6 +66,11 @@ class AdminPageListSerializer(serializers.ModelSerializer):
     """어드민 페이지 목록 항목. 소유자/공개여부/임포트출처/최근30일 조회수 요약."""
 
     owner = _OwnerSerializer(source="user", read_only=True, help_text="페이지 소유자 (id/email)")
+    public_url = serializers.SerializerMethodField(
+        help_text="공개 페이지 절대 URL ({base}/@{slug}). base=SNAPSHOT_BASE_URL→FRONTEND_URL. "
+        "차단(is_active=false)/비공개(is_public=false)여도 canonical URL 은 항상 반환 "
+        "(방문자 접근 가부는 프론트가 두 플래그로 판단)."
+    )
     views_30d = serializers.SerializerMethodField(
         help_text="최근 30일간 PageView(공개 페이지 조회) 수."
     )
@@ -71,6 +81,7 @@ class AdminPageListSerializer(serializers.ModelSerializer):
             "slug",
             "title",
             "owner",
+            "public_url",
             "is_public",
             "is_active",
             "import_source",
@@ -80,6 +91,9 @@ class AdminPageListSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = fields
+
+    def get_public_url(self, obj: Page) -> str:
+        return _resolve_target_url(obj.slug)
 
     def get_views_30d(self, obj: Page) -> int:
         # 뷰에서 annotate(views_30d=...) 한 경우 그 값을 우선 사용해 N+1 회피.
@@ -93,6 +107,11 @@ class AdminPageDetailSerializer(serializers.ModelSerializer):
     """어드민 페이지 상세. 목록 필드 + 블록 목록 + 누적/최근 통계 + 레퍼런스 카테고리."""
 
     owner = _OwnerSerializer(source="user", read_only=True, help_text="페이지 소유자 (id/email)")
+    public_url = serializers.SerializerMethodField(
+        help_text="공개 페이지 절대 URL ({base}/@{slug}). base=SNAPSHOT_BASE_URL→FRONTEND_URL. "
+        "차단(is_active=false)/비공개(is_public=false)여도 canonical URL 은 항상 반환 "
+        "(방문자 접근 가부는 프론트가 두 플래그로 판단)."
+    )
     views_30d = serializers.SerializerMethodField(help_text="최근 30일간 PageView 수.")
     blocks = serializers.SerializerMethodField(
         help_text="페이지에 속한 블록 요약 목록 (order ASC)."
@@ -110,6 +129,7 @@ class AdminPageDetailSerializer(serializers.ModelSerializer):
             "slug",
             "title",
             "owner",
+            "public_url",
             "is_public",
             "is_active",
             "import_source",
@@ -123,6 +143,9 @@ class AdminPageDetailSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = fields
 
+    def get_public_url(self, obj: Page) -> str:
+        return _resolve_target_url(obj.slug)
+
     def get_views_30d(self, obj: Page) -> int:
         return _views_in_last_30d(obj)
 
@@ -131,9 +154,12 @@ class AdminPageDetailSerializer(serializers.ModelSerializer):
         return _BlockSummarySerializer(blocks, many=True).data
 
     def get_stats(self, obj: Page) -> dict:
+        # clicks_total = 블록 클릭 수. Page 의 BlockClick 역참조는 ``block_clicks`` 이다
+        # (``clicks`` 는 Block 의 역참조라 Page 엔 없음 — 기존 obj.clicks 는 AttributeError 로
+        #  상세 응답을 500 냈다. 단일 소스 = apps.pages.models.BlockClick.page.related_name).
         return {
             "views_total": obj.views.count(),
-            "clicks_total": obj.clicks.count(),
+            "clicks_total": obj.block_clicks.count(),
             "views_30d": _views_in_last_30d(obj),
         }
 

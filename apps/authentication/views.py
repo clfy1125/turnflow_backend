@@ -93,6 +93,9 @@ class RegisterView(generics.CreateAPIView):
         - `password` (필수): 비밀번호 (최소 8자, 숫자/문자 조합 권장)
         - `password_confirm` (필수): 비밀번호 확인 (password와 일치해야 함)
         - `full_name` (선택): 사용자 이름
+        - `marketing_opt_in` (선택, boolean, 기본 false): 마케팅(광고성) 정보 수신 동의.
+          `true` 로 보내면 동의 시각(`marketing_opt_in_at`)이 함께 기록됩니다. 정보통신망법상 별도 동의 항목입니다.
+        - `attribution` (선택, object): 가입 유입 채널 attribution
 
         ## 응답 데이터
         - `user`: 생성된 사용자 정보 (id, email, full_name 등)
@@ -365,8 +368,12 @@ class MeView(generics.RetrieveUpdateAPIView):
         - `id`: 사용자 고유 ID
         - `email`: 이메일 주소
         - `full_name`: 사용자 이름
+        - `is_email_verified`: 이메일 인증 여부
         - `date_joined`: 가입 일시
         - `last_login`: 마지막 로그인 일시
+        - `marketing_opt_in` (boolean): 마케팅 수신 동의 여부. **이 필드로 설정 페이지의
+          수신동의/수신거부 토글을 렌더**하세요 (PATCH 로 켜고 끄면 됩니다).
+        - `marketing_opt_in_at` (datetime|null): 마케팅 동의 시각 (미동의면 null)
 
         ## 주의사항
         - 토큰 없이 호출 시 401 에러
@@ -425,9 +432,12 @@ class MeView(generics.RetrieveUpdateAPIView):
 
         ## 요청 필드
         - `full_name` (선택): 변경할 사용자 이름
+        - `marketing_opt_in` (선택, boolean): 마케팅 수신 동의 토글. `false` 로 보내면
+          **수신거부**(동의 시각 제거), `true` 로 보내면 동의(동의 시각 기록). 설정 페이지
+          수신동의 토글과 마케팅 메일의 수신거부가 모두 이 한 필드로 수렴합니다.
 
         ## 응답 데이터
-        - 업데이트된 전체 사용자 정보 반환 (GET /me와 동일한 형식)
+        - 업데이트된 **전체 사용자 정보** 반환 (GET /me와 동일한 형식 — `marketing_opt_in` 포함)
 
         ## 주의사항
         - 이메일은 변경할 수 없습니다 (고유 식별자)
@@ -474,7 +484,13 @@ class MeView(generics.RetrieveUpdateAPIView):
         },
     )
     def patch(self, request, *args, **kwargs):
-        return super().patch(request, *args, **kwargs)
+        # 갱신은 UserUpdateSerializer(full_name/marketing_opt_in)로, 응답은 갱신된
+        # '프로필 전체'(UserSerializer)로 돌려준다 — 프론트가 응답만으로 상태를 동기화.
+        instance = self.get_object()
+        serializer = UserUpdateSerializer(instance, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(UserSerializer(instance).data)
 
 
 class TokenRefreshView(generics.GenericAPIView):
@@ -801,6 +817,8 @@ class GoogleLoginView(generics.GenericAPIView):
 | 필드 | 필수 | 타입 | 설명 |
 |------|:------:|------|------|
 | `token` | ✅ | string | Google 로그인 후 받은 ID Token |
+| `marketing_opt_in` | | boolean | 마케팅 수신 동의 (신규 가입 시에만 반영, 기본 false) |
+| `attribution` | | object | 가입 유입 attribution (신규 가입 시에만 저장) |
 
 ## 응답 데이터
 - `user`: 사용자 정보 (id, email, full_name, date_joined, last_login)
@@ -932,12 +950,16 @@ curl -X POST http://localhost:8000/api/v1/auth/google/ \\
 
         from django.utils import timezone
 
+        marketing_opt_in = bool(serializer.validated_data.get("marketing_opt_in"))
         user, created = User.objects.get_or_create(
             email=email,
             defaults={
                 "full_name": name,
                 "is_email_verified": True,
                 "email_verified_at": timezone.now(),
+                # 신규 가입 시에만 마케팅 동의 반영 (동의 시 시각도 기록).
+                "marketing_opt_in": marketing_opt_in,
+                "marketing_opt_in_at": timezone.now() if marketing_opt_in else None,
             },
         )
 
