@@ -23,6 +23,13 @@
   channel="referral" 로 분류 (코드 사용이 가입 이후라 가입 시점 저장 불가).
 - 업셀 후보의 DM 사용량은 **실제 과금 정의**(billing.dm_limits) 재사용 —
   SENT_FOR_QUOTA_STATUSES + (캠페인 × 수신자) 고유쌍, 캘린더월(_month_bounds).
+- ``period=all``(R-1): current = [서비스 최초 가입 시각, now), **직전 기간 없음** —
+  ``range.previous_* = null`` + 모든 delta 지표 ``previous/delta_pct = null``
+  (빈 구간을 previous 로 넘기면 "직전 0명"으로 오독됨). 캐시 TTL 은 15분.
+- ``snapshot``(R-2): 상단 고정 패널 — **기간 파라미터와 무관한 전체 기간 누적**.
+  별도 캐시 키(``admin:dash:mkt:snapshot``)라 모든 period 응답이 같은 값을 공유한다.
+- 무료체험 집계(R-4)는 **카드 등록 완료**(billing_key_issued_at) 체험만 —
+  어드민이 수동 부여한 무카드 계정을 전환 실적에서 제외한다 (퍼널/채널 공통).
 - 모든 카운트는 전사(GLOBAL). 응답은 Redis 5분 캐시 (키 ``admin:dash:mkt:{period}``).
 """
 
@@ -34,7 +41,7 @@ from datetime import date, datetime, timedelta
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
-from django.db.models import Count, Exists, Max, Min, OuterRef, Q, Sum
+from django.db.models import Count, Exists, F, Max, Min, OuterRef, Q, Sum
 from django.db.models.functions import Coalesce, TruncDate, TruncWeek
 from django.utils import timezone
 from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiResponse, extend_schema
@@ -52,12 +59,16 @@ from apps.admin_api.dashboard_constants import (
     COHORT_USAGE_WEEKS,
     CUSTOMER_ACTIONS_LIMIT,
     DORMANT_IDLE_DAYS,
+    MARKETING_DASHBOARD_ALL_CACHE_TTL,
     MARKETING_DASHBOARD_CACHE_TTL,
+    MARKETING_DASHBOARD_SNAPSHOT_CACHE_TTL,
     ONBOARDING_SAMPLE_LIMIT,
     POST_PAYMENT_WINDOW_DAYS,
     RECENT_CANCELLATIONS_LIMIT,
     RECENT_CHURN_WINDOW_DAYS,
     TOP_PAGES_LIMIT,
+    TRENDS_DAY_MAX_SPAN_DAYS,
+    TRENDS_WEEK_MAX_SPAN_DAYS,
     UPSELL_CANDIDATES_LIMIT,
     UPSELL_CLICKS_HIGH,
     UPSELL_CLICKS_MID,
@@ -157,9 +168,14 @@ TRIALS_ENDED_CONVERSION_FORMULA = (
     "종료 시점 기준으로 집계 · 전환 판정은 조회 시점"
 )
 
-ALLOWED_PERIODS = {"7d": 7, "30d": 30, "90d": 90}
+# period → 일수. "all"(R-1) = 서비스 오픈부터 now 까지라 고정 일수가 없어 None,
+# 이 경우에만 previous 구간을 만들지 않는다(prev=None → delta 전부 null).
+ALLOWED_PERIODS = {"7d": 7, "30d": 30, "90d": 90, "all": None}
+PERIOD_ALL = "all"
 CACHE_KEY_TMPL = "admin:dash:mkt:{period}"
 CACHE_KEY_CUSTOM_TMPL = "admin:dash:mkt:custom:{start}:{end}"
+# R-2: 기간 무관 고정 패널 — period 별 응답이 공유하는 단일 키 (계산 1회)
+CACHE_KEY_SNAPSHOT = "admin:dash:mkt:snapshot"
 MAX_CUSTOM_SPAN_DAYS = 366  # 커스텀 범위 상한 (초과 시 400)
 
 TARGET_UPSELL_PLANS = ("free", "basic")
@@ -199,8 +215,14 @@ _FUNNEL_NODE_LABELS = {
     "dm_campaign": "DM 캠페인",
     "page_created": "페이지 생성",
     "page_published": "페이지 공개",
+    # R-3: 분기 4노드를 대체하는 단일 활성화 노드 (분기는 branches 에 그대로 남아 팝업용)
+    "activated": "활성화 유저",
     "paid": "유료플랜 전환",  # N-1: 무료체험+실결제 합산으로 재정의 (breakdown 으로 분해)
 }
+
+# R-4: '무료체험 진행 중' 판정 — 카드 등록 완료(billing_key_issued_at) 건만.
+# 어드민이 수동 부여한 무카드 유료플랜 계정은 전환 실적에서 제외한다.
+_TRIAL_PLAN_EXCLUDE = ("free", "admin")
 
 # 활성화 판정에 쓰는 스팸 차단 상태 (FAILED 는 차단 실패라 제외)
 _SPAM_BLOCKED_STATUSES = (SpamCommentLog.Status.DETECTED, SpamCommentLog.Status.HIDDEN)
@@ -260,8 +282,14 @@ CANCEL_REASON_LABELS = {
 # ── 공통 헬퍼 ────────────────────────────────────────────────────────
 
 
-def _delta_metric(current: int, previous: int) -> dict:
-    """{current, previous, delta_pct} — previous == 0 이면 delta_pct = null."""
+def _delta_metric(current: int, previous: int | None) -> dict:
+    """{current, previous, delta_pct} — previous == 0 이면 delta_pct = null.
+
+    previous is None(= period=all, 비교할 직전 기간 자체가 없음)이면 previous 도 null —
+    0 으로 내려보내면 프론트가 "직전 기간에 0명이었다"로 오독한다 (R-1).
+    """
+    if previous is None:
+        return {"current": current, "previous": None, "delta_pct": None}
     delta = round((current - previous) / previous * 100, 1) if previous else None
     return {"current": current, "previous": previous, "delta_pct": delta}
 
@@ -275,28 +303,56 @@ def _cohort_qs(start, end):
 
     pgc = 페이지 '생성'(공개 여부 무관), pg = 페이지 '공개'(is_public=True).
     바이오링크 갈래는 생성→공개 2단계라 둘 다 필요.
-    tr = **현재** 무료체험 진행 중(TRIALING 유료플랜 구독) — N-1 유료플랜 전환 분해용.
+    cur_plan / cur_status / cur_card 는 **현재 구독**(User.subscription, OneToOne 이라
+    행 증식 없음)의 플랜명·상태·빌링키 발급 시각 — 체험/실결제의 플랜별 분해(R-4)와
+    '카드 등록 완료' 판정에 쓴다. 구독이 없으면 셋 다 None.
     """
     has_ig = Exists(IGAccountConnection.objects.filter(workspace__owner=OuterRef("pk")))
     has_any_page = Exists(Page.objects.filter(user=OuterRef("pk")))
     has_page = Exists(Page.objects.filter(user=OuterRef("pk"), is_public=True))
     has_camp = Exists(AutoDMCampaign.objects.filter(ig_connection__workspace__owner=OuterRef("pk")))
     has_paid = Exists(PaymentHistory.objects.filter(user=OuterRef("pk"), status=PaymentStatus.PAID))
-    has_trial = Exists(
-        UserSubscription.objects.filter(
-            user=OuterRef("pk"), status=SubscriptionStatus.TRIALING
-        ).exclude(plan__name__in=("free", "admin"))
-    )
     return User.objects.filter(date_joined__gte=start, date_joined__lt=end).annotate(
-        ig=has_ig, pgc=has_any_page, pg=has_page, cp=has_camp, pd=has_paid, tr=has_trial
+        ig=has_ig,
+        pgc=has_any_page,
+        pg=has_page,
+        cp=has_camp,
+        pd=has_paid,
+        cur_plan=F("subscription__plan__name"),
+        cur_status=F("subscription__status"),
+        cur_card=F("subscription__billing_key_issued_at"),
     )
+
+
+# 현재 유료플랜 무료체험 중 (플랜 free/admin 제외) — 카드 등록 여부는 별도 조건
+_Q_TRIALING = Q(subscription__status=SubscriptionStatus.TRIALING) & ~Q(
+    subscription__plan__name__in=_TRIAL_PLAN_EXCLUDE
+)
+# R-4: 카드 등록 완료 체험만 '유료플랜 전환'으로 인정
+_Q_TRIAL_CARD = _Q_TRIALING & Q(subscription__billing_key_issued_at__isnull=False)
+_Q_TRIAL_NO_CARD = _Q_TRIALING & Q(subscription__billing_key_issued_at__isnull=True)
+
+
+def _trial_flags(cur_plan, cur_status, cur_card) -> tuple[bool, bool]:
+    """(카드 등록 체험 중, 카드 미등록 체험 중) — flag_rows 파이썬 판정용.
+
+    _Q_TRIAL_CARD / _Q_TRIAL_NO_CARD 와 동일 규칙 (집계 SQL 과 정의 일치 필수).
+    """
+    trialing = (
+        cur_status == SubscriptionStatus.TRIALING
+        and cur_plan not in _TRIAL_PLAN_EXCLUDE
+        # cur_plan is None(구독 없음)이면 cur_status 도 None 이라 위에서 이미 False
+    )
+    return trialing and cur_card is not None, trialing and cur_card is None
 
 
 def _cohort_agg(start, end) -> dict:
     """코호트 단계 도달 집계 (funnel/kpi 공용) — activated = page ∪ campaign.
 
-    paid = 실결제(PAID 이력), trial_only = 현재 체험 중 & 미결제 —
-    퍼널 conversion 노드(유료플랜 전환)의 count = paid + trial_only (N-1).
+    paid = 실결제(PAID 이력), trial_only = 현재 체험 중(카드 등록 완료) & 미결제 —
+    퍼널 conversion 노드(유료플랜 전환)의 count = paid + trial_only (N-1 + R-4).
+    pro_trial/basic_trial/pro_paid/basic_paid 는 conversion.breakdown 3분할용
+    (현재 구독 플랜 기준), trial_no_card 는 카드 미등록으로 전환에서 제외된 인원.
     """
     return _cohort_qs(start, end).aggregate(
         signups=Count("id"),
@@ -307,7 +363,14 @@ def _cohort_agg(start, end) -> dict:
         both=Count("id", filter=Q(pg=True, cp=True)),
         activated=Count("id", filter=Q(pg=True) | Q(cp=True)),
         paid=Count("id", filter=Q(pd=True)),
-        trial_only=Count("id", filter=Q(tr=True, pd=False)),
+        trial_only=Count("id", filter=_Q_TRIAL_CARD & Q(pd=False)),
+        pro_trial=Count("id", filter=_Q_TRIAL_CARD & Q(pd=False, subscription__plan__name="pro")),
+        basic_trial=Count(
+            "id", filter=_Q_TRIAL_CARD & Q(pd=False, subscription__plan__name="basic")
+        ),
+        pro_paid=Count("id", filter=Q(pd=True, subscription__plan__name="pro")),
+        basic_paid=Count("id", filter=Q(pd=True, subscription__plan__name="basic")),
+        trial_no_card=Count("id", filter=_Q_TRIAL_NO_CARD & Q(pd=False)),
     )
 
 
@@ -325,6 +388,11 @@ def _signups_count(start, end) -> int:
     return User.objects.filter(date_joined__gte=start, date_joined__lt=end).count()
 
 
+def _service_start(now):
+    """period=all 의 current_start — 가장 이른 User.date_joined (회원 0명이면 now)."""
+    return User.objects.aggregate(first=Min("date_joined"))["first"] or now
+
+
 # ── 커스텀 범위 / 일별 추이(trends) ─────────────────────────────────────
 
 
@@ -333,6 +401,44 @@ def _local_midnight(d: date) -> datetime:
     return timezone.make_aware(
         datetime.combine(d, datetime.min.time()), timezone.get_current_timezone()
     )
+
+
+def _month_add(d: date, k: int) -> date:
+    """월초일 d 에 k 개월 더한 월초일 (월 산술 — timedelta 로는 불가)."""
+    total = d.year * 12 + (d.month - 1) + k
+    return date(total // 12, total % 12 + 1, 1)
+
+
+def _trends_granularity(start, end) -> str:
+    """R-5: 구간 길이에 따른 trends 버킷 단위 — day / week(월요일) / month(1일).
+
+    period=all 이면 구간이 수백 일이 되어 일별 버킷 × 채널 분해로 응답이 급증하므로
+    자동 상향한다 (임계값은 dashboard_constants).
+    """
+    span_days = max(1, (end - start).days)
+    if span_days <= TRENDS_DAY_MAX_SPAN_DAYS:
+        return "day"
+    if span_days <= TRENDS_WEEK_MAX_SPAN_DAYS:
+        return "week"
+    return "month"
+
+
+def _bucket_of(d: date, granularity: str) -> date:
+    """로컬 날짜 → 버킷 시작일 (week=그 주 월요일, month=그 달 1일)."""
+    if granularity == "week":
+        return d - timedelta(days=d.weekday())
+    if granularity == "month":
+        return d.replace(day=1)
+    return d
+
+
+def _bucket_next(d: date, granularity: str) -> date:
+    """제로필 순회용 — 다음 버킷 시작일."""
+    if granularity == "week":
+        return d + timedelta(days=7)
+    if granularity == "month":
+        return _month_add(d, 1)
+    return d + timedelta(days=1)
 
 
 def _parse_custom_range(start_raw: str, end_raw: str) -> tuple[date, date]:
@@ -386,8 +492,10 @@ def _trend_channel_of(uid, attr_map: dict, referral_users) -> str:
 
 
 def _trends(start, end) -> dict:
-    """현재 기간(range.current) 을 로컬 날짜 단위로 zero-fill 한 일별 추이.
+    """현재 기간(range.current) 을 로컬 날짜 단위로 zero-fill 한 추이.
 
+    버킷 단위는 구간 길이로 자동 결정(R-5): day / week(월요일 시작) / month(1일 시작).
+    `date` 는 버킷 **시작일**, 마지막 버킷은 진행 중(미완결)이어도 그대로 내려간다.
     지표별 1쿼리(TruncDate group-by), 파이썬에서 날짜→버킷 병합.
     - signups: User.date_joined
     - paid: 유저별 첫 PAID paid_at (KPI first-paid 재사용)
@@ -395,63 +503,81 @@ def _trends(start, end) -> dict:
     - page_views: PageView.viewed_at
     - page_clicks: BlockClick.clicked_at
     - visits: LandingVisit.created_at (세션 단위 행 수 — kpis.visits 와 동일)
-    - activated(Q-1): 그날 DM 캠페인 생성 or 페이지 공개(공개 페이지 created_at 근사)한
-      고유 회원 수 (일별 user dedupe, 가입 시기 무관 이벤트 기준)
+    - activated(Q-1): 그 버킷에 DM 캠페인 생성 or 페이지 공개(공개 페이지 created_at 근사)한
+      고유 회원 수 (**버킷 단위 user dedupe** — 주별이면 같은 주 중복 활동은 1명,
+      가입 시기 무관 이벤트 기준)
     - by_channel(Q-1): visits/signups/activated/paid 4지표의 채널 분해 —
       귀속은 채널별 성과 표와 동일(저장 채널 + 제휴코드 사용자 referral 오버라이드),
       visits 만 방문 자체의 저장 채널. Σ by_channel == 총량. 전부 0인 채널은 생략.
     """
     tz = timezone.get_current_timezone()
+    granularity = _trends_granularity(start, end)
 
-    # signups — (uid, day) 필요 (채널 분해용)
+    def _bk(d: date) -> date:
+        return _bucket_of(d, granularity)
+
+    def _roll(day_counts: dict) -> Counter:
+        """{로컬 날짜: n} → {버킷 시작일: Σn} (day 단위면 그대로)."""
+        rolled: Counter = Counter()
+        for d, n in day_counts.items():
+            rolled[_bk(d)] += n
+        return rolled
+
+    # signups — (uid, 버킷) 필요 (채널 분해용)
     signup_rows = [
-        (r[0], r[1])
+        (r[0], _bk(r[1]))
         for r in User.objects.filter(date_joined__gte=start, date_joined__lt=end)
         .annotate(d=TruncDate("date_joined", tzinfo=tz))
         .values_list("id", "d")
         if r[1] is not None
     ]
-    signups = Counter(d for _uid, d in signup_rows)
+    signups = Counter(b for _uid, b in signup_rows)
 
-    # paid — {uid: day}
-    first_paid_map = _first_paid_local_dates(start, end)
+    # paid — {uid: 버킷}
+    first_paid_map = {uid: _bk(d) for uid, d in _first_paid_local_dates(start, end).items()}
     paid = Counter(first_paid_map.values())
 
-    # activated — 그날 캠페인 생성 ∪ 공개 페이지 생성 유저 (day → set)
-    activated_by_day: dict = defaultdict(set)
+    # activated — 그 버킷에 캠페인 생성 ∪ 공개 페이지 생성 유저 (버킷 → set, 버킷 내 dedupe)
+    activated_by_bucket: dict = defaultdict(set)
     for owner_id, d in (
         AutoDMCampaign.objects.filter(created_at__gte=start, created_at__lt=end)
         .annotate(d=TruncDate("created_at", tzinfo=tz))
         .values_list("ig_connection__workspace__owner_id", "d")
     ):
         if d is not None:
-            activated_by_day[d].add(owner_id)
+            activated_by_bucket[_bk(d)].add(owner_id)
     for user_id, d in (
         Page.objects.filter(is_public=True, created_at__gte=start, created_at__lt=end)
         .annotate(d=TruncDate("created_at", tzinfo=tz))
         .values_list("user_id", "d")
     ):
         if d is not None:
-            activated_by_day[d].add(user_id)
+            activated_by_bucket[_bk(d)].add(user_id)
 
-    dm_delivered = _local_date_counts(
-        SentDMLog.objects.filter(
-            created_at__gte=start,
-            created_at__lt=end,
-            status__in=(SentDMLog.Status.DELIVERED, SentDMLog.Status.READ),
-        ),
-        "created_at",
+    dm_delivered = _roll(
+        _local_date_counts(
+            SentDMLog.objects.filter(
+                created_at__gte=start,
+                created_at__lt=end,
+                status__in=(SentDMLog.Status.DELIVERED, SentDMLog.Status.READ),
+            ),
+            "created_at",
+        )
     )
-    page_views = _local_date_counts(
-        PageView.objects.filter(viewed_at__gte=start, viewed_at__lt=end), "viewed_at"
+    page_views = _roll(
+        _local_date_counts(
+            PageView.objects.filter(viewed_at__gte=start, viewed_at__lt=end), "viewed_at"
+        )
     )
-    page_clicks = _local_date_counts(
-        BlockClick.objects.filter(clicked_at__gte=start, clicked_at__lt=end), "clicked_at"
+    page_clicks = _roll(
+        _local_date_counts(
+            BlockClick.objects.filter(clicked_at__gte=start, clicked_at__lt=end), "clicked_at"
+        )
     )
 
-    # visits — 총량(세션) + 채널 분해 {(day, channel): n}
-    visits: dict = {}
-    visits_by_day_channel: dict = {}
+    # visits — 총량(세션) + 채널 분해 {(버킷, channel): n}
+    visits: Counter = Counter()
+    visits_by_bucket_channel: Counter = Counter()
     if ATTRIBUTION_AVAILABLE:
         for r in (
             LandingVisit.objects.filter(created_at__gte=start, created_at__lt=end)
@@ -461,12 +587,13 @@ def _trends(start, end) -> dict:
         ):
             if r["d"] is None:
                 continue
-            visits[r["d"]] = visits.get(r["d"], 0) + r["c"]
-            visits_by_day_channel[(r["d"], r["channel"])] = r["c"]
+            bucket = _bk(r["d"])
+            visits[bucket] += r["c"]
+            visits_by_bucket_channel[(bucket, r["channel"])] += r["c"]
 
     # 유저 채널 귀속 맵 — 관련 유저만 조회 (signups + activated + paid)
-    involved = {uid for uid, _d in signup_rows} | set(first_paid_map)
-    for users in activated_by_day.values():
+    involved = {uid for uid, _b in signup_rows} | set(first_paid_map)
+    for users in activated_by_bucket.values():
         involved |= users
     attr_map: dict = {}
     referral_users: set = set()
@@ -480,27 +607,27 @@ def _trends(start, end) -> dict:
             )
         )
 
-    # (day, channel) 슬라이스 집계 — Σ by_channel == 총량 보장 (모든 유저가 채널 보유)
+    # (버킷, channel) 슬라이스 집계 — Σ by_channel == 총량 보장 (모든 유저가 채널 보유)
     slice_key = defaultdict(lambda: {"visits": 0, "signups": 0, "activated": 0, "paid": 0})
-    for (d, channel), n in visits_by_day_channel.items():
-        slice_key[(d, channel)]["visits"] = n
-    for uid, d in signup_rows:
-        slice_key[(d, _trend_channel_of(uid, attr_map, referral_users))]["signups"] += 1
-    for d, users in activated_by_day.items():
+    for (bucket, channel), n in visits_by_bucket_channel.items():
+        slice_key[(bucket, channel)]["visits"] += n
+    for uid, bucket in signup_rows:
+        slice_key[(bucket, _trend_channel_of(uid, attr_map, referral_users))]["signups"] += 1
+    for bucket, users in activated_by_bucket.items():
         for uid in users:
-            slice_key[(d, _trend_channel_of(uid, attr_map, referral_users))]["activated"] += 1
-    for uid, d in first_paid_map.items():
-        slice_key[(d, _trend_channel_of(uid, attr_map, referral_users))]["paid"] += 1
+            slice_key[(bucket, _trend_channel_of(uid, attr_map, referral_users))]["activated"] += 1
+    for uid, bucket in first_paid_map.items():
+        slice_key[(bucket, _trend_channel_of(uid, attr_map, referral_users))]["paid"] += 1
 
-    by_channel_by_day: dict = defaultdict(dict)
-    for (d, channel), slice_ in slice_key.items():
+    by_channel_by_bucket: dict = defaultdict(dict)
+    for (bucket, channel), slice_ in slice_key.items():
         if any(slice_.values()):  # 전부 0인 채널은 생략 (프론트 0 처리)
-            by_channel_by_day[d][channel] = slice_
+            by_channel_by_bucket[bucket][channel] = slice_
 
-    # zero-fill: [start 로컬 날짜, end 로컬 날짜) — end 는 미포함 상한이므로 하루 뺀 날까지
+    # zero-fill: [start 버킷, end 버킷] — end 는 미포함 상한이므로 하루 뺀 날의 버킷까지
     buckets = []
-    cur = timezone.localtime(start).date()
-    last = timezone.localtime(end - timedelta(microseconds=1)).date()
+    cur = _bk(timezone.localtime(start).date())
+    last = _bk(timezone.localtime(end - timedelta(microseconds=1)).date())
     while cur <= last:
         buckets.append(
             {
@@ -511,12 +638,12 @@ def _trends(start, end) -> dict:
                 "page_views": page_views.get(cur, 0),
                 "page_clicks": page_clicks.get(cur, 0),
                 "visits": visits.get(cur, 0),
-                "activated": len(activated_by_day.get(cur, ())),
-                "by_channel": by_channel_by_day.get(cur, {}),
+                "activated": len(activated_by_bucket.get(cur, ())),
+                "by_channel": by_channel_by_bucket.get(cur, {}),
             }
         )
-        cur += timedelta(days=1)
-    return {"granularity": "day", "buckets": buckets}
+        cur = _bucket_next(cur, granularity)
+    return {"granularity": granularity, "buckets": buckets}
 
 
 def _visit_counts(start, end) -> tuple[int, int]:
@@ -530,8 +657,11 @@ def _visit_counts(start, end) -> tuple[int, int]:
 # ── KPI ──────────────────────────────────────────────────────────────
 
 
-def _kpis(cur: tuple, prev: tuple, mrr_total: int) -> dict:
-    """모든 KPI 를 {current, previous, delta_pct} 로. cur/prev = (start, end)."""
+def _kpis(cur: tuple, prev: tuple | None, mrr_total: int) -> dict:
+    """모든 KPI 를 {current, previous, delta_pct} 로. cur/prev = (start, end).
+
+    prev is None(period=all — 비교할 직전 기간 없음)이면 previous/delta_pct 전부 null.
+    """
 
     def first_ig(w):
         return _count_first_in_window(
@@ -557,24 +687,28 @@ def _kpis(cur: tuple, prev: tuple, mrr_total: int) -> dict:
             PaymentHistory.objects.filter(status=PaymentStatus.PAID), "user_id", "paid_at", *w
         )
 
+    def _prev(fn):
+        """직전 기간 값 — 비교 구간이 없으면 None (→ _delta_metric 이 null 처리)."""
+        return None if prev is None else fn(prev)
+
     visits_cur, uniq_cur = _visit_counts(*cur)
-    visits_prev, uniq_prev = _visit_counts(*prev)
+    visits_prev, uniq_prev = (None, None) if prev is None else _visit_counts(*prev)
 
     mrr = _delta_metric(mrr_total, 0)
     # MRR 은 point-in-time — 과거 시점 재구성 불가 → previous/delta 는 항상 null
     mrr.update({"previous": None, "delta_pct": None, "currency": "KRW"})
 
     # M-2: 정의 문자열 동봉 — 실결제(PAID)만 카운트, 체험·쿠폰 미결제 제외를 명시
-    paid_conversions = _delta_metric(first_paid(cur), first_paid(prev))
+    paid_conversions = _delta_metric(first_paid(cur), _prev(first_paid))
     paid_conversions["definition"] = PAID_CONVERSIONS_DEFINITION
 
     return {
         "visits": _delta_metric(visits_cur, visits_prev),
         "unique_visitors": _delta_metric(uniq_cur, uniq_prev),
-        "signups": _delta_metric(_signups_count(*cur), _signups_count(*prev)),
-        "ig_connected": _delta_metric(first_ig(cur), first_ig(prev)),
-        "first_page_published": _delta_metric(first_page(cur), first_page(prev)),
-        "first_dm_campaign": _delta_metric(first_campaign(cur), first_campaign(prev)),
+        "signups": _delta_metric(_signups_count(*cur), _prev(lambda w: _signups_count(*w))),
+        "ig_connected": _delta_metric(first_ig(cur), _prev(first_ig)),
+        "first_page_published": _delta_metric(first_page(cur), _prev(first_page)),
+        "first_dm_campaign": _delta_metric(first_campaign(cur), _prev(first_campaign)),
         "paid_conversions": paid_conversions,
         "mrr": mrr,
     }
@@ -600,25 +734,40 @@ def _funnel_node(key: str, count: int, numer: int, denom: int, rate_of, formula)
 
 
 def _build_funnel_variant(counts: dict, visitors: int) -> dict:
-    """counts(+visitors) → {head, branches, conversion} 분기 퍼널 구조.
+    """counts(+visitors) → {head, branches, activation, activation_overlap, conversion}.
 
     counts keys: signups, ig_connected, page_created, page_published, dm_campaign,
-    paid(실결제), trial_only(현재 체험 중 & 미결제).
+    activated(page ∪ campaign), both(page ∩ campaign), paid(실결제),
+    trial_only/pro_trial/basic_trial(카드 등록 체험 중 & 미결제), pro_paid/basic_paid,
+    trial_no_card(카드 미등록 체험 — 전환에서 제외된 인원).
     - head: 방문자(visit, **고유 방문자** distinct visitor_id — 세션 수는 kpis.visits)
       → 가입(signup, rate=signups/visitors, visitors 0 → null)
     - branch dm: IG 연동(ig/signups) → DM 캠페인(dm/ig)
     - branch biolink: 페이지 생성(created/signups) → 페이지 공개(published/created)
-    - conversion(N-1): **유료플랜 전환** = 무료체험 중 + 실결제 (count = paid + trial_only),
-      breakdown = {free_trial, real_payment}. 분기 수렴이라 rate 는 가입 대비로 통일.
+      ※ R-3 이후 프론트 퍼널은 branches 를 숨기고 '자세히 보기' 팝업에서 재사용한다.
+        (구조는 유지 — 제거 금지)
+    - activation(R-3): 분기 4노드를 대체하는 단일 노드 = activated / signups.
+      activation_overlap.both = 페이지 공개 AND DM 캠페인 둘 다인 인원 (중복 제거 구성용).
+    - conversion(N-1 + R-4): **유료플랜 전환** = 카드 등록 체험 중 + 실결제
+      (count = paid + trial_only), **rate 분모는 activated**(방문→가입→활성화→유료 직렬),
+      breakdown = {pro_trial, basic_trial, pro_paid, basic_paid, other} (합 == count).
     """
     signups = counts["signups"]
     ig = counts["ig_connected"]
     page_created = counts["page_created"]
     page = counts["page_published"]
     dm = counts["dm_campaign"]
+    activated = counts.get("activated", 0)
+    both = counts.get("both", 0)
     paid = counts["paid"]
     trial_only = counts.get("trial_only", 0)
+    pro_trial = counts.get("pro_trial", 0)
+    basic_trial = counts.get("basic_trial", 0)
+    pro_paid = counts.get("pro_paid", 0)
+    basic_paid = counts.get("basic_paid", 0)
     plan_total = paid + trial_only
+    # other = 해지 후 free 강등 등으로 pro/basic 어디에도 안 잡히는 잔여 (합계 보정용)
+    other = plan_total - (pro_trial + basic_trial + pro_paid + basic_paid)
 
     # M-6: 모든 노드에 한국어 정의(formula)를 채운다 — 프론트 툴팁 정본 (null 금지)
     head = [
@@ -690,17 +839,41 @@ def _build_funnel_variant(counts: dict, visitors: int) -> dict:
             ],
         },
     ]
+    activation = _funnel_node(
+        "activated",
+        activated,
+        activated,
+        signups,
+        "signup",
+        "DM 캠페인 1개 이상 생성 또는 페이지 공개 ÷ 이 기간 가입자 (중복 제거) · "
+        "도달 여부는 현재까지 기준",
+    )
     conversion = _funnel_node(
         "paid",
         plan_total,
         plan_total,
-        signups,
-        "signup",
-        "가입 코호트 중 유료플랜(무료체험+실결제) 진입 ÷ 가입 × 100 · "
-        "free_trial=현재 체험 진행 중(미결제), real_payment=실제 결제(Toss PAID) 발생",
+        activated,
+        "activated",
+        "가입 코호트 중 유료플랜(무료체험+실결제) 진입 ÷ 활성화 유저 × 100 · "
+        "무료체험은 **카드 등록 완료** 건만(어드민 수동 부여 제외), "
+        "실결제=실제 결제(Toss PAID) 발생",
     )
-    conversion["breakdown"] = {"free_trial": trial_only, "real_payment": paid}
-    return {"head": head, "branches": branches, "conversion": conversion}
+    conversion["breakdown"] = {
+        "pro_trial": pro_trial,
+        "basic_trial": basic_trial,
+        "pro_paid": pro_paid,
+        "basic_paid": basic_paid,
+        "other": other,
+    }
+    # 화면 비노출 — 카드 미등록으로 전환에서 빠진 체험 인원 (검증/로그용)
+    conversion["excluded_no_card"] = counts.get("trial_no_card", 0)
+    return {
+        "head": head,
+        "branches": branches,
+        "activation": activation,
+        "activation_overlap": {"both": both},
+        "conversion": conversion,
+    }
 
 
 def _funnel(all_counts: dict, visitors_all: int, channel_variants: list[tuple]) -> dict:
@@ -739,8 +912,9 @@ def _cohort_flags(start, end) -> tuple:
     """가입 코호트 flag_rows + 어트리뷰션 맵 (채널/퍼널 공용, 중복 쿼리 방지).
 
     반환: (flag_rows, attr_map, attr_utm, referral_users, visits_by_channel)
-    - flag_rows: [(id, ig, pgc, pg, cp, pd, tr), ...] (_cohort_qs values_list)
-      pgc=페이지 생성(공개 무관), pg=페이지 공개, pd=실결제, tr=현재 체험 중.
+    - flag_rows: [(id, ig, pgc, pg, cp, pd, cur_plan, cur_status, cur_card), ...]
+      (_cohort_qs values_list) pgc=페이지 생성(공개 무관), pg=페이지 공개, pd=실결제,
+      cur_* = 현재 구독의 플랜명/상태/빌링키 발급 시각 (체험 판정은 _trial_flags).
     - attr_map: {user_id: channel} (SignupAttribution)
     - attr_utm: {user_id: (utm_campaign, utm_content)} — N-2 캠페인 분해용
     - referral_users: {user_id: 제휴코드 문자열} (ReferralRedemption 보유 — 조회 시점
@@ -750,7 +924,11 @@ def _cohort_flags(start, end) -> tuple:
     """
     if not ATTRIBUTION_AVAILABLE:
         return [], {}, {}, {}, {}
-    flag_rows = list(_cohort_qs(start, end).values_list("id", "ig", "pgc", "pg", "cp", "pd", "tr"))
+    flag_rows = list(
+        _cohort_qs(start, end).values_list(
+            "id", "ig", "pgc", "pg", "cp", "pd", "cur_plan", "cur_status", "cur_card"
+        )
+    )
     user_ids = [r[0] for r in flag_rows]
     attr_map: dict = {}
     attr_utm: dict = {}
@@ -784,8 +962,8 @@ def _channel_of(uid, attr_map: dict, referral_users) -> str:
 def _funnel_channel_variants(flags: tuple) -> list[tuple]:
     """채널별 퍼널 counts 집계 → [(channel, counts, visitors), ...] (signups desc).
 
-    counts keys: signups, ig_connected, page_created, page_published, dm_campaign,
-    paid(실결제), trial_only(현재 체험 중 & 미결제 — N-1 conversion 분해).
+    counts keys 는 _cohort_agg 와 동일 축 (activated/both/플랜별 분해 포함) —
+    _build_funnel_variant 가 all variant 와 같은 구조를 만들 수 있어야 한다 (R-3/R-4).
     signups>0 인 채널만 (드롭다운/available_channels 대상). 어트리뷰션 미탑재 시 빈 리스트.
     """
     flag_rows, attr_map, _attr_utm, referral_users, visits_by_channel = flags
@@ -796,11 +974,19 @@ def _funnel_channel_variants(flags: tuple) -> list[tuple]:
             "page_created": 0,
             "page_published": 0,
             "dm_campaign": 0,
+            "activated": 0,
+            "both": 0,
             "paid": 0,
             "trial_only": 0,
+            "pro_trial": 0,
+            "basic_trial": 0,
+            "pro_paid": 0,
+            "basic_paid": 0,
+            "trial_no_card": 0,
         }
     )
-    for uid, ig, pgc, pg, cp, pd, tr in flag_rows:
+    for uid, ig, pgc, pg, cp, pd, cur_plan, cur_status, cur_card in flag_rows:
+        tr, tr_no_card = _trial_flags(cur_plan, cur_status, cur_card)
         channel = _channel_of(uid, attr_map, referral_users)
         slot = per_channel[channel]
         slot["signups"] += 1
@@ -812,10 +998,24 @@ def _funnel_channel_variants(flags: tuple) -> list[tuple]:
             slot["page_published"] += 1
         if cp:
             slot["dm_campaign"] += 1
+        if pg or cp:
+            slot["activated"] += 1
+        if pg and cp:
+            slot["both"] += 1
         if pd:
             slot["paid"] += 1
-        if tr and not pd:
+            if cur_plan == "pro":
+                slot["pro_paid"] += 1
+            elif cur_plan == "basic":
+                slot["basic_paid"] += 1
+        elif tr:
             slot["trial_only"] += 1
+            if cur_plan == "pro":
+                slot["pro_trial"] += 1
+            elif cur_plan == "basic":
+                slot["basic_trial"] += 1
+        elif tr_no_card:
+            slot["trial_no_card"] += 1
 
     variants = [
         (channel, counts, visits_by_channel.get(channel, 0))
@@ -834,7 +1034,7 @@ def _channels(start, end, flags: tuple | None = None) -> dict:
     - referral_codes 는 billing 소스라 어트리뷰션 미탑재여도 항상 채워진다.
     - flags: 뷰에서 미리 계산한 _cohort_flags(start,end) 결과 (funnel 과 중복 쿼리 방지).
     - paid 는 **실결제(첫 PAID 이력)** 만 — 체험 미포함 (N-4). free_trial(현재 체험 중 &
-      미결제)은 별도 컬럼.
+      미결제)은 별도 컬럼 — R-4 이후 **카드 등록 완료 체험만** (퍼널 conversion 과 동일 정의).
     - campaigns(N-2): 채널 행 하위의 (utm_campaign × utm_content) 조합별 분해.
       방문(=고유 방문자, distinct visitor_id)=LandingVisit 저장 utm, 가입측=SignupAttribution
       저장 utm (레퍼럴 오버레이 유저도 자신의 저장 utm 조합으로 referral 채널 아래 분해).
@@ -868,7 +1068,8 @@ def _channels(start, end, flags: tuple | None = None) -> dict:
         per_combo: dict = defaultdict(_empty_slot)
         # P-3: 저장 채널 → referral 로 이동한 인원 (원 채널 과소 집계 보정 표기용)
         referral_overlap: dict = defaultdict(int)
-        for uid, ig, pgc, pg, cp, pd, tr in flag_rows:
+        for uid, ig, pgc, pg, cp, pd, cur_plan, cur_status, cur_card in flag_rows:
+            tr, _tr_no_card = _trial_flags(cur_plan, cur_status, cur_card)
             channel = _channel_of(uid, attr_map, referral_users)
             if channel == "referral":
                 referral_overlap[attr_map.get(uid, "unknown")] += 1
@@ -1219,8 +1420,12 @@ def _trials_ended(start, end) -> dict:
     }
 
 
-def _feature_stats(cur: tuple, prev: tuple) -> dict:
+def _feature_stats(cur: tuple, prev: tuple | None) -> dict:
+    """기능별 사용 통계. prev is None(period=all)이면 delta 계열 previous 전부 null."""
     start, end = cur
+
+    def _prev(fn):
+        return None if prev is None else fn(prev)
 
     # biolink — new_public_pages 는 created_at 근사 (공개 시각 미기록)
     def new_public_pages(w):
@@ -1303,7 +1508,8 @@ def _feature_stats(cur: tuple, prev: tuple) -> dict:
 
     from apps.admin_api.views.dashboard import _delivery_rate  # 표준 공식 재사용
 
-    dm_cur, dm_prev = dm_agg(cur), dm_agg(prev)
+    dm_cur = dm_agg(cur)
+    dm_prev = None if prev is None else dm_agg(prev)
 
     # spam
     def spam_counts(w):
@@ -1321,7 +1527,8 @@ def _feature_stats(cur: tuple, prev: tuple) -> dict:
             hidden=Count("id", filter=Q(status=SpamCommentLog.Status.HIDDEN)),
         )
 
-    spam_cur, spam_prev = spam_counts(cur), spam_counts(prev)
+    spam_cur = spam_counts(cur)
+    spam_prev = None if prev is None else spam_counts(prev)
 
     # trials — started = 레퍼럴 트라이얼 + 카드등록 트라이얼(trial_used_at).
     # converted/conversion_rate 는 '레퍼럴 코호트'만 대상 (카드 트라이얼 전환은 전용
@@ -1336,7 +1543,7 @@ def _feature_stats(cur: tuple, prev: tuple) -> dict:
 
     ref_cur_count = referral_started(cur).count()
     started_cur = ref_cur_count + card_trial_qs(cur).count()
-    started_prev = referral_started(prev).count() + card_trial_qs(prev).count()
+    started_prev = _prev(lambda w: referral_started(w).count() + card_trial_qs(w).count())
     converted = referral_started(cur).filter(converted_to_paid=True).count()
 
     # N-3: 현재 체험 진행 중 수 — 조회 시점 TRIALING 유료플랜 구독 (상태 전이는
@@ -1395,27 +1602,32 @@ def _feature_stats(cur: tuple, prev: tuple) -> dict:
     return {
         "biolink": {
             "public_pages_total": Page.objects.filter(is_public=True).count(),
-            "new_public_pages": _delta_metric(new_public_pages(cur), new_public_pages(prev)),
+            "new_public_pages": _delta_metric(new_public_pages(cur), _prev(new_public_pages)),
             "created_breakdown": created_breakdown(cur),
-            "active_users": _delta_metric(page_users(cur), page_users(prev)),
-            "views": _delta_metric(views_cur, page_views(prev)),
-            "clicks": _delta_metric(clicks_cur, block_clicks(prev)),
+            "active_users": _delta_metric(page_users(cur), _prev(page_users)),
+            "views": _delta_metric(views_cur, _prev(page_views)),
+            "clicks": _delta_metric(clicks_cur, _prev(block_clicks)),
             "ctr": round(clicks_cur / views_cur, 4) if views_cur else 0.0,
             "top_pages": top_pages,
         },
         "dm": {
-            "campaigns_created": _delta_metric(campaigns_created(cur), campaigns_created(prev)),
-            "active_users": _delta_metric(dm_campaign_users(cur), dm_campaign_users(prev)),
-            "requested": _delta_metric(dm_cur["requested"], dm_prev["requested"]),
+            "campaigns_created": _delta_metric(campaigns_created(cur), _prev(campaigns_created)),
+            "active_users": _delta_metric(dm_campaign_users(cur), _prev(dm_campaign_users)),
+            "requested": _delta_metric(
+                dm_cur["requested"], dm_prev["requested"] if dm_prev else None
+            ),
             "delivered": _delta_metric(
-                dm_cur["delivered"] + dm_cur["read"], dm_prev["delivered"] + dm_prev["read"]
+                dm_cur["delivered"] + dm_cur["read"],
+                (dm_prev["delivered"] + dm_prev["read"]) if dm_prev else None,
             ),
             "delivery_rate": _delivery_rate(dm_cur),
         },
         "spam": {
-            "active_users": _delta_metric(spam_users(cur), spam_users(prev)),
-            "detected": _delta_metric(spam_cur["detected"], spam_prev["detected"]),
-            "hidden": _delta_metric(spam_cur["hidden"], spam_prev["hidden"]),
+            "active_users": _delta_metric(spam_users(cur), _prev(spam_users)),
+            "detected": _delta_metric(
+                spam_cur["detected"], spam_prev["detected"] if spam_prev else None
+            ),
+            "hidden": _delta_metric(spam_cur["hidden"], spam_prev["hidden"] if spam_prev else None),
         },
         "trials": {
             "started": _delta_metric(started_cur, started_prev),
@@ -2014,12 +2226,6 @@ def _subscription_retention(cur) -> dict:
 # ── 코호트 분석 (Q-2) — 기간 필터와 무관한 고정 창 ─────────────────────
 
 
-def _month_add(d: date, k: int) -> date:
-    """월초일 d 에 k 개월 더한 월초일 (월 산술 — timedelta 로는 불가)."""
-    total = d.year * 12 + (d.month - 1) + k
-    return date(total // 12, total % 12 + 1, 1)
-
-
 def _subscription_cohorts(now) -> dict:
     """구독 유지 코호트 (첫 PAID 월 × M+1..M+5 유지율).
 
@@ -2401,6 +2607,87 @@ def _customer_actions(now) -> dict:
     }
 
 
+# ── 고정 패널 스냅샷 (R-2) — 기간 파라미터와 무관한 전체 기간 누적 ──────
+
+
+def _plan_count_rows(subs) -> tuple[list[dict], int]:
+    """구독 QS → ([{name, display_name, count}], total) — Σ count == total 보장."""
+    rows = [
+        {
+            "name": r["plan__name"],
+            "display_name": r["plan__display_name"],
+            "count": r["c"],
+        }
+        for r in (
+            subs.values("plan__name", "plan__display_name", "plan__sort_order")
+            .annotate(c=Count("id"))
+            .order_by("plan__sort_order", "plan__name")
+        )
+    ]
+    return rows, sum(r["count"] for r in rows)
+
+
+def _snapshot(now) -> dict:
+    """상단 고정 패널 — **전체 기간 누적**, period/커스텀 범위와 무관 (R-2).
+
+    - paying: 실제 결제(PAID) 이력이 있고 **현재 유료 구독이 살아있는**(ACTIVE) 회원 수.
+      PAST_DUE(결제 실패 dunning 중)는 **제외** — customer_actions.payment_failed 에
+      별도로 잡히고, '실제 결제 인원'의 의미를 흐리지 않기 위함 (R-7 ②).
+      by_plan 은 **현재 구독 플랜** 기준 (Σ == total).
+    - trialing: 조회 시점 TRIALING + 유료플랜 + **카드 등록 완료**
+      (billing_key_issued_at — 어드민 수동 부여 무카드 계정 제외).
+      feature_stats.trials.active(카드 필터 없음) 보다 작거나 같은 것이 정상.
+    - visitors: 전체 기간 고유 방문자(distinct visitor_id). 어트리뷰션 미탑재 시 0.
+    - signups: 누적 가입 회원 수 (_signups_count 와 동일 정책 — 별도 필터 없음).
+    - activated: **가입 시기 무관**, 공개 페이지 보유 ∪ DM 캠페인 보유 고유 회원 수.
+      period=all 의 funnel.activation.count(코호트=전체)와 일치해야 하므로 판정 축을
+      _cohort_qs(pg/cp)와 동일하게 맞춘다.
+    """
+    paid_user_ids = PaymentHistory.objects.filter(status=PaymentStatus.PAID).values("user_id")
+    paying_rows, paying_total = _plan_count_rows(
+        UserSubscription.objects.filter(
+            user_id__in=paid_user_ids, status=SubscriptionStatus.ACTIVE
+        ).exclude(plan__name__in=_PAID_EXCLUDE)
+    )
+    trial_rows, trial_total = _plan_count_rows(
+        UserSubscription.objects.filter(
+            status=SubscriptionStatus.TRIALING, billing_key_issued_at__isnull=False
+        ).exclude(plan__name__in=_PAID_EXCLUDE)
+    )
+
+    visitors = 0
+    if ATTRIBUTION_AVAILABLE:
+        visitors = LandingVisit.objects.order_by().values("visitor_id").distinct().count()
+
+    page_owners = set(
+        Page.objects.filter(is_public=True).order_by().values_list("user_id", flat=True).distinct()
+    )
+    campaign_owners = set(
+        AutoDMCampaign.objects.order_by()
+        .values_list("ig_connection__workspace__owner_id", flat=True)
+        .distinct()
+    )
+
+    return {
+        "as_of": timezone.localtime(now).isoformat(),
+        "paying": {"total": paying_total, "by_plan": paying_rows},
+        "trialing": {"total": trial_total, "by_plan": trial_rows},
+        "visitors": visitors,
+        "signups": User.objects.count(),
+        "activated": len(page_owners | campaign_owners),
+    }
+
+
+def _snapshot_cached(now) -> dict:
+    """R-6 ②: 기간과 무관하므로 별도 캐시 키 — 모든 period 응답이 계산 1회를 공유."""
+    cached = cache.get(CACHE_KEY_SNAPSHOT)
+    if cached is not None:
+        return cached
+    data = _snapshot(now)
+    cache.set(CACHE_KEY_SNAPSHOT, data, MARKETING_DASHBOARD_SNAPSHOT_CACHE_TTL)
+    return data
+
+
 class AdminMarketingDashboardView(APIView):
     """어드민 마케팅 대시보드 집계 (단일 GET, Redis 5분 캐시)."""
 
@@ -2427,12 +2714,37 @@ KPI(기간 비교), 가입 코호트 퍼널, 채널별 성과, 업셀 후보, �
 
 ## 비즈니스 로직
 - **전수 집계**: request.user 소속 워크스페이스로 필터하지 않습니다.
-- `period`: `7d` / `30d`(기본) / `90d`. current = [now-N일, now), previous = [now-2N일, now-N일).
-  잘못된 값은 **400**. 모든 KPI 는 `{current, previous, delta_pct}` (previous==0 → delta null).
+- `period`: `7d` / `30d`(기본) / `90d` / `all`. current = [now-N일, now),
+  previous = [now-2N일, now-N일). 잘못된 값은 **400**.
+  모든 KPI 는 `{current, previous, delta_pct}` (previous==0 → delta null).
+- **`period=all`(R-1, 전체 기간)**: current = [**서비스 최초 가입 시각**(가장 이른
+  `User.date_joined`, 회원 0명이면 now), now). **직전 기간을 만들지 않습니다** —
+  `range.previous_start/previous_end = null`, 모든 delta 계열은
+  `previous: null` + `delta_pct: null` (빈 구간을 previous 로 주면 "직전 0건"으로
+  오독되므로 의도적으로 null). 커스텀 범위(`start`&`end`)는 지금처럼 직전 동일 길이 비교 유지.
+  계산량이 가장 크고 분 단위로 값이 변하지 않아 캐시 TTL 은 **900초(15분)**.
+- **`snapshot`(R-2, 상단 고정 패널)**: **전체 기간 누적, 기간 파라미터와 무관** —
+  `period=7d` 응답에도 `period=all` 응답에도 같은 값이 들어갑니다
+  (별도 캐시 키 `admin:dash:mkt:snapshot`, TTL 900초 → 모든 period 가 계산 1회를 공유).
+  `{as_of, paying{total,by_plan}, trialing{total,by_plan}, visitors, signups, activated}`.
+  · `paying` = 실결제(PAID) 이력 보유 + **현재 유료 ACTIVE** 구독 회원 수
+  (**PAST_DUE 제외** — `customer_actions.payment_failed` 에 별도 집계, free/admin 제외),
+  `by_plan` 은 현재 구독 플랜 기준 (Σ == total).
+  · `trialing` = 조회 시점 TRIALING + 유료플랜 + **카드 등록 완료**(billing_key_issued_at) —
+  카드 필터가 없는 `feature_stats.trials.active` 보다 작거나 같은 것이 정상.
+  · `visitors` = 전체 기간 고유 방문자(distinct visitor_id, 미탑재 시 0),
+  `signups` = 누적 가입 회원 수, `activated` = **가입 시기 무관** 공개 페이지 ∪ DM 캠페인
+  보유 고유 회원 수. `funnel.activation.count`(이 기간 가입 코호트)와는 정의가 다르며
+  **period=all 에서만 두 값이 일치**합니다.
 - **커스텀 범위**: `start=YYYY-MM-DD` + `end=YYYY-MM-DD` (Asia/Seoul 로컬 날짜) 를 함께 주면
   `period` 무시하고 커스텀 집계 — `period` 응답은 `"custom"`. current = [start 자정, end+1일 자정),
   previous = **직전 동일 길이 구간** `[start-span, start)` (span = current 길이). **검증(400)**:
   start/end 중 하나만·파싱 불가·`end < start`·span > 366일 → `details.reason`.
+- **`trends.granularity`(R-5)**: 현재 구간이 길면 버킷 단위를 자동 상향합니다 —
+  **≤120일 `"day"` / ≤400일 `"week"`(월요일 시작) / 그 이상 `"month"`(1일 시작)**.
+  `date` 는 버킷 **시작일**, 필드 구성·`Σ by_channel == 버킷 총량` 규칙은 일별과 동일하며
+  마지막 버킷이 진행 중(미완결)이어도 그대로 내려갑니다. `activated` 는 **버킷 단위 dedupe**
+  (주별이면 같은 주 중복 활동은 1명). 프론트는 이 값을 읽어 받은 단위 그대로 렌더하세요.
 - **`trends`(신규, 항상 포함)**: current 기간 전체를 **로컬 날짜 단위로 zero-fill** 한 일별 버킷.
   각 버킷 = `{date(로컬 YYYY-MM-DD), signups, paid, dm_delivered, page_views, page_clicks, visits}`.
   signups=User.date_joined, paid=유저별 첫 PAID paid_at(KPI first-paid 재사용),
@@ -2449,11 +2761,28 @@ KPI(기간 비교), 가입 코호트 퍼널, 채널별 성과, 업셀 후보, �
   각 노드 = `{key, label, count, rate, rate_of, formula}`. rate: signup=가입/고유 방문자,
   ig_connected=ig/가입, dm_campaign=dm/ig, page_created=생성/가입, page_published=공개/생성,
   paid=유료플랜 전환/가입(수렴이라 가입 대비).
-- **퍼널 conversion 노드(N-1)**: label="유료플랜 전환", `count` = **무료체험 중 + 실결제**
-  (가입 코호트 중 유료플랜 진입 전체). `breakdown = {free_trial, real_payment}` —
-  free_trial=현재 체험 진행 중(TRIALING 유료플랜)·미결제, real_payment=실결제(첫 PAID 이력,
-  kpis.paid_conversions 와 동일 기준). free_trial + real_payment == count. 체험이 만료돼
-  free 로 강등된 회원은 어느 쪽에도 안 잡힘(현재 상태 기준 — 코호트 의미론과 동일).
+- **퍼널 activation 노드(R-3)**: 분기 4노드(IG 연동/DM 캠페인/페이지 생성/페이지 공개)를
+  대체하는 **단일 '활성화 유저' 노드** — `variants[*].activation =
+  {key:"activated", label:"활성화 유저", count, rate, rate_of:"signup", formula}`.
+  count = 가입 코호트 중 **공개 페이지 보유 ∪ DM 캠페인 보유**(중복 제거),
+  rate = activated / signups (분모 0 → null). `variants[*].activation_overlap.both` =
+  둘 다 보유한 인원 → 프론트가 `dm_only = dm_campaign - both`,
+  `page_published_only = page_published - both` 로 중복 제거 구성을 계산합니다.
+  `branches` 는 **그대로 유지**(퍼널에서 숨기고 '자세히 보기' 팝업에서 재사용). 채널
+  variant 전부에 동일하게 들어갑니다.
+- **퍼널 conversion 노드(N-1 + R-4)**: label="유료플랜 전환", `count` = **카드 등록 체험 중
+  + 실결제**, **`rate_of` = `"activated"`**(방문→가입→활성화→유료 직렬이라 분모가 활성화
+  유저로 변경). `breakdown = {pro_trial, basic_trial, pro_paid, basic_paid, other}` —
+  **모든 값의 합 == count** 보장. pro_trial/basic_trial = 현재 TRIALING · 해당 플랜 ·
+  **카드 등록 완료**(billing_key_issued_at) · PAID 이력 없음 (basic_trial 은 체험이 프로
+  전용인 현 정책에선 사실상 항상 0이지만 합계식 안정성을 위해 **키는 항상 포함** — 0이면
+  프론트에서 행 생략), pro_paid/basic_paid = PAID 이력 보유 회원의 **현재 구독 플랜** 분해,
+  other = 해지 후 free 강등 등 잔여(보통 0). **카드 미등록 체험자는 breakdown 뿐 아니라
+  `count` 에서도 제외**되며(어드민 수동 부여 계정이 전환 실적으로 잡히는 문제 제거),
+  제외 인원은 `conversion.excluded_no_card`(화면 비노출, 검증용)로 함께 내려갑니다.
+  체험이 만료돼 free 로 강등된 회원은 어느 쪽에도 안 잡힘(현재 상태 기준).
+  ⚠ 같은 정의 변경이 `channels.rows[].free_trial` / `campaigns[].free_trial` 에도
+  적용됩니다(카드 등록 체험만).
 - **채널별 퍼널 variant(미리 계산)**: `funnel.variants` 에 `all` + signups>0 인 채널별 variant 를
   담아 응답 (드롭다운 전환 시 재요청 불필요). `available_channels` 는 `all` + 각 채널
   (signups desc). 어트리뷰션 미탑재 시 `all` 만.
@@ -2547,7 +2876,8 @@ KPI(기간 비교), 가입 코호트 퍼널, 채널별 성과, 업셀 후보, �
   `post_payment_usage` 결제 후 7일 내 실제 사용 기능별 유저 수. **'무엇 때문에 결제했나'를
   단정하지 않고** 진입 경로/사용을 분리 제시.
 - 응답은 Redis 에 **300초(5분) 캐시** (프리셋 키 `admin:dash:mkt:{period}`,
-  커스텀 키 `admin:dash:mkt:custom:{start}:{end}`).
+  커스텀 키 `admin:dash:mkt:custom:{start}:{end}`). 단 `period=all` 은 **900초(15분)**,
+  `snapshot` 은 별도 키 `admin:dash:mkt:snapshot` 에 **900초** (모든 period 공유).
 
 ## 주의사항
 - 결제/토큰 비밀값은 직렬화하지 않습니다. 읽기 전용 — 감사 로그 없음.
@@ -2571,8 +2901,9 @@ curl -H "Authorization: Bearer <staff_token>" \\
                 location=OpenApiParameter.QUERY,
                 required=False,
                 enum=list(ALLOWED_PERIODS),
-                description="집계 기간. 7d / 30d(기본) / 90d. 그 외 값은 400. "
-                "start&end 를 함께 주면 무시됩니다.",
+                description="집계 기간. 7d / 30d(기본) / 90d / all(전체 기간). 그 외 값은 400. "
+                "all 은 서비스 최초 가입 시각부터 now 까지이며 직전 기간 비교가 없습니다"
+                "(range.previous_*=null, delta 전부 null). start&end 를 함께 주면 무시됩니다.",
             ),
             OpenApiParameter(
                 name="start",
@@ -2596,7 +2927,7 @@ curl -H "Authorization: Bearer <staff_token>" \\
             400: OpenApiResponse(
                 description="잘못된 period 값 — "
                 '{"success": false, "error": {"code": 400, "message": "...", '
-                '"details": {"allowed": ["7d","30d","90d"]}}} '
+                '"details": {"allowed": ["7d","30d","90d","all"]}}} '
                 "또는 잘못된 커스텀 범위(하나만/역순/파싱불가/span>366) — "
                 '{"success": false, "error": {"code": 400, "message": "...", '
                 '"details": {"reason": "..."}}}'
@@ -2619,6 +2950,23 @@ curl -H "Authorization: Bearer <staff_token>" \\
                     },
                     "generated_at": "2026-07-11T14:00:03+09:00",
                     "attribution_available": True,
+                    "snapshot": {
+                        "as_of": "2026-07-11T14:00:03+09:00",
+                        "paying": {
+                            "total": 87,
+                            "by_plan": [
+                                {"name": "basic", "display_name": "베이직", "count": 29},
+                                {"name": "pro", "display_name": "프로", "count": 58},
+                            ],
+                        },
+                        "trialing": {
+                            "total": 41,
+                            "by_plan": [{"name": "pro", "display_name": "프로", "count": 41}],
+                        },
+                        "visitors": 24180,
+                        "signups": 1842,
+                        "activated": 612,
+                    },
                     "kpis": {
                         "visits": {"current": 5400, "previous": 4100, "delta_pct": 31.7},
                         "unique_visitors": {"current": 3900, "previous": 3000, "delta_pct": 30.0},
@@ -2719,16 +3067,33 @@ curl -H "Authorization: Bearer <staff_token>" \\
                                         ],
                                     },
                                 ],
+                                "activation": {
+                                    "key": "activated",
+                                    "label": "활성화 유저",
+                                    "count": 96,
+                                    "rate": 0.4571,
+                                    "rate_of": "signup",
+                                    "formula": "DM 캠페인 1개 이상 생성 또는 페이지 공개 ÷ "
+                                    "이 기간 가입자 (중복 제거) · 도달 여부는 현재까지 기준",
+                                },
+                                "activation_overlap": {"both": 21},
                                 "conversion": {
                                     "key": "paid",
                                     "label": "유료플랜 전환",
                                     "count": 18,
-                                    "rate": 0.0857,
-                                    "rate_of": "signup",
+                                    "rate": 0.1875,
+                                    "rate_of": "activated",
                                     "formula": "가입 코호트 중 유료플랜(무료체험+실결제) 진입"
-                                    " ÷ 가입 × 100 · free_trial=현재 체험 진행 중(미결제), "
-                                    "real_payment=실제 결제(Toss PAID) 발생",
-                                    "breakdown": {"free_trial": 12, "real_payment": 6},
+                                    " ÷ 활성화 유저 × 100 · 무료체험은 **카드 등록 완료** "
+                                    "건만(어드민 수동 부여 제외), 실결제=실제 결제(Toss PAID) 발생",
+                                    "breakdown": {
+                                        "pro_trial": 11,
+                                        "basic_trial": 0,
+                                        "pro_paid": 5,
+                                        "basic_paid": 2,
+                                        "other": 0,
+                                    },
+                                    "excluded_no_card": 1,
                                 },
                             }
                         },
@@ -3141,6 +3506,7 @@ curl -H "Authorization: Bearer <staff_token>" \\
             cur = (cur_start, cur_end)
             prev = (cur_start - span, cur_start)
             cache_key = CACHE_KEY_CUSTOM_TMPL.format(start=start_raw, end=end_raw)
+            cache_ttl = MARKETING_DASHBOARD_CACHE_TTL
         else:
             period = request.query_params.get("period", "30d")
             if period not in ALLOWED_PERIODS:
@@ -3156,9 +3522,15 @@ curl -H "Authorization: Bearer <staff_token>" \\
                     status=http_status.HTTP_400_BAD_REQUEST,
                 )
             days = ALLOWED_PERIODS[period]
-            cur = (now - timedelta(days=days), now)
-            prev = (now - timedelta(days=days * 2), now - timedelta(days=days))
             cache_key = CACHE_KEY_TMPL.format(period=period)
+            if days is None:  # R-1: 전체 기간 — 비교할 직전 기간이 없음 (prev=None)
+                cur = (_service_start(now), now)
+                prev = None
+                cache_ttl = MARKETING_DASHBOARD_ALL_CACHE_TTL
+            else:
+                cur = (now - timedelta(days=days), now)
+                prev = (now - timedelta(days=days * 2), now - timedelta(days=days))
+                cache_ttl = MARKETING_DASHBOARD_CACHE_TTL
 
         cached = cache.get(cache_key)
         if cached is not None:
@@ -3177,11 +3549,13 @@ curl -H "Authorization: Bearer <staff_token>" \\
             "range": {
                 "current_start": timezone.localtime(cur[0]).isoformat(),
                 "current_end": timezone.localtime(cur[1]).isoformat(),
-                "previous_start": timezone.localtime(prev[0]).isoformat(),
-                "previous_end": timezone.localtime(prev[1]).isoformat(),
+                # period=all 은 비교 대상이 없어 null (빈 구간을 previous 로 주면 오독됨)
+                "previous_start": timezone.localtime(prev[0]).isoformat() if prev else None,
+                "previous_end": timezone.localtime(prev[1]).isoformat() if prev else None,
             },
             "generated_at": timezone.localtime(now).isoformat(),
             "attribution_available": ATTRIBUTION_AVAILABLE,
+            "snapshot": _snapshot_cached(now),
             "kpis": _kpis(cur, prev, mrr_breakdown["total"]),
             "funnel": _funnel(cohort, unique_visitors_current, channel_variants),
             "trends": _trends(*cur),
@@ -3198,7 +3572,7 @@ curl -H "Authorization: Bearer <staff_token>" \\
         }
 
         data = AdminMarketingDashboardSerializer(payload).data
-        cache.set(cache_key, data, MARKETING_DASHBOARD_CACHE_TTL)
+        cache.set(cache_key, data, cache_ttl)
 
         logger.info(
             "[admin-dash-mkt] req=%s period=%s signups=%s mrr=%s attribution=%s",

@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 from django.contrib.auth import get_user_model
@@ -60,7 +60,10 @@ requires_analytics = pytest.mark.skipif(
 User = get_user_model()
 
 URL = "/api/v1/admin/dashboard/marketing/"
-CACHE_KEYS = [f"admin:dash:mkt:{p}" for p in ("7d", "30d", "90d")]
+# snapshot(R-2)은 기간 무관 별도 키라 함께 비워야 테스트 간 값이 새지 않는다
+CACHE_KEYS = [f"admin:dash:mkt:{p}" for p in ("7d", "30d", "90d", "all")] + [
+    "admin:dash:mkt:snapshot"
+]
 LONG_AGO = timedelta(days=400)
 
 # ─── 공통 픽스처 (tests_subscription.py 패턴) ─────────────────────────
@@ -208,6 +211,20 @@ def _mk_paid_payment(user, paid_at, amount=14900):
     )
 
 
+def _mk_trial_sub(user, plan, *, card=True, **kwargs):
+    """무료체험(TRIALING) 구독 — R-4 이후 '카드 등록 완료'(billing_key_issued_at)만 집계.
+
+    card=False 는 어드민 수동 부여(무카드) 계정 — 전환/체험 카운트에서 빠져야 한다.
+    """
+    return UserSubscription.objects.create(
+        user=user,
+        plan=plan,
+        status=SubscriptionStatus.TRIALING,
+        billing_key_issued_at=timezone.now() if card else None,
+        **kwargs,
+    )
+
+
 def _mk_quota_dms(campaign, recipient_ids):
     """quota 소진 상태(ACCEPTED) DM 로그 벌크 생성 — (캠페인 × 수신자) 쌍 카운트 검증용.
 
@@ -232,14 +249,19 @@ def _variant(res, channel="all"):
     return res.data["funnel"]["variants"][channel]
 
 
-def _node(res, key, channel="all"):
-    """분기 퍼널 노드 1개를 key 로 조회 (head + 모든 branch.steps + conversion 탐색)."""
-    v = _variant(res, channel)
-    nodes = list(v["head"])
-    for br in v["branches"]:
+def _all_nodes(variant) -> list[dict]:
+    """variant 의 전 노드 (head + branch.steps + activation + conversion)."""
+    nodes = list(variant["head"])
+    for br in variant["branches"]:
         nodes.extend(br["steps"])
-    nodes.append(v["conversion"])
-    return next(n for n in nodes if n["key"] == key)
+    nodes.append(variant["activation"])
+    nodes.append(variant["conversion"])
+    return nodes
+
+
+def _node(res, key, channel="all"):
+    """분기 퍼널 노드 1개를 key 로 조회 (head + branch.steps + activation + conversion)."""
+    return next(n for n in _all_nodes(_variant(res, channel)) if n["key"] == key)
 
 
 def _branch(res, branch_key, channel="all"):
@@ -261,7 +283,7 @@ class TestPermissionsAndParams:
         assert res.status_code == 200
         assert res.data["period"] == "30d"
 
-    @pytest.mark.parametrize("period", ["7d", "30d", "90d"])
+    @pytest.mark.parametrize("period", ["7d", "30d", "90d", "all"])
     def test_valid_periods(self, staff_client, period):
         res = staff_client.get(URL, {"period": period})
         assert res.status_code == 200
@@ -272,7 +294,7 @@ class TestPermissionsAndParams:
         assert res.status_code == 400
         assert res.data["success"] is False
         assert res.data["error"]["code"] == 400
-        assert res.data["error"]["details"]["allowed"] == ["7d", "30d", "90d"]
+        assert res.data["error"]["details"]["allowed"] == ["7d", "30d", "90d", "all"]
 
 
 # ─── 빈 상태 ─────────────────────────────────────────────────────────
@@ -314,9 +336,14 @@ class TestEmptyState:
             "page_published",
         ]
         assert v["conversion"]["key"] == "paid"
+        # R-3: 분기와 나란히 단일 활성화 노드 + 교집합
+        assert v["activation"]["key"] == "activated"
+        assert v["activation"]["rate_of"] == "signup"
+        assert v["activation_overlap"] == {"both": 0}
         for key in (
             "visit",
             "signup",
+            "activated",
             "ig_connected",
             "dm_campaign",
             "page_created",
@@ -398,11 +425,19 @@ class TestCohortFunnel:
         res = staff_client.get(URL)
         paid = _node(res, "paid")
         assert paid["count"] == 1
-        assert paid["rate"] == 0.2  # paid/signups = 1/5
-        assert paid["rate_of"] == "signup"
-        # N-1: 유료플랜 전환(무료체험+실결제) — 체험 없으면 count == real_payment
+        # R-4: 분모가 가입(5) 이 아니라 활성화 유저 — 여기선 활성화 0 이므로 rate=null
+        assert paid["rate_of"] == "activated"
+        assert paid["rate"] is None
+        # 유료플랜 전환(무료체험+실결제) — 체험 없으면 전부 실결제 쪽
         assert "유료플랜" in paid["formula"] and "Toss PAID" in paid["formula"]
-        assert paid["breakdown"] == {"free_trial": 0, "real_payment": 1}
+        assert paid["breakdown"] == {
+            "pro_trial": 0,
+            "basic_trial": 0,
+            "pro_paid": 0,  # 구독 레코드가 없는 결제자 → other
+            "basic_paid": 0,
+            "other": 1,
+        }
+        assert sum(paid["breakdown"].values()) == paid["count"]
 
     def test_private_page_created_but_not_published(self, staff_client, clean_slate):
         # 비공개 페이지 = '생성'에는 포함, '공개'에는 미포함 (생성→공개 2단계 검증)
@@ -1334,11 +1369,8 @@ class TestReferralCodeDescription:
 class TestFunnelFormulas:
     def test_all_nodes_have_formula(self, staff_client, clean_slate):
         variant = staff_client.get(URL).data["funnel"]["variants"]["all"]
-        nodes = list(variant["head"])
-        for branch in variant["branches"]:
-            nodes.extend(branch["steps"])
-        nodes.append(variant["conversion"])
-        assert len(nodes) == 7
+        nodes = _all_nodes(variant)
+        assert len(nodes) == 8  # head 2 + 분기 4 + activation 1 + conversion 1
         for node in nodes:
             assert node["formula"], f"{node['key']} formula 가 비어 있음"
         # 유료플랜 전환 노드는 체험/실결제 분해 정의를 명시 (N-1)
@@ -1346,24 +1378,22 @@ class TestFunnelFormulas:
         assert "Toss PAID" in variant["conversion"]["formula"]
 
 
-# ─── N-1: 퍼널 유료플랜 전환 분해 (무료체험/실결제) ─────────────────────
+# ─── N-1 + R-4: 퍼널 유료플랜 전환 3분할 (플랜 × 체험/실결제) ─────────────
 
 
 class TestFunnelPlanConversion:
     def test_conversion_counts_trial_and_payment(self, staff_client, clean_slate, pro_plan):
         now = timezone.now()
         in_cohort = now - timedelta(days=5)
-        # 실결제 회원
+        # 실결제 회원 (현재 구독 = pro ACTIVE → pro_paid)
         u_paid = _mk_user(joined=in_cohort)
         _mk_paid_payment(u_paid, paid_at=now - timedelta(days=2))
-        # 무료체험 진행 중(미결제) 회원
-        u_trial = _mk_user(joined=in_cohort)
         UserSubscription.objects.create(
-            user=u_trial,
-            plan=pro_plan,
-            status=SubscriptionStatus.TRIALING,
-            trial_used_at=now - timedelta(days=1),
+            user=u_paid, plan=pro_plan, status=SubscriptionStatus.ACTIVE
         )
+        # 무료체험(카드 등록) 진행 중·미결제 회원 → pro_trial
+        u_trial = _mk_user(joined=in_cohort)
+        _mk_trial_sub(u_trial, pro_plan, trial_used_at=now - timedelta(days=1))
         # 체험 만료 후 강등(CANCELLED) 회원 — 어느 쪽에도 안 잡힘 (현재 상태 기준)
         u_expired = _mk_user(joined=in_cohort)
         UserSubscription.objects.create(
@@ -1376,25 +1406,71 @@ class TestFunnelPlanConversion:
         conv = _variant(res)["conversion"]
         assert conv["label"] == "유료플랜 전환"
         assert conv["count"] == 2  # u_paid + u_trial
-        assert conv["breakdown"] == {"free_trial": 1, "real_payment": 1}
-        assert conv["rate"] == 0.5  # 2/4
-        # 체험 중 + 실결제 이력 둘 다인 회원은 real_payment 로 1회만
+        assert conv["breakdown"] == {
+            "pro_trial": 1,
+            "basic_trial": 0,
+            "pro_paid": 1,
+            "basic_paid": 0,
+            "other": 0,
+        }
+        assert conv["excluded_no_card"] == 0
+        # 체험 중 + 실결제 이력 둘 다인 회원은 실결제로 1회만
         _mk_paid_payment(u_trial, paid_at=now - timedelta(hours=1))
         cache.delete_many(CACHE_KEYS)
         conv = _variant(staff_client.get(URL))["conversion"]
         assert conv["count"] == 2
-        assert conv["breakdown"] == {"free_trial": 0, "real_payment": 2}
+        assert conv["breakdown"]["pro_paid"] == 2
+        assert conv["breakdown"]["pro_trial"] == 0
+
+    def test_no_card_trial_excluded_from_conversion(self, staff_client, clean_slate, pro_plan):
+        """R-4 — 어드민 수동 부여(무카드) 체험은 전환 자체에서 제외 + excluded_no_card."""
+        now = timezone.now()
+        u_nocard = _mk_user(joined=now - timedelta(days=3))
+        _mk_trial_sub(u_nocard, pro_plan, card=False)
+        u_card = _mk_user(joined=now - timedelta(days=3))
+        _mk_trial_sub(u_card, pro_plan, card=True)
+
+        conv = _variant(staff_client.get(URL))["conversion"]
+        assert conv["count"] == 1  # 카드 등록 체험만
+        assert conv["breakdown"]["pro_trial"] == 1
+        assert conv["excluded_no_card"] == 1
+
+    def test_conversion_rate_of_activated(self, staff_client, clean_slate, pro_plan):
+        """R-4 — 전환율 분모가 가입이 아니라 활성화 유저."""
+        now = timezone.now()
+        in_cohort = now - timedelta(days=4)
+        # 활성화 2명 (공개 페이지) 중 1명이 카드 체험
+        u1 = _mk_user(joined=in_cohort)
+        _mk_page(u1, public=True)
+        _mk_trial_sub(u1, pro_plan)
+        u2 = _mk_user(joined=in_cohort)
+        _mk_page(u2, public=True)
+        # 비활성 가입자 2명 (분모에 안 들어감)
+        _mk_user(joined=in_cohort)
+        _mk_user(joined=in_cohort)
+
+        v = _variant(staff_client.get(URL))
+        assert v["activation"]["count"] == 2
+        assert v["activation"]["rate"] == 0.5  # 2/4 (가입 대비)
+        assert v["conversion"]["rate_of"] == "activated"
+        assert v["conversion"]["rate"] == 0.5  # 1/2 (활성화 대비)
 
     @requires_analytics
     def test_channel_variant_has_breakdown(self, staff_client, clean_slate, pro_plan):
         now = timezone.now()
         u = _mk_user(joined=now - timedelta(days=3))
         SignupAttribution.objects.create(user=u, channel="meta_ads", signup_kind="email")
-        UserSubscription.objects.create(user=u, plan=pro_plan, status=SubscriptionStatus.TRIALING)
+        _mk_trial_sub(u, pro_plan)
 
         conv = _variant(staff_client.get(URL), "meta_ads")["conversion"]
         assert conv["count"] == 1
-        assert conv["breakdown"] == {"free_trial": 1, "real_payment": 0}
+        assert conv["breakdown"] == {
+            "pro_trial": 1,
+            "basic_trial": 0,
+            "pro_paid": 0,
+            "basic_paid": 0,
+            "other": 0,
+        }
 
 
 # ─── N-2: 채널별 캠페인/소재 분해 (campaigns[]) ─────────────────────────
@@ -1425,7 +1501,7 @@ class TestChannelCampaigns:
         _mk_paid_payment(u_a, paid_at=now - timedelta(days=1))
         u_b = _mk_user(joined=now - timedelta(days=2))
         SignupAttribution.objects.create(user=u_b, channel="meta_ads", signup_kind="email")
-        UserSubscription.objects.create(user=u_b, plan=pro_plan, status=SubscriptionStatus.TRIALING)
+        _mk_trial_sub(u_b, pro_plan)
 
         rows = {r["channel"]: r for r in staff_client.get(URL).data["channels"]["rows"]}
         row = rows["meta_ads"]
@@ -1525,9 +1601,7 @@ class TestChannelPaidVsFreeTrial:
         now = timezone.now()
         u_trial = _mk_user(joined=now - timedelta(days=3))
         SignupAttribution.objects.create(user=u_trial, channel="meta_ads", signup_kind="email")
-        UserSubscription.objects.create(
-            user=u_trial, plan=pro_plan, status=SubscriptionStatus.TRIALING
-        )
+        _mk_trial_sub(u_trial, pro_plan)
         u_paid = _mk_user(joined=now - timedelta(days=3))
         SignupAttribution.objects.create(user=u_paid, channel="meta_ads", signup_kind="email")
         _mk_paid_payment(u_paid, paid_at=now - timedelta(days=1))
@@ -1922,3 +1996,225 @@ class TestReferralCampaignsByCode:
         assert (code.code, "") in combos  # referral_codes[].code 와 조인 가능
         assert ("spring", "a") not in combos  # 원래 utm 으로는 안 내려감
         assert combos[(code.code, "")]["signups"] == 1
+
+
+# ─── R-1: period=all (전체 기간, 직전 기간 없음) ────────────────────────
+
+
+class TestPeriodAll:
+    def test_range_previous_is_null_and_deltas_null(self, staff_client, clean_slate):
+        now = timezone.now()
+        old = _mk_user(joined=now - timedelta(days=300))
+        _mk_user(joined=now - timedelta(days=2))
+
+        res = staff_client.get(URL, {"period": "all"})
+        assert res.status_code == 200
+        assert res.data["period"] == "all"
+
+        rng = res.data["range"]
+        assert rng["previous_start"] is None
+        assert rng["previous_end"] is None
+        # current_start = 서비스 최초 가입 시각 → 어떤 회원보다도 이르거나 같아야 한다
+        assert datetime.fromisoformat(rng["current_start"]) <= old.date_joined
+        # 30d 창 밖(300일 전) 가입자도 all 코호트에는 포함 (테스트 DB 가 더러워 델타로 단언)
+        assert (
+            res.data["kpis"]["signups"]["current"]
+            > staff_client.get(URL, {"period": "30d"}).data["kpis"]["signups"]["current"]
+        )
+        for key in ("visits", "unique_visitors", "signups", "ig_connected", "paid_conversions"):
+            kpi = res.data["kpis"][key]
+            assert kpi["previous"] is None, key
+            assert kpi["delta_pct"] is None, key
+
+        # feature_stats 의 delta 계열도 동일 규칙
+        bio = res.data["feature_stats"]["biolink"]
+        assert bio["new_public_pages"]["previous"] is None
+        assert bio["views"]["delta_pct"] is None
+        assert res.data["feature_stats"]["dm"]["requested"]["previous"] is None
+        assert res.data["feature_stats"]["spam"]["detected"]["previous"] is None
+        assert res.data["feature_stats"]["trials"]["started"]["previous"] is None
+
+    def test_preset_period_still_compares(self, staff_client, clean_slate):
+        """회귀 방어 — 프리셋/커스텀은 기존대로 직전 동일 길이 비교 유지."""
+        res = staff_client.get(URL, {"period": "7d"})
+        assert res.data["range"]["previous_start"] is not None
+        assert res.data["kpis"]["signups"]["previous"] == 0  # null 아님
+
+    def test_activated_matches_snapshot_on_all(self, staff_client, clean_slate):
+        """R-3 정합성 — period=all 이면 코호트 활성화 == snapshot.activated (누적)."""
+        now = timezone.now()
+        u_old = _mk_user(joined=now - timedelta(days=250))
+        _mk_page(u_old, public=True)
+        u_new = _mk_user(joined=now - timedelta(days=1))
+        _mk_campaign(_mk_conn(u_new))
+
+        res = staff_client.get(URL, {"period": "all"})
+        activated_all = res.data["funnel"]["variants"]["all"]["activation"]["count"]
+        assert activated_all == res.data["snapshot"]["activated"]
+        assert activated_all >= 2  # 방금 만든 2명 포함 (DB 잔존분이 있어 델타로 단언)
+
+
+# ─── R-2: 고정 패널 snapshot (전체 기간 누적, 기간 무관) ──────────────────
+
+
+class TestSnapshotPanel:
+    def test_paying_trialing_and_totals(self, staff_client, clean_slate, pro_plan):
+        now = timezone.now()
+        basic_plan, _ = SubscriptionPlan.objects.get_or_create(
+            name="basic",
+            defaults={"display_name": "베이직", "monthly_price": 9900, "sort_order": 1},
+        )
+        # ① 실제 결제 인원 — PAID 이력 + 현재 유료 ACTIVE
+        u_pro = _mk_user(joined=now - timedelta(days=200))
+        _mk_paid_payment(u_pro, paid_at=now - timedelta(days=190))
+        UserSubscription.objects.create(user=u_pro, plan=pro_plan, status=SubscriptionStatus.ACTIVE)
+        u_basic = _mk_user(joined=now - timedelta(days=100))
+        _mk_paid_payment(u_basic, paid_at=now - timedelta(days=90), amount=9900)
+        UserSubscription.objects.create(
+            user=u_basic, plan=basic_plan, status=SubscriptionStatus.ACTIVE
+        )
+        # PAST_DUE 는 제외 (R-7 ②)
+        u_pastdue = _mk_user()
+        _mk_paid_payment(u_pastdue, paid_at=now - timedelta(days=40))
+        UserSubscription.objects.create(
+            user=u_pastdue, plan=pro_plan, status=SubscriptionStatus.PAST_DUE
+        )
+        # 결제 이력 없는 ACTIVE 유료(어드민 수동 부여) → 제외
+        u_free_pro = _mk_user()
+        UserSubscription.objects.create(
+            user=u_free_pro, plan=pro_plan, status=SubscriptionStatus.ACTIVE
+        )
+        # ② 체험 인원 — 카드 등록 완료만
+        _mk_trial_sub(_mk_user(), pro_plan, card=True)
+        _mk_trial_sub(_mk_user(), pro_plan, card=False)
+
+        res = staff_client.get(URL)
+        snap = res.data["snapshot"]
+        assert snap["paying"]["total"] == 2
+        by_plan = {r["name"]: r["count"] for r in snap["paying"]["by_plan"]}
+        assert by_plan == {"basic": 1, "pro": 1}
+        assert sum(r["count"] for r in snap["paying"]["by_plan"]) == snap["paying"]["total"]
+        assert snap["trialing"]["total"] == 1  # 카드 등록 건만
+        assert snap["trialing"]["by_plan"] == [
+            {"name": "pro", "display_name": pro_plan.display_name, "count": 1}
+        ]
+        # 카드 필터가 없는 trials.active 는 이보다 크거나 같아야 한다 (의도된 차이)
+        assert res.data["feature_stats"]["trials"]["active"] >= snap["trialing"]["total"]
+
+    def test_signups_and_activated_ignore_period(self, staff_client, clean_slate):
+        """기간 파라미터를 바꿔도 snapshot 은 동일 — 그리고 코호트 퍼널과는 다른 축."""
+        now = timezone.now()
+        u_old = _mk_user(joined=now - timedelta(days=300))
+        _mk_page(u_old, public=True)
+        Page.objects.filter(user=u_old).update(created_at=now - timedelta(days=299))
+        _mk_user(joined=now - timedelta(days=1))
+
+        res_7d = staff_client.get(URL, {"period": "7d"})
+        res_all = staff_client.get(URL, {"period": "all"})
+        snap_7d, snap_all = res_7d.data["snapshot"], res_all.data["snapshot"]
+        assert snap_7d == snap_all  # 별도 캐시 키를 공유 (as_of 포함 완전 동일)
+        assert snap_7d["activated"] >= 1  # 300일 전 활성화 회원도 누적에 포함
+        # 반면 7d 퍼널 활성화는 '이 기간 가입 코호트' 기준이라 잡히지 않는다
+        assert res_7d.data["funnel"]["variants"]["all"]["activation"]["count"] == 0
+
+
+# ─── R-3: 활성화 단일 노드 + 교집합 ─────────────────────────────────────
+
+
+def _node_from(variant, key):
+    return next(n for n in _all_nodes(variant) if n["key"] == key)
+
+
+class TestFunnelActivationNode:
+    def test_activation_dedupes_and_exposes_overlap(self, staff_client, clean_slate):
+        now = timezone.now()
+        in_cohort = now - timedelta(days=5)
+        u_page = _mk_user(joined=in_cohort)
+        _mk_page(u_page, public=True)
+        u_camp = _mk_user(joined=in_cohort)
+        _mk_campaign(_mk_conn(u_camp))
+        u_both = _mk_user(joined=in_cohort)
+        _mk_page(u_both, public=True)
+        _mk_campaign(_mk_conn(u_both))
+        _mk_user(joined=in_cohort)  # 무행동
+
+        v = _variant(staff_client.get(URL))
+        act = v["activation"]
+        assert act["key"] == "activated" and act["label"] == "활성화 유저"
+        assert act["count"] == 3  # 중복 제거 (u_both 1회)
+        assert act["rate"] == 0.75  # 3/4
+        assert act["rate_of"] == "signup"
+        assert v["activation_overlap"]["both"] == 1
+
+        # 팝업용 분기 4노드는 그대로 유지 — 프론트가 dm_only/page_only 를 계산할 수 있어야 함
+        dm = _node_from(v, "dm_campaign")["count"]
+        pub = _node_from(v, "page_published")["count"]
+        both = v["activation_overlap"]["both"]
+        assert dm - both == 1 and pub - both == 1
+        assert (dm - both) + (pub - both) + both == act["count"]
+
+    @requires_analytics
+    def test_channel_variant_has_activation(self, staff_client, clean_slate):
+        now = timezone.now()
+        u = _mk_user(joined=now - timedelta(days=3))
+        SignupAttribution.objects.create(user=u, channel="meta_ads", signup_kind="email")
+        _mk_page(u, public=True)
+        _mk_campaign(_mk_conn(u))
+
+        v = _variant(staff_client.get(URL), "meta_ads")
+        assert v["activation"]["count"] == 1
+        assert v["activation_overlap"]["both"] == 1
+
+
+# ─── R-5: 긴 구간의 trends 버킷 자동 상향 ───────────────────────────────
+
+
+def _custom_trends(staff_client, span_days: int):
+    """커스텀 범위 응답의 trends — 커스텀 캐시 키는 autouse 정리 대상이 아니라 직접 비운다."""
+    end = timezone.localdate()
+    start = end - timedelta(days=span_days)
+    cache.delete(f"admin:dash:mkt:custom:{start.isoformat()}:{end.isoformat()}")
+    res = staff_client.get(URL, {"start": start.isoformat(), "end": end.isoformat()})
+    assert res.status_code == 200, res.data
+    return res.data["trends"]
+
+
+class TestTrendsGranularity:
+    def test_preset_stays_daily(self, staff_client, clean_slate):
+        trends = staff_client.get(URL, {"period": "90d"}).data["trends"]
+        assert trends["granularity"] == "day"
+        assert len(trends["buckets"]) == 91  # [now-90d, now] 로컬 날짜 경계 포함
+
+    def test_long_custom_range_switches_to_week(self, staff_client, clean_slate):
+        now = timezone.now()
+        u = _mk_user(joined=now - timedelta(days=100))
+
+        trends = _custom_trends(staff_client, 200)
+        assert trends["granularity"] == "week"
+        # 모든 버킷 시작일이 월요일 + 오름차순 + 정확히 7일 간격
+        dates = [date.fromisoformat(b["date"]) for b in trends["buckets"]]
+        assert all(d.weekday() == 0 for d in dates)
+        assert dates == sorted(dates)
+        assert all((b - a).days == 7 for a, b in zip(dates, dates[1:], strict=False))
+        # 가입 1건이 정확히 1개 버킷에 들어간다 (총량 보존)
+        assert sum(b["signups"] for b in trends["buckets"]) == 1
+        joined_week = timezone.localtime(u.date_joined).date()
+        joined_week -= timedelta(days=joined_week.weekday())
+        bucket = next(b for b in trends["buckets"] if b["date"] == joined_week.isoformat())
+        assert bucket["signups"] == 1
+        if HAS_ANALYTICS:  # Σ by_channel == 버킷 총량 (주별에서도 유지)
+            assert sum(s["signups"] for s in bucket["by_channel"].values()) == 1
+
+    def test_week_bucket_dedupes_activated(self, staff_client, clean_slate):
+        """주 버킷 내 같은 회원의 반복 활동은 1명 (사람 단위 dedupe)."""
+        now = timezone.now()
+        u = _mk_user(joined=now - timedelta(days=150))
+        conn = _mk_conn(u)
+        c1, c2 = _mk_campaign(conn), _mk_campaign(conn)
+        same_week = now - timedelta(days=100)
+        AutoDMCampaign.objects.filter(pk=c1.pk).update(created_at=same_week)
+        AutoDMCampaign.objects.filter(pk=c2.pk).update(created_at=same_week + timedelta(days=1))
+
+        trends = _custom_trends(staff_client, 210)
+        assert trends["granularity"] == "week"
+        assert sum(b["activated"] for b in trends["buckets"]) == 1  # 같은 주 2회 → 1명

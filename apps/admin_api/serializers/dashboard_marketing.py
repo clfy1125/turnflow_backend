@@ -17,10 +17,15 @@ class _DeltaMetricSerializer(serializers.Serializer):
     """기간 비교 지표 — current(현재 기간) vs previous(직전 동일 길이 기간)."""
 
     current = serializers.IntegerField(help_text="현재 기간 값")
-    previous = serializers.IntegerField(allow_null=True, help_text="직전 기간 값")
+    previous = serializers.IntegerField(
+        allow_null=True,
+        help_text="직전 기간 값. **period=all 이면 항상 null** — 비교할 직전 기간 자체가 "
+        "없다는 뜻이며 '직전 0건'이 아님 (프론트는 증감 배지를 '—' 로)",
+    )
     delta_pct = serializers.FloatField(
         allow_null=True,
-        help_text="증감률(%) = round((current-previous)/previous*100, 1). previous==0 → null",
+        help_text="증감률(%) = round((current-previous)/previous*100, 1). "
+        "previous==0 또는 previous==null(period=all) → null",
     )
 
 
@@ -74,11 +79,12 @@ class _KpisSerializer(serializers.Serializer):
 
 
 class _FunnelNodeSerializer(serializers.Serializer):
-    """퍼널 노드 1개 — visit/signup/ig_connected/dm_campaign/page_created/page_published/paid."""
+    """퍼널 노드 1개 — visit/signup/활성화/분기 4노드/paid."""
 
     key = serializers.CharField(
         help_text=(
-            "visit / signup / ig_connected / dm_campaign / page_created / page_published / paid"
+            "visit / signup / activated / ig_connected / dm_campaign / "
+            "page_created / page_published / paid"
         )
     )
     label = serializers.CharField(help_text="한국어 고정 라벨 (예: 방문자/가입/IG 연동/…)")
@@ -100,21 +106,52 @@ class _FunnelNodeSerializer(serializers.Serializer):
 
 
 class _FunnelConversionBreakdownSerializer(serializers.Serializer):
-    """유료플랜 전환 분해 (N-1) — free_trial + real_payment == conversion.count."""
+    """유료플랜 전환 분해 (R-4) — 모든 값의 합 == conversion.count (프론트 검증용).
 
-    free_trial = serializers.IntegerField(
-        help_text="현재 무료체험 진행 중(TRIALING 유료플랜)이며 아직 실결제 없는 회원 수"
+    무료체험은 **카드 등록 완료(billing_key_issued_at) 건만** — 어드민 수동 부여
+    무카드 계정은 breakdown 뿐 아니라 conversion.count 에서도 빠진다
+    (제외 인원은 conversion.excluded_no_card).
+    """
+
+    pro_trial = serializers.IntegerField(
+        help_text="프로 무료체험 — 현재 TRIALING · 플랜 pro · 카드 등록 완료 · 실결제 이력 없음"
     )
-    real_payment = serializers.IntegerField(
-        help_text="실제 결제(Toss PAID) 이력이 있는 회원 수 — kpis.paid_conversions 와 동일 기준"
+    basic_trial = serializers.IntegerField(
+        help_text="베이직 무료체험 (동일 정의, 플랜 basic). 현재 제품 정책상 체험은 프로 전용 "
+        "→ 사실상 항상 0. 키는 합계식 안정성을 위해 **항상 포함**되므로 0 이면 프론트에서 "
+        "행을 생략하면 된다"
+    )
+    pro_paid = serializers.IntegerField(
+        help_text="프로 실결제 — PAID 이력 보유 + 현재 구독 플랜 pro"
+    )
+    basic_paid = serializers.IntegerField(help_text="베이직 실결제 — PAID 이력 보유 + 현재 basic")
+    other = serializers.IntegerField(
+        help_text="잔여 보정 — 해지 후 free 강등 등으로 위 4분류에 안 맞는 인원 (보통 0). "
+        "pro_trial + basic_trial + pro_paid + basic_paid + other == count 를 보장"
     )
 
 
 class _FunnelConversionNodeSerializer(_FunnelNodeSerializer):
-    """수렴 노드(paid) — N-1: '유료플랜 전환'(무료체험+실결제 합산) + breakdown."""
+    """수렴 노드(paid) — '유료플랜 전환'(카드 등록 체험 + 실결제) + 3분할 breakdown.
+
+    R-4: rate_of 가 signup → **activated** 로 변경 (방문→가입→활성화→유료 직렬).
+    """
 
     breakdown = _FunnelConversionBreakdownSerializer(
-        help_text="무료체험/실결제 분해 — free_trial + real_payment == count"
+        help_text="플랜×결제여부 분해 — 값들의 합 == count (basic_trial 포함)"
+    )
+    excluded_no_card = serializers.IntegerField(
+        help_text="카드 미등록(어드민 수동 부여 등)이라 전환에서 제외된 체험 인원 수 — "
+        "화면 비노출, 검증/로그용 참고값 (count 에 포함되지 않음)"
+    )
+
+
+class _FunnelActivationOverlapSerializer(serializers.Serializer):
+    """활성화 노드의 중복 제거 구성 재료 (R-3)."""
+
+    both = serializers.IntegerField(
+        help_text="공개 페이지 AND DM 캠페인 둘 다 보유한 코호트 회원 수. 프론트는 "
+        "dm_only = dm_campaign - both, page_published_only = page_published - both 로 계산"
     )
 
 
@@ -137,13 +174,25 @@ class _FunnelChannelOptionSerializer(serializers.Serializer):
 
 
 class _FunnelVariantSerializer(serializers.Serializer):
-    """채널 1개 기준 분기 퍼널 — head → 분기 → conversion."""
+    """채널 1개 기준 퍼널 — head → 활성화 → conversion (+ 분기 상세는 branches)."""
 
     head = _FunnelNodeSerializer(many=True, help_text="공통 head [visit, signup]")
-    branches = _FunnelBranchSerializer(many=True, help_text="병렬 분기 2개 (dm, biolink)")
+    branches = _FunnelBranchSerializer(
+        many=True,
+        help_text="병렬 분기 2개 (dm, biolink) — R-3 이후 메인 퍼널에서는 숨기고 "
+        "'자세히 보기' 팝업에서 재사용한다 (계약 유지, 제거하지 않음)",
+    )
+    activation = _FunnelNodeSerializer(
+        help_text="R-3 — 분기 4노드를 대체하는 단일 '활성화 유저' 노드 "
+        "(key=activated, rate_of=signup). count = 공개 페이지 ∪ DM 캠페인 보유 코호트 회원 "
+        "(중복 제거) = branches 의 dm_campaign ∪ page_published"
+    )
+    activation_overlap = _FunnelActivationOverlapSerializer(
+        help_text="R-3 — 활성화 구성 분해용 교집합 (both)"
+    )
     conversion = _FunnelConversionNodeSerializer(
-        help_text="수렴 노드 (paid=유료플랜 전환, 가입 대비) — N-1: count=무료체험+실결제, "
-        "breakdown 으로 분해"
+        help_text="수렴 노드 (paid=유료플랜 전환) — count=카드 등록 체험+실결제, "
+        "**rate 분모는 activated**(R-4), breakdown 으로 3분할"
     )
 
 
@@ -673,10 +722,16 @@ class _MrrBreakdownSerializer(serializers.Serializer):
 class _PeriodRangeSerializer(serializers.Serializer):
     """집계 기간 경계 (Asia/Seoul ISO 8601). current=[start,end), previous=직전 동일 길이."""
 
-    current_start = serializers.DateTimeField(help_text="현재 기간 시작")
-    current_end = serializers.DateTimeField(help_text="현재 기간 끝 (미포함)")
-    previous_start = serializers.DateTimeField(help_text="직전 기간 시작")
-    previous_end = serializers.DateTimeField(help_text="직전 기간 끝 (미포함)")
+    current_start = serializers.DateTimeField(
+        help_text="현재 기간 시작. period=all 이면 **서비스 최초 가입 시각**(회원 0명이면 now)"
+    )
+    current_end = serializers.DateTimeField(help_text="현재 기간 끝 (미포함) — 프리셋은 now")
+    previous_start = serializers.DateTimeField(
+        allow_null=True, help_text="직전 기간 시작. **period=all 이면 null** (비교 대상 없음)"
+    )
+    previous_end = serializers.DateTimeField(
+        allow_null=True, help_text="직전 기간 끝 (미포함). **period=all 이면 null**"
+    )
 
 
 class _TrendChannelSliceSerializer(serializers.Serializer):
@@ -697,9 +752,12 @@ class _TrendChannelSliceSerializer(serializers.Serializer):
 
 
 class _TrendBucketSerializer(serializers.Serializer):
-    """일별 추이 버킷 1개 (로컬 날짜, 제로필 — 빈 날도 0 으로 포함)."""
+    """추이 버킷 1개 (로컬 날짜, 제로필 — 빈 버킷도 0 으로 포함)."""
 
-    date = serializers.CharField(help_text="로컬(Asia/Seoul) 날짜 YYYY-MM-DD")
+    date = serializers.CharField(
+        help_text="버킷 **시작일** (로컬 Asia/Seoul, YYYY-MM-DD) — "
+        "granularity=week 면 그 주 월요일, month 면 그 달 1일"
+    )
     signups = serializers.IntegerField(help_text="가입 수 (User.date_joined, TruncDate)")
     paid = serializers.IntegerField(
         help_text="유저별 첫 PAID paid_at 이 이 날인 수 (KPI first-paid 재사용)"
@@ -714,8 +772,9 @@ class _TrendBucketSerializer(serializers.Serializer):
         "고유 방문자와 단위 다름. 어트리뷰션 미탑재 시 0"
     )
     activated = serializers.IntegerField(
-        help_text="Q-1 — 그날 DM 캠페인 생성 or 페이지 공개(공개 페이지 created_at 근사)한 "
-        "고유 회원 수 (일별 user dedupe, 가입 시기 무관 이벤트 기준)"
+        help_text="Q-1 — 그 버킷에 DM 캠페인 생성 or 페이지 공개(공개 페이지 created_at 근사)한 "
+        "고유 회원 수 (**버킷 단위** user dedupe — 주별이면 같은 주 중복 활동은 1명, "
+        "가입 시기 무관 이벤트 기준)"
     )
     by_channel = serializers.DictField(
         child=_TrendChannelSliceSerializer(),
@@ -725,11 +784,16 @@ class _TrendBucketSerializer(serializers.Serializer):
 
 
 class _TrendsSerializer(serializers.Serializer):
-    """일별 추이 블록 — current 기간 전체를 로컬 날짜 단위 zero-fill (항상 포함)."""
+    """추이 블록 — current 기간 전체를 로컬 날짜 기준 zero-fill (항상 포함)."""
 
-    granularity = serializers.CharField(help_text='항상 "day"')
+    granularity = serializers.CharField(
+        help_text='"day" | "week" | "month" — R-5: 구간이 길면 자동 상향 '
+        "(<=120일 day / <=400일 week(월요일 시작) / 그 이상 month(1일 시작)). "
+        "프론트는 이 값을 읽어 그대로 렌더 (day 가 아니면 일별 토글 비활성)"
+    )
     buckets = _TrendBucketSerializer(
-        many=True, help_text="로컬 날짜별 제로필 버킷 (date 오름차순, 길이 = 기간 일수)"
+        many=True,
+        help_text="버킷 시작일 오름차순 제로필. 마지막 버킷은 진행 중(미완결)일 수 있음",
     )
 
 
@@ -863,19 +927,80 @@ class _CustomerActionsSerializer(serializers.Serializer):
     )
 
 
+class _SnapshotPlanCountSerializer(serializers.Serializer):
+    """고정 패널의 플랜 분해 1행 (R-2) — Σ count == 상위 total 보장."""
+
+    name = serializers.CharField(help_text="SubscriptionPlan.name (pro/basic)")
+    display_name = serializers.CharField(help_text="플랜 표시명 (프로/베이직)")
+    count = serializers.IntegerField(help_text="해당 플랜 회원 수 (현재 구독 플랜 기준)")
+
+
+class _SnapshotPayingSerializer(serializers.Serializer):
+    """실제 결제 인원 (R-2 ①) — PAID 이력 보유 + 현재 유료 ACTIVE 구독."""
+
+    total = serializers.IntegerField(
+        help_text="실제 결제(Toss PAID) 이력이 있고 현재 유료 구독이 ACTIVE 인 고유 회원 수. "
+        "**PAST_DUE(결제 실패 dunning 중)는 제외** — customer_actions.payment_failed 에 별도 "
+        "집계됨. free/admin 플랜 제외"
+    )
+    by_plan = _SnapshotPlanCountSerializer(
+        many=True, help_text="현재 구독 플랜 기준 분해 (Σ count == total)"
+    )
+
+
+class _SnapshotTrialingSerializer(serializers.Serializer):
+    """체험 인원 (R-2 ②) — 조회 시점 TRIALING + 카드 등록 완료."""
+
+    total = serializers.IntegerField(
+        help_text="조회 시점 status=TRIALING · 유료플랜(free/admin 제외) · **카드 등록 완료**"
+        "(billing_key_issued_at) 고유 회원 수. 카드 필터가 없는 "
+        "feature_stats.trials.active 보다 작거나 같은 것이 정상"
+    )
+    by_plan = _SnapshotPlanCountSerializer(
+        many=True, help_text="플랜 분해 (Σ count == total). 체험이 프로 전용이면 pro 1행"
+    )
+
+
+class _SnapshotSerializer(serializers.Serializer):
+    """상단 고정 패널 (R-2) — **전체 기간 누적, period/커스텀 범위와 무관**.
+
+    period=7d 응답에도 period=all 응답에도 같은 값이 들어간다 (별도 캐시 키 공유).
+    """
+
+    as_of = serializers.DateTimeField(help_text="스냅샷 산출 시각 (Asia/Seoul ISO)")
+    paying = _SnapshotPayingSerializer(help_text="① 실제 결제 인원")
+    trialing = _SnapshotTrialingSerializer(help_text="② 체험 인원 (카드 등록 완료 기준)")
+    visitors = serializers.IntegerField(
+        help_text="③ 전체 기간 고유 방문자 수 (distinct visitor_id). "
+        "attribution_available=false 면 0"
+    )
+    signups = serializers.IntegerField(help_text="④ 누적 가입 회원 수")
+    activated = serializers.IntegerField(
+        help_text="⑤ **가입 시기 무관** 공개 페이지 보유 ∪ DM 캠페인 보유 고유 회원 수 "
+        "(중복 제거). funnel.activation.count 는 '이 기간 가입 코호트' 기준이라 정의가 다름 "
+        "— period=all 에서만 두 값이 일치"
+    )
+
+
 class AdminMarketingDashboardSerializer(serializers.Serializer):
     """마케팅 대시보드 단일 집계 응답 (전 워크스페이스 GLOBAL, Redis 5분 캐시)."""
 
-    period = serializers.CharField(help_text="적용된 기간 (7d/30d/90d) 또는 커스텀 범위면 'custom'")
+    period = serializers.CharField(
+        help_text="적용된 기간 (7d/30d/90d/all) 또는 커스텀 범위면 'custom'"
+    )
     range = _PeriodRangeSerializer(
-        help_text="현재/직전 기간 경계 (커스텀은 previous=직전 동일 길이 구간)"
+        help_text="현재/직전 기간 경계 (커스텀은 previous=직전 동일 길이 구간, "
+        "period=all 은 previous_*=null)"
     )
     generated_at = serializers.DateTimeField(
-        help_text="집계 생성 시각 — 캐시(MARKETING_DASHBOARD_CACHE_TTL=300s) 신선도 표시용"
+        help_text="집계 생성 시각 — 캐시 신선도 표시용 (TTL: 프리셋/커스텀 300s, all 900s)"
     )
     attribution_available = serializers.BooleanField(
         help_text="어트리뷰션 서브시스템(apps.analytics) 탑재 여부 — false 면 "
         "visits/unique_visitors=0, channels.rows=[] 로 강등"
+    )
+    snapshot = _SnapshotSerializer(
+        help_text="R-2 — 상단 고정 패널 (전체 기간 누적, 기간 파라미터와 무관)"
     )
     kpis = _KpisSerializer(help_text="핵심 KPI (전부 기간 비교)")
     funnel = _FunnelSerializer(help_text="가입 코호트 분기 퍼널 (채널별 variant 포함)")

@@ -95,6 +95,17 @@ POST_PAYMENT_WINDOW_DAYS = 7
 # 그 전환의 진입 경로로 귀속.
 CHECKOUT_ATTRIBUTION_WINDOW_DAYS = 30
 
+# ── 일별 추이 버킷 단위 (R-5) ────────────────────────────────────────
+# 현재 구간이 길어지면 일별 버킷 수가 폭증(+버킷마다 채널 분해)하므로 자동 상향 전환:
+#   span <= 120일 → "day" / <= 400일 → "week"(월요일 시작) / 그 이상 → "month"(1일 시작)
+# 프론트는 trends.granularity 를 읽어 그대로 렌더 (일별 토글은 day 일 때만 활성).
+TRENDS_DAY_MAX_SPAN_DAYS = 120
+TRENDS_WEEK_MAX_SPAN_DAYS = 400
+
 # ── 캐시 ─────────────────────────────────────────────────────────────
 OPS_DASHBOARD_CACHE_TTL = 30  # 초 — 어드민 30~60s 폴링 대비
 MARKETING_DASHBOARD_CACHE_TTL = 300  # 초
+# period=all(전체 기간)은 계산량이 가장 크고 분 단위로 값이 변하지 않음 → 더 긴 TTL (R-6).
+MARKETING_DASHBOARD_ALL_CACHE_TTL = 900  # 초
+# snapshot(고정 패널)은 기간과 무관 → 별도 키로 분리해 모든 period 응답이 공유 (R-6).
+MARKETING_DASHBOARD_SNAPSHOT_CACHE_TTL = 900  # 초
