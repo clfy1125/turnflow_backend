@@ -23,6 +23,10 @@ from .models import UAClass
 CH_META_ADS = "meta_ads"
 CH_GOOGLE_ADS = "google_ads"
 CH_NAVER_ADS = "naver_ads"
+CH_TIKTOK_ADS = "tiktok_ads"
+CH_KAKAO_ADS = "kakao_ads"
+CH_X_ADS = "x_ads"
+CH_LINKEDIN_ADS = "linkedin_ads"
 CH_PAID_OTHER = "paid_other"
 CH_INFLUENCER = "influencer"
 CH_IG_ORGANIC = "instagram_organic"
@@ -49,7 +53,15 @@ UTM_SOURCE_MAP = {
     "youtube_ads": CH_GOOGLE_ADS,
     "naver": CH_NAVER_ADS,
     "naver_gfa": CH_NAVER_ADS,
-    "kakao": CH_PAID_OTHER,
+    # distinct 유료 채널 (2026-07 어드민 마케팅 대시보드 M-5 — 프론트 lib/channels.ts 와 계약 동기화).
+    # ⚠️ 채널은 방문/가입 '저장 시점'에 파생되므로 매핑 변경은 소급되지 않는다
+    # (예: 과거 kakao 방문은 paid_other 로 남음).
+    "tiktok": CH_TIKTOK_ADS,
+    "tiktok_ads": CH_TIKTOK_ADS,
+    "kakao": CH_KAKAO_ADS,
+    "x": CH_X_ADS,
+    "twitter": CH_X_ADS,
+    "linkedin": CH_LINKEDIN_ADS,
 }
 
 # utm_medium 이 이 집합이면 utm_source 매핑보다 우선해 influencer 로 분류

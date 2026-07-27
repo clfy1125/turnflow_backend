@@ -36,7 +36,10 @@
       "Bash(xargs grep *)",
       "Bash(docker stop clfy_postgres_db *)",
       "Bash(curl *)",
-      "PowerShell(Get-ChildItem -Path \"C:\\\\Users\\\\USER\\\\Desktop\\\\CLFY\\\\TurnflowLink-dev\\\\src\\\\app\\\\pages\\\\link\" -Recurse | Where-Object { $_.Extension -match '\\\\.\\(tsx|ts\\)$' } | Select-Object FullName)"
+      "PowerShell(Get-ChildItem -Path \"C:\\\\Users\\\\USER\\\\Desktop\\\\CLFY\\\\TurnflowLink-dev\\\\src\\\\app\\\\pages\\\\link\" -Recurse | Where-Object { $_.Extension -match '\\\\.\\(tsx|ts\\)$' } | Select-Object FullName)",
+      "PowerShell(& \"C:\\Python314\\python.exe\" \"test\\_pcmd.py\" \"docker exec -w /etc/caddy caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile\")"
+
+
     ]
   },
   "enableAllProjectMcpServers": true,

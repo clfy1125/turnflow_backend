@@ -11,6 +11,8 @@ from apps.analytics.channels import (
     CH_GOOGLE_ADS,
     CH_IG_ORGANIC,
     CH_INFLUENCER,
+    CH_KAKAO_ADS,
+    CH_LINKEDIN_ADS,
     CH_META_ADS,
     CH_NAVER_ADS,
     CH_OTHER_CAMPAIGN,
@@ -18,7 +20,9 @@ from apps.analytics.channels import (
     CH_PAID_OTHER,
     CH_SEARCH,
     CH_THREADS,
+    CH_TIKTOK_ADS,
     CH_TT_ORGANIC,
+    CH_X_ADS,
     CH_YT_ORGANIC,
     REFERRER_CHANNEL_MAP,
     UTM_SOURCE_MAP,
@@ -50,11 +54,24 @@ class TestDeriveChannelUtm:
         assert derive_channel("newsletter", "email", "") == CH_OTHER_CAMPAIGN
         assert derive_channel("partner_x", "", "") == CH_OTHER_CAMPAIGN
 
-    def test_kakao_source_is_paid_other(self):
-        assert derive_channel("kakao", "", "") == CH_PAID_OTHER
-
     def test_naver_gfa_is_naver_ads(self):
         assert derive_channel("naver_gfa", "cpc", "") == CH_NAVER_ADS
+
+    # ── distinct 유료 채널 (M-5, 2026-07) — paid_other 로 뭉개지면 안 됨 ──
+    @pytest.mark.parametrize(
+        "source,expected",
+        [
+            ("tiktok", CH_TIKTOK_ADS),
+            ("tiktok_ads", CH_TIKTOK_ADS),
+            ("kakao", CH_KAKAO_ADS),  # 구 매핑은 paid_other — 소급 안 됨(저장 시점 파생)
+            ("x", CH_X_ADS),
+            ("twitter", CH_X_ADS),
+            ("linkedin", CH_LINKEDIN_ADS),
+        ],
+    )
+    def test_distinct_paid_channels(self, source, expected):
+        assert derive_channel(source, "cpc", "") == expected
+        assert derive_channel(source, "", "") == expected
 
 
 class TestDeriveChannelReferrer:

@@ -33,6 +33,10 @@ from apps.admin_api.views.dashboard import AdminMetricsOverviewView
 from apps.admin_api.views.dashboard_marketing import AdminMarketingDashboardView
 from apps.admin_api.views.dashboard_ops import AdminOpsDashboardView
 from apps.admin_api.views.identity import AdminMeView
+from apps.admin_api.views.marketing import (
+    AdminChannelLinkDetailView,
+    AdminChannelLinkListCreateView,
+)
 from apps.admin_api.views.pages import (
     AdminPageDetailView,
     AdminPageInquiryListView,
@@ -165,5 +169,16 @@ urlpatterns = [
         "referral-codes/<uuid:pk>/redemptions/",
         AdminReferralCodeRedemptionsView.as_view(),
         name="referral-code-redemptions",
+    ),
+    # H. 마케팅 채널 링크 (UTM 링크 생성기 서버 저장 — 전 관리자 공용)
+    path(
+        "marketing/channel-links/",
+        AdminChannelLinkListCreateView.as_view(),
+        name="channel-link-list",
+    ),
+    path(
+        "marketing/channel-links/<int:pk>/",
+        AdminChannelLinkDetailView.as_view(),
+        name="channel-link-detail",
     ),
 ]

@@ -74,6 +74,19 @@ ONBOARDING_SAMPLE_LIMIT = 5
 RECENT_CANCELLATIONS_LIMIT = 8
 # 해지 사유 TOP N
 CANCEL_REASONS_TOP = 5
+# 채널별 성과의 하위 캠페인(utm_campaign × utm_content) 분해 — 채널당 상위 N개 (N-2).
+# (paid+free_trial) desc → signups desc → visits desc 정렬 후 캡, 잘리면 campaigns_truncated.
+CHANNEL_CAMPAIGNS_LIMIT = 10
+
+# ── 고객 액션 리스트 (Q-3) ───────────────────────────────────────────
+CUSTOMER_ACTIONS_LIMIT = 20  # payment_failed / dormant / recent_churn 각 리스트 캡
+DORMANT_IDLE_DAYS = 30  # 유료 구독인데 이 일수 이상 기능 미사용 → 장기 미사용(해지 위험)
+RECENT_CHURN_WINDOW_DAYS = 30  # 최근 해지(완료) 관찰 창
+
+# ── 코호트 분석 (Q-2) — 기간 필터와 무관한 고정 창 ────────────────────
+COHORT_SUBSCRIPTION_MONTHS = 6  # 구독 유지 코호트: 최근 N개월 (첫 결제 월 기준)
+COHORT_USAGE_WEEKS = 6  # 제품 사용 코호트: 최근 N주 (가입 주 기준, 월요일 시작)
+COHORT_MAX_PERIODS = 5  # 코호트별 관찰 기간 수 (M+1..M+5 / W+1..W+5)
 
 # ── 유료 전환 분석 ───────────────────────────────────────────────────
 # 결제 후 '실제 사용' 관찰 창 (일) — paid_at 이후 N일 내 기능 사용 여부.

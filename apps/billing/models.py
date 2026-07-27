@@ -933,3 +933,91 @@ class ReferralRedemption(models.Model):
 
     def __str__(self):
         return f"{self.user.email} ← {self.referral_code.code}"
+
+
+class DailySubscriptionSnapshot(models.Model):
+    """일별 구독 상태 스냅샷 (어드민 마케팅 P-4 Phase 1).
+
+    과거 시점의 구독 상태는 라이브 테이블에서 재구성이 불가능하다 —
+    다운그레이드(:func:`apps.billing.tasks._downgrade_to_free`)가 기간/금액을 소거하기
+    때문. 그래서 매일 1회 '오늘의 상태'를 적재해, 적재 시작 이후 기간에 대해 정확한
+    유지율/이탈률/MRR 이동을 계산할 수 있게 한다.
+
+    - 적재: ``billing.snapshot_daily_metrics`` (매일 KST 00:20, core.ScheduledJob 시드).
+      멱등 upsert — 같은 날 재실행하면 그날 값을 갱신한다.
+    - **과거 백필 불가**: 그날의 상태가 어디에도 남아있지 않다 (설계 한계의 원인 그 자체).
+    - 어드민 ``subscription_retention`` 은 스냅샷 이력이 충분히 쌓인 뒤
+      basis="snapshot" 으로 전환 예정 (그 전까지 approx_no_snapshot 유지).
+    """
+
+    snapshot_date = models.DateField(unique=True, verbose_name="스냅샷 날짜(KST)")
+    plan_status_counts = models.JSONField(
+        default=dict,
+        verbose_name="플랜×상태 인원",
+        help_text='{"pro": {"active": 120, "trialing": 14, ...}, ...} — 전 플랜(free 포함)',
+    )
+    paying_count = models.PositiveIntegerField(
+        default=0, verbose_name="유료 ACTIVE 수", help_text="free/admin 제외 ACTIVE 구독 수"
+    )
+    trialing_count = models.PositiveIntegerField(
+        default=0, verbose_name="체험 중 수", help_text="free/admin 제외 TRIALING 구독 수"
+    )
+    cancel_scheduled_count = models.PositiveIntegerField(
+        default=0,
+        verbose_name="취소 예약 수",
+        help_text="CANCELLED + 주기 남음 (free/admin 제외)",
+    )
+    past_due_count = models.PositiveIntegerField(default=0, verbose_name="미납 수")
+    mrr_total = models.BigIntegerField(
+        default=0,
+        verbose_name="MRR (원)",
+        help_text="유료 ACTIVE 의 Coalesce(snapshot, 판매가) 합 + 추가 IG 계정 매출",
+    )
+    extra_ig_count = models.PositiveIntegerField(
+        default=0, verbose_name="추가 IG 계정 합", help_text="ACTIVE pro 의 extra_ig_accounts 합"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "daily_subscription_snapshots"
+        ordering = ["-snapshot_date"]
+        verbose_name = "일별 구독 스냅샷"
+        verbose_name_plural = "일별 구독 스냅샷 목록"
+
+    def __str__(self):
+        return f"{self.snapshot_date} paying={self.paying_count} mrr={self.mrr_total}"
+
+
+class DailyPaidCohortSnapshot(models.Model):
+    """일별 × 결제 코호트(첫 결제 월) 스냅샷 — 월별 코호트 유지율 곡선의 재료 (P-4).
+
+    각 스냅샷 날짜에 '현재 유료 ACTIVE' 회원을 **첫 PAID 결제 월**(cohort_month, KST
+    월초일)로 묶어 인원·월 청구액 합을 적재한다. 상태를 매일 사실대로 찍으므로
+    이탈 후 재구독(churn-and-return)도 정확히 반영된다.
+    사용 예: 2026-05 코호트의 60일 유지율 = snapshot(코호트월+60일).paying_users
+    ÷ snapshot(코호트월 말).paying_users.
+    """
+
+    snapshot_date = models.DateField(db_index=True, verbose_name="스냅샷 날짜(KST)")
+    cohort_month = models.DateField(
+        verbose_name="코호트 월",
+        help_text="해당 회원의 첫 PAID paid_at 의 KST 월초일 (예: 2026-05-01)",
+    )
+    paying_users = models.PositiveIntegerField(default=0, verbose_name="유료 유지 인원")
+    mrr = models.BigIntegerField(default=0, verbose_name="코호트 MRR (원)")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "daily_paid_cohort_snapshots"
+        ordering = ["-snapshot_date", "cohort_month"]
+        verbose_name = "일별 결제 코호트 스냅샷"
+        verbose_name_plural = "일별 결제 코호트 스냅샷 목록"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["snapshot_date", "cohort_month"], name="uniq_snapshot_cohort"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.snapshot_date} cohort={self.cohort_month} n={self.paying_users}"
