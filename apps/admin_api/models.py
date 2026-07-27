@@ -2,7 +2,9 @@
 
 이 앱은 기존 도메인 모델(authentication / workspace / pages / integrations)을
 **읽기/제어**하는 백오피스 API 를 제공한다. 도메인 데이터의 진실의 원천은 각 앱 모델이며,
-여기서는 관리자 액션 감사 로그(:class:`AdminActionLog`) 한 개만 새로 정의한다.
+여기서는 백오피스 자체 소유 데이터만 정의한다:
+- :class:`AdminActionLog` — 관리자 액션 감사 로그
+- :class:`MarketingChannelLink` — 마케팅 채널 링크 생성기의 저장 링크 (전 관리자 공용)
 """
 
 from __future__ import annotations
@@ -36,6 +38,9 @@ class AdminActionLog(models.Model):
         REFERRAL_CREATE = "referral.create", "레퍼럴 코드 생성"
         REFERRAL_UPDATE = "referral.update", "레퍼럴 코드 수정"
         REFERRAL_DELETE = "referral.delete", "레퍼럴 코드 삭제"
+        CHANNEL_LINK_CREATE = "channel_link.create", "채널 링크 생성"
+        CHANNEL_LINK_UPDATE = "channel_link.update", "채널 링크 수정"
+        CHANNEL_LINK_DELETE = "channel_link.delete", "채널 링크 삭제"
 
     class Meta:
         db_table = "admin_action_logs"
@@ -68,3 +73,51 @@ class AdminActionLog(models.Model):
     def __str__(self) -> str:
         who = self.actor.email if self.actor_id else "(deleted)"
         return f"{who} · {self.action} · {self.target_type}:{self.target_id}"
+
+
+class MarketingChannelLink(models.Model):
+    """마케팅 채널 링크 생성기의 '저장한 링크' — 전 관리자 공용 (M-4).
+
+    프론트 localStorage 전용이던 저장 링크를 기기·관리자 간 공유되도록 서버로 이관.
+    ``url``(utm 조합 최종 URL)·``channel``(analytics.channels.derive_channel 파생 키)은
+    입력값이 아니라 **저장 시 서버가 계산**한다 — 계산 로직은
+    :mod:`apps.admin_api.serializers.marketing` (단일 소스).
+    조회 스코프는 전 관리자 공용(생성자 무관 전체 노출), created_by 는 표기용.
+    """
+
+    name = models.CharField(max_length=100, verbose_name="링크 이름")
+    base_url = models.URLField(max_length=500, verbose_name="기본 URL")
+    utm_source = models.CharField(max_length=100, blank=True, default="")
+    utm_medium = models.CharField(max_length=100, blank=True, default="")
+    utm_campaign = models.CharField(max_length=100, blank=True, default="")
+    utm_content = models.CharField(max_length=100, blank=True, default="")
+    url = models.URLField(
+        max_length=1000,
+        verbose_name="완성 URL",
+        help_text="base_url + utm 파라미터 조합 (서버 계산, 기존 동일 utm 키는 교체)",
+    )
+    channel = models.CharField(
+        max_length=32,
+        verbose_name="파생 채널 키",
+        help_text="derive_channel(utm_source, utm_medium) 결과 — 대시보드 채널 키와 동일 어휘",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="marketing_channel_links",
+        verbose_name="생성 관리자",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="생성 시각")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="수정 시각")
+
+    class Meta:
+        db_table = "marketing_channel_links"
+        verbose_name = "마케팅 채널 링크"
+        verbose_name_plural = "마케팅 채널 링크 목록"
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["channel"])]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.channel})"

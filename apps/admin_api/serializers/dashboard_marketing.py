@@ -35,14 +35,25 @@ class _MrrKpiSerializer(serializers.Serializer):
     currency = serializers.CharField(help_text='통화 — 항상 "KRW"')
 
 
+class _PaidConversionsKpiSerializer(_DeltaMetricSerializer):
+    """유료 전환 KPI — delta 지표 + 정의 문자열(M-2, 프론트 툴팁 정본)."""
+
+    definition = serializers.CharField(
+        help_text="지표 정의 (한국어) — '기간 내 실제 결제(Toss PAID)가 처음 발생한 회원 수 · "
+        "체험·쿠폰 미결제 제외'"
+    )
+
+
 class _KpisSerializer(serializers.Serializer):
     """핵심 KPI 묶음 — 전부 {current, previous, delta_pct}."""
 
     visits = _DeltaMetricSerializer(
-        help_text="랜딩 방문 수 (LandingVisit 행 수). 어트리뷰션 미탑재 시 0"
+        help_text="랜딩 방문 수 (LandingVisit 행 수 = 세션 단위). 퍼널/채널의 방문자 지표는 "
+        "이게 아니라 고유 방문자 기준. 어트리뷰션 미탑재 시 0"
     )
     unique_visitors = _DeltaMetricSerializer(
-        help_text="고유 방문자 수 (distinct visitor_id). 어트리뷰션 미탑재 시 0"
+        help_text="고유 방문자 수 (distinct visitor_id) — 퍼널 head·채널 visits 와 동일 단위. "
+        "어트리뷰션 미탑재 시 0"
     )
     signups = _DeltaMetricSerializer(help_text="가입 수 (User.date_joined ∈ 기간)")
     ig_connected = _DeltaMetricSerializer(
@@ -54,8 +65,9 @@ class _KpisSerializer(serializers.Serializer):
     first_dm_campaign = _DeltaMetricSerializer(
         help_text="첫 AutoDMCampaign 생성이 기간 내인 오너 수"
     )
-    paid_conversions = _DeltaMetricSerializer(
-        help_text="유저별 첫 PAID PaymentHistory.paid_at 이 기간 내인 수 — "
+    paid_conversions = _PaidConversionsKpiSerializer(
+        help_text="유저별 첫 PAID PaymentHistory.paid_at 이 기간 내인 수 (실결제만 — "
+        "체험·쿠폰 미결제 제외, definition 필드 참고). "
         "pro_activated_at 은 환불 시 null 처리되어 부적합"
     )
     mrr = _MrrKpiSerializer(help_text="MRR (point-in-time, previous=null)")
@@ -69,9 +81,10 @@ class _FunnelNodeSerializer(serializers.Serializer):
             "visit / signup / ig_connected / dm_campaign / page_created / page_published / paid"
         )
     )
-    label = serializers.CharField(help_text="한국어 고정 라벨 (예: 방문/가입/IG 연동/…)")
+    label = serializers.CharField(help_text="한국어 고정 라벨 (예: 방문자/가입/IG 연동/…)")
     count = serializers.IntegerField(
-        help_text="노드 도달 수. visit 만 기간-이벤트, 나머지는 가입 코호트의 '현재까지' 도달"
+        help_text="노드 도달 수. visit 만 기간-이벤트이며 **고유 방문자**(distinct visitor_id, "
+        "세션 수 아님 — 세션은 kpis.visits), 나머지는 가입 코호트의 '현재까지' 도달"
     )
     rate = serializers.FloatField(
         allow_null=True, help_text="rate_of 노드 대비 전환율 (0~1, 분모 0 → null)"
@@ -81,7 +94,27 @@ class _FunnelNodeSerializer(serializers.Serializer):
     )
     formula = serializers.CharField(
         allow_null=True,
-        help_text='공식 한국어 문자열 (i-아이콘 툴팁용, 예 "IG 연동 수 ÷ 가입 수 × 100")',
+        help_text="공식/정의 한국어 문자열 (i-아이콘 툴팁용) — M-6 이후 모든 노드에서 "
+        "non-null 로 채워짐 (백엔드 값이 정본, null 폴백은 방어용)",
+    )
+
+
+class _FunnelConversionBreakdownSerializer(serializers.Serializer):
+    """유료플랜 전환 분해 (N-1) — free_trial + real_payment == conversion.count."""
+
+    free_trial = serializers.IntegerField(
+        help_text="현재 무료체험 진행 중(TRIALING 유료플랜)이며 아직 실결제 없는 회원 수"
+    )
+    real_payment = serializers.IntegerField(
+        help_text="실제 결제(Toss PAID) 이력이 있는 회원 수 — kpis.paid_conversions 와 동일 기준"
+    )
+
+
+class _FunnelConversionNodeSerializer(_FunnelNodeSerializer):
+    """수렴 노드(paid) — N-1: '유료플랜 전환'(무료체험+실결제 합산) + breakdown."""
+
+    breakdown = _FunnelConversionBreakdownSerializer(
+        help_text="무료체험/실결제 분해 — free_trial + real_payment == count"
     )
 
 
@@ -108,7 +141,10 @@ class _FunnelVariantSerializer(serializers.Serializer):
 
     head = _FunnelNodeSerializer(many=True, help_text="공통 head [visit, signup]")
     branches = _FunnelBranchSerializer(many=True, help_text="병렬 분기 2개 (dm, biolink)")
-    conversion = _FunnelNodeSerializer(help_text="수렴 노드 (paid, 가입 대비)")
+    conversion = _FunnelConversionNodeSerializer(
+        help_text="수렴 노드 (paid=유료플랜 전환, 가입 대비) — N-1: count=무료체험+실결제, "
+        "breakdown 으로 분해"
+    )
 
 
 class _FunnelSerializer(serializers.Serializer):
@@ -126,6 +162,28 @@ class _FunnelSerializer(serializers.Serializer):
     )
 
 
+class _ChannelCampaignRowSerializer(serializers.Serializer):
+    """채널 하위 캠페인/소재 분해 1행 (N-2) — (utm_campaign × utm_content) 조합.
+
+    방문(고유 방문자)은 LandingVisit 저장 utm, 가입측 지표는 SignupAttribution 저장 utm 기준.
+    utm 없는 유입은 utm_campaign="" · utm_content="" 한 행 (프론트 라벨 "(직접/기타)").
+    """
+
+    utm_campaign = serializers.CharField(allow_blank=True, help_text='utm_campaign (없으면 "")')
+    utm_content = serializers.CharField(allow_blank=True, help_text='utm_content (없으면 "")')
+    visits = serializers.IntegerField(
+        help_text="기간 내 이 조합 고유 방문자 수 (distinct visitor_id — 세션 수 아님)"
+    )
+    signups = serializers.IntegerField(help_text="코호트 가입자 수 (SignupAttribution utm 기준)")
+    ig_connected = serializers.IntegerField(help_text="IG 연동 도달 수 (채널 행과 동일 축)")
+    dm_campaign = serializers.IntegerField(help_text="DM 캠페인 생성 수")
+    page_created = serializers.IntegerField(help_text="페이지 생성 수")
+    page_published = serializers.IntegerField(help_text="페이지 공개 수")
+    paid = serializers.IntegerField(help_text="실결제(첫 PAID) 전환 수 — 체험 미포함")
+    free_trial = serializers.IntegerField(help_text="현재 무료체험 진행 중(미결제) 수")
+    paid_rate = serializers.FloatField(allow_null=True, help_text="paid / signups")
+
+
 class _ChannelRowSerializer(serializers.Serializer):
     """채널 성과 1행 — SignupAttribution.channel 기준 (레퍼럴 오버레이 적용).
 
@@ -137,23 +195,47 @@ class _ChannelRowSerializer(serializers.Serializer):
         help_text='채널 키. 어트리뷰션 없는 가입자는 "unknown", '
         'ReferralRedemption 보유자는 "referral" (조회 시점 오버레이)'
     )
-    visits = serializers.IntegerField(help_text="기간 내 해당 채널 LandingVisit 수")
+    visits = serializers.IntegerField(
+        help_text="기간 내 해당 채널 고유 방문자 수 (distinct visitor_id — 세션 수 아님)"
+    )
     signups = serializers.IntegerField(help_text="코호트 가입자 수")
     signup_rate = serializers.FloatField(
-        allow_null=True, help_text="signups / visits (visits 0 → null)"
+        allow_null=True, help_text="signups / visits(고유 방문자) (visits 0 → null)"
     )
     ig_connected = serializers.IntegerField(help_text="IG 연동 도달 수 (DM 갈래 1단계)")
     dm_campaign = serializers.IntegerField(help_text="DM 캠페인 생성 수 (DM 갈래 2단계)")
     page_created = serializers.IntegerField(help_text="페이지 생성 수 (바이오링크 갈래 1단계)")
     page_published = serializers.IntegerField(help_text="페이지 공개 수 (바이오링크 갈래 2단계)")
-    paid = serializers.IntegerField(help_text="유료 전환 수 (첫 PAID 결제 보유)")
-    paid_rate = serializers.FloatField(allow_null=True, help_text="paid / signups")
+    paid = serializers.IntegerField(
+        help_text="**실결제**(첫 PAID 이력 보유) 전환 수 — 무료체험 미포함 (N-4 확정)"
+    )
+    free_trial = serializers.IntegerField(
+        help_text="현재 무료체험 진행 중(TRIALING 유료플랜)이며 미결제인 코호트 회원 수 (N-4)"
+    )
+    paid_rate = serializers.FloatField(allow_null=True, help_text="paid / signups (실결제 기준)")
+    campaigns = _ChannelCampaignRowSerializer(
+        many=True,
+        help_text="채널 하위 (utm_campaign × utm_content) 분해 (N-2) — "
+        "(paid+free_trial) desc → signups desc → visits desc 상위 CHANNEL_CAMPAIGNS_LIMIT(10)",
+    )
+    campaigns_truncated = serializers.BooleanField(
+        help_text="campaigns 가 상한(10)에 잘렸는지 — true 면 하위 조합이 더 존재"
+    )
+    referral_overlap = serializers.IntegerField(
+        help_text="P-3 — 원래 이 채널로 저장됐으나 제휴코드 사용(레퍼럴 오버레이)으로 "
+        "referral 행으로 이동한 코호트 인원 수. 오버레이는 배타적(중복 집계 없음)이라 "
+        "이 채널이 그만큼 과소 집계됨을 보정 표기하는 용도. referral 행은 항상 0"
+    )
 
 
 class _ReferralCodeRowSerializer(serializers.Serializer):
     """레퍼럴 코드 성과 1행 (기간 내 trial_started_at 기준 코호트)."""
 
     code = serializers.CharField(help_text="레퍼럴 코드")
+    description = serializers.CharField(
+        allow_blank=True,
+        help_text="내부 메모 (ReferralCode.description, 최대 200자) — 어떤 제휴인지 식별용 (M-3)",
+    )
     redemptions = serializers.IntegerField(help_text="기간 내 사용(트라이얼 시작) 수")
     converted = serializers.IntegerField(help_text="그중 유료 전환(converted_to_paid) 수")
     conversion_rate = serializers.FloatField(allow_null=True, help_text="converted / redemptions")
@@ -226,12 +308,33 @@ class _TopPageSerializer(serializers.Serializer):
     clicks = serializers.IntegerField(help_text="기간 내 블록 클릭 수")
 
 
+class _CreatedBreakdownSerializer(serializers.Serializer):
+    """기간 내 생성된 공개 페이지의 생성 방식 분해 (M-1).
+
+    모집단 = new_public_pages.current (기간 내 created_at 공개 페이지) →
+    ai + imported + manual == new_public_pages.current 항상 성립.
+    우선순위: imported > ai > manual (임포트 후 AI 리메이크는 imported 로 1회만).
+    """
+
+    ai = serializers.IntegerField(
+        help_text="AI 생성 — 성공(SUCCEEDED)한 AiJob(bio_remake/theme_generation/"
+        "copy_generation) 보유 페이지 (imported 제외 후)"
+    )
+    imported = serializers.IntegerField(
+        help_text="외부 이전 — Page.import_source ∈ {inpock, litly, linktree}"
+    )
+    manual = serializers.IntegerField(help_text="직접 생성 — 그 외 전부")
+
+
 class _BiolinkStatsSerializer(serializers.Serializer):
     """바이오링크(페이지) 기능 통계."""
 
     public_pages_total = serializers.IntegerField(help_text="공개 페이지 총수 (현재 기준)")
     new_public_pages = _DeltaMetricSerializer(
         help_text="⚠ 근사 — 기간 내 created_at 인 공개 페이지 수 (공개 시각 미기록)"
+    )
+    created_breakdown = _CreatedBreakdownSerializer(
+        help_text="생성 방식 분해 (현재 기간) — 합 == new_public_pages.current"
     )
     active_users = _DeltaMetricSerializer(
         help_text="기간 내 공개 페이지를 만든 고유 회원 수 (페이지 공개 사용자)"
@@ -269,19 +372,53 @@ class _SpamFeatureStatsSerializer(serializers.Serializer):
 
 
 class _TrialsStatsSerializer(serializers.Serializer):
-    """트라이얼 통계 — started 는 레퍼럴+카드등록, 전환은 레퍼럴 코호트만."""
+    """트라이얼 통계 — started 는 레퍼럴+카드등록, 전환은 레퍼럴 코호트만.
+
+    N-3: active(현재 체험 중) + paid_conversion_rate(전체 체험 실결제 전환율) +
+    비율 2종의 한국어 계산식 문자열(conversion_formula/paid_conversion_formula) 추가.
+    """
 
     started = _DeltaMetricSerializer(
         help_text="기간 내 시작된 트라이얼 수 = ReferralRedemption.trial_started_at ∈ 기간 "
         "+ UserSubscription.trial_used_at ∈ 기간 (카드등록 트라이얼)"
+    )
+    active = serializers.IntegerField(
+        help_text="조회 시점 무료체험 진행 중인 회원 수 — TRIALING 상태 유료플랜 구독 "
+        "(free/admin 제외, 기간과 무관한 point-in-time)"
     )
     converted = serializers.IntegerField(
         help_text="기간 내 시작한 '레퍼럴' 트라이얼 중 converted_to_paid=True (코호트)"
     )
     conversion_rate = serializers.FloatField(
         allow_null=True,
-        help_text="converted / 기간 내 레퍼럴 트라이얼 시작 수 — 카드 트라이얼 전환은 "
-        "전용 플래그 부재로 미포함 (레퍼럴 코호트 한정)",
+        help_text="converted / 기간 내 레퍼럴 트라이얼 시작 수 — 실결제(PAID) 기준 "
+        "(converted_to_paid 는 결제 성공 시점 마킹), 카드 트라이얼은 전용 플래그 부재로 "
+        "분모·분자 제외 (레퍼럴 코호트 한정)",
+    )
+    conversion_formula = serializers.CharField(
+        help_text="conversion_rate 의 한국어 계산식 (i-아이콘 툴팁 정본)"
+    )
+    paid_conversion_rate = serializers.FloatField(
+        allow_null=True,
+        help_text="기간 내 시작한 전체 체험(레퍼럴+카드, 회원 dedupe) 중 현재까지 "
+        "실제 결제(PAID)가 발생한 회원 비율 (시작자 0 → null)",
+    )
+    paid_conversion_formula = serializers.CharField(
+        help_text="paid_conversion_rate 의 한국어 계산식 (i-아이콘 툴팁 정본)"
+    )
+    ended = serializers.IntegerField(
+        help_text="P-1 — 이 기간에 무료체험이 '끝난' 고객 수 (유저 dedupe, 쿠폰+카드 전체). "
+        "종료 = 만료·중도 해지(예정일 도래)·체험 중 결제 전환. 진행 중 체험은 제외 — "
+        "체험 길이가 가변이라 시작이 아닌 종료 시점 기준의 대표 분모"
+    )
+    ended_converted = serializers.IntegerField(
+        help_text="ended 중 실제 결제(Toss PAID)로 이어져 유지된 고객 수 (전환 판정은 조회 시점)"
+    )
+    ended_conversion_rate = serializers.FloatField(
+        allow_null=True, help_text="ended_converted / ended (0~1, 분모 0 → null) — 대표 전환율"
+    )
+    ended_conversion_formula = serializers.CharField(
+        help_text="ended_conversion_rate 의 한국어 계산식 (i-아이콘 툴팁 정본)"
     )
 
 
@@ -354,6 +491,24 @@ class _EntryPathRowSerializer(serializers.Serializer):
     count = serializers.IntegerField(help_text="이 경로로 귀속된 전환자 수")
 
 
+class _PaidPlanNoPaymentSerializer(serializers.Serializer):
+    """체험·쿠폰 유료플랜 미결제 회원 (M-2 동반 지표).
+
+    기간 내 체험(카드등록 trial_used_at)·쿠폰(레퍼럴 trial_started_at)으로 유료 플랜을
+    시작했고 조회 시점까지 PAID 결제 이력이 전혀 없는 회원 수 (합집합, 유저 dedupe).
+    """
+
+    count = serializers.IntegerField(help_text="미결제 체험·쿠폰 회원 수 (경로 합집합 dedupe)")
+    referral_trial = serializers.IntegerField(
+        help_text="그중 쿠폰(레퍼럴) 경로 — ReferralRedemption.trial_started_at ∈ 기간"
+    )
+    card_trial = serializers.IntegerField(
+        help_text="그중 체험(카드등록) 경로 — UserSubscription.trial_used_at ∈ 기간. "
+        "두 경로 모두 탄 회원은 양쪽에 잡혀 합이 count 를 넘을 수 있음"
+    )
+    definition = serializers.CharField(help_text="지표 정의 (한국어, 프론트 툴팁 정본)")
+
+
 class _PaidConversionAnalysisSerializer(serializers.Serializer):
     """유료 전환 분석 — 선택 플랜 / 결제 진입 경로 / 결제 후 사용 (3축 분리).
 
@@ -364,6 +519,10 @@ class _PaidConversionAnalysisSerializer(serializers.Serializer):
     total = serializers.IntegerField(help_text="기간 내 유료 전환자 수 (유저별 첫 PAID)")
     by_plan = _ConversionByPlanRowSerializer(
         many=True, help_text="선택 플랜별 전환자 수 (현재 구독 플랜 기준, admin/free 제외)"
+    )
+    paid_plan_no_payment = _PaidPlanNoPaymentSerializer(
+        help_text="M-2 동반 지표 — 기간 내 체험·쿠폰으로 유료 플랜을 시작했으나 "
+        "현재까지 미결제인 회원 수 ('실결제 N명 / 무료 유료플랜 M명' 병기용)"
     )
     post_payment_usage = _PostPaymentUsageRowSerializer(
         many=True, help_text="결제 후 창 내 실제 사용 기능별 유저 수"
@@ -429,7 +588,15 @@ class _SubscriptionRetentionSerializer(serializers.Serializer):
     현재-상태 카운트(취소 예약/past_due/at-risk MRR)는 정확.
     """
 
-    basis = serializers.CharField(help_text='항상 "approx_no_snapshot" — 근사 근거 플래그')
+    basis = serializers.CharField(
+        help_text='현재 "approx_no_snapshot" — 일별 스냅샷 이력이 충분히 쌓여 정확 계산으로 '
+        '전환되면 "snapshot" 으로 바뀜 (프론트는 basis !== "snapshot" 이면 근사 배지)'
+    )
+    snapshot_since = serializers.CharField(
+        allow_null=True,
+        help_text="P-4 — 일별 구독 스냅샷(billing.snapshot_daily_metrics) 적재 시작일 "
+        "(YYYY-MM-DD). 미적재면 null. 이 날짜 이후 기간부터 정확 계산 전환 대상",
+    )
     window_days = serializers.IntegerField(help_text="유지율 산출 기준 기간 일수")
     retention_rate = serializers.FloatField(
         allow_null=True, help_text="기간 시작 전 첫 결제 고객 중 현재 유료 유지 비율 (0~1, 근사)"
@@ -512,6 +679,23 @@ class _PeriodRangeSerializer(serializers.Serializer):
     previous_end = serializers.DateTimeField(help_text="직전 기간 끝 (미포함)")
 
 
+class _TrendChannelSliceSerializer(serializers.Serializer):
+    """일별 추이의 채널 1개 분해 슬라이스 (Q-1 — 스택 막대그래프 층 재료).
+
+    채널 귀속은 채널별 성과 표와 동일(가입 시 저장 채널 + 제휴코드 사용자 referral
+    오버라이드) — visits 만 방문 자체의 저장 채널. 각 지표 Σ(채널) == 버킷 총량.
+    """
+
+    visits = serializers.IntegerField(
+        help_text="이 채널 방문 수 (세션 단위 — 버킷 visits 와 동단위)"
+    )
+    signups = serializers.IntegerField(help_text="이 채널 귀속 가입 수")
+    activated = serializers.IntegerField(
+        help_text="이 채널 귀속 활성 유저 수 (버킷 activated 분해)"
+    )
+    paid = serializers.IntegerField(help_text="이 채널 귀속 유료 전환 수 (첫 PAID 발생일 기준)")
+
+
 class _TrendBucketSerializer(serializers.Serializer):
     """일별 추이 버킷 1개 (로컬 날짜, 제로필 — 빈 날도 0 으로 포함)."""
 
@@ -526,7 +710,17 @@ class _TrendBucketSerializer(serializers.Serializer):
     page_views = serializers.IntegerField(help_text="PageView.viewed_at TruncDate")
     page_clicks = serializers.IntegerField(help_text="BlockClick.clicked_at TruncDate")
     visits = serializers.IntegerField(
-        help_text="LandingVisit.created_at TruncDate — 어트리뷰션 미탑재 시 0"
+        help_text="LandingVisit.created_at TruncDate — **행 수(세션 단위)**, 퍼널/채널의 "
+        "고유 방문자와 단위 다름. 어트리뷰션 미탑재 시 0"
+    )
+    activated = serializers.IntegerField(
+        help_text="Q-1 — 그날 DM 캠페인 생성 or 페이지 공개(공개 페이지 created_at 근사)한 "
+        "고유 회원 수 (일별 user dedupe, 가입 시기 무관 이벤트 기준)"
+    )
+    by_channel = serializers.DictField(
+        child=_TrendChannelSliceSerializer(),
+        help_text="Q-1 — 채널 키 → {visits, signups, activated, paid} 분해. "
+        "값이 전부 0인 채널은 생략 (프론트 0 처리). 채널 키 셋은 channels.rows 와 동일",
     )
 
 
@@ -536,6 +730,136 @@ class _TrendsSerializer(serializers.Serializer):
     granularity = serializers.CharField(help_text='항상 "day"')
     buckets = _TrendBucketSerializer(
         many=True, help_text="로컬 날짜별 제로필 버킷 (date 오름차순, 길이 = 기간 일수)"
+    )
+
+
+class _CohortRowSerializer(serializers.Serializer):
+    """코호트 매트릭스 1행 (Q-2)."""
+
+    cohort = serializers.CharField(
+        help_text='코호트 키 — subscription: "YYYY-MM"(첫 결제 월), usage: "YYYY-MM-DD"(가입 주 월요일)'
+    )
+    size = serializers.IntegerField(help_text="코호트 크기 (해당 월 첫 결제 / 해당 주 가입 수)")
+    values = serializers.ListField(
+        child=serializers.FloatField(),
+        help_text="values[i] = 기준 +(i+1)기간 시점의 유지/사용 비율 (0~1). "
+        "아직 도래하지 않은(또는 진행 중인) 기간은 생략되어 배열이 짧아짐. size 0 → []",
+    )
+
+
+class _SubscriptionCohortsSerializer(serializers.Serializer):
+    """구독 유지 코호트 (첫 결제 월 × M+1..M+5) — 기간 필터 무관, 최근 6개월."""
+
+    unit = serializers.CharField(help_text='항상 "month"')
+    max_periods = serializers.IntegerField(help_text="관찰 기간 수 (5 고정)")
+    basis = serializers.CharField(
+        help_text='"snapshot"(전 값이 일별 스냅샷 소스) | "approx"(하나라도 현재 상태 역산 — '
+        "현재 유지 중이거나 다운그레이드 시각이 시점 이후면 유지로 간주). "
+        '프론트는 approx 일 때 "근사" 표기'
+    )
+    rows = _CohortRowSerializer(many=True, help_text="최근 6개월 코호트 (오래된 월부터)")
+
+
+class _UsageCohortsSerializer(serializers.Serializer):
+    """제품 사용 코호트 (가입 주 × W+1..W+5) — 이벤트 로그 소급이라 항상 정확."""
+
+    unit = serializers.CharField(help_text='항상 "week"')
+    max_periods = serializers.IntegerField(help_text="관찰 기간 수 (5 고정)")
+    rows = _CohortRowSerializer(
+        many=True,
+        help_text="최근 6주 가입 코호트 (오래된 주부터). '사용' = 그 주에 DM 캠페인 생성 · "
+        "DM 발송 발생 · 페이지 생성/공개 중 1개 이상. 진행 중인 주는 값에서 생략",
+    )
+
+
+class _CohortsSerializer(serializers.Serializer):
+    """코호트 분석 매트릭스 2종 (Q-2) — 기간 필터와 무관 (항상 최근 6개월/6주)."""
+
+    subscription = _SubscriptionCohortsSerializer(help_text="탭 1 — 구독 유지 코호트")
+    usage = _UsageCohortsSerializer(help_text="탭 2 — 제품 사용 코호트")
+
+
+class _PaymentFailedRowSerializer(serializers.Serializer):
+    """결제 실패 고객 1명 (Q-3 ①) — PAST_DUE 유료 구독 (dunning 중/소진)."""
+
+    user_id = serializers.IntegerField(help_text="User PK")
+    email = serializers.CharField(allow_blank=True, help_text="회원 이메일")
+    plan = serializers.CharField(help_text="플랜 name")
+    plan_display = serializers.CharField(help_text="플랜 표시명")
+    amount = serializers.IntegerField(help_text="월 청구액 (원, 추가 IG 포함)")
+    failed_at = serializers.CharField(
+        allow_null=True, help_text="마지막 FAILED 결제 시각 (Asia/Seoul ISO, 없으면 null)"
+    )
+    reason = serializers.CharField(
+        allow_blank=True, help_text="PG 실패 사유 (UserSubscription.last_billing_error, 없으면 '')"
+    )
+    retry_status = serializers.CharField(
+        help_text="scheduled(재시도 예약됨) | exhausted(3회 소진 — 유예 만료 대기) | none"
+    )
+    next_retry_at = serializers.CharField(
+        allow_null=True, help_text="다음 자동 재시도 예정 시각 (D+1/D+3/D+5, 없으면 null)"
+    )
+    retry_count = serializers.IntegerField(help_text="현재 주기 과금 시도 횟수")
+    retry_max = serializers.IntegerField(help_text="최대 재시도 횟수 (3)")
+    link = _UpsellLinkSerializer(help_text="회원 상세 드릴다운")
+
+
+class _DormantRowSerializer(serializers.Serializer):
+    """장기 미사용 고객 1명 (Q-3 ②) — 유료 ACTIVE 인데 30일+ 기능 미사용 (해지 위험)."""
+
+    user_id = serializers.IntegerField(help_text="User PK")
+    email = serializers.CharField(allow_blank=True, help_text="회원 이메일")
+    plan = serializers.CharField(help_text="플랜 name")
+    plan_display = serializers.CharField(help_text="플랜 표시명")
+    last_active_at = serializers.CharField(
+        allow_null=True,
+        help_text="마지막 기능 사용 시각 (DM 발송·캠페인 생성·페이지 공개/수정·페이지 클릭 중 "
+        "최신, Asia/Seoul ISO). 활동 이력이 전혀 없으면 null",
+    )
+    idle_days = serializers.IntegerField(
+        help_text="미사용 경과일. 활동 이력 없으면 첫 결제(없으면 구독 생성) 후 경과일"
+    )
+    dm_30d = serializers.IntegerField(help_text="최근 30일 DM 발송 로그 수 (정의상 대개 0)")
+    page_clicks_30d = serializers.IntegerField(help_text="최근 30일 페이지 클릭 수 (정의상 대개 0)")
+    link = _UpsellLinkSerializer(help_text="회원 상세 드릴다운")
+
+
+class _RecentChurnRowSerializer(serializers.Serializer):
+    """최근 해지 고객 1명 (Q-3 ③) — 해지 '완료'(free 다운그레이드) + 실결제 이력 (윈백 대상)."""
+
+    user_id = serializers.IntegerField(help_text="User PK")
+    email = serializers.CharField(allow_blank=True, help_text="회원 이메일")
+    plan = serializers.CharField(
+        allow_blank=True,
+        help_text="해지 전 플랜 name — 다운그레이드가 이전 플랜을 소거하므로 "
+        "CancellationEvent.from_plan best-effort (미수집 시 '')",
+    )
+    plan_display = serializers.CharField(
+        allow_blank=True, help_text="해지 전 플랜 표시명 (없으면 '')"
+    )
+    churned_at = serializers.CharField(help_text="해지 완료(다운그레이드) 시각 (Asia/Seoul ISO)")
+    reason = serializers.CharField(allow_blank=True, help_text="해지 사유 키 (미수집 시 '')")
+    reason_label = serializers.CharField(
+        allow_blank=True, help_text="해지 사유 라벨 (미수집 시 '')"
+    )
+    tenure_months = serializers.IntegerField(help_text="첫 결제 ~ 해지까지 개월 (30일 단위 근사)")
+    monthly_amount = serializers.IntegerField(help_text="마지막 PAID 결제 금액 (원)")
+    link = _UpsellLinkSerializer(help_text="회원 상세 드릴다운")
+
+
+class _CustomerActionsSerializer(serializers.Serializer):
+    """고객 액션 리스트 3종 (Q-3) — 기간 필터와 무관한 현재 스냅샷, 각 최대 20건."""
+
+    payment_failed = _PaymentFailedRowSerializer(
+        many=True, help_text="① 결제 실패 (PAST_DUE 유료 구독, failed_at desc)"
+    )
+    dormant = _DormantRowSerializer(
+        many=True, help_text="② 장기 미사용 (유료 ACTIVE + 30일+ 미사용, 미사용 오래된 순)"
+    )
+    recent_churn = _RecentChurnRowSerializer(
+        many=True,
+        help_text="③ 최근 해지 완료 (30일 내 free 다운그레이드 + 실결제 이력, churned_at desc). "
+        "recent_cancellations(취소 예약, 아직 유료)와 상호 배타",
     )
 
 
@@ -569,6 +893,12 @@ class AdminMarketingDashboardSerializer(serializers.Serializer):
     )
     subscription_retention = _SubscriptionRetentionSerializer(
         help_text="구독 유지·해지 분석 (유지율/취소 예약/이탈 MRR/해지 사유/최근 취소)"
+    )
+    cohorts = _CohortsSerializer(
+        help_text="코호트 분석 매트릭스 2종 (Q-2) — 기간 필터 무관 (최근 6개월/6주 고정)"
+    )
+    customer_actions = _CustomerActionsSerializer(
+        help_text="고객 액션 리스트 3종 (Q-3) — 기간 필터 무관 (현재 스냅샷, 각 20건)"
     )
     plan_distribution = _PlanDistributionRowSerializer(
         many=True, help_text="플랜별 구독 상태 분포 (전 플랜, sort_order 순)"

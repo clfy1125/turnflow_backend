@@ -131,12 +131,18 @@ def clean_slate(db):
     SpamCommentLog.objects.all().update(created_at=long_ago)
     PaymentHistory.objects.all().update(created_at=long_ago)
     PaymentHistory.objects.filter(paid_at__isnull=False).update(paid_at=long_ago)
-    ReferralRedemption.objects.all().update(trial_started_at=long_ago)
+    # trial_ends_at/converted_at 도 함께 이동 — P-1 종료 시점 집계가 잔존행에 오염되지 않게
+    ReferralRedemption.objects.all().update(trial_started_at=long_ago, trial_ends_at=long_ago)
+    ReferralRedemption.objects.filter(converted_at__isnull=False).update(converted_at=long_ago)
     UserSubscription.objects.all().update(
         status=SubscriptionStatus.CANCELLED, trial_used_at=None, extra_ig_accounts=0
     )
     if HAS_ANALYTICS:
         LandingVisit.objects.all().update(created_at=long_ago)
+        # 더러운 테스트 DB에 커밋된 이벤트 행이 기간 창 안에 남아 cancel_defense 등을
+        # 오염시키는 케이스 방어 (LandingVisit 과 동일한 이유)
+        CancellationEvent.objects.all().update(created_at=long_ago)
+        CheckoutEvent.objects.all().update(created_at=long_ago)
 
 
 @pytest.fixture
@@ -359,7 +365,8 @@ class TestCohortFunnel:
         # ig.rate = ig/signups
         assert ig["rate"] == 0.5
         assert ig["rate_of"] == "signup"
-        assert ig["formula"] == "IG 연동 수 ÷ 가입 수 × 100"
+        # M-6 이후 formula 는 한국어 정의 문장 — 핵심 구성요소만 단언 (문구 리팩터 내성)
+        assert "IG 계정" in ig["formula"] and "÷ 가입 수" in ig["formula"]
 
         # dm 분기: IG-less 페이지 유저는 미포함 (u_camp, u_both 만)
         dm = _node(res, "dm_campaign")
@@ -372,13 +379,13 @@ class TestCohortFunnel:
         assert created["count"] == 2  # u_page, u_both (둘 다 공개 페이지=생성 포함)
         assert created["rate"] == 0.5  # created/signups = 2/4
         assert created["rate_of"] == "signup"
-        assert created["formula"] == "페이지 생성 수 ÷ 가입 수 × 100"
+        assert "페이지를 만든" in created["formula"] and "÷ 가입 수" in created["formula"]
 
         page = _node(res, "page_published")
         assert page["count"] == 2
         assert page["rate"] == 1.0  # published/created = 2/2
         assert page["rate_of"] == "page_created"
-        assert page["formula"] == "페이지 공개 수 ÷ 페이지 생성 수 × 100"
+        assert "페이지를 공개한" in page["formula"] and "÷ 페이지 생성 수" in page["formula"]
 
     def test_paid_rate_of_signups(self, staff_client, clean_slate):
         now = timezone.now()
@@ -393,7 +400,9 @@ class TestCohortFunnel:
         assert paid["count"] == 1
         assert paid["rate"] == 0.2  # paid/signups = 1/5
         assert paid["rate_of"] == "signup"
-        assert paid["formula"] == "유료 전환 수 ÷ 가입 수 × 100"
+        # N-1: 유료플랜 전환(무료체험+실결제) — 체험 없으면 count == real_payment
+        assert "유료플랜" in paid["formula"] and "Toss PAID" in paid["formula"]
+        assert paid["breakdown"] == {"free_trial": 0, "real_payment": 1}
 
     def test_private_page_created_but_not_published(self, staff_client, clean_slate):
         # 비공개 페이지 = '생성'에는 포함, '공개'에는 미포함 (생성→공개 2단계 검증)
@@ -615,7 +624,9 @@ class TestChannels:
         res = staff_client.get(URL)
         rows = {r["channel"]: r for r in res.data["channels"]["rows"]}
         assert rows["referral"]["signups"] == 1
-        assert "meta_ads" not in rows  # 저장 채널은 오버레이로 대체
+        # P-3 이후: 원 채널 행은 사라지지 않고 signups 0 + referral_overlap 로 보정 표기
+        assert rows["meta_ads"]["signups"] == 0
+        assert rows["meta_ads"]["referral_overlap"] == 1
 
     def test_kpi_visits_counted(self, staff_client, clean_slate):
         vid = uuid.uuid4()
@@ -623,9 +634,29 @@ class TestChannels:
         LandingVisit.objects.create(visitor_id=vid, channel="direct")  # 같은 방문자 재방문
 
         res = staff_client.get(URL)
-        assert res.data["kpis"]["visits"]["current"] == 2
+        assert res.data["kpis"]["visits"]["current"] == 2  # KPI visits 는 세션 단위 유지
         assert res.data["kpis"]["unique_visitors"]["current"] == 1
-        assert _node(res, "visit")["count"] == 2
+        # 퍼널 head 는 고유 방문자 단위 — 재방문 세션은 1명
+        assert _node(res, "visit")["count"] == 1
+
+    def test_channel_visits_dedupe_by_visitor(self, staff_client, clean_slate):
+        """채널 성과·캠페인 분해의 visits = distinct visitor_id (재방문 세션 dedupe)."""
+        vid = uuid.uuid4()
+        for _ in range(3):  # 같은 방문자가 같은 채널·utm 으로 3세션
+            LandingVisit.objects.create(
+                visitor_id=vid,
+                channel="instagram_organic",
+                utm_campaign="camp_a",
+                utm_content="banner",
+            )
+        LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="instagram_organic")
+
+        res = staff_client.get(URL)
+        rows = {r["channel"]: r for r in res.data["channels"]["rows"]}
+        ig = rows["instagram_organic"]
+        assert ig["visits"] == 2  # 4세션 → 방문자 2명
+        combos = {(c["utm_campaign"], c["utm_content"]): c for c in ig["campaigns"]}
+        assert combos[("camp_a", "banner")]["visits"] == 1  # 3세션 → 1명
 
     def test_channel_variant_matches_available_channels(self, staff_client, clean_slate):
         now = timezone.now()
@@ -649,11 +680,11 @@ class TestChannels:
         assert set(values) == set(funnel["variants"].keys())
         # 채널 라벨 = CHANNEL_LABELS
         ig_opt = next(c for c in funnel["available_channels"] if c["value"] == "instagram_organic")
-        assert ig_opt["label"] == "인스타 오가닉"
+        assert ig_opt["label"] == "인스타그램 유입"  # P-5/Q-5: 표시 라벨 (키는 불변)
         # 채널 variant 노드 카운트
         assert _node(res, "signup", channel="instagram_organic")["count"] == 2
         assert _node(res, "page_published", channel="instagram_organic")["count"] == 1
-        # signup.rate = signups/visits = 2/1 (분모=해당 채널 visits)
+        # signup.rate = signups/방문자 = 2/1 (분모=해당 채널 고유 방문자)
         assert _node(res, "signup", channel="instagram_organic")["rate"] == 2.0
 
 
@@ -838,7 +869,7 @@ class TestTrends:
         assert trends["granularity"] == "day"
         # 7d 는 현재 시각 기준 [now-7d, now) — 로컬 날짜 zero-fill: 7 또는 8 버킷
         assert len(trends["buckets"]) in (7, 8)
-        # 각 버킷 키 계약
+        # 각 버킷 키 계약 (Q-1: activated + by_channel 추가)
         b = trends["buckets"][0]
         assert set(b) == {
             "date",
@@ -848,6 +879,8 @@ class TestTrends:
             "page_views",
             "page_clicks",
             "visits",
+            "activated",
+            "by_channel",
         }
 
     def test_trends_buckets_zero_filled_length_equals_day_count(self, staff_client, clean_slate):
@@ -1179,3 +1212,713 @@ class TestSubscriptionRetention:
             "retained": 1,
             "defense_rate": 0.5,
         }
+
+
+# ─── M-1: 페이지 생성 방식 분해 (created_breakdown) ────────────────────
+
+
+class TestCreatedBreakdown:
+    def test_priority_and_sum_matches_new_public_pages(self, staff_client, clean_slate):
+        u = _mk_user()
+        _mk_page(u)  # manual
+        imported = _mk_page(u)
+        Page.objects.filter(pk=imported.pk).update(import_source="litly")
+        ai_page = _mk_page(u)
+        AiJob.objects.create(
+            user=u, page=ai_page, job_type="bio_remake", status=AiJob.Status.SUCCEEDED
+        )
+        # 우선순위: imported > ai — 임포트 페이지에 성공 AI 잡이 있어도 imported 로 1회만
+        AiJob.objects.create(
+            user=u, page=imported, job_type="theme_generation", status=AiJob.Status.SUCCEEDED
+        )
+        # 실패한 AI 잡은 ai 로 안 침 → manual
+        failed_page = _mk_page(u)
+        AiJob.objects.create(
+            user=u, page=failed_page, job_type="bio_remake", status=AiJob.Status.FAILED
+        )
+        # 비-페이지 job_type(external_import)은 ai 판정 제외 → manual
+        ext_page = _mk_page(u)
+        AiJob.objects.create(
+            user=u, page=ext_page, job_type="external_import", status=AiJob.Status.SUCCEEDED
+        )
+
+        bio = staff_client.get(URL).data["feature_stats"]["biolink"]
+        assert bio["created_breakdown"] == {"ai": 1, "imported": 1, "manual": 3}
+        total = sum(bio["created_breakdown"].values())
+        assert total == bio["new_public_pages"]["current"]
+
+    def test_private_pages_excluded(self, staff_client, clean_slate):
+        u = _mk_user()
+        page = _mk_page(u, public=False)
+        Page.objects.filter(pk=page.pk).update(import_source="inpock")
+
+        bio = staff_client.get(URL).data["feature_stats"]["biolink"]
+        assert bio["created_breakdown"] == {"ai": 0, "imported": 0, "manual": 0}
+
+
+# ─── M-2: 유료 전환 정의 + 체험·쿠폰 미결제 동반 지표 ───────────────────
+
+
+class TestPaidPlanNoPayment:
+    def test_kpi_paid_conversions_has_definition(self, staff_client, clean_slate):
+        kpi = staff_client.get(URL).data["kpis"]["paid_conversions"]
+        assert "실제 결제" in kpi["definition"]
+        assert "체험·쿠폰" in kpi["definition"]
+
+    def test_trial_and_coupon_without_payment_counted(self, staff_client, clean_slate, pro_plan):
+        now = timezone.now()
+        # 쿠폰(레퍼럴) 트라이얼 — 미결제 → 카운트
+        coupon_user = _mk_user()
+        code = ReferralCode.objects.create(code=f"NP-{uuid.uuid4().hex[:6]}", target_plan=pro_plan)
+        ReferralRedemption.objects.create(
+            user=coupon_user,
+            referral_code=code,
+            trial_started_at=now - timedelta(days=4),
+            trial_ends_at=now + timedelta(days=26),
+        )
+        # 카드등록 체험 — 미결제 → 카운트
+        card_user = _mk_user()
+        UserSubscription.objects.create(
+            user=card_user,
+            plan=pro_plan,
+            status=SubscriptionStatus.TRIALING,
+            trial_used_at=now - timedelta(days=2),
+        )
+        # 체험 후 실결제 발생 → 제외 (paid_conversions 쪽에 잡힘)
+        converted = _mk_user()
+        UserSubscription.objects.create(
+            user=converted,
+            plan=pro_plan,
+            status=SubscriptionStatus.ACTIVE,
+            trial_used_at=now - timedelta(days=3),
+        )
+        _mk_paid_payment(converted, paid_at=now - timedelta(days=1))
+
+        analysis = staff_client.get(URL).data["paid_conversion_analysis"]
+        block = analysis["paid_plan_no_payment"]
+        assert block["count"] == 2
+        assert block["referral_trial"] == 1
+        assert block["card_trial"] == 1
+        assert "미결제" in block["definition"] or "이력이 없는" in block["definition"]
+        # 실결제자는 paid_conversions(total) 쪽에만
+        assert analysis["total"] == 1
+
+
+# ─── M-3: 채널 레퍼럴 코드 행에 내부 메모(description) 노출 ─────────────
+
+
+class TestReferralCodeDescription:
+    def test_description_included_in_rows(self, staff_client, clean_slate, pro_plan):
+        now = timezone.now()
+        code = ReferralCode.objects.create(
+            code=f"DE-{uuid.uuid4().hex[:6]}",
+            description="A 인플루언서 릴스 협찬",
+            target_plan=pro_plan,
+        )
+        ReferralRedemption.objects.create(
+            user=_mk_user(),
+            referral_code=code,
+            trial_started_at=now - timedelta(days=1),
+            trial_ends_at=now + timedelta(days=29),
+        )
+
+        rows = staff_client.get(URL).data["channels"]["referral_codes"]
+        assert len(rows) == 1
+        assert rows[0]["code"] == code.code
+        assert rows[0]["description"] == "A 인플루언서 릴스 협찬"
+
+
+# ─── M-6: 퍼널 노드 formula 전부 non-null ───────────────────────────────
+
+
+class TestFunnelFormulas:
+    def test_all_nodes_have_formula(self, staff_client, clean_slate):
+        variant = staff_client.get(URL).data["funnel"]["variants"]["all"]
+        nodes = list(variant["head"])
+        for branch in variant["branches"]:
+            nodes.extend(branch["steps"])
+        nodes.append(variant["conversion"])
+        assert len(nodes) == 7
+        for node in nodes:
+            assert node["formula"], f"{node['key']} formula 가 비어 있음"
+        # 유료플랜 전환 노드는 체험/실결제 분해 정의를 명시 (N-1)
+        assert "유료플랜" in variant["conversion"]["formula"]
+        assert "Toss PAID" in variant["conversion"]["formula"]
+
+
+# ─── N-1: 퍼널 유료플랜 전환 분해 (무료체험/실결제) ─────────────────────
+
+
+class TestFunnelPlanConversion:
+    def test_conversion_counts_trial_and_payment(self, staff_client, clean_slate, pro_plan):
+        now = timezone.now()
+        in_cohort = now - timedelta(days=5)
+        # 실결제 회원
+        u_paid = _mk_user(joined=in_cohort)
+        _mk_paid_payment(u_paid, paid_at=now - timedelta(days=2))
+        # 무료체험 진행 중(미결제) 회원
+        u_trial = _mk_user(joined=in_cohort)
+        UserSubscription.objects.create(
+            user=u_trial,
+            plan=pro_plan,
+            status=SubscriptionStatus.TRIALING,
+            trial_used_at=now - timedelta(days=1),
+        )
+        # 체험 만료 후 강등(CANCELLED) 회원 — 어느 쪽에도 안 잡힘 (현재 상태 기준)
+        u_expired = _mk_user(joined=in_cohort)
+        UserSubscription.objects.create(
+            user=u_expired, plan=pro_plan, status=SubscriptionStatus.CANCELLED
+        )
+        # 무행동 회원
+        _mk_user(joined=in_cohort)
+
+        res = staff_client.get(URL)
+        conv = _variant(res)["conversion"]
+        assert conv["label"] == "유료플랜 전환"
+        assert conv["count"] == 2  # u_paid + u_trial
+        assert conv["breakdown"] == {"free_trial": 1, "real_payment": 1}
+        assert conv["rate"] == 0.5  # 2/4
+        # 체험 중 + 실결제 이력 둘 다인 회원은 real_payment 로 1회만
+        _mk_paid_payment(u_trial, paid_at=now - timedelta(hours=1))
+        cache.delete_many(CACHE_KEYS)
+        conv = _variant(staff_client.get(URL))["conversion"]
+        assert conv["count"] == 2
+        assert conv["breakdown"] == {"free_trial": 0, "real_payment": 2}
+
+    @requires_analytics
+    def test_channel_variant_has_breakdown(self, staff_client, clean_slate, pro_plan):
+        now = timezone.now()
+        u = _mk_user(joined=now - timedelta(days=3))
+        SignupAttribution.objects.create(user=u, channel="meta_ads", signup_kind="email")
+        UserSubscription.objects.create(user=u, plan=pro_plan, status=SubscriptionStatus.TRIALING)
+
+        conv = _variant(staff_client.get(URL), "meta_ads")["conversion"]
+        assert conv["count"] == 1
+        assert conv["breakdown"] == {"free_trial": 1, "real_payment": 0}
+
+
+# ─── N-2: 채널별 캠페인/소재 분해 (campaigns[]) ─────────────────────────
+
+
+@requires_analytics
+class TestChannelCampaigns:
+    def test_campaign_rows_grouped_by_utm(self, staff_client, clean_slate, pro_plan):
+        now = timezone.now()
+        # 방문: banner_a 조합 2회 + utm 없는 조합 1회 (meta_ads)
+        for _ in range(2):
+            LandingVisit.objects.create(
+                visitor_id=uuid.uuid4(),
+                channel="meta_ads",
+                utm_campaign="2026_spring",
+                utm_content="banner_a",
+            )
+        LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="meta_ads")
+        # 가입: banner_a 로 1명(실결제) + utm 없이 1명(체험 중)
+        u_a = _mk_user(joined=now - timedelta(days=3))
+        SignupAttribution.objects.create(
+            user=u_a,
+            channel="meta_ads",
+            signup_kind="email",
+            utm_campaign="2026_spring",
+            utm_content="banner_a",
+        )
+        _mk_paid_payment(u_a, paid_at=now - timedelta(days=1))
+        u_b = _mk_user(joined=now - timedelta(days=2))
+        SignupAttribution.objects.create(user=u_b, channel="meta_ads", signup_kind="email")
+        UserSubscription.objects.create(user=u_b, plan=pro_plan, status=SubscriptionStatus.TRIALING)
+
+        rows = {r["channel"]: r for r in staff_client.get(URL).data["channels"]["rows"]}
+        row = rows["meta_ads"]
+        assert row["paid"] == 1 and row["free_trial"] == 1
+        assert row["campaigns_truncated"] is False
+        combos = {(c["utm_campaign"], c["utm_content"]): c for c in row["campaigns"]}
+        banner = combos[("2026_spring", "banner_a")]
+        assert banner["visits"] == 2
+        assert banner["signups"] == 1
+        assert banner["paid"] == 1
+        assert banner["paid_rate"] == 1.0
+        blank = combos[("", "")]
+        assert blank["visits"] == 1
+        assert blank["signups"] == 1
+        assert blank["paid"] == 0
+        assert blank["free_trial"] == 1
+
+    def test_campaigns_truncated_flag(self, staff_client, clean_slate, monkeypatch):
+        monkeypatch.setattr("apps.admin_api.views.dashboard_marketing.CHANNEL_CAMPAIGNS_LIMIT", 1)
+        for content in ("a", "b"):
+            LandingVisit.objects.create(
+                visitor_id=uuid.uuid4(),
+                channel="meta_ads",
+                utm_campaign="camp",
+                utm_content=content,
+            )
+
+        rows = {r["channel"]: r for r in staff_client.get(URL).data["channels"]["rows"]}
+        row = rows["meta_ads"]
+        assert len(row["campaigns"]) == 1
+        assert row["campaigns_truncated"] is True
+
+
+# ─── N-3: 무료체험 active + 실결제 전환율 ───────────────────────────────
+
+
+class TestTrialsExpanded:
+    def test_active_and_paid_conversion_rate(self, staff_client, clean_slate, pro_plan):
+        now = timezone.now()
+        # 현재 체험 진행 중 1명 (기간 내 시작, 미결제)
+        u_trial = _mk_user()
+        UserSubscription.objects.create(
+            user=u_trial,
+            plan=pro_plan,
+            status=SubscriptionStatus.TRIALING,
+            trial_used_at=now - timedelta(days=2),
+        )
+        # 체험 시작 후 실결제 1명 (체험 종료 → ACTIVE)
+        u_paid = _mk_user()
+        UserSubscription.objects.create(
+            user=u_paid,
+            plan=pro_plan,
+            status=SubscriptionStatus.ACTIVE,
+            trial_used_at=now - timedelta(days=10),
+        )
+        _mk_paid_payment(u_paid, paid_at=now - timedelta(days=1))
+
+        trials = staff_client.get(URL).data["feature_stats"]["trials"]
+        assert trials["active"] == 1  # TRIALING 유료플랜만 (clean_slate 로 기존 전부 CANCELLED)
+        assert trials["started"]["current"] == 2
+        # 시작자 2명(dedupe) 중 실결제 1명
+        assert trials["paid_conversion_rate"] == 0.5
+        assert "실제 결제" in trials["paid_conversion_formula"]
+        assert "레퍼럴" in trials["conversion_formula"]
+
+    def test_paid_conversion_rate_dedupes_referral_and_card(
+        self, staff_client, clean_slate, pro_plan
+    ):
+        now = timezone.now()
+        # 같은 회원이 레퍼럴+카드 체험 둘 다 → 분모 1 (started 는 이벤트 합산이라 2)
+        u = _mk_user()
+        code = ReferralCode.objects.create(code=f"DD-{uuid.uuid4().hex[:6]}", target_plan=pro_plan)
+        ReferralRedemption.objects.create(
+            user=u,
+            referral_code=code,
+            trial_started_at=now - timedelta(days=3),
+            trial_ends_at=now + timedelta(days=27),
+        )
+        UserSubscription.objects.create(
+            user=u,
+            plan=pro_plan,
+            status=SubscriptionStatus.TRIALING,
+            trial_used_at=now - timedelta(days=2),
+        )
+
+        trials = staff_client.get(URL).data["feature_stats"]["trials"]
+        assert trials["started"]["current"] == 2
+        assert trials["paid_conversion_rate"] == 0.0  # 분모 1(dedupe), 결제 0
+
+
+# ─── N-4: 채널 paid=실결제 · free_trial 별도 컬럼 ───────────────────────
+
+
+@requires_analytics
+class TestChannelPaidVsFreeTrial:
+    def test_trialing_user_not_in_paid_column(self, staff_client, clean_slate, pro_plan):
+        now = timezone.now()
+        u_trial = _mk_user(joined=now - timedelta(days=3))
+        SignupAttribution.objects.create(user=u_trial, channel="meta_ads", signup_kind="email")
+        UserSubscription.objects.create(
+            user=u_trial, plan=pro_plan, status=SubscriptionStatus.TRIALING
+        )
+        u_paid = _mk_user(joined=now - timedelta(days=3))
+        SignupAttribution.objects.create(user=u_paid, channel="meta_ads", signup_kind="email")
+        _mk_paid_payment(u_paid, paid_at=now - timedelta(days=1))
+
+        rows = {r["channel"]: r for r in staff_client.get(URL).data["channels"]["rows"]}
+        row = rows["meta_ads"]
+        assert row["paid"] == 1  # 실결제만 (체험 미포함)
+        assert row["free_trial"] == 1
+        assert row["paid_rate"] == 0.5  # 1/2 (실결제 기준 유지)
+
+
+# ─── P-1: 무료체험 종료 시점 기준 전환율 ─────────────────────────────────
+
+
+class TestTrialsEnded:
+    def test_ended_cohort_all_end_types(self, staff_client, clean_slate, pro_plan):
+        now = timezone.now()
+        code = ReferralCode.objects.create(code=f"EN-{uuid.uuid4().hex[:6]}", target_plan=pro_plan)
+
+        # (b) 쿠폰 체험 만료 후 이탈 — 분모에만
+        u_expired = _mk_user()
+        ReferralRedemption.objects.create(
+            user=u_expired,
+            referral_code=code,
+            trial_started_at=now - timedelta(days=35),
+            trial_ends_at=now - timedelta(days=5),
+        )
+        # (a) 쿠폰 체험 중 결제 전환 — 종료 시점=converted_at, ended_converted
+        u_conv = _mk_user()
+        ReferralRedemption.objects.create(
+            user=u_conv,
+            referral_code=code,
+            trial_started_at=now - timedelta(days=10),
+            trial_ends_at=now + timedelta(days=20),
+            converted_to_paid=True,
+            converted_at=now - timedelta(days=1),
+        )
+        # (a) 카드 체험 전환 — 첫 PAID 가 종료 시점, ended_converted
+        u_card_conv = _mk_user()
+        UserSubscription.objects.create(
+            user=u_card_conv,
+            plan=pro_plan,
+            status=SubscriptionStatus.ACTIVE,
+            trial_used_at=now - timedelta(days=40),
+        )
+        _mk_paid_payment(u_card_conv, paid_at=now - timedelta(days=3))
+        # (b) 카드 체험 만료 이탈 — cancelled_at(다운그레이드 시각)이 종료 시점, 분모에만
+        u_card_exp = _mk_user()
+        s = UserSubscription.objects.create(
+            user=u_card_exp,
+            plan=pro_plan,
+            status=SubscriptionStatus.CANCELLED,
+            trial_used_at=now - timedelta(days=40),
+        )
+        UserSubscription.objects.filter(pk=s.pk).update(cancelled_at=now - timedelta(days=2))
+        # 진행 중 체험 — 분모 제외
+        u_ongoing = _mk_user()
+        UserSubscription.objects.create(
+            user=u_ongoing,
+            plan=pro_plan,
+            status=SubscriptionStatus.TRIALING,
+            trial_used_at=now - timedelta(days=1),
+        )
+        # 쿠폰 체험이 다음 기간에 끝남 — 분모 제외
+        u_future = _mk_user()
+        ReferralRedemption.objects.create(
+            user=u_future,
+            referral_code=code,
+            trial_started_at=now - timedelta(days=1),
+            trial_ends_at=now + timedelta(days=29),
+        )
+
+        trials = staff_client.get(URL).data["feature_stats"]["trials"]
+        assert trials["ended"] == 4  # u_expired, u_conv, u_card_conv, u_card_exp
+        assert trials["ended_converted"] == 2  # u_conv, u_card_conv
+        assert trials["ended_conversion_rate"] == 0.5
+        assert "종료 시점" in trials["ended_conversion_formula"]
+
+    def test_ended_zero_is_null_rate(self, staff_client, clean_slate):
+        trials = staff_client.get(URL).data["feature_stats"]["trials"]
+        assert trials["ended"] == 0
+        assert trials["ended_converted"] == 0
+        assert trials["ended_conversion_rate"] is None
+
+
+# ─── P-3: 레퍼럴 오버레이 원 채널 보정 표기 (referral_overlap) ───────────
+
+
+@requires_analytics
+class TestReferralOverlap:
+    def test_moved_user_counted_on_origin_channel(self, staff_client, clean_slate, pro_plan):
+        now = timezone.now()
+        # meta_ads 로 유입·가입했으나 제휴코드 사용 → referral 행으로 배타 이동
+        u = _mk_user(joined=now - timedelta(days=3))
+        SignupAttribution.objects.create(user=u, channel="meta_ads", signup_kind="email")
+        code = ReferralCode.objects.create(code=f"OV-{uuid.uuid4().hex[:6]}", target_plan=pro_plan)
+        ReferralRedemption.objects.create(
+            user=u,
+            referral_code=code,
+            trial_started_at=now - timedelta(days=2),
+            trial_ends_at=now + timedelta(days=28),
+        )
+
+        rows = {r["channel"]: r for r in staff_client.get(URL).data["channels"]["rows"]}
+        # referral 행에만 가입이 잡히고 (배타 — 중복 없음)
+        assert rows["referral"]["signups"] == 1
+        assert rows["referral"]["referral_overlap"] == 0
+        # 원 채널 행은 잔여 멤버가 없어도 overlap 표기를 위해 생성된다
+        assert rows["meta_ads"]["signups"] == 0
+        assert rows["meta_ads"]["referral_overlap"] == 1
+
+
+# ─── P-4: 일별 스냅샷 적재 시작일 노출 (snapshot_since) ─────────────────
+
+
+class TestSnapshotSince:
+    def test_null_without_snapshots(self, staff_client, clean_slate):
+        from apps.billing.models import DailySubscriptionSnapshot
+
+        DailySubscriptionSnapshot.objects.all().delete()
+        r = staff_client.get(URL).data["subscription_retention"]
+        assert r["basis"] == "approx_no_snapshot"
+        assert r["snapshot_since"] is None
+
+    def test_earliest_snapshot_date_exposed(self, staff_client, clean_slate):
+        from apps.billing.models import DailySubscriptionSnapshot
+
+        DailySubscriptionSnapshot.objects.all().delete()
+        d1 = timezone.localdate() - timedelta(days=3)
+        d2 = timezone.localdate()
+        DailySubscriptionSnapshot.objects.create(snapshot_date=d2)
+        DailySubscriptionSnapshot.objects.create(snapshot_date=d1)
+
+        r = staff_client.get(URL).data["subscription_retention"]
+        assert r["snapshot_since"] == d1.isoformat()
+
+
+# ─── Q-1: 일별 추이 activated + 채널 분해 ───────────────────────────────
+
+
+class TestTrendsActivatedByChannel:
+    def test_activated_daily_dedupe(self, staff_client, clean_slate):
+        u = _mk_user()
+        _mk_campaign(_mk_conn(u))  # 오늘 캠페인 생성
+        _mk_page(u)  # 같은 날 페이지 공개 — 같은 유저라 dedupe 로 1
+
+        bucket = staff_client.get(URL).data["trends"]["buckets"][-1]
+        assert bucket["activated"] == 1
+
+    @requires_analytics
+    def test_by_channel_slices_sum_to_totals(self, staff_client, clean_slate):
+        now = timezone.now()
+        # 방문 2세션 (meta_ads 저장 채널)
+        LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="meta_ads")
+        LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="meta_ads")
+        # 가입 2명 — meta_ads 귀속 1 + 어트리뷰션 없음(unknown) 1
+        u1 = _mk_user(joined=now)
+        SignupAttribution.objects.create(user=u1, channel="meta_ads", signup_kind="email")
+        u2 = _mk_user(joined=now)
+        # u1 활성화(캠페인) + 첫 결제
+        _mk_campaign(_mk_conn(u1))
+        _mk_paid_payment(u1, paid_at=now)
+        assert u2  # unknown 채널 귀속 대상
+
+        bucket = staff_client.get(URL).data["trends"]["buckets"][-1]
+        assert bucket["signups"] == 2
+        assert bucket["activated"] == 1
+        assert bucket["paid"] == 1
+        by = bucket["by_channel"]
+        assert by["meta_ads"] == {"visits": 2, "signups": 1, "activated": 1, "paid": 1}
+        assert by["unknown"]["signups"] == 1
+        # 각 지표 Σ(채널) == 버킷 총량
+        for key in ("visits", "signups", "activated", "paid"):
+            assert sum(s[key] for s in by.values()) == bucket[key], key
+
+    @requires_analytics
+    def test_referral_override_in_by_channel(self, staff_client, clean_slate, pro_plan):
+        now = timezone.now()
+        u = _mk_user(joined=now)
+        SignupAttribution.objects.create(user=u, channel="meta_ads", signup_kind="email")
+        code = ReferralCode.objects.create(code=f"TB-{uuid.uuid4().hex[:6]}", target_plan=pro_plan)
+        ReferralRedemption.objects.create(
+            user=u,
+            referral_code=code,
+            trial_started_at=now,
+            trial_ends_at=now + timedelta(days=30),
+        )
+
+        bucket = staff_client.get(URL).data["trends"]["buckets"][-1]
+        assert bucket["by_channel"]["referral"]["signups"] == 1
+        assert "meta_ads" not in bucket["by_channel"]  # 전부 0이라 생략
+
+
+# ─── Q-2: 코호트 분석 매트릭스 ─────────────────────────────────────────
+
+
+class TestCohorts:
+    def test_subscription_cohort_approx_and_snapshot(self, staff_client, clean_slate, pro_plan):
+        from apps.admin_api.views.dashboard_marketing import _local_midnight, _month_add
+        from apps.billing.models import DailyPaidCohortSnapshot
+
+        DailyPaidCohortSnapshot.objects.all().delete()
+        today = timezone.localdate()
+        m = _month_add(today.replace(day=1), -2)  # 2개월 전 코호트
+        paid_dt = _local_midnight(m) + timedelta(days=5)
+
+        # 유지 회원 — 현재 유료 ACTIVE
+        keeper = _mk_user()
+        UserSubscription.objects.create(
+            user=keeper, plan=pro_plan, status=SubscriptionStatus.ACTIVE
+        )
+        _mk_paid_payment(keeper, paid_at=paid_dt)
+        # 이탈 회원 — 결제 다음날 다운그레이드 (M+1 시점 전 이탈)
+        churner = _mk_user()
+        s = UserSubscription.objects.create(
+            user=churner, plan=pro_plan, status=SubscriptionStatus.CANCELLED
+        )
+        UserSubscription.objects.filter(pk=s.pk).update(cancelled_at=paid_dt + timedelta(days=1))
+        _mk_paid_payment(churner, paid_at=paid_dt)
+
+        sub = staff_client.get(URL).data["cohorts"]["subscription"]
+        assert sub["unit"] == "month" and sub["max_periods"] == 5
+        assert sub["basis"] == "approx"  # 스냅샷 없음 → 현재 상태 역산
+        row = next(r for r in sub["rows"] if r["cohort"] == m.strftime("%Y-%m"))
+        assert row["size"] == 2
+        assert row["values"][0] == 0.5  # M+1: keeper 만 유지
+
+        # 스냅샷이 있으면 그 값을 우선 사용
+        checkpoint = _month_add(m, 1)
+        DailyPaidCohortSnapshot.objects.create(
+            snapshot_date=checkpoint, cohort_month=m, paying_users=2, mrr=29800
+        )
+        cache.delete_many(CACHE_KEYS)
+        sub = staff_client.get(URL).data["cohorts"]["subscription"]
+        row = next(r for r in sub["rows"] if r["cohort"] == m.strftime("%Y-%m"))
+        assert row["values"][0] == 1.0  # 스냅샷 소스 (2/2)
+
+    def test_usage_cohort_weekly(self, staff_client, clean_slate):
+        from apps.admin_api.views.dashboard_marketing import _local_midnight
+
+        today = timezone.localdate()
+        this_monday = today - timedelta(days=today.weekday())
+        w = this_monday - timedelta(weeks=2)  # 2주 전 가입 코호트
+
+        active_u = _mk_user(joined=_local_midnight(w) + timedelta(days=1))
+        _mk_user(joined=_local_midnight(w) + timedelta(days=2))  # 미사용 가입자
+        # W+1 주에 캠페인 생성 (사용)
+        camp = _mk_campaign(_mk_conn(active_u))
+        AutoDMCampaign.objects.filter(pk=camp.pk).update(
+            created_at=_local_midnight(w + timedelta(weeks=1)) + timedelta(days=1)
+        )
+
+        usage = staff_client.get(URL).data["cohorts"]["usage"]
+        assert usage["unit"] == "week" and usage["max_periods"] == 5
+        row = next(r for r in usage["rows"] if r["cohort"] == w.isoformat())
+        assert row["size"] == 2
+        assert row["values"] == [0.5]  # W+1 완결, W+2=이번 주(진행 중) 생략
+
+
+# ─── Q-3: 고객 액션 리스트 3종 ─────────────────────────────────────────
+
+
+class TestCustomerActions:
+    def test_payment_failed_rows(self, staff_client, clean_slate, pro_plan):
+        now = timezone.now()
+        u = _mk_user()
+        UserSubscription.objects.create(
+            user=u,
+            plan=pro_plan,
+            status=SubscriptionStatus.PAST_DUE,
+            monthly_amount_snapshot=14900,
+            renewal_attempts=1,
+            next_billing_retry_at=now + timedelta(days=1),
+            last_billing_error="카드 한도 초과",
+        )
+        PaymentHistory.objects.create(user=u, amount=14900, status=PaymentStatus.FAILED)
+        # 재시도 소진 회원
+        u2 = _mk_user()
+        UserSubscription.objects.create(
+            user=u2,
+            plan=pro_plan,
+            status=SubscriptionStatus.PAST_DUE,
+            monthly_amount_snapshot=14900,
+            renewal_attempts=3,
+        )
+
+        rows = staff_client.get(URL).data["customer_actions"]["payment_failed"]
+        by_user = {r["user_id"]: r for r in rows}
+        assert set(by_user) == {u.id, u2.id}
+        row = by_user[u.id]
+        assert row["retry_status"] == "scheduled"
+        assert row["retry_count"] == 1 and row["retry_max"] == 3
+        assert row["reason"] == "카드 한도 초과"
+        assert row["amount"] == 14900
+        assert row["failed_at"] is not None and row["next_retry_at"] is not None
+        assert by_user[u2.id]["retry_status"] == "exhausted"
+
+    def test_dormant_rows(self, staff_client, clean_slate, pro_plan):
+        now = timezone.now()
+        # 45일 미사용 (마지막 활동 = 캠페인 생성)
+        idle_u = _mk_user()
+        UserSubscription.objects.create(
+            user=idle_u, plan=pro_plan, status=SubscriptionStatus.ACTIVE
+        )
+        camp = _mk_campaign(_mk_conn(idle_u))
+        AutoDMCampaign.objects.filter(pk=camp.pk).update(created_at=now - timedelta(days=45))
+        # 활동 이력 전무 — 첫 결제 100일 전 기준
+        never_u = _mk_user()
+        UserSubscription.objects.create(
+            user=never_u, plan=pro_plan, status=SubscriptionStatus.ACTIVE
+        )
+        _mk_paid_payment(never_u, paid_at=now - timedelta(days=100))
+        # 오늘 페이지 만든 활성 사용자 — 제외
+        active_u = _mk_user()
+        UserSubscription.objects.create(
+            user=active_u, plan=pro_plan, status=SubscriptionStatus.ACTIVE
+        )
+        _mk_page(active_u)
+
+        rows = staff_client.get(URL).data["customer_actions"]["dormant"]
+        by_user = {r["user_id"]: r for r in rows}
+        assert active_u.id not in by_user
+        assert 44 <= by_user[idle_u.id]["idle_days"] <= 46
+        assert by_user[idle_u.id]["last_active_at"] is not None
+        assert by_user[never_u.id]["last_active_at"] is None
+        assert by_user[never_u.id]["idle_days"] >= 99
+        # 미사용 오래된 순
+        assert rows[0]["user_id"] == never_u.id
+        assert by_user[idle_u.id]["dm_30d"] == 0
+
+    def test_recent_churn_rows(self, staff_client, clean_slate, free_plan, pro_plan):
+        now = timezone.now()
+        churn = _mk_user()
+        s = UserSubscription.objects.create(
+            user=churn, plan=free_plan, status=SubscriptionStatus.ACTIVE
+        )
+        UserSubscription.objects.filter(pk=s.pk).update(cancelled_at=now - timedelta(days=3))
+        _mk_paid_payment(churn, paid_at=now - timedelta(days=130))
+        PaymentHistory.objects.create(
+            user=churn, amount=17900, status=PaymentStatus.PAID, paid_at=now - timedelta(days=10)
+        )
+        # 결제 이력 없는 다운그레이드(트라이얼 만료 등) — 실이탈 아님, 제외
+        trial_exp = _mk_user()
+        s2 = UserSubscription.objects.create(
+            user=trial_exp, plan=free_plan, status=SubscriptionStatus.ACTIVE
+        )
+        UserSubscription.objects.filter(pk=s2.pk).update(cancelled_at=now - timedelta(days=2))
+        if HAS_ANALYTICS:
+            CancellationEvent.objects.create(
+                user=churn, event="cancel_reason_submitted", reason="price", from_plan="pro"
+            )
+
+        rows = staff_client.get(URL).data["customer_actions"]["recent_churn"]
+        assert [r["user_id"] for r in rows] == [churn.id]
+        row = rows[0]
+        assert row["monthly_amount"] == 17900  # 마지막 PAID 금액
+        assert row["tenure_months"] == 4  # (130-3)일 // 30
+        if HAS_ANALYTICS:
+            assert row["reason"] == "price"
+            assert row["plan"] == "pro"
+            assert row["plan_display"] == pro_plan.display_name
+
+
+# ─── Q-4: referral 채널 campaigns[] = 제휴코드 단위 ─────────────────────
+
+
+@requires_analytics
+class TestReferralCampaignsByCode:
+    def test_referral_details_grouped_by_code(self, staff_client, clean_slate, pro_plan):
+        now = timezone.now()
+        u = _mk_user(joined=now - timedelta(days=3))
+        # 원래 방문 utm 이 있어도 referral 채널 세부는 코드 단위여야 한다
+        SignupAttribution.objects.create(
+            user=u,
+            channel="meta_ads",
+            signup_kind="email",
+            utm_campaign="spring",
+            utm_content="a",
+        )
+        code = ReferralCode.objects.create(
+            code=f"RC{uuid.uuid4().hex[:6].upper()}", target_plan=pro_plan
+        )
+        ReferralRedemption.objects.create(
+            user=u,
+            referral_code=code,
+            trial_started_at=now - timedelta(days=2),
+            trial_ends_at=now + timedelta(days=28),
+        )
+
+        rows = {r["channel"]: r for r in staff_client.get(URL).data["channels"]["rows"]}
+        combos = {(c["utm_campaign"], c["utm_content"]): c for c in rows["referral"]["campaigns"]}
+        assert (code.code, "") in combos  # referral_codes[].code 와 조인 가능
+        assert ("spring", "a") not in combos  # 원래 utm 으로는 안 내려감
+        assert combos[(code.code, "")]["signups"] == 1

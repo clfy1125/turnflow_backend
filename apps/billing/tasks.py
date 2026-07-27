@@ -1223,3 +1223,138 @@ def send_winback_emails():
     if sent:
         logger.info("send_winback_emails: %d건 발송", sent)
     return {"sent": sent}
+
+
+@shared_task(name="billing.snapshot_daily_metrics")
+def snapshot_daily_metrics(target_date: str | None = None):
+    """일 1회 구독 상태 스냅샷 적재 (어드민 마케팅 P-4 Phase 1).
+
+    라이브 테이블은 과거 상태를 재구성할 수 없으므로(다운그레이드가 기간/금액 소거)
+    '오늘의 사실'을 매일 적재한다 — 적재 시작 이후 기간은 정확한 코호트 유지율/MRR
+    이동 계산이 가능해진다. **멱등**: 같은 날 재실행하면 upsert 로 그날 값을 갱신.
+
+    - DailySubscriptionSnapshot: 플랜×상태 인원, 유료/체험/취소예약/미납 수, MRR.
+    - DailyPaidCohortSnapshot: 현재 유료 ACTIVE 회원을 첫 PAID 월로 묶은 코호트별
+      인원·MRR (월별 코호트 유지율 곡선 재료, 재구독도 그날 사실로 반영).
+    - target_date: "YYYY-MM-DD" (KST) — 미지정 시 오늘. 과거 날짜를 줘도 '현재 상태'를
+      찍는 것이라 백필 용도로는 쓸 수 없다 (재실행 보정용).
+    """
+    from django.db.models import Count, Min, Q, Sum
+    from django.db.models.functions import Coalesce
+
+    from .models import (
+        EXTRA_IG_ACCOUNT_PRICE,
+        DailyPaidCohortSnapshot,
+        DailySubscriptionSnapshot,
+        PaymentHistory,
+        PaymentStatus,
+        SubscriptionStatus,
+        UserSubscription,
+    )
+
+    now = timezone.now()
+    snap_date = (
+        timezone.datetime.strptime(target_date, "%Y-%m-%d").date()
+        if target_date
+        else timezone.localdate(now)
+    )
+    paid_exclude = ("free", "admin")
+
+    # ① 플랜×상태 인원 (전 플랜, free 포함 — 분포 재구성용)
+    plan_status_counts: dict = {}
+    for row in UserSubscription.objects.values("plan__name", "status").annotate(c=Count("id")):
+        plan_status_counts.setdefault(row["plan__name"] or "", {})[row["status"]] = row["c"]
+
+    paid_active = UserSubscription.objects.filter(status=SubscriptionStatus.ACTIVE).exclude(
+        plan__name__in=paid_exclude
+    )
+    agg = paid_active.aggregate(
+        n=Count("id"),
+        base=Sum(Coalesce("monthly_amount_snapshot", "plan__monthly_price")),
+        extra=Sum("extra_ig_accounts", filter=Q(plan__name="pro")),
+    )
+    extra_count = agg["extra"] or 0
+    mrr_total = (agg["base"] or 0) + extra_count * EXTRA_IG_ACCOUNT_PRICE
+
+    trialing_count = (
+        UserSubscription.objects.filter(status=SubscriptionStatus.TRIALING)
+        .exclude(plan__name__in=paid_exclude)
+        .count()
+    )
+    cancel_scheduled_count = (
+        UserSubscription.objects.filter(
+            status=SubscriptionStatus.CANCELLED, current_period_end__gt=now
+        )
+        .exclude(plan__name__in=paid_exclude)
+        .count()
+    )
+    past_due_count = (
+        UserSubscription.objects.filter(status=SubscriptionStatus.PAST_DUE)
+        .exclude(plan__name__in=paid_exclude)
+        .count()
+    )
+
+    # ② 결제 코호트 (현재 유료 ACTIVE 회원 → 첫 PAID 월별 인원/MRR)
+    payer_rows = list(
+        paid_active.values_list(
+            "user_id",
+            "monthly_amount_snapshot",
+            "plan__monthly_price",
+            "plan__name",
+            "extra_ig_accounts",
+        )
+    )
+    cohort: dict = {}
+    if payer_rows:
+        first_paid = {
+            r["user_id"]: r["first"]
+            for r in PaymentHistory.objects.filter(
+                user_id__in=[r[0] for r in payer_rows], status=PaymentStatus.PAID
+            )
+            .values("user_id")
+            .annotate(first=Min("paid_at"))
+        }
+        for uid, snapshot_amt, plan_price, plan_name, extra in payer_rows:
+            first = first_paid.get(uid)
+            if first is None:
+                continue  # 유료 ACTIVE 인데 PAID 이력 없음(어드민 수동 부여 등) — 코호트 제외
+            month = timezone.localtime(first).date().replace(day=1)
+            amount = snapshot_amt if snapshot_amt is not None else (plan_price or 0)
+            if plan_name == "pro":
+                amount += (extra or 0) * EXTRA_IG_ACCOUNT_PRICE
+            slot = cohort.setdefault(month, {"paying_users": 0, "mrr": 0})
+            slot["paying_users"] += 1
+            slot["mrr"] += amount
+
+    with transaction.atomic():
+        DailySubscriptionSnapshot.objects.update_or_create(
+            snapshot_date=snap_date,
+            defaults={
+                "plan_status_counts": plan_status_counts,
+                "paying_count": agg["n"] or 0,
+                "trialing_count": trialing_count,
+                "cancel_scheduled_count": cancel_scheduled_count,
+                "past_due_count": past_due_count,
+                "mrr_total": mrr_total,
+                "extra_ig_count": extra_count,
+            },
+        )
+        DailyPaidCohortSnapshot.objects.filter(snapshot_date=snap_date).delete()
+        DailyPaidCohortSnapshot.objects.bulk_create(
+            DailyPaidCohortSnapshot(
+                snapshot_date=snap_date,
+                cohort_month=month,
+                paying_users=slot["paying_users"],
+                mrr=slot["mrr"],
+            )
+            for month, slot in sorted(cohort.items())
+        )
+
+    logger.info(
+        "snapshot_daily_metrics: date=%s paying=%s mrr=%s cohorts=%s",
+        snap_date,
+        agg["n"] or 0,
+        mrr_total,
+        len(cohort),
+    )
+    return {"date": str(snap_date), "paying": agg["n"] or 0, "cohorts": len(cohort)}

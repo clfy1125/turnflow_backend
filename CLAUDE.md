@@ -56,7 +56,7 @@ turnflow_backend/
 │   ├── pages/                  # 페이지/게시물/DM 관련 뷰 (multi_views, image_views, stats, aiviews)
 │   ├── ai_jobs/                # LLM 작업 큐 + services(llm_client, model_router, prompt_builder)
 │   ├── analytics/              # 랜딩 방문 추적(LandingVisit) + 가입 어트리뷰션(SignupAttribution) — POST /api/v1/track/visit/ (공개·silent 204), 채널 파생 단일 소스 channels.derive_channel()
-│   └── admin_api/              # 백오피스(어드민) 전용 API — 신원/대시보드(overview + 운영/마케팅: dashboard_ops·dashboard_marketing, 임계값=dashboard_constants.py)/회원/워크스페이스/페이지/자동DM 모니터링 (serializers/, views/ 패키지 + AdminActionLog 감사로그). 마운트: /api/v1/admin/
+│   └── admin_api/              # 백오피스(어드민) 전용 API — 신원/대시보드(overview + 운영/마케팅: dashboard_ops·dashboard_marketing, 임계값=dashboard_constants.py)/회원/워크스페이스/페이지/자동DM 모니터링/레퍼럴 코드/마케팅 채널링크(marketing/channel-links — UTM 링크 서버 저장 CRUD, MarketingChannelLink·url/channel 서버 계산) (serializers/, views/ 패키지 + AdminActionLog 감사로그). 마운트: /api/v1/admin/
 ├── config/                     # Django 프로젝트 설정
 │   ├── settings/               # base.py / local.py / prod.py
 │   ├── urls.py                 # 루트 URL (admin, api/v1, swagger, redoc)
@@ -253,6 +253,7 @@ make test-cov                             # HTML 커버리지 리포트
   - `billing.handle_pause_expiry` — 매시간 (리텐션 정지 만료 → 자동 유료 재개 + 갱신 과금)
   - `billing.notify_pause_resume_reminder` — 매일 09:30 KST (정지 재개 3일 전 사전 고지 메일)
   - `billing.send_winback_emails` — 매일 10:00 KST (해지 후 복귀 유도, `WINBACK_ENABLED` 게이트·기본 dormant)
+  - `billing.snapshot_daily_metrics` — 매일 00:20 KST (일별 구독 상태/MRR/결제 코호트 스냅샷 적재 — 어드민 유지·해지 분석 P-4, 멱등 upsert, core 0010 시드)
 - 태스크 타임 리밋: 30분 (`CELERY_TASK_TIME_LIMIT`)
 - 큐: billing 등 기능별 `options: {queue: "..."}` 지정
 

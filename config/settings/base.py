@@ -452,6 +452,14 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": crontab(hour=10, minute=0),  # 매일 KST 10:00
         "options": {"queue": "billing"},
     },
+    # ===== 일별 구독 스냅샷 (어드민 마케팅 P-4) =====
+    # 매일 00:20 KST — 구독 상태/MRR/결제 코호트 스냅샷 적재 (멱등 upsert).
+    # 실제 구동은 core.ScheduledJob(0010 시드). CELERY_BEAT_SCHEDULE 은 fallback/문서용.
+    "billing-snapshot-daily-metrics": {
+        "task": "billing.snapshot_daily_metrics",
+        "schedule": crontab(hour=0, minute=20),  # 매일 KST 00:20
+        "options": {"queue": "billing"},
+    },
     # ===== DM 발송 99.9% 보증 시스템 =====
     "dm-reconcile-accepted": {
         "task": "apps.integrations.tasks.reconcile_accepted_dms",
