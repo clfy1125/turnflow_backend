@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 
 from django.conf import settings
 
@@ -54,12 +55,27 @@ ADMIN_API_PREFIX = "/api/v1/admin/"
 # Django admin(세션) — 마케팅 전용 역할은 is_staff=True 라 그냥 두면 로그인이 되므로 함께 차단.
 DJANGO_ADMIN_PREFIX = "/admin/"
 
+CHANNEL_LINKS_PATH = f"{ADMIN_API_PREFIX}marketing/channel-links/"
+
 # {역할: {(METHOD, 절대경로), ...}} — 여기 없으면 거부. 경로는 끝슬래시 포함 정본.
 ROLE_ALLOWED_ENDPOINTS: dict[str, set[tuple[str, str]]] = {
     ROLE_MARKETING_VIEWER: {
         ("GET", f"{ADMIN_API_PREFIX}me/"),
         ("GET", f"{ADMIN_API_PREFIX}dashboard/marketing/"),
+        # RBAC-4-a: UTM 링크 생성은 캠페인 운영의 기본 작업이라 조회+생성까지 허용.
+        # (직전 라운드 Q3 "전체 불허" 결정을 프론트 요청으로 철회)
+        ("GET", CHANNEL_LINKS_PATH),
+        ("POST", CHANNEL_LINKS_PATH),
     },
+}
+
+# {역할: [(METHOD, 컴파일된 경로 정규식), ...]} — pk 가 들어가는 상세 경로용.
+# ⚠ 여기서 통과해도 **객체 소유자 검사는 뷰가** 한다(RBAC-4-b) — 미들웨어는 경로 게이트일 뿐.
+ROLE_ALLOWED_PATTERNS: dict[str, list[tuple[str, re.Pattern]]] = {
+    ROLE_MARKETING_VIEWER: [
+        # 자기가 만든 링크만 삭제 가능 (소유자 판정은 can_delete_channel_link)
+        ("DELETE", re.compile(rf"^{re.escape(CHANNEL_LINKS_PATH)}\d+/$")),
+    ],
 }
 
 # 프리플라이트/메타 — 화이트리스트 경로에 한해 함께 허용 (CORS 차단 방지).
@@ -68,6 +84,9 @@ _SAFE_META_METHODS = ("OPTIONS", "HEAD")
 # 403 응답 사유 코드 (프론트가 401 세션만료와 구분해 다른 화면을 띄운다).
 FORBIDDEN_CODE = "section_forbidden"
 FORBIDDEN_MESSAGE = "이 계정에 허용되지 않은 어드민 영역입니다."
+# RBAC-4-b: 경로는 허용됐지만 **남의 링크**라 거부 — 프론트가 다른 문구를 띄운다.
+NOT_LINK_OWNER_CODE = "not_link_owner"
+NOT_LINK_OWNER_MESSAGE = "다른 관리자가 만든 링크는 삭제할 수 없습니다."
 
 
 def admin_role(user) -> str:
@@ -111,15 +130,39 @@ def is_restricted(role: str) -> bool:
 
 
 def is_endpoint_allowed(role: str, method: str, path: str) -> bool:
-    """deny-by-default — 제한 역할은 화이트리스트에 정확히 일치할 때만 허용."""
+    """deny-by-default — 제한 역할은 화이트리스트(정확 일치 또는 패턴)에 걸릴 때만 허용.
+
+    객체 단위 권한(예: 남의 채널 링크 삭제)은 여기서 판정하지 않는다 — 경로만 통과시키고
+    소유자 검사는 뷰가 한다(:func:`can_delete_channel_link`).
+    """
     if not is_restricted(role):
         return True
-    allowed = ROLE_ALLOWED_ENDPOINTS[role]
     normalized = path if path.endswith("/") else f"{path}/"
     method = (method or "GET").upper()
-    if method in _SAFE_META_METHODS:
-        return ("GET", normalized) in allowed
-    return (method, normalized) in allowed
+    # 프리플라이트/HEAD 는 대응하는 GET 이 허용된 경로에서만 통과
+    probe = "GET" if method in _SAFE_META_METHODS else method
+    if (probe, normalized) in ROLE_ALLOWED_ENDPOINTS[role]:
+        return True
+    return any(
+        probe == m and pattern.match(normalized)
+        for m, pattern in ROLE_ALLOWED_PATTERNS.get(role, ())
+    )
+
+
+def can_delete_channel_link(role: str, user, link) -> bool:
+    """이 요청자가 이 채널 링크를 삭제할 수 있는가 (RBAC-4-b/c 단일 소스).
+
+    응답의 ``can_delete`` 플래그와 DELETE 게이트가 **반드시 같은 함수**를 써야 한다 —
+    갈라지면 화면의 삭제 버튼과 실제 동작이 어긋난다.
+
+    - full: 항상 True (기존 동작 유지)
+    - marketing_viewer: 자기가 만든 링크만. ``created_by`` 가 null 인 레코드(생성자 계정
+      삭제 → SET_NULL)는 소유자를 확인할 수 없으므로 **불가**.
+    """
+    if not is_restricted(role):
+        return True
+    owner_id = getattr(link, "created_by_id", None)
+    return bool(owner_id) and owner_id == getattr(user, "id", None)
 
 
 def user_ref(user_id) -> str:

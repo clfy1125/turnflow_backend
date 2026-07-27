@@ -12,6 +12,16 @@
 ``url``·``channel`` 은 서버 계산(:mod:`apps.admin_api.serializers.marketing`) —
 채널 키는 방문/가입 저장과 동일한 ``derive_channel`` 단일 소스라 마케팅 대시보드의
 채널별 성과 행과 어휘가 일치한다. mutation 성공 시 ``AdminActionLog`` 감사 기록.
+
+역할별 권한 (RBAC-4) — 경로 게이트는 미들웨어, **객체 소유자 검사는 이 뷰**:
+  ================  ======  ==================================================
+  메서드            full    marketing_viewer(외주)
+  ================  ======  ==================================================
+  GET   목록        200     200 (created_by_email 은 빈 문자열로 마스킹)
+  POST  생성        201     201
+  DELETE 상세       204     **자기가 만든 링크만** 204, 남의 것/생성자 null 은 403
+  GET/PATCH 상세    200     403 (미들웨어 화이트리스트 밖 — Q1 기본안 유지)
+  ================  ======  ==================================================
 """
 
 from __future__ import annotations
@@ -26,6 +36,12 @@ from rest_framework.response import Response
 
 from apps.admin_api.audit import log_admin_action
 from apps.admin_api.models import AdminActionLog, MarketingChannelLink
+from apps.admin_api.roles import (
+    NOT_LINK_OWNER_CODE,
+    NOT_LINK_OWNER_MESSAGE,
+    can_delete_channel_link,
+    resolve_admin_role,
+)
 from apps.admin_api.serializers.marketing import (
     AdminChannelLinkRenameSerializer,
     AdminChannelLinkSerializer,
@@ -48,9 +64,12 @@ _EXAMPLE_LINK = {
     ),
     "channel": "tiktok_ads",
     "created_by_email": "marketer@clfy.ai.kr",
+    "can_delete": True,
     "created_at": "2026-07-26T10:00:00+09:00",
     "updated_at": "2026-07-26T10:00:00+09:00",
 }
+# 외주(마케팅 조회 전용) 계정이 같은 링크를 봤을 때 — 내부 직원 이메일 비노출 + 남의 링크
+_EXAMPLE_LINK_VIEWER = {**_EXAMPLE_LINK, "created_by_email": "", "can_delete": False}
 
 
 class AdminChannelLinkListCreateView(generics.ListCreateAPIView):
@@ -98,7 +117,16 @@ class AdminChannelLinkListCreateView(generics.ListCreateAPIView):
 | `base_url` / `utm_*` | 생성 시 입력값 |
 | `url` | 서버가 조합한 최종 URL (기존 쿼리 보존, 동일 utm 키 교체) |
 | `channel` | `derive_channel(utm_source, utm_medium)` 파생 키 — 대시보드 채널 키와 동일 어휘 |
-| `created_by_email` | 생성 관리자 (탈퇴 시 빈 문자열) |
+| `created_by_email` | 생성 관리자 (탈퇴 시 빈 문자열). **marketing_viewer 는 항상 `""`** |
+| `can_delete` | 이 요청자가 삭제 가능한지 (서버 판정, RBAC-4-c) |
+
+## 역할별 차이 (RBAC-4)
+- `full`: 기존 그대로 — `created_by_email` 노출, `can_delete` 항상 `true`.
+- `marketing_viewer`(외주): 목록은 **전 관리자 공용 그대로** 보이지만(채널 리포트 해석에
+  내부 팀 링크도 필요), `created_by_email` 은 **빈 문자열**로 마스킹되고
+  `can_delete` 는 **자기가 만든 링크만** `true` 입니다.
+  `can_delete=false` 인 행은 삭제 버튼을 렌더하지 마세요 — 누르면 403
+  (`error.details.code="not_link_owner"`).
 
 ## 주의사항
 - 응답은 `{count,next,previous,results}` 형태(PAGE_SIZE=20)입니다.
@@ -131,10 +159,20 @@ class AdminChannelLinkListCreateView(generics.ListCreateAPIView):
         },
         examples=[
             OpenApiExample(
-                "응답 예시",
+                "응답 예시 (full 역할)",
                 response_only=True,
                 value={"count": 1, "next": None, "previous": None, "results": [_EXAMPLE_LINK]},
-            )
+            ),
+            OpenApiExample(
+                "응답 예시 (marketing_viewer — 남이 만든 링크)",
+                response_only=True,
+                value={
+                    "count": 1,
+                    "next": None,
+                    "previous": None,
+                    "results": [_EXAMPLE_LINK_VIEWER],
+                },
+            ),
         ],
     )
     def get(self, request, *args, **kwargs):
@@ -340,6 +378,15 @@ class AdminChannelLinkDetailView(generics.RetrieveUpdateDestroyAPIView):
 ## 인증
 - `Authorization: Bearer <staff_access_token>` (is_staff=True)
 
+## 소유자 스코프 (RBAC-4-b)
+- `full` 역할: 모든 링크 삭제 가능 (기존 동작 그대로).
+- `marketing_viewer`(외주): **자기가 만든 링크만** 삭제할 수 있습니다. 남의 링크나
+  생성자가 없는 링크(`created_by=null` — 생성 계정 삭제됨)는 **403**:
+  `{"success": false, "error": {"code": 403, "message": "다른 관리자가 만든 링크는 삭제할 수 없습니다.",
+  "details": {"code": "not_link_owner", "admin_role": "marketing_viewer"}}}`
+  → 목록 응답의 `can_delete` 와 **같은 판정 함수**를 쓰므로, `can_delete=true` 인 행은
+  반드시 삭제에 성공합니다. 차단된 시도는 감사 로그(`admin.access_denied`)에 남습니다.
+
 ## 응답
 - 204 No Content (삭제 완료). 성공 시 `AdminActionLog(channel_link.delete)` 감사 기록.
         """,
@@ -347,7 +394,10 @@ class AdminChannelLinkDetailView(generics.RetrieveUpdateDestroyAPIView):
         responses={
             204: OpenApiResponse(description="삭제 완료"),
             401: OpenApiResponse(description="인증 누락/만료"),
-            403: OpenApiResponse(description="관리자 권한 없음 (is_staff=False)"),
+            403: OpenApiResponse(
+                description="관리자 권한 없음(is_staff=False) 또는 "
+                '남이 만든 링크(details.code="not_link_owner")'
+            ),
             404: OpenApiResponse(description="해당 링크 없음"),
             500: OpenApiResponse(description="서버 오류"),
         },
@@ -357,6 +407,37 @@ class AdminChannelLinkDetailView(generics.RetrieveUpdateDestroyAPIView):
 
     def destroy(self, request, *args, **kwargs):
         link = self.get_object()
+
+        # RBAC-4-b: 제한 역할(외주)은 **자기가 만든 링크만** 삭제. 응답의 can_delete 와
+        # 반드시 같은 함수를 쓴다 — 갈라지면 버튼과 실제 동작이 어긋난다.
+        role = resolve_admin_role(request)
+        if not can_delete_channel_link(role, request.user, link):
+            log_admin_action(
+                request=request,
+                action=AdminActionLog.Action.ADMIN_ACCESS_DENIED,
+                target_type="channel_link",
+                target_id=link.pk,
+                target_repr=f"DELETE {link.name}"[:255],
+                changes={"admin_role": role, "reason": NOT_LINK_OWNER_CODE},
+            )
+            logger.warning(
+                "[admin-marketing] req=%s role=%s 남의 링크 삭제 시도 차단 id=%s",
+                getattr(request, "id", ""),
+                role,
+                link.pk,
+            )
+            return Response(
+                {
+                    "success": False,
+                    "error": {
+                        "code": 403,
+                        "message": NOT_LINK_OWNER_MESSAGE,
+                        "details": {"code": NOT_LINK_OWNER_CODE, "admin_role": role},
+                    },
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         link_pk, link_name = link.pk, link.name
         link.delete()
 

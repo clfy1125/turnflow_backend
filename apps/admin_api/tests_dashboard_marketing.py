@@ -2169,6 +2169,15 @@ class TestFunnelActivationNode:
 # ─── R-5: 긴 구간의 trends 버킷 자동 상향 ───────────────────────────────
 
 
+def _local_midnight_kst(d: date):
+    """로컬(Asia/Seoul) 날짜 → 그 날 자정 aware datetime (뷰의 _local_midnight 와 동일 규칙)."""
+    from datetime import datetime as _dt
+
+    return timezone.make_aware(
+        _dt.combine(d, _dt.min.time()), timezone.get_current_timezone()
+    )
+
+
 def _custom_trends(staff_client, span_days: int):
     """커스텀 범위 응답의 trends — 커스텀 캐시 키는 autouse 정리 대상이 아니라 직접 비운다."""
     end = timezone.localdate()
@@ -2211,9 +2220,13 @@ class TestTrendsGranularity:
         u = _mk_user(joined=now - timedelta(days=150))
         conn = _mk_conn(u)
         c1, c2 = _mk_campaign(conn), _mk_campaign(conn)
-        same_week = now - timedelta(days=100)
+        # 두 시각을 **같은 주 월요일 기준**으로 고정한다 — 단순히 "N일 전, N-1일 전" 으로
+        # 잡으면 실행 요일에 따라 주 경계를 넘어 테스트가 날짜 의존으로 깨진다.
+        monday = timezone.localtime(now - timedelta(days=100)).date()
+        monday -= timedelta(days=monday.weekday())
+        same_week = _local_midnight_kst(monday) + timedelta(hours=10)
         AutoDMCampaign.objects.filter(pk=c1.pk).update(created_at=same_week)
-        AutoDMCampaign.objects.filter(pk=c2.pk).update(created_at=same_week + timedelta(days=1))
+        AutoDMCampaign.objects.filter(pk=c2.pk).update(created_at=same_week + timedelta(days=2))
 
         trends = _custom_trends(staff_client, 210)
         assert trends["granularity"] == "week"

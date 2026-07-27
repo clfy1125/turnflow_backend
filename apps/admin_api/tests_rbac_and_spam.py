@@ -27,8 +27,10 @@ from django.core.cache import cache
 from django.test import Client
 from django.utils import timezone
 
+from apps.admin_api.models import MarketingChannelLink
 from apps.admin_api.pii import mask_email
 from apps.admin_api.roles import ROLE_FULL, ROLE_MARKETING_VIEWER, is_endpoint_allowed, user_ref
+from apps.analytics.channels import derive_channel
 from apps.integrations.models import (
     AutoDMCampaign,
     IGAccountConnection,
@@ -43,6 +45,7 @@ SPAM_URL = "/api/v1/admin/spam/logs/"
 ME_URL = "/api/v1/admin/me/"
 MARKETING_URL = "/api/v1/admin/dashboard/marketing/"
 OPS_URL = "/api/v1/admin/dashboard/operations/"
+LINKS_URL = "/api/v1/admin/marketing/channel-links/"
 
 MKT_CACHE_KEYS = [f"admin:dash:mkt:{p}" for p in ("7d", "30d", "90d", "all")] + [
     "admin:dash:mkt:snapshot"
@@ -68,13 +71,17 @@ def _mk_staff(email=None, *, superuser=False):
 
 @pytest.fixture
 def full_admin(db):
-    return _mk_staff("full-admin@test.com")
+    return _mk_staff()
 
 
 @pytest.fixture
 def viewer(db):
-    """marketing_viewer 그룹이 붙은 스태프 (외주 계정 시뮬레이션)."""
-    user = _mk_staff("agency@partner.co.kr")
+    """marketing_viewer 그룹이 붙은 스태프 (외주 계정 시뮬레이션).
+
+    이메일은 매번 고유 — 이 스위트는 dev DB 위에서 트랜잭션 롤백으로 돌기 때문에
+    고정 이메일을 쓰면 같은 주소의 실계정과 UNIQUE 충돌한다.
+    """
+    user = _mk_staff()
     group, _ = Group.objects.get_or_create(name=ROLE_MARKETING_VIEWER)
     user.groups.add(group)
     return user
@@ -112,7 +119,7 @@ class TestAdminMeRole:
 
     def test_superuser_is_never_locked_out(self, db):
         """안전 밸브 — 슈퍼유저에 역할 그룹이 실수로 붙어도 full."""
-        su = _mk_staff("su@test.com", superuser=True)
+        su = _mk_staff(superuser=True)
         group, _ = Group.objects.get_or_create(name=ROLE_MARKETING_VIEWER)
         su.groups.add(group)
         client = _login(su)
@@ -138,7 +145,6 @@ class TestSectionGuard:
         "/api/v1/admin/spam/logs/",
         "/api/v1/admin/referral-codes/",
         "/api/v1/admin/subscription-plans/",
-        "/api/v1/admin/marketing/channel-links/",
     )
 
     @pytest.mark.parametrize("url", ALLOWED)
@@ -155,13 +161,15 @@ class TestSectionGuard:
         assert body["error"]["details"]["code"] == "section_forbidden"
         assert body["error"]["details"]["allowed_sections"] == ["marketing"]
 
-    def test_channel_link_writes_blocked(self, viewer):
-        """조회 전용 — 채널 링크는 GET 포함 전 메서드 차단 (Q3 기본안)."""
+    def test_channel_link_detail_reads_and_patch_still_blocked(self, viewer):
+        """RBAC-4 로 목록 GET/POST·소유 DELETE 만 열렸다 — 상세 GET/PATCH 는 여전히 403 (Q1)."""
         client = _login(viewer)
-        url = "/api/v1/admin/marketing/channel-links/"
-        assert client.get(url).status_code == 403
-        assert client.post(url, {}, content_type="application/json").status_code == 403
-        assert client.delete(f"{url}1/").status_code == 403
+        detail = f"{LINKS_URL}1/"
+        assert client.get(detail).status_code == 403
+        assert client.patch(detail, {"name": "x"}, content_type="application/json").status_code == (
+            403
+        )
+        assert client.put(detail, {"name": "x"}, content_type="application/json").status_code == 403
 
     def test_django_admin_blocked(self, viewer):
         """is_staff=True 라 그냥 두면 Django admin 에 로그인된다 → 함께 차단."""
@@ -170,7 +178,7 @@ class TestSectionGuard:
     def test_full_admin_unaffected(self, full_admin):
         """회귀 방어 — 기존 스태프는 전 구간 그대로."""
         client = _login(full_admin)
-        for url in (ME_URL, MARKETING_URL, *self.BLOCKED):
+        for url in (ME_URL, MARKETING_URL, LINKS_URL, *self.BLOCKED):
             assert client.get(url).status_code == 200, url
 
     def test_denied_attempt_is_audited(self, viewer):
@@ -189,6 +197,15 @@ class TestSectionGuard:
         assert not is_endpoint_allowed(ROLE_MARKETING_VIEWER, "POST", ME_URL)
         assert not is_endpoint_allowed(ROLE_MARKETING_VIEWER, "GET", "/api/v1/admin/anything-new/")
         assert is_endpoint_allowed(ROLE_FULL, "DELETE", "/api/v1/admin/anything-new/")
+
+    def test_channel_link_pattern_is_narrow(self):
+        """RBAC-4-a 로 연 pk 패턴이 다른 경로까지 열지 않는지."""
+        assert is_endpoint_allowed(ROLE_MARKETING_VIEWER, "DELETE", f"{LINKS_URL}41/")
+        assert not is_endpoint_allowed(ROLE_MARKETING_VIEWER, "DELETE", LINKS_URL)  # 목록 삭제 금지
+        assert not is_endpoint_allowed(ROLE_MARKETING_VIEWER, "PATCH", f"{LINKS_URL}41/")
+        assert not is_endpoint_allowed(ROLE_MARKETING_VIEWER, "GET", f"{LINKS_URL}41/")
+        assert not is_endpoint_allowed(ROLE_MARKETING_VIEWER, "DELETE", f"{LINKS_URL}41/extra/")
+        assert not is_endpoint_allowed(ROLE_MARKETING_VIEWER, "DELETE", "/api/v1/admin/users/41/")
 
 
 # ─── RBAC-3: 서버측 PII 마스킹 ─────────────────────────────────────────
@@ -257,6 +274,120 @@ class TestPiiMasking:
             assert ref == user_ref(uid)
 
 
+# ─── RBAC-4: 채널 링크 부분 허용 (조회·생성 + 자기 링크만 삭제) ──────────
+
+
+def _mk_link(owner, name="링크"):
+    return MarketingChannelLink.objects.create(
+        name=name,
+        base_url="https://turnflow.link/",
+        utm_source="instagram",
+        utm_medium="social",
+        url="https://turnflow.link/?utm_source=instagram&utm_medium=social",
+        channel="instagram_organic",
+        created_by=owner,
+    )
+
+
+_NEW_LINK = {
+    "name": "인스타 리그램 7월",
+    "base_url": "https://turnflow.link/",
+    "utm_source": "instagram",
+    "utm_medium": "social",
+    "utm_campaign": "regram_july",
+}
+
+
+class TestChannelLinkViewerScope:
+    def test_viewer_can_list_and_create(self, viewer):
+        client = _login(viewer)
+        assert client.get(LINKS_URL).status_code == 200
+        res = client.post(LINKS_URL, _NEW_LINK, content_type="application/json")
+        assert res.status_code == 201
+        body = res.json()
+        # url/channel 은 서버 계산 (파생 규칙은 derive_channel 단일 소스)
+        assert body["channel"] == derive_channel("instagram", "social", "")
+        assert "utm_campaign=regram_july" in body["url"]
+        assert body["can_delete"] is True  # 자기가 만든 링크
+        assert body["created_by_email"] == ""  # 내부 직원 이메일 비노출
+
+    def test_created_by_email_hidden_from_viewer_only(self, viewer, full_admin):
+        _mk_link(full_admin, "내부 팀 링크")
+
+        row = next(
+            r
+            for r in _login(viewer).get(LINKS_URL).json()["results"]
+            if r["name"] == "내부 팀 링크"
+        )
+        assert row["created_by_email"] == ""
+        assert row["can_delete"] is False  # 남의 링크
+
+        row_full = next(
+            r
+            for r in _login(full_admin).get(LINKS_URL).json()["results"]
+            if r["name"] == "내부 팀 링크"
+        )
+        assert row_full["created_by_email"] == full_admin.email  # full 은 기존 그대로
+        assert row_full["can_delete"] is True
+
+    def test_viewer_deletes_own_link(self, viewer):
+        link = _mk_link(viewer, "외주가 만든 링크")
+        assert _login(viewer).delete(f"{LINKS_URL}{link.pk}/").status_code == 204
+        assert not MarketingChannelLink.objects.filter(pk=link.pk).exists()
+
+    def test_viewer_cannot_delete_others_link(self, viewer, full_admin):
+        """이번 요청의 핵심 안전장치 — 내부 팀 링크는 외주가 못 지운다."""
+        link = _mk_link(full_admin, "내부 팀 링크")
+        res = _login(viewer).delete(f"{LINKS_URL}{link.pk}/")
+        assert res.status_code == 403
+        body = res.json()
+        assert body["error"]["details"]["code"] == "not_link_owner"
+        assert MarketingChannelLink.objects.filter(pk=link.pk).exists()  # 남아 있어야 함
+
+    def test_viewer_cannot_delete_ownerless_link(self, viewer):
+        """created_by=null(생성 계정 삭제됨)은 소유자 확인 불가 → 삭제 불가."""
+        link = _mk_link(None, "주인 없는 링크")
+        res = _login(viewer).delete(f"{LINKS_URL}{link.pk}/")
+        assert res.status_code == 403
+        assert res.json()["error"]["details"]["code"] == "not_link_owner"
+
+    def test_can_delete_matches_actual_delete(self, viewer, full_admin):
+        """can_delete 와 실제 DELETE 결과가 갈라지지 않는지 (같은 판정 함수)."""
+        _mk_link(viewer, "내 것")
+        _mk_link(full_admin, "남의 것")
+        _mk_link(None, "주인 없음")
+
+        client = _login(viewer)
+        for row in client.get(LINKS_URL).json()["results"]:
+            expected = 204 if row["can_delete"] else 403
+            assert client.delete(f"{LINKS_URL}{row['id']}/").status_code == expected, row["name"]
+
+    def test_full_admin_deletes_any_link(self, full_admin, viewer):
+        """회귀 방어 — full 은 남의 링크도 그대로 삭제 가능."""
+        link = _mk_link(viewer, "외주 링크")
+        assert _login(full_admin).delete(f"{LINKS_URL}{link.pk}/").status_code == 204
+
+    def test_viewer_writes_are_audited(self, viewer, full_admin):
+        from apps.admin_api.models import AdminActionLog
+
+        client = _login(viewer)
+        client.post(LINKS_URL, _NEW_LINK, content_type="application/json")
+        assert AdminActionLog.objects.filter(actor=viewer, action="channel_link.create").exists()
+
+        own = _mk_link(viewer, "지울 것")
+        client.delete(f"{LINKS_URL}{own.pk}/")
+        assert AdminActionLog.objects.filter(
+            actor=viewer, action="channel_link.delete", target_id=str(own.pk)
+        ).exists()
+
+        others = _mk_link(full_admin, "남의 것")
+        client.delete(f"{LINKS_URL}{others.pk}/")
+        denied = AdminActionLog.objects.filter(
+            actor=viewer, action="admin.access_denied", target_type="channel_link"
+        ).latest("created_at")
+        assert denied.changes["reason"] == "not_link_owner"
+
+
 # ─── OPS-3: 스팸 차단 댓글 로그 ────────────────────────────────────────
 
 
@@ -301,7 +432,9 @@ class TestSpamLogList:
     def test_requires_staff(self, db):
         client = Client()
         assert client.get(SPAM_URL).status_code in (401, 403)
-        user = User.objects.create_user(email="plain@test.com", password="Pass1234!")
+        user = User.objects.create_user(
+            email=f"plain-{uuid.uuid4().hex[:8]}@test.com", password="Pass1234!"
+        )
         client.force_login(user)
         assert client.get(SPAM_URL).status_code == 403
 
