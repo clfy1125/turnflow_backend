@@ -14,11 +14,7 @@ from __future__ import annotations
 
 import logging
 
-from drf_spectacular.utils import (
-    OpenApiExample,
-    OpenApiResponse,
-    extend_schema,
-)
+from drf_spectacular.utils import OpenApiExample, OpenApiResponse, extend_schema
 from rest_framework import generics
 from rest_framework.permissions import IsAdminUser
 
@@ -59,6 +55,18 @@ class AdminMeView(generics.RetrieveAPIView):
 - 미인증(토큰 없음/만료) → **401**, 인증됐으나 비스태프(`is_staff=False`) → **403**.
 
 ## 비즈니스 로직
+- **`admin_role` / `allowed_sections`(RBAC-1)**: 어드민 역할 기반 섹션 게이팅.
+  `admin_role` 은 `"full"`(기존 스태프 — 전 권한) 또는 `"marketing_viewer"`
+  (마케팅 대시보드 **조회 전용**, 외주/에이전시용). 역할은 **동명의 Django Group** 으로
+  부여하며(모델 변경 없음), 회수는 다음 요청부터 즉시 반영됩니다(JWT claim 미사용).
+  슈퍼유저는 안전 밸브로 항상 `full`.
+- `allowed_sections` 는 접근 가능한 백오피스 섹션 키 배열(프론트 사이드바와 1:1):
+  full = `["marketing","operations","users","pages","auto_dm","support","system"]`,
+  marketing_viewer = `["marketing"]`. **프론트는 역할 문자열이 아니라 이 배열로 분기**하세요 —
+  역할이 추가돼도 프론트 배포가 필요 없습니다.
+- 이 배열은 UX 용이며 **실제 차단은 서버**가 합니다(RBAC-2) — 허용되지 않은
+  `/api/v1/admin/**` 경로는 화이트리스트 방식으로 **403**
+  (`error.details.code = "section_forbidden"`).
 - `get_object()` 가 `request.user` 를 그대로 반환하므로 **본인 정보만** 조회됩니다.
 - 워크스페이스 교차 글로벌 어드민 API 이지만, 본 엔드포인트는 사용자 본인만 노출하므로
   추가 필터가 필요 없습니다.
@@ -88,6 +96,30 @@ curl -X GET http://localhost:8000/api/v1/admin/me/ \\
                             "is_active": True,
                             "is_staff": True,
                             "is_superuser": True,
+                            "admin_role": "full",
+                            "allowed_sections": [
+                                "marketing",
+                                "operations",
+                                "users",
+                                "pages",
+                                "auto_dm",
+                                "support",
+                                "system",
+                            ],
+                        },
+                        response_only=True,
+                    ),
+                    OpenApiExample(
+                        "마케팅 조회 전용 계정 (외주)",
+                        value={
+                            "id": 42,
+                            "email": "agency@partner.co.kr",
+                            "full_name": "외주 마케팅",
+                            "is_active": True,
+                            "is_staff": True,
+                            "is_superuser": False,
+                            "admin_role": "marketing_viewer",
+                            "allowed_sections": ["marketing"],
                         },
                         response_only=True,
                     ),

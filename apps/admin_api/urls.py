@@ -48,6 +48,7 @@ from apps.admin_api.views.referral import (
     AdminReferralCodeListCreateView,
     AdminReferralCodeRedemptionsView,
 )
+from apps.admin_api.views.spam import AdminSpamLogListView
 from apps.admin_api.views.users import (
     AdminUserDetailView,
     AdminUserListView,
@@ -154,6 +155,8 @@ urlpatterns = [
     ),
     path("auto-dm/backlog/", AdminDMBacklogView.as_view(), name="dm-backlog"),
     path("ig-connections/", AdminIGConnectionListView.as_view(), name="ig-connection-list"),
+    # F-2. 스팸 차단 댓글 로그 (운영 대시보드 '자세히 보기' 드릴다운, OPS-3)
+    path("spam/logs/", AdminSpamLogListView.as_view(), name="spam-log-list"),
     # G. 레퍼럴 코드 관리 (마케팅 프로모션)
     path(
         "referral-codes/",

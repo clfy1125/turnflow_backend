@@ -760,3 +760,128 @@ class TestFailureBreakdown:
             "expired": 0,
             "recovery_rate": None,
         }
+
+
+# ─── OPS-1: 카드 KPI ↔ 오류 상세 합계 정합성 ────────────────────────────
+
+
+class TestFailureBreakdownConsistency:
+    """Σ(group==failed)==failed, Σ(group==hidden_spam)==hidden_spam, Σ전체==둘의 합."""
+
+    @staticmethod
+    def _sum(bd, group):
+        return sum(r["count"] for r in bd if r["group"] == group)
+
+    def test_invariants_hold_across_all_error_kinds(self, staff_client, clean_slate):
+        camp = _mk_campaign(_mk_conn())
+        # group=failed 계열
+        _mk_dms(camp, SentDMLog.Status.FAILED_TOKEN, 7, error_code="190")
+        _mk_dms(camp, SentDMLog.Status.FAILED_WINDOW, 5, error_code="10", error_subcode="2534022")
+        _mk_dms(camp, SentDMLog.Status.FAILED_PARAM, 3, error_code="100")  # 2534025 아님
+        _mk_dms(camp, SentDMLog.Status.FAILED_NO_TRACE, 2)
+        _mk_dms(camp, SentDMLog.Status.FAILED, 1)  # legacy
+        _mk_dms(camp, SentDMLog.Status.FAILED_API, 4)  # legacy — OPS-1-b 로 failed 에 합산
+        # group=hidden_spam 계열
+        _mk_dms(camp, SentDMLog.Status.FAILED_PARAM, 6, error_code="100", error_subcode="2534025")
+        _mk_dms(camp, SentDMLog.Status.RECOVERY_PENDING, 8)
+        _mk_dms(camp, SentDMLog.Status.RECOVERY_EXPIRED, 2)
+        # 오류 아님 — 어느 쪽에도 안 잡혀야 함
+        _mk_dms(camp, SentDMLog.Status.DELIVERED, 9)
+        _mk_dms(camp, SentDMLog.Status.RECOVERY_DELIVERED, 3)
+        _mk_dms(camp, SentDMLog.Status.SKIPPED, 2)
+
+        dq = staff_client.get(URL).data["dm_quality"]
+        bd = dq["failure_breakdown"]
+        assert dq["failed"] == 7 + 5 + 3 + 2 + 1 + 4  # legacy failed_api 포함
+        assert dq["hidden_spam"] == 6 + 8 + 2
+        assert self._sum(bd, "failed") == dq["failed"]
+        assert self._sum(bd, "hidden_spam") == dq["hidden_spam"]
+        assert sum(r["count"] for r in bd) == dq["failed"] + dq["hidden_spam"]
+        assert {r["group"] for r in bd} <= {"failed", "hidden_spam"}
+
+    def test_legacy_failed_api_counted_and_grouped(self, staff_client, clean_slate):
+        """OPS-1-b — 예전엔 어느 KPI 에도 없어 합계가 어긋나던 legacy 상태."""
+        camp = _mk_campaign(_mk_conn())
+        _mk_dms(camp, SentDMLog.Status.FAILED_API, 3)
+
+        dq = staff_client.get(URL).data["dm_quality"]
+        assert dq["failed"] == 3
+        row = next(r for r in dq["failure_breakdown"] if r["status"] == "failed_api")
+        assert row["group"] == "failed"
+        # 시계열도 같은 정의(DM_FAILED_Q)를 써야 한다
+        assert sum(b["failed"] for b in dq["series"]["buckets"]) == 3
+
+    def test_hidden_spam_group_uses_server_judgment(self, staff_client, clean_slate):
+        """2534025 판정은 서버(dm_status_groups) 단일 소스 — 프론트 재하드코딩 방지."""
+        camp = _mk_campaign(_mk_conn())
+        _mk_dms(camp, SentDMLog.Status.FAILED_PARAM, 2, error_code="100", error_subcode="2534025")
+        _mk_dms(camp, SentDMLog.Status.FAILED_PARAM, 5, error_code="100", error_subcode="2534014")
+
+        bd = staff_client.get(URL).data["dm_quality"]["failure_breakdown"]
+        by_sub = {r["subcode"]: r for r in bd}
+        assert by_sub["2534025"]["group"] == "hidden_spam"
+        assert by_sub["2534014"]["group"] == "failed"
+
+
+# ─── OPS-2: 원문 메시지 + 원인·조치 사전 ────────────────────────────────
+
+
+class TestFailureBreakdownDescriptions:
+    def test_sample_error_message_is_latest_original(self, staff_client, clean_slate):
+        camp = _mk_campaign(_mk_conn())
+        old = _mk_dms(
+            camp, SentDMLog.Status.FAILED_PARAM, 1, error_code="100", error_message="옛날"
+        )
+        _backdate_dms(old, timezone.now() - timedelta(hours=2))
+        _mk_dms(
+            camp,
+            SentDMLog.Status.FAILED_PARAM,
+            1,
+            error_code="100",
+            error_message="param recipient must be a valid instagram-scoped id",
+        )
+
+        row = next(
+            r
+            for r in staff_client.get(URL).data["dm_quality"]["failure_breakdown"]
+            if r["status"] == "failed_param"
+        )
+        assert row["sample_error_message"] == (
+            "param recipient must be a valid instagram-scoped id"
+        )  # 그룹 내 최신 1건
+
+    def test_sample_error_message_truncated_to_500(self, staff_client, clean_slate):
+        camp = _mk_campaign(_mk_conn())
+        _mk_dms(camp, SentDMLog.Status.FAILED_NO_TRACE, 1, error_message="가" * 900)
+        row = staff_client.get(URL).data["dm_quality"]["failure_breakdown"][0]
+        assert len(row["sample_error_message"]) == 500
+        assert row["sample_error_message"].endswith("…")
+
+    def test_title_cause_action_from_server_catalog(self, staff_client, clean_slate):
+        camp = _mk_campaign(_mk_conn())
+        _mk_dms(camp, SentDMLog.Status.FAILED_TOKEN, 1, error_code="190")
+        _mk_dms(camp, SentDMLog.Status.FAILED_PARAM, 1, error_code="100", error_subcode="2534025")
+
+        bd = {
+            r["code"] + ":" + r["subcode"]: r
+            for r in staff_client.get(URL).data["dm_quality"]["failure_breakdown"]
+        }
+        token = bd["190:"]
+        assert "토큰" in token["title"] and token["cause"] and token["action"]
+        hidden = bd["100:2534025"]
+        assert "숨겨진" in hidden["title"]
+        assert hidden["group"] == "hidden_spam"
+
+    def test_unknown_code_falls_back_to_status_entry(self, staff_client, clean_slate):
+        """사전에 없는 코드여도 status 기본값으로 최소한의 설명은 나간다."""
+        camp = _mk_campaign(_mk_conn())
+        _mk_dms(camp, SentDMLog.Status.FAILED_NO_TRACE, 1, error_code="99999")
+        row = staff_client.get(URL).data["dm_quality"]["failure_breakdown"][0]
+        assert row["title"]  # 빈 문자열이 아님 (프론트 폴백 없이도 표시 가능)
+        assert row["code"] == "99999"
+
+    def test_no_error_message_gives_blank_sample(self, staff_client, clean_slate):
+        camp = _mk_campaign(_mk_conn())
+        _mk_dms(camp, SentDMLog.Status.RECOVERY_PENDING, 2)  # error_message 없음
+        row = staff_client.get(URL).data["dm_quality"]["failure_breakdown"][0]
+        assert row["sample_error_message"] == ""

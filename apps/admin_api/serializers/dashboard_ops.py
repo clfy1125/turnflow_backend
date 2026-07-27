@@ -170,6 +170,29 @@ class _DmFailureBreakdownSerializer(serializers.Serializer):
         help_text="복구/재검증 경로가 있는 실패인가. failed_no_trace(재검증)·recovery_*·"
         "failed_param@2534025(숨김채널 복구)=true, 나머지 하드 실패=false."
     )
+    group = serializers.CharField(
+        help_text='OPS-1-a — 이 행이 속한 KPI. `"failed"`(확인 필요) | '
+        '`"hidden_spam"`(숨겨진 요청·스팸). 판정의 단일 소스는 서버의 '
+        "dm_status_groups(2534025·recovery_* → hidden_spam) 이므로 프론트가 subcode 를 "
+        "다시 하드코딩하지 말 것. 불변식: Σ(group==failed)==dm_quality.failed, "
+        "Σ(group==hidden_spam)==dm_quality.hidden_spam"
+    )
+    sample_error_message = serializers.CharField(
+        allow_blank=True,
+        help_text="OPS-2-a — 이 그룹의 **가장 최근 1건 Meta 원문 오류 메시지**(최대 500자, "
+        "초과 시 말줄임). '무슨 파라미터인지'를 알 수 있는 유일한 정보. 원문이 없으면 빈 문자열",
+    )
+    title = serializers.CharField(
+        allow_blank=True,
+        help_text="OPS-2-b — 짧은 한국어 라벨 (예: '토큰 만료 · 무효'). 서버 사전에 없으면 "
+        "빈 문자열 → 프론트 로컬 사전으로 폴백",
+    )
+    cause = serializers.CharField(
+        allow_blank=True, help_text="OPS-2-b — 왜 발생하는가 (1~2문장 한국어). 없으면 빈 문자열"
+    )
+    action = serializers.CharField(
+        allow_blank=True, help_text="OPS-2-b — 운영자가 무엇을 해야 하는가. 없으면 빈 문자열"
+    )
 
 
 class _DmRecoverySerializer(serializers.Serializer):

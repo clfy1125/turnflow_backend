@@ -331,7 +331,15 @@ class _UpsellMetricsSerializer(serializers.Serializer):
 class _UpsellCandidateSerializer(serializers.Serializer):
     """업셀 후보 1명 — free/basic 오너, score desc 상위 UPSELL_CANDIDATES_LIMIT(10)."""
 
-    user_id = serializers.IntegerField(help_text="User PK")
+    user_id = serializers.IntegerField(
+        allow_null=True,
+        help_text="User PK. **pii_masked=true(마케팅 조회 전용 역할)면 null** — 대신 ref 사용",
+    )
+    ref = serializers.CharField(
+        required=False,
+        help_text="회원 참조용 비가역 안정 식별자 `u_<hmac6>` (RBAC-3). 역할과 무관하게 항상 "
+        "제공되며, 같은 회원은 어느 리스트에서도 같은 값 → 리스트 key·중복 인지용",
+    )
     email = serializers.CharField(help_text="유저 이메일")
     plan = serializers.CharField(help_text="현재 플랜 name (free/basic)")
     score = serializers.IntegerField(
@@ -483,7 +491,15 @@ class _FeatureStatsSerializer(serializers.Serializer):
 class _DropoffSampleSerializer(serializers.Serializer):
     """이탈 세그먼트 샘플 회원 1명 (CS 드릴다운용)."""
 
-    user_id = serializers.IntegerField(help_text="User PK")
+    user_id = serializers.IntegerField(
+        allow_null=True,
+        help_text="User PK. **pii_masked=true(마케팅 조회 전용 역할)면 null** — 대신 ref 사용",
+    )
+    ref = serializers.CharField(
+        required=False,
+        help_text="회원 참조용 비가역 안정 식별자 `u_<hmac6>` (RBAC-3). 역할과 무관하게 항상 "
+        "제공되며, 같은 회원은 어느 리스트에서도 같은 값 → 리스트 key·중복 인지용",
+    )
     email = serializers.CharField(allow_blank=True, help_text="회원 이메일")
     joined_at = serializers.DateTimeField(help_text="가입 일시 (Asia/Seoul ISO)")
     link = _UpsellLinkSerializer(help_text="회원 상세 드릴다운 (/users/{id})")
@@ -615,7 +631,15 @@ class _MrrMovementSerializer(serializers.Serializer):
 class _RecentCancellationSerializer(serializers.Serializer):
     """최근 취소 예약(해지 위험) 고객 1명 — CS 액션용."""
 
-    user_id = serializers.IntegerField(help_text="User PK")
+    user_id = serializers.IntegerField(
+        allow_null=True,
+        help_text="User PK. **pii_masked=true(마케팅 조회 전용 역할)면 null** — 대신 ref 사용",
+    )
+    ref = serializers.CharField(
+        required=False,
+        help_text="회원 참조용 비가역 안정 식별자 `u_<hmac6>` (RBAC-3). 역할과 무관하게 항상 "
+        "제공되며, 같은 회원은 어느 리스트에서도 같은 값 → 리스트 key·중복 인지용",
+    )
     email = serializers.CharField(allow_blank=True, help_text="회원 이메일")
     plan = serializers.CharField(help_text="현재 플랜 표시명")
     monthly_amount = serializers.IntegerField(help_text="월 청구액 (원, 추가 IG 포함)")
@@ -846,7 +870,15 @@ class _CohortsSerializer(serializers.Serializer):
 class _PaymentFailedRowSerializer(serializers.Serializer):
     """결제 실패 고객 1명 (Q-3 ①) — PAST_DUE 유료 구독 (dunning 중/소진)."""
 
-    user_id = serializers.IntegerField(help_text="User PK")
+    user_id = serializers.IntegerField(
+        allow_null=True,
+        help_text="User PK. **pii_masked=true(마케팅 조회 전용 역할)면 null** — 대신 ref 사용",
+    )
+    ref = serializers.CharField(
+        required=False,
+        help_text="회원 참조용 비가역 안정 식별자 `u_<hmac6>` (RBAC-3). 역할과 무관하게 항상 "
+        "제공되며, 같은 회원은 어느 리스트에서도 같은 값 → 리스트 key·중복 인지용",
+    )
     email = serializers.CharField(allow_blank=True, help_text="회원 이메일")
     plan = serializers.CharField(help_text="플랜 name")
     plan_display = serializers.CharField(help_text="플랜 표시명")
@@ -871,7 +903,15 @@ class _PaymentFailedRowSerializer(serializers.Serializer):
 class _DormantRowSerializer(serializers.Serializer):
     """장기 미사용 고객 1명 (Q-3 ②) — 유료 ACTIVE 인데 30일+ 기능 미사용 (해지 위험)."""
 
-    user_id = serializers.IntegerField(help_text="User PK")
+    user_id = serializers.IntegerField(
+        allow_null=True,
+        help_text="User PK. **pii_masked=true(마케팅 조회 전용 역할)면 null** — 대신 ref 사용",
+    )
+    ref = serializers.CharField(
+        required=False,
+        help_text="회원 참조용 비가역 안정 식별자 `u_<hmac6>` (RBAC-3). 역할과 무관하게 항상 "
+        "제공되며, 같은 회원은 어느 리스트에서도 같은 값 → 리스트 key·중복 인지용",
+    )
     email = serializers.CharField(allow_blank=True, help_text="회원 이메일")
     plan = serializers.CharField(help_text="플랜 name")
     plan_display = serializers.CharField(help_text="플랜 표시명")
@@ -891,7 +931,15 @@ class _DormantRowSerializer(serializers.Serializer):
 class _RecentChurnRowSerializer(serializers.Serializer):
     """최근 해지 고객 1명 (Q-3 ③) — 해지 '완료'(free 다운그레이드) + 실결제 이력 (윈백 대상)."""
 
-    user_id = serializers.IntegerField(help_text="User PK")
+    user_id = serializers.IntegerField(
+        allow_null=True,
+        help_text="User PK. **pii_masked=true(마케팅 조회 전용 역할)면 null** — 대신 ref 사용",
+    )
+    ref = serializers.CharField(
+        required=False,
+        help_text="회원 참조용 비가역 안정 식별자 `u_<hmac6>` (RBAC-3). 역할과 무관하게 항상 "
+        "제공되며, 같은 회원은 어느 리스트에서도 같은 값 → 리스트 key·중복 인지용",
+    )
     email = serializers.CharField(allow_blank=True, help_text="회원 이메일")
     plan = serializers.CharField(
         allow_blank=True,
@@ -998,6 +1046,13 @@ class AdminMarketingDashboardSerializer(serializers.Serializer):
     attribution_available = serializers.BooleanField(
         help_text="어트리뷰션 서브시스템(apps.analytics) 탑재 여부 — false 면 "
         "visits/unique_visitors=0, channels.rows=[] 로 강등"
+    )
+    pii_masked = serializers.BooleanField(
+        required=False,
+        help_text="RBAC-3 — 이 응답의 고객 개인정보가 **서버에서** 마스킹됐는지. "
+        "marketing_viewer 역할이면 true (email 부분 마스킹 · user_id=null · link 비움 · "
+        "referral_codes[].description 제거), full 역할이면 false. "
+        "true 면 프론트는 안내 배너 + 이메일 복사/검색 UI 숨김",
     )
     snapshot = _SnapshotSerializer(
         help_text="R-2 — 상단 고정 패널 (전체 기간 누적, 기간 파라미터와 무관)"

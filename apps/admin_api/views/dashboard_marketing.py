@@ -77,6 +77,8 @@ from apps.admin_api.dashboard_constants import (
     UPSELL_MULTI_IG_MIN,
     UPSELL_SPAM_HEAVY,
 )
+from apps.admin_api.pii import apply_pii_policy
+from apps.admin_api.roles import resolve_admin_role
 from apps.admin_api.serializers.dashboard_marketing import AdminMarketingDashboardSerializer
 from apps.ai_jobs.models import AiJob
 from apps.billing.dm_limits import DEFAULT_DM_MONTHLY_LIMIT
@@ -3532,9 +3534,12 @@ curl -H "Authorization: Bearer <staff_token>" \\
                 prev = (now - timedelta(days=days * 2), now - timedelta(days=days))
                 cache_ttl = MARKETING_DASHBOARD_CACHE_TTL
 
+        # RBAC-3: 캐시에는 **원본**을 저장하고, 꺼낸 뒤 요청자 역할로 마스킹한다
+        # (마스킹본을 캐시에 넣으면 full 역할이 마스킹된 값을 받는다).
+        role = resolve_admin_role(request)
         cached = cache.get(cache_key)
         if cached is not None:
-            return Response(cached)
+            return Response(apply_pii_policy(cached, role=role))
 
         mrr_breakdown = _mrr_breakdown()
         cohort = _cohort_agg(*cur)
@@ -3575,11 +3580,12 @@ curl -H "Authorization: Bearer <staff_token>" \\
         cache.set(cache_key, data, cache_ttl)
 
         logger.info(
-            "[admin-dash-mkt] req=%s period=%s signups=%s mrr=%s attribution=%s",
+            "[admin-dash-mkt] req=%s period=%s role=%s signups=%s mrr=%s attribution=%s",
             request_id,
             period,
+            role,
             cohort["signups"],
             mrr_breakdown["total"],
             ATTRIBUTION_AVAILABLE,
         )
-        return Response(data)
+        return Response(apply_pii_policy(data, role=role))

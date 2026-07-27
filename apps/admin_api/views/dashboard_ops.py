@@ -54,6 +54,8 @@ from apps.admin_api.dashboard_constants import (
     WEBHOOK_BACKLOG_CRITICAL_MINUTES,
     WEBHOOK_BACKLOG_STALE_MINUTES,
 )
+from apps.admin_api.dm_error_catalog import describe as describe_dm_error
+from apps.admin_api.dm_error_catalog import truncate_message
 from apps.admin_api.serializers.dashboard_ops import AdminOpsDashboardSerializer
 
 # delivery_rate 표준 공식 재사용 (dm-verification/stats 와 동일 정의 — 복제 금지)
@@ -65,7 +67,8 @@ from apps.billing.models import (
     TossWebhookLog,
     UserSubscription,
 )
-from apps.integrations.dm_status_groups import HIDDEN_SPAM_SUBCODE
+from apps.integrations.dm_status_groups import HIDDEN_SPAM as GROUP_HIDDEN_SPAM
+from apps.integrations.dm_status_groups import HIDDEN_SPAM_SUBCODE, status_group
 from apps.integrations.models import IGAccountConnection, SentDMLog, SpamCommentLog
 
 logger = logging.getLogger(__name__)
@@ -87,12 +90,15 @@ DM_SUCCEEDED_STATUSES = (
 #   ★ '숨겨진 요청·스팸'(비팔로워 채널 미개설 subcode=2534025 + 복구 대기/만료)은 실패가
 #     아니므로 제외한다 — 아래 DM_HIDDEN_SPAM_Q 로 별도 집계. 정의의 단일 소스는
 #     dm_status_groups(HIDDEN_SPAM_SUBCODE / hidden_spam 그룹)와 동일하게 맞춘다.
+#   ★ OPS-1-b: legacy ``failed_api`` 도 여기 포함한다 — 예전에는 어느 KPI 에도 안 들어가
+#     failure_breakdown 합계와 카드 KPI 가 그만큼 어긋났다(legacy ``failed`` 는 이미 포함).
 DM_FAILED_Q = Q(
     status__in=(
         SentDMLog.Status.FAILED_TOKEN,
         SentDMLog.Status.FAILED_WINDOW,
         SentDMLog.Status.FAILED_NO_TRACE,
         SentDMLog.Status.FAILED,  # legacy
+        SentDMLog.Status.FAILED_API,  # legacy (OPS-1-b)
     )
 ) | (Q(status=SentDMLog.Status.FAILED_PARAM) & ~Q(error_subcode=HIDDEN_SPAM_SUBCODE))
 # hidden_spam(숨겨진 요청·스팸): 비팔로워라 첫 DM 이 상대 숨김함/스팸함으로 간 경우
@@ -149,6 +155,28 @@ def _error_is_recoverable(status: str, error_subcode: str) -> bool:
     return status == SentDMLog.Status.FAILED_PARAM and str(error_subcode or "").strip() == (
         HIDDEN_SPAM_SUBCODE
     )
+
+
+def _error_samples(error_rows) -> dict:
+    """(code, subcode, status) → 그룹 내 **가장 최근** 원문 오류 메시지 1건 (OPS-2-a).
+
+    "무슨 파라미터인지 모르겠다"에 답하는 유일한 정보라 Meta 원문(SentDMLog.error_message)을
+    그대로 준다. Postgres DISTINCT ON 으로 그룹당 1행만 당겨 오고, 길이는 500자로 자른다.
+    운영 대시보드는 내부 전용이며 제한 역할(marketing_viewer)에는 이 엔드포인트 자체가
+    차단되므로(RBAC-2) 원문에 섞인 수신자 ID 가 외부로 나가지 않는다.
+    """
+    rows = (
+        error_rows.exclude(error_message="")
+        .order_by("error_code", "error_subcode", "status", "-created_at")
+        .distinct("error_code", "error_subcode", "status")
+        .values("error_code", "error_subcode", "status", "error_message")
+    )
+    return {
+        ((r["error_code"] or ""), (r["error_subcode"] or ""), r["status"]): truncate_message(
+            r["error_message"]
+        )
+        for r in rows
+    }
 
 
 _STATUS_RANK = {"ok": 0, "warning": 1, "critical": 2}
@@ -268,7 +296,9 @@ def _bucketize(qs_rows, granularity: str, fields: tuple) -> dict:
 def _dm_quality(until, since, granularity: str) -> tuple[dict, dict]:
     """DM 발송 품질 블록 + 원시 집계(dict) 반환 (status_summary 재사용용).
 
-    ``until`` 은 시리즈 제로필 상한(프리셋=now, 커스텀=min(end+1일, now)).
+    ``until`` 은 범위 상한(프리셋=now, 커스텀=min(end+1일, now)) — 집계·시계열·오류 세분화
+    모두 ``[since, until)`` 로 **상한까지 맞춘다**. (예전에는 집계가 since 하한만 걸어
+    과거 커스텀 범위에서 범위 밖 최신 행까지 세어 목록/시계열과 어긋났다.)
     """
     # 오프닝/상호작용 분할: dm_kind 로만 requested 를 쪼갠다 (동일 window). 용어 정의 —
     #   오프닝 = opening + standalone (트리거로 나간 첫 DM, 게이트 미사용 단발 포함),
@@ -276,7 +306,8 @@ def _dm_quality(until, since, granularity: str) -> tuple[dict, dict]:
     #   dm_kind 는 non-null(default=standalone)이라 null/legacy 는 오프닝 범주로 자연 귀속.
     #   불변식: opening_requested + interaction_requested == requested.
     _opening_kinds = [SentDMLog.DMKind.OPENING, SentDMLog.DMKind.STANDALONE]
-    dm_agg = SentDMLog.objects.filter(created_at__gte=since).aggregate(
+    in_range = SentDMLog.objects.filter(created_at__gte=since, created_at__lt=until)
+    dm_agg = in_range.aggregate(
         requested=Count("id"),
         opening_requested=Count("id", filter=Q(dm_kind__in=_opening_kinds)),
         interaction_requested=Count("id", filter=Q(dm_kind=SentDMLog.DMKind.REWARD)),
@@ -295,6 +326,8 @@ def _dm_quality(until, since, granularity: str) -> tuple[dict, dict]:
         ),
         failed_no_trace=Count("id", filter=Q(status=SentDMLog.Status.FAILED_NO_TRACE)),
         legacy_failed=Count("id", filter=Q(status=SentDMLog.Status.FAILED)),
+        # OPS-1-b: legacy failed_api 도 '실패'로 합산 (예전엔 어느 KPI 에도 없었음)
+        legacy_failed_api=Count("id", filter=Q(status=SentDMLog.Status.FAILED_API)),
         recovery_pending=Count("id", filter=Q(status=SentDMLog.Status.RECOVERY_PENDING)),
         recovery_expired=Count("id", filter=Q(status=SentDMLog.Status.RECOVERY_EXPIRED)),
         skipped=Count("id", filter=Q(status=SentDMLog.Status.SKIPPED)),
@@ -312,8 +345,7 @@ def _dm_quality(until, since, granularity: str) -> tuple[dict, dict]:
         "skipped",
     )
     series_rows = (
-        SentDMLog.objects.filter(created_at__gte=since)
-        .annotate(bucket=_series_trunc(granularity))
+        in_range.annotate(bucket=_series_trunc(granularity))
         .values("bucket")
         .annotate(
             requested=Count("id"),
@@ -331,19 +363,31 @@ def _dm_quality(until, since, granularity: str) -> tuple[dict, dict]:
     )
 
     # J-1: 오류 세분화 — 선택 범위의 오류를 (error_code, error_subcode, status) 로 묶는다.
-    #   프론트는 status.ts 의 dmErrorCode/dmLogStatus 라벨로 렌더 → label 은 서버가 안 준다.
     #   code 없는 실패(failed_no_trace 등)는 code="" 로 식별. count desc 정렬.
+    # OPS-1-a: 각 행이 어느 KPI 에 속하는지 **서버가** 판정해 group 으로 내린다 — 판정의
+    #   단일 소스는 dm_status_groups.status_group (프론트가 2534025 를 재하드코딩하지 않도록).
+    # OPS-2: 원문 메시지(sample_error_message) + 원인·조치 사전(title/cause/action) 동봉.
+    error_rows = in_range.filter(status__in=DM_ERROR_STATUSES)
+    samples = _error_samples(error_rows)
     failure_breakdown = [
         {
-            "code": row["error_code"] or "",
-            "subcode": row["error_subcode"] or "",
+            "code": (row["error_code"] or ""),
+            "subcode": (row["error_subcode"] or ""),
             "status": row["status"],
             "count": row["count"],
             "recoverable": _error_is_recoverable(row["status"], row["error_subcode"]),
+            "group": (
+                "hidden_spam"
+                if status_group(row["status"], row["error_subcode"] or "") == GROUP_HIDDEN_SPAM
+                else "failed"
+            ),
+            "sample_error_message": samples.get(
+                ((row["error_code"] or ""), (row["error_subcode"] or ""), row["status"]), ""
+            ),
+            **describe_dm_error(row["error_code"], row["error_subcode"], row["status"]),
         }
         for row in (
-            SentDMLog.objects.filter(created_at__gte=since, status__in=DM_ERROR_STATUSES)
-            .values("error_code", "error_subcode", "status")
+            error_rows.values("error_code", "error_subcode", "status")
             .annotate(count=Count("id"))
             .order_by("-count", "status")
         )
@@ -379,12 +423,15 @@ def _dm_quality(until, since, granularity: str) -> tuple[dict, dict]:
             + dm_agg["recovery_delivered"]
         ),
         "accepted_pending": dm_agg["accepted"],
+        # OPS-1: Σ{failure_breakdown | group=="failed"} 와 정확히 일치해야 한다
+        # (legacy failed_api 포함 — OPS-1-b).
         "failed": (
             dm_agg["failed_token"]
             + dm_agg["failed_window"]
             + (dm_agg["failed_param"] - dm_agg["failed_param_hidden"])
             + dm_agg["failed_no_trace"]
             + dm_agg["legacy_failed"]
+            + dm_agg["legacy_failed_api"]
         ),
         "hidden_spam": (
             dm_agg["failed_param_hidden"] + dm_agg["recovery_pending"] + dm_agg["recovery_expired"]
@@ -434,7 +481,13 @@ def _ig_connections(now) -> dict:
 
 
 def _spam(until, since, granularity: str) -> dict:
-    agg = SpamCommentLog.objects.filter(created_at__gte=since).aggregate(
+    """스팸 방어 블록 — 범위는 ``[since, until)``.
+
+    OPS-3: ``detected`` 는 ``GET /admin/spam/logs/`` 의 기본(status 미지정) ``total`` 과
+    **정확히 같아야 한다** — 두 쪽 모두 SPAM_DETECTED_STATUSES(clean 제외) + 같은 범위.
+    """
+    in_range = SpamCommentLog.objects.filter(created_at__gte=since, created_at__lt=until)
+    agg = in_range.aggregate(
         checked=Count("id"),
         detected=Count("id", filter=Q(status__in=SPAM_DETECTED_STATUSES)),
         hidden=Count("id", filter=Q(status=SpamCommentLog.Status.HIDDEN)),
@@ -443,8 +496,7 @@ def _spam(until, since, granularity: str) -> dict:
 
     fields = ("detected", "hidden")
     series_rows = (
-        SpamCommentLog.objects.filter(created_at__gte=since)
-        .annotate(bucket=_series_trunc(granularity))
+        in_range.annotate(bucket=_series_trunc(granularity))
         .values("bucket")
         .annotate(
             detected=Count("id", filter=Q(status__in=SPAM_DETECTED_STATUSES)),
@@ -459,7 +511,7 @@ def _spam(until, since, granularity: str) -> dict:
     top_categories = [
         {"category": row["spam_category"] or "uncategorized", "count": row["c"]}
         for row in (
-            SpamCommentLog.objects.filter(created_at__gte=since, status__in=SPAM_DETECTED_STATUSES)
+            in_range.filter(status__in=SPAM_DETECTED_STATUSES)
             .values("spam_category")
             .annotate(c=Count("id"))
             .order_by("-c")[:5]
@@ -578,16 +630,17 @@ def _action_required(now, since, dm_agg: dict, ig_block: dict, billing: dict) ->
     ]
 
 
-def _recent_errors(since) -> list[dict]:
+def _recent_errors(since, until) -> list[dict]:
     """DM 실패 / 결제 실패 / 스팸 숨김 실패 3종 병합 (timestamp desc, 최대 20).
 
     DM 실패는 '확인 필요' 실패만(DM_FAILED_Q) 노출한다 — 숨겨진 요청·스팸(2534025·복구
     대기/만료)은 실패가 아니므로 최근 오류 목록에서도 제외.
+    범위는 다른 블록과 동일하게 ``[since, until)``.
     """
     errors: list[dict] = []
 
     dm_failures = (
-        SentDMLog.objects.filter(DM_FAILED_Q, created_at__gte=since)
+        SentDMLog.objects.filter(DM_FAILED_Q, created_at__gte=since, created_at__lt=until)
         .select_related("campaign__ig_connection")
         .order_by("-created_at")[:RECENT_ERRORS_LIMIT]
     )
@@ -606,7 +659,9 @@ def _recent_errors(since) -> list[dict]:
         )
 
     payment_failures = (
-        PaymentHistory.objects.filter(created_at__gte=since, status=PaymentStatus.FAILED)
+        PaymentHistory.objects.filter(
+            created_at__gte=since, created_at__lt=until, status=PaymentStatus.FAILED
+        )
         .select_related("user")
         .order_by("-created_at")[:RECENT_ERRORS_LIMIT]
     )
@@ -624,7 +679,9 @@ def _recent_errors(since) -> list[dict]:
         )
 
     spam_failures = (
-        SpamCommentLog.objects.filter(created_at__gte=since, status=SpamCommentLog.Status.FAILED)
+        SpamCommentLog.objects.filter(
+            created_at__gte=since, created_at__lt=until, status=SpamCommentLog.Status.FAILED
+        )
         .select_related("spam_filter__ig_connection")
         .order_by("-created_at")[:RECENT_ERRORS_LIMIT]
     )
@@ -1243,7 +1300,7 @@ curl -H "Authorization: Bearer <staff_token>" \\
             "dm_quality": dm_block,
             "ig_connections": ig_block,
             "spam": spam_block,
-            "recent_errors": _recent_errors(since),
+            "recent_errors": _recent_errors(since, until),
             "risk_accounts": _risk_accounts(now),
         }
 
