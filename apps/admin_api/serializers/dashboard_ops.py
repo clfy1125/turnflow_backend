@@ -203,7 +203,8 @@ class _DmSkippedBreakdownSerializer(serializers.Serializer):
     reason = serializers.CharField(
         help_text="사유 머신값 — monthly_dm_limit / campaign_not_active / "
         "outside_schedule_window / ig_account_inactive / self_recipient / "
-        "connection_disconnected / other(미분류)"
+        "connection_disconnected / duplicate_campaign_cleanup / ghost_opening_cleanup / "
+        "other(미분류). 뒤 2개는 운영 중 수동 정리로 찍힌 과거 데이터"
     )
     label = serializers.CharField(help_text="한국어 표시명 (서버 제공 — 프론트 하드코딩 불필요)")
     count = serializers.IntegerField(help_text="윈도우 내 해당 사유 건수")
