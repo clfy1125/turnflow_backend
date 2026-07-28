@@ -253,8 +253,12 @@ class TestPiiMasking:
             assert row["link"] == {"page": None, "params": {}}
             assert row["ref"].startswith("u_")
             assert row["email"] == "" or "***@" in row["email"]
-        for code in data["channels"]["referral_codes"]:
-            assert code["description"] == ""
+        # MKT-2/CLN-1: 코드 메모·링크 생성자 이메일은 채널 행에서 가린다
+        # (별도 referral_codes 블록은 제거됨 — rows 의 코드 행이 상위집합)
+        assert "referral_codes" not in data["channels"]
+        for row in data["channels"]["rows"]:
+            assert row.get("description", "") == ""
+            assert row.get("created_by_email", "") == ""
 
     def test_full_admin_sees_raw_and_ref(self, full_admin):
         data = _login(full_admin).get(MARKETING_URL).json()

@@ -689,11 +689,12 @@ class TestChannels:
         assert ig["ig_connected"] == 0
         assert ig["dm_campaign"] == 0
 
-        unknown = _source(res, "unknown")
-        assert unknown["visits"] == 0
-        assert unknown["signups"] == 1
-        assert unknown["signup_rate"] is None  # 방문 0 → null
-        assert unknown["label"] == "어디서 왔는지 모름"
+        # MKT-6 ②: 귀속 기록이 없는 가입자(구 unknown)는 direct 로 접힌다 —
+        # 라벨이 같은 줄이 둘 생기지 않게. 방문 없는 소스라도 가입은 여기 잡힌다.
+        direct = _source(res, "direct")
+        assert direct["signups"] == 1
+        assert direct["label"] == "어디서 왔는지 모름"
+        assert "unknown" not in {s["key"] for s in _channel_row(res, "other")["sources"]}
 
     def test_referral_overlay_wins_over_stored_channel(self, staff_client, clean_slate, pro_plan):
         now = timezone.now()
@@ -741,33 +742,65 @@ class TestChannels:
         assert _channel_row(res, "other")["visits"] == 2
 
     def test_channel_variant_matches_available_channels(self, staff_client, clean_slate):
+        """MKT-4: 드롭다운 value == channels.rows[].key, label 은 서버가 준다."""
         now = timezone.now()
         in_cohort = now - timedelta(days=5)
-        # instagram_organic 채널로 2명 가입 (1명 페이지 공개)
+        link = _mk_link("퍼널용 링크", source="meta", medium="cpc", campaign="fn")
+        utm = {"utm_source": "meta", "utm_medium": "cpc", "utm_campaign": "fn"}
         for i in range(2):
             u = _mk_user(joined=in_cohort)
-            SignupAttribution.objects.create(
-                user=u, channel="instagram_organic", signup_kind="email"
-            )
+            SignupAttribution.objects.create(user=u, channel="meta_ads", signup_kind="email", **utm)
             if i == 0:
                 _mk_page(u, public=True)
-        LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="instagram_organic")
+        LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="meta_ads", **utm)
 
         res = staff_client.get(URL)
         funnel = res.data["funnel"]
-        # available_channels 에 해당 채널 (all 다음), variants 키와 일치
         values = [c["value"] for c in funnel["available_channels"]]
         assert values[0] == "all"
-        assert "instagram_organic" in values
+        assert str(link.pk) in values
         assert set(values) == set(funnel["variants"].keys())
-        # 채널 라벨 = CHANNEL_LABELS
-        ig_opt = next(c for c in funnel["available_channels"] if c["value"] == "instagram_organic")
-        assert ig_opt["label"] == "인스타그램 유입"  # P-5/Q-5: 표시 라벨 (키는 불변)
-        # 채널 variant 노드 카운트
-        assert _node(res, "signup", channel="instagram_organic")["count"] == 2
-        assert _node(res, "page_published", channel="instagram_organic")["count"] == 1
-        # signup.rate = signups/방문자 = 2/1 (분모=해당 채널 고유 방문자)
-        assert _node(res, "signup", channel="instagram_organic")["rate"] == 2.0
+        assert funnel["available_channels_truncated"] is False
+        # 라벨 정본은 서버 — 링크 이름은 프론트 사전에 없다
+        opt = next(c for c in funnel["available_channels"] if c["value"] == str(link.pk))
+        assert opt["label"] == "퍼널용 링크"
+        assert opt["label"] == _channel_row(res, link.pk)["label"]
+        # 드롭다운 키는 전부 표의 행으로 존재해야 조인이 된다 (all 제외)
+        row_keys = {r["key"] for r in res.data["channels"]["rows"]}
+        assert {v for v in values if v != "all"} <= row_keys
+        # variant 노드 카운트
+        assert _node(res, "signup", channel=str(link.pk))["count"] == 2
+        assert _node(res, "page_published", channel=str(link.pk))["count"] == 1
+        # signup.rate = signups/방문자 = 2/1 (분모=해당 행 고유 방문자)
+        assert _node(res, "signup", channel=str(link.pk))["rate"] == 2.0
+
+    def test_zero_signup_link_is_not_in_dropdown(self, staff_client, clean_slate):
+        """표에는 남지만 드롭다운에서는 뺀다 — 고르면 전부 0인 빈 퍼널이라 고를 이유가 없다."""
+        link = _mk_link("아무도 안 온 링크", source="nobody", medium="cpc")
+        res = staff_client.get(URL)
+        values = [c["value"] for c in res.data["funnel"]["available_channels"]]
+        assert str(link.pk) not in values
+        assert _channel_row(res, link.pk)["visits"] == 0  # 표에는 있다
+
+    def test_link_variants_capped(self, staff_client, clean_slate, monkeypatch):
+        monkeypatch.setattr("apps.admin_api.views.dashboard_marketing.FUNNEL_LINK_VARIANTS_MAX", 1)
+        now = timezone.now()
+        for i in range(2):
+            _mk_link(f"캡링크{i}", source=f"cap{i}", medium="cpc")
+            u = _mk_user(joined=now - timedelta(days=2))
+            SignupAttribution.objects.create(
+                user=u,
+                channel="other_campaign",
+                signup_kind="email",
+                utm_source=f"cap{i}",
+                utm_medium="cpc",
+            )
+
+        funnel = staff_client.get(URL).data["funnel"]
+        assert funnel["available_channels_truncated"] is True
+        # all + other(가입 0이라 제외될 수도) + 링크 1개
+        link_values = [c["label"] for c in funnel["available_channels"] if "캡링크" in c["label"]]
+        assert len(link_values) == 1
 
 
 # ─── 업셀 후보 ───────────────────────────────────────────────────────
@@ -868,8 +901,9 @@ class TestTrialsAndFeatureStats:
         assert trials["converted"] == 1
         assert trials["conversion_rate"] == 0.5  # 레퍼럴 코호트(2) 기준
 
-        codes = res.data["channels"]["referral_codes"]
-        row = next(r for r in codes if r["code"] == code.code)
+        # CLN-1: 별도 referral_codes 블록은 제거 — rows 의 코드 행이 상위집합
+        assert "referral_codes" not in res.data["channels"]
+        row = _channel_row(res, code.code)
         assert row["redemptions"] == 2
         assert row["converted"] == 1
         assert row["conversion_rate"] == 0.5
@@ -1404,10 +1438,9 @@ class TestReferralCodeDescription:
             trial_ends_at=now + timedelta(days=29),
         )
 
-        rows = staff_client.get(URL).data["channels"]["referral_codes"]
-        assert len(rows) == 1
-        assert rows[0]["code"] == code.code
-        assert rows[0]["description"] == "A 인플루언서 릴스 협찬"
+        row = _channel_row(staff_client.get(URL), code.code)
+        assert row["kind"] == "referral_code"
+        assert row["description"] == "A 인플루언서 릴스 협찬"
 
 
 # ─── M-6: 퍼널 노드 formula 전부 non-null ───────────────────────────────
@@ -1505,11 +1538,19 @@ class TestFunnelPlanConversion:
     @requires_analytics
     def test_channel_variant_has_breakdown(self, staff_client, clean_slate, pro_plan):
         now = timezone.now()
+        link = _mk_link("전환용 링크", source="meta", medium="cpc", campaign="bd")
         u = _mk_user(joined=now - timedelta(days=3))
-        SignupAttribution.objects.create(user=u, channel="meta_ads", signup_kind="email")
+        SignupAttribution.objects.create(
+            user=u,
+            channel="meta_ads",
+            signup_kind="email",
+            utm_source="meta",
+            utm_medium="cpc",
+            utm_campaign="bd",
+        )
         _mk_trial_sub(u, pro_plan)
 
-        conv = _variant(staff_client.get(URL), "meta_ads")["conversion"]
+        conv = _variant(staff_client.get(URL), str(link.pk))["conversion"]
         assert conv["count"] == 1
         assert conv["breakdown"] == {
             "pro_trial": 1,
@@ -2080,9 +2121,41 @@ class TestReferralCampaignsByCode:
         assert row["kind"] == "referral_code"
         assert row["signups"] == 1  # 원래 utm 이 아니라 코드 행으로 잡힌다
         assert row["redemptions"] == 1 and row["conversion_rate"] == 0.0
-        # 기존 referral_codes 블록과 같은 코드로 조인 가능 (하위호환 유지)
-        codes = {c["code"] for c in res.data["channels"]["referral_codes"]}
-        assert code.code in codes
+
+    def test_code_axis_differs_from_signup_axis(self, staff_client, clean_slate, pro_plan):
+        """MKT-7 — 두 축은 기준 시각이 다르다. 제휴사 보고 숫자는 코드 축(redemptions)이다.
+
+        오래 전에 가입한 회원이 이번 기간에 코드를 쓰면 redemptions 에는 잡히지만
+        signups(가입 코호트)에는 없다 → 화면에 둘 다 필요하다.
+        """
+        now = timezone.now()
+        code = ReferralCode.objects.create(
+            code=f"AX{uuid.uuid4().hex[:6].upper()}", target_plan=pro_plan
+        )
+        # 이번 기간 가입 + 이번 기간 코드 사용 → 양쪽 모두
+        u_new = _mk_user(joined=now - timedelta(days=3))
+        ReferralRedemption.objects.create(
+            user=u_new,
+            referral_code=code,
+            trial_started_at=now - timedelta(days=2),
+            trial_ends_at=now + timedelta(days=28),
+        )
+        # 오래 전 가입 + 이번 기간 코드 사용 → redemptions 만
+        u_old = _mk_user(joined=now - timedelta(days=200))
+        ReferralRedemption.objects.create(
+            user=u_old,
+            referral_code=code,
+            trial_started_at=now - timedelta(days=1),
+            trial_ends_at=now + timedelta(days=29),
+            converted_to_paid=True,
+            converted_at=now,
+        )
+
+        row = _channel_row(staff_client.get(URL, {"period": "30d"}), code.code)
+        assert row["redemptions"] == 2  # 코드 축 — 제휴사에 보고할 숫자
+        assert row["signups"] == 1  # 성과 축 — 이 기간 가입 코호트만
+        assert row["converted"] == 1  # ReferralRedemption.converted_to_paid
+        assert row["paid"] == 0  # 실결제(PAID) 이력 없음 — converted 와 정의가 다르다
 
     def test_unused_code_still_gets_a_row(self, staff_client, clean_slate, pro_plan):
         """사용 0건이어도 행이 나온다 — 프론트는 /admin/referral-codes/ 에 접근 권한이 없다."""
@@ -2092,6 +2165,124 @@ class TestReferralCampaignsByCode:
         row = _channel_row(staff_client.get(URL), code.code)
         assert (row["redemptions"], row["signups"]) == (0, 0)
         assert row["visits"] is None and row["conversion_rate"] is None
+
+
+# ─── MKT-5/6/8: unsaved_utm 조합 · 소스 키 집합 · 겹침 규칙 ──────────────
+
+
+@requires_analytics
+class TestSourceContract:
+    def test_unsaved_utm_combos_listed_with_raw_utm(self, staff_client, clean_slate):
+        """MKT-5 — 합계만 있으면 할 수 있는 일이 없다. 조합이 보여야 저장할 수 있다."""
+        now = timezone.now()
+        for _ in range(2):
+            LandingVisit.objects.create(
+                visitor_id=uuid.uuid4(),
+                channel="paid_other",
+                utm_source="Kakao",  # 원문 보존 확인용 대문자
+                utm_medium="cpc",
+                utm_campaign="0728_open",
+            )
+        LandingVisit.objects.create(
+            visitor_id=uuid.uuid4(), channel="other_campaign", utm_source="naver_blog"
+        )
+        u = _mk_user(joined=now - timedelta(days=2))
+        SignupAttribution.objects.create(
+            user=u,
+            channel="paid_other",
+            signup_kind="email",
+            utm_source="kakao",  # 소문자 — 정규화되어 같은 조합으로 묶여야 한다
+            utm_medium="cpc",
+            utm_campaign="0728_open",
+        )
+
+        src = _source(staff_client.get(URL), "unsaved_utm")
+        assert src["combos_truncated"] is False
+        combos = {c["utm"]["source"]: c for c in src["combos"]}
+        kakao = combos["Kakao"]  # 원문 그대로 (저장 화면에 실어 보내야 하므로)
+        assert kakao["visits"] == 2
+        assert kakao["signups"] == 1  # 대소문자 달라도 같은 조합으로 합쳐진다
+        assert kakao["utm"]["campaign"] == "0728_open"
+        assert kakao["first_seen"] is not None and kakao["last_seen"] is not None
+        assert combos["naver_blog"]["visits"] == 1
+
+    def test_saving_an_unsaved_combo_is_not_rejected(self, staff_client, clean_slate):
+        """MKT-5 질문 — 유입만 있는 조합은 아직 링크가 아니므로 중복이 아니다."""
+        LandingVisit.objects.create(
+            visitor_id=uuid.uuid4(), channel="paid_other", utm_source="kakao", utm_medium="cpc"
+        )
+        combo = _source(staff_client.get(URL), "unsaved_utm")["combos"][0]["utm"]
+        res = staff_client.post(
+            "/api/v1/admin/marketing/channel-links/",
+            {
+                "name": "카카오 오픈",
+                "base_url": "https://turnflow.link/",
+                "utm_source": combo["source"],
+                "utm_medium": combo["medium"],
+                "utm_campaign": combo["campaign"],
+                "utm_content": combo["content"],
+            },
+            format="json",
+        )
+        assert res.status_code == 201
+
+    def test_combos_only_on_unsaved_utm_source(self, staff_client, clean_slate):
+        LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="direct")
+        assert "combos" not in _source(staff_client.get(URL), "direct")
+
+    def test_sources_sorted_by_visits_then_signups(self, staff_client, clean_slate):
+        """MKT-6 ③ — visits desc → signups desc → key asc. 방문 0 줄도 가입 순으로 뜬다."""
+        now = timezone.now()
+        for _ in range(3):
+            LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="search_organic")
+        LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="instagram_organic")
+        u = _mk_user(joined=now - timedelta(days=2))  # 귀속 없음 → direct(방문 0)
+        assert u
+
+        sources = _channel_row(staff_client.get(URL), "other")["sources"]
+        keys = [s["key"] for s in sources]
+        assert keys[0] == "search_organic"  # 방문 3
+        assert keys.index("instagram_organic") < keys.index("direct")  # 방문 1 > 0
+
+    def test_small_sources_folded_into_other_referral(self, staff_client, clean_slate, monkeypatch):
+        """MKT-6 ① — 줄이 많아지면 서버가 접는다(프론트가 접으면 정의가 화면마다 달라진다)."""
+        monkeypatch.setattr("apps.admin_api.views.dashboard_marketing.SOURCE_ROWS_MAX", 2)
+        for channel in ("search_organic", "instagram_organic", "youtube_organic", "blog_organic"):
+            LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel=channel)
+
+        sources = _channel_row(staff_client.get(URL), "other")["sources"]
+        keys = {s["key"] for s in sources}
+        assert "other_referral" in keys
+        assert len(sources) <= 3  # 상한 2 + 접힘 버킷
+        folded = next(s for s in sources if s["key"] == "other_referral")
+        assert folded["visits"] >= 1
+
+    def test_only_visits_overlap_across_sources(self, staff_client, clean_slate):
+        """MKT-8 — 겹치는 지표는 visits 뿐. 사람 계열은 Σsources == other 등식이 성립한다."""
+        now = timezone.now()
+        vid = uuid.uuid4()
+        # 같은 방문자가 인스타로도 오고 검색으로도 옴 → visits 는 양쪽에 1씩
+        LandingVisit.objects.create(visitor_id=vid, channel="instagram_organic")
+        LandingVisit.objects.create(visitor_id=vid, channel="search_organic")
+        for channel in ("instagram_organic", "search_organic"):
+            u = _mk_user(joined=now - timedelta(days=2))
+            SignupAttribution.objects.create(user=u, channel=channel, signup_kind="email")
+            _mk_page(u, public=True)
+            _mk_campaign(_mk_conn(u))
+
+        other = _channel_row(staff_client.get(URL), "other")
+        sources = other["sources"]
+        assert sum(s["visits"] for s in sources) == 2 > other["visits"] == 1  # 겹침
+        for metric in (
+            "signups",
+            "ig_connected",
+            "dm_campaign",
+            "page_created",
+            "page_published",
+            "paid",
+            "free_trial",
+        ):
+            assert sum(s[metric] for s in sources) == other[metric], metric
 
 
 # ─── MKT-3: 기간 매출 (MRR 대체) ───────────────────────────────────────
@@ -2397,7 +2588,8 @@ class TestFunnelActivationNode:
         _mk_page(u, public=True)
         _mk_campaign(_mk_conn(u))
 
-        v = _variant(staff_client.get(URL), "meta_ads")
+        # UTM 없이 저장된 가입은 other 행 (파생 채널은 other.sources 로 접힌다 — MKT-2/4)
+        v = _variant(staff_client.get(URL), "other")
         assert v["activation"]["count"] == 1
         assert v["activation_overlap"]["both"] == 1
 
@@ -2539,26 +2731,38 @@ class TestFunnelNodeDeltas:
     @requires_analytics
     def test_channel_variant_carries_delta(self, staff_client, clean_slate):
         now = timezone.now()
+        link = _mk_link("델타 링크", source="meta", medium="cpc", campaign="dl")
+        utm = {"utm_source": "meta", "utm_medium": "cpc", "utm_campaign": "dl"}
         u_prev = _mk_user(joined=now - timedelta(days=40))
-        SignupAttribution.objects.create(user=u_prev, channel="meta_ads", signup_kind="email")
+        SignupAttribution.objects.create(
+            user=u_prev, channel="meta_ads", signup_kind="email", **utm
+        )
         _mk_page(u_prev, public=True)
         for _ in range(3):
             u = _mk_user(joined=now - timedelta(days=3))
-            SignupAttribution.objects.create(user=u, channel="meta_ads", signup_kind="email")
+            SignupAttribution.objects.create(user=u, channel="meta_ads", signup_kind="email", **utm)
             _mk_page(u, public=True)
 
-        v = _variant(staff_client.get(URL, {"period": "30d"}), "meta_ads")
+        v = _variant(staff_client.get(URL, {"period": "30d"}), str(link.pk))
         assert v["activation"]["count"] == 3
         assert v["activation"]["previous"] == 1
         assert v["activation"]["delta_pct"] == 200.0
 
     @requires_analytics
     def test_channel_absent_in_previous_period_gets_zero_not_null(self, staff_client, clean_slate):
-        """직전 기간에 유입이 없던 신규 채널 — '없음(null)'이 아니라 '0명'이 사실."""
+        """직전 기간에 유입이 없던 신규 링크 — '없음(null)'이 아니라 '0명'이 사실."""
+        link = _mk_link("신규 링크", source="kakao", medium="cpc", campaign="new")
         u = _mk_user(joined=timezone.now() - timedelta(days=3))
-        SignupAttribution.objects.create(user=u, channel="kakao_ads", signup_kind="email")
+        SignupAttribution.objects.create(
+            user=u,
+            channel="kakao_ads",
+            signup_kind="email",
+            utm_source="kakao",
+            utm_medium="cpc",
+            utm_campaign="new",
+        )
         _mk_page(u, public=True)
 
-        v = _variant(staff_client.get(URL, {"period": "30d"}), "kakao_ads")
+        v = _variant(staff_client.get(URL, {"period": "30d"}), str(link.pk))
         assert v["activation"]["previous"] == 0
         assert v["activation"]["delta_pct"] is None  # 0 분모 → null

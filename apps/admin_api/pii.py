@@ -91,13 +91,10 @@ def apply_pii_policy(data: dict, *, role: str) -> dict:
             row["link"] = {"page": None, "params": {}}
 
     if mask:
-        # 제휴 내부 메모는 PII 는 아니지만 제휴 계약 정보 — 외주에는 코드만 노출 (Q2).
-        for code_row in _rows_at(out, ("channels", "referral_codes")):
-            if isinstance(code_row, dict):
-                code_row["description"] = ""
         # MKT-2: 채널 행 3종이 한 배열에 섞여 있다 — 링크 행의 생성자 이메일(내부 직원)과
-        # 제휴코드 행의 내부 메모를 같은 규칙으로 가린다. **여기서 가려야** 한다:
-        # 뷰에서 역할별로 만들면 full 이 채운 캐시를 제한 역할이 그대로 받는다.
+        # 제휴코드 행의 내부 메모(제휴 계약 정보, Q2)를 같은 규칙으로 가린다.
+        # **여기서 가려야** 한다: 뷰에서 역할별로 만들면 full 이 채운 캐시를 제한 역할이
+        # 그대로 받는다. (CLN-1 로 channels.referral_codes 블록은 사라졌다)
         for row in _rows_at(out, ("channels", "rows")):
             if not isinstance(row, dict):
                 continue

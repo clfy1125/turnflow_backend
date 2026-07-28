@@ -68,6 +68,7 @@ from apps.admin_api.dashboard_constants import (
     COHORT_USAGE_WEEKS,
     CUSTOMER_ACTIONS_LIMIT,
     DORMANT_IDLE_DAYS,
+    FUNNEL_LINK_VARIANTS_MAX,
     MARKETING_DASHBOARD_ALL_CACHE_TTL,
     MARKETING_DASHBOARD_CACHE_TTL,
     MARKETING_DASHBOARD_SNAPSHOT_CACHE_TTL,
@@ -75,9 +76,11 @@ from apps.admin_api.dashboard_constants import (
     POST_PAYMENT_WINDOW_DAYS,
     RECENT_CANCELLATIONS_LIMIT,
     RECENT_CHURN_WINDOW_DAYS,
+    SOURCE_ROWS_MAX,
     TOP_PAGES_LIMIT,
     TRENDS_DAY_MAX_SPAN_DAYS,
     TRENDS_WEEK_MAX_SPAN_DAYS,
+    UNSAVED_UTM_COMBOS_LIMIT,
     UPSELL_CANDIDATES_LIMIT,
     UPSELL_CLICKS_HIGH,
     UPSELL_CLICKS_MID,
@@ -233,20 +236,32 @@ OTHER_ROW_LABEL = "기타 (기본 링크로 들어옴)"
 # other 행 안의 소스 키 (리퍼러 파생 채널 + 아래 2개 특수 소스)
 SOURCE_BIOLINK = "biolink"
 SOURCE_UNSAVED_UTM = "unsaved_utm"
+SOURCE_DIRECT = "direct"
+# 초과분을 접는 버킷 (SOURCE_ROWS_MAX). 파생 채널 키를 그대로 재사용한다.
+SOURCE_OTHER_REFERRAL = "other_referral"
+# 접기·판별상 특별 취급하는 소스 — 신호가 크거나(direct) 조치 가능해서(biolink/unsaved_utm)
+# 순위와 무관하게 항상 자기 줄을 유지한다.
+_SOURCE_NEVER_FOLD = (SOURCE_DIRECT, SOURCE_BIOLINK, SOURCE_UNSAVED_UTM)
 
-# 소스 라벨 — CHANNEL_LABELS 보다 우선. direct/unknown 은 채널 표기("다이렉트"/"미분류")가
-# 아니라 사용자 언어로 바꾼다("어디서 왔는지 모름") — 이 행은 추정조차 못 한 유입이다.
+# 소스 라벨 — CHANNEL_LABELS 보다 우선. direct 는 채널 표기("다이렉트")가 아니라 사용자
+# 언어로 바꾼다 — 실제 의미는 "주소를 직접 입력했다"가 아니라 **리퍼러가 아예 없었다**
+# (앱 내 이동·메신저 경유 포함) + 가입 귀속 기록이 없는 경우까지다 (MKT-6 ②).
 _SOURCE_LABEL_OVERRIDES = {
     SOURCE_BIOLINK: "고객 바이오링크 페이지",
     SOURCE_UNSAVED_UTM: "저장 안 된 링크(UTM)",
-    "direct": "어디서 왔는지 모름",
-    "unknown": "어디서 왔는지 모름",
+    SOURCE_DIRECT: "어디서 왔는지 모름",
 }
 
 # 고객 바이오링크 페이지(turnflow.link/@slug)의 'Powered by' 배지가 붙이는 UTM.
-# ⚠️ 배지는 프론트 렌더러가 만들므로 이 저장소에 문자열이 없다 — prod 실측(2026-07-28)으로
-#    확인한 값이다: utm_source=turnflow_badge & utm_medium=biolink & utm_content=<slug>.
-#    배지 UTM 규칙이 바뀌면 여기도 함께 고칠 것.
+#
+# ⚠️⚠️ **이 문자열의 정본은 고객용 프론트(TurnflowLink) 렌더러다** — 백엔드에도, 어드민
+#      프론트에도 없다. 아래 값은 prod 실측(2026-07-28)으로 역추적한 것이고, **판별 주체는
+#      여기(백엔드)** 다: utm_source=turnflow_badge & utm_medium=biolink & utm_content=<slug>.
+#      렌더러가 UTM 규칙을 바꾸면 **에러 없이** 바이오링크 유입이 '저장 안 된 링크(UTM)'
+#      줄로 흘러든다(조용한 오분류). 세 저장소 어디에도 정본이 없는 결합이라, 어드민 프론트
+#      `src/lib/channels.ts` 에도 같은 경고가 있다 — 한쪽만 고치지 말 것.
+#      같은 이유로 이 조합을 쓰는 채널 링크는 저장해도 영구히 0 이다(바이오링크 판정이
+#      링크 매칭보다 우선하므로) — 어드민 프론트의 CHANNEL_PRESETS 추가 금지와 짝이다.
 _BIOLINK_UTM_SOURCES = {"turnflow_badge"}
 _BIOLINK_UTM_MEDIUMS = {"biolink"}
 # 배지가 UTM 을 잃어도 잡히도록 하는 2차 신호 — 자기 도메인 + /@slug 경로 리퍼러.
@@ -294,6 +309,9 @@ def _resolve_row_key(source, medium, campaign, content, referrer, channel, link_
       3. UTM 있음 + 미매칭        → other / unsaved_utm  ("링크를 저장 안 하고 쓰는 중" 신호)
       4. UTM 없음                → other / 저장된 파생 채널(리퍼러 추정)
     제휴코드 오버레이는 **가입자에게만** 적용되며 호출부에서 먼저 처리한다.
+
+    ⚠️ ``unknown``(가입 귀속 기록 자체가 없음)은 ``direct`` 로 접는다 — 둘 다 "어디서
+    왔는지 모름"이라 라벨이 같은 줄이 둘 생기는 화면 결함이 된다 (MKT-6 ②).
     """
     if _is_biolink(source, medium, referrer):
         return OTHER_ROW_KEY, SOURCE_BIOLINK
@@ -303,7 +321,9 @@ def _resolve_row_key(source, medium, campaign, content, referrer, channel, link_
         if link_pk is not None:
             return str(link_pk), None
         return OTHER_ROW_KEY, SOURCE_UNSAVED_UTM
-    return OTHER_ROW_KEY, (channel or "unknown")
+    if not channel or channel == "unknown":
+        return OTHER_ROW_KEY, SOURCE_DIRECT
+    return OTHER_ROW_KEY, channel
 
 
 def _link_index(links) -> dict:
@@ -1097,16 +1117,23 @@ def _funnel(
     prev_all_counts: dict | None = None,
     prev_visitors_all: int | None = None,
     prev_channel_map: dict | None = None,
+    codes: frozenset = frozenset(),
 ) -> dict:
     """가입 코호트 분기 퍼널 — variants.all + 채널별 variant (드롭다운용, 미리 계산).
 
     - all_counts: _cohort_agg(*cur) (signups/ig_connected/page_published/dm_campaign/paid 사용)
     - visitors_all: 전체 현재 기간 고유 방문자 수 (distinct visitor_id)
-    - channel_variants: [(channel_key, counts_dict, visitors), ...] signups desc 정렬됨.
+    - channel_variants: [(row_key, label, counts, visitors), ...] signups desc 정렬됨.
       비어 있으면(어트리뷰션 미탑재) available_channels 는 all 만.
-    - prev_*: MKT-1(R-8) 직전 기간 값. prev_channel_map = {channel: (counts, visitors)}.
-      직전 기간에 없던 채널은 previous=0(그 채널로 0명이었던 게 맞음), period=all 이면
+    - prev_*: MKT-1(R-8) 직전 기간 값. prev_channel_map = {row_key: (counts, visitors)}.
+      직전 기간에 없던 행은 previous=0(그 경로로 0명이었던 게 맞음), period=all 이면
       셋 다 None → 전 노드 previous/delta_pct = null.
+
+    **MKT-4**: value 는 ``channels.rows[].key``, ``label`` 은 서버가 함께 준다(링크 이름·
+    제휴코드는 프론트 사전에 없다). variant 1개가 노드·분기·breakdown 을 통째로 들고 있어
+    **저장 링크는 가입 상위 FUNNEL_LINK_VARIANTS_MAX 개만** 싣는다 — 잘리면
+    ``available_channels_truncated=true``. other/제휴코드는 캡 대상이 아니다.
+    배열 순서는 계약이 아니다(프론트가 rows 에 조인해 재정렬한다).
     """
     signups = all_counts["signups"]
     if signups > COHORT_SNAPSHOT_WARN_ROWS:
@@ -1121,18 +1148,27 @@ def _funnel(
     variants = {
         "all": _build_funnel_variant(all_counts, visitors_all, prev_all_counts, prev_visitors_all)
     }
-    for channel, counts, visitors in channel_variants:
-        available_channels.append({"value": channel, "label": CHANNEL_LABELS.get(channel, channel)})
+    # 저장 링크만 캡 대상 (other/제휴코드는 개수가 유계이고 운영상 항상 필요)
+    link_seen = 0
+    truncated = False
+    for key, label, counts, visitors in channel_variants:
+        if key != OTHER_ROW_KEY and key not in codes:
+            link_seen += 1
+            if link_seen > FUNNEL_LINK_VARIANTS_MAX:
+                truncated = True
+                continue
+        available_channels.append({"value": key, "label": label})
         prev_counts, prev_visitors = (None, None)
         if has_prev:
             prev_counts, prev_visitors = (prev_channel_map or {}).get(
-                channel, (_EMPTY_FUNNEL_COUNTS, 0)
+                key, (_EMPTY_FUNNEL_COUNTS, 0)
             )
-        variants[channel] = _build_funnel_variant(counts, visitors, prev_counts, prev_visitors)
+        variants[key] = _build_funnel_variant(counts, visitors, prev_counts, prev_visitors)
 
     return {
         "semantics": "signup_cohort",
         "available_channels": available_channels,
+        "available_channels_truncated": truncated,
         "variants": variants,
     }
 
@@ -1148,7 +1184,8 @@ def _cohort_flags(start, end) -> tuple:
       (_cohort_qs values_list) pgc=페이지 생성(공개 무관), pg=페이지 공개, pd=실결제,
       cur_* = 현재 구독의 플랜명/상태/빌링키 발급 시각 (체험 판정은 _trial_flags).
     - attr_map: {user_id: channel} (SignupAttribution)
-    - attr_utm: {user_id: (utm_campaign, utm_content)} — N-2 캠페인 분해용
+    - attr_utm: {user_id: (utm_source, utm_medium, utm_campaign, utm_content)} —
+      MKT-5 저장 안 된 UTM 조합 분해용 (원문, 정규화 전)
     - referral_users: {user_id: 제휴코드 문자열} (ReferralRedemption 보유 — 조회 시점
       오버레이. `uid in referral_users` 멤버십 판정 + Q-4 referral 채널 코드 단위 분해 겸용)
     - visits_by_channel: {channel: 고유 방문자 수(distinct visitor_id)} — 세션 수 아님
@@ -1180,7 +1217,7 @@ def _cohort_flags(start, end) -> tuple:
         "referrer",
     ):
         attr_map[uid] = channel
-        attr_utm[uid] = (camp or "", content or "")
+        attr_utm[uid] = (src or "", med or "", camp or "", content or "")
         attr_row[uid] = _resolve_row_key(src, med, camp, content, referrer, channel, link_index)
     referral_users = dict(
         ReferralRedemption.objects.filter(user_id__in=user_ids).values_list(
@@ -1204,21 +1241,40 @@ def _channel_of(uid, attr_map: dict, referral_users) -> str:
     return "referral" if uid in referral_users else attr_map.get(uid, "unknown")
 
 
-def _funnel_channel_variants(flags: tuple) -> list[tuple]:
-    """채널별 퍼널 counts 집계 → [(channel, counts, visitors), ...] (signups desc).
+def _row_labels(links, codes) -> dict:
+    """row_key → 화면 표시명. 퍼널 드롭다운과 채널 표가 **같은 이름**을 쓰게 하는 단일 소스.
+
+    키가 링크 pk·제휴코드가 되면서 이름은 사람이 붙인 값이 됐다 — 프론트 사전에는 없고
+    서버만이 정본이라 ``available_channels[].label`` 을 반드시 함께 내려야 한다 (MKT-4).
+    """
+    labels = {OTHER_ROW_KEY: OTHER_ROW_LABEL}
+    labels.update({str(link.pk): link.name for link in links})
+    labels.update({code: code for code in codes})
+    return labels
+
+
+def _funnel_channel_variants(flags: tuple, visit_rows: list[tuple]) -> list[tuple]:
+    """행별 퍼널 counts 집계 → [(row_key, label, counts, visitors), ...] (signups desc).
 
     counts keys 는 _cohort_agg 와 동일 축 (activated/both/플랜별 분해 포함) —
     _build_funnel_variant 가 all variant 와 같은 구조를 만들 수 있어야 한다 (R-3/R-4).
-    signups>0 인 채널만 (드롭다운/available_channels 대상). 어트리뷰션 미탑재 시 빈 리스트.
 
-    ⚠️ 퍼널 드롭다운은 **파생 채널 키**를 유지한다 (MKT-2 로 바뀐 것은 채널별 성과 표와
-    trends.by_channel 뿐) — 여기 키를 바꾸면 available_channels 계약이 함께 깨진다.
+    **MKT-4: 키는 channels.rows[].key 와 같다** (other / 링크 pk / 제휴코드).
+    예전엔 파생 채널 키였는데, 같은 화면 위아래에 두 분류가 공존해 드롭다운에서 고른
+    이름이 아래 표에 없는 상태였다. 채널 표와 같은 ``_resolve_row_key`` 를 쓴다.
+    가입 0인 행은 제외 — 고르면 전부 0인 빈 퍼널이라 고를 이유가 없다.
     """
-    flag_rows, attr_map, _attr_utm, referral_users, visits_by_channel, _attr_row = flags
+    flag_rows, _attr_map, _attr_utm, referral_users, _visits_by_channel, attr_row = flags
+    links = list(MarketingChannelLink.objects.all())
+    link_index = _link_index(links)
+    visitors_by_row, _by_source = _visitors_by_bucket(visit_rows, link_index)
+    labels = _row_labels(links, ReferralCode.objects.values_list("code", flat=True))
+
     per_channel: dict = defaultdict(lambda: dict(_EMPTY_FUNNEL_COUNTS))
     for uid, ig, pgc, pg, cp, pd, cur_plan, cur_status, cur_card in flag_rows:
         tr, tr_no_card = _trial_flags(cur_plan, cur_status, cur_card)
-        channel = _channel_of(uid, attr_map, referral_users)
+        code = referral_users.get(uid)
+        channel = code or attr_row.get(uid, (OTHER_ROW_KEY, None))[0]
         slot = per_channel[channel]
         slot["signups"] += 1
         if ig:
@@ -1249,25 +1305,29 @@ def _funnel_channel_variants(flags: tuple) -> list[tuple]:
             slot["trial_no_card"] += 1
 
     variants = [
-        (channel, counts, visits_by_channel.get(channel, 0))
-        for channel, counts in per_channel.items()
+        (key, labels.get(key, key), counts, len(visitors_by_row.get(key, ())))
+        for key, counts in per_channel.items()
         if counts["signups"] > 0
     ]
-    variants.sort(key=lambda t: (-t[1]["signups"], t[0]))
+    variants.sort(key=lambda t: (-t[2]["signups"], t[0]))
     return variants
+
+
+# 성과 축의 '가입자 수 계열' 필드 (signups 제외) — 전부 **사람 1명 = 한 곳** 배타 집계라
+# Σsources == other 가 성립한다. 겹치는 것은 visits 뿐 (MKT-8).
+_PERF_COUNT_FIELDS = (
+    "ig_connected",
+    "dm_campaign",
+    "page_created",
+    "page_published",
+    "paid",
+    "free_trial",
+)
 
 
 def _empty_perf_slot() -> dict:
     """채널 행/소스의 성과 카운터 0 초기값 (행·소스·링크 전부 같은 축)."""
-    return {
-        "signups": 0,
-        "ig_connected": 0,
-        "dm_campaign": 0,
-        "page_created": 0,
-        "page_published": 0,
-        "paid": 0,
-        "free_trial": 0,
-    }
+    return {"signups": 0, **{f: 0 for f in _PERF_COUNT_FIELDS}}
 
 
 def _accumulate_perf(slot: dict, ig, pgc, pg, cp, pd, trialing) -> None:
@@ -1308,6 +1368,121 @@ def _perf_payload(slot: dict, visits: int | None) -> dict:
     }
 
 
+def _visitors_by_bucket(visit_rows: list[tuple], link_index: dict) -> tuple[dict, dict]:
+    """방문 원본 행 → ({row_key: 방문자 집합}, {source_key: 방문자 집합}).
+
+    합산이 아니라 **집합**이라 각 버킷의 고유 방문자 수가 정확하다. 대신 한 방문자가
+    두 소스로 들어오면 양쪽에 들어가므로 Σsources.visits ≥ other.visits 다 (MKT-8).
+    채널 표(_channel_rows)와 퍼널 variant(_funnel_channel_variants)가 같은 결과를 공유한다.
+    """
+    by_row: dict = defaultdict(set)
+    by_source: dict = defaultdict(set)
+    for vid, src, med, camp, content, referrer, channel, _created in visit_rows:
+        row_key, source_key = _resolve_row_key(
+            src, med, camp, content, referrer, channel, link_index
+        )
+        by_row[row_key].add(vid)
+        if source_key is not None:
+            by_source[source_key].add(vid)
+    return by_row, by_source
+
+
+def _unsaved_utm_combos(visit_rows: list[tuple], link_index: dict, signups_by_combo: dict) -> tuple:
+    """'저장 안 된 링크(UTM)' 조합 목록 (MKT-5) — (combos, truncated).
+
+    합계만 있으면 "저장 안 된 링크로 40명 들어왔다"에서 끝나고 할 수 있는 일이 없다.
+    조합이 보이면 그 자리에서 링크로 저장할 수 있다 → 다음 집계부터 자기 행으로 올라온다.
+
+    - 묶음 키는 **정규화된** 4-튜플(대소문자·공백 변형이 한 줄로 합쳐진다).
+    - 응답의 ``utm`` 은 **정규화 전 원문** — 저장 화면에 그대로 실어 보내야 하므로
+      처음 본 방문의 원문을 유지한다.
+    - visits = 고유 방문자, first/last_seen = 그 조합의 방문 시각 범위.
+    """
+    buckets: dict = {}
+    for vid, src, med, camp, content, referrer, channel, created in visit_rows:
+        row_key, source_key = _resolve_row_key(
+            src, med, camp, content, referrer, channel, link_index
+        )
+        if source_key != SOURCE_UNSAVED_UTM:
+            continue
+        norm = _utm_key(src, med, camp, content)
+        slot = buckets.get(norm)
+        if slot is None:
+            slot = buckets[norm] = {
+                "utm": {
+                    "source": src or "",
+                    "medium": med or "",
+                    "campaign": camp or "",
+                    "content": content or "",
+                },
+                "visitors": set(),
+                "first_seen": created,
+                "last_seen": created,
+            }
+        slot["visitors"].add(vid)
+        if created is not None:
+            if slot["first_seen"] is None or created < slot["first_seen"]:
+                slot["first_seen"] = created
+            if slot["last_seen"] is None or created > slot["last_seen"]:
+                slot["last_seen"] = created
+    # 방문이 없고 가입만 있는 조합(랜딩 미경유 가입)도 줄이 나와야 저장할 수 있다
+    for norm, agg in signups_by_combo.items():
+        slot = buckets.get(norm)
+        if slot is None:
+            buckets[norm] = {
+                "utm": agg["utm"],
+                "visitors": set(),
+                "first_seen": None,
+                "last_seen": None,
+            }
+
+    combos = [
+        {
+            "utm": slot["utm"],
+            "visits": len(slot["visitors"]),
+            "signups": signups_by_combo.get(norm, {}).get("signups", 0),
+            "paid": signups_by_combo.get(norm, {}).get("paid", 0),
+            "first_seen": slot["first_seen"],
+            "last_seen": slot["last_seen"],
+        }
+        for norm, slot in buckets.items()
+    ]
+    combos.sort(key=lambda c: (-c["visits"], -c["signups"], c["utm"]["source"]))
+    return combos[:UNSAVED_UTM_COMBOS_LIMIT], len(combos) > UNSAVED_UTM_COMBOS_LIMIT
+
+
+def _fold_sources(sources: list[dict]) -> list[dict]:
+    """소스 줄이 너무 많으면 하위를 ``other_referral`` 로 접는다 (MKT-6 ①).
+
+    방문 desc 로 정렬한 뒤 상한을 넘는 꼬리만 합친다. direct/biolink/unsaved_utm 은
+    신호가 크거나 조치 가능한 줄이라 순위와 무관하게 접지 않는다.
+    """
+    if len(sources) <= SOURCE_ROWS_MAX:
+        return sources
+    keep, fold = [], []
+    for src in sources:
+        if len(keep) < SOURCE_ROWS_MAX or src["key"] in _SOURCE_NEVER_FOLD:
+            keep.append(src)
+        else:
+            fold.append(src)
+    if not fold:
+        return keep
+    merged = next((s for s in keep if s["key"] == SOURCE_OTHER_REFERRAL), None)
+    if merged is None:
+        merged = {"key": SOURCE_OTHER_REFERRAL, "label": _source_label(SOURCE_OTHER_REFERRAL)}
+        merged.update({k: 0 for k in ("visits", "signups", *_PERF_COUNT_FIELDS)})
+        merged.update({"signup_rate": None, "paid_rate": None})
+        keep.append(merged)
+    for src in fold:
+        merged["visits"] = (merged["visits"] or 0) + (src["visits"] or 0)
+        for field in ("signups", *_PERF_COUNT_FIELDS):
+            merged[field] += src[field]
+    merged["signup_rate"] = _rate(merged["signups"], merged["visits"])
+    merged["paid_rate"] = _rate(merged["paid"], merged["signups"])
+    keep.sort(key=lambda s: (-(s["visits"] or 0), -s["signups"], s["key"]))
+    return keep
+
+
 def _channel_rows(start, end, flags: tuple, visit_rows: list[tuple]) -> list[dict]:
     """MKT-2 — 채널별 성과 행 3종 (other / link / referral_code) 을 한 배열로.
 
@@ -1326,28 +1501,20 @@ def _channel_rows(start, end, flags: tuple, visit_rows: list[tuple]) -> list[dic
     제휴코드 사용자는 저장 채널과 무관하게 코드 행으로 이동한다(기존 referral 오버레이와
     같은 규칙, 배타적). 이동으로 원 행이 과소 집계되는 양은 각 행의 ``referral_overlap``.
     """
-    flag_rows, _attr_map, _attr_utm, referral_users, _visits_by_channel, attr_row = flags
+    flag_rows, _attr_map, attr_utm, referral_users, _visits_by_channel, attr_row = flags
     links = list(MarketingChannelLink.objects.select_related("created_by"))
     link_index = _link_index(links)
-
-    # ── 방문: 버킷별 고유 방문자 집합 (합산이 아니라 집합이라 중복 없이 정확) ──
-    visitors_by_row: dict = defaultdict(set)
-    visitors_by_source: dict = defaultdict(set)
-    for vid, src, med, camp, content, referrer, channel, _created in visit_rows:
-        row_key, source_key = _resolve_row_key(
-            src, med, camp, content, referrer, channel, link_index
-        )
-        visitors_by_row[row_key].add(vid)
-        if source_key is not None:
-            visitors_by_source[source_key].add(vid)
+    visitors_by_row, visitors_by_source = _visitors_by_bucket(visit_rows, link_index)
 
     # ── 가입/단계 도달: 행·소스별 누적 ──
     per_row: dict = defaultdict(_empty_perf_slot)
     per_source: dict = defaultdict(_empty_perf_slot)
     referral_overlap: dict = defaultdict(int)
+    # MKT-5: 저장 안 된 UTM 조합별 가입/실결제 (방문만으로는 조합의 가치를 알 수 없다)
+    signups_by_combo: dict = {}
     for uid, ig, pgc, pg, cp, pd, cur_plan, cur_status, cur_card in flag_rows:
         trialing, _no_card = _trial_flags(cur_plan, cur_status, cur_card)
-        origin_row, origin_source = attr_row.get(uid, (OTHER_ROW_KEY, "unknown"))
+        origin_row, origin_source = attr_row.get(uid, (OTHER_ROW_KEY, SOURCE_DIRECT))
         code = referral_users.get(uid)
         if code:
             # 제휴코드 행으로 이동 — 원래 있었을 행에 과소 집계량을 표기
@@ -1357,6 +1524,24 @@ def _channel_rows(start, end, flags: tuple, visit_rows: list[tuple]) -> list[dic
         _accumulate_perf(per_row[origin_row], ig, pgc, pg, cp, pd, trialing)
         if origin_source is not None:
             _accumulate_perf(per_source[origin_source], ig, pgc, pg, cp, pd, trialing)
+        if origin_source == SOURCE_UNSAVED_UTM:
+            src, med, camp, content = attr_utm.get(uid, ("", "", "", ""))
+            slot = signups_by_combo.setdefault(
+                _utm_key(src, med, camp, content),
+                {
+                    "utm": {
+                        "source": src,
+                        "medium": med,
+                        "campaign": camp,
+                        "content": content,
+                    },
+                    "signups": 0,
+                    "paid": 0,
+                },
+            )
+            slot["signups"] += 1
+            if pd:
+                slot["paid"] += 1
 
     # ── other 행 (항상 첫 행, 항상 존재) ──
     sources = [
@@ -1370,6 +1555,12 @@ def _channel_rows(start, end, flags: tuple, visit_rows: list[tuple]) -> list[dic
         for key in set(per_source) | set(visitors_by_source)
     ]
     sources.sort(key=lambda s: (-(s["visits"] or 0), -s["signups"], s["key"]))
+    sources = _fold_sources(sources)
+    for src_row in sources:
+        if src_row["key"] == SOURCE_UNSAVED_UTM:
+            combos, truncated = _unsaved_utm_combos(visit_rows, link_index, signups_by_combo)
+            src_row["combos"] = combos
+            src_row["combos_truncated"] = truncated
     rows: list[dict] = [
         {
             "kind": ROW_KIND_OTHER,
@@ -1473,34 +1664,14 @@ def _channels(
       마스킹은 **캐시 이후** apply_pii_policy 가 한다 (여기서 하면 캐시가 오염된다).
     - paid 는 **실결제(첫 PAID 이력)** 만 — 체험 미포함 (N-4). free_trial(현재 체험 중 &
       미결제)은 별도 컬럼 — R-4 이후 **카드 등록 완료 체험만** (퍼널 conversion 과 동일 정의).
-    - referral_codes(기존 블록)는 유지 — 기간 내 코드 사용 실적. 같은 데이터가
-      rows 의 referral_code 행에도 들어가지만, 이쪽은 사용 0건 코드를 포함하지 않는다.
+    - CLN-1: 기존 ``referral_codes`` 블록은 **제거**됐다 — rows 의 referral_code 행이
+      상위집합(사용 0건 코드까지 포함)이라 같은 데이터가 두 곳에 있을 이유가 없다.
     """
     if flags is None:
         flags = _cohort_flags(start, end)
     if visit_rows is None:
         visit_rows = _visit_rows(start, end)
-    rows = _channel_rows(start, end, flags, visit_rows)
-
-    referral_codes = [
-        {
-            "code": r["referral_code__code"],
-            "description": r["referral_code__description"] or "",
-            "redemptions": r["redemptions"],
-            "converted": r["converted"],
-            "conversion_rate": _rate(r["converted"], r["redemptions"]),
-        }
-        for r in (
-            ReferralRedemption.objects.filter(trial_started_at__gte=start, trial_started_at__lt=end)
-            .values("referral_code__code", "referral_code__description")
-            .annotate(
-                redemptions=Count("id"),
-                converted=Count("id", filter=Q(converted_to_paid=True)),
-            )
-            .order_by("-redemptions")
-        )
-    ]
-    return {"rows": rows, "referral_codes": referral_codes}
+    return {"rows": _channel_rows(start, end, flags, visit_rows)}
 
 
 # ── 업셀 후보 ────────────────────────────────────────────────────────
@@ -3432,11 +3603,14 @@ curl -H "Authorization: Bearer <staff_token>" \\
                     },
                     "funnel": {
                         "semantics": "signup_cohort",
+                        # MKT-4: value = channels.rows[].key, label 은 서버 정본
                         "available_channels": [
                             {"value": "all", "label": "전체 채널"},
-                            {"value": "instagram_organic", "label": "인스타그램 유입"},
-                            {"value": "unknown", "label": "미분류"},
+                            {"value": "other", "label": "기타 (기본 링크로 들어옴)"},
+                            {"value": "41", "label": "7월 메타 리타겟팅"},
+                            {"value": "SUMMER10", "label": "SUMMER10"},
                         ],
+                        "available_channels_truncated": False,
                         "variants": {
                             "all": {
                                 "head": [
@@ -3731,6 +3905,23 @@ curl -H "Authorization: Bearer <staff_token>" \\
                                         "paid": 0,
                                         "free_trial": 0,
                                         "paid_rate": 0.0,
+                                        # MKT-5: 이 줄에서 바로 '링크로 저장'할 수 있게 하는 재료
+                                        "combos": [
+                                            {
+                                                "utm": {
+                                                    "source": "kakao",
+                                                    "medium": "cpc",
+                                                    "campaign": "0728_open",
+                                                    "content": "",
+                                                },
+                                                "visits": 31,
+                                                "signups": 2,
+                                                "paid": 0,
+                                                "first_seen": "2026-07-19T13:12:00+09:00",
+                                                "last_seen": "2026-07-28T10:30:00+09:00",
+                                            }
+                                        ],
+                                        "combos_truncated": False,
                                     },
                                     {
                                         "key": "direct",
@@ -3796,15 +3987,6 @@ curl -H "Authorization: Bearer <staff_token>" \\
                                 "converted": 5,
                                 "conversion_rate": 0.4167,
                             },
-                        ],
-                        "referral_codes": [
-                            {
-                                "code": "CREATOR10",
-                                "description": "A 인플루언서 릴스 협찬",
-                                "redemptions": 14,
-                                "converted": 3,
-                                "conversion_rate": 0.2143,
-                            }
                         ],
                     },
                     "upsell_candidates": [
@@ -4069,9 +4251,10 @@ curl -H "Authorization: Bearer <staff_token>" \\
         # 코호트 flag_rows/attr_map/referral_users/visits_by_channel 1회 계산 →
         # funnel(채널 variant) 과 channels 양쪽에 재사용 (중복 쿼리 방지).
         cohort_flags = _cohort_flags(*cur)
-        channel_variants = _funnel_channel_variants(cohort_flags)
-        # MKT-2: 방문 원본 행 1회 조회 → 채널 표와 추이가 **같은 행 분류**를 공유한다
+        # MKT-2: 방문 원본 행 1회 조회 → 채널 표·추이·퍼널 variant 가 **같은 행 분류**를 공유
         visit_rows = _visit_rows(*cur)
+        channel_variants = _funnel_channel_variants(cohort_flags, visit_rows)
+        referral_code_keys = frozenset(ReferralCode.objects.values_list("code", flat=True))
 
         # MKT-1(R-8): 퍼널 노드가 자기 증감을 들도록 직전 기간 코호트를 한 번 더 집계한다.
         # period=all 은 prev 자체가 없어(R-1) 계산도 하지 않는다 → 전 노드 previous=null.
@@ -4080,8 +4263,10 @@ curl -H "Authorization: Bearer <staff_token>" \\
             prev_cohort = _cohort_agg(*prev)
             _prev_visits, prev_visitors = _visit_counts(*prev)
             prev_channel_map = {
-                channel: (counts, visitors)
-                for channel, counts, visitors in _funnel_channel_variants(_cohort_flags(*prev))
+                key: (counts, visitors)
+                for key, _label, counts, visitors in _funnel_channel_variants(
+                    _cohort_flags(*prev), _visit_rows(*prev)
+                )
             }
 
         payload = {
@@ -4104,6 +4289,7 @@ curl -H "Authorization: Bearer <staff_token>" \\
                 prev_cohort,
                 prev_visitors,
                 prev_channel_map,
+                referral_code_keys,
             ),
             "trends": _trends(*cur, visit_rows=visit_rows),
             "channels": _channels(*cur, flags=cohort_flags, visit_rows=visit_rows),
