@@ -104,6 +104,9 @@ TRENDS_WEEK_MAX_SPAN_DAYS = 400
 
 # ── 캐시 ─────────────────────────────────────────────────────────────
 OPS_DASHBOARD_CACHE_TTL = 30  # 초 — 어드민 30~60s 폴링 대비
+# window=all(전체 기간)은 계산량이 가장 크고 분 단위로 값이 변하지 않음 → 더 긴 TTL (OPS-4).
+# 마케팅 period=all 과 같은 900초.
+OPS_DASHBOARD_ALL_CACHE_TTL = 900  # 초
 MARKETING_DASHBOARD_CACHE_TTL = 300  # 초
 # period=all(전체 기간)은 계산량이 가장 크고 분 단위로 값이 변하지 않음 → 더 긴 TTL (R-6).
 MARKETING_DASHBOARD_ALL_CACHE_TTL = 900  # 초

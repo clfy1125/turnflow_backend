@@ -16,9 +16,17 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from rest_framework import serializers
 
 from apps.admin_api.models import MarketingChannelLink
+from apps.admin_api.roles import (
+    ROLE_FULL,
+    can_delete_channel_link,
+    is_restricted,
+    resolve_admin_role,
+)
 from apps.analytics.channels import derive_channel
 
 _UTM_FIELDS = ("utm_source", "utm_medium", "utm_campaign", "utm_content")
+# request 없이 직렬화될 때(스키마 생성 등)의 안전 기본값 — 제한을 걸지 않는다
+ROLE_FULL_FALLBACK = ROLE_FULL
 
 
 def build_channel_url(base_url: str, utm: dict) -> str:
@@ -36,10 +44,22 @@ def build_channel_url(base_url: str, utm: dict) -> str:
 
 
 class AdminChannelLinkSerializer(serializers.ModelSerializer):
-    """읽기(목록/상세/생성 응답) 형태 — 서버 계산 필드(url/channel) 포함."""
+    """읽기(목록/상세/생성 응답) 형태 — 서버 계산 필드(url/channel) 포함.
+
+    역할별 변형 (RBAC-4-c):
+    - ``created_by_email`` 은 **내부 직원 이메일**이라 marketing_viewer(외주)에게는 빈 문자열.
+    - ``can_delete`` 는 삭제 게이트와 **같은 함수**(roles.can_delete_channel_link)로 판정 —
+      화면의 삭제 버튼과 실제 동작이 갈라지지 않게 한다.
+    """
 
     created_by_email = serializers.SerializerMethodField(
-        help_text="생성 관리자 이메일 (탈퇴 시 빈 문자열) — 전 관리자 공용 목록의 표기용"
+        help_text="생성 관리자 이메일 (탈퇴 시 빈 문자열) — 전 관리자 공용 목록의 표기용. "
+        "**marketing_viewer 역할에는 항상 빈 문자열**(내부 직원 이메일 비노출, RBAC-4-c)"
+    )
+    can_delete = serializers.SerializerMethodField(
+        help_text="이 요청자가 이 링크를 삭제할 수 있는지(서버 판정). full=항상 true, "
+        "marketing_viewer=자기가 만든 링크만 true(created_by=null 인 링크는 false). "
+        "false 인 행은 삭제 버튼을 렌더하지 마세요 — 누르면 403(not_link_owner)"
     )
 
     class Meta:
@@ -55,13 +75,25 @@ class AdminChannelLinkSerializer(serializers.ModelSerializer):
             "url",
             "channel",
             "created_by_email",
+            "can_delete",
             "created_at",
             "updated_at",
         ]
         read_only_fields = fields
 
+    def _role(self) -> str:
+        request = self.context.get("request")
+        return resolve_admin_role(request) if request is not None else ROLE_FULL_FALLBACK
+
     def get_created_by_email(self, obj) -> str:
+        if is_restricted(self._role()):
+            return ""
         return obj.created_by.email if obj.created_by_id else ""
+
+    def get_can_delete(self, obj) -> bool:
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        return can_delete_channel_link(self._role(), user, obj)
 
 
 class AdminChannelLinkWriteSerializer(serializers.ModelSerializer):

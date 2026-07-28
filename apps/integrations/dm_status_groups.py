@@ -98,20 +98,25 @@ def _statuses_for(group: str) -> list[str]:
     return [s for s, g in _STATUS_TO_GROUP.items() if g == group]
 
 
-def status_group_q(group: str) -> Q:
+def status_group_q(group: str, prefix: str = "") -> Q:
     """그룹 → SentDMLog 필터 Q (목록 status_group= 쿼리·통계 집계 공용).
 
     - hidden_spam: recovery_pending/expired + failed_param@2534025
     - attention:   나머지 실패군에서 2534025 failed_param 은 제외(hidden_spam 으로 빠짐)
     - 그 외:       단순 status__in
+
+    ``prefix`` 를 주면 역참조 경로로 필드명을 감싼다 (예: ``prefix="dm_logs"`` →
+    ``dm_logs__status``). 캠페인 목록의 사람 단위 annotate 처럼 SentDMLog 를 조인해서
+    거를 때 쓴다 — 판정 규칙을 복제하지 않기 위한 것이므로 직접 하드코딩하지 말 것.
     """
+    p = f"{prefix}__" if prefix else ""
     if group == HIDDEN_SPAM:
-        return Q(status__in=HIDDEN_SPAM_STATUSES) | Q(
-            status="failed_param", error_subcode=HIDDEN_SPAM_SUBCODE
+        return Q(**{f"{p}status__in": HIDDEN_SPAM_STATUSES}) | Q(
+            **{f"{p}status": "failed_param", f"{p}error_subcode": HIDDEN_SPAM_SUBCODE}
         )
     if group == ATTENTION:
         base = [s for s in _statuses_for(ATTENTION) if s != "failed_param"]
-        return Q(status__in=base) | (
-            Q(status="failed_param") & ~Q(error_subcode=HIDDEN_SPAM_SUBCODE)
+        return Q(**{f"{p}status__in": base}) | (
+            Q(**{f"{p}status": "failed_param"}) & ~Q(**{f"{p}error_subcode": HIDDEN_SPAM_SUBCODE})
         )
-    return Q(status__in=_statuses_for(group))
+    return Q(**{f"{p}status__in": _statuses_for(group)})

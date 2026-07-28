@@ -41,6 +41,9 @@ class AdminActionLog(models.Model):
         CHANNEL_LINK_CREATE = "channel_link.create", "채널 링크 생성"
         CHANNEL_LINK_UPDATE = "channel_link.update", "채널 링크 수정"
         CHANNEL_LINK_DELETE = "channel_link.delete", "채널 링크 삭제"
+        # RBAC-2 — 제한 역할(marketing_viewer)이 허용되지 않은 어드민 경로를 시도해 403.
+        # 조회는 기록하지 않는 원칙의 예외 — 외부(외주) 계정의 접근 시도 이력은 남긴다.
+        ADMIN_ACCESS_DENIED = "admin.access_denied", "어드민 접근 차단(권한 없음)"
 
     class Meta:
         db_table = "admin_action_logs"

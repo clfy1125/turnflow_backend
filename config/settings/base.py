@@ -65,6 +65,9 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    # RBAC-2: /api/v1/admin/** + Django admin 을 어드민 역할로 게이팅 (deny-by-default).
+    # AuthenticationMiddleware 뒤여야 세션 사용자를 볼 수 있다 (JWT 는 자체 해석).
+    "apps.admin_api.middleware.AdminRoleGuardMiddleware",
 ]
 
 ROOT_URLCONF = "config.urls"

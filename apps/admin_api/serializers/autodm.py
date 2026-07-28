@@ -21,6 +21,12 @@ from django.utils import timezone
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
+from apps.admin_api.dm_error_catalog import describe_for_log
+from apps.integrations.campaign_stats import (
+    build_dm_stats,
+    compute_campaign_enrichment,
+    people_from_annotations,
+)
 from apps.integrations.dm_status_groups import GROUP_DISPLAY
 from apps.integrations.models import AutoDMCampaign, IGAccountConnection, SentDMLog
 from apps.integrations.services import is_instagram_permalink
@@ -63,63 +69,47 @@ class _CampaignMiniSerializer(serializers.Serializer):
 
 
 def _build_stats(queryset) -> dict:
-    """``SentDMLog`` 쿼리셋을 ``DMVerificationStatsSerializer`` 와 동일한 dict 로 집계.
+    """``SentDMLog`` 쿼리셋 → ``DMVerificationStatsSerializer`` 형태의 통계 dict.
 
-    verification_views.stats 의 집계 로직을 그대로 따른다 (전역 범위에서 재사용).
+    DM-1-a: 어드민 전용 사본을 폐기하고 **유저 콘솔과 같은 함수**
+    (:func:`apps.integrations.campaign_stats.build_dm_stats`) 를 호출한다.
+    사본 시절에는 이벤트 단위 필드만 있고 ``unique_*``(사람 단위)가 통째로 빠져 있어서
+    같은 캠페인의 숫자가 어드민/유저 화면에서 달랐다. 필드를 여기 복사하지 말 것.
     """
-    delivered_or_read = Q(status="delivered") | Q(status="read")
-    agg = queryset.aggregate(
-        total=Count("id"),
-        queued=Count("id", filter=Q(status="queued")),
-        submitting=Count("id", filter=Q(status="submitting")),
-        accepted=Count("id", filter=Q(status="accepted")),
-        delivered=Count("id", filter=Q(status="delivered")),
-        read=Count("id", filter=Q(status="read")),
-        rate_limited=Count("id", filter=Q(status="rate_limited")),
-        failed_token=Count("id", filter=Q(status="failed_token")),
-        failed_window=Count("id", filter=Q(status="failed_window")),
-        failed_param=Count("id", filter=Q(status="failed_param")),
-        failed_no_trace=Count("id", filter=Q(status="failed_no_trace")),
-        skipped=Count("id", filter=Q(status="skipped")),
-        recovery_pending=Count("id", filter=Q(status="recovery_pending")),
-        recovery_delivered=Count("id", filter=Q(status="recovery_delivered")),
-        recovery_expired=Count("id", filter=Q(status="recovery_expired")),
-        legacy_sent=Count("id", filter=Q(status="sent")),
-        legacy_failed=Count("id", filter=Q(status="failed")),
-        legacy_failed_api=Count("id", filter=Q(status="failed_api")),
-        standalone_total=Count("id", filter=Q(dm_kind="standalone")),
-        opening_total=Count("id", filter=Q(dm_kind="opening")),
-        opening_delivered=Count("id", filter=Q(dm_kind="opening") & delivered_or_read),
-        reward_total=Count("id", filter=Q(dm_kind="reward")),
-        reward_delivered=Count("id", filter=Q(dm_kind="reward") & delivered_or_read),
-        gate_pending=Count("id", filter=Q(gate_status="pending")),
-        gate_passed=Count("id", filter=Q(gate_status="passed")),
-        gate_expired=Count("id", filter=Q(gate_status="expired")),
-        public_replies_posted=Count("id", filter=~Q(public_reply_id="")),
-    )
-
-    accepted_or_after = (
-        agg["accepted"]
-        + agg["delivered"]
-        + agg["read"]
-        + agg["failed_no_trace"]
-        + agg["recovery_delivered"]  # 복구 재전송 성공 = 실제 도착 (분모·분자 포함)
-    )
-    confirmed_delivered = agg["delivered"] + agg["read"] + agg["recovery_delivered"]
-
-    delivery_rate = confirmed_delivered / accepted_or_after if accepted_or_after else 0.0
-    read_rate = agg["read"] / confirmed_delivered if confirmed_delivered else 0.0
-    gate_passthrough_rate = (
-        agg["gate_passed"] / agg["opening_delivered"] if agg["opening_delivered"] else 0.0
-    )
-
-    agg["delivery_rate"] = round(delivery_rate, 4)
-    agg["read_rate"] = round(read_rate, 4)
-    agg["gate_passthrough_rate"] = round(gate_passthrough_rate, 4)
-    return agg
+    return build_dm_stats(queryset)
 
 
 # ===== 캠페인 =====
+
+
+class AdminCampaignPeopleSerializer(serializers.Serializer):
+    """캠페인 1건의 **사람(인원) 단위** 요약 (DM-1-b).
+
+    상세(`stats`)의 ``unique_*`` 와 **같은 정의·같은 계산**(campaign_stats) — 목록의
+    ``people.sent`` 와 상세의 ``unique_sent`` 는 항상 일치한다.
+    ``targets == sent + waiting + failed`` 항등이 성립한다.
+    """
+
+    targets = serializers.IntegerField(help_text="전체 대상 인원 (unique_targets — 루트 DM 기준)")
+    sent = serializers.IntegerField(help_text="실제 발송된 인원 (unique_sent — Meta 접수 이상)")
+    waiting = serializers.IntegerField(help_text="발송 대기/발송 중 인원 (unique_waiting)")
+    failed = serializers.IntegerField(help_text="아무것도 받지 못한 인원 (unique_failed)")
+    unconfirmed = serializers.IntegerField(
+        help_text="발송됐으나 도착 미확인 인원 (unique_unconfirmed)"
+    )
+    hidden_spam = serializers.IntegerField(
+        help_text="숨겨진 요청·스팸함으로 간 인원 (unique_hidden_spam — failed 의 부분집합)"
+    )
+    needs_attention = serializers.IntegerField(
+        help_text="숨김함 제외 '확인 필요' 인원 (unique_needs_attention_excl_hidden). "
+        "목록의 '발송 실패 인원' 컬럼은 이 값을 쓴다"
+    )
+    sent_rate = serializers.FloatField(
+        help_text="sent / targets (0~1, unique_sent_rate — 헤드라인용). targets 0 이면 0.0"
+    )
+
+    class Meta:
+        ref_name = "AdminCampaignPeople"
 
 
 class AdminCampaignListSerializer(serializers.ModelSerializer):
@@ -135,6 +125,27 @@ class AdminCampaignListSerializer(serializers.ModelSerializer):
         read_only=True,
         help_text="IG 계정이 속한 워크스페이스의 소유자(User).",
     )
+    people = serializers.SerializerMethodField(
+        help_text=(
+            "사람(인원) 단위 요약 — 상세 stats 의 unique_* 와 동일 정의 (DM-1-b). "
+            "목록 카드의 '발송 인원'은 people.sent, '발송 실패 인원'은 people.needs_attention. "
+            "total_sent/total_failed 는 **발송 이벤트** 수라 follow-gate 캠페인에서 "
+            "인원보다 크다(1명 = 오프닝+리워드 2건)."
+        )
+    )
+    delivered_count = serializers.SerializerMethodField(
+        help_text="확정 도착 DM 건수 (delivered+read+recovery_delivered) — 이벤트 단위."
+    )
+    delivery_rate = serializers.SerializerMethodField(
+        help_text=(
+            "(delivered+read+recovery_delivered) / (accepted 진입 건) — 0~1. "
+            "⚠️ 하드실패가 분모에서 빠지므로 100% 로 부풀 수 있다. 헤드라인에는 "
+            "people.sent_rate 를 쓸 것."
+        )
+    )
+    last_sent_at = serializers.SerializerMethodField(
+        help_text="이 캠페인의 마지막 DM 로그 생성 시각 (로그 0건이면 null)."
+    )
 
     class Meta:
         model = AutoDMCampaign
@@ -145,6 +156,11 @@ class AdminCampaignListSerializer(serializers.ModelSerializer):
             "owner",
             "status",
             "trigger_type",
+            "people",
+            "delivered_count",
+            "delivery_rate",
+            "last_sent_at",
+            # 하위호환(폴백용) — 발송 **이벤트** 단위 비정규화 카운터. 제거 예정 없음.
             "total_sent",
             "total_failed",
             "total_unconfirmed",
@@ -152,6 +168,28 @@ class AdminCampaignListSerializer(serializers.ModelSerializer):
             "started_at",
         ]
         read_only_fields = fields
+
+    @extend_schema_field(AdminCampaignPeopleSerializer)
+    def get_people(self, obj: AutoDMCampaign) -> dict | None:
+        return people_from_annotations(obj)
+
+    def _enrichment(self, obj: AutoDMCampaign) -> dict:
+        # annotate 된 값을 재사용 (추가 쿼리 0) — 미annotate 인스턴스는 즉석 집계 폴백.
+        cached = getattr(obj, "_admin_enrichment", None)
+        if cached is None:
+            cached = compute_campaign_enrichment(obj)
+            obj._admin_enrichment = cached
+        return cached
+
+    def get_delivered_count(self, obj: AutoDMCampaign) -> int:
+        return self._enrichment(obj)["delivered_count"]
+
+    def get_delivery_rate(self, obj: AutoDMCampaign) -> float:
+        return self._enrichment(obj)["delivery_rate"]
+
+    @extend_schema_field(serializers.DateTimeField(allow_null=True))
+    def get_last_sent_at(self, obj: AutoDMCampaign):
+        return self._enrichment(obj)["last_sent_at"]
 
 
 class AdminCampaignDetailSerializer(serializers.ModelSerializer):
@@ -249,6 +287,15 @@ class AdminDMLogListSerializer(serializers.ModelSerializer):
         )
     )
 
+    error_title = serializers.SerializerMethodField(
+        help_text=(
+            "DM-2 — 오류의 짧은 한국어 라벨 (예: '숨겨진 요청 · 스팸함 유입'). 서버 사전"
+            "(dm_error_catalog)이 (code, subcode, status) 로 판정한다. 오류가 아니거나 "
+            "사전에 없으면 빈 문자열 → 프론트 로컬 사전 폴백. "
+            "원인·조치 전문은 목록에 자리가 없어 상세 응답에만 있다."
+        )
+    )
+
     class Meta:
         model = SentDMLog
         fields = [
@@ -262,10 +309,17 @@ class AdminDMLogListSerializer(serializers.ModelSerializer):
             "flow_role",
             "gate_status",
             "error_code",
+            # DM-2 — (code, subcode) 정확 일치가 사전 판정 1순위라 subcode 가 필요하다
+            # (100/2534025 숨김함=복구 대상 vs 100/2534022 윈도우 만료=정상 실패는 조치가 정반대).
+            "error_subcode",
+            "error_title",
             "created_at",
             "delivered_at",
         ]
         read_only_fields = fields
+
+    def get_error_title(self, obj: SentDMLog) -> str:
+        return describe_for_log(obj.error_code, obj.error_subcode, obj.status)["error_title"]
 
     @extend_schema_field(
         serializers.ChoiceField(choices=["opening", "retry", "reward", "standalone"])
@@ -280,9 +334,31 @@ class AdminDMLogListSerializer(serializers.ModelSerializer):
 
 
 class AdminDMLogDetailSerializer(serializers.ModelSerializer):
-    """DM 발송 로그 상세 (cross-workspace) — 디버깅/검증 이력 포함."""
+    """DM 발송 로그 상세 (cross-workspace) — 디버깅/검증 이력 + 오류 원인·조치 (DM-2).
+
+    운영 대시보드 `failure_breakdown` 과 **같은 서버 사전**(dm_error_catalog)을 쓰므로,
+    로그 1건을 열었을 때 대시보드로 돌아가 코드를 대조할 필요가 없다. 새 코드가 나와도
+    사전이 서버에 있어 프론트 배포가 필요 없다.
+    필드명에 ``error_`` 접두를 둔 이유 — 상세는 평면 객체라 다른 필드와 섞이기 때문
+    (대시보드의 title/cause/action 은 breakdown 행 안이라 접두가 없다).
+    """
 
     campaign = _CampaignMiniSerializer(read_only=True)
+    error_title = serializers.SerializerMethodField(
+        help_text="짧은 한국어 라벨 (예: '토큰 만료 · 무효'). 사전에 없으면 빈 문자열."
+    )
+    error_cause = serializers.SerializerMethodField(
+        help_text="왜 발생했는가 (1~2문장 한국어). 없으면 빈 문자열."
+    )
+    error_action = serializers.SerializerMethodField(
+        help_text="운영자가 무엇을 해야 하는가. 없으면 빈 문자열."
+    )
+    recoverable = serializers.SerializerMethodField(
+        help_text=(
+            "복구/재검증 경로가 있는 실패인가 — 재발송/재검증 버튼 노출 판단용. "
+            "failed_no_trace(재검증)·recovery_*·failed_param@2534025(숨김채널 복구)=true."
+        )
+    )
 
     class Meta:
         model = SentDMLog
@@ -294,6 +370,13 @@ class AdminDMLogDetailSerializer(serializers.ModelSerializer):
             "dm_kind",
             "gate_status",
             "error_code",
+            # DM-2 — 사전 판정 1순위가 (code, subcode) 정확 일치라 subcode 없이는
+            # 프론트에서 사전을 붙일 수도 없었다 (모델엔 원래 있던 값).
+            "error_subcode",
+            "error_title",
+            "error_cause",
+            "error_action",
+            "recoverable",
             "created_at",
             "delivered_at",
             # 상세 전용
@@ -306,6 +389,25 @@ class AdminDMLogDetailSerializer(serializers.ModelSerializer):
             "verification_log",
         ]
         read_only_fields = fields
+
+    def _described(self, obj: SentDMLog) -> dict:
+        cached = getattr(obj, "_described_error", None)
+        if cached is None:
+            cached = describe_for_log(obj.error_code, obj.error_subcode, obj.status)
+            obj._described_error = cached
+        return cached
+
+    def get_error_title(self, obj: SentDMLog) -> str:
+        return self._described(obj)["error_title"]
+
+    def get_error_cause(self, obj: SentDMLog) -> str:
+        return self._described(obj)["error_cause"]
+
+    def get_error_action(self, obj: SentDMLog) -> str:
+        return self._described(obj)["error_action"]
+
+    def get_recoverable(self, obj: SentDMLog) -> bool:
+        return self._described(obj)["recoverable"]
 
 
 # ===== DM 수신자(사람) 단위 롤업 =====
@@ -366,6 +468,14 @@ class AdminDMRecipientSerializer(serializers.Serializer):
     )
     latest_status = serializers.CharField(
         allow_blank=True, help_text="가장 최근 발송의 SentDMLog.status (배지 보조용)."
+    )
+    error_title = serializers.CharField(
+        allow_blank=True,
+        help_text=(
+            "DM-2 — **가장 최근 로그**의 오류 라벨 (서버 사전 dm_error_catalog 판정). "
+            "최신 로그가 오류가 아니거나 사전에 없으면 빈 문자열. 원인·조치 전문은 "
+            "`GET /admin/auto-dm/logs/{id}/` 상세에 있다."
+        ),
     )
     first_sent_at = serializers.DateTimeField(
         allow_null=True, help_text="이 수신자의 첫 DM 로그 생성(발송 시작) 시각."

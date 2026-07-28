@@ -26,7 +26,7 @@ import logging
 from datetime import date, datetime, timedelta
 
 from django.core.cache import cache
-from django.db.models import Count, Q
+from django.db.models import Count, Min, Q
 from django.db.models.functions import TruncDate, TruncHour, TruncMinute
 from django.utils import timezone
 from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiResponse, extend_schema
@@ -40,6 +40,7 @@ from apps.admin_api.dashboard_constants import (
     DM_DELIVERY_WARNING_THRESHOLD,
     DM_MIN_SAMPLE_FOR_STATUS,
     IG_EXPIRED_CRITICAL_COUNT,
+    OPS_DASHBOARD_ALL_CACHE_TTL,
     OPS_DASHBOARD_CACHE_TTL,
     PAST_DUE_CRITICAL_COUNT,
     PAYMENT_FAILED_WARNING_COUNT,
@@ -51,9 +52,13 @@ from apps.admin_api.dashboard_constants import (
     SPAM_HIDE_FAILED_WARNING_COUNT,
     STUCK_SUBMITTING_MINUTES,
     TOKEN_EXPIRING_SOON_HOURS,
+    TRENDS_DAY_MAX_SPAN_DAYS,
     WEBHOOK_BACKLOG_CRITICAL_MINUTES,
     WEBHOOK_BACKLOG_STALE_MINUTES,
 )
+from apps.admin_api.dm_error_catalog import describe as describe_dm_error
+from apps.admin_api.dm_error_catalog import is_recoverable as _error_is_recoverable
+from apps.admin_api.dm_error_catalog import truncate_message
 from apps.admin_api.serializers.dashboard_ops import AdminOpsDashboardSerializer
 
 # delivery_rate 표준 공식 재사용 (dm-verification/stats 와 동일 정의 — 복제 금지)
@@ -65,12 +70,14 @@ from apps.billing.models import (
     TossWebhookLog,
     UserSubscription,
 )
-from apps.integrations.dm_status_groups import HIDDEN_SPAM_SUBCODE
+from apps.integrations.dm_status_groups import HIDDEN_SPAM as GROUP_HIDDEN_SPAM
+from apps.integrations.dm_status_groups import HIDDEN_SPAM_SUBCODE, status_group
 from apps.integrations.models import IGAccountConnection, SentDMLog, SpamCommentLog
 
 logger = logging.getLogger(__name__)
 
-ALLOWED_WINDOWS = ("1h", "24h", "today", "7d", "30d")
+# OPS-4: "all" = 서비스 전체 기간. 커스텀 범위(최대 92일)로는 볼 수 없던 구간을 연다.
+ALLOWED_WINDOWS = ("1h", "24h", "today", "7d", "30d", "all")
 CACHE_KEY_TMPL = "admin:dash:ops:{window}"
 CACHE_KEY_CUSTOM_TMPL = "admin:dash:ops:custom:{start}:{end}"
 MAX_CUSTOM_SPAN_DAYS = 92  # 커스텀 범위 상한 (초과 시 400)
@@ -87,12 +94,15 @@ DM_SUCCEEDED_STATUSES = (
 #   ★ '숨겨진 요청·스팸'(비팔로워 채널 미개설 subcode=2534025 + 복구 대기/만료)은 실패가
 #     아니므로 제외한다 — 아래 DM_HIDDEN_SPAM_Q 로 별도 집계. 정의의 단일 소스는
 #     dm_status_groups(HIDDEN_SPAM_SUBCODE / hidden_spam 그룹)와 동일하게 맞춘다.
+#   ★ OPS-1-b: legacy ``failed_api`` 도 여기 포함한다 — 예전에는 어느 KPI 에도 안 들어가
+#     failure_breakdown 합계와 카드 KPI 가 그만큼 어긋났다(legacy ``failed`` 는 이미 포함).
 DM_FAILED_Q = Q(
     status__in=(
         SentDMLog.Status.FAILED_TOKEN,
         SentDMLog.Status.FAILED_WINDOW,
         SentDMLog.Status.FAILED_NO_TRACE,
         SentDMLog.Status.FAILED,  # legacy
+        SentDMLog.Status.FAILED_API,  # legacy (OPS-1-b)
     )
 ) | (Q(status=SentDMLog.Status.FAILED_PARAM) & ~Q(error_subcode=HIDDEN_SPAM_SUBCODE))
 # hidden_spam(숨겨진 요청·스팸): 비팔로워라 첫 DM 이 상대 숨김함/스팸함으로 간 경우
@@ -125,30 +135,74 @@ DM_ERROR_STATUSES = (
     SentDMLog.Status.RECOVERY_PENDING,
     SentDMLog.Status.RECOVERY_EXPIRED,
 )
-# recoverable=true 판정 대상 상태 — 복구/재검증 경로가 있는 실패.
-#   - failed_no_trace: 능동 재검증(GET /{message_id})으로 delivered 승격 가능
-#   - recovery_pending/expired: 숨김채널 재댓글 복구 플로우 대상
-#   - failed_param@2534025(HIDDEN_SPAM_SUBCODE): 숨김채널 복구 대상 (아래 함수가 subcode 분기)
-DM_RECOVERABLE_STATUSES = frozenset(
-    (
-        SentDMLog.Status.FAILED_NO_TRACE,
-        SentDMLog.Status.RECOVERY_PENDING,
-        SentDMLog.Status.RECOVERY_EXPIRED,
-    )
+# ── DM-4: 건너뜀(skipped) 사유 분해 ──────────────────────────────────
+# skipped = "Meta 에 요청을 보내지 않고 취소한 건". **실패가 아니라 발송을 시작하지 않은
+# 상태**이며, 6가지 사유 중 조치가 필요한 것은 월 DM 한도 하나뿐이다(업셀 신호).
+# 사유 컬럼이 따로 없어 error_message 문자열로 판별하지만, 규칙을 **여기 한 곳**에 모아
+# 두었으니 발송 경로의 문구를 바꾸면 이 표를 함께 고칠 것.
+#   (원문 출처: integrations/tasks.py 의 log.mark_skipped(...) 호출부 +
+#    integrations/models.py 의 IGAccountConnection._halt_automation)
+# 형식: (reason 키, 한국어 라벨, actionable, 매칭 부분문자열들)
+SKIPPED_REASONS: tuple[tuple[str, str, bool, tuple[str, ...]], ...] = (
+    ("monthly_dm_limit", "월 DM 한도 도달", True, ("monthly_dm_limit_reached",)),
+    ("campaign_not_active", "캠페인 일시정지 중", False, ("campaign not active",)),
+    ("outside_schedule_window", "예약 발송 창 밖", False, ("outside active schedule window",)),
+    ("ig_account_inactive", "IG 계정 비활성(플랜 축소)", False, ("ig account deactivated",)),
+    ("self_recipient", "계정 자신의 댓글", False, ("self recipient",)),
+    ("connection_disconnected", "IG 연결 해제 정리", False, ("ig connection disconnected",)),
 )
+SKIPPED_OTHER = ("other", "기타", False)
 
 
-def _error_is_recoverable(status: str, error_subcode: str) -> bool:
-    """이 실패가 복구/재검증 경로를 갖는지 (failure_breakdown.recoverable).
+def _classify_skipped(message: str) -> tuple[str, str, bool]:
+    """skipped 로그의 error_message → (reason, label, actionable). 미매칭은 other."""
+    text = (message or "").strip().lower()
+    for reason, label, actionable, needles in SKIPPED_REASONS:
+        if any(n in text for n in needles):
+            return reason, label, actionable
+    return SKIPPED_OTHER
 
-    recovery 퍼널(recovery_*)보다 넓은 개념 — failed_no_trace(재검증)와
-    failed_param@2534025(숨김채널 복구)도 recoverable=true 로 본다.
+
+def _skipped_breakdown(in_range) -> list[dict]:
+    """건너뜀 사유별 카운트 (count desc) — failure_breakdown 과 같은 형태 (DM-4).
+
+    Σ count == dm_quality.skipped 를 항상 만족한다 (미매칭도 other 로 흡수).
     """
-    if status in DM_RECOVERABLE_STATUSES:
-        return True
-    return status == SentDMLog.Status.FAILED_PARAM and str(error_subcode or "").strip() == (
-        HIDDEN_SPAM_SUBCODE
+    buckets: dict[str, dict] = {}
+    rows = (
+        in_range.filter(status=SentDMLog.Status.SKIPPED)
+        .values("error_message")
+        .annotate(count=Count("id"))
     )
+    for row in rows:
+        reason, label, actionable = _classify_skipped(row["error_message"])
+        slot = buckets.setdefault(
+            reason, {"reason": reason, "label": label, "count": 0, "actionable": actionable}
+        )
+        slot["count"] += row["count"]
+    return sorted(buckets.values(), key=lambda b: (-b["count"], b["reason"]))
+
+
+def _error_samples(error_rows) -> dict:
+    """(code, subcode, status) → 그룹 내 **가장 최근** 원문 오류 메시지 1건 (OPS-2-a).
+
+    "무슨 파라미터인지 모르겠다"에 답하는 유일한 정보라 Meta 원문(SentDMLog.error_message)을
+    그대로 준다. Postgres DISTINCT ON 으로 그룹당 1행만 당겨 오고, 길이는 500자로 자른다.
+    운영 대시보드는 내부 전용이며 제한 역할(marketing_viewer)에는 이 엔드포인트 자체가
+    차단되므로(RBAC-2) 원문에 섞인 수신자 ID 가 외부로 나가지 않는다.
+    """
+    rows = (
+        error_rows.exclude(error_message="")
+        .order_by("error_code", "error_subcode", "status", "-created_at")
+        .distinct("error_code", "error_subcode", "status")
+        .values("error_code", "error_subcode", "status", "error_message")
+    )
+    return {
+        ((r["error_code"] or ""), (r["error_subcode"] or ""), r["status"]): truncate_message(
+            r["error_message"]
+        )
+        for r in rows
+    }
 
 
 _STATUS_RANK = {"ok": 0, "warning": 1, "critical": 2}
@@ -165,12 +219,33 @@ def _local_midnight(d: date) -> datetime:
 
 
 def _granularity_for_span(span: timedelta) -> str:
-    """범위 길이 → 시리즈 granularity (span<=2h→5m, <=2d→hour, >2d→day)."""
+    """범위 길이 → 시리즈 granularity (span<=2h→5m, <=2d→hour, <=120d→day, 그 이상→week).
+
+    120일 상한은 마케팅 trends 와 같은 임계값(TRENDS_DAY_MAX_SPAN_DAYS) — 전체 기간이
+    길어져도 버킷 수가 폭증하지 않게 한다 (OPS-4).
+    """
     if span <= timedelta(hours=2):
         return "5m"
     if span <= timedelta(days=2):
         return "hour"
-    return "day"
+    if span <= timedelta(days=TRENDS_DAY_MAX_SPAN_DAYS):
+        return "day"
+    return "week"
+
+
+def _service_start(now):
+    """window=all 의 since — DM 로그·스팸 로그를 통틀어 가장 이른 created_at (없으면 now).
+
+    ``_window_bounds`` 는 운영 대시보드와 ``GET /admin/spam/logs/`` 가 **공유**하므로
+    (spam.py 가 이 모듈에서 import) 한쪽 테이블만 보면 다른 쪽이 잘린다 → 두 테이블의
+    최솟값을 쓴다. 둘 다 인덱스된 컬럼의 MIN 이라 비용은 무시할 만하다.
+    """
+    firsts = [
+        SentDMLog.objects.aggregate(m=Min("created_at"))["m"],
+        SpamCommentLog.objects.aggregate(m=Min("created_at"))["m"],
+    ]
+    values = [f for f in firsts if f is not None]
+    return min(values) if values else now
 
 
 def _window_bounds(window: str, now) -> tuple[datetime, str]:
@@ -181,6 +256,7 @@ def _window_bounds(window: str, now) -> tuple[datetime, str]:
     - "today": Asia/Seoul 자정 → now, 시간 버킷("hour")
     - "7d": now-7d, 일 버킷("day")
     - "30d": now-30d, 일 버킷("day")
+    - "all": 서비스 최초 로그 → now, span 자동(≤120일 "day" / 그 이상 "week")  ← OPS-4
     """
     if window == "1h":
         return now - timedelta(hours=1), "5m"
@@ -190,6 +266,9 @@ def _window_bounds(window: str, now) -> tuple[datetime, str]:
         return now - timedelta(days=7), "day"
     if window == "30d":
         return now - timedelta(days=30), "day"
+    if window == "all":
+        since = _service_start(now)
+        return since, _granularity_for_span(now - since)
     return now - timedelta(hours=24), "hour"
 
 
@@ -207,14 +286,18 @@ def _custom_bounds(start: date, end: date, now) -> tuple[datetime, datetime, str
 def _floor_bucket(dt, granularity: str):
     """datetime/date 를 로컬(Asia/Seoul) 기준 버킷 시작 시각으로 내림.
 
-    - TruncDate 결과는 date 객체 → day 버킷은 그 날 로컬 자정으로 승격.
+    - TruncDate 결과는 date 객체 → day/week 버킷은 그 날 로컬 자정으로 승격.
+    - week 은 **월요일 자정** 기준 (마케팅 trends 의 주 버킷과 동일 규칙).
     - datetime 은 로컬 타임존으로 변환 후 granularity 별 내림.
     """
-    if granularity == "day":
+    if granularity in ("day", "week"):
         if isinstance(dt, date) and not isinstance(dt, datetime):
-            return _local_midnight(dt)
-        local = timezone.localtime(dt)
-        return local.replace(hour=0, minute=0, second=0, microsecond=0)
+            base = _local_midnight(dt)
+        else:
+            base = timezone.localtime(dt).replace(hour=0, minute=0, second=0, microsecond=0)
+        if granularity == "week":
+            base -= timedelta(days=base.weekday())
+        return base
     local = timezone.localtime(dt)
     if granularity == "hour":
         return local.replace(minute=0, second=0, microsecond=0)
@@ -222,8 +305,12 @@ def _floor_bucket(dt, granularity: str):
 
 
 def _series_trunc(granularity: str):
-    """granularity → Django Trunc 함수. day 는 로컬 날짜 경계 위해 현재 타임존 지정."""
-    if granularity == "day":
+    """granularity → Django Trunc 함수. day/week 는 로컬 날짜 경계 위해 현재 타임존 지정.
+
+    week 은 TruncDate 로 뽑고 파이썬(_floor_bucket)에서 월요일로 접는다 — TruncWeek 의
+    주 시작 규칙은 DB 설정에 의존하지만, 여기서는 항상 월요일이어야 하기 때문.
+    """
+    if granularity in ("day", "week"):
         return TruncDate("created_at", tzinfo=timezone.get_current_timezone())
     if granularity == "hour":
         return TruncHour("created_at")
@@ -232,7 +319,9 @@ def _series_trunc(granularity: str):
 
 def _zero_filled_series(rows: dict, since, until, granularity: str, fields: tuple) -> list[dict]:
     """[floor(since), floor(until)] 구간을 granularity 간격으로 제로필한 버킷 리스트."""
-    if granularity == "day":
+    if granularity == "week":
+        step = timedelta(days=7)
+    elif granularity == "day":
         step = timedelta(days=1)
     elif granularity == "hour":
         step = timedelta(hours=1)
@@ -268,7 +357,9 @@ def _bucketize(qs_rows, granularity: str, fields: tuple) -> dict:
 def _dm_quality(until, since, granularity: str) -> tuple[dict, dict]:
     """DM 발송 품질 블록 + 원시 집계(dict) 반환 (status_summary 재사용용).
 
-    ``until`` 은 시리즈 제로필 상한(프리셋=now, 커스텀=min(end+1일, now)).
+    ``until`` 은 범위 상한(프리셋=now, 커스텀=min(end+1일, now)) — 집계·시계열·오류 세분화
+    모두 ``[since, until)`` 로 **상한까지 맞춘다**. (예전에는 집계가 since 하한만 걸어
+    과거 커스텀 범위에서 범위 밖 최신 행까지 세어 목록/시계열과 어긋났다.)
     """
     # 오프닝/상호작용 분할: dm_kind 로만 requested 를 쪼갠다 (동일 window). 용어 정의 —
     #   오프닝 = opening + standalone (트리거로 나간 첫 DM, 게이트 미사용 단발 포함),
@@ -276,7 +367,8 @@ def _dm_quality(until, since, granularity: str) -> tuple[dict, dict]:
     #   dm_kind 는 non-null(default=standalone)이라 null/legacy 는 오프닝 범주로 자연 귀속.
     #   불변식: opening_requested + interaction_requested == requested.
     _opening_kinds = [SentDMLog.DMKind.OPENING, SentDMLog.DMKind.STANDALONE]
-    dm_agg = SentDMLog.objects.filter(created_at__gte=since).aggregate(
+    in_range = SentDMLog.objects.filter(created_at__gte=since, created_at__lt=until)
+    dm_agg = in_range.aggregate(
         requested=Count("id"),
         opening_requested=Count("id", filter=Q(dm_kind__in=_opening_kinds)),
         interaction_requested=Count("id", filter=Q(dm_kind=SentDMLog.DMKind.REWARD)),
@@ -295,6 +387,8 @@ def _dm_quality(until, since, granularity: str) -> tuple[dict, dict]:
         ),
         failed_no_trace=Count("id", filter=Q(status=SentDMLog.Status.FAILED_NO_TRACE)),
         legacy_failed=Count("id", filter=Q(status=SentDMLog.Status.FAILED)),
+        # OPS-1-b: legacy failed_api 도 '실패'로 합산 (예전엔 어느 KPI 에도 없었음)
+        legacy_failed_api=Count("id", filter=Q(status=SentDMLog.Status.FAILED_API)),
         recovery_pending=Count("id", filter=Q(status=SentDMLog.Status.RECOVERY_PENDING)),
         recovery_expired=Count("id", filter=Q(status=SentDMLog.Status.RECOVERY_EXPIRED)),
         skipped=Count("id", filter=Q(status=SentDMLog.Status.SKIPPED)),
@@ -312,8 +406,7 @@ def _dm_quality(until, since, granularity: str) -> tuple[dict, dict]:
         "skipped",
     )
     series_rows = (
-        SentDMLog.objects.filter(created_at__gte=since)
-        .annotate(bucket=_series_trunc(granularity))
+        in_range.annotate(bucket=_series_trunc(granularity))
         .values("bucket")
         .annotate(
             requested=Count("id"),
@@ -331,19 +424,31 @@ def _dm_quality(until, since, granularity: str) -> tuple[dict, dict]:
     )
 
     # J-1: 오류 세분화 — 선택 범위의 오류를 (error_code, error_subcode, status) 로 묶는다.
-    #   프론트는 status.ts 의 dmErrorCode/dmLogStatus 라벨로 렌더 → label 은 서버가 안 준다.
     #   code 없는 실패(failed_no_trace 등)는 code="" 로 식별. count desc 정렬.
+    # OPS-1-a: 각 행이 어느 KPI 에 속하는지 **서버가** 판정해 group 으로 내린다 — 판정의
+    #   단일 소스는 dm_status_groups.status_group (프론트가 2534025 를 재하드코딩하지 않도록).
+    # OPS-2: 원문 메시지(sample_error_message) + 원인·조치 사전(title/cause/action) 동봉.
+    error_rows = in_range.filter(status__in=DM_ERROR_STATUSES)
+    samples = _error_samples(error_rows)
     failure_breakdown = [
         {
-            "code": row["error_code"] or "",
-            "subcode": row["error_subcode"] or "",
+            "code": (row["error_code"] or ""),
+            "subcode": (row["error_subcode"] or ""),
             "status": row["status"],
             "count": row["count"],
             "recoverable": _error_is_recoverable(row["status"], row["error_subcode"]),
+            "group": (
+                "hidden_spam"
+                if status_group(row["status"], row["error_subcode"] or "") == GROUP_HIDDEN_SPAM
+                else "failed"
+            ),
+            "sample_error_message": samples.get(
+                ((row["error_code"] or ""), (row["error_subcode"] or ""), row["status"]), ""
+            ),
+            **describe_dm_error(row["error_code"], row["error_subcode"], row["status"]),
         }
         for row in (
-            SentDMLog.objects.filter(created_at__gte=since, status__in=DM_ERROR_STATUSES)
-            .values("error_code", "error_subcode", "status")
+            error_rows.values("error_code", "error_subcode", "status")
             .annotate(count=Count("id"))
             .order_by("-count", "status")
         )
@@ -379,17 +484,22 @@ def _dm_quality(until, since, granularity: str) -> tuple[dict, dict]:
             + dm_agg["recovery_delivered"]
         ),
         "accepted_pending": dm_agg["accepted"],
+        # OPS-1: Σ{failure_breakdown | group=="failed"} 와 정확히 일치해야 한다
+        # (legacy failed_api 포함 — OPS-1-b).
         "failed": (
             dm_agg["failed_token"]
             + dm_agg["failed_window"]
             + (dm_agg["failed_param"] - dm_agg["failed_param_hidden"])
             + dm_agg["failed_no_trace"]
             + dm_agg["legacy_failed"]
+            + dm_agg["legacy_failed_api"]
         ),
         "hidden_spam": (
             dm_agg["failed_param_hidden"] + dm_agg["recovery_pending"] + dm_agg["recovery_expired"]
         ),
         "skipped": dm_agg["skipped"],
+        # DM-4: 건너뜀 사유 분해 (Σ count == skipped). 조치 필요한 건 월 한도(actionable) 뿐.
+        "skipped_breakdown": _skipped_breakdown(in_range),
         "queued": dm_agg["queued"],
         "submitting": dm_agg["submitting"],
         "delivery_rate": _delivery_rate(dm_agg),
@@ -434,7 +544,13 @@ def _ig_connections(now) -> dict:
 
 
 def _spam(until, since, granularity: str) -> dict:
-    agg = SpamCommentLog.objects.filter(created_at__gte=since).aggregate(
+    """스팸 방어 블록 — 범위는 ``[since, until)``.
+
+    OPS-3: ``detected`` 는 ``GET /admin/spam/logs/`` 의 기본(status 미지정) ``total`` 과
+    **정확히 같아야 한다** — 두 쪽 모두 SPAM_DETECTED_STATUSES(clean 제외) + 같은 범위.
+    """
+    in_range = SpamCommentLog.objects.filter(created_at__gte=since, created_at__lt=until)
+    agg = in_range.aggregate(
         checked=Count("id"),
         detected=Count("id", filter=Q(status__in=SPAM_DETECTED_STATUSES)),
         hidden=Count("id", filter=Q(status=SpamCommentLog.Status.HIDDEN)),
@@ -443,8 +559,7 @@ def _spam(until, since, granularity: str) -> dict:
 
     fields = ("detected", "hidden")
     series_rows = (
-        SpamCommentLog.objects.filter(created_at__gte=since)
-        .annotate(bucket=_series_trunc(granularity))
+        in_range.annotate(bucket=_series_trunc(granularity))
         .values("bucket")
         .annotate(
             detected=Count("id", filter=Q(status__in=SPAM_DETECTED_STATUSES)),
@@ -459,7 +574,7 @@ def _spam(until, since, granularity: str) -> dict:
     top_categories = [
         {"category": row["spam_category"] or "uncategorized", "count": row["c"]}
         for row in (
-            SpamCommentLog.objects.filter(created_at__gte=since, status__in=SPAM_DETECTED_STATUSES)
+            in_range.filter(status__in=SPAM_DETECTED_STATUSES)
             .values("spam_category")
             .annotate(c=Count("id"))
             .order_by("-c")[:5]
@@ -578,16 +693,17 @@ def _action_required(now, since, dm_agg: dict, ig_block: dict, billing: dict) ->
     ]
 
 
-def _recent_errors(since) -> list[dict]:
+def _recent_errors(since, until) -> list[dict]:
     """DM 실패 / 결제 실패 / 스팸 숨김 실패 3종 병합 (timestamp desc, 최대 20).
 
     DM 실패는 '확인 필요' 실패만(DM_FAILED_Q) 노출한다 — 숨겨진 요청·스팸(2534025·복구
     대기/만료)은 실패가 아니므로 최근 오류 목록에서도 제외.
+    범위는 다른 블록과 동일하게 ``[since, until)``.
     """
     errors: list[dict] = []
 
     dm_failures = (
-        SentDMLog.objects.filter(DM_FAILED_Q, created_at__gte=since)
+        SentDMLog.objects.filter(DM_FAILED_Q, created_at__gte=since, created_at__lt=until)
         .select_related("campaign__ig_connection")
         .order_by("-created_at")[:RECENT_ERRORS_LIMIT]
     )
@@ -606,7 +722,9 @@ def _recent_errors(since) -> list[dict]:
         )
 
     payment_failures = (
-        PaymentHistory.objects.filter(created_at__gte=since, status=PaymentStatus.FAILED)
+        PaymentHistory.objects.filter(
+            created_at__gte=since, created_at__lt=until, status=PaymentStatus.FAILED
+        )
         .select_related("user")
         .order_by("-created_at")[:RECENT_ERRORS_LIMIT]
     )
@@ -624,7 +742,9 @@ def _recent_errors(since) -> list[dict]:
         )
 
     spam_failures = (
-        SpamCommentLog.objects.filter(created_at__gte=since, status=SpamCommentLog.Status.FAILED)
+        SpamCommentLog.objects.filter(
+            created_at__gte=since, created_at__lt=until, status=SpamCommentLog.Status.FAILED
+        )
         .select_related("spam_filter__ig_connection")
         .order_by("-created_at")[:RECENT_ERRORS_LIMIT]
     )
@@ -891,7 +1011,17 @@ DM 발송 품질 / IG 연동 / 스팸 필터 / 빌링 4개 서브시스템의 �
 ## 비즈니스 로직
 - **전수 집계**: request.user 소속 워크스페이스로 필터하지 않습니다 (백오피스 전역).
 - `window`: `1h`(5분 버킷) / `24h`(시간 버킷, 기본) / `today`(Asia/Seoul 자정~현재, 시간 버킷) /
-  `7d`·`30d`(일 버킷). 잘못된 값은 **400** — 레거시 `/metrics/overview/` 의 `since` 폴백과 달리 엄격 검증.
+  `7d`·`30d`(일 버킷) / **`all`(전체 기간)**. 잘못된 값은 **400** — 레거시 `/metrics/overview/` 의
+  `since` 폴백과 달리 엄격 검증.
+- **`window=all` (OPS-4)**: `since` = DM 로그·스팸 로그를 통틀어 가장 이른 `created_at`
+  (둘 다 0건이면 `now`). granularity 는 span 자동 — **span ≤ 120일 → `day`, 그 이상 → `week`**
+  (주 버킷 `ts` 는 **월요일 자정**, 마케팅 trends 와 동일 임계값/규칙). 커스텀 범위(최대 92일)로는
+  볼 수 없던 구간을 여기서 봅니다. 캐시는 **900초**(키 `admin:dash:ops:all`) — 다른 프리셋은 30초.
+  `GET /admin/spam/logs/` 도 같은 `ALLOWED_WINDOWS` 를 공유하므로 `window=all` 을 그대로 받습니다
+  (운영 대시보드에서 전체 기간을 고른 뒤 스팸 '자세히 보기' 로 넘어가도 400 이 나지 않습니다).
+- **시점(point-in-time) 지표는 range 와 무관**하므로 `all` 에서도 값이 같습니다 —
+  `status_summary`(dm 판정만 window 집계 기반) · `action_required` 의 즉시성 신호 ·
+  `ig_connections` · `risk_accounts`(항상 최근 24h).
 - **커스텀 범위**: `start=YYYY-MM-DD` + `end=YYYY-MM-DD` (Asia/Seoul 로컬 날짜) 를 함께 주면
   `window` 무시하고 커스텀 집계 — `window` 응답은 `"custom"`. since = start 로컬 자정,
   until = min(end+1일 자정, now). granularity 는 span 자동: span ≤ 2h → `5m`, ≤ 2일 → `hour`,
@@ -966,7 +1096,8 @@ curl -H "Authorization: Bearer <staff_token>" \\
                 required=False,
                 enum=list(ALLOWED_WINDOWS),
                 description="집계 윈도우. 1h(5분 버킷) / 24h(기본, 시간 버킷) / "
-                "today(Asia/Seoul 자정~현재) / 7d·30d(일 버킷). 그 외 값은 400. "
+                "today(Asia/Seoul 자정~현재) / 7d·30d(일 버킷) / all(전체 기간, "
+                "span≤120일이면 day·그 이상 week 버킷). 그 외 값은 400. "
                 "start&end 를 함께 주면 무시됩니다.",
             ),
             OpenApiParameter(
@@ -991,7 +1122,7 @@ curl -H "Authorization: Bearer <staff_token>" \\
             400: OpenApiResponse(
                 description="잘못된 window 값 — "
                 '{"success": false, "error": {"code": 400, "message": "...", '
-                '"details": {"allowed": ["1h","24h","today","7d","30d"]}}} '
+                '"details": {"allowed": ["1h","24h","today","7d","30d","all"]}}} '
                 "또는 잘못된 커스텀 범위(하나만/역순/파싱불가/span>92) — "
                 '{"success": false, "error": {"code": 400, "message": "...", '
                 '"details": {"reason": "..."}}}'
@@ -1063,6 +1194,20 @@ curl -H "Authorization: Bearer <staff_token>" \\
                         "failed": 27,
                         "hidden_spam": 20,
                         "skipped": 25,
+                        "skipped_breakdown": [
+                            {
+                                "reason": "monthly_dm_limit",
+                                "label": "월 DM 한도 도달",
+                                "count": 16,
+                                "actionable": True,
+                            },
+                            {
+                                "reason": "campaign_not_active",
+                                "label": "캠페인 일시정지 중",
+                                "count": 9,
+                                "actionable": False,
+                            },
+                        ],
                         "queued": 5,
                         "submitting": 0,
                         "delivery_rate": 0.9932,
@@ -1201,6 +1346,7 @@ curl -H "Authorization: Bearer <staff_token>" \\
             window = "custom"
             since, until, granularity = _custom_bounds(start_d, end_d, now)
             cache_key = CACHE_KEY_CUSTOM_TMPL.format(start=start_raw, end=end_raw)
+            cache_ttl = OPS_DASHBOARD_CACHE_TTL
         else:
             window = request.query_params.get("window", "24h")
             if window not in ALLOWED_WINDOWS:
@@ -1218,6 +1364,8 @@ curl -H "Authorization: Bearer <staff_token>" \\
             since, granularity = _window_bounds(window, now)
             until = now
             cache_key = CACHE_KEY_TMPL.format(window=window)
+            # OPS-4: all 은 계산량이 가장 크고 분 단위로 값이 안 변함 → 900초
+            cache_ttl = OPS_DASHBOARD_ALL_CACHE_TTL if window == "all" else OPS_DASHBOARD_CACHE_TTL
 
         cached = cache.get(cache_key)
         if cached is not None:
@@ -1243,12 +1391,12 @@ curl -H "Authorization: Bearer <staff_token>" \\
             "dm_quality": dm_block,
             "ig_connections": ig_block,
             "spam": spam_block,
-            "recent_errors": _recent_errors(since),
+            "recent_errors": _recent_errors(since, until),
             "risk_accounts": _risk_accounts(now),
         }
 
         data = AdminOpsDashboardSerializer(payload).data
-        cache.set(cache_key, data, OPS_DASHBOARD_CACHE_TTL)
+        cache.set(cache_key, data, cache_ttl)
 
         logger.info(
             "[admin-dash-ops] req=%s window=%s overall=%s dm_rate=%s",
