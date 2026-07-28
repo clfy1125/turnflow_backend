@@ -95,6 +95,16 @@ def apply_pii_policy(data: dict, *, role: str) -> dict:
         for code_row in _rows_at(out, ("channels", "referral_codes")):
             if isinstance(code_row, dict):
                 code_row["description"] = ""
+        # MKT-2: 채널 행 3종이 한 배열에 섞여 있다 — 링크 행의 생성자 이메일(내부 직원)과
+        # 제휴코드 행의 내부 메모를 같은 규칙으로 가린다. **여기서 가려야** 한다:
+        # 뷰에서 역할별로 만들면 full 이 채운 캐시를 제한 역할이 그대로 받는다.
+        for row in _rows_at(out, ("channels", "rows")):
+            if not isinstance(row, dict):
+                continue
+            if "created_by_email" in row:
+                row["created_by_email"] = ""
+            if "description" in row:
+                row["description"] = ""
 
     out["pii_masked"] = mask
     return out

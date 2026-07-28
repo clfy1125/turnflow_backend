@@ -1203,7 +1203,10 @@ def apply_refund(payment: PaymentHistory, *, downgrade: bool = True, reason: str
         if locked.status == PaymentStatus.REFUNDED:
             return False
         locked.status = PaymentStatus.REFUNDED
-        locked.save(update_fields=["status"])
+        # MKT-3: 환불 시각을 남긴다 — 기간 매출의 refunded 는 이 시각으로 귀속되므로
+        # (paid_at 으로 귀속하면 과거 기간 매출이 소급 변경된다) 비워두면 안 된다.
+        locked.refunded_at = timezone.now()
+        locked.save(update_fields=["status", "refunded_at"])
 
         sub = locked.subscription
         if downgrade and sub is not None:

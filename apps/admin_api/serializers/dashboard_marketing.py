@@ -223,45 +223,19 @@ class _FunnelSerializer(serializers.Serializer):
     )
 
 
-class _ChannelCampaignRowSerializer(serializers.Serializer):
-    """채널 하위 캠페인/소재 분해 1행 (N-2) — (utm_campaign × utm_content) 조합.
+class _ChannelPerfMixin(serializers.Serializer):
+    """채널 행·소스가 공유하는 성과 축 (퍼널 분기와 같은 단계 컬럼)."""
 
-    방문(고유 방문자)은 LandingVisit 저장 utm, 가입측 지표는 SignupAttribution 저장 utm 기준.
-    utm 없는 유입은 utm_campaign="" · utm_content="" 한 행 (프론트 라벨 "(직접/기타)").
-    """
-
-    utm_campaign = serializers.CharField(allow_blank=True, help_text='utm_campaign (없으면 "")')
-    utm_content = serializers.CharField(allow_blank=True, help_text='utm_content (없으면 "")')
     visits = serializers.IntegerField(
-        help_text="기간 내 이 조합 고유 방문자 수 (distinct visitor_id — 세션 수 아님)"
-    )
-    signups = serializers.IntegerField(help_text="코호트 가입자 수 (SignupAttribution utm 기준)")
-    ig_connected = serializers.IntegerField(help_text="IG 연동 도달 수 (채널 행과 동일 축)")
-    dm_campaign = serializers.IntegerField(help_text="DM 캠페인 생성 수")
-    page_created = serializers.IntegerField(help_text="페이지 생성 수")
-    page_published = serializers.IntegerField(help_text="페이지 공개 수")
-    paid = serializers.IntegerField(help_text="실결제(첫 PAID) 전환 수 — 체험 미포함")
-    free_trial = serializers.IntegerField(help_text="현재 무료체험 진행 중(미결제) 수")
-    paid_rate = serializers.FloatField(allow_null=True, help_text="paid / signups")
-
-
-class _ChannelRowSerializer(serializers.Serializer):
-    """채널 성과 1행 — SignupAttribution.channel 기준 (레퍼럴 오버레이 적용).
-
-    비순차 제품 특성 반영 — 단일 '활성화' 대신 분기 단계별 컬럼(IG 연동/DM 캠페인 ·
-    페이지 생성/페이지 공개) 을 제공한다 (퍼널 분기와 동일한 축).
-    """
-
-    channel = serializers.CharField(
-        help_text='채널 키. 어트리뷰션 없는 가입자는 "unknown", '
-        'ReferralRedemption 보유자는 "referral" (조회 시점 오버레이)'
-    )
-    visits = serializers.IntegerField(
-        help_text="기간 내 해당 채널 고유 방문자 수 (distinct visitor_id — 세션 수 아님)"
+        allow_null=True,
+        help_text="기간 내 고유 방문자 수 (distinct visitor_id — 세션 수 아님). "
+        "**제휴코드 행은 항상 null** — 코드는 URL 에 실려 오는 값이 아니라 결제 화면 "
+        "입력값이라 코드에 귀속되는 '방문'이 존재하지 않는다(0 과 구분 필요)",
     )
     signups = serializers.IntegerField(help_text="코호트 가입자 수")
     signup_rate = serializers.FloatField(
-        allow_null=True, help_text="signups / visits(고유 방문자) (visits 0 → null)"
+        allow_null=True,
+        help_text="signups / visits(고유 방문자). visits 가 0 이거나 null 이면 null",
     )
     ig_connected = serializers.IntegerField(help_text="IG 연동 도달 수 (DM 갈래 1단계)")
     dm_campaign = serializers.IntegerField(help_text="DM 캠페인 생성 수 (DM 갈래 2단계)")
@@ -274,18 +248,82 @@ class _ChannelRowSerializer(serializers.Serializer):
         help_text="현재 무료체험 진행 중(TRIALING 유료플랜)이며 미결제인 코호트 회원 수 (N-4)"
     )
     paid_rate = serializers.FloatField(allow_null=True, help_text="paid / signups (실결제 기준)")
-    campaigns = _ChannelCampaignRowSerializer(
-        many=True,
-        help_text="채널 하위 (utm_campaign × utm_content) 분해 (N-2) — "
-        "(paid+free_trial) desc → signups desc → visits desc 상위 CHANNEL_CAMPAIGNS_LIMIT(10)",
+
+
+class _ChannelSourceRowSerializer(_ChannelPerfMixin):
+    """``kind=other`` 행을 펼쳤을 때 나오는 소스 1줄 (리퍼러 추정 유입의 내역)."""
+
+    key = serializers.CharField(
+        help_text="소스 키 — 리퍼러 파생 채널(instagram_organic/search_organic/direct/…) "
+        "+ 특수 2종: biolink(고객 바이오링크 페이지 경유) / unsaved_utm(UTM 은 있는데 "
+        "저장된 채널 링크와 매칭 안 됨)"
     )
-    campaigns_truncated = serializers.BooleanField(
-        help_text="campaigns 가 상한(10)에 잘렸는지 — true 면 하위 조합이 더 존재"
+    label = serializers.CharField(help_text="한국어 표시명 (서버 제공 — 프론트 하드코딩 불필요)")
+
+
+class _ChannelRowSerializer(_ChannelPerfMixin):
+    """채널 성과 1행 (MKT-2) — ``kind`` 로 3종을 구분하는 **이종 배열**.
+
+    | kind | 무엇 | 전용 필드 |
+    |---|---|---|
+    | `other` | 리퍼러로 '추정'한 유입 전부를 접은 1행 (항상 첫 행, 1개) | `sources` |
+    | `link` | 저장한 채널 링크 1개 (방문 0이어도 행이 나온다) | `channel`,`url`,`utm`,`created_by_email` |
+    | `referral_code` | 제휴 코드 1개 (사용 0건이어도 행이 나온다) | `description`,`redemptions`,`converted`,`conversion_rate` |
+
+    배열 **순서를 그대로 렌더**하면 된다 (정렬 정책은 서버 소유): other → link(가입 desc)
+    → referral_code(가입 desc). 모르는 `kind` 는 건너뛰어도 되며, 추가 시 사전 공지한다.
+    """
+
+    kind = serializers.ChoiceField(
+        choices=["other", "link", "referral_code"], help_text="행 종류 판별자"
     )
+    key = serializers.CharField(
+        help_text='행 고유 키 — other="other", link=MarketingChannelLink.pk(문자열), '
+        "referral_code=코드 문자열. **trends.by_channel 의 키와 동일**(프론트 조인 키)"
+    )
+    label = serializers.CharField(help_text="화면 표시명 (링크 이름 / 코드 / '기타 …')")
     referral_overlap = serializers.IntegerField(
-        help_text="P-3 — 원래 이 채널로 저장됐으나 제휴코드 사용(레퍼럴 오버레이)으로 "
-        "referral 행으로 이동한 코호트 인원 수. 오버레이는 배타적(중복 집계 없음)이라 "
-        "이 채널이 그만큼 과소 집계됨을 보정 표기하는 용도. referral 행은 항상 0"
+        help_text="P-3 — 원래 이 행으로 집계됐어야 하나 제휴코드 사용으로 코드 행으로 "
+        "이동한 코호트 인원 수. 오버레이는 배타적(중복 집계 없음)이라 이 행이 그만큼 "
+        "과소 집계됨을 보정 표기하는 용도. 코드 행은 이동의 도착지라 항상 0"
+    )
+    # ── kind 별 전용 필드 (해당 kind 에서만 존재) ──
+    sources = _ChannelSourceRowSerializer(
+        many=True,
+        required=False,
+        help_text="`kind=other` 전용 — 접힌 유입의 내역 (visits desc). "
+        "⚠️ 한 방문자가 두 소스로 들어올 수 있어 Σsources.visits ≥ other.visits "
+        "(둘 다 각자 정확한 고유 방문자 수)",
+    )
+    channel = serializers.CharField(
+        required=False, help_text="`kind=link` 전용 — 저장 시 서버가 파생한 채널 키(배지 표기용)"
+    )
+    url = serializers.CharField(required=False, help_text="`kind=link` 전용 — 완성 UTM URL")
+    utm = serializers.DictField(
+        required=False,
+        help_text="`kind=link` 전용 — {source, medium, campaign, content} 원문(정규화 전)",
+    )
+    created_by_email = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text='`kind=link` 전용 — 링크를 만든 관리자. marketing_viewer 에는 "" (RBAC-4)',
+    )
+    description = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text='`kind=referral_code` 전용 — 제휴 내부 메모. marketing_viewer 에는 ""',
+    )
+    redemptions = serializers.IntegerField(
+        required=False, help_text="`kind=referral_code` 전용 — 기간 내 코드 사용(체험 시작) 수"
+    )
+    converted = serializers.IntegerField(
+        required=False, help_text="`kind=referral_code` 전용 — 그중 유료 전환 수"
+    )
+    # ⚠️ allow_null=True 를 주면 안 된다 — DRF get_attribute 가 키 부재 시 SkipField 보다
+    # allow_null 을 먼저 보고 None 을 채워, other/link 행에도 conversion_rate=null 이 붙는다.
+    # 값이 None 인 경우(사용 0건)는 allow_null 없이도 그대로 null 로 직렬화된다.
+    conversion_rate = serializers.FloatField(
+        required=False, help_text="`kind=referral_code` 전용 — converted/redemptions"
     )
 
 
@@ -303,11 +341,17 @@ class _ReferralCodeRowSerializer(serializers.Serializer):
 
 
 class _ChannelsSerializer(serializers.Serializer):
-    """채널 블록 — 어트리뷰션 미탑재 시 rows 는 빈 배열 (referral_codes 는 항상 제공)."""
+    """채널 블록 (MKT-2) — kind 판별자를 가진 이종 행 배열 + 레퍼럴 코드 목록."""
 
-    rows = _ChannelRowSerializer(many=True, help_text="채널별 성과 (signups desc)")
+    rows = _ChannelRowSerializer(
+        many=True,
+        help_text="채널별 성과 3종 (other → link → referral_code, 서버 정렬 그대로 렌더). "
+        "어트리뷰션 미탑재여도 link/referral_code 행은 나온다(각각 admin/billing 소스)",
+    )
     referral_codes = _ReferralCodeRowSerializer(
-        many=True, help_text="레퍼럴 코드별 성과 — billing 소스라 어트리뷰션과 무관"
+        many=True,
+        help_text="레퍼럴 코드별 성과 (기간 내 사용분만) — rows 의 referral_code 행과 같은 "
+        "데이터지만 사용 0건 코드는 포함하지 않는다. 하위호환용 유지",
     )
 
 
@@ -755,6 +799,58 @@ class _MrrBreakdownSerializer(serializers.Serializer):
     extra_ig_accounts = _ExtraIgAccountsMrrSerializer(help_text="추가 IG 계정 매출")
 
 
+class _RevenueByPlanRowSerializer(serializers.Serializer):
+    """기간 매출의 플랜별 1행 (추가 IG 계정 과금은 제외 — 별도 블록)."""
+
+    name = serializers.CharField(help_text='플랜 머신값. 구독이 지워진 결제는 "unknown"')
+    display_name = serializers.CharField(help_text="플랜 표시명")
+    net = serializers.IntegerField(help_text="이 플랜의 gross − refunded (원)")
+    payments = serializers.IntegerField(help_text="결제 성공 건수")
+
+
+class _RevenueExtraIgSerializer(serializers.Serializer):
+    """추가 IG 계정 과금분 (주문 ID 의 -extra-/-ex- 조각으로 판별)."""
+
+    net = serializers.IntegerField(help_text="추가 계정 과금 net (원)")
+    payments = serializers.IntegerField(help_text="추가 계정 결제 건수")
+
+
+class _PeriodRevenueSerializer(serializers.Serializer):
+    """MKT-3 — **선택한 기간에 실제 발생한 매출**. MRR 카드를 대체한다.
+
+    MRR 은 월 환산 반복 매출이라 기간 필터에 반응하지 않았다(7일을 골라도 30일을 골라도
+    같은 값) — 옆 카드들과 시간축이 어긋나 같은 화면에서 두 기준이 섞였다.
+
+    **귀속 규칙**
+    - `gross` = 결제 시점(paid_at) 귀속. 나중에 환불돼도 **과거 gross 는 변하지 않는다**.
+    - `refunded` = 환불 시점(refunded_at) 귀속. 6월 결제를 7월에 환불하면 7월에 잡힌다.
+    - 같은 기간 안에서 결제 후 환불되면 양쪽에 잡혀 net 에서 상쇄된다.
+
+    `mrr_breakdown` / `kpis.mrr` 는 그대로 유지된다 (CSV·계약 하위호환).
+    """
+
+    gross = serializers.IntegerField(help_text="기간 내 결제 성공 금액 합계 (원, 부분취소 행 제외)")
+    refunded = serializers.IntegerField(help_text="기간 내 환불된 금액 (원, 양수)")
+    net = serializers.IntegerField(help_text="gross − refunded — **화면 헤드라인**")
+    payments = serializers.IntegerField(help_text="결제 성공 건수 (실패·재시도 실패 건 제외)")
+    paying_users = serializers.IntegerField(help_text="결제한 고유 회원 수")
+    previous = serializers.IntegerField(
+        allow_null=True, help_text="직전 동일 기간의 net. **period=all 이면 null**"
+    )
+    delta_pct = serializers.FloatField(
+        allow_null=True, help_text="net 기준 증감률(%). previous 가 null/0 이면 null"
+    )
+    by_plan = _RevenueByPlanRowSerializer(many=True, help_text="플랜별 분해 (net desc)")
+    extra_ig_accounts = _RevenueExtraIgSerializer(
+        help_text="추가 IG 계정 과금 — by_plan 과 배타적이라 "
+        "**Σby_plan.net + extra_ig_accounts.net == net**"
+    )
+    vat_included = serializers.BooleanField(
+        help_text="net 이 부가세 포함 금액인지. 우리는 토스에 승인 요청한 **총 결제금액**을 "
+        "그대로 저장하므로 항상 true (별도 세액 필드 없음)"
+    )
+
+
 class _PeriodRangeSerializer(serializers.Serializer):
     """집계 기간 경계 (Asia/Seoul ISO 8601). current=[start,end), previous=직전 동일 길이."""
 
@@ -812,6 +908,8 @@ class _TrendBucketSerializer(serializers.Serializer):
         "고유 회원 수 (**버킷 단위** user dedupe — 주별이면 같은 주 중복 활동은 1명, "
         "가입 시기 무관 이벤트 기준)"
     )
+    # MKT-2: 키가 파생 채널이 아니라 channels.rows[].key 다 (표=링크 단위인데 그래프만
+    # 채널 단위면 한 화면에 두 분류가 공존한다). 라벨은 rows 에서 찾아 쓸 것(단일 소스).
     by_channel = serializers.DictField(
         child=_TrendChannelSliceSerializer(),
         help_text="Q-1 — 채널 키 → {visits, signups, activated, paid} 분해. "
@@ -1095,4 +1193,10 @@ class AdminMarketingDashboardSerializer(serializers.Serializer):
     plan_distribution = _PlanDistributionRowSerializer(
         many=True, help_text="플랜별 구독 상태 분포 (전 플랜, sort_order 순)"
     )
-    mrr_breakdown = _MrrBreakdownSerializer(help_text="MRR 브레이크다운")
+    period_revenue = _PeriodRevenueSerializer(
+        help_text="MKT-3 — 선택 기간에 실제 발생한 매출 (MRR 카드 대체)"
+    )
+    mrr_breakdown = _MrrBreakdownSerializer(
+        help_text="MRR 브레이크다운 (point-in-time). 화면에서는 period_revenue 로 대체됐지만 "
+        "CSV·계약 하위호환을 위해 유지"
+    )

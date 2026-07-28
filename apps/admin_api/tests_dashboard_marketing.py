@@ -134,6 +134,9 @@ def clean_slate(db):
     SpamCommentLog.objects.all().update(created_at=long_ago)
     PaymentHistory.objects.all().update(created_at=long_ago)
     PaymentHistory.objects.filter(paid_at__isnull=False).update(paid_at=long_ago)
+    # MKT-3: 환불은 refunded_at 으로 귀속되므로 이것도 창 밖으로 밀어야 한다 —
+    # 안 하면 기존 환불이 '이번 기간 환불'로 잡혀 period_revenue.net 이 음수가 된다.
+    PaymentHistory.objects.filter(refunded_at__isnull=False).update(refunded_at=long_ago)
     # trial_ends_at/converted_at 도 함께 이동 — P-1 종료 시점 집계가 잔존행에 오염되지 않게
     ReferralRedemption.objects.all().update(trial_started_at=long_ago, trial_ends_at=long_ago)
     ReferralRedemption.objects.filter(converted_at__isnull=False).update(converted_at=long_ago)
@@ -268,6 +271,40 @@ def _branch(res, branch_key, channel="all"):
     return next(b for b in _variant(res, channel)["branches"] if b["key"] == branch_key)
 
 
+# ─── MKT-2: 채널 행(other / link / referral_code) 조회 헬퍼 ──────────────
+# 테스트 DB 가 dev DB 라 남의 링크·코드 행이 섞여 들어온다 → 전체 배열 비교 금지,
+# 반드시 내가 만든 key 로 집어서 단언할 것.
+
+
+def _channel_row(res, key):
+    return next(r for r in res.data["channels"]["rows"] if r["key"] == str(key))
+
+
+def _source(res, key):
+    """other 행을 펼친 소스 1줄."""
+    return next(s for s in _channel_row(res, "other")["sources"] if s["key"] == key)
+
+
+def _mk_link(name, **utm):
+    """저장한 채널 링크 1개 (url/channel 은 대시보드 집계에 안 쓰이므로 단순 값)."""
+    from apps.admin_api.models import MarketingChannelLink
+
+    fields = {f"utm_{k}": v for k, v in utm.items()}
+    return MarketingChannelLink.objects.create(
+        name=name,
+        base_url="https://turnflow.link/",
+        url="https://turnflow.link/?x=1",
+        channel="meta_ads",
+        **{
+            "utm_source": "",
+            "utm_medium": "",
+            "utm_campaign": "",
+            "utm_content": "",
+            **fields,
+        },
+    )
+
+
 # ─── 권한 / period 파라미터 ──────────────────────────────────────────
 
 
@@ -355,8 +392,18 @@ class TestEmptyState:
         assert _node(res, "signup")["rate"] is None
 
         assert res.data["upsell_candidates"] == []
-        assert res.data["channels"]["rows"] == []
+        # MKT-2: other 행은 항상 존재한다(첫 행) — 빈 상태에서도 0 으로 나온다
+        other = _channel_row(res, "other")
+        assert other["kind"] == "other"
+        assert (other["visits"], other["signups"], other["sources"]) == (0, 0, [])
+        assert other["signup_rate"] is None
+        assert "conversion_rate" not in other  # 코드 행 전용 필드는 붙지 않는다
         assert res.data["mrr_breakdown"]["total"] == 0
+        # 기간 매출은 dev DB 의 기존 결제가 섞이므로 절대값이 아니라 **항등**으로 단언한다
+        rev = res.data["period_revenue"]
+        assert rev["net"] == rev["gross"] - rev["refunded"]
+        assert sum(p["net"] for p in rev["by_plan"]) + rev["extra_ig_accounts"]["net"] == rev["net"]
+        assert rev["vat_included"] is True
         assert isinstance(res.data["attribution_available"], bool)
 
     def test_attribution_flag_matches_app_presence(self, staff_client, clean_slate):
@@ -627,22 +674,26 @@ class TestChannels:
 
         res = staff_client.get(URL)
         assert res.data["attribution_available"] is True
-        rows = {r["channel"]: r for r in res.data["channels"]["rows"]}
+        # MKT-2: 리퍼러 추정 채널은 최상위 행이 아니라 other 행의 소스 줄이 된다
+        other = _channel_row(res, "other")
+        assert other["visits"] == 2 and other["signups"] == 2
 
-        ig = rows["instagram_organic"]
+        ig = _source(res, "instagram_organic")
         assert ig["visits"] == 2
         assert ig["signups"] == 1
         assert ig["signup_rate"] == 0.5
+        assert ig["label"] == "인스타그램 유입"
         # 비순차 분기 컬럼: 페이지 생성/공개는 1, IG·DM 갈래는 0
         assert ig["page_created"] == 1
         assert ig["page_published"] == 1
         assert ig["ig_connected"] == 0
         assert ig["dm_campaign"] == 0
 
-        unknown = rows["unknown"]
+        unknown = _source(res, "unknown")
         assert unknown["visits"] == 0
         assert unknown["signups"] == 1
         assert unknown["signup_rate"] is None  # 방문 0 → null
+        assert unknown["label"] == "어디서 왔는지 모름"
 
     def test_referral_overlay_wins_over_stored_channel(self, staff_client, clean_slate, pro_plan):
         now = timezone.now()
@@ -657,11 +708,15 @@ class TestChannels:
         )
 
         res = staff_client.get(URL)
-        rows = {r["channel"]: r for r in res.data["channels"]["rows"]}
-        assert rows["referral"]["signups"] == 1
-        # P-3 이후: 원 채널 행은 사라지지 않고 signups 0 + referral_overlap 로 보정 표기
-        assert rows["meta_ads"]["signups"] == 0
-        assert rows["meta_ads"]["referral_overlap"] == 1
+        # MKT-2: 제휴코드는 최상위 행 1개 (사용자는 저장 채널이 아니라 코드 행으로 간다)
+        code_row = _channel_row(res, code.code)
+        assert code_row["kind"] == "referral_code"
+        assert code_row["signups"] == 1
+        assert code_row["visits"] is None  # 코드에 귀속되는 '방문'은 존재하지 않음
+        assert code_row["signup_rate"] is None
+        assert code_row["redemptions"] == 1
+        # 원래 있었을 행(저장 UTM 없음 → other)에 과소 집계량이 표기된다
+        assert _channel_row(res, "other")["referral_overlap"] == 1
 
     def test_kpi_visits_counted(self, staff_client, clean_slate):
         vid = uuid.uuid4()
@@ -675,23 +730,15 @@ class TestChannels:
         assert _node(res, "visit")["count"] == 1
 
     def test_channel_visits_dedupe_by_visitor(self, staff_client, clean_slate):
-        """채널 성과·캠페인 분해의 visits = distinct visitor_id (재방문 세션 dedupe)."""
+        """행·소스의 visits = distinct visitor_id (재방문 세션 dedupe)."""
         vid = uuid.uuid4()
-        for _ in range(3):  # 같은 방문자가 같은 채널·utm 으로 3세션
-            LandingVisit.objects.create(
-                visitor_id=vid,
-                channel="instagram_organic",
-                utm_campaign="camp_a",
-                utm_content="banner",
-            )
+        for _ in range(3):  # 같은 방문자가 3세션
+            LandingVisit.objects.create(visitor_id=vid, channel="instagram_organic")
         LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="instagram_organic")
 
         res = staff_client.get(URL)
-        rows = {r["channel"]: r for r in res.data["channels"]["rows"]}
-        ig = rows["instagram_organic"]
-        assert ig["visits"] == 2  # 4세션 → 방문자 2명
-        combos = {(c["utm_campaign"], c["utm_content"]): c for c in ig["campaigns"]}
-        assert combos[("camp_a", "banner")]["visits"] == 1  # 3세션 → 1명
+        assert _source(res, "instagram_organic")["visits"] == 2  # 4세션 → 방문자 2명
+        assert _channel_row(res, "other")["visits"] == 2
 
     def test_channel_variant_matches_available_channels(self, staff_client, clean_slate):
         now = timezone.now()
@@ -1477,62 +1524,87 @@ class TestFunnelPlanConversion:
 
 
 @requires_analytics
-class TestChannelCampaigns:
-    def test_campaign_rows_grouped_by_utm(self, staff_client, clean_slate, pro_plan):
+class TestChannelLinkRows:
+    """MKT-2 — 저장한 채널 링크 1개 = 1행, UTM 4-튜플 완전일치로 유입을 붙인다."""
+
+    def test_link_row_collects_matching_traffic(self, staff_client, clean_slate, pro_plan):
         now = timezone.now()
-        # 방문: banner_a 조합 2회 + utm 없는 조합 1회 (meta_ads)
+        link = _mk_link("7월 메타 리타겟팅", source="meta", medium="cpc", campaign="jul")
+        utm = {"utm_source": "meta", "utm_medium": "cpc", "utm_campaign": "jul"}
         for _ in range(2):
-            LandingVisit.objects.create(
-                visitor_id=uuid.uuid4(),
-                channel="meta_ads",
-                utm_campaign="2026_spring",
-                utm_content="banner_a",
-            )
-        LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="meta_ads")
-        # 가입: banner_a 로 1명(실결제) + utm 없이 1명(체험 중)
-        u_a = _mk_user(joined=now - timedelta(days=3))
-        SignupAttribution.objects.create(
-            user=u_a,
-            channel="meta_ads",
-            signup_kind="email",
-            utm_campaign="2026_spring",
-            utm_content="banner_a",
+            LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="meta_ads", **utm)
+        u = _mk_user(joined=now - timedelta(days=3))
+        SignupAttribution.objects.create(user=u, channel="meta_ads", signup_kind="email", **utm)
+        _mk_paid_payment(u, paid_at=now - timedelta(days=1))
+
+        res = staff_client.get(URL)
+        row = _channel_row(res, link.pk)
+        assert row["kind"] == "link"
+        assert row["label"] == "7월 메타 리타겟팅"
+        assert row["utm"] == {"source": "meta", "medium": "cpc", "campaign": "jul", "content": ""}
+        assert (row["visits"], row["signups"], row["paid"]) == (2, 1, 1)
+        assert row["signup_rate"] == 0.5
+        # 링크로 잡힌 유입은 other 에 중복으로 들어가지 않는다
+        assert _channel_row(res, "other")["visits"] == 0
+
+    def test_saved_link_row_exists_with_zero_traffic(self, staff_client, clean_slate):
+        """만들었는데 아무도 안 온 링크를 보는 것이 이 화면의 용도 중 하나다."""
+        link = _mk_link("아무도 안 온 링크", source="nobody", medium="cpc")
+        row = _channel_row(staff_client.get(URL), link.pk)
+        assert (row["visits"], row["signups"]) == (0, 0)
+        assert row["signup_rate"] is None
+
+    def test_unmatched_utm_goes_to_its_own_source(self, staff_client, clean_slate):
+        """저장 안 된 UTM 은 direct 와 섞지 않는다 — 'UTM 붙였는데 왜 기타?' 추적용."""
+        LandingVisit.objects.create(
+            visitor_id=uuid.uuid4(), channel="other_campaign", utm_source="손으로만든것"
         )
-        _mk_paid_payment(u_a, paid_at=now - timedelta(days=1))
-        u_b = _mk_user(joined=now - timedelta(days=2))
-        SignupAttribution.objects.create(user=u_b, channel="meta_ads", signup_kind="email")
-        _mk_trial_sub(u_b, pro_plan)
+        LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="direct")
 
-        rows = {r["channel"]: r for r in staff_client.get(URL).data["channels"]["rows"]}
-        row = rows["meta_ads"]
-        assert row["paid"] == 1 and row["free_trial"] == 1
-        assert row["campaigns_truncated"] is False
-        combos = {(c["utm_campaign"], c["utm_content"]): c for c in row["campaigns"]}
-        banner = combos[("2026_spring", "banner_a")]
-        assert banner["visits"] == 2
-        assert banner["signups"] == 1
-        assert banner["paid"] == 1
-        assert banner["paid_rate"] == 1.0
-        blank = combos[("", "")]
-        assert blank["visits"] == 1
-        assert blank["signups"] == 1
-        assert blank["paid"] == 0
-        assert blank["free_trial"] == 1
+        res = staff_client.get(URL)
+        assert _source(res, "unsaved_utm")["visits"] == 1
+        assert _source(res, "unsaved_utm")["label"] == "저장 안 된 링크(UTM)"
+        assert _source(res, "direct")["visits"] == 1
 
-    def test_campaigns_truncated_flag(self, staff_client, clean_slate, monkeypatch):
-        monkeypatch.setattr("apps.admin_api.views.dashboard_marketing.CHANNEL_CAMPAIGNS_LIMIT", 1)
-        for content in ("a", "b"):
-            LandingVisit.objects.create(
-                visitor_id=uuid.uuid4(),
-                channel="meta_ads",
-                utm_campaign="camp",
-                utm_content=content,
-            )
+    def test_matching_ignores_case_and_whitespace(self, staff_client, clean_slate):
+        """저장 시점과 방문 시점의 정규화 규칙이 같아야 한다 (_utm_key 단일 소스)."""
+        link = _mk_link("대소문자", source="Meta", medium="CPC")
+        LandingVisit.objects.create(
+            visitor_id=uuid.uuid4(), channel="meta_ads", utm_source=" meta ", utm_medium="cpc"
+        )
+        assert _channel_row(staff_client.get(URL), link.pk)["visits"] == 1
 
-        rows = {r["channel"]: r for r in staff_client.get(URL).data["channels"]["rows"]}
-        row = rows["meta_ads"]
-        assert len(row["campaigns"]) == 1
-        assert row["campaigns_truncated"] is True
+    def test_biolink_badge_traffic_is_folded_into_other(self, staff_client, clean_slate):
+        """고객 바이오링크 배지 유입은 UTM 이 있어도 우리가 집행한 채널이 아니다."""
+        link = _mk_link("배지 흉내", source="turnflow_badge", medium="biolink")
+        LandingVisit.objects.create(
+            visitor_id=uuid.uuid4(),
+            channel="other_campaign",
+            utm_source="turnflow_badge",
+            utm_medium="biolink",
+            utm_content="brand-shop",
+        )
+        res = staff_client.get(URL)
+        assert _source(res, "biolink")["visits"] == 1
+        assert _source(res, "biolink")["label"] == "고객 바이오링크 페이지"
+        assert _channel_row(res, link.pk)["visits"] == 0  # 링크보다 바이오링크 판정이 우선
+
+    def test_duplicate_utm_link_rejected_on_create(self, staff_client, clean_slate):
+        """같은 4-튜플 링크가 둘이면 트래픽이 어느 행에 붙을지 모호해진다 → 생성 차단."""
+        _mk_link("먼저 만든 것", source="dupe", medium="cpc", campaign="x")
+        res = staff_client.post(
+            "/api/v1/admin/marketing/channel-links/",
+            {
+                "name": "나중에 만든 것",
+                "base_url": "https://turnflow.link/",
+                "utm_source": "DUPE",  # 대소문자만 다름 — 매칭 규칙상 같은 링크
+                "utm_medium": "cpc",
+                "utm_campaign": "x",
+            },
+            format="json",
+        )
+        assert res.status_code == 400
+        assert "먼저 만든 것" in str(res.data)
 
 
 # ─── N-3: 무료체험 active + 실결제 전환율 ───────────────────────────────
@@ -1606,8 +1678,7 @@ class TestChannelPaidVsFreeTrial:
         SignupAttribution.objects.create(user=u_paid, channel="meta_ads", signup_kind="email")
         _mk_paid_payment(u_paid, paid_at=now - timedelta(days=1))
 
-        rows = {r["channel"]: r for r in staff_client.get(URL).data["channels"]["rows"]}
-        row = rows["meta_ads"]
+        row = _channel_row(staff_client.get(URL), "other")
         assert row["paid"] == 1  # 실결제만 (체험 미포함)
         assert row["free_trial"] == 1
         assert row["paid_rate"] == 0.5  # 1/2 (실결제 기준 유지)
@@ -1692,11 +1763,19 @@ class TestTrialsEnded:
 
 @requires_analytics
 class TestReferralOverlap:
-    def test_moved_user_counted_on_origin_channel(self, staff_client, clean_slate, pro_plan):
+    def test_moved_user_counted_on_origin_row(self, staff_client, clean_slate, pro_plan):
         now = timezone.now()
-        # meta_ads 로 유입·가입했으나 제휴코드 사용 → referral 행으로 배타 이동
+        # 저장 링크로 유입·가입했으나 제휴코드 사용 → 코드 행으로 배타 이동
+        link = _mk_link("원래 링크", source="meta", medium="cpc", campaign="ov")
         u = _mk_user(joined=now - timedelta(days=3))
-        SignupAttribution.objects.create(user=u, channel="meta_ads", signup_kind="email")
+        SignupAttribution.objects.create(
+            user=u,
+            channel="meta_ads",
+            signup_kind="email",
+            utm_source="meta",
+            utm_medium="cpc",
+            utm_campaign="ov",
+        )
         code = ReferralCode.objects.create(code=f"OV-{uuid.uuid4().hex[:6]}", target_plan=pro_plan)
         ReferralRedemption.objects.create(
             user=u,
@@ -1705,13 +1784,13 @@ class TestReferralOverlap:
             trial_ends_at=now + timedelta(days=28),
         )
 
-        rows = {r["channel"]: r for r in staff_client.get(URL).data["channels"]["rows"]}
-        # referral 행에만 가입이 잡히고 (배타 — 중복 없음)
-        assert rows["referral"]["signups"] == 1
-        assert rows["referral"]["referral_overlap"] == 0
-        # 원 채널 행은 잔여 멤버가 없어도 overlap 표기를 위해 생성된다
-        assert rows["meta_ads"]["signups"] == 0
-        assert rows["meta_ads"]["referral_overlap"] == 1
+        res = staff_client.get(URL)
+        # 코드 행에만 가입이 잡히고 (배타 — 중복 없음)
+        assert _channel_row(res, code.code)["signups"] == 1
+        assert _channel_row(res, code.code)["referral_overlap"] == 0
+        # 원 링크 행은 잔여 멤버가 없어도 overlap 표기를 위해 값이 채워진다
+        assert _channel_row(res, link.pk)["signups"] == 0
+        assert _channel_row(res, link.pk)["referral_overlap"] == 1
 
 
 # ─── P-4: 일별 스냅샷 적재 시작일 노출 (snapshot_since) ─────────────────
@@ -1752,33 +1831,39 @@ class TestTrendsActivatedByChannel:
         assert bucket["activated"] == 1
 
     @requires_analytics
-    def test_by_channel_slices_sum_to_totals(self, staff_client, clean_slate):
+    def test_by_channel_keys_match_channel_rows(self, staff_client, clean_slate):
+        """MKT-2 — 그래프의 층 키 == 표의 rows[].key. 두 분류가 공존하면 안 된다."""
         now = timezone.now()
-        # 방문 2세션 (meta_ads 저장 채널)
-        LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="meta_ads")
-        LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="meta_ads")
-        # 가입 2명 — meta_ads 귀속 1 + 어트리뷰션 없음(unknown) 1
+        link = _mk_link("추이 링크", source="meta", medium="cpc", campaign="tr")
+        utm = {"utm_source": "meta", "utm_medium": "cpc", "utm_campaign": "tr"}
+        # 방문 2세션은 저장 링크로, 1세션은 리퍼러 추정(other)
+        LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="meta_ads", **utm)
+        LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="meta_ads", **utm)
+        LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="search_organic")
+        # 가입 2명 — 링크 귀속 1(활성화+결제) + 어트리뷰션 없음 1(→ other)
         u1 = _mk_user(joined=now)
-        SignupAttribution.objects.create(user=u1, channel="meta_ads", signup_kind="email")
+        SignupAttribution.objects.create(user=u1, channel="meta_ads", signup_kind="email", **utm)
         u2 = _mk_user(joined=now)
-        # u1 활성화(캠페인) + 첫 결제
         _mk_campaign(_mk_conn(u1))
         _mk_paid_payment(u1, paid_at=now)
-        assert u2  # unknown 채널 귀속 대상
+        assert u2  # other 귀속 대상
 
-        bucket = staff_client.get(URL).data["trends"]["buckets"][-1]
+        res = staff_client.get(URL)
+        bucket = res.data["trends"]["buckets"][-1]
         assert bucket["signups"] == 2
-        assert bucket["activated"] == 1
-        assert bucket["paid"] == 1
         by = bucket["by_channel"]
-        assert by["meta_ads"] == {"visits": 2, "signups": 1, "activated": 1, "paid": 1}
-        assert by["unknown"]["signups"] == 1
-        # 각 지표 Σ(채널) == 버킷 총량
+        assert by[str(link.pk)] == {"visits": 2, "signups": 1, "activated": 1, "paid": 1}
+        assert by["other"]["signups"] == 1
+        assert by["other"]["visits"] == 1
+        # 각 지표 Σ(키) == 버킷 총량
         for key in ("visits", "signups", "activated", "paid"):
             assert sum(s[key] for s in by.values()) == bucket[key], key
+        # 모든 by_channel 키가 표의 행으로 존재해야 라벨을 찾을 수 있다
+        row_keys = {r["key"] for r in res.data["channels"]["rows"]}
+        assert set(by) <= row_keys
 
     @requires_analytics
-    def test_referral_override_in_by_channel(self, staff_client, clean_slate, pro_plan):
+    def test_referral_code_key_in_by_channel(self, staff_client, clean_slate, pro_plan):
         now = timezone.now()
         u = _mk_user(joined=now)
         SignupAttribution.objects.create(user=u, channel="meta_ads", signup_kind="email")
@@ -1791,8 +1876,7 @@ class TestTrendsActivatedByChannel:
         )
 
         bucket = staff_client.get(URL).data["trends"]["buckets"][-1]
-        assert bucket["by_channel"]["referral"]["signups"] == 1
-        assert "meta_ads" not in bucket["by_channel"]  # 전부 0이라 생략
+        assert bucket["by_channel"][code.code]["signups"] == 1
 
 
 # ─── Q-2: 코호트 분석 매트릭스 ─────────────────────────────────────────
@@ -1991,11 +2075,163 @@ class TestReferralCampaignsByCode:
             trial_ends_at=now + timedelta(days=28),
         )
 
-        rows = {r["channel"]: r for r in staff_client.get(URL).data["channels"]["rows"]}
-        combos = {(c["utm_campaign"], c["utm_content"]): c for c in rows["referral"]["campaigns"]}
-        assert (code.code, "") in combos  # referral_codes[].code 와 조인 가능
-        assert ("spring", "a") not in combos  # 원래 utm 으로는 안 내려감
-        assert combos[(code.code, "")]["signups"] == 1
+        res = staff_client.get(URL)
+        row = _channel_row(res, code.code)
+        assert row["kind"] == "referral_code"
+        assert row["signups"] == 1  # 원래 utm 이 아니라 코드 행으로 잡힌다
+        assert row["redemptions"] == 1 and row["conversion_rate"] == 0.0
+        # 기존 referral_codes 블록과 같은 코드로 조인 가능 (하위호환 유지)
+        codes = {c["code"] for c in res.data["channels"]["referral_codes"]}
+        assert code.code in codes
+
+    def test_unused_code_still_gets_a_row(self, staff_client, clean_slate, pro_plan):
+        """사용 0건이어도 행이 나온다 — 프론트는 /admin/referral-codes/ 에 접근 권한이 없다."""
+        code = ReferralCode.objects.create(
+            code=f"ZZ{uuid.uuid4().hex[:6].upper()}", target_plan=pro_plan
+        )
+        row = _channel_row(staff_client.get(URL), code.code)
+        assert (row["redemptions"], row["signups"]) == (0, 0)
+        assert row["visits"] is None and row["conversion_rate"] is None
+
+
+# ─── MKT-3: 기간 매출 (MRR 대체) ───────────────────────────────────────
+
+
+class TestPeriodRevenue:
+    """귀속 규칙: gross=결제 시점 / refunded=환불 시점 → 과거 기간이 소급 변경되지 않는다."""
+
+    def _rev(self, staff_client, **params):
+        # 같은 테스트에서 두 번 호출하면 5분 캐시가 첫 응답을 돌려준다 → 매번 무효화
+        cache.delete_many(CACHE_KEYS)
+        return staff_client.get(URL, params).data["period_revenue"]
+
+    def _pay(
+        self, user, amount, paid_at, *, status=None, refunded_at=None, order_id=None, sub=None
+    ):
+        from apps.billing.models import PaymentHistory, PaymentStatus
+
+        return PaymentHistory.objects.create(
+            user=user,
+            subscription=sub,  # 없으면 by_plan 의 "unknown" 버킷
+            amount=amount,
+            status=status or PaymentStatus.PAID,
+            paid_at=paid_at,
+            refunded_at=refunded_at,
+            toss_order_id=order_id or f"t-{uuid.uuid4().hex[:16]}",
+        )
+
+    def test_gross_refunded_net_and_counts(self, staff_client, clean_slate):
+        now = timezone.now()
+        from apps.billing.models import PaymentStatus
+
+        u1, u2 = _mk_user(), _mk_user()
+        base = self._rev(staff_client)
+        self._pay(u1, 9900, now - timedelta(days=2))
+        self._pay(u1, 9900, now - timedelta(days=1))  # 같은 회원 2건
+        self._pay(u2, 19800, now - timedelta(days=3))
+
+        rev = self._rev(staff_client)
+        assert rev["gross"] - base["gross"] == 39600
+        assert rev["payments"] - base["payments"] == 3
+        assert rev["paying_users"] - base["paying_users"] == 2
+        assert rev["net"] == rev["gross"] - rev["refunded"]
+        assert PaymentStatus.PAID  # 임포트 사용 표시
+
+    def test_refund_is_attributed_to_when_it_happened(self, staff_client, clean_slate):
+        """지난 기간 결제를 이번 기간에 환불 — gross 는 그대로, 이번 기간 refunded 로 잡힌다."""
+        from apps.billing.models import PaymentStatus
+
+        now = timezone.now()
+        base = self._rev(staff_client, period="7d")
+        # 60일 전 결제(7d 창 밖) → 어제 환불(7d 창 안)
+        self._pay(
+            _mk_user(),
+            30000,
+            now - timedelta(days=60),
+            status=PaymentStatus.REFUNDED,
+            refunded_at=now - timedelta(days=1),
+        )
+        rev = self._rev(staff_client, period="7d")
+        assert rev["gross"] == base["gross"]  # 과거 결제는 이 창에 없음
+        assert rev["refunded"] - base["refunded"] == 30000
+        assert rev["net"] - base["net"] == -30000
+
+    def test_same_period_charge_and_refund_cancel_out(self, staff_client, clean_slate):
+        from apps.billing.models import PaymentStatus
+
+        now = timezone.now()
+        base = self._rev(staff_client)
+        self._pay(
+            _mk_user(),
+            12000,
+            now - timedelta(days=3),
+            status=PaymentStatus.REFUNDED,
+            refunded_at=now - timedelta(days=2),
+        )
+        rev = self._rev(staff_client)
+        assert rev["gross"] - base["gross"] == 12000  # 그 시점엔 실제로 들어온 돈
+        assert rev["refunded"] - base["refunded"] == 12000
+        assert rev["net"] == base["net"]
+
+    def test_partial_cancel_row_is_refund_not_negative_gross(self, staff_client, clean_slate):
+        """부분취소는 음수 금액의 **별도 행**이다 — gross 를 깎으면 안 된다."""
+        from apps.billing.models import PaymentStatus
+
+        now = timezone.now()
+        base = self._rev(staff_client)
+        self._pay(
+            _mk_user(),
+            -3000,
+            now - timedelta(days=1),
+            status=PaymentStatus.REFUNDED,
+            refunded_at=now - timedelta(days=1),
+        )
+        rev = self._rev(staff_client)
+        assert rev["gross"] == base["gross"]
+        assert rev["refunded"] - base["refunded"] == 3000  # 절대값으로 환불에 계상
+        assert rev["payments"] == base["payments"]
+
+    def test_extra_ig_account_charge_split_from_plan(self, staff_client, clean_slate, pro_plan):
+        now = timezone.now()
+        u = _mk_user()
+        sub = UserSubscription.objects.create(
+            user=u, plan=pro_plan, status=SubscriptionStatus.ACTIVE
+        )
+        base = self._rev(staff_client)
+        self._pay(
+            u,
+            29000,
+            now - timedelta(days=1),
+            order_id=f"tfsub-{uuid.uuid4().hex[:10]}-a0",
+            sub=sub,
+        )
+        self._pay(
+            u,
+            9900,
+            now - timedelta(days=1),
+            order_id=f"tfsub-{uuid.uuid4().hex[:10]}-extra-abc",
+            sub=sub,
+        )
+
+        rev = self._rev(staff_client)
+        assert rev["extra_ig_accounts"]["net"] - base["extra_ig_accounts"]["net"] == 9900
+        assert rev["extra_ig_accounts"]["payments"] - base["extra_ig_accounts"]["payments"] == 1
+        pro = next(p for p in rev["by_plan"] if p["name"] == "pro")
+        base_pro = next((p for p in base["by_plan"] if p["name"] == "pro"), {"net": 0})
+        assert pro["net"] - base_pro["net"] == 29000  # 추가계정분은 플랜에서 빠진다
+        # 항등: Σby_plan + extra == net
+        assert sum(p["net"] for p in rev["by_plan"]) + rev["extra_ig_accounts"]["net"] == rev["net"]
+
+    def test_previous_null_for_period_all(self, staff_client, clean_slate):
+        rev = self._rev(staff_client, period="all")
+        assert rev["previous"] is None
+        assert rev["delta_pct"] is None
+
+    def test_mrr_block_is_kept(self, staff_client, clean_slate):
+        """화면에서만 뺀다 — CSV·계약 하위호환을 위해 응답 필드는 유지."""
+        res = staff_client.get(URL)
+        assert "mrr_breakdown" in res.data
+        assert "mrr" in res.data["kpis"]
 
 
 # ─── R-1: period=all (전체 기간, 직전 기간 없음) ────────────────────────

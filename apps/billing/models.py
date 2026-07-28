@@ -612,6 +612,17 @@ class PaymentHistory(models.Model):
     failure_message = models.CharField(max_length=200, blank=True, default="")
 
     paid_at = models.DateTimeField(null=True, blank=True)
+    # MKT-3: 환불이 **일어난** 시각. 전액 환불은 원 행의 status 만 뒤집으므로(apply_refund)
+    # 이 필드가 없으면 "지난 달 매출"이 이번 달 환불로 소급해서 바뀐다 — 기간 매출은
+    # gross(=결제 시점 귀속) − refunded(=환불 시점 귀속) 로 계산해야 과거가 고정된다.
+    # 부분취소 행(_record_partial_cancels, amount<0)은 생성 시각이 곧 환불 시각.
+    refunded_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="환불 시각",
+        help_text="status=refunded 로 전환된 시각. 과거 데이터는 paid_at 으로 백필됨(근사).",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
