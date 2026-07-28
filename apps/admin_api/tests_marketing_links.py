@@ -137,15 +137,19 @@ class TestCreate:
 
 class TestListSharedScope:
     def test_links_shared_across_admins(self, client, db):
+        """전 관리자 공용 — 다른 관리자가 만든 링크도 보인다.
+
+        NOTE(test-db-not-clean): dev DB 에 실제 저장된 링크가 섞여 있어 **전역 count 단언
+        금지** — 내가 만든 링크가 남의 계정 목록에 보이는지로 검증한다.
+        """
         admin_a, admin_b = _mk_user(staff=True), _mk_user(staff=True)
         client.force_authenticate(user=admin_a)
         assert client.post(URL, PAYLOAD, format="json").status_code == 201
 
         client.force_authenticate(user=admin_b)  # 다른 관리자도 조회 가능 (전 관리자 공용)
-        res = client.get(URL)
+        res = client.get(URL, {"search": PAYLOAD["name"]})
         assert res.status_code == 200
-        assert res.data["count"] == 1
-        assert res.data["results"][0]["name"] == PAYLOAD["name"]
+        assert PAYLOAD["name"] in [r["name"] for r in res.data["results"]]
 
     def test_channel_filter(self, staff_client):
         staff_client.post(URL, PAYLOAD, format="json")

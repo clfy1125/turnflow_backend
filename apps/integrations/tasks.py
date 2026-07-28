@@ -1766,6 +1766,50 @@ def send_dm_task(self, log_id: str):
 
 # ===== 능동 검증 (단건) =====
 
+# ACCEPTED 후 이 시간까지 도착을 확인하지 못하면 '미확인' 종결 (v3.2).
+VERIFY_CUTOFF_SECONDS = 35 * 60
+
+
+def _verify_age_seconds(log) -> float:
+    return (timezone.now() - (log.accepted_at or log.created_at)).total_seconds()
+
+
+def _verify_abandon(log, reason: str) -> dict:
+    """cutoff 초과 → 미확인 종결.
+
+    v3.9: no_trace 는 '실패'가 아니라 '미확인' → 전용 카운터(success_rate/total_failed 와 분리).
+    """
+    log.mark_failed(status=SentDMLog.Status.FAILED_NO_TRACE, error_message=reason)
+    log.campaign.increment_unconfirmed()
+    return {"status": "failed_no_trace"}
+
+
+def _verify_terminate_or_defer(log, reason: str) -> dict:
+    """도착을 확인하지 못한 채 조회가 실패한 경우의 단일 출구.
+
+    cutoff 초과면 미확인 종결, 아니면 예약을 남기고 물러난다. **어느 쪽이든
+    'ACCEPTED + next_retry_at=None' 상태로 돌아가지 않는다** — 그 조합이 곧
+    reconcile 재큐 대상이라 매분 트레드밀이 된다.
+    """
+    age = _verify_age_seconds(log)
+    if age >= VERIFY_CUTOFF_SECONDS:
+        return _verify_abandon(log, f"Verification gave up after 35 minutes ({reason})")
+    return _verify_defer(log, age, reason=reason)
+
+
+def _verify_defer(log, age_seconds: float, reason: str) -> dict:
+    """cutoff 시점까지 한 번만 더 예약 (v3.9 sparse 폴링 = GET 약 2회).
+
+    ⚠️ **next_retry_at 을 반드시 남긴다.** reconcile_accepted_dms(1분 주기)는
+    ``next_retry_at`` 이 비어 있는 ACCEPTED 를 '예약 유실 고아'로 보고 재큐하므로,
+    예약만 하고 이 필드를 안 채우면 같은 행이 **매분 재큐되는 트레드밀**이 된다.
+    """
+    remaining = max(60, int(VERIFY_CUTOFF_SECONDS - age_seconds))
+    log.next_retry_at = timezone.now() + timedelta(seconds=remaining)
+    log.save(update_fields=["next_retry_at"])
+    verify_dm_delivery.apply_async(args=[str(log.id)], countdown=remaining)
+    return {"status": "deferred", "reason": reason, "next_check_in_seconds": remaining}
+
 
 @shared_task(bind=True, max_retries=3)
 def verify_dm_delivery(self, log_id: str):
@@ -1803,10 +1847,21 @@ def verify_dm_delivery(self, log_id: str):
         log.append_verification_log(
             {"path": "conv_api", "result": "transient_error", "error": str(e)}
         )
+        if self.request.retries >= self.max_retries:
+            # 재시도 소진 — 아래 api_error 와 같은 이유로 ACCEPTED 를 남겨두면 안 된다.
+            return _verify_terminate_or_defer(log, f"transient_error: {e}")
+        # 재시도가 in-flight 인 동안 reconcile 이 중복 재큐하지 않도록 예약을 남긴다.
+        log.next_retry_at = timezone.now() + timedelta(seconds=120)
+        log.save(update_fields=["next_retry_at"])
         raise self.retry(exc=e, countdown=120) from e
     except DMSendError as e:
         log.append_verification_log({"path": "conv_api", "result": "api_error", "error": str(e)})
-        return {"status": "api_error", "error": str(e)}
+        # ⚠️ 여기서 그냥 return 하면 status 가 ACCEPTED 로 남고 next_retry_at 도 비어 있어
+        #    reconcile_accepted_dms(1분 주기, 최대 200건)가 같은 행을 **영구히** 재큐한다.
+        #    토큰이 죽은 계정(code=190)·삭제된 메시지처럼 절대 성공하지 않는 조회가
+        #    verify 큐를 200건/분으로 점유했다(dev 실측 252건 → 400건/90초).
+        #    cutoff 를 지났으면 미확인 종결, 아니면 예약을 남기고 물러난다.
+        return _verify_terminate_or_defer(log, f"api_error: {e}")
 
     if message is not None:
         log.append_verification_log(
@@ -1816,28 +1871,14 @@ def verify_dm_delivery(self, log_id: str):
         return {"status": "delivered", "via": "conv_api"}
 
     # 미발견 — 35분 cutoff 검사
-    age = timezone.now() - (log.accepted_at or log.created_at)
-    log.append_verification_log(
-        {"path": "conv_api", "result": "not_found", "age_seconds": age.total_seconds()}
-    )
+    age = _verify_age_seconds(log)
+    log.append_verification_log({"path": "conv_api", "result": "not_found", "age_seconds": age})
 
-    if age.total_seconds() < 35 * 60:
-        # 첫 검증(10분 시점) — 35분 시점까지 한 번만 더 예약 (v3.9: sparse 폴링 = GET 약 2회).
-        remaining = max(60, int(35 * 60 - age.total_seconds()))
-        # next_retry_at 기록 → reconcile_accepted_dms 가 예약 살아있는 건은 재큐하지 않도록 게이트.
-        log.next_retry_at = timezone.now() + timedelta(seconds=remaining)
-        log.save(update_fields=["next_retry_at"])
-        verify_dm_delivery.apply_async(args=[log_id], countdown=remaining)
-        return {"status": "deferred", "next_check_in_seconds": remaining}
-
-    # 35분+ — 도착 확인 실패 종결 (자가 점검 체크리스트 영역)
-    log.mark_failed(
-        status=SentDMLog.Status.FAILED_NO_TRACE,
-        error_message="No echo and not found in Conversations API after 35 minutes",
-    )
-    # v3.9: no_trace 는 '실패'가 아니라 '미확인' → 전용 카운터(success_rate/total_failed 와 분리).
-    log.campaign.increment_unconfirmed()
-    return {"status": "failed_no_trace"}
+    if age >= VERIFY_CUTOFF_SECONDS:
+        # 35분+ — 도착 확인 실패 종결 (자가 점검 체크리스트 영역)
+        return _verify_abandon(log, "No echo and not found in Conversations API after 35 minutes")
+    # 첫 검증(10분 시점) — cutoff 시점까지 한 번만 더 예약
+    return _verify_defer(log, age, reason="not_found")
 
 
 # ===== Beat 워커 =====
@@ -1857,23 +1898,35 @@ def reconcile_accepted_dms():
     now = timezone.now()
     cutoff = now - timedelta(minutes=10)
     grace = now - timedelta(minutes=2)
+    limit = 200
     queryset = (
         SentDMLog.objects.filter(
             status=SentDMLog.Status.ACCEPTED,
             accepted_at__lte=cutoff,
         )
         .filter(Q(next_retry_at__isnull=True) | Q(next_retry_at__lte=grace))
-        .values_list("id", flat=True)[:200]
+        .order_by("accepted_at")  # 오래된 것부터 — 상한에 걸려도 백로그가 순서대로 빠진다
+        .values_list("id", flat=True)[: limit + 1]
     )
 
-    count = 0
-    for log_id in queryset:
+    log_ids = list(queryset)
+    saturated = len(log_ids) > limit
+    for log_id in log_ids[:limit]:
         verify_dm_delivery.delay(str(log_id))
-        count += 1
+    count = min(len(log_ids), limit)
 
+    if saturated:
+        # 정상 상태에서 이 태스크의 대상은 '예약 유실 고아' 뿐이라 보통 0~수건이다.
+        # 매분 상한을 채운다면 verify 가 ACCEPTED 를 종결하지 못하고 되돌려주는
+        # 경로가 있다는 신호 — 조용한 200건/분 트레드밀이 되기 전에 여기서 드러낸다.
+        logger.warning(
+            "reconcile_accepted_dms: 대상이 상한(%s)을 초과 — verify 가 ACCEPTED 를 "
+            "종결하지 못하는 경로를 확인할 것",
+            limit,
+        )
     if count:
         logger.info(f"reconcile_accepted_dms: queued {count} verifications")
-    return {"queued": count}
+    return {"queued": count, "saturated": saturated}
 
 
 @shared_task

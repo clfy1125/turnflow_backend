@@ -117,6 +117,22 @@ class AdminChannelLinkWriteSerializer(serializers.ModelSerializer):
         # utm 값 정규화(공백 제거) — 채널 파생/URL 조합 모두 동일 값 사용
         for field in _UTM_FIELDS:
             attrs[field] = (attrs.get(field) or "").strip()
+        # MKT-2: 같은 utm 4-튜플 링크가 둘이면 대시보드가 그 트래픽을 **어느 행에 붙일지
+        # 모호해진다**(현재 규칙은 '먼저 만든 링크가 이김'). 애초에 만들지 못하게 막는다.
+        # 매칭은 대소문자·공백 무시라 여기 중복 판정도 iexact 로 맞춘다.
+        dupe = MarketingChannelLink.objects.filter(
+            **{f"{field}__iexact": attrs.get(field, "") for field in _UTM_FIELDS}
+        ).first()
+        if dupe is not None:
+            raise serializers.ValidationError(
+                {
+                    "utm_source": (
+                        f"같은 UTM 조합의 링크가 이미 있습니다: '{dupe.name}'. "
+                        "이름만 다르게 저장해도 유입은 한 행으로만 집계되므로, "
+                        "기존 링크를 쓰거나 utm 조합을 바꿔주세요."
+                    )
+                }
+            )
         return attrs
 
     def create(self, validated_data: dict) -> MarketingChannelLink:

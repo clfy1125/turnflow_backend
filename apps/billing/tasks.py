@@ -729,7 +729,10 @@ def _webhook_payment_event(log) -> None:
         if payment.status == PaymentStatus.PENDING:
             payment.status = PaymentStatus.PAID  # 환불 가드 통과용 중간 확정
             payment.toss_payment_key = payment.toss_payment_key or payment_key
-            payment.save(update_fields=["status", "toss_payment_key"])
+            # paid_at 을 비워두면 기간 매출에서 gross 에는 안 잡히고 refunded 에만 잡혀
+            # net 이 음수가 된다 (MKT-3). 승인 시각을 모르므로 확정 시점으로 채운다.
+            payment.paid_at = payment.paid_at or timezone.now()
+            payment.save(update_fields=["status", "toss_payment_key", "paid_at"])
         apply_refund(payment, downgrade=True, reason="webhook_cancel")
     elif toss_status == "PARTIAL_CANCELED":
         _record_partial_cancels(payment, data)
@@ -757,6 +760,9 @@ def _record_partial_cancels(payment, toss_payment: dict) -> None:
                 "description": f"부분 환불 (원거래: {payment.toss_order_id})",
                 "receipt_url": payment.receipt_url,
                 "paid_at": timezone.now(),
+                # MKT-3: 부분취소 행은 생성 시각이 곧 환불 시각 — 전액 환불(apply_refund)과
+                # 같은 타임라인에 놓여야 기간 매출의 refunded 합이 맞는다.
+                "refunded_at": timezone.now(),
             },
         )
     logger.info("부분취소 반영: order=%s", payment.toss_order_id)

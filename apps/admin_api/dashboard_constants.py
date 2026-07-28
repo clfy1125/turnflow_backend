@@ -74,9 +74,19 @@ ONBOARDING_SAMPLE_LIMIT = 5
 RECENT_CANCELLATIONS_LIMIT = 8
 # 해지 사유 TOP N
 CANCEL_REASONS_TOP = 5
-# 채널별 성과의 하위 캠페인(utm_campaign × utm_content) 분해 — 채널당 상위 N개 (N-2).
-# (paid+free_trial) desc → signups desc → visits desc 정렬 후 캡, 잘리면 campaigns_truncated.
-CHANNEL_CAMPAIGNS_LIMIT = 10
+
+# ── 채널별 성과 행/소스 (MKT-2 · MKT-4 · MKT-5) ───────────────────────
+# other 행을 펼쳤을 때 보여줄 소스 줄 수 상한. 초과분은 other_referral("기타 외부")로 접는다.
+# 리퍼러 파생 채널은 최대 9종이라 평소엔 안 걸리지만, 대부분 0~2명이면 신호가 묻히므로
+# **서버가** 접는다 (프론트가 접으면 접힌 값의 정의가 화면마다 달라진다).
+SOURCE_ROWS_MAX = 8
+# '저장 안 된 링크(UTM)' 줄에 함께 내려보낼 조합 목록 상한 (방문 desc). 이 값이 길다는 것
+# 자체가 신호라 전수 나열은 불필요 — 잘리면 combos_truncated=true.
+UNSAVED_UTM_COMBOS_LIMIT = 10
+# 퍼널 채널 드롭다운(available_channels)에 실을 **저장 링크** variant 상한 (가입 desc).
+# variant 1개당 노드·분기·breakdown 이 통째로 실려 응답에서 가장 무거운 블록이라 캡이 필요.
+# all/other/제휴코드는 캡 대상이 아니다. 잘리면 available_channels_truncated=true.
+FUNNEL_LINK_VARIANTS_MAX = 10
 
 # ── 고객 액션 리스트 (Q-3) ───────────────────────────────────────────
 CUSTOMER_ACTIONS_LIMIT = 20  # payment_failed / dormant / recent_churn 각 리스트 캡
