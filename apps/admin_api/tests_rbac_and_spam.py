@@ -253,12 +253,34 @@ class TestPiiMasking:
             assert row["link"] == {"page": None, "params": {}}
             assert row["ref"].startswith("u_")
             assert row["email"] == "" or "***@" in row["email"]
-        # MKT-2/CLN-1: 코드 메모·링크 생성자 이메일은 채널 행에서 가린다
+        # MKT-2/CLN-1: 링크 생성자 이메일(내부 직원)만 가린다
         # (별도 referral_codes 블록은 제거됨 — rows 의 코드 행이 상위집합)
         assert "referral_codes" not in data["channels"]
         for row in data["channels"]["rows"]:
-            assert row.get("description", "") == ""
             assert row.get("created_by_email", "") == ""
+
+    def test_referral_code_description_visible_to_viewer(self, viewer, db):
+        """RBAC-16 — 제휴 메모는 가리지 않는다(직전 Q2 결정 철회).
+
+        코드 문자열·사용 인원·전환율이 이미 보이는데 설명만 가리면 "무슨 코드인지 모르는
+        숫자"가 된다 — 가려서 얻는 보호 없이 실용만 잃는다.
+        """
+        from apps.billing.models import ReferralCode, SubscriptionPlan
+
+        plan, _ = SubscriptionPlan.objects.get_or_create(
+            name="pro", defaults={"display_name": "프로", "monthly_price": 14900}
+        )
+        code = ReferralCode.objects.create(
+            code=f"RB{uuid.uuid4().hex[:6].upper()}",
+            description="크리에이터 협업 · 10% 쿠폰",
+            target_plan=plan,
+        )
+        cache.delete_many(MKT_CACHE_KEYS)
+
+        data = _login(viewer).get(MARKETING_URL).json()
+        assert data["pii_masked"] is True  # 다른 PII 는 여전히 마스킹
+        row = next(r for r in data["channels"]["rows"] if r["key"] == code.code)
+        assert row["description"] == "크리에이터 협업 · 10% 쿠폰"
 
     def test_full_admin_sees_raw_and_ref(self, full_admin):
         data = _login(full_admin).get(MARKETING_URL).json()

@@ -74,7 +74,8 @@ def apply_pii_policy(data: dict, *, role: str) -> dict:
 
     - 공통: 회원 행에 ``ref``(비가역 안정 참조값) 주입.
     - marketing_viewer: ``email`` 마스킹 · ``user_id=None`` · ``link`` 비움 ·
-      ``channels.referral_codes[].description``(제휴 내부 메모) 제거.
+      채널 링크 행의 ``created_by_email``(내부 직원 이메일) 제거.
+      제휴코드 ``description`` 은 **가리지 않는다**(RBAC-16 — 아래 주석 참고).
 
     캐시 오염을 막기 위해 마스킹 시에는 깊은 복사본을 만든다.
     """
@@ -91,17 +92,18 @@ def apply_pii_policy(data: dict, *, role: str) -> dict:
             row["link"] = {"page": None, "params": {}}
 
     if mask:
-        # MKT-2: 채널 행 3종이 한 배열에 섞여 있다 — 링크 행의 생성자 이메일(내부 직원)과
-        # 제휴코드 행의 내부 메모(제휴 계약 정보, Q2)를 같은 규칙으로 가린다.
-        # **여기서 가려야** 한다: 뷰에서 역할별로 만들면 full 이 채운 캐시를 제한 역할이
-        # 그대로 받는다. (CLN-1 로 channels.referral_codes 블록은 사라졌다)
+        # MKT-2: 채널 행 3종이 한 배열에 섞여 있다 — 링크 행의 **생성자 이메일**(내부 직원
+        # 개인정보)만 가린다. **여기서 가려야** 한다: 뷰에서 역할별로 만들면 full 이 채운
+        # 캐시를 제한 역할이 그대로 받는다. (CLN-1 로 channels.referral_codes 블록은 사라졌다)
+        #
+        # ⚠️ RBAC-16(2026-07-28): 제휴코드 행의 ``description`` 마스킹은 **철회**했다.
+        #    직전 결정(Q2 "제휴 내부 메모는 외주 비노출")이 과했다 — 이 값은 "이 코드가 어느
+        #    제휴인지" 적은 라벨("크리에이터 협업 · 10% 쿠폰")이고, 코드 문자열·사용 인원·
+        #    전환율은 이미 다 보인다. 설명만 가리면 "무슨 코드인지 모르는 숫자"가 되어
+        #    **가려서 얻는 보호 없이 실용만 잃는다**. 개인정보(이메일·회원 식별자)는 그대로 가린다.
         for row in _rows_at(out, ("channels", "rows")):
-            if not isinstance(row, dict):
-                continue
-            if "created_by_email" in row:
+            if isinstance(row, dict) and "created_by_email" in row:
                 row["created_by_email"] = ""
-            if "description" in row:
-                row["description"] = ""
 
     out["pii_masked"] = mask
     return out

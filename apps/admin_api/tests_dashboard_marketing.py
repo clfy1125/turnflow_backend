@@ -676,7 +676,9 @@ class TestChannels:
         assert res.data["attribution_available"] is True
         # MKT-2: 리퍼러 추정 채널은 최상위 행이 아니라 other 행의 소스 줄이 된다
         other = _channel_row(res, "other")
-        assert other["visits"] == 2 and other["signups"] == 2
+        # MKT-10: 귀속 행이 없는 두 번째 회원은 채널 분해에서 빠진다(attribution_gap 으로)
+        assert other["visits"] == 2 and other["signups"] == 1
+        assert res.data["channels"]["attribution_gap"]["signups_unattributed"] == 1
 
         ig = _source(res, "instagram_organic")
         assert ig["visits"] == 2
@@ -689,12 +691,8 @@ class TestChannels:
         assert ig["ig_connected"] == 0
         assert ig["dm_campaign"] == 0
 
-        # MKT-6 ②: 귀속 기록이 없는 가입자(구 unknown)는 direct 로 접힌다 —
-        # 라벨이 같은 줄이 둘 생기지 않게. 방문 없는 소스라도 가입은 여기 잡힌다.
-        direct = _source(res, "direct")
-        assert direct["signups"] == 1
-        assert direct["label"] == "어디서 왔는지 모름"
-        assert "unknown" not in {s["key"] for s in _channel_row(res, "other")["sources"]}
+        # MKT-6 ②: 저장 channel 이 unknown 인 경우는 direct 로 접힌다(라벨 중복 방지)
+        assert "unknown" not in {s["key"] for s in other["sources"]}
 
     def test_referral_overlay_wins_over_stored_channel(self, staff_client, clean_slate, pro_plan):
         now = timezone.now()
@@ -2236,13 +2234,15 @@ class TestSourceContract:
         for _ in range(3):
             LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="search_organic")
         LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="instagram_organic")
-        u = _mk_user(joined=now - timedelta(days=2))  # 귀속 없음 → direct(방문 0)
-        assert u
+        # 방문 0 · 가입 1 인 소스 (blog_organic) — 정렬 꼬리 확인용
+        u = _mk_user(joined=now - timedelta(days=2))
+        SignupAttribution.objects.create(user=u, channel="blog_organic", signup_kind="email")
 
         sources = _channel_row(staff_client.get(URL), "other")["sources"]
         keys = [s["key"] for s in sources]
         assert keys[0] == "search_organic"  # 방문 3
-        assert keys.index("instagram_organic") < keys.index("direct")  # 방문 1 > 0
+        assert keys.index("instagram_organic") < keys.index("blog_organic")  # 방문 1 > 0
+        assert _source(staff_client.get(URL), "blog_organic")["visits"] == 0
 
     def test_small_sources_folded_into_other_referral(self, staff_client, clean_slate, monkeypatch):
         """MKT-6 ① — 줄이 많아지면 서버가 접는다(프론트가 접으면 정의가 화면마다 달라진다)."""
@@ -2283,6 +2283,93 @@ class TestSourceContract:
             "free_trial",
         ):
             assert sum(s[metric] for s in sources) == other[metric], metric
+
+
+# ─── MKT-9/10/11: 라벨 · 귀속 공백 분리 · 캐시 무효화 ────────────────────
+
+
+@requires_analytics
+class TestAttributionGap:
+    """MKT-10 — 계측 공백은 채널 성과가 아니다. 채널 행에서 빼고 표 밖에 숫자로 둔다."""
+
+    def test_unattributed_signups_excluded_from_rows(self, staff_client, clean_slate):
+        now = timezone.now()
+        u_ok = _mk_user(joined=now - timedelta(days=2))
+        SignupAttribution.objects.create(user=u_ok, channel="search_organic", signup_kind="email")
+        _mk_user(joined=now - timedelta(days=2))  # 귀속 행 없음 (계측 공백)
+        _mk_user(joined=now - timedelta(days=1))  # 귀속 행 없음
+
+        res = staff_client.get(URL)
+        gap = res.data["channels"]["attribution_gap"]
+        assert gap["signups_unattributed"] == 2
+        assert gap["share"] == round(2 / 3, 4)
+        # 항등: Σrows.signups + 공백 == 이 기간 가입자 수 (= 퍼널 signup 노드)
+        rows_signups = sum(r["signups"] for r in res.data["channels"]["rows"])
+        assert rows_signups + gap["signups_unattributed"] == _node(res, "signup")["count"] == 3
+        # 출처 미상 줄에는 계측 공백이 섞이지 않는다
+        assert _source(res, "search_organic")["signups"] == 1
+        assert "direct" not in {s["key"] for s in _channel_row(res, "other")["sources"]}
+
+    def test_direct_label_is_shortened(self, staff_client, clean_slate):
+        """MKT-9 — 표에서 길이 균형이 안 맞아 문구만 줄였다(의미는 동일)."""
+        LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="direct")
+        assert _source(staff_client.get(URL), "direct")["label"] == "출처 미상"
+
+    def test_since_is_earliest_attribution_record(self, staff_client, clean_slate):
+        u = _mk_user(joined=timezone.now() - timedelta(days=2))
+        attr = SignupAttribution.objects.create(user=u, channel="direct", signup_kind="email")
+        gap = staff_client.get(URL).data["channels"]["attribution_gap"]
+        assert gap["since"] is not None
+        # 전 기간 최솟값이라 방금 만든 행보다 이르거나 같다 (직렬화 결과는 문자열 → 파싱)
+        assert datetime.fromisoformat(str(gap["since"])) <= attr.created_at
+
+
+class TestChannelLinkCacheBust:
+    """MKT-11 — 저장 직후 확인하는 흐름이라 5분 지연이 '동작 안 함'으로 읽힌다."""
+
+    _LINKS = "/api/v1/admin/marketing/channel-links/"
+
+    def test_created_link_appears_immediately(self, staff_client, clean_slate):
+        staff_client.get(URL)  # 캐시 적재
+        res = staff_client.post(
+            self._LINKS,
+            {
+                "name": "광고용 릴스",
+                "base_url": "https://turnflow.link/",
+                "utm_source": "reels",
+                "utm_medium": "social",
+            },
+            format="json",
+        )
+        assert res.status_code == 201
+        # 캐시를 지우지 않으면 여기서 행이 없다 (직전 GET 의 본문이 그대로 온다)
+        row = _channel_row(staff_client.get(URL), res.data["id"])
+        assert row["label"] == "광고용 릴스"
+
+    def test_renamed_link_label_updates_immediately(self, staff_client, clean_slate):
+        link = _mk_link("옛 이름", source="rn", medium="cpc")
+        staff_client.get(URL)
+        res = staff_client.patch(f"{self._LINKS}{link.pk}/", {"name": "새 이름"}, format="json")
+        assert res.status_code == 200
+        assert _channel_row(staff_client.get(URL), link.pk)["label"] == "새 이름"
+
+    def test_deleted_link_disappears_immediately(self, staff_client, clean_slate):
+        link = _mk_link("지울 링크", source="del", medium="cpc")
+        assert _channel_row(staff_client.get(URL), link.pk)  # 캐시 적재 + 존재 확인
+        assert staff_client.delete(f"{self._LINKS}{link.pk}/").status_code == 204
+        keys = {r["key"] for r in staff_client.get(URL).data["channels"]["rows"]}
+        assert str(link.pk) not in keys
+
+    def test_snapshot_key_is_kept(self, staff_client, clean_slate):
+        """기간 무관 누적치는 링크와 무관 — 매번 지우면 비싼 재계산이 반복된다."""
+        from apps.admin_api.dashboard_cache import (
+            MKT_CACHE_KEY_SNAPSHOT,
+            bust_marketing_dashboard_cache,
+        )
+
+        cache.set(MKT_CACHE_KEY_SNAPSHOT, {"sentinel": 1}, 60)
+        bust_marketing_dashboard_cache(reason="test")
+        assert cache.get(MKT_CACHE_KEY_SNAPSHOT) == {"sentinel": 1}
 
 
 # ─── MKT-3: 기간 매출 (MRR 대체) ───────────────────────────────────────

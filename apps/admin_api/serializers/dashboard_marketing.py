@@ -387,8 +387,30 @@ class _ChannelRowSerializer(_ChannelPerfMixin):
     )
 
 
+class _AttributionGapSerializer(serializers.Serializer):
+    """MKT-10 — 귀속 기록이 없어 어느 채널에도 집계되지 않은 가입 인원 (데이터 품질).
+
+    사용자 행동이 아니라 **우리 계측 공백**이라 채널 행이 아니다. 채널 표의 신뢰도
+    정보로 표 밖에 두며, 비율이 크면 그 자체가 고쳐야 할 버그 신호다.
+    """
+
+    signups_unattributed = serializers.IntegerField(
+        help_text="이 기간 가입자 중 SignupAttribution 행이 없는 인원. "
+        "**Σrows[].signups + 이 값 == 이 기간 가입자 수**(funnel 의 signup 노드 count)"
+    )
+    share = serializers.FloatField(
+        allow_null=True, help_text="전체 가입 대비 비율 (0~1). 가입 0이면 null"
+    )
+    since = serializers.DateTimeField(
+        allow_null=True,
+        help_text="계측 최초 기록 시각(전 기간 SignupAttribution 최솟값). 이 시각 이전 가입은 "
+        "애초에 기록이 없으므로 화면에 '계측 도입 이전 가입 포함'을 덧붙일 수 있다. "
+        "어트리뷰션 미탑재면 null",
+    )
+
+
 class _ChannelsSerializer(serializers.Serializer):
-    """채널 블록 (MKT-2) — kind 판별자를 가진 이종 행 배열.
+    """채널 블록 (MKT-2) — kind 판별자를 가진 이종 행 배열 + 데이터 품질 필드.
 
     CLN-1: 기존 ``referral_codes`` 블록은 제거됐다 — rows 의 referral_code 행이
     상위집합(사용 0건 코드 포함)이라 같은 데이터를 두 곳에 둘 이유가 없다.
@@ -398,6 +420,10 @@ class _ChannelsSerializer(serializers.Serializer):
         many=True,
         help_text="채널별 성과 3종 (other → link → referral_code, 각 그룹 내부는 가입 desc). "
         "어트리뷰션 미탑재여도 link/referral_code 행은 나온다(각각 admin/billing 소스)",
+    )
+    attribution_gap = _AttributionGapSerializer(
+        help_text="MKT-10 — 어느 채널에도 집계되지 않은 가입 인원 (채널 행이 아니라 표의 "
+        "신뢰도 정보)"
     )
 
 

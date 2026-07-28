@@ -60,6 +60,11 @@ from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.admin_api.dashboard_cache import (
+    MKT_CACHE_KEY_CUSTOM_TMPL,
+    MKT_CACHE_KEY_SNAPSHOT,
+    MKT_CACHE_KEY_TMPL,
+)
 from apps.admin_api.dashboard_constants import (
     CANCEL_REASONS_TOP,
     CHECKOUT_ATTRIBUTION_WINDOW_DAYS,
@@ -188,10 +193,12 @@ TRIALS_ENDED_CONVERSION_FORMULA = (
 # 이 경우에만 previous 구간을 만들지 않는다(prev=None → delta 전부 null).
 ALLOWED_PERIODS = {"7d": 7, "30d": 30, "90d": 90, "all": None}
 PERIOD_ALL = "all"
-CACHE_KEY_TMPL = "admin:dash:mkt:{period}"
-CACHE_KEY_CUSTOM_TMPL = "admin:dash:mkt:custom:{start}:{end}"
+# 캐시 키는 apps/admin_api/dashboard_cache.py 가 정본 — 채널 링크 CRUD 가 같은 키를 지워야
+# 하므로(MKT-11) 뷰 안에 두면 무효화하는 쪽이 알 수 없다. 여기서는 별칭만 유지한다.
+CACHE_KEY_TMPL = MKT_CACHE_KEY_TMPL
+CACHE_KEY_CUSTOM_TMPL = MKT_CACHE_KEY_CUSTOM_TMPL
 # R-2: 기간 무관 고정 패널 — period 별 응답이 공유하는 단일 키 (계산 1회)
-CACHE_KEY_SNAPSHOT = "admin:dash:mkt:snapshot"
+CACHE_KEY_SNAPSHOT = MKT_CACHE_KEY_SNAPSHOT
 MAX_CUSTOM_SPAN_DAYS = 366  # 커스텀 범위 상한 (초과 시 400)
 
 TARGET_UPSELL_PLANS = ("free", "basic")
@@ -243,13 +250,14 @@ SOURCE_OTHER_REFERRAL = "other_referral"
 # 순위와 무관하게 항상 자기 줄을 유지한다.
 _SOURCE_NEVER_FOLD = (SOURCE_DIRECT, SOURCE_BIOLINK, SOURCE_UNSAVED_UTM)
 
-# 소스 라벨 — CHANNEL_LABELS 보다 우선. direct 는 채널 표기("다이렉트")가 아니라 사용자
-# 언어로 바꾼다 — 실제 의미는 "주소를 직접 입력했다"가 아니라 **리퍼러가 아예 없었다**
-# (앱 내 이동·메신저 경유 포함) + 가입 귀속 기록이 없는 경우까지다 (MKT-6 ②).
+# 소스 라벨 — CHANNEL_LABELS 보다 우선. direct 는 채널 표기("다이렉트")로 되돌리지 말 것:
+# 실제 의미는 "주소를 직접 입력했다"가 아니라 **리퍼러가 아예 없었다**(앱 내 이동·메신저
+# 경유 포함)다. MKT-9 로 문구를 "어디서 왔는지 모름" → **"출처 미상"** 으로 줄였다
+# (표에서 다른 줄과 길이 균형이 안 맞았다). 라벨 정본은 서버다.
 _SOURCE_LABEL_OVERRIDES = {
     SOURCE_BIOLINK: "고객 바이오링크 페이지",
     SOURCE_UNSAVED_UTM: "저장 안 된 링크(UTM)",
-    SOURCE_DIRECT: "어디서 왔는지 모름",
+    SOURCE_DIRECT: "출처 미상",
 }
 
 # 고객 바이오링크 페이지(turnflow.link/@slug)의 'Powered by' 배지가 붙이는 UTM.
@@ -310,8 +318,10 @@ def _resolve_row_key(source, medium, campaign, content, referrer, channel, link_
       4. UTM 없음                → other / 저장된 파생 채널(리퍼러 추정)
     제휴코드 오버레이는 **가입자에게만** 적용되며 호출부에서 먼저 처리한다.
 
-    ⚠️ ``unknown``(가입 귀속 기록 자체가 없음)은 ``direct`` 로 접는다 — 둘 다 "어디서
-    왔는지 모름"이라 라벨이 같은 줄이 둘 생기는 화면 결함이 된다 (MKT-6 ②).
+    ⚠️ 저장된 channel 이 ``unknown``(파생 실패)인 경우는 ``direct`` 로 접는다 — 둘 다
+    "출처 미상"이라 라벨이 같은 줄이 둘 생기는 화면 결함이 된다 (MKT-6 ②).
+    **귀속 행 자체가 없는 회원은 여기 오지 않는다** — 채널 분해에서 아예 빼고
+    ``attribution_gap`` 으로 따로 센다 (MKT-10).
     """
     if _is_biolink(source, medium, referrer):
         return OTHER_ROW_KEY, SOURCE_BIOLINK
@@ -1274,7 +1284,10 @@ def _funnel_channel_variants(flags: tuple, visit_rows: list[tuple]) -> list[tupl
     for uid, ig, pgc, pg, cp, pd, cur_plan, cur_status, cur_card in flag_rows:
         tr, tr_no_card = _trial_flags(cur_plan, cur_status, cur_card)
         code = referral_users.get(uid)
-        channel = code or attr_row.get(uid, (OTHER_ROW_KEY, None))[0]
+        bucket = attr_row.get(uid)
+        if code is None and bucket is None:
+            continue  # MKT-10: 귀속 기록 없는 회원은 채널 variant 에서도 제외 (표와 동일 모집단)
+        channel = code or bucket[0]
         slot = per_channel[channel]
         slot["signups"] += 1
         if ig:
@@ -1514,13 +1527,22 @@ def _channel_rows(start, end, flags: tuple, visit_rows: list[tuple]) -> list[dic
     signups_by_combo: dict = {}
     for uid, ig, pgc, pg, cp, pd, cur_plan, cur_status, cur_card in flag_rows:
         trialing, _no_card = _trial_flags(cur_plan, cur_status, cur_card)
-        origin_row, origin_source = attr_row.get(uid, (OTHER_ROW_KEY, SOURCE_DIRECT))
         code = referral_users.get(uid)
+        bucket = attr_row.get(uid)
         if code:
-            # 제휴코드 행으로 이동 — 원래 있었을 행에 과소 집계량을 표기
-            referral_overlap[origin_row] += 1
+            # 제휴코드 행으로 이동 — 원래 있었을 행에 과소 집계량을 표기.
+            # ⚠️ 코드 사용자는 귀속 행이 없어도 **채널을 안다**(코드 자체가 유입 경로) →
+            #    attribution_gap 이 아니다. 원 행이 없으면 보정할 대상도 없다.
+            if bucket is not None:
+                referral_overlap[bucket[0]] += 1
             _accumulate_perf(per_row[code], ig, pgc, pg, cp, pd, trialing)
             continue
+        if bucket is None:
+            # MKT-10: 귀속 기록이 아예 없는 회원 — 사용자 행동이 아니라 **우리 계측 공백**이다.
+            # direct 에 섞으면 마케터가 유입 채널 성과로 읽는다(prod 51명 = 그 줄의 절반 이상)
+            # → 채널 분해에서 제외하고 attribution_gap 으로만 노출한다.
+            continue
+        origin_row, origin_source = bucket
         _accumulate_perf(per_row[origin_row], ig, pgc, pg, cp, pd, trialing)
         if origin_source is not None:
             _accumulate_perf(per_source[origin_source], ig, pgc, pg, cp, pd, trialing)
@@ -1644,6 +1666,36 @@ def _channel_rows(start, end, flags: tuple, visit_rows: list[tuple]) -> list[dic
     return rows
 
 
+def _attribution_gap(flags: tuple) -> dict:
+    """MKT-10 — 귀속 기록이 없어 **어느 채널에도 집계되지 않은** 가입 인원 (데이터 품질).
+
+    ``sources`` 안의 한 줄로 주면 다시 채널처럼 읽히므로 **채널 배열 밖**에 둔다.
+    비율이 크면 그 자체가 고쳐야 할 계측 버그 신호라, 숫자를 보이게 두는 것이 목적이다.
+
+    항등: ``Σrows[].signups + signups_unattributed == 이 기간 가입자 수``
+    (= funnel variants.all 의 signup 노드 count).
+
+    ``since`` = SignupAttribution 최초 기록 시각(전 기간) — 그 이전 가입은 애초에 기록이
+    없으므로 "계측 도입 이전 가입 포함"을 화면에서 덧붙일 수 있다.
+
+    ⚠️ **제휴코드 사용자는 공백이 아니다** — 귀속 행이 없어도 코드 자체가 유입 경로라
+    코드 행에 집계된다. 여기서 세면 rows 합과 이 값이 겹쳐 항등이 깨진다.
+    """
+    flag_rows, _attr_map, _attr_utm, referral_users, _visits_by_channel, attr_row = flags
+    total = len(flag_rows)
+    unattributed = sum(
+        1 for row in flag_rows if row[0] not in attr_row and row[0] not in referral_users
+    )
+    since = None
+    if ATTRIBUTION_AVAILABLE:
+        since = SignupAttribution.objects.aggregate(m=Min("created_at"))["m"]
+    return {
+        "signups_unattributed": unattributed,
+        "share": _rate(unattributed, total),
+        "since": since,
+    }
+
+
 def _channels(
     start,
     end,
@@ -1666,12 +1718,17 @@ def _channels(
       미결제)은 별도 컬럼 — R-4 이후 **카드 등록 완료 체험만** (퍼널 conversion 과 동일 정의).
     - CLN-1: 기존 ``referral_codes`` 블록은 **제거**됐다 — rows 의 referral_code 행이
       상위집합(사용 0건 코드까지 포함)이라 같은 데이터가 두 곳에 있을 이유가 없다.
+    - MKT-10: 귀속 기록이 없는 회원은 rows 에서 빠지고 ``attribution_gap`` 에만 잡힌다
+      (계측 공백을 채널 성과로 읽지 않게).
     """
     if flags is None:
         flags = _cohort_flags(start, end)
     if visit_rows is None:
         visit_rows = _visit_rows(start, end)
-    return {"rows": _channel_rows(start, end, flags, visit_rows)}
+    return {
+        "rows": _channel_rows(start, end, flags, visit_rows),
+        "attribution_gap": _attribution_gap(flags),
+    }
 
 
 # ── 업셀 후보 ────────────────────────────────────────────────────────

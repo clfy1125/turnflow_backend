@@ -35,6 +35,7 @@ from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
 
 from apps.admin_api.audit import log_admin_action
+from apps.admin_api.dashboard_cache import bust_marketing_dashboard_cache
 from apps.admin_api.models import AdminActionLog, MarketingChannelLink
 from apps.admin_api.roles import (
     NOT_LINK_OWNER_CODE,
@@ -264,6 +265,10 @@ curl -X POST -H "Authorization: Bearer <staff_token>" -H "Content-Type: applicat
             link.pk,
             link.channel,
         )
+        # MKT-11: 새 링크는 방문 0이어도 채널별 성과에 행이 생겨야 하는데, 대시보드 응답이
+        # 5분 캐시를 타서 최대 5분간 "저장했는데 안 나온다"로 보였다. 저장 직후 확인하는
+        # 흐름이라 여기서만은 지연이 '동작 안 함'으로 읽힌다 → 즉시 무효화.
+        bust_marketing_dashboard_cache(reason="channel_link.create")
         read = AdminChannelLinkSerializer(link, context=self.get_serializer_context())
         return Response(read.data, status=status.HTTP_201_CREATED)
 
@@ -412,6 +417,8 @@ class AdminChannelLinkDetailView(generics.RetrieveUpdateDestroyAPIView):
                 getattr(request, "id", ""),
                 link.pk,
             )
+        # MKT-11: 이름은 채널별 성과 행의 label 이므로 캐시를 지워야 즉시 반영된다
+        bust_marketing_dashboard_cache(reason="channel_link.update")
         read = AdminChannelLinkSerializer(link, context=self.get_serializer_context())
         return Response(read.data)
 
@@ -475,4 +482,6 @@ class AdminChannelLinkDetailView(generics.RetrieveUpdateDestroyAPIView):
         logger.info(
             "[admin-marketing] req=%s 채널 링크 삭제 id=%s", getattr(request, "id", ""), link_pk
         )
+        # MKT-11: 지운 링크의 행이 최대 5분간 남아 보이지 않게
+        bust_marketing_dashboard_cache(reason="channel_link.delete")
         return Response(status=status.HTTP_204_NO_CONTENT)
