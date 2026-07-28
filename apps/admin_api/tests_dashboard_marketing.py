@@ -440,7 +440,9 @@ class TestCohortFunnel:
         assert ig["rate"] == 0.5
         assert ig["rate_of"] == "signup"
         # M-6 이후 formula 는 한국어 정의 문장 — 핵심 구성요소만 단언 (문구 리팩터 내성)
-        assert "IG 계정" in ig["formula"] and "÷ 가입 수" in ig["formula"]
+        # FMT-1 이후 내부 표기(÷ 가입 수) 대신 읽는 문장이다 → 의미어로 단언한다.
+        assert "인스타그램 계정을 연동한" in ig["formula"]
+        assert "이 기간에 가입한 회원" in ig["formula"]
 
         # dm 분기: IG-less 페이지 유저는 미포함 (u_camp, u_both 만)
         dm = _node(res, "dm_campaign")
@@ -453,13 +455,15 @@ class TestCohortFunnel:
         assert created["count"] == 2  # u_page, u_both (둘 다 공개 페이지=생성 포함)
         assert created["rate"] == 0.5  # created/signups = 2/4
         assert created["rate_of"] == "signup"
-        assert "페이지를 만든" in created["formula"] and "÷ 가입 수" in created["formula"]
+        assert "페이지를 만든" in created["formula"]
+        assert "이 기간에 가입한 회원" in created["formula"]
 
         page = _node(res, "page_published")
         assert page["count"] == 2
         assert page["rate"] == 1.0  # published/created = 2/2
         assert page["rate_of"] == "page_created"
-        assert "페이지를 공개한" in page["formula"] and "÷ 페이지 생성 수" in page["formula"]
+        assert "페이지를 공개한" in page["formula"]
+        assert "페이지를 만든 회원 중" in page["formula"]  # 분모가 '가입'이 아니라 '생성'
 
     def test_paid_rate_of_signups(self, staff_client, clean_slate):
         now = timezone.now()
@@ -476,7 +480,8 @@ class TestCohortFunnel:
         assert paid["rate_of"] == "activated"
         assert paid["rate"] is None
         # 유료플랜 전환(무료체험+실결제) — 체험 없으면 전부 실결제 쪽
-        assert "유료플랜" in paid["formula"] and "Toss PAID" in paid["formula"]
+        assert "무료체험을 시작했거나 실제 결제를 완료한" in paid["formula"]
+        assert "카드 등록을 완료한 경우만" in paid["formula"]  # 체험 정의 (R-4)
         assert paid["breakdown"] == {
             "pro_trial": 0,
             "basic_trial": 0,
@@ -1455,8 +1460,24 @@ class TestFunnelFormulas:
         for node in nodes:
             assert node["formula"], f"{node['key']} formula 가 비어 있음"
         # 유료플랜 전환 노드는 체험/실결제 분해 정의를 명시 (N-1)
-        assert "유료플랜" in variant["conversion"]["formula"]
-        assert "Toss PAID" in variant["conversion"]["formula"]
+        assert "무료체험" in variant["conversion"]["formula"]
+        assert "Toss" in variant["conversion"]["formula"]
+
+    def test_formula_is_plain_reader_friendly_korean(self, staff_client, clean_slate):
+        """FMT-1 — 이 문구는 외주 마케팅 파트너가 툴팁에서 그대로 읽는다.
+
+        내부 표기가 새어 들어가면 프론트가 다시 오버라이드해야 하므로(그 순간 문구
+        정본이 둘로 갈라진다) 작성 기준을 테스트로 못 박는다.
+        """
+        variant = staff_client.get(URL).data["funnel"]["variants"]["all"]
+        # 내부 용어 · 마크다운 강조 · 기호 나열 금지
+        banned = ("가입 코호트", "중복 제거", "도달 여부", "distinct", "**", " · ", "유저", "고객")
+        for node in _all_nodes(variant):
+            f = node["formula"]
+            for token in banned:
+                assert token not in f, f"{node['key']} formula 에 금지 표현 {token!r}: {f!r}"
+            # 완전한 문장으로 끝난다 (첫 줄은 '÷ … × 100' 비율식일 수 있어 마지막 줄만 검사)
+            assert f.rstrip().endswith("."), f"{node['key']} 문구가 문장으로 안 끝남: {f!r}"
 
 
 # ─── N-1 + R-4: 퍼널 유료플랜 전환 3분할 (플랜 × 체험/실결제) ─────────────
