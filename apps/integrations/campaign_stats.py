@@ -118,8 +118,42 @@ def root_dm_q(prefix: str = "") -> Q:
 ROOT_DM_Q = root_dm_q()
 
 
-def people_rollup(log_qs) -> dict:
-    """사람(수신자) 단위 처리 현황 롤업 — 루트 DM(오프닝/단독) 기준.
+def _derive_people(
+    *,
+    targets: int,
+    sent: int,
+    sent_or_waiting: int,
+    confirmed: int,
+    no_trace_or_confirmed: int,
+    hidden_or_sent_waiting: int,
+) -> dict:
+    """6개 기저 카운트 → 응답 ``people`` 블록 (파생 산술 단일 소스).
+
+    로그 쿼리셋 판(:func:`people_rollup_full`)과 목록 annotate 판
+    (:func:`people_from_annotations`)이 **이 함수 하나**를 공유한다 — 뺄셈을 양쪽에
+    복제하면 어느 한쪽만 고쳐져 목록·상세가 갈라진다(DM-5 회귀 유형).
+
+    ``exclude()`` 를 쓸 수 없는 자리는 포함-배제로 푼다: ``|A \\ B| = |A ∪ B| − |B|``.
+    total = sent + waiting + failed 항등이 항상 성립한다.
+    """
+    waiting = max(sent_or_waiting - sent, 0)
+    failed = max(targets - sent - waiting, 0)
+    unconfirmed = max(no_trace_or_confirmed - confirmed, 0)
+    hidden_spam = max(hidden_or_sent_waiting - sent_or_waiting, 0)
+    return {
+        "targets": targets,
+        "sent": sent,
+        "waiting": waiting,
+        "failed": failed,
+        "unconfirmed": unconfirmed,
+        "hidden_spam": hidden_spam,
+        "needs_attention": max(failed + unconfirmed - hidden_spam, 0),
+        "sent_rate": round(sent / targets, 4) if targets else 0.0,
+    }
+
+
+def people_rollup_full(log_qs) -> dict:
+    """사람(수신자) 단위 처리 현황 — **루트 DM(오프닝/단독) 기준**, 단일 aggregate.
 
     한 사람이 루트 DM 을 여러 건 받아도(댓글 2회 등) 1명으로 센다.
     버킷 우선순위: sent > waiting > failed(잔여).
@@ -127,39 +161,45 @@ def people_rollup(log_qs) -> dict:
       - waiting : 발송된 건 없고, 큐에서 차례 대기/발송 중인 루트 DM 이 있음
       - failed  : 나머지 = 아무것도 못 받고 종결·정체된 사람
                   (하드실패 failed_* / 복구 대기·만료 recovery_* / 한도 skipped 포함)
-    total = sent + waiting + failed 항등이 항상 성립한다.
 
-    성능: 폴링 엔드포인트(queue-state 5~10초)에서 호출되므로 단일 aggregate 로 계산한다.
-    SENT_FOR_QUOTA 와 QUEUE_WAITING 은 서로소 상태집합이므로 포함-배제로
-    waiting = |sent∪waiting 사람| − |sent 사람| (= sent 없이 waiting 만 있는 사람) 이 성립한다.
+    반환 키는 :func:`people_from_annotations`(목록 판)와 **완전히 동일**하다.
+    두 경로가 같은 캠페인에서 같은 dict 를 내는지는 회귀 테스트가 직접 단언한다.
+
+    성능: 폴링 엔드포인트(queue-state 5~10초)에서 호출되므로 쿼리 1회로 끝낸다.
 
     ⚠️ 근사: recipient_user_id 값 공간이 경로마다 다르다(웹훅=IGSID, 폴링=username 폴백,
     _recipient_match_q 참조). 한 사람이 두 키로 로그를 가지면(폴 보정 pending + 웹훅 재댓글
     성공 등) 2명으로 셀 수 있다 — 재발송이 정상화되는 recovery 크로스키 케이스에 한정된
     드문 오차이며 발송에는 영향 없다. 정확 매칭이 필요한 recovery flip 은 _recipient_match_q 사용.
     """
-    root = log_qs.filter(ROOT_DM_Q)
-    agg = root.aggregate(
-        total=Count("recipient_user_id", distinct=True),
-        sent=Count(
-            "recipient_user_id",
-            filter=Q(status__in=SENT_FOR_QUOTA_STATUSES),
-            distinct=True,
-        ),
-        sent_or_waiting=Count(
-            "recipient_user_id",
-            filter=Q(status__in=SENT_FOR_QUOTA_STATUSES + QUEUE_WAITING_STATUSES),
-            distinct=True,
-        ),
+    sent_or_waiting_q = Q(status__in=SENT_FOR_QUOTA_STATUSES + QUEUE_WAITING_STATUSES)
+    confirmed_q = Q(status__in=CONFIRMED_DELIVERED_STATUSES)
+
+    def _uniq(cond=None):
+        return Count("recipient_user_id", filter=cond, distinct=True)
+
+    agg = log_qs.filter(ROOT_DM_Q).aggregate(
+        targets=_uniq(),
+        sent=_uniq(Q(status__in=SENT_FOR_QUOTA_STATUSES)),
+        sent_or_waiting=_uniq(sent_or_waiting_q),
+        confirmed=_uniq(confirmed_q),
+        no_trace_or_confirmed=_uniq(Q(status=SentDMLog.Status.FAILED_NO_TRACE) | confirmed_q),
+        hidden_or_sent_waiting=_uniq(status_group_q(HIDDEN_SPAM) | sent_or_waiting_q),
     )
-    total = agg["total"] or 0
-    sent = agg["sent"] or 0
-    waiting = max((agg["sent_or_waiting"] or 0) - sent, 0)
+    return _derive_people(**{k: v or 0 for k, v in agg.items()})
+
+
+def people_rollup(log_qs) -> dict:
+    """queue-state 게이지용 축약 롤업 — :func:`people_rollup_full` 의 4키 어댑터.
+
+    ``total`` 키 이름만 다르고(게이지 계약 유지) 값의 정의는 완전히 같다.
+    """
+    full = people_rollup_full(log_qs)
     return {
-        "total": total,
-        "sent": sent,
-        "waiting": waiting,
-        "failed": max(total - sent - waiting, 0),
+        "total": full["targets"],
+        "sent": full["sent"],
+        "waiting": full["waiting"],
+        "failed": full["failed"],
     }
 
 
@@ -174,8 +214,15 @@ def build_dm_stats(log_qs) -> dict:
     두 층위를 함께 낸다:
     - **이벤트 단위** (total/queued/delivered/... , delivery_rate/read_rate) — 배송
       신뢰성·디버깅용. follow-gate 캠페인은 1명 = DM 2건이라 사람 수보다 크다.
-    - **사람 단위** (``unique_*``) — 마케팅 화면용. 모수는 루트 DM(:data:`ROOT_DM_Q`)
-      기준 :func:`people_rollup` 과 동일해서 queue-state 의 ``people`` 과 정합한다.
+    - **사람 단위** (``unique_*``) — 마케팅 화면용. 모수는 **전부** 루트 DM
+      (:data:`ROOT_DM_Q`) 기준 :func:`people_rollup_full` 과 같아서 queue-state 의
+      ``people`` · 목록의 ``people.*`` 와 값이 항상 일치한다.
+
+    사람 단위 불변식 (프론트가 진행률 바·비율에 그대로 의존한다):
+      - ``unique_targets == unique_sent + unique_waiting + unique_failed``
+      - ``unique_targets ≥ unique_sent ≥ unique_delivered ≥ unique_read``
+      - ``unique_sent ≥ unique_followers``, ``unique_sent ≥ ctr_interacted`` (→ ``ctr ≤ 1``)
+      - ``unique_hidden_spam ≤ unique_failed``
 
     헤드라인 지표는 ``unique_sent_rate``(= unique_sent / unique_targets). ``delivery_rate``
     는 하드실패가 분모에서 빠져 100% 로 부풀 수 있으므로 헤드라인에 쓰지 말 것.
@@ -240,39 +287,52 @@ def build_dm_stats(log_qs) -> dict:
     # ─────────────────────────────────────────────────────────────
     # v4.2 — 사람(수신자 Instagram ID) 단위 지표 + CTR (마케팅 API)
     # ─────────────────────────────────────────────────────────────
-    def _uniq(**flt) -> int:
-        base = log_qs.filter(**flt) if flt else log_qs
+    # ⚠️ 모수 규칙 (DM-5 회귀 방지 — 절대 섞지 말 것)
+    #   `unique_*` 는 **전부 루트 DM 모수**다: 한 사람 = 루트 DM 1건, 리워드·재안내 child 제외.
+    #   ① 발송/도착/읽음처럼 **루트 DM 자체의 상태**로 판정하는 지표 → root 쿼리셋에서 센다.
+    #   ② 클릭·게이트 통과처럼 **증거가 자식 로그에 있는** 지표 → 전체 로그에서 사람 집합을
+    #      구한 뒤 `_people_within_sent` 로 **루트 발송 인원과 교집합**한다.
+    #   이 규칙 덕에 targets ⊇ sent ⊇ delivered ⊇ read, sent ⊇ followers/interacted 가
+    #   항상 성립한다(분자>분모 불가). 예전엔 unique_sent 만 전체 로그 기준이라
+    #   `unique_targets == unique_sent + unique_waiting + unique_failed` 항등이 깨졌고,
+    #   목록 people.sent 와 상세 unique_sent 가 다른 숫자를 냈다.
+    root = log_qs.filter(ROOT_DM_Q)
+    root_sent = root.filter(status__in=SENT_FOR_QUOTA_STATUSES)
+
+    def _root_uniq(**flt) -> int:
+        base = root.filter(**flt) if flt else root
         return base.values("recipient_user_id").distinct().count()
 
-    unique_recipients = _uniq()
-    unique_sent = (
-        log_qs.filter(status__in=SENT_FOR_QUOTA_STATUSES)
-        .values("recipient_user_id")
-        .distinct()
-        .count()
-    )
-    unique_delivered = (
-        log_qs.filter(status__in=["delivered", "read"])
-        .values("recipient_user_id")
-        .distinct()
-        .count()
-    )
-    unique_read = _uniq(status="read")
-    unique_followers = _uniq(gate_status="passed")
+    def _people_within_sent(evidence_qs) -> int:
+        """증거 로그(자식 포함)의 사람 집합 ∩ 루트 발송 인원 — 분자 ⊆ 분모 보장."""
+        return (
+            root_sent.filter(recipient_user_id__in=evidence_qs.values("recipient_user_id"))
+            .values("recipient_user_id")
+            .distinct()
+            .count()
+        )
+
+    people = people_rollup_full(log_qs)
+    # 하위호환 필드. 루트 모수로 통일된 지금은 unique_targets 와 항상 같다(신규 사용 비권장).
+    unique_recipients = people["targets"]
+    unique_sent = people["sent"]
+    # 확정 도착 = delivered/read + recovery_delivered(복구 재전송 성공도 실제 도착).
+    # 이벤트 단위 delivery_rate 가 이미 recovery_delivered 를 도착으로 세므로 정의를 맞춘다.
+    unique_delivered = _root_uniq(status__in=CONFIRMED_DELIVERED_STATUSES)
+    unique_read = _root_uniq(status="read")
+    unique_followers = _people_within_sent(log_qs.filter(gate_status="passed"))
 
     # CTR = 상호작용한 고유 수신자 / 발송된 고유 수신자.
     #  - 게이트형 캠페인(follow_gate_enabled=True): 버튼 1회라도 클릭 = child 로그 존재
     #    (reward=통과 / retry=클릭했으나 미통과 둘 다 parent_log 로 opening 에 묶인다).
     #  - 비게이트형 캠페인: 상호작용 단계가 없으므로 "읽음(READ)" 을 참여로 본다.
     # 두 조건은 캠페인 타입으로 자연히 배타적이라 OR 하나로 집계된다.
-    ctr_interacted = (
+    # 판정 증거는 child 로그라 전체 로그에서 찾되(규칙 ②), 최종 인원은 발송 인원과 교집합한다.
+    ctr_interacted = _people_within_sent(
         log_qs.filter(
             Q(campaign__follow_gate_enabled=True, parent_log__isnull=False)
             | Q(campaign__follow_gate_enabled=False, status="read")
         )
-        .values("recipient_user_id")
-        .distinct()
-        .count()
     )
     ctr = ctr_interacted / unique_sent if unique_sent else 0.0
 
@@ -286,50 +346,17 @@ def build_dm_stats(log_qs) -> dict:
 
     unique_delivery_rate = unique_delivered / unique_sent if unique_sent else 0.0
 
-    # ── v4.4 — 사람 단위 처리 현황 (루트 DM 기준 rollup — queue-state.people 과 동일 정의)
+    # ── v4.4/v4.5 — 사람 단위 처리 현황.  waiting/failed/unconfirmed/hidden_spam/
+    # needs_attention 은 전부 people_rollup_full 이 계산한다(= 목록 people.* 와 같은 산술).
     # unique_failed: 아무것도 받지 못한 사람 (하드실패·복구 대기/만료·한도 스킵).
     # "확인 필요" 카드가 이 값을 쓴다 — delivery_rate(Meta 접수건 기준)에는 하드실패가
     # 분모에서 빠져 100% 로 보이므로, 실패 인원은 이 필드로만 노출된다.
-    people = people_rollup(log_qs)
-    # 도착 미확인(사람): no_trace 만 있고 확정 도착이 한 번도 없는 수신자.
-    # 발송은 됐으므로(쿼터 소진) people.failed 와는 서로소 — 합산해도 중복 없음.
-    unique_unconfirmed = (
-        log_qs.filter(status=SentDMLog.Status.FAILED_NO_TRACE)
-        .exclude(
-            recipient_user_id__in=log_qs.filter(status__in=CONFIRMED_DELIVERED_STATUSES).values(
-                "recipient_user_id"
-            )
-        )
-        .values("recipient_user_id")
-        .distinct()
-        .count()
-    )
-    # unique_delivered(전체 qs)는 리워드/재안내 child 도 세는 반면 people.total 은 루트 DM
-    # 기준이라, 부모 오프닝이 시간창(기본 30일) 밖이고 child 만 안에 든 드문 경우 분자>분모가
-    # 될 수 있다 → [0,1] 로 클램프해 100% 초과 표기를 막는다.
-    unique_reach_rate = min(unique_delivered / people["total"], 1.0) if people["total"] else 0.0
+    targets = people["targets"]
+    # 분자·분모가 같은 루트 모수라 구조적으로 ≤ 1 이다. min() 은 모수를 다시 갈라놓는
+    # 회귀(DM-5)가 화면에 100%+ 로 새어나가지 않게 하는 백스톱 — 지우지 말 것.
+    unique_reach_rate = min(unique_delivered / targets, 1.0) if targets else 0.0
     # 헤드라인 "N% 메시지가 성공적으로 전송됐어요" = 전체 대상 대비 전송된 비율.
-    unique_sent_rate = min(unique_sent / people["total"], 1.0) if people["total"] else 0.0
-
-    # ── v4.5 — '숨겨진 요청 · 스팸' 분리 (아무것도 못 받은 사람 = people.failed 의 부분집합)
-    # 비팔로워 채널 미개설(2534025)로 숨김함으로 간 케이스: 복구 대기/만료(recovery_*) +
-    # 복구 OFF 시 failed_param@2534025. failed 버킷(발송·대기 없음)에 든 사람만 센다
-    # (같은 사람이 다른 댓글로 발송/대기 중이면 sent/waiting 버킷이므로 여기서 제외).
-    root = log_qs.filter(ROOT_DM_Q)
-    sent_or_waiting_ids = root.filter(
-        status__in=SENT_FOR_QUOTA_STATUSES + QUEUE_WAITING_STATUSES
-    ).values("recipient_user_id")
-    unique_hidden_spam = (
-        root.filter(status_group_q(HIDDEN_SPAM))
-        .exclude(recipient_user_id__in=sent_or_waiting_ids)
-        .values("recipient_user_id")
-        .distinct()
-        .count()
-    )
-    # 기존 '확인 필요' 총합(= failed + 도착미확인) 과, 숨김함을 뺀 새 '확인 필요'.
-    # hidden_spam ⊆ failed 이므로 excl 은 항상 ≥ 0.
-    unique_needs_attention = people["failed"] + unique_unconfirmed
-    unique_needs_attention_excl_hidden = max(unique_needs_attention - unique_hidden_spam, 0)
+    unique_sent_rate = min(unique_sent / targets, 1.0) if targets else 0.0
 
     agg.update(
         {
@@ -339,15 +366,17 @@ def build_dm_stats(log_qs) -> dict:
             "unique_read": unique_read,
             "unique_followers": unique_followers,
             "unique_delivery_rate": round(unique_delivery_rate, 4),
-            "unique_targets": people["total"],
+            "unique_targets": targets,
             "unique_waiting": people["waiting"],
             "unique_failed": people["failed"],
-            "unique_unconfirmed": unique_unconfirmed,
+            "unique_unconfirmed": people["unconfirmed"],
             "unique_reach_rate": round(unique_reach_rate, 4),
             "unique_sent_rate": round(unique_sent_rate, 4),
-            "unique_hidden_spam": unique_hidden_spam,
-            "unique_needs_attention": unique_needs_attention,
-            "unique_needs_attention_excl_hidden": unique_needs_attention_excl_hidden,
+            "unique_hidden_spam": people["hidden_spam"],
+            # 기존 '확인 필요' 총합(= failed + 도착미확인). hidden_spam ⊆ failed 라
+            # excl_hidden(= people.needs_attention) 은 항상 ≥ 0.
+            "unique_needs_attention": people["failed"] + people["unconfirmed"],
+            "unique_needs_attention_excl_hidden": people["needs_attention"],
             "ctr": round(ctr, 4),
             "ctr_basis": ctr_basis,
             "ctr_interacted": ctr_interacted,
@@ -393,15 +422,14 @@ PEOPLE_ORDERING_FIELDS = ("people_targets", "people_sent")
 def annotate_campaign_people(qs):
     """캠페인 목록에 **사람(인원) 단위** 집계를 annotate (목록 N+1 제거, DM-1-b).
 
-    상세(:func:`build_dm_stats`)의 ``unique_*`` 와 **같은 정의**를 단일 LEFT JOIN 으로
-    계산한다. 목록의 ``people.sent`` 와 상세의 ``unique_sent`` 가 어긋나면 안 되므로
-    각 값의 유도식을 여기 명시한다.
+    상세(:func:`people_rollup_full`)의 6개 기저 카운트를 **같은 조건·같은 순서**로 단일
+    LEFT JOIN 에 옮긴 것이다. 목록의 ``people.sent`` 와 상세의 ``unique_sent`` 가 어긋나면
+    안 되므로(DM-5), 조건식을 바꿀 때는 반드시 두 함수를 함께 고칠 것 —
+    두 경로가 같은 dict 를 내는지는 회귀 테스트가 직접 비교한다.
 
-    ``exclude(...)`` 를 못 쓰는 자리(unconfirmed/hidden_spam)는 **포함-배제**로 푼다:
-      |A \\ B| = |A ∪ B| − |B|
-    그래서 조건부 ``COUNT(DISTINCT recipient_user_id)`` 6개만으로 전부 나온다.
-    파생값(waiting/failed/unconfirmed/hidden_spam/needs_attention)은 SQL 이 아니라
-    :func:`people_from_annotations` 에서 뺄셈으로 만든다.
+    ⚠️ **전 카운트에 root 를 건다.** 예전엔 confirmed 계열만 root 없이 세어(전체 로그 기준)
+    상세와 모수가 갈렸다. 파생값(waiting/failed/unconfirmed/hidden_spam/needs_attention)은
+    SQL 이 아니라 :func:`_derive_people` 이 뺄셈으로 만든다(포함-배제, 산술 단일 소스).
     """
     root = root_dm_q("dm_logs")
     sent_or_waiting = Q(dm_logs__status__in=SENT_FOR_QUOTA_STATUSES + QUEUE_WAITING_STATUSES)
@@ -419,8 +447,8 @@ def annotate_campaign_people(qs):
         people_sent=_uniq(root & Q(dm_logs__status__in=SENT_FOR_QUOTA_STATUSES)),
         # ↓ 파생용 중간값 (응답에 그대로 나가지 않음)
         _people_sent_or_waiting=_uniq(root & sent_or_waiting),
-        _people_confirmed=_uniq(confirmed),
-        _people_no_trace_or_confirmed=_uniq(no_trace | confirmed),
+        _people_confirmed=_uniq(root & confirmed),
+        _people_no_trace_or_confirmed=_uniq(root & (no_trace | confirmed)),
         _people_hidden_or_sw=_uniq(root & (hidden | sent_or_waiting)),
     )
 
@@ -429,34 +457,20 @@ def people_from_annotations(obj: AutoDMCampaign) -> dict | None:
     """:func:`annotate_campaign_people` 결과 → 응답 ``people`` 블록 (추가 쿼리 0).
 
     annotate 되지 않은 인스턴스면 None (호출부가 필드를 생략하도록).
-    total = sent + waiting + failed 항등은 people_rollup 과 동일하게 성립한다.
+    파생 산술은 :func:`_derive_people` 공유 — 상세 :func:`people_rollup_full` 과
+    **같은 dict** 가 나온다(total = sent + waiting + failed 항등 포함).
     """
     targets = getattr(obj, "people_targets", None)
     if targets is None:
         return None
-    sent = getattr(obj, "people_sent", 0) or 0
-    sent_or_waiting = getattr(obj, "_people_sent_or_waiting", 0) or 0
-    waiting = max(sent_or_waiting - sent, 0)
-    failed = max(targets - sent - waiting, 0)
-    # unconfirmed = |no_trace \ confirmed| = |no_trace ∪ confirmed| − |confirmed|
-    unconfirmed = max(
-        (getattr(obj, "_people_no_trace_or_confirmed", 0) or 0)
-        - (getattr(obj, "_people_confirmed", 0) or 0),
-        0,
+    return _derive_people(
+        targets=targets,
+        sent=getattr(obj, "people_sent", 0) or 0,
+        sent_or_waiting=getattr(obj, "_people_sent_or_waiting", 0) or 0,
+        confirmed=getattr(obj, "_people_confirmed", 0) or 0,
+        no_trace_or_confirmed=getattr(obj, "_people_no_trace_or_confirmed", 0) or 0,
+        hidden_or_sent_waiting=getattr(obj, "_people_hidden_or_sw", 0) or 0,
     )
-    # hidden_spam = |hidden \ (발송·대기)| = |hidden ∪ 발송·대기| − |발송·대기|
-    hidden_spam = max((getattr(obj, "_people_hidden_or_sw", 0) or 0) - sent_or_waiting, 0)
-    needs_attention = max(failed + unconfirmed - hidden_spam, 0)
-    return {
-        "targets": targets,
-        "sent": sent,
-        "waiting": waiting,
-        "failed": failed,
-        "unconfirmed": unconfirmed,
-        "hidden_spam": hidden_spam,
-        "needs_attention": needs_attention,
-        "sent_rate": round(sent / targets, 4) if targets else 0.0,
-    }
 
 
 def compute_campaign_enrichment(obj: AutoDMCampaign) -> dict:

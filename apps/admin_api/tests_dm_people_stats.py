@@ -30,6 +30,7 @@ from apps.integrations.campaign_stats import (
     annotate_campaign_people,
     build_dm_stats,
     people_from_annotations,
+    people_rollup_full,
 )
 from apps.integrations.models import AutoDMCampaign, IGAccountConnection, SentDMLog
 from apps.workspace.models import Workspace
@@ -193,6 +194,10 @@ class TestCampaignListPeople:
         _mk_log(camp, "r4", SentDMLog.Status.FAILED_TOKEN, code="190")
         _mk_log(camp, "r5", SentDMLog.Status.RECOVERY_PENDING, code="100", subcode="2534025")
         _mk_log(camp, "r6", SentDMLog.Status.FAILED_NO_TRACE)
+        # ⬇ DM-5 재현: 루트는 숨김함(미발송)인데 자식만 발송된 사람.
+        #   전부 DELIVERED 인 픽스처로는 두 모수가 우연히 같아져 이 가드가 통과해버렸다.
+        op7 = _mk_log(camp, "r7", SentDMLog.Status.RECOVERY_PENDING, code="100", subcode="2534025")
+        _mk_log(camp, "r7", SentDMLog.Status.DELIVERED, kind=SentDMLog.DMKind.REWARD, parent=op7)
 
         detail = staff_client.get(f"{CAMPAIGNS_URL}{camp.id}/").data["stats"]
         people = _row(staff_client.get(CAMPAIGNS_URL, {"search": camp.name}), camp)["people"]
@@ -205,6 +210,41 @@ class TestCampaignListPeople:
         assert people["hidden_spam"] == detail["unique_hidden_spam"]
         assert people["needs_attention"] == detail["unique_needs_attention_excl_hidden"]
         assert people["sent_rate"] == detail["unique_sent_rate"]
+
+    def test_detail_identity_holds_when_only_child_was_sent(self, staff_client):
+        """DM-5: 루트 미발송 + 자식만 발송 — 상세 응답 내부 항등이 깨지던 케이스.
+
+        예전엔 unique_sent 만 전체 로그 기준이라 그 사람을 sent 로도, failed 로도 세서
+        targets(1) != sent(1) + waiting(0) + failed(1) 이 됐다.
+        """
+        camp = _mk_campaign()
+        op = _mk_log(camp, "r1", SentDMLog.Status.RECOVERY_PENDING, code="100", subcode="2534025")
+        _mk_log(camp, "r1", SentDMLog.Status.DELIVERED, kind=SentDMLog.DMKind.REWARD, parent=op)
+
+        d = staff_client.get(f"{CAMPAIGNS_URL}{camp.id}/").data["stats"]
+        assert d["unique_targets"] == d["unique_sent"] + d["unique_waiting"] + d["unique_failed"]
+        assert (d["unique_targets"], d["unique_sent"], d["unique_failed"]) == (1, 0, 1)
+        assert _people_of(camp)["sent"] == d["unique_sent"] == 0
+
+    def test_annotate_and_rollup_return_identical_dicts(self, staff_client):
+        """목록 annotate 판과 상세 aggregate 판이 **같은 dict** 여야 한다 (구조적 가드).
+
+        필드별 단언은 픽스처가 그 분기를 안 밟으면 통과해버린다 — 두 경로의 전체
+        결과를 통째로 비교해, 조건식이 한쪽만 바뀌면 무조건 빨개지게 한다.
+        """
+        camp = _mk_campaign(follow_gate_enabled=True)
+        op1 = _mk_log(camp, "p1", SentDMLog.Status.DELIVERED)
+        _mk_log(camp, "p1", SentDMLog.Status.READ, kind=SentDMLog.DMKind.REWARD, parent=op1)
+        _mk_log(camp, "p2", SentDMLog.Status.ACCEPTED)
+        _mk_log(camp, "p3", SentDMLog.Status.QUEUED)
+        _mk_log(camp, "p4", SentDMLog.Status.FAILED_TOKEN, code="190")
+        _mk_log(camp, "p5", SentDMLog.Status.FAILED_NO_TRACE)
+        _mk_log(camp, "p6", SentDMLog.Status.RECOVERY_EXPIRED)
+        op7 = _mk_log(camp, "p7", SentDMLog.Status.RECOVERY_PENDING, code="100", subcode="2534025")
+        _mk_log(camp, "p7", SentDMLog.Status.DELIVERED, kind=SentDMLog.DMKind.REWARD, parent=op7)
+        _mk_log(camp, "p8", SentDMLog.Status.SKIPPED, msg="monthly_dm_limit_reached")
+
+        assert people_rollup_full(camp.dm_logs.all()) == _people_of(camp)
 
     def test_people_identity_total_equals_sent_waiting_failed(self, staff_client):
         camp = _mk_campaign()
@@ -276,6 +316,63 @@ class TestCampaignListPeople:
         assert row["last_sent_at"] is not None
         assert row["delivered_count"] == 1
         assert log.campaign_id == camp.id
+
+
+# ─── DM-5: unique_* 모수 통일 불변식 ──────────────────────────────────
+
+
+class TestUniqueBaseInvariants:
+    """`unique_*` 가 전부 루트 DM 모수라는 계약 — 깨지면 프론트 비율/진행률이 100%를 넘는다."""
+
+    def test_funnel_is_monotone(self, db):
+        camp = _mk_campaign(follow_gate_enabled=True)
+        op = _mk_log(camp, "r1", SentDMLog.Status.DELIVERED)
+        # 리워드가 read 여도 루트가 delivered 면 read 인원은 늘지 않는다(같은 모수)
+        _mk_log(camp, "r1", SentDMLog.Status.READ, kind=SentDMLog.DMKind.REWARD, parent=op)
+        _mk_log(camp, "r2", SentDMLog.Status.QUEUED)
+
+        d = build_dm_stats(camp.dm_logs.all())
+        assert d["unique_targets"] >= d["unique_sent"] >= d["unique_delivered"] >= d["unique_read"]
+        assert (d["unique_targets"], d["unique_sent"], d["unique_delivered"]) == (2, 1, 1)
+        assert d["unique_read"] == 0  # 루트는 delivered — 리워드 read 는 모수 밖
+
+    def test_ctr_cannot_exceed_one_for_hidden_folder_clicker(self, db):
+        """숨김함에서 버튼을 누른 사람 — 예전엔 분자만 세어 CTR 이 1을 넘을 수 있었다.
+
+        루트가 recovery_pending 이라 '발송'으로 안 잡히는데, 클릭 증거(child)는 남는다.
+        분자를 발송 인원과 교집합해 분모 초과를 원천 차단한다.
+        """
+        camp = _mk_campaign(follow_gate_enabled=True)
+        hidden = _mk_log(
+            camp, "r1", SentDMLog.Status.RECOVERY_PENDING, code="100", subcode="2534025"
+        )
+        _mk_log(camp, "r1", SentDMLog.Status.DELIVERED, kind=SentDMLog.DMKind.REWARD, parent=hidden)
+
+        d = build_dm_stats(camp.dm_logs.all())
+        assert d["unique_sent"] == 0 and d["ctr_denominator"] == 0
+        assert d["ctr_interacted"] == 0  # 발송 인원 밖 → 분자에서도 제외
+        assert d["ctr"] == 0.0
+
+    def test_followers_counted_from_child_evidence_but_capped_by_sent(self, db):
+        """게이트 통과 표시가 리워드에만 있어도 인원은 잡히고, 발송 인원을 넘지 않는다."""
+        camp = _mk_campaign(follow_gate_enabled=True)
+        op = _mk_log(camp, "r1", SentDMLog.Status.DELIVERED)
+        reward = _mk_log(
+            camp, "r1", SentDMLog.Status.DELIVERED, kind=SentDMLog.DMKind.REWARD, parent=op
+        )
+        SentDMLog.objects.filter(pk=reward.pk).update(gate_status=SentDMLog.GateStatus.PASSED)
+
+        d = build_dm_stats(camp.dm_logs.all())
+        assert d["unique_followers"] == 1 <= d["unique_sent"]
+
+    def test_unique_delivered_counts_recovery_delivered(self, db):
+        """복구 재전송 성공은 실제 도착 — 이벤트 delivery_rate 와 정의를 맞춘다."""
+        camp = _mk_campaign()
+        _mk_log(camp, "r1", SentDMLog.Status.RECOVERY_DELIVERED)
+
+        d = build_dm_stats(camp.dm_logs.all())
+        assert d["unique_delivered"] == 1
+        assert d["unique_reach_rate"] == 1.0
 
 
 # ─── DM-1-c: 사람 단위 정렬 ───────────────────────────────────────────

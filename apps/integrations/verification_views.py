@@ -595,9 +595,15 @@ class DMVerificationViewSet(viewsets.ViewSet):
         - `total`, `delivered`, `read`, `gate_passed` 등: 로그(이벤트) 개수.
 
         ### ② 사람(수신자 Instagram ID) 단위 — v4.2 (마케팅)
-        - `unique_recipients`: 도달한 고유 수신자 수.
+        **`unique_*` 는 전부 같은 모수입니다** — 루트 DM(오프닝/단독) 1건 = 사람 1명.
+        리워드·재안내 child 는 같은 사람에게 가는 부가 발송이라 모수에서 빠집니다. 따라서
+        `unique_targets ≥ unique_sent ≥ unique_delivered ≥ unique_read` 와
+        `ctr ≤ 1` 이 **항상** 성립하고, 어드민 목록의 `people.*` 와 값이 같습니다.
+        - `unique_recipients`: 하위호환 — `unique_targets` 와 항상 같습니다(신규 사용 비권장).
         - `unique_sent`: DM 이 실제 발송된 고유 수신자 수 (CTR 분모).
         - `unique_delivered` / `unique_read` / `unique_followers`: 각 단계 도달 사람 수.
+          `unique_delivered` 는 복구 재전송 성공(`recovery_delivered`)도 도착으로 셉니다
+          (이벤트 단위 `delivery_rate` 와 같은 정의).
         - `unique_delivery_rate`: unique_delivered / unique_sent.
         - `ctr`: **참여율** = 상호작용한 사람 / 발송된 사람 (0~1).
           - 게이트형 캠페인(`follow_gate_enabled=true`): "버튼 클릭" 을 참여로 봄.
