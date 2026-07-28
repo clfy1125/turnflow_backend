@@ -983,7 +983,7 @@ class TestTrends:
         assert trends["granularity"] == "day"
         # 7d 는 현재 시각 기준 [now-7d, now) — 로컬 날짜 zero-fill: 7 또는 8 버킷
         assert len(trends["buckets"]) in (7, 8)
-        # 각 버킷 키 계약 (Q-1: activated + by_channel 추가)
+        # 각 버킷 키 계약 (Q-1: activated + by_channel / Q-B: unattributed 추가)
         b = trends["buckets"][0]
         assert set(b) == {
             "date",
@@ -995,7 +995,10 @@ class TestTrends:
             "visits",
             "activated",
             "by_channel",
+            "unattributed",
         }
+        # unattributed 는 빈 버킷에도 항상 존재 (프론트가 존재 여부로 분기하지 않게)
+        assert b["unattributed"] == {"signups": 0, "activated": 0, "paid": 0}
 
     def test_trends_buckets_zero_filled_length_equals_day_count(self, staff_client, clean_slate):
         # 커스텀 6/1~6/30 = 30일 → 30 버킷 (전부 zero-fill 포함)
@@ -1892,11 +1895,16 @@ class TestTrendsActivatedByChannel:
         assert bucket["signups"] == 2
         by = bucket["by_channel"]
         assert by[str(link.pk)] == {"visits": 2, "signups": 1, "activated": 1, "paid": 1}
-        assert by["other"]["signups"] == 1
+        # MKT-10/Q-B: 귀속 기록 없는 u2 는 other 가 아니라 unattributed 로 간다
+        assert by["other"]["signups"] == 0
         assert by["other"]["visits"] == 1
-        # 각 지표 Σ(키) == 버킷 총량
-        for key in ("visits", "signups", "activated", "paid"):
-            assert sum(s[key] for s in by.values()) == bucket[key], key
+        assert bucket["unattributed"] == {"signups": 1, "activated": 0, "paid": 0}
+        # 사람 단위 3지표: Σ(키) + unattributed == 버킷 총량 / visits 는 등식 그대로
+        for key in ("signups", "activated", "paid"):
+            assert (
+                sum(s[key] for s in by.values()) + bucket["unattributed"][key] == bucket[key]
+            ), key
+        assert sum(s["visits"] for s in by.values()) == bucket["visits"]
         # 모든 by_channel 키가 표의 행으로 존재해야 라벨을 찾을 수 있다
         row_keys = {r["key"] for r in res.data["channels"]["rows"]}
         assert set(by) <= row_keys
@@ -2323,6 +2331,56 @@ class TestAttributionGap:
         # 전 기간 최솟값이라 방금 만든 행보다 이르거나 같다 (직렬화 결과는 문자열 → 파싱)
         assert datetime.fromisoformat(str(gap["since"])) <= attr.created_at
 
+    def test_gap_lives_under_channels_not_top_level(self, staff_client, clean_slate):
+        """Q-A — 정본 위치는 channels 안. 최상위에 같은 키를 두면 두 곳이 갈라진다."""
+        res = staff_client.get(URL)
+        assert "attribution_gap" in res.data["channels"]
+        assert "attribution_gap" not in res.data
+
+    def test_trends_uses_same_population_as_rows_and_funnel(self, staff_client, clean_slate):
+        """Q-B — 표·퍼널·추이 세 카드의 ``other`` 가 같은 인원을 뜻해야 한다.
+
+        추이만 공백 인원을 other 로 접으면 같은 키가 카드마다 다른 모집단이 된다
+        (MKT-10 으로 표·퍼널에서 뺀 것과 같은 문제가 카드 하나에 남는다).
+        """
+        now = timezone.now()
+        u_ok = _mk_user(joined=now)
+        SignupAttribution.objects.create(user=u_ok, channel="search_organic", signup_kind="email")
+        _mk_user(joined=now)  # 귀속 행 없음
+
+        res = staff_client.get(URL)
+        bucket = res.data["trends"]["buckets"][-1]
+        gap_today = bucket["unattributed"]["signups"]
+        assert gap_today == 1
+        # 추이의 채널 층 == 표의 행 (둘 다 공백 제외)
+        assert sum(s["signups"] for s in bucket["by_channel"].values()) == 1
+        assert sum(r["signups"] for r in res.data["channels"]["rows"]) == 1
+        # 버킷 총량에는 남는다 → 항등으로 복원 가능
+        assert sum(s["signups"] for s in bucket["by_channel"].values()) + gap_today == (
+            bucket["signups"]
+        )
+        # 기간 전체 합 == 표 밖 숫자 (버킷 쪼개기가 총량을 바꾸지 않는다)
+        buckets = res.data["trends"]["buckets"]
+        assert sum(b["unattributed"]["signups"] for b in buckets) == (
+            res.data["channels"]["attribution_gap"]["signups_unattributed"]
+        )
+
+    def test_referral_code_user_is_not_a_trends_gap(self, staff_client, clean_slate, pro_plan):
+        """공백 판정은 추이에서도 코드 우선 — 코드 사용자는 귀속 행이 없어도 채널을 안다."""
+        now = timezone.now()
+        u = _mk_user(joined=now)  # 귀속 행 없음, 코드만 사용
+        code = ReferralCode.objects.create(code=f"TG-{uuid.uuid4().hex[:6]}", target_plan=pro_plan)
+        ReferralRedemption.objects.create(
+            user=u,
+            referral_code=code,
+            trial_started_at=now,
+            trial_ends_at=now + timedelta(days=30),
+        )
+
+        bucket = staff_client.get(URL).data["trends"]["buckets"][-1]
+        assert bucket["by_channel"][code.code]["signups"] == 1
+        assert bucket["unattributed"]["signups"] == 0
+
 
 class TestChannelLinkCacheBust:
     """MKT-11 — 저장 직후 확인하는 흐름이라 5분 지연이 '동작 안 함'으로 읽힌다."""
@@ -2724,8 +2782,12 @@ class TestTrendsGranularity:
         joined_week -= timedelta(days=joined_week.weekday())
         bucket = next(b for b in trends["buckets"] if b["date"] == joined_week.isoformat())
         assert bucket["signups"] == 1
-        if HAS_ANALYTICS:  # Σ by_channel == 버킷 총량 (주별에서도 유지)
-            assert sum(s["signups"] for s in bucket["by_channel"].values()) == 1
+        if HAS_ANALYTICS:  # 항등 (주별에서도 유지) — 이 유저는 귀속 기록이 없어 gap 쪽
+            assert (
+                sum(s["signups"] for s in bucket["by_channel"].values())
+                + bucket["unattributed"]["signups"]
+                == 1
+            )
 
     def test_week_bucket_dedupes_activated(self, staff_client, clean_slate):
         """주 버킷 내 같은 회원의 반복 활동은 1명 (사람 단위 dedupe)."""

@@ -942,7 +942,10 @@ class _TrendChannelSliceSerializer(serializers.Serializer):
     """일별 추이의 채널 1개 분해 슬라이스 (Q-1 — 스택 막대그래프 층 재료).
 
     채널 귀속은 채널별 성과 표와 동일(가입 시 저장 채널 + 제휴코드 사용자 referral
-    오버라이드) — visits 만 방문 자체의 저장 채널. 각 지표 Σ(채널) == 버킷 총량.
+    오버라이드) — visits 만 방문 자체의 저장 채널.
+
+    ⚠️ 합계 규칙 (MKT-10 / Q-B): 사람 단위 3지표는 귀속 기록 없는 인원이 빠져 있어
+    ``Σ(채널) + bucket.unattributed[m] == 버킷[m]``. visits 만 ``Σ(채널) == 버킷 visits``.
     """
 
     visits = serializers.IntegerField(
@@ -953,6 +956,21 @@ class _TrendChannelSliceSerializer(serializers.Serializer):
         help_text="이 채널 귀속 활성 유저 수 (버킷 activated 분해)"
     )
     paid = serializers.IntegerField(help_text="이 채널 귀속 유료 전환 수 (첫 PAID 발생일 기준)")
+
+
+class _TrendUnattributedSerializer(serializers.Serializer):
+    """추이 버킷의 '유입 경로 기록 없음' 인원 (MKT-10 의 추이 판 — Q-B).
+
+    채널별 성과 표의 ``channels.attribution_gap`` 과 **같은 판정**(귀속 행 없음 &
+    제휴코드 미사용)을 버킷 단위로 쪼갠 값. 채널 층으로 그리면 다시 채널처럼 읽히므로
+    ``by_channel`` **밖**에 둔다 — 표에서 경고 줄로 뺀 것과 같은 이유.
+
+    ``visits`` 는 없다 — 방문은 행 자체(UTM·리퍼러)로 판정하므로 공백이 성립하지 않는다.
+    """
+
+    signups = serializers.IntegerField(help_text="이 버킷 가입 중 귀속 기록이 없는 인원")
+    activated = serializers.IntegerField(help_text="이 버킷 활성 중 귀속 기록이 없는 인원")
+    paid = serializers.IntegerField(help_text="이 버킷 첫 결제 중 귀속 기록이 없는 인원")
 
 
 class _TrendBucketSerializer(serializers.Serializer):
@@ -985,7 +1003,12 @@ class _TrendBucketSerializer(serializers.Serializer):
     by_channel = serializers.DictField(
         child=_TrendChannelSliceSerializer(),
         help_text="Q-1 — 채널 키 → {visits, signups, activated, paid} 분해. "
-        "값이 전부 0인 채널은 생략 (프론트 0 처리). 채널 키 셋은 channels.rows 와 동일",
+        "값이 전부 0인 채널은 생략 (프론트 0 처리). 채널 키 셋은 channels.rows 와 동일. "
+        "**사람 단위 3지표는 귀속 공백 인원 제외** — unattributed 참고",
+    )
+    unattributed = _TrendUnattributedSerializer(
+        help_text="MKT-10 / Q-B — 귀속 기록이 없어 by_channel 에서 제외된 인원. "
+        "항등: Σby_channel[m] + unattributed[m] == 이 버킷의 [m]. 항상 존재(0 포함)"
     )
 
 

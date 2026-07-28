@@ -634,17 +634,32 @@ def _first_paid_local_dates(start, end) -> dict:
     return {row["user_id"]: timezone.localtime(row["first"], tz).date() for row in rows}
 
 
-def _trend_row_key_of(uid, attr_row: dict, referral_users: dict) -> str:
+def _empty_trend_gap() -> dict:
+    """추이 버킷의 '귀속 기록 없음' 슬롯 (MKT-10 의 추이 판 — Q-B).
+
+    visits 는 없다 — 방문은 행 자체(UTM·리퍼러)로 판정하므로 '귀속 기록 없음'이라는
+    개념이 성립하지 않는다. 사람 단위 3지표만 공백을 가진다.
+    """
+    return {"signups": 0, "activated": 0, "paid": 0}
+
+
+def _trend_row_key_of(uid, attr_row: dict, referral_users: dict) -> str | None:
     """trends 막대의 채널 층 키 — **채널별 성과 표의 rows[].key 와 동일**(MKT-2).
 
     표는 링크 단위인데 그래프만 파생 채널 단위면 한 화면에 두 분류가 공존한다.
     제휴코드 사용자는 코드 행으로(표와 같은 배타적 오버레이), 나머지는 attr_row 가
     이미 계산해 둔 (row_key, source) 의 row_key 를 쓴다.
+
+    **None = 귀속 기록 없음**(MKT-10 / Q-B). 예전엔 other 로 접었지만, 그러면 같은
+    ``other`` 키가 표·퍼널(제외)과 추이(포함)에서 다른 인원을 뜻한다 → 버킷의
+    ``unattributed`` 로 빼고 by_channel 에서 제외한다. 코드 사용자는 귀속 행이 없어도
+    공백이 아니다(코드 자체가 유입 경로) — 판정 순서를 바꾸지 말 것.
     """
     code = referral_users.get(uid)
     if code:
         return code
-    return (attr_row.get(uid) or (OTHER_ROW_KEY, None))[0]
+    bucket = attr_row.get(uid)
+    return bucket[0] if bucket is not None else None
 
 
 def _trends(start, end, visit_rows: list[tuple] | None = None) -> dict:
@@ -664,7 +679,12 @@ def _trends(start, end, visit_rows: list[tuple] | None = None) -> dict:
       가입 시기 무관 이벤트 기준)
     - by_channel(Q-1 → MKT-2): visits/signups/activated/paid 4지표의 분해. **키는
       channels.rows[].key 와 동일**(other / 링크 pk / 제휴코드) — 라벨은 프론트가 rows 에서
-      찾는다(단일 소스). Σ by_channel == 버킷 총량. 전부 0인 키는 생략.
+      찾는다(단일 소스). 전부 0인 키는 생략.
+    - unattributed(MKT-10 / Q-B): 귀속 기록이 없어 by_channel 에서 **제외된** 인원.
+      표·퍼널과 같은 모집단을 쓰려면 추이도 빼야 한다 — 안 빼면 같은 ``other`` 키가
+      카드마다 다른 인원을 뜻한다. 버킷 총량에는 **그대로 남는다**:
+      ``Σby_channel[m] + unattributed[m] == 버킷[m]`` (m = signups/activated/paid),
+      ``Σby_channel.visits == 버킷 visits``(방문은 공백 개념 없음 — 등식 그대로).
     """
     tz = timezone.get_current_timezone()
     granularity = _trends_granularity(start, end)
@@ -771,17 +791,29 @@ def _trends(start, end, visit_rows: list[tuple] | None = None) -> dict:
             )
         )
 
-    # (버킷, row_key) 슬라이스 집계 — Σ by_channel == 총량 보장 (귀속 없는 유저도 other 로 감)
+    # (버킷, row_key) 슬라이스 집계. 귀속 기록 없는 회원(row_key=None)은 by_channel 에서
+    # 빼고 버킷의 unattributed 로 모은다 (MKT-10 을 추이에도 적용 — Q-B).
+    # 항등: Σby_channel[m] + unattributed[m] == 버킷 총량[m] (m = signups/activated/paid),
+    #       Σby_channel.visits == 버킷 visits (방문은 행 자체로 판정 — 공백 개념 없음).
     slice_key = defaultdict(lambda: {"visits": 0, "signups": 0, "activated": 0, "paid": 0})
+    unattributed: dict = defaultdict(_empty_trend_gap)
     for (bucket, row_key), n in visits_by_bucket_row.items():
         slice_key[(bucket, row_key)]["visits"] += n
+
+    def _put(bucket, uid, metric: str) -> None:
+        row_key = _trend_row_key_of(uid, attr_row, referral_users)
+        if row_key is None:
+            unattributed[bucket][metric] += 1
+            return
+        slice_key[(bucket, row_key)][metric] += 1
+
     for uid, bucket in signup_rows:
-        slice_key[(bucket, _trend_row_key_of(uid, attr_row, referral_users))]["signups"] += 1
+        _put(bucket, uid, "signups")
     for bucket, users in activated_by_bucket.items():
         for uid in users:
-            slice_key[(bucket, _trend_row_key_of(uid, attr_row, referral_users))]["activated"] += 1
+            _put(bucket, uid, "activated")
     for uid, bucket in first_paid_map.items():
-        slice_key[(bucket, _trend_row_key_of(uid, attr_row, referral_users))]["paid"] += 1
+        _put(bucket, uid, "paid")
 
     by_channel_by_bucket: dict = defaultdict(dict)
     for (bucket, channel), slice_ in slice_key.items():
@@ -804,6 +836,7 @@ def _trends(start, end, visit_rows: list[tuple] | None = None) -> dict:
                 "visits": visits.get(cur, 0),
                 "activated": len(activated_by_bucket.get(cur, ())),
                 "by_channel": by_channel_by_bucket.get(cur, {}),
+                "unattributed": unattributed.get(cur) or _empty_trend_gap(),
             }
         )
         cur = _bucket_next(cur, granularity)
@@ -3399,7 +3432,7 @@ KPI(기간 비교), 가입 코호트 퍼널, 채널별 성과, 업셀 후보, �
   start/end 중 하나만·파싱 불가·`end < start`·span > 366일 → `details.reason`.
 - **`trends.granularity`(R-5)**: 현재 구간이 길면 버킷 단위를 자동 상향합니다 —
   **≤120일 `"day"` / ≤400일 `"week"`(월요일 시작) / 그 이상 `"month"`(1일 시작)**.
-  `date` 는 버킷 **시작일**, 필드 구성·`Σ by_channel == 버킷 총량` 규칙은 일별과 동일하며
+  `date` 는 버킷 **시작일**, 필드 구성·합계 규칙(`by_channel` + `unattributed`)은 일별과 동일하며
   마지막 버킷이 진행 중(미완결)이어도 그대로 내려갑니다. `activated` 는 **버킷 단위 dedupe**
   (주별이면 같은 주 중복 활동은 1명). 프론트는 이 값을 읽어 받은 단위 그대로 렌더하세요.
 - **`trends`(신규, 항상 포함)**: current 기간 전체를 **로컬 날짜 단위로 zero-fill** 한 일별 버킷.
@@ -3519,7 +3552,13 @@ KPI(기간 비교), 가입 코호트 퍼널, 채널별 성과, 업셀 후보, �
   or 페이지 공개한 고유 회원 수(일별 dedupe). by_channel = 채널 키 →
   `{visits, signups, activated, paid}` — 귀속은 채널별 성과 표와 동일 규칙
   (저장 채널 + referral 오버라이드), visits 만 방문 자체의 저장 채널(세션 단위).
-  각 지표 Σ(채널) == 버킷 총량, 전부 0인 채널은 생략. 주별 합산은 프론트에서.
+  전부 0인 채널은 생략. 주별 합산은 프론트에서.
+- **`trends.buckets[].unattributed`(MKT-10 / Q-B)**: 귀속 기록이 없어 `by_channel` 에서
+  **제외된** 인원 `{signups, activated, paid}`(항상 존재, 0 포함). 채널별 성과 표
+  (`channels.attribution_gap`)·퍼널 채널 variant 와 **같은 모집단**을 쓰기 위한 것 —
+  안 빼면 같은 `other` 키가 표·퍼널 vs 추이에서 다른 인원을 뜻합니다.
+  항등: `Σby_channel[m] + unattributed[m] == 버킷[m]`(m = signups/activated/paid),
+  `Σby_channel.visits == 버킷 visits`(방문은 행 자체로 판정 — 공백 개념 없음).
 - **`cohorts`(Q-2, 기간 필터 무관)**: `subscription`(첫 결제 월 × M+1..M+5 유료 유지율 —
   시점별로 일별 스냅샷 우선, 없으면 현재 상태 역산 근사 → 하나라도 근사면
   `basis="approx"`) + `usage`(가입 주(월요일) × W+1..W+5 기능 사용률 — 이벤트 로그
@@ -3781,7 +3820,8 @@ curl -H "Authorization: Bearer <staff_token>" \\
                         "buckets": [
                             {
                                 "date": "2026-06-11",
-                                "signups": 12,
+                                # 13 = by_channel 합 12 + unattributed 1 (MKT-10/Q-B 항등)
+                                "signups": 13,
                                 "paid": 2,
                                 "dm_delivered": 340,
                                 "page_views": 210,
@@ -3809,6 +3849,12 @@ curl -H "Authorization: Bearer <staff_token>" \\
                                         "paid": 0,
                                     },
                                 },
+                                # 귀속 기록 없음 — by_channel 에서 빠지고 여기로만 잡힌다
+                                "unattributed": {
+                                    "signups": 1,
+                                    "activated": 0,
+                                    "paid": 0,
+                                },
                             },
                             {
                                 "date": "2026-06-12",
@@ -3826,6 +3872,11 @@ curl -H "Authorization: Bearer <staff_token>" \\
                                         "activated": 4,
                                         "paid": 0,
                                     }
+                                },
+                                "unattributed": {
+                                    "signups": 0,
+                                    "activated": 0,
+                                    "paid": 0,
                                 },
                             },
                         ],
