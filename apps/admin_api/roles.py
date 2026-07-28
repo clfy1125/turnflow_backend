@@ -150,10 +150,13 @@ def is_endpoint_allowed(role: str, method: str, path: str) -> bool:
 
 
 def can_delete_channel_link(role: str, user, link) -> bool:
-    """이 요청자가 이 채널 링크를 삭제할 수 있는가 (RBAC-4-b/c 단일 소스).
+    """이 요청자가 이 채널 링크를 **변경(삭제·수정)** 할 수 있는가 (RBAC-4-b/c 단일 소스).
 
     응답의 ``can_delete`` 플래그와 DELETE 게이트가 **반드시 같은 함수**를 써야 한다 —
-    갈라지면 화면의 삭제 버튼과 실제 동작이 어긋난다.
+    갈라지면 화면의 삭제 버튼과 실제 동작이 어긋난다. PATCH(이름 수정)도 같은 판정을
+    쓴다 — 현재 PATCH 는 화이트리스트에 없어 미들웨어가 먼저 막지만, 경로만 열었을 때
+    남의 링크를 고칠 수 있는 구멍이 생기지 않도록 뷰에서 미리 닫아둔다.
+    이름이 ``can_delete_*`` 인 것은 응답 필드명(``can_delete``)과 1:1 로 맞추기 위함이다.
 
     - full: 항상 True (기존 동작 유지)
     - marketing_viewer: 자기가 만든 링크만. ``created_by`` 가 null 인 레코드(생성자 계정

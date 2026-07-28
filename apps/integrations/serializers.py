@@ -1469,18 +1469,34 @@ class DMVerificationStatsSerializer(serializers.Serializer):
     # ── v4.2 — 사람(수신자 Instagram ID) 단위 지표 (마케팅용) ──────────────
     # 위 필드는 모두 "발송 이벤트" 단위라 follow-gate 캠페인(1명=DM 2건)에서 부풀려 보인다.
     # 아래 unique_* 는 수신자 계정 기준 중복 제거한 "사람 수" 지표.
+    # ⚠️ unique_* 는 **전부 같은 모수**다: 루트 DM(오프닝/단독) 1건 = 사람 1명.
+    #    리워드·재안내 child 는 같은 사람에게 가는 부가 발송이라 모수에서 빠진다.
+    #    따라서 targets ⊇ sent ⊇ delivered ⊇ read, sent ⊇ followers/ctr_interacted 가
+    #    항상 성립하고, 목록(`/admin/auto-dm/campaigns/` 의 people.*)과 값이 같다.
     unique_recipients = serializers.IntegerField(
-        help_text="DM 로그가 1건이라도 있는 고유 수신자 수 (도달 인원)"
+        help_text=(
+            "DM 대상이 된 고유 수신자 수. 모수 통일 후 unique_targets 와 항상 같다 — "
+            "하위호환용이며 신규 화면은 unique_targets 를 쓸 것"
+        )
     )
     unique_sent = serializers.IntegerField(
-        help_text="DM 이 실제 발송된 고유 수신자 수 (CTR 분모). accepted 이상 상태 기준"
+        help_text=(
+            "DM 이 실제 발송된 고유 수신자 수 (CTR 분모). 루트 DM 이 accepted 이상인 사람. "
+            "목록 응답의 people.sent 와 **항상 동일**"
+        )
     )
     unique_delivered = serializers.IntegerField(
-        help_text="도착(delivered/read) 경험이 있는 고유 수신자 수"
+        help_text=(
+            "확정 도착(delivered/read/recovery_delivered)한 루트 DM 이 있는 고유 수신자 수. "
+            "unique_sent 의 부분집합"
+        )
     )
-    unique_read = serializers.IntegerField(help_text="읽음 확인된 고유 수신자 수")
+    unique_read = serializers.IntegerField(help_text="루트 DM 을 읽은 고유 수신자 수")
     unique_followers = serializers.IntegerField(
-        help_text="follow-gate 통과(팔로우 확인)된 고유 수신자 수"
+        help_text=(
+            "follow-gate 통과(팔로우 확인)된 고유 수신자 수. 통과 증거는 리워드 child 에도 "
+            "남지만 인원은 발송 인원(unique_sent)과 교집합해 세므로 분자 ≤ 분모"
+        )
     )
     unique_delivery_rate = serializers.FloatField(
         help_text="unique_delivered / unique_sent (사람 단위 도착률, 0~1)"
@@ -1490,9 +1506,9 @@ class DMVerificationStatsSerializer(serializers.Serializer):
     unique_targets = serializers.IntegerField(
         help_text=(
             "전체 대상 사람 수 — 루트 DM(오프닝/단독, 리워드·재안내 제외) 기준 고유 수신자. "
-            "실패 포함 모수이며 항등 '루트 발송 + unique_waiting + unique_failed' 이 항상 성립. "
-            "unique_sent 는 리워드/재안내 수신자도 포함(전체 로그 기준)이라, 부모 오프닝이 집계 "
-            "구간(기본 30일) 밖인 드문 경우 unique_targets 와 미세하게 다를 수 있음"
+            "실패 포함 모수이며 항등 "
+            "**unique_targets == unique_sent + unique_waiting + unique_failed** 가 "
+            "항상 성립한다(진행률 바 분모로 그대로 사용 가능)"
         )
     )
     unique_waiting = serializers.IntegerField(

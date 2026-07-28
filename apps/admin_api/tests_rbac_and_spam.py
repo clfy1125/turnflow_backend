@@ -345,6 +345,59 @@ class TestChannelLinkViewerScope:
         assert _login(viewer).delete(f"{LINKS_URL}{link.pk}/").status_code == 204
         assert not MarketingChannelLink.objects.filter(pk=link.pk).exists()
 
+    def test_viewer_cannot_rename_any_link(self, viewer, full_admin):
+        """Q1-①: 이름 수정(PATCH)은 외주에게 열지 않는다 — 경로 자체가 미들웨어에서 막힌다."""
+        link = _mk_link(full_admin, "내부 팀 링크")
+        res = _login(viewer).patch(
+            f"{LINKS_URL}{link.pk}/", {"name": "바뀜"}, content_type="application/json"
+        )
+        assert res.status_code == 403
+        assert res.json()["error"]["details"]["code"] == "section_forbidden"
+        link.refresh_from_db()
+        assert link.name == "내부 팀 링크"
+
+    def test_rename_owner_guard_holds_even_if_path_is_opened(self, viewer, full_admin):
+        """경로만 열었을 때 남의 링크를 고칠 수 있게 되면 안 된다 (뷰 단 2차 방어).
+
+        DELETE 와 달리 PATCH 에는 소유자 게이트가 없었다 — 나중에 화이트리스트에
+        PATCH 를 추가하는 순간 구멍이 되므로, 그 상황을 흉내 내 미리 검증한다.
+        """
+        import re
+        from unittest.mock import patch as mock_patch
+
+        from apps.admin_api import roles as roles_mod
+
+        others = _mk_link(full_admin, "내부 팀 링크")
+        mine = _mk_link(viewer, "외주 링크")
+        opened = dict(roles_mod.ROLE_ALLOWED_PATTERNS)
+        opened[ROLE_MARKETING_VIEWER] = [
+            *opened[ROLE_MARKETING_VIEWER],
+            ("PATCH", re.compile(rf"^{re.escape(roles_mod.CHANNEL_LINKS_PATH)}\d+/$")),
+        ]
+        with mock_patch.object(roles_mod, "ROLE_ALLOWED_PATTERNS", opened):
+            client = _login(viewer)
+            blocked = client.patch(
+                f"{LINKS_URL}{others.pk}/", {"name": "바뀜"}, content_type="application/json"
+            )
+            allowed = client.patch(
+                f"{LINKS_URL}{mine.pk}/", {"name": "내 링크 v2"}, content_type="application/json"
+            )
+        assert blocked.status_code == 403
+        assert blocked.json()["error"]["details"]["code"] == "not_link_owner"
+        others.refresh_from_db()
+        assert others.name == "내부 팀 링크"
+        assert allowed.status_code == 200  # 자기 링크는 통과 (can_delete 판정과 동일)
+
+    def test_full_admin_can_still_rename(self, full_admin):
+        """full 역할 회귀 0 — 소유자 검사는 제한 역할에만 적용된다."""
+        link = _mk_link(full_admin, "이름 바꿀 링크")
+        res = _login(full_admin).patch(
+            f"{LINKS_URL}{link.pk}/", {"name": "새 이름"}, content_type="application/json"
+        )
+        assert res.status_code == 200
+        link.refresh_from_db()
+        assert link.name == "새 이름"
+
     def test_viewer_cannot_delete_others_link(self, viewer, full_admin):
         """이번 요청의 핵심 안전장치 — 내부 팀 링크는 외주가 못 지운다."""
         link = _mk_link(full_admin, "내부 팀 링크")

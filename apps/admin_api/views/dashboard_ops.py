@@ -137,11 +137,14 @@ DM_ERROR_STATUSES = (
 )
 # ── DM-4: 건너뜀(skipped) 사유 분해 ──────────────────────────────────
 # skipped = "Meta 에 요청을 보내지 않고 취소한 건". **실패가 아니라 발송을 시작하지 않은
-# 상태**이며, 6가지 사유 중 조치가 필요한 것은 월 DM 한도 하나뿐이다(업셀 신호).
+# 상태**이며, 조치가 필요한 것은 월 DM 한도 하나뿐이다(업셀 신호).
 # 사유 컬럼이 따로 없어 error_message 문자열로 판별하지만, 규칙을 **여기 한 곳**에 모아
 # 두었으니 발송 경로의 문구를 바꾸면 이 표를 함께 고칠 것.
 #   (원문 출처: integrations/tasks.py 의 log.mark_skipped(...) 호출부 +
 #    integrations/models.py 의 IGAccountConnection._halt_automation)
+# ⚠️ 아래 뒤 2개는 **운영 중 수동 정리**로 찍힌 문구다(2026-07 중복 캠페인/유령 오프닝
+#    사고 대응). 코드 경로가 아니라 사고 대응 셸에서 나왔지만 prod 실측 66건 중 40건을
+#    차지해, 없으면 패널의 다수가 '기타'로 보인다 — 지우지 말 것.
 # 형식: (reason 키, 한국어 라벨, actionable, 매칭 부분문자열들)
 SKIPPED_REASONS: tuple[tuple[str, str, bool, tuple[str, ...]], ...] = (
     ("monthly_dm_limit", "월 DM 한도 도달", True, ("monthly_dm_limit_reached",)),
@@ -150,6 +153,13 @@ SKIPPED_REASONS: tuple[tuple[str, str, bool, tuple[str, ...]], ...] = (
     ("ig_account_inactive", "IG 계정 비활성(플랜 축소)", False, ("ig account deactivated",)),
     ("self_recipient", "계정 자신의 댓글", False, ("self recipient",)),
     ("connection_disconnected", "IG 연결 해제 정리", False, ("ig connection disconnected",)),
+    (
+        "duplicate_campaign_cleanup",
+        "같은 게시물 중복 캠페인 정리",
+        False,
+        ("duplicate campaign on same media",),
+    ),
+    ("ghost_opening_cleanup", "유령 오프닝 정리(운영 조치)", False, ("유령 오프닝",)),
 )
 SKIPPED_OTHER = ("other", "기타", False)
 

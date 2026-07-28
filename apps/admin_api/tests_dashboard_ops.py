@@ -1037,6 +1037,27 @@ class TestSkippedBreakdown:
         }
         assert rows == {"connection_disconnected": 1, "ig_account_inactive": 1}
 
+    def test_operational_cleanup_reasons_are_recognised(self, staff_client, clean_slate):
+        """prod 실측(2026-07-28) 66건 중 40건이 이 두 문구였다 — 없으면 대다수가 '기타'."""
+        camp = _mk_campaign(_mk_conn())
+        _mk_dms(
+            camp,
+            SentDMLog.Status.SKIPPED,
+            2,
+            error_message="duplicate campaign on same media (sibling delivered) — auto-cleared",
+        )
+        _mk_dms(
+            camp,
+            SentDMLog.Status.SKIPPED,
+            1,
+            error_message="이미 답글 존재(subcode 2534023) + 리워드 전달완료 — 유령 오프닝 정리(수동)",
+        )
+        rows = {
+            r["reason"]: r["count"]
+            for r in staff_client.get(URL).data["dm_quality"]["skipped_breakdown"]
+        }
+        assert rows == {"duplicate_campaign_cleanup": 2, "ghost_opening_cleanup": 1}
+
     def test_empty_when_no_skipped(self, staff_client, clean_slate):
         camp = _mk_campaign(_mk_conn())
         _mk_dms(camp, SentDMLog.Status.DELIVERED, 1)

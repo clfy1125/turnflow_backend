@@ -485,7 +485,9 @@ class Command(BaseCommand):
         for i in range(count):
             self._seq += 1
             s = self._seq
-            rid = f"{TAG}_{s}"
+            # child(리워드/재안내)는 **부모와 같은 사람**이어야 한다 — 새 rid 를 뽑으면
+            # 루트 없는 유령 수신자가 생겨 사람 단위 지표(unique_*/people.*)가 뒤틀린다.
+            rid = parent.recipient_user_id if parent is not None else f"{TAG}_{s}"
             cid = f"{TAG}-c-{s}" if comment else ""
             created_at = created_ats[i] if created_ats else (self.now - timedelta(minutes=5))
             objs.append(

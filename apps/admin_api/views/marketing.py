@@ -321,6 +321,12 @@ class AdminChannelLinkDetailView(generics.RetrieveUpdateDestroyAPIView):
 |------|------|------|------|
 | `name` | ✅ | string | 변경할 이름 (최대 100자) |
 
+## 소유자 스코프
+- `full` 역할: 모든 링크 수정 가능 (기존 동작 그대로).
+- `marketing_viewer`(외주): 이 엔드포인트는 **화이트리스트에 없어 미들웨어에서 403**
+  (`section_forbidden`) 입니다. 경로를 열더라도 삭제와 **같은 소유자 판정**을 거치므로
+  남의 링크는 `not_link_owner` 403 입니다.
+
 ## 주의사항
 - `base_url`/`utm_*` 는 수정할 수 없습니다 — `url`·`channel` 파생값과의 일관성을 위해
   UTM 조합을 바꾸려면 **삭제 후 재생성**하세요 (보내도 무시됩니다).
@@ -342,8 +348,50 @@ class AdminChannelLinkDetailView(generics.RetrieveUpdateDestroyAPIView):
     def patch(self, request, *args, **kwargs):
         return self.update(request, *args, **kwargs)
 
+    def _owner_guard(self, request, link, verb: str):
+        """제한 역할(외주)의 **남의 링크** 변경 차단 → 403 Response, 통과면 None.
+
+        수정과 삭제가 같은 판정 함수를 쓴다 — 화이트리스트에 새 메서드를 열 때
+        소유자 검사를 빠뜨리는 사고를 막는다(경로 게이트는 미들웨어, 객체 권한은 뷰).
+        """
+        role = resolve_admin_role(request)
+        if can_delete_channel_link(role, request.user, link):
+            return None
+        log_admin_action(
+            request=request,
+            action=AdminActionLog.Action.ADMIN_ACCESS_DENIED,
+            target_type="channel_link",
+            target_id=link.pk,
+            target_repr=f"{verb} {link.name}"[:255],
+            changes={"admin_role": role, "reason": NOT_LINK_OWNER_CODE},
+        )
+        logger.warning(
+            "[admin-marketing] req=%s role=%s 남의 링크 %s 시도 차단 id=%s",
+            getattr(request, "id", ""),
+            role,
+            verb,
+            link.pk,
+        )
+        return Response(
+            {
+                "success": False,
+                "error": {
+                    "code": 403,
+                    "message": NOT_LINK_OWNER_MESSAGE,
+                    "details": {"code": NOT_LINK_OWNER_CODE, "admin_role": role},
+                },
+            },
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
     def update(self, request, *args, **kwargs):
         link = self.get_object()
+        # 현재 PATCH 는 제한 역할 화이트리스트에 없어 미들웨어에서 먼저 막힌다. 그래도 여기서
+        # 한 번 더 검사한다 — 나중에 경로만 열면 남의 링크 이름을 바꿀 수 있는 구멍이 되므로
+        # (DELETE 와 달리 게이트가 없었다). full 역할은 항상 통과라 회귀 없음.
+        denied = self._owner_guard(request, link, "PATCH")
+        if denied is not None:
+            return denied
         before_name = link.name
 
         serializer = self.get_serializer(link, data=request.data, partial=True)
@@ -410,33 +458,9 @@ class AdminChannelLinkDetailView(generics.RetrieveUpdateDestroyAPIView):
 
         # RBAC-4-b: 제한 역할(외주)은 **자기가 만든 링크만** 삭제. 응답의 can_delete 와
         # 반드시 같은 함수를 쓴다 — 갈라지면 버튼과 실제 동작이 어긋난다.
-        role = resolve_admin_role(request)
-        if not can_delete_channel_link(role, request.user, link):
-            log_admin_action(
-                request=request,
-                action=AdminActionLog.Action.ADMIN_ACCESS_DENIED,
-                target_type="channel_link",
-                target_id=link.pk,
-                target_repr=f"DELETE {link.name}"[:255],
-                changes={"admin_role": role, "reason": NOT_LINK_OWNER_CODE},
-            )
-            logger.warning(
-                "[admin-marketing] req=%s role=%s 남의 링크 삭제 시도 차단 id=%s",
-                getattr(request, "id", ""),
-                role,
-                link.pk,
-            )
-            return Response(
-                {
-                    "success": False,
-                    "error": {
-                        "code": 403,
-                        "message": NOT_LINK_OWNER_MESSAGE,
-                        "details": {"code": NOT_LINK_OWNER_CODE, "admin_role": role},
-                    },
-                },
-                status=status.HTTP_403_FORBIDDEN,
-            )
+        denied = self._owner_guard(request, link, "DELETE")
+        if denied is not None:
+            return denied
 
         link_pk, link_name = link.pk, link.name
         link.delete()
