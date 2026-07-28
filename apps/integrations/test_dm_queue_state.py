@@ -154,8 +154,11 @@ class TestQueueStateGauge:
         camp = _campaign(conn)
         _log(camp, retry_at=timezone.now() + timedelta(seconds=5))
 
+        # 패치 대상은 **queue_state 모듈**이다 — DM-3 에서 페이로드 계산을
+        # apps/integrations/queue_state.py 로 옮기며 module-level import 로 바뀌었다
+        # (rate_governor 쪽을 패치하면 이미 바인딩된 참조라 안 먹는다).
         with patch(
-            "apps.integrations.rate_governor.action_block_cooldown_remaining",
+            "apps.integrations.queue_state.action_block_cooldown_remaining",
             return_value=3600,
         ):
             resp = self._client(user).get(f"{URL}?campaign_id={camp.id}")

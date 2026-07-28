@@ -26,7 +26,7 @@ import logging
 from datetime import date, datetime, timedelta
 
 from django.core.cache import cache
-from django.db.models import Count, Q
+from django.db.models import Count, Min, Q
 from django.db.models.functions import TruncDate, TruncHour, TruncMinute
 from django.utils import timezone
 from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiResponse, extend_schema
@@ -40,6 +40,7 @@ from apps.admin_api.dashboard_constants import (
     DM_DELIVERY_WARNING_THRESHOLD,
     DM_MIN_SAMPLE_FOR_STATUS,
     IG_EXPIRED_CRITICAL_COUNT,
+    OPS_DASHBOARD_ALL_CACHE_TTL,
     OPS_DASHBOARD_CACHE_TTL,
     PAST_DUE_CRITICAL_COUNT,
     PAYMENT_FAILED_WARNING_COUNT,
@@ -51,10 +52,12 @@ from apps.admin_api.dashboard_constants import (
     SPAM_HIDE_FAILED_WARNING_COUNT,
     STUCK_SUBMITTING_MINUTES,
     TOKEN_EXPIRING_SOON_HOURS,
+    TRENDS_DAY_MAX_SPAN_DAYS,
     WEBHOOK_BACKLOG_CRITICAL_MINUTES,
     WEBHOOK_BACKLOG_STALE_MINUTES,
 )
 from apps.admin_api.dm_error_catalog import describe as describe_dm_error
+from apps.admin_api.dm_error_catalog import is_recoverable as _error_is_recoverable
 from apps.admin_api.dm_error_catalog import truncate_message
 from apps.admin_api.serializers.dashboard_ops import AdminOpsDashboardSerializer
 
@@ -73,7 +76,8 @@ from apps.integrations.models import IGAccountConnection, SentDMLog, SpamComment
 
 logger = logging.getLogger(__name__)
 
-ALLOWED_WINDOWS = ("1h", "24h", "today", "7d", "30d")
+# OPS-4: "all" = 서비스 전체 기간. 커스텀 범위(최대 92일)로는 볼 수 없던 구간을 연다.
+ALLOWED_WINDOWS = ("1h", "24h", "today", "7d", "30d", "all")
 CACHE_KEY_TMPL = "admin:dash:ops:{window}"
 CACHE_KEY_CUSTOM_TMPL = "admin:dash:ops:custom:{start}:{end}"
 MAX_CUSTOM_SPAN_DAYS = 92  # 커스텀 범위 상한 (초과 시 400)
@@ -131,30 +135,52 @@ DM_ERROR_STATUSES = (
     SentDMLog.Status.RECOVERY_PENDING,
     SentDMLog.Status.RECOVERY_EXPIRED,
 )
-# recoverable=true 판정 대상 상태 — 복구/재검증 경로가 있는 실패.
-#   - failed_no_trace: 능동 재검증(GET /{message_id})으로 delivered 승격 가능
-#   - recovery_pending/expired: 숨김채널 재댓글 복구 플로우 대상
-#   - failed_param@2534025(HIDDEN_SPAM_SUBCODE): 숨김채널 복구 대상 (아래 함수가 subcode 분기)
-DM_RECOVERABLE_STATUSES = frozenset(
-    (
-        SentDMLog.Status.FAILED_NO_TRACE,
-        SentDMLog.Status.RECOVERY_PENDING,
-        SentDMLog.Status.RECOVERY_EXPIRED,
-    )
+# ── DM-4: 건너뜀(skipped) 사유 분해 ──────────────────────────────────
+# skipped = "Meta 에 요청을 보내지 않고 취소한 건". **실패가 아니라 발송을 시작하지 않은
+# 상태**이며, 6가지 사유 중 조치가 필요한 것은 월 DM 한도 하나뿐이다(업셀 신호).
+# 사유 컬럼이 따로 없어 error_message 문자열로 판별하지만, 규칙을 **여기 한 곳**에 모아
+# 두었으니 발송 경로의 문구를 바꾸면 이 표를 함께 고칠 것.
+#   (원문 출처: integrations/tasks.py 의 log.mark_skipped(...) 호출부 +
+#    integrations/models.py 의 IGAccountConnection._halt_automation)
+# 형식: (reason 키, 한국어 라벨, actionable, 매칭 부분문자열들)
+SKIPPED_REASONS: tuple[tuple[str, str, bool, tuple[str, ...]], ...] = (
+    ("monthly_dm_limit", "월 DM 한도 도달", True, ("monthly_dm_limit_reached",)),
+    ("campaign_not_active", "캠페인 일시정지 중", False, ("campaign not active",)),
+    ("outside_schedule_window", "예약 발송 창 밖", False, ("outside active schedule window",)),
+    ("ig_account_inactive", "IG 계정 비활성(플랜 축소)", False, ("ig account deactivated",)),
+    ("self_recipient", "계정 자신의 댓글", False, ("self recipient",)),
+    ("connection_disconnected", "IG 연결 해제 정리", False, ("ig connection disconnected",)),
 )
+SKIPPED_OTHER = ("other", "기타", False)
 
 
-def _error_is_recoverable(status: str, error_subcode: str) -> bool:
-    """이 실패가 복구/재검증 경로를 갖는지 (failure_breakdown.recoverable).
+def _classify_skipped(message: str) -> tuple[str, str, bool]:
+    """skipped 로그의 error_message → (reason, label, actionable). 미매칭은 other."""
+    text = (message or "").strip().lower()
+    for reason, label, actionable, needles in SKIPPED_REASONS:
+        if any(n in text for n in needles):
+            return reason, label, actionable
+    return SKIPPED_OTHER
 
-    recovery 퍼널(recovery_*)보다 넓은 개념 — failed_no_trace(재검증)와
-    failed_param@2534025(숨김채널 복구)도 recoverable=true 로 본다.
+
+def _skipped_breakdown(in_range) -> list[dict]:
+    """건너뜀 사유별 카운트 (count desc) — failure_breakdown 과 같은 형태 (DM-4).
+
+    Σ count == dm_quality.skipped 를 항상 만족한다 (미매칭도 other 로 흡수).
     """
-    if status in DM_RECOVERABLE_STATUSES:
-        return True
-    return status == SentDMLog.Status.FAILED_PARAM and str(error_subcode or "").strip() == (
-        HIDDEN_SPAM_SUBCODE
+    buckets: dict[str, dict] = {}
+    rows = (
+        in_range.filter(status=SentDMLog.Status.SKIPPED)
+        .values("error_message")
+        .annotate(count=Count("id"))
     )
+    for row in rows:
+        reason, label, actionable = _classify_skipped(row["error_message"])
+        slot = buckets.setdefault(
+            reason, {"reason": reason, "label": label, "count": 0, "actionable": actionable}
+        )
+        slot["count"] += row["count"]
+    return sorted(buckets.values(), key=lambda b: (-b["count"], b["reason"]))
 
 
 def _error_samples(error_rows) -> dict:
@@ -193,12 +219,33 @@ def _local_midnight(d: date) -> datetime:
 
 
 def _granularity_for_span(span: timedelta) -> str:
-    """범위 길이 → 시리즈 granularity (span<=2h→5m, <=2d→hour, >2d→day)."""
+    """범위 길이 → 시리즈 granularity (span<=2h→5m, <=2d→hour, <=120d→day, 그 이상→week).
+
+    120일 상한은 마케팅 trends 와 같은 임계값(TRENDS_DAY_MAX_SPAN_DAYS) — 전체 기간이
+    길어져도 버킷 수가 폭증하지 않게 한다 (OPS-4).
+    """
     if span <= timedelta(hours=2):
         return "5m"
     if span <= timedelta(days=2):
         return "hour"
-    return "day"
+    if span <= timedelta(days=TRENDS_DAY_MAX_SPAN_DAYS):
+        return "day"
+    return "week"
+
+
+def _service_start(now):
+    """window=all 의 since — DM 로그·스팸 로그를 통틀어 가장 이른 created_at (없으면 now).
+
+    ``_window_bounds`` 는 운영 대시보드와 ``GET /admin/spam/logs/`` 가 **공유**하므로
+    (spam.py 가 이 모듈에서 import) 한쪽 테이블만 보면 다른 쪽이 잘린다 → 두 테이블의
+    최솟값을 쓴다. 둘 다 인덱스된 컬럼의 MIN 이라 비용은 무시할 만하다.
+    """
+    firsts = [
+        SentDMLog.objects.aggregate(m=Min("created_at"))["m"],
+        SpamCommentLog.objects.aggregate(m=Min("created_at"))["m"],
+    ]
+    values = [f for f in firsts if f is not None]
+    return min(values) if values else now
 
 
 def _window_bounds(window: str, now) -> tuple[datetime, str]:
@@ -209,6 +256,7 @@ def _window_bounds(window: str, now) -> tuple[datetime, str]:
     - "today": Asia/Seoul 자정 → now, 시간 버킷("hour")
     - "7d": now-7d, 일 버킷("day")
     - "30d": now-30d, 일 버킷("day")
+    - "all": 서비스 최초 로그 → now, span 자동(≤120일 "day" / 그 이상 "week")  ← OPS-4
     """
     if window == "1h":
         return now - timedelta(hours=1), "5m"
@@ -218,6 +266,9 @@ def _window_bounds(window: str, now) -> tuple[datetime, str]:
         return now - timedelta(days=7), "day"
     if window == "30d":
         return now - timedelta(days=30), "day"
+    if window == "all":
+        since = _service_start(now)
+        return since, _granularity_for_span(now - since)
     return now - timedelta(hours=24), "hour"
 
 
@@ -235,14 +286,18 @@ def _custom_bounds(start: date, end: date, now) -> tuple[datetime, datetime, str
 def _floor_bucket(dt, granularity: str):
     """datetime/date 를 로컬(Asia/Seoul) 기준 버킷 시작 시각으로 내림.
 
-    - TruncDate 결과는 date 객체 → day 버킷은 그 날 로컬 자정으로 승격.
+    - TruncDate 결과는 date 객체 → day/week 버킷은 그 날 로컬 자정으로 승격.
+    - week 은 **월요일 자정** 기준 (마케팅 trends 의 주 버킷과 동일 규칙).
     - datetime 은 로컬 타임존으로 변환 후 granularity 별 내림.
     """
-    if granularity == "day":
+    if granularity in ("day", "week"):
         if isinstance(dt, date) and not isinstance(dt, datetime):
-            return _local_midnight(dt)
-        local = timezone.localtime(dt)
-        return local.replace(hour=0, minute=0, second=0, microsecond=0)
+            base = _local_midnight(dt)
+        else:
+            base = timezone.localtime(dt).replace(hour=0, minute=0, second=0, microsecond=0)
+        if granularity == "week":
+            base -= timedelta(days=base.weekday())
+        return base
     local = timezone.localtime(dt)
     if granularity == "hour":
         return local.replace(minute=0, second=0, microsecond=0)
@@ -250,8 +305,12 @@ def _floor_bucket(dt, granularity: str):
 
 
 def _series_trunc(granularity: str):
-    """granularity → Django Trunc 함수. day 는 로컬 날짜 경계 위해 현재 타임존 지정."""
-    if granularity == "day":
+    """granularity → Django Trunc 함수. day/week 는 로컬 날짜 경계 위해 현재 타임존 지정.
+
+    week 은 TruncDate 로 뽑고 파이썬(_floor_bucket)에서 월요일로 접는다 — TruncWeek 의
+    주 시작 규칙은 DB 설정에 의존하지만, 여기서는 항상 월요일이어야 하기 때문.
+    """
+    if granularity in ("day", "week"):
         return TruncDate("created_at", tzinfo=timezone.get_current_timezone())
     if granularity == "hour":
         return TruncHour("created_at")
@@ -260,7 +319,9 @@ def _series_trunc(granularity: str):
 
 def _zero_filled_series(rows: dict, since, until, granularity: str, fields: tuple) -> list[dict]:
     """[floor(since), floor(until)] 구간을 granularity 간격으로 제로필한 버킷 리스트."""
-    if granularity == "day":
+    if granularity == "week":
+        step = timedelta(days=7)
+    elif granularity == "day":
         step = timedelta(days=1)
     elif granularity == "hour":
         step = timedelta(hours=1)
@@ -437,6 +498,8 @@ def _dm_quality(until, since, granularity: str) -> tuple[dict, dict]:
             dm_agg["failed_param_hidden"] + dm_agg["recovery_pending"] + dm_agg["recovery_expired"]
         ),
         "skipped": dm_agg["skipped"],
+        # DM-4: 건너뜀 사유 분해 (Σ count == skipped). 조치 필요한 건 월 한도(actionable) 뿐.
+        "skipped_breakdown": _skipped_breakdown(in_range),
         "queued": dm_agg["queued"],
         "submitting": dm_agg["submitting"],
         "delivery_rate": _delivery_rate(dm_agg),
@@ -948,7 +1011,17 @@ DM 발송 품질 / IG 연동 / 스팸 필터 / 빌링 4개 서브시스템의 �
 ## 비즈니스 로직
 - **전수 집계**: request.user 소속 워크스페이스로 필터하지 않습니다 (백오피스 전역).
 - `window`: `1h`(5분 버킷) / `24h`(시간 버킷, 기본) / `today`(Asia/Seoul 자정~현재, 시간 버킷) /
-  `7d`·`30d`(일 버킷). 잘못된 값은 **400** — 레거시 `/metrics/overview/` 의 `since` 폴백과 달리 엄격 검증.
+  `7d`·`30d`(일 버킷) / **`all`(전체 기간)**. 잘못된 값은 **400** — 레거시 `/metrics/overview/` 의
+  `since` 폴백과 달리 엄격 검증.
+- **`window=all` (OPS-4)**: `since` = DM 로그·스팸 로그를 통틀어 가장 이른 `created_at`
+  (둘 다 0건이면 `now`). granularity 는 span 자동 — **span ≤ 120일 → `day`, 그 이상 → `week`**
+  (주 버킷 `ts` 는 **월요일 자정**, 마케팅 trends 와 동일 임계값/규칙). 커스텀 범위(최대 92일)로는
+  볼 수 없던 구간을 여기서 봅니다. 캐시는 **900초**(키 `admin:dash:ops:all`) — 다른 프리셋은 30초.
+  `GET /admin/spam/logs/` 도 같은 `ALLOWED_WINDOWS` 를 공유하므로 `window=all` 을 그대로 받습니다
+  (운영 대시보드에서 전체 기간을 고른 뒤 스팸 '자세히 보기' 로 넘어가도 400 이 나지 않습니다).
+- **시점(point-in-time) 지표는 range 와 무관**하므로 `all` 에서도 값이 같습니다 —
+  `status_summary`(dm 판정만 window 집계 기반) · `action_required` 의 즉시성 신호 ·
+  `ig_connections` · `risk_accounts`(항상 최근 24h).
 - **커스텀 범위**: `start=YYYY-MM-DD` + `end=YYYY-MM-DD` (Asia/Seoul 로컬 날짜) 를 함께 주면
   `window` 무시하고 커스텀 집계 — `window` 응답은 `"custom"`. since = start 로컬 자정,
   until = min(end+1일 자정, now). granularity 는 span 자동: span ≤ 2h → `5m`, ≤ 2일 → `hour`,
@@ -1023,7 +1096,8 @@ curl -H "Authorization: Bearer <staff_token>" \\
                 required=False,
                 enum=list(ALLOWED_WINDOWS),
                 description="집계 윈도우. 1h(5분 버킷) / 24h(기본, 시간 버킷) / "
-                "today(Asia/Seoul 자정~현재) / 7d·30d(일 버킷). 그 외 값은 400. "
+                "today(Asia/Seoul 자정~현재) / 7d·30d(일 버킷) / all(전체 기간, "
+                "span≤120일이면 day·그 이상 week 버킷). 그 외 값은 400. "
                 "start&end 를 함께 주면 무시됩니다.",
             ),
             OpenApiParameter(
@@ -1048,7 +1122,7 @@ curl -H "Authorization: Bearer <staff_token>" \\
             400: OpenApiResponse(
                 description="잘못된 window 값 — "
                 '{"success": false, "error": {"code": 400, "message": "...", '
-                '"details": {"allowed": ["1h","24h","today","7d","30d"]}}} '
+                '"details": {"allowed": ["1h","24h","today","7d","30d","all"]}}} '
                 "또는 잘못된 커스텀 범위(하나만/역순/파싱불가/span>92) — "
                 '{"success": false, "error": {"code": 400, "message": "...", '
                 '"details": {"reason": "..."}}}'
@@ -1120,6 +1194,20 @@ curl -H "Authorization: Bearer <staff_token>" \\
                         "failed": 27,
                         "hidden_spam": 20,
                         "skipped": 25,
+                        "skipped_breakdown": [
+                            {
+                                "reason": "monthly_dm_limit",
+                                "label": "월 DM 한도 도달",
+                                "count": 16,
+                                "actionable": True,
+                            },
+                            {
+                                "reason": "campaign_not_active",
+                                "label": "캠페인 일시정지 중",
+                                "count": 9,
+                                "actionable": False,
+                            },
+                        ],
                         "queued": 5,
                         "submitting": 0,
                         "delivery_rate": 0.9932,
@@ -1258,6 +1346,7 @@ curl -H "Authorization: Bearer <staff_token>" \\
             window = "custom"
             since, until, granularity = _custom_bounds(start_d, end_d, now)
             cache_key = CACHE_KEY_CUSTOM_TMPL.format(start=start_raw, end=end_raw)
+            cache_ttl = OPS_DASHBOARD_CACHE_TTL
         else:
             window = request.query_params.get("window", "24h")
             if window not in ALLOWED_WINDOWS:
@@ -1275,6 +1364,8 @@ curl -H "Authorization: Bearer <staff_token>" \\
             since, granularity = _window_bounds(window, now)
             until = now
             cache_key = CACHE_KEY_TMPL.format(window=window)
+            # OPS-4: all 은 계산량이 가장 크고 분 단위로 값이 안 변함 → 900초
+            cache_ttl = OPS_DASHBOARD_ALL_CACHE_TTL if window == "all" else OPS_DASHBOARD_CACHE_TTL
 
         cached = cache.get(cache_key)
         if cached is not None:
@@ -1305,7 +1396,7 @@ curl -H "Authorization: Bearer <staff_token>" \\
         }
 
         data = AdminOpsDashboardSerializer(payload).data
-        cache.set(cache_key, data, OPS_DASHBOARD_CACHE_TTL)
+        cache.set(cache_key, data, cache_ttl)
 
         logger.info(
             "[admin-dash-ops] req=%s window=%s overall=%s dm_rate=%s",

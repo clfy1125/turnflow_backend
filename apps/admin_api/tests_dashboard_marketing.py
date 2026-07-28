@@ -2173,9 +2173,7 @@ def _local_midnight_kst(d: date):
     """로컬(Asia/Seoul) 날짜 → 그 날 자정 aware datetime (뷰의 _local_midnight 와 동일 규칙)."""
     from datetime import datetime as _dt
 
-    return timezone.make_aware(
-        _dt.combine(d, _dt.min.time()), timezone.get_current_timezone()
-    )
+    return timezone.make_aware(_dt.combine(d, _dt.min.time()), timezone.get_current_timezone())
 
 
 def _custom_trends(staff_client, span_days: int):
@@ -2231,3 +2229,100 @@ class TestTrendsGranularity:
         trends = _custom_trends(staff_client, 210)
         assert trends["granularity"] == "week"
         assert sum(b["activated"] for b in trends["buckets"]) == 1  # 같은 주 2회 → 1명
+
+
+# ─── MKT-1 (= R-8): 퍼널 노드 자체의 증감 (previous / delta_pct) ────────
+
+
+class TestFunnelNodeDeltas:
+    """노드가 자기 증감을 들고 있는지 — 배지와 숫자가 같은 집계에서 나와야 한다."""
+
+    def test_activation_and_conversion_carry_their_own_delta(
+        self, staff_client, clean_slate, pro_plan
+    ):
+        now = timezone.now()
+        cur = now - timedelta(days=5)  # 30d 기간 안
+        prev = now - timedelta(days=40)  # 직전 30d 구간 안
+
+        # 직전 기간: 활성화 1명 (그중 실결제 1명)
+        u_prev = _mk_user(joined=prev)
+        _mk_page(u_prev, public=True)
+        _mk_paid_payment(u_prev, paid_at=prev)
+        # 현재 기간: 활성화 2명 (그중 실결제 1명)
+        for _ in range(2):
+            u = _mk_user(joined=cur)
+            _mk_page(u, public=True)
+        _mk_paid_payment(User.objects.filter(date_joined__gte=cur).first(), paid_at=cur)
+
+        v = _variant(staff_client.get(URL, {"period": "30d"}))
+        act = v["activation"]
+        assert (act["count"], act["previous"]) == (2, 1)
+        assert act["delta_pct"] == 100.0
+        conv = v["conversion"]
+        assert conv["previous"] == 1  # 직전 기간 유료플랜 전환(실결제 1)
+        assert conv["delta_pct"] == 0.0  # 1 → 1
+
+    def test_head_nodes_carry_delta_too(self, staff_client, clean_slate):
+        """head(visit/signup)도 같은 출처 — 프론트가 노드별로 분기하지 않아도 된다."""
+        now = timezone.now()
+        _mk_user(joined=now - timedelta(days=3))
+        _mk_user(joined=now - timedelta(days=3))
+        _mk_user(joined=now - timedelta(days=40))
+
+        v = _variant(staff_client.get(URL, {"period": "30d"}))
+        signup = _node_from(v, "signup")
+        assert (signup["count"], signup["previous"], signup["delta_pct"]) == (2, 1, 100.0)
+        assert "previous" in _node_from(v, "visit")
+
+    def test_zero_previous_gives_null_delta_not_infinity(self, staff_client, clean_slate):
+        now = timezone.now()
+        _mk_user(joined=now - timedelta(days=3))  # 직전 기간엔 0명
+
+        v = _variant(staff_client.get(URL, {"period": "30d"}))
+        signup = _node_from(v, "signup")
+        assert signup["previous"] == 0
+        assert signup["delta_pct"] is None
+
+    def test_period_all_has_null_previous_everywhere(self, staff_client, clean_slate):
+        """R-1 규칙 — 비교할 직전 기간 자체가 없으므로 0 이 아니라 null."""
+        _mk_user(joined=timezone.now() - timedelta(days=3))
+
+        v = _variant(staff_client.get(URL, {"period": "all"}))
+        for node in (v["activation"], v["conversion"], *v["head"]):
+            assert node["previous"] is None, node["key"]
+            assert node["delta_pct"] is None, node["key"]
+
+    def test_branch_steps_keep_the_fields_but_stay_null(self, staff_client, clean_slate):
+        """팝업 전용 분기 노드는 스키마만 유지 (증감 배지를 쓰지 않음)."""
+        _mk_user(joined=timezone.now() - timedelta(days=3))
+        v = _variant(staff_client.get(URL, {"period": "30d"}))
+        for br in v["branches"]:
+            for step in br["steps"]:
+                assert step["previous"] is None and step["delta_pct"] is None
+
+    @requires_analytics
+    def test_channel_variant_carries_delta(self, staff_client, clean_slate):
+        now = timezone.now()
+        u_prev = _mk_user(joined=now - timedelta(days=40))
+        SignupAttribution.objects.create(user=u_prev, channel="meta_ads", signup_kind="email")
+        _mk_page(u_prev, public=True)
+        for _ in range(3):
+            u = _mk_user(joined=now - timedelta(days=3))
+            SignupAttribution.objects.create(user=u, channel="meta_ads", signup_kind="email")
+            _mk_page(u, public=True)
+
+        v = _variant(staff_client.get(URL, {"period": "30d"}), "meta_ads")
+        assert v["activation"]["count"] == 3
+        assert v["activation"]["previous"] == 1
+        assert v["activation"]["delta_pct"] == 200.0
+
+    @requires_analytics
+    def test_channel_absent_in_previous_period_gets_zero_not_null(self, staff_client, clean_slate):
+        """직전 기간에 유입이 없던 신규 채널 — '없음(null)'이 아니라 '0명'이 사실."""
+        u = _mk_user(joined=timezone.now() - timedelta(days=3))
+        SignupAttribution.objects.create(user=u, channel="kakao_ads", signup_kind="email")
+        _mk_page(u, public=True)
+
+        v = _variant(staff_client.get(URL, {"period": "30d"}), "kakao_ads")
+        assert v["activation"]["previous"] == 0
+        assert v["activation"]["delta_pct"] is None  # 0 분모 → null

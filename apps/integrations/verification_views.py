@@ -25,11 +25,11 @@ READ 의 차이를 표시하고, 실패 사유별 후속 액션(재연동/재시
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from django.conf import settings
 from django.core.cache import cache
-from django.db.models import Count, Max, Min, Q
+from django.db.models import Count, Max, Q
 from django.utils import timezone
 from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import status, viewsets
@@ -39,12 +39,10 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
 from .campaign_stats import (
-    CONFIRMED_DELIVERED_STATUSES,
     NEEDS_ATTENTION_STATUSES,
     QUEUE_WAITING_STATUSES,
-    ROOT_DM_Q,
     SENT_FOR_QUOTA_STATUSES,
-    people_rollup,
+    build_dm_stats,
 )
 from .dm_exceptions import DMSendError, DMTransientError
 from .dm_frontend_actions import SELF_CHECK_CHECKLIST, build_frontend_action
@@ -59,6 +57,7 @@ from .dm_status_groups import (
     status_group_q,
 )
 from .models import AutoDMCampaign, IGAccountConnection, SentDMLog
+from .queue_state import build_queue_state_payload
 from .serializers import (
     DMLookupResponseSerializer,
     DMQueueStateSerializer,
@@ -701,189 +700,9 @@ class DMVerificationViewSet(viewsets.ViewSet):
         else:
             qs = qs.filter(created_at__gte=timezone.now() - timedelta(days=30))
 
-        delivered_or_read = Q(status="delivered") | Q(status="read")
-        agg = qs.aggregate(
-            total=Count("id"),
-            queued=Count("id", filter=Q(status="queued")),
-            submitting=Count("id", filter=Q(status="submitting")),
-            accepted=Count("id", filter=Q(status="accepted")),
-            delivered=Count("id", filter=Q(status="delivered")),
-            read=Count("id", filter=Q(status="read")),
-            rate_limited=Count("id", filter=Q(status="rate_limited")),
-            failed_token=Count("id", filter=Q(status="failed_token")),
-            failed_window=Count("id", filter=Q(status="failed_window")),
-            failed_param=Count("id", filter=Q(status="failed_param")),
-            failed_no_trace=Count("id", filter=Q(status="failed_no_trace")),
-            skipped=Count("id", filter=Q(status="skipped")),
-            recovery_pending=Count("id", filter=Q(status="recovery_pending")),
-            recovery_delivered=Count("id", filter=Q(status="recovery_delivered")),
-            recovery_expired=Count("id", filter=Q(status="recovery_expired")),
-            legacy_sent=Count("id", filter=Q(status="sent")),
-            legacy_failed=Count("id", filter=Q(status="failed")),
-            legacy_failed_api=Count("id", filter=Q(status="failed_api")),
-            # v3.3 — DM 종류별
-            standalone_total=Count("id", filter=Q(dm_kind="standalone")),
-            opening_total=Count("id", filter=Q(dm_kind="opening")),
-            opening_delivered=Count("id", filter=Q(dm_kind="opening") & delivered_or_read),
-            reward_total=Count("id", filter=Q(dm_kind="reward")),
-            reward_delivered=Count("id", filter=Q(dm_kind="reward") & delivered_or_read),
-            # v3.3 — Follow-gate
-            gate_pending=Count("id", filter=Q(gate_status="pending")),
-            gate_passed=Count("id", filter=Q(gate_status="passed")),
-            gate_expired=Count("id", filter=Q(gate_status="expired")),
-            # 공개 답글
-            public_replies_posted=Count("id", filter=~Q(public_reply_id="")),
-        )
-
-        # ACCEPTED 진입 건 = accepted + delivered + read + failed_no_trace
-        # (DELIVERED/READ는 ACCEPTED를 거쳐 갔고, no_trace 도 ACCEPTED 후 종결)
-        accepted_or_after = (
-            agg["accepted"]
-            + agg["delivered"]
-            + agg["read"]
-            + agg["failed_no_trace"]
-            + agg["recovery_delivered"]  # 복구 재전송 성공 = 실제 도착
-        )
-        confirmed_delivered = agg["delivered"] + agg["read"] + agg["recovery_delivered"]
-
-        delivery_rate = confirmed_delivered / accepted_or_after if accepted_or_after else 0.0
-        read_rate = agg["read"] / confirmed_delivered if confirmed_delivered else 0.0
-
-        # Gate 통과율 = gate_passed / opening_delivered
-        # (opening DELIVERED 중 사용자가 응답해서 통과한 비율)
-        gate_passthrough_rate = (
-            agg["gate_passed"] / agg["opening_delivered"] if agg["opening_delivered"] else 0.0
-        )
-
-        agg["delivery_rate"] = round(delivery_rate, 4)
-        agg["read_rate"] = round(read_rate, 4)
-        agg["gate_passthrough_rate"] = round(gate_passthrough_rate, 4)
-
-        # ─────────────────────────────────────────────────────────────
-        # v4.2 — 사람(수신자 Instagram ID) 단위 지표 + CTR (마케팅 API)
-        #
-        # 위의 total/delivered/... 는 "발송 이벤트" 단위(디버깅·배송 신뢰성용)라
-        # follow-gate 캠페인에서 1명 = DM 2건(opening+reward)으로 부풀려 보인다.
-        # 마케터가 보는 "몇 명에게 닿았나 / 몇 명이 반응했나" 는 아래 unique_* 로 제공한다.
-        # (기존 이벤트 필드는 하위호환 위해 그대로 둔다.)
-        # ─────────────────────────────────────────────────────────────
-        def _uniq(**flt) -> int:
-            base = qs.filter(**flt) if flt else qs
-            return base.values("recipient_user_id").distinct().count()
-
-        unique_recipients = _uniq()
-        unique_sent = (
-            qs.filter(status__in=SENT_FOR_QUOTA_STATUSES)
-            .values("recipient_user_id")
-            .distinct()
-            .count()
-        )
-        unique_delivered = (
-            qs.filter(status__in=["delivered", "read"])
-            .values("recipient_user_id")
-            .distinct()
-            .count()
-        )
-        unique_read = _uniq(status="read")
-        unique_followers = _uniq(gate_status="passed")
-
-        # CTR = 상호작용한 고유 수신자 / 발송된 고유 수신자.
-        #  - 게이트형 캠페인(follow_gate_enabled=True): 버튼 1회라도 클릭 = child 로그 존재
-        #    (reward=통과 / retry=클릭했으나 미통과 둘 다 parent_log 로 opening 에 묶인다).
-        #  - 비게이트형 캠페인: 상호작용 단계가 없으므로 "읽음(READ)" 을 참여로 본다.
-        # 두 조건은 캠페인 타입으로 자연히 배타적이라 OR 하나로 집계된다.
-        ctr_interacted = (
-            qs.filter(
-                Q(campaign__follow_gate_enabled=True, parent_log__isnull=False)
-                | Q(campaign__follow_gate_enabled=False, status="read")
-            )
-            .values("recipient_user_id")
-            .distinct()
-            .count()
-        )
-        ctr = ctr_interacted / unique_sent if unique_sent else 0.0
-
-        gate_flags = set(qs.values_list("campaign__follow_gate_enabled", flat=True).distinct())
-        if gate_flags == {True}:
-            ctr_basis = "click"
-        elif gate_flags == {False} or not gate_flags:
-            ctr_basis = "read"
-        else:
-            ctr_basis = "mixed"
-
-        unique_delivery_rate = unique_delivered / unique_sent if unique_sent else 0.0
-
-        # ── v4.4 — 사람 단위 처리 현황 (루트 DM 기준 rollup — queue-state.people 과 동일 정의)
-        # unique_failed: 아무것도 받지 못한 사람 (하드실패·복구 대기/만료·한도 스킵).
-        # "확인 필요" 카드가 이 값을 쓴다 — delivery_rate(Meta 접수건 기준)에는 하드실패가
-        # 분모에서 빠져 100% 로 보이므로, 실패 인원은 이 필드로만 노출된다.
-        people = people_rollup(qs)
-        # 도착 미확인(사람): no_trace 만 있고 확정 도착이 한 번도 없는 수신자.
-        # 발송은 됐으므로(쿼터 소진) people.failed 와는 서로소 — 합산해도 중복 없음.
-        unique_unconfirmed = (
-            qs.filter(status=SentDMLog.Status.FAILED_NO_TRACE)
-            .exclude(
-                recipient_user_id__in=qs.filter(status__in=CONFIRMED_DELIVERED_STATUSES).values(
-                    "recipient_user_id"
-                )
-            )
-            .values("recipient_user_id")
-            .distinct()
-            .count()
-        )
-        # unique_delivered(전체 qs)는 리워드/재안내 child 도 세는 반면 people.total 은 루트 DM
-        # 기준이라, 부모 오프닝이 시간창(기본 30일) 밖이고 child 만 안에 든 드문 경우 분자>분모가
-        # 될 수 있다 → [0,1] 로 클램프해 100% 초과 표기를 막는다.
-        unique_reach_rate = min(unique_delivered / people["total"], 1.0) if people["total"] else 0.0
-        # 헤드라인 "N% 메시지가 성공적으로 전송됐어요" = 전체 대상 대비 전송된 비율.
-        # delivery_rate(Meta 접수건만 분모)는 하드실패가 빠져 100%로 부풀므로 헤드라인엔 부적합 →
-        # people.total(전체 대상) 을 분모로 하는 이 값을 쓴다. [0,1] 클램프(위와 동일 사유).
-        unique_sent_rate = min(unique_sent / people["total"], 1.0) if people["total"] else 0.0
-
-        # ── v4.5 — '숨겨진 요청 · 스팸' 분리 (아무것도 못 받은 사람 = people.failed 의 부분집합)
-        # 비팔로워 채널 미개설(2534025)로 숨김함으로 간 케이스: 복구 대기/만료(recovery_*) +
-        # 복구 OFF 시 failed_param@2534025. failed 버킷(발송·대기 없음)에 든 사람만 센다
-        # (같은 사람이 다른 댓글로 발송/대기 중이면 sent/waiting 버킷이므로 여기서 제외).
-        root = qs.filter(ROOT_DM_Q)
-        sent_or_waiting_ids = root.filter(
-            status__in=SENT_FOR_QUOTA_STATUSES + QUEUE_WAITING_STATUSES
-        ).values("recipient_user_id")
-        unique_hidden_spam = (
-            root.filter(status_group_q(HIDDEN_SPAM))
-            .exclude(recipient_user_id__in=sent_or_waiting_ids)
-            .values("recipient_user_id")
-            .distinct()
-            .count()
-        )
-        # 기존 '확인 필요' 총합(= failed + 도착미확인) 과, 숨김함을 뺀 새 '확인 필요'.
-        # hidden_spam ⊆ failed 이므로 excl 은 항상 ≥ 0.
-        unique_needs_attention = people["failed"] + unique_unconfirmed
-        unique_needs_attention_excl_hidden = max(unique_needs_attention - unique_hidden_spam, 0)
-
-        agg.update(
-            {
-                "unique_recipients": unique_recipients,
-                "unique_sent": unique_sent,
-                "unique_delivered": unique_delivered,
-                "unique_read": unique_read,
-                "unique_followers": unique_followers,
-                "unique_delivery_rate": round(unique_delivery_rate, 4),
-                "unique_targets": people["total"],
-                "unique_waiting": people["waiting"],
-                "unique_failed": people["failed"],
-                "unique_unconfirmed": unique_unconfirmed,
-                "unique_reach_rate": round(unique_reach_rate, 4),
-                "unique_sent_rate": round(unique_sent_rate, 4),
-                "unique_hidden_spam": unique_hidden_spam,
-                "unique_needs_attention": unique_needs_attention,
-                "unique_needs_attention_excl_hidden": unique_needs_attention_excl_hidden,
-                "ctr": round(ctr, 4),
-                "ctr_basis": ctr_basis,
-                "ctr_interacted": ctr_interacted,
-                "ctr_denominator": unique_sent,
-            }
-        )
-        return Response(agg)
+        # DM-1-a: 집계 본문은 campaign_stats.build_dm_stats 단일 소스 —
+        # 어드민(admin_api)이 같은 함수를 호출해 두 화면의 숫자가 갈라지지 않는다.
+        return Response(build_dm_stats(qs))
 
     # ===== 수신자(사람) 단위 로그 =====
 
@@ -1324,11 +1143,6 @@ class DMVerificationViewSet(viewsets.ViewSet):
     )
     @action(detail=False, methods=["get"], url_path="queue-state")
     def queue_state(self, request):
-        import time as _time
-
-        from . import dm_pacer
-        from .rate_governor import PRIVATE_REPLY_HOURLY_CAP, action_block_cooldown_remaining
-
         campaign_id = request.query_params.get("campaign_id")
         ig_connection_id = request.query_params.get("ig_connection_id")
         if bool(campaign_id) == bool(ig_connection_id):  # 둘 다 or 둘 다 아님
@@ -1365,127 +1179,9 @@ class DMVerificationViewSet(viewsets.ViewSet):
         if not workspace.memberships.filter(user=request.user).exists():
             raise PermissionDenied("이 리소스가 속한 워크스페이스의 멤버가 아닙니다.")
 
-        ext = str(ig_conn.external_account_id)
-        account_qs = SentDMLog.objects.filter(campaign__ig_connection=ig_conn)
-        scope_qs = account_qs.filter(campaign=campaign) if campaign else account_qs
-
-        hard_failed = [
-            SentDMLog.Status.FAILED_TOKEN,
-            SentDMLog.Status.FAILED_WINDOW,
-            SentDMLog.Status.FAILED_PARAM,
-            SentDMLog.Status.FAILED,  # legacy
-        ]
-        agg = scope_qs.aggregate(
-            sent=Count("id", filter=Q(status__in=SENT_FOR_QUOTA_STATUSES)),
-            waiting=Count("id", filter=Q(status=SentDMLog.Status.QUEUED)),
-            in_flight=Count("id", filter=Q(status=SentDMLog.Status.SUBMITTING)),
-            failed=Count("id", filter=Q(status__in=hard_failed)),
-        )
-        gauge = {
-            "sent": agg["sent"],
-            "waiting": agg["waiting"],
-            "in_flight": agg["in_flight"],
-            "failed": agg["failed"],
-            "total": agg["sent"] + agg["waiting"] + agg["in_flight"],
-        }
-        # v4.4 — 사람(수신자) 단위 게이지. gauge 는 발송 이벤트 단위라 follow-gate
-        # 캠페인(1명 = 오프닝+리워드 2건 이상)에서 사람 수보다 크게 보인다.
-        # 유저 콘솔의 "전체 대상 N명 / 처리 완료" 표기는 이 블록을 쓴다.
-        people = people_rollup(scope_qs)
-        people["processed"] = people["sent"] + people["failed"]
-
-        account_waiting_qs = account_qs.filter(status=SentDMLog.Status.QUEUED)
-        account_waiting = account_waiting_qs.count()
-        ahead = 0
-        if campaign:
-            my_oldest = scope_qs.filter(status=SentDMLog.Status.QUEUED).aggregate(
-                m=Min("created_at")
-            )["m"]
-            if my_oldest:
-                ahead = account_waiting_qs.filter(created_at__lt=my_oldest).count()
-
-        # ── ETA (v4.3): 대기 건 대부분은 확정 슬롯(next_retry_at)을 보유. 버킷별로
-        #    max(확정 슬롯) 과 (포인터 + 미클레임 × 평균 간격) 추정을 합성한다.
-        #    미클레임은 계정 공유 포인터를 소비하므로 **계정 단위**로 센다.
-        now_ts = _time.time()
-        finish_ts = now_ts
-        is_estimate = False
-
-        bucket_filters = {
-            dm_pacer.BUCKET_PRIVATE_REPLY: (
-                dm_pacer.bucket_q(dm_pacer.BUCKET_PRIVATE_REPLY),
-                dm_pacer.avg_gap_seconds(dm_pacer.BUCKET_PRIVATE_REPLY),
-            ),
-            dm_pacer.BUCKET_SEND_API: (
-                dm_pacer.bucket_q(dm_pacer.BUCKET_SEND_API),
-                dm_pacer.avg_gap_seconds(dm_pacer.BUCKET_SEND_API),
-            ),
-        }
-        scope_waiting_qs = scope_qs.filter(status=SentDMLog.Status.QUEUED)
-        for bucket, (bucket_q, avg_gap) in bucket_filters.items():
-            scope_bucket = scope_waiting_qs.filter(bucket_q)
-            if not scope_bucket.exists():
-                continue
-            claimed_max = scope_bucket.aggregate(m=Max("next_retry_at"))["m"]
-            if claimed_max:
-                finish_ts = max(finish_ts, claimed_max.timestamp())
-            # 미클레임(슬롯 미예약) — 계정 전체가 같은 포인터를 소비하므로 계정 단위 추정
-            unclaimed_account = account_waiting_qs.filter(
-                bucket_q, next_retry_at__isnull=True
-            ).count()
-            if unclaimed_account and scope_bucket.filter(next_retry_at__isnull=True).exists():
-                pointer = dm_pacer.peek_next_slot(ext, bucket) or now_ts
-                finish_ts = max(finish_ts, max(pointer, now_ts) + unclaimed_account * avg_gap)
-                is_estimate = True
-
-        # ── 차단 요인 ──
-        ab_remaining = action_block_cooldown_remaining(ext)
-        blocking_reason = None
-        if ab_remaining > 0:
-            blocking_reason = "action_block_cooldown"
-            finish_ts = max(finish_ts, now_ts + ab_remaining) + 0  # 쿨다운 후 재개
-            is_estimate = True
-        else:
-            from apps.billing.dm_limits import check_dm_quota
-
-            try:
-                quota_ok, _, _ = check_dm_quota(workspace.owner)
-            except Exception:  # noqa: BLE001 — 쿼터 조회 실패는 표시만 정상 취급
-                quota_ok = True
-            if not quota_ok and gauge["waiting"] > 0:
-                blocking_reason = "monthly_quota_reached"
-                is_estimate = True
-
-        eta_seconds = max(0.0, round(finish_ts - now_ts, 1)) if gauge["waiting"] else 0.0
-        eta_finish_at = (
-            datetime.fromtimestamp(finish_ts, tz=timezone.get_current_timezone())
-            if gauge["waiting"]
-            else None
-        )
-
-        cap = getattr(settings, "IG_PRIVATE_REPLY_HOURLY_CAP", PRIVATE_REPLY_HOURLY_CAP)
-        payload = {
-            "scope": "campaign" if campaign else "account",
-            "campaign_id": str(campaign.id) if campaign else None,
-            "ig_connection_id": str(ig_conn.id),
-            "external_account_id": ext,
-            "ig_username": ig_conn.username or "",
-            "gauge": gauge,
-            "people": people,
-            "pacing": {
-                "private_reply_avg_gap_s": dm_pacer.avg_gap_seconds(dm_pacer.BUCKET_PRIVATE_REPLY),
-                "send_api_avg_gap_s": dm_pacer.avg_gap_seconds(dm_pacer.BUCKET_SEND_API),
-                "hourly_backstop_cap": int(cap or 0),
-            },
-            "account_waiting": account_waiting,
-            "ahead_of_this_campaign": ahead,
-            "blocking_reason": blocking_reason,
-            "action_block_cooldown_seconds": int(ab_remaining),
-            "eta_seconds": eta_seconds,
-            "eta_finish_at": eta_finish_at,
-            "eta_is_estimate": bool(is_estimate),
-            "generated_at": timezone.now(),
-        }
+        # DM-3: 페이로드 계산은 queue_state.build_queue_state_payload 단일 소스 —
+        # 어드민(/admin/auto-dm/campaigns/{id}/queue-state/)이 같은 함수를 호출한다.
+        payload = build_queue_state_payload(ig_conn, campaign)
         return Response(DMQueueStateSerializer(payload).data)
 
     # ===== 룩업 (message_id / idempotency_key) =====

@@ -18,7 +18,9 @@ from apps.admin_api.views.autodm import (
     AdminCampaignDetailView,
     AdminCampaignListView,
     AdminCampaignPauseView,
+    AdminCampaignQueueStateView,
     AdminCampaignResumeView,
+    AdminCampaignTimeseriesView,
     AdminDMBacklogView,
     AdminDMLogDetailView,
     AdminDMLogListView,
@@ -134,6 +136,17 @@ urlpatterns = [
         "auto-dm/campaigns/<uuid:pk>/resume/",
         AdminCampaignResumeView.as_view(),
         name="campaign-resume",
+    ),
+    # DM-3 — 유저 콘솔과 같은 스키마·집계, 워크스페이스 필터만 제거한 어드민 판
+    path(
+        "auto-dm/campaigns/<uuid:pk>/queue-state/",
+        AdminCampaignQueueStateView.as_view(),
+        name="campaign-queue-state",
+    ),
+    path(
+        "auto-dm/campaigns/<uuid:pk>/timeseries/",
+        AdminCampaignTimeseriesView.as_view(),
+        name="campaign-timeseries",
     ),
     path("auto-dm/recipients/", AdminDMRecipientListView.as_view(), name="dm-recipient-list"),
     path("auto-dm/logs/", AdminDMLogListView.as_view(), name="dmlog-list"),

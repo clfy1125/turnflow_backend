@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
 from django.contrib.auth import get_user_model
@@ -22,6 +22,7 @@ from django.core.cache import cache
 from django.utils import timezone
 from rest_framework.test import APIClient
 
+from apps.admin_api.views.dashboard_ops import _granularity_for_span, _service_start, _window_bounds
 from apps.billing.models import (
     PaymentHistory,
     PaymentStatus,
@@ -42,7 +43,7 @@ from apps.workspace.models import Workspace
 User = get_user_model()
 
 URL = "/api/v1/admin/dashboard/operations/"
-CACHE_KEYS = [f"admin:dash:ops:{w}" for w in ("1h", "24h", "today", "7d", "30d")]
+CACHE_KEYS = [f"admin:dash:ops:{w}" for w in ("1h", "24h", "today", "7d", "30d", "all")]
 LONG_AGO = timedelta(days=400)  # 캘린더월/윈도우 어디에도 안 걸리게 멀리
 
 # ─── 공통 픽스처 (tests_subscription.py 패턴) ─────────────────────────
@@ -218,7 +219,14 @@ class TestWindowParam:
         assert res.status_code == 400
         assert res.data["success"] is False
         assert res.data["error"]["code"] == 400
-        assert res.data["error"]["details"]["allowed"] == ["1h", "24h", "today", "7d", "30d"]
+        assert res.data["error"]["details"]["allowed"] == [
+            "1h",
+            "24h",
+            "today",
+            "7d",
+            "30d",
+            "all",  # OPS-4
+        ]
 
     @pytest.mark.parametrize("window", ["7d", "30d"])
     def test_long_presets_use_day_granularity(self, staff_client, clean_slate, window):
@@ -885,3 +893,151 @@ class TestFailureBreakdownDescriptions:
         _mk_dms(camp, SentDMLog.Status.RECOVERY_PENDING, 2)  # error_message 없음
         row = staff_client.get(URL).data["dm_quality"]["failure_breakdown"][0]
         assert row["sample_error_message"] == ""
+
+
+# ─── OPS-4: window=all (전체 기간) ────────────────────────────────────
+
+
+class TestWindowAll:
+    """전체 기간 윈도우 — since=최초 로그, span 에 따른 day/week 자동 전환.
+
+    ⚠️ ``clean_slate`` 는 기존 행을 **창 밖으로 밀어낼 뿐 지우지 않는데**, `all` 은
+    창이 없어서 그 행들이 전부 집계에 들어온다 → 절대 카운트로 단언하면 안 되고
+    **델타/내부 정합성**으로 단언한다 (테스트 DB 가 dev DB 라 더 그렇다).
+    """
+
+    @pytest.mark.parametrize(
+        ("days", "expected"),
+        [(0.01, "5m"), (1, "hour"), (10, "day"), (120, "day"), (121, "week"), (500, "week")],
+    )
+    def test_granularity_thresholds(self, days, expected):
+        assert _granularity_for_span(timedelta(days=days)) == expected
+
+    def test_all_starts_at_earliest_log(self, staff_client, clean_slate):
+        camp = _mk_campaign(_mk_conn())
+        oldest = timezone.now() - timedelta(days=800)  # clean_slate(400d)보다 더 과거
+        _backdate_dms(_mk_dms(camp, SentDMLog.Status.DELIVERED, 1), oldest)
+
+        res = staff_client.get(URL, {"window": "all"})
+        assert res.status_code == 200
+        assert res.data["window"] == "all"
+        assert res.data["range"]["start"][:10] == timezone.localtime(oldest).date().isoformat()
+
+    def test_all_counts_rows_outside_every_preset_window(self, staff_client, clean_slate):
+        """프리셋(최대 30d)·커스텀(최대 92일)로는 못 보던 과거 행이 all 에는 들어온다."""
+        camp = _mk_campaign(_mk_conn())
+        base = staff_client.get(URL, {"window": "all"}).data["dm_quality"]["requested"]
+        cache.delete("admin:dash:ops:all")
+        _backdate_dms(
+            _mk_dms(camp, SentDMLog.Status.DELIVERED, 3), timezone.now() - timedelta(days=300)
+        )
+        after = staff_client.get(URL, {"window": "all"}).data["dm_quality"]["requested"]
+        assert after - base == 3
+        # 같은 행이 30d 프리셋에는 안 잡힌다 (all 이 실제로 더 넓다는 증거)
+        assert staff_client.get(URL, {"window": "30d"}).data["dm_quality"]["requested"] == 0
+
+    def test_all_upgrades_to_week_buckets_over_120_days(self, staff_client, clean_slate):
+        """span > 120일이면 주 버킷 — ts 는 항상 월요일 자정이고 총량은 보존된다."""
+        camp = _mk_campaign(_mk_conn())
+        _backdate_dms(
+            _mk_dms(camp, SentDMLog.Status.DELIVERED, 1), timezone.now() - timedelta(days=200)
+        )
+        _mk_dms(camp, SentDMLog.Status.DELIVERED, 2)
+
+        dq = staff_client.get(URL, {"window": "all"}).data["dm_quality"]
+        series = dq["series"]
+        assert series["granularity"] == "week"
+        buckets = series["buckets"]
+        ts = [datetime.fromisoformat(b["ts"]) for b in buckets]
+        assert all(t.weekday() == 0 for t in ts)  # 월요일 시작
+        assert all((b - a).days == 7 for a, b in zip(ts, ts[1:], strict=False))
+        # 제로필해도 총량 보존 (버킷 합 == 스칼라 KPI)
+        assert sum(b["requested"] for b in buckets) == dq["requested"]
+        # 버킷 수가 일별(400+)보다 훨씬 적다 = 폭증 방지 목적 달성
+        assert len(buckets) < 100
+
+    def test_all_uses_longer_cache_ttl_key(self, staff_client, clean_slate):
+        staff_client.get(URL, {"window": "all"})
+        assert cache.get("admin:dash:ops:all") is not None
+
+    def test_point_in_time_blocks_identical_to_24h(self, staff_client, clean_slate):
+        """시점 지표(ig_connections)는 range 와 무관 — all 에서도 같은 값."""
+        _mk_conn(status=IGAccountConnection.Status.EXPIRED)
+        a = staff_client.get(URL, {"window": "all"}).data
+        b = staff_client.get(URL, {"window": "24h"}).data
+        assert a["ig_connections"] == b["ig_connections"]
+
+    def test_service_start_falls_back_to_now_when_no_logs(self, db):
+        """로그 0건이면 since=now — 빈 구간이지 500 이 아니다 (트랜잭션 내 삭제라 롤백됨)."""
+        SentDMLog.objects.all().delete()
+        SpamCommentLog.objects.all().delete()
+        now = timezone.now()
+        assert _service_start(now) == now
+        since, granularity = _window_bounds("all", now)
+        assert since == now
+        assert granularity == "5m"
+
+    def test_spam_log_endpoint_accepts_all_too(self, staff_client, clean_slate):
+        """ALLOWED_WINDOWS 공유 — 대시보드에서 all 을 고른 뒤 '자세히 보기' 가 400 나면 안 된다."""
+        conn = _mk_conn()
+        base = staff_client.get("/api/v1/admin/spam/logs/", {"window": "all"})
+        assert base.status_code == 200
+        _mk_spam_log(conn, SpamCommentLog.Status.HIDDEN)
+        res = staff_client.get("/api/v1/admin/spam/logs/", {"window": "all"})
+        assert res.status_code == 200
+        assert res.data["total"] - base.data["total"] == 1
+
+
+# ─── DM-4: 건너뜀 사유 분해 ───────────────────────────────────────────
+
+
+class TestSkippedBreakdown:
+    def test_sum_equals_skipped_and_actionable_flag(self, staff_client, clean_slate):
+        camp = _mk_campaign(_mk_conn())
+        _mk_dms(camp, SentDMLog.Status.SKIPPED, 3, error_message="monthly_dm_limit_reached")
+        _mk_dms(
+            camp, SentDMLog.Status.SKIPPED, 2, error_message="Campaign not active (status=paused)"
+        )
+        _mk_dms(camp, SentDMLog.Status.SKIPPED, 1, error_message="self recipient (account itself)")
+
+        dq = staff_client.get(URL).data["dm_quality"]
+        rows = {r["reason"]: r for r in dq["skipped_breakdown"]}
+        assert sum(r["count"] for r in dq["skipped_breakdown"]) == dq["skipped"] == 6
+        assert rows["monthly_dm_limit"]["count"] == 3
+        assert rows["monthly_dm_limit"]["actionable"] is True
+        assert rows["monthly_dm_limit"]["label"]  # 라벨은 서버가 준다
+        assert rows["campaign_not_active"]["count"] == 2
+        assert rows["campaign_not_active"]["actionable"] is False
+        assert rows["self_recipient"]["count"] == 1
+        # count desc 정렬
+        assert [r["count"] for r in dq["skipped_breakdown"]] == [3, 2, 1]
+
+    def test_unknown_message_falls_into_other(self, staff_client, clean_slate):
+        camp = _mk_campaign(_mk_conn())
+        _mk_dms(camp, SentDMLog.Status.SKIPPED, 2, error_message="something we never wrote")
+        dq = staff_client.get(URL).data["dm_quality"]
+        assert dq["skipped_breakdown"] == [
+            {"reason": "other", "label": "기타", "count": 2, "actionable": False}
+        ]
+        assert sum(r["count"] for r in dq["skipped_breakdown"]) == dq["skipped"]
+
+    def test_disconnect_cleanup_reason_is_recognised(self, staff_client, clean_slate):
+        """_halt_automation 이 남기는 문구(사유 접미사 포함)도 한 버킷으로 묶인다."""
+        camp = _mk_campaign(_mk_conn())
+        _mk_dms(
+            camp,
+            SentDMLog.Status.SKIPPED,
+            1,
+            error_message="IG connection disconnected (user_requested)",
+        )
+        _mk_dms(camp, SentDMLog.Status.SKIPPED, 1, error_message="IG account deactivated (plan)")
+        rows = {
+            r["reason"]: r["count"]
+            for r in staff_client.get(URL).data["dm_quality"]["skipped_breakdown"]
+        }
+        assert rows == {"connection_disconnected": 1, "ig_account_inactive": 1}
+
+    def test_empty_when_no_skipped(self, staff_client, clean_slate):
+        camp = _mk_campaign(_mk_conn())
+        _mk_dms(camp, SentDMLog.Status.DELIVERED, 1)
+        assert staff_client.get(URL).data["dm_quality"]["skipped_breakdown"] == []

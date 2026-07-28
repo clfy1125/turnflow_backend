@@ -718,12 +718,39 @@ def _kpis(cur: tuple, prev: tuple | None, mrr_total: int) -> dict:
 
 # ── 퍼널 ─────────────────────────────────────────────────────────────
 
+# 채널별 퍼널 counts 의 0 초기값 — _cohort_agg 와 같은 축(키 셋)이어야 한다.
+# 직전 기간에 존재하지 않던 채널의 previous 로도 쓴다 (MKT-1: 그 채널로 0명이었던 게 맞음).
+_EMPTY_FUNNEL_COUNTS: dict = {
+    "signups": 0,
+    "ig_connected": 0,
+    "page_created": 0,
+    "page_published": 0,
+    "dm_campaign": 0,
+    "activated": 0,
+    "both": 0,
+    "paid": 0,
+    "trial_only": 0,
+    "pro_trial": 0,
+    "basic_trial": 0,
+    "pro_paid": 0,
+    "basic_paid": 0,
+    "trial_no_card": 0,
+}
 
-def _funnel_node(key: str, count: int, numer: int, denom: int, rate_of, formula) -> dict:
-    """퍼널 노드 1개 — {key, label, count, rate, rate_of, formula}.
+
+def _funnel_node(
+    key: str, count: int, numer: int, denom: int, rate_of, formula, previous: int | None = None
+) -> dict:
+    """퍼널 노드 1개 — {key, label, count, rate, rate_of, formula, previous, delta_pct}.
 
     rate = numer/denom (denom 0 → null). rate_of = 분모 노드 key(또는 null),
     formula = 한국어 정의 문자열 (M-6 — 모든 노드에서 non-null, 프론트 툴팁 정본).
+
+    MKT-1(R-8): 노드가 **자기 증감**을 들고 있다 — previous 는 직전 동일 기간의 같은
+    집계라 배지와 바로 위 숫자가 어긋날 수 없다. kpis 로 대신 채우면 모집단이 달라진다
+    (kpis.paid_conversions=실결제만 vs conversion 노드=체험+실결제).
+    previous is None(= period=all, 비교 기간 없음) → previous/delta_pct 모두 null (R-1).
+    previous == 0 → delta_pct null (÷0).
     """
     return {
         "key": key,
@@ -732,10 +759,24 @@ def _funnel_node(key: str, count: int, numer: int, denom: int, rate_of, formula)
         "rate": _rate(numer, denom),
         "rate_of": rate_of,
         "formula": formula,
+        "previous": previous,
+        "delta_pct": (round((count - previous) / previous * 100, 1) if previous else None),
     }
 
 
-def _build_funnel_variant(counts: dict, visitors: int) -> dict:
+def _prev_plan_total(prev_counts: dict | None) -> int | None:
+    """직전 기간의 '유료플랜 전환' 인원 = paid + trial_only (conversion.count 와 동일 정의)."""
+    if prev_counts is None:
+        return None
+    return prev_counts.get("paid", 0) + prev_counts.get("trial_only", 0)
+
+
+def _build_funnel_variant(
+    counts: dict,
+    visitors: int,
+    prev_counts: dict | None = None,
+    prev_visitors: int | None = None,
+) -> dict:
     """counts(+visitors) → {head, branches, activation, activation_overlap, conversion}.
 
     counts keys: signups, ig_connected, page_created, page_published, dm_campaign,
@@ -753,6 +794,9 @@ def _build_funnel_variant(counts: dict, visitors: int) -> dict:
     - conversion(N-1 + R-4): **유료플랜 전환** = 카드 등록 체험 중 + 실결제
       (count = paid + trial_only), **rate 분모는 activated**(방문→가입→활성화→유료 직렬),
       breakdown = {pro_trial, basic_trial, pro_paid, basic_paid, other} (합 == count).
+
+    MKT-1(R-8): prev_counts/prev_visitors 를 주면 4개 노드(visit/signup/activation/
+    conversion) 모두 previous·delta_pct 가 채워진다. prev 가 없으면(period=all) 전부 null.
     """
     signups = counts["signups"]
     ig = counts["ig_connected"]
@@ -781,6 +825,7 @@ def _build_funnel_variant(counts: dict, visitors: int) -> dict:
             None,
             "기간 내 랜딩 고유 방문자 수(distinct visitor_id, 브라우저 단위) — "
             "재방문 세션은 1명으로 집계, 유일하게 기간-이벤트 기준",
+            prev_visitors,
         ),
         _funnel_node(
             "signup",
@@ -789,6 +834,7 @@ def _build_funnel_variant(counts: dict, visitors: int) -> dict:
             visitors,
             "visit",
             "기간 내 가입한 회원 수(가입 코호트) ÷ 고유 방문자 수 × 100",
+            prev_counts["signups"] if prev_counts is not None else None,
         ),
     ]
     branches = [
@@ -849,6 +895,7 @@ def _build_funnel_variant(counts: dict, visitors: int) -> dict:
         "signup",
         "DM 캠페인 1개 이상 생성 또는 페이지 공개 ÷ 이 기간 가입자 (중복 제거) · "
         "도달 여부는 현재까지 기준",
+        prev_counts.get("activated", 0) if prev_counts is not None else None,
     )
     conversion = _funnel_node(
         "paid",
@@ -859,6 +906,7 @@ def _build_funnel_variant(counts: dict, visitors: int) -> dict:
         "가입 코호트 중 유료플랜(무료체험+실결제) 진입 ÷ 활성화 유저 × 100 · "
         "무료체험은 **카드 등록 완료** 건만(어드민 수동 부여 제외), "
         "실결제=실제 결제(Toss PAID) 발생",
+        _prev_plan_total(prev_counts),
     )
     conversion["breakdown"] = {
         "pro_trial": pro_trial,
@@ -878,13 +926,23 @@ def _build_funnel_variant(counts: dict, visitors: int) -> dict:
     }
 
 
-def _funnel(all_counts: dict, visitors_all: int, channel_variants: list[tuple]) -> dict:
+def _funnel(
+    all_counts: dict,
+    visitors_all: int,
+    channel_variants: list[tuple],
+    prev_all_counts: dict | None = None,
+    prev_visitors_all: int | None = None,
+    prev_channel_map: dict | None = None,
+) -> dict:
     """가입 코호트 분기 퍼널 — variants.all + 채널별 variant (드롭다운용, 미리 계산).
 
     - all_counts: _cohort_agg(*cur) (signups/ig_connected/page_published/dm_campaign/paid 사용)
     - visitors_all: 전체 현재 기간 고유 방문자 수 (distinct visitor_id)
     - channel_variants: [(channel_key, counts_dict, visitors), ...] signups desc 정렬됨.
       비어 있으면(어트리뷰션 미탑재) available_channels 는 all 만.
+    - prev_*: MKT-1(R-8) 직전 기간 값. prev_channel_map = {channel: (counts, visitors)}.
+      직전 기간에 없던 채널은 previous=0(그 채널로 0명이었던 게 맞음), period=all 이면
+      셋 다 None → 전 노드 previous/delta_pct = null.
     """
     signups = all_counts["signups"]
     if signups > COHORT_SNAPSHOT_WARN_ROWS:
@@ -894,11 +952,19 @@ def _funnel(all_counts: dict, visitors_all: int, channel_variants: list[tuple]) 
             COHORT_SNAPSHOT_WARN_ROWS,
         )
 
+    has_prev = prev_all_counts is not None
     available_channels = [{"value": "all", "label": "전체 채널"}]
-    variants = {"all": _build_funnel_variant(all_counts, visitors_all)}
+    variants = {
+        "all": _build_funnel_variant(all_counts, visitors_all, prev_all_counts, prev_visitors_all)
+    }
     for channel, counts, visitors in channel_variants:
         available_channels.append({"value": channel, "label": CHANNEL_LABELS.get(channel, channel)})
-        variants[channel] = _build_funnel_variant(counts, visitors)
+        prev_counts, prev_visitors = (None, None)
+        if has_prev:
+            prev_counts, prev_visitors = (prev_channel_map or {}).get(
+                channel, (_EMPTY_FUNNEL_COUNTS, 0)
+            )
+        variants[channel] = _build_funnel_variant(counts, visitors, prev_counts, prev_visitors)
 
     return {
         "semantics": "signup_cohort",
@@ -969,24 +1035,7 @@ def _funnel_channel_variants(flags: tuple) -> list[tuple]:
     signups>0 인 채널만 (드롭다운/available_channels 대상). 어트리뷰션 미탑재 시 빈 리스트.
     """
     flag_rows, attr_map, _attr_utm, referral_users, visits_by_channel = flags
-    per_channel: dict = defaultdict(
-        lambda: {
-            "signups": 0,
-            "ig_connected": 0,
-            "page_created": 0,
-            "page_published": 0,
-            "dm_campaign": 0,
-            "activated": 0,
-            "both": 0,
-            "paid": 0,
-            "trial_only": 0,
-            "pro_trial": 0,
-            "basic_trial": 0,
-            "pro_paid": 0,
-            "basic_paid": 0,
-            "trial_no_card": 0,
-        }
-    )
+    per_channel: dict = defaultdict(lambda: dict(_EMPTY_FUNNEL_COUNTS))
     for uid, ig, pgc, pg, cp, pd, cur_plan, cur_status, cur_card in flag_rows:
         tr, tr_no_card = _trial_flags(cur_plan, cur_status, cur_card)
         channel = _channel_of(uid, attr_map, referral_users)
@@ -2760,9 +2809,19 @@ KPI(기간 비교), 가입 코호트 퍼널, 채널별 성과, 업셀 후보, �
   다르면 별개로 집계됨). 공통 head(방문자→가입) 이후 2갈래 병렬 분기 → 유료 전환 수렴:
   분기 A(DM 자동화) = IG 연동 → DM 캠페인(IG 연동이 전제라 순차),
   분기 B(바이오링크) = 페이지 생성 → 페이지 공개(IG 불필요, 가입에서 바로 — 비선형).
-  각 노드 = `{key, label, count, rate, rate_of, formula}`. rate: signup=가입/고유 방문자,
-  ig_connected=ig/가입, dm_campaign=dm/ig, page_created=생성/가입, page_published=공개/생성,
-  paid=유료플랜 전환/가입(수렴이라 가입 대비).
+  각 노드 = `{key, label, count, rate, rate_of, formula, previous, delta_pct}`.
+  rate: signup=가입/고유 방문자, ig_connected=ig/가입, dm_campaign=dm/ig,
+  page_created=생성/가입, page_published=공개/생성, paid=유료플랜 전환/가입(수렴이라 가입 대비).
+- **퍼널 노드 증감 `previous`/`delta_pct` (MKT-1 = R-8)**: `head[visit, signup]` ·
+  `activation` · `conversion` **4개 노드 모두**에 붙습니다 (채널 variant 포함).
+  `previous` = **직전 동일 기간의 같은 집계**, `delta_pct` = `(current−previous)/previous×100`
+  (소수 1자리). 노드가 자기 증감을 들고 있으므로 배지와 바로 위 숫자가 같은 모집단이며,
+  `kpis` 로 대체하면 어긋납니다 — `kpis.paid_conversions` 는 **실결제만**이라
+  conversion 노드(체험+실결제)와 모집단이 다르고, '활성화 유저'에 대응하는 KPI 는 아예 없습니다.
+  `previous` 가 **null**(= `period=all`, R-1 규칙) 이거나 **0** 이면 `delta_pct` 는 null.
+  직전 기간에 없던 채널의 variant 는 `previous: 0`(그 채널로 0명이었던 것이 사실).
+  `branches[*].steps[*]` 는 스키마 일관성을 위해 두 필드를 갖지만 **항상 null** 입니다
+  (팝업 전용 상세라 증감 배지를 쓰지 않음).
 - **퍼널 activation 노드(R-3)**: 분기 4노드(IG 연동/DM 캠페인/페이지 생성/페이지 공개)를
   대체하는 **단일 '활성화 유저' 노드** — `variants[*].activation =
   {key:"activated", label:"활성화 유저", count, rate, rate_of:"signup", formula}`.
@@ -3012,6 +3071,8 @@ curl -H "Authorization: Bearer <staff_token>" \\
                                         "formula": "기간 내 랜딩 고유 방문자 수(distinct "
                                         "visitor_id, 브라우저 단위) — 재방문 세션은 1명으로 "
                                         "집계, 유일하게 기간-이벤트 기준",
+                                        "previous": 3000,
+                                        "delta_pct": 30.0,
                                     },
                                     {
                                         "key": "signup",
@@ -3021,6 +3082,8 @@ curl -H "Authorization: Bearer <staff_token>" \\
                                         "rate_of": "visit",
                                         "formula": "기간 내 가입한 회원 수(가입 코호트) ÷ "
                                         "고유 방문자 수 × 100",
+                                        "previous": 180,
+                                        "delta_pct": 16.7,
                                     },
                                 ],
                                 "branches": [
@@ -3077,6 +3140,8 @@ curl -H "Authorization: Bearer <staff_token>" \\
                                     "rate_of": "signup",
                                     "formula": "DM 캠페인 1개 이상 생성 또는 페이지 공개 ÷ "
                                     "이 기간 가입자 (중복 제거) · 도달 여부는 현재까지 기준",
+                                    "previous": 78,
+                                    "delta_pct": 23.1,
                                 },
                                 "activation_overlap": {"both": 21},
                                 "conversion": {
@@ -3088,6 +3153,8 @@ curl -H "Authorization: Bearer <staff_token>" \\
                                     "formula": "가입 코호트 중 유료플랜(무료체험+실결제) 진입"
                                     " ÷ 활성화 유저 × 100 · 무료체험은 **카드 등록 완료** "
                                     "건만(어드민 수동 부여 제외), 실결제=실제 결제(Toss PAID) 발생",
+                                    "previous": 13,
+                                    "delta_pct": 38.5,
                                     "breakdown": {
                                         "pro_trial": 11,
                                         "basic_trial": 0,
@@ -3549,6 +3616,17 @@ curl -H "Authorization: Bearer <staff_token>" \\
         cohort_flags = _cohort_flags(*cur)
         channel_variants = _funnel_channel_variants(cohort_flags)
 
+        # MKT-1(R-8): 퍼널 노드가 자기 증감을 들도록 직전 기간 코호트를 한 번 더 집계한다.
+        # period=all 은 prev 자체가 없어(R-1) 계산도 하지 않는다 → 전 노드 previous=null.
+        prev_cohort = prev_visitors = prev_channel_map = None
+        if prev:
+            prev_cohort = _cohort_agg(*prev)
+            _prev_visits, prev_visitors = _visit_counts(*prev)
+            prev_channel_map = {
+                channel: (counts, visitors)
+                for channel, counts, visitors in _funnel_channel_variants(_cohort_flags(*prev))
+            }
+
         payload = {
             "period": period,
             "range": {
@@ -3562,7 +3640,14 @@ curl -H "Authorization: Bearer <staff_token>" \\
             "attribution_available": ATTRIBUTION_AVAILABLE,
             "snapshot": _snapshot_cached(now),
             "kpis": _kpis(cur, prev, mrr_breakdown["total"]),
-            "funnel": _funnel(cohort, unique_visitors_current, channel_variants),
+            "funnel": _funnel(
+                cohort,
+                unique_visitors_current,
+                channel_variants,
+                prev_cohort,
+                prev_visitors,
+                prev_channel_map,
+            ),
             "trends": _trends(*cur),
             "channels": _channels(*cur, flags=cohort_flags),
             "upsell_candidates": _upsell_candidates(now),

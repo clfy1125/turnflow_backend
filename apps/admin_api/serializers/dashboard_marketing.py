@@ -103,6 +103,18 @@ class _FunnelNodeSerializer(serializers.Serializer):
         help_text="공식/정의 한국어 문자열 (i-아이콘 툴팁용) — M-6 이후 모든 노드에서 "
         "non-null 로 채워짐 (백엔드 값이 정본, null 폴백은 방어용)",
     )
+    previous = serializers.IntegerField(
+        allow_null=True,
+        help_text="MKT-1(R-8) — **직전 동일 기간의 같은 집계**. 노드가 자기 증감을 들고 있으므로 "
+        "배지와 바로 위 숫자가 항상 같은 모집단이다 (kpis 로 대체하지 말 것: "
+        "kpis.paid_conversions 는 실결제만이라 conversion 노드와 모집단이 다르다). "
+        "`period=all` 은 비교할 직전 기간이 없어 **null** (R-1 규칙).",
+    )
+    delta_pct = serializers.FloatField(
+        allow_null=True,
+        help_text="(current − previous) / previous × 100, 소수 1자리. "
+        "previous 가 null 이거나 0 이면 **null** (÷0·오독 방지).",
+    )
 
 
 class _FunnelConversionBreakdownSerializer(serializers.Serializer):

@@ -145,7 +145,9 @@ class _DmSeriesSerializer(serializers.Serializer):
 
     granularity = serializers.CharField(
         help_text='"5m"(1h 또는 span≤2h 커스텀) / "hour"(24h/today 또는 span≤2일) / '
-        '"day"(7d/30d 또는 span>2일 커스텀 — day 버킷은 로컬 날짜 자정 ts)'
+        '"day"(7d/30d 또는 span≤120일 — day 버킷은 로컬 날짜 자정 ts) / '
+        '"week"(span>120일, window=all 장기 구간 — 버킷 ts 는 **월요일 자정**). '
+        "프론트는 이 값을 그대로 읽어 렌더할 것 (OPS-4)"
     )
     buckets = _DmSeriesBucketSerializer(many=True, help_text="제로필된 버킷 리스트 (ts 오름차순)")
 
@@ -195,6 +197,22 @@ class _DmFailureBreakdownSerializer(serializers.Serializer):
     )
 
 
+class _DmSkippedBreakdownSerializer(serializers.Serializer):
+    """건너뜀 사유 1종 (DM-4) — failure_breakdown 과 같은 형태."""
+
+    reason = serializers.CharField(
+        help_text="사유 머신값 — monthly_dm_limit / campaign_not_active / "
+        "outside_schedule_window / ig_account_inactive / self_recipient / "
+        "connection_disconnected / other(미분류)"
+    )
+    label = serializers.CharField(help_text="한국어 표시명 (서버 제공 — 프론트 하드코딩 불필요)")
+    count = serializers.IntegerField(help_text="윈도우 내 해당 사유 건수")
+    actionable = serializers.BooleanField(
+        help_text="운영 조치가 필요한 신호인가. 현재 true 는 monthly_dm_limit(업셀 기회) 하나뿐 — "
+        "나머지는 일시정지·예약창 밖·자기 댓글 등 **정상 동작**이다."
+    )
+
+
 class _DmRecoverySerializer(serializers.Serializer):
     """복구 퍼널 — 숨김채널 재댓글 복구(recovery_*) 상태 집계 (J-1)."""
 
@@ -238,7 +256,15 @@ class _DmQualitySerializer(serializers.Serializer):
         "숨김함/스팸함으로 간 건 + 복구 대기/만료. = failed_param@2534025 + "
         "recovery_pending + recovery_expired (복구 재댓글 대상 사유)."
     )
-    skipped = serializers.IntegerField(help_text="skipped (한도 초과 등)")
+    skipped = serializers.IntegerField(
+        help_text="건너뜀 — Meta 에 요청을 보내지 않고 취소한 건. **실패가 아니라 발송을 "
+        "시작하지 않은 상태**. 사유별 분해는 skipped_breakdown 참고 (DM-4)."
+    )
+    skipped_breakdown = _DmSkippedBreakdownSerializer(
+        many=True,
+        help_text="DM-4 — 건너뜀 사유별 카운트 (count desc). Σ count == skipped. "
+        "조치가 필요한 것은 actionable=true(월 DM 한도 = 업셀 신호) 뿐이고 나머지는 정상 동작.",
+    )
     queued = serializers.IntegerField(help_text="queued (발송 대기)")
     submitting = serializers.IntegerField(help_text="submitting (API 호출 중)")
     delivery_rate = serializers.FloatField(
@@ -281,7 +307,7 @@ class _SpamSeriesSerializer(serializers.Serializer):
     """스팸 필터 시계열."""
 
     granularity = serializers.CharField(
-        help_text='"5m" / "hour" / "day" (dm_quality.series 와 동일)'
+        help_text='"5m" / "hour" / "day" / "week" (dm_quality.series 와 동일)'
     )
     buckets = _SpamSeriesBucketSerializer(many=True, help_text="제로필된 버킷 리스트")
 

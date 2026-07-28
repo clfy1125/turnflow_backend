@@ -141,6 +141,9 @@ class TestSectionGuard:
         "/api/v1/admin/pages/",
         "/api/v1/admin/auto-dm/logs/",
         "/api/v1/admin/auto-dm/campaigns/",
+        # DM-3 신규 — pk 경로도 기본 차단인지 (ROLE_ALLOWED_PATTERNS 가 넓어지지 않았는지)
+        "/api/v1/admin/auto-dm/campaigns/8b1c0e2a-1111-4a2b-9c3d-aaaaaaaaaaaa/queue-state/",
+        "/api/v1/admin/auto-dm/campaigns/8b1c0e2a-1111-4a2b-9c3d-aaaaaaaaaaaa/timeseries/",
         "/api/v1/admin/ig-connections/",
         "/api/v1/admin/spam/logs/",
         "/api/v1/admin/referral-codes/",

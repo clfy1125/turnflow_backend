@@ -32,6 +32,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.admin_api.audit import log_admin_action
+from apps.admin_api.dm_error_catalog import describe_for_log
 from apps.admin_api.models import AdminActionLog
 from apps.admin_api.serializers.autodm import (
     AdminCampaignDetailSerializer,
@@ -42,7 +43,14 @@ from apps.admin_api.serializers.autodm import (
     AdminIGConnectionListSerializer,
     _build_stats,
 )
-from apps.integrations.campaign_stats import QUEUE_WAITING_STATUSES, SENT_FOR_QUOTA_STATUSES
+from apps.integrations.campaign_stats import (
+    QUEUE_WAITING_STATUSES,
+    SENT_FOR_QUOTA_STATUSES,
+    TIMESERIES_RANGES,
+    annotate_campaign_people,
+    annotate_campaign_stats,
+    new_requester_timeseries,
+)
 from apps.integrations.dm_exceptions import DMSendError, DMTransientError
 from apps.integrations.dm_status_groups import (
     ATTENTION,
@@ -54,7 +62,12 @@ from apps.integrations.dm_status_groups import (
     status_group_q,
 )
 from apps.integrations.models import AutoDMCampaign, IGAccountConnection, SentDMLog
-from apps.integrations.serializers import DMVerificationStatsSerializer
+from apps.integrations.queue_state import build_queue_state_payload
+from apps.integrations.serializers import (
+    CampaignTimeseriesSerializer,
+    DMQueueStateSerializer,
+    DMVerificationStatsSerializer,
+)
 from apps.integrations.services import InstagramMessagingService
 
 logger = logging.getLogger(__name__)
@@ -78,7 +91,16 @@ class AdminCampaignListView(generics.ListAPIView):
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ["status", "trigger_type"]
     search_fields = ["name", "ig_connection__username"]
-    ordering_fields = ["created_at", "started_at", "total_sent"]
+    # DM-1-c: 목록이 **인원**을 보여주므로 인원 기준 정렬을 제공한다 (annotate 필드 재사용).
+    # total_sent(발송 이벤트 수)는 하위호환으로 남겨둔다 — 값과 정렬 축을 맞추려면
+    # 프론트는 '발송 인원' 컬럼에 people_sent 를 쓸 것.
+    ordering_fields = [
+        "created_at",
+        "started_at",
+        "total_sent",
+        "people_targets",
+        "people_sent",
+    ]
     ordering = ["-created_at"]
 
     def get_queryset(self):
@@ -89,7 +111,9 @@ class AdminCampaignListView(generics.ListAPIView):
             qs = qs.filter(ig_connection_id=ig_connection_id)
         if owner:
             qs = qs.filter(ig_connection__workspace__owner_id=owner)
-        return qs
+        # DM-1-b/c: 사람 단위 요약 + 이벤트 단위 enrichment 를 한 번의 LEFT JOIN 으로
+        # annotate (목록 N+1 제거). 정의는 상세 stats 와 같은 campaign_stats 모듈.
+        return annotate_campaign_people(annotate_campaign_stats(qs))
 
     @extend_schema(
         tags=[TAG],
@@ -102,7 +126,7 @@ class AdminCampaignListView(generics.ListAPIView):
 ## 사용 시나리오
 - 운영 대시보드에서 활성/일시정지 캠페인 현황 파악
 - 특정 IG 계정 또는 특정 소유자(User)의 캠페인만 필터링하여 점검
-- 발송량(total_sent) 기준 상위 캠페인 추적
+- 발송 **인원**(`people.sent`) 기준 상위 캠페인 추적
 
 ## 인증
 - `Authorization: Bearer <staff_access_token>` (is_staff=True)
@@ -111,6 +135,31 @@ class AdminCampaignListView(generics.ListAPIView):
 - 전역 조회 — request.user 의 워크스페이스로 필터링하지 않습니다.
 - N+1 방지를 위해 ig_connection / workspace / owner 를 select_related 합니다.
 - 기본 정렬 `-created_at`, 표준 PageNumberPagination(page_size=20) 적용 → `{count,next,previous,results}`.
+
+### 사람(인원) 단위 요약 `people` (DM-1-b)
+각 항목의 `people` 은 **상세 `stats` 의 `unique_*` 와 같은 정의·같은 계산**입니다
+(`apps.integrations.campaign_stats`) — 목록의 `people.sent` 와 상세의 `unique_sent` 는
+항상 일치합니다.
+
+| 키 | 상세 stats 대응 | 의미 |
+|---|---|---|
+| `targets` | `unique_targets` | 전체 대상 인원 (루트 DM 기준) |
+| `sent` | `unique_sent` | 실제 발송된 인원 (Meta 접수 이상) |
+| `waiting` | `unique_waiting` | 발송 대기/발송 중 인원 |
+| `failed` | `unique_failed` | 아무것도 받지 못한 인원 |
+| `unconfirmed` | `unique_unconfirmed` | 발송됐으나 도착 미확인 인원 |
+| `hidden_spam` | `unique_hidden_spam` | 숨겨진 요청·스팸 인원 (`failed` 의 부분집합) |
+| `needs_attention` | `unique_needs_attention_excl_hidden` | 숨김함 제외 '확인 필요' 인원 |
+| `sent_rate` | `unique_sent_rate` | `sent / targets` (0~1) |
+
+불변식 `targets == sent + waiting + failed`.
+
+- **`total_sent` / `total_failed` / `total_unconfirmed` 는 발송 *이벤트* 수**(모델
+  비정규화 카운터)라 follow-gate 캠페인에서 인원보다 큽니다(1명 = 오프닝+리워드 2건 이상).
+  하위호환 폴백용으로 유지하며, 화면 표기는 `people.*` 를 쓰세요.
+- `delivered_count` / `delivery_rate` / `last_sent_at` 은 이벤트 단위 배송 지표입니다.
+  `delivery_rate` 는 하드실패가 분모에서 빠져 100% 로 부풀 수 있으니 헤드라인에는
+  `people.sent_rate` 를 쓰세요.
 
 ## 주의사항
 - `owner` 는 IG 계정이 속한 워크스페이스의 소유자(User) PK 로 필터합니다.
@@ -157,7 +206,10 @@ class AdminCampaignListView(generics.ListAPIView):
                 str,
                 OpenApiParameter.QUERY,
                 required=False,
-                description="정렬 (created_at/started_at/total_sent, `-` 접두 내림차순).",
+                description="정렬 — created_at/started_at/**people_targets**/**people_sent**"
+                "/total_sent (`-` 접두 내림차순). '발송 인원' 컬럼 정렬은 `people_sent`, "
+                "'전체 대상' 은 `people_targets` 를 쓰세요. total_sent 는 발송 **이벤트** "
+                "수 기준이라 인원 표기와 축이 다릅니다(하위호환용).",
             ),
             OpenApiParameter(
                 "page",
@@ -188,8 +240,22 @@ class AdminCampaignListView(generics.ListAPIView):
                             "owner": {"id": 7, "email": "owner@example.com"},
                             "status": "active",
                             "trigger_type": "specific_media",
+                            "people": {
+                                "targets": 827,
+                                "sent": 696,
+                                "waiting": 0,
+                                "failed": 131,
+                                "unconfirmed": 0,
+                                "hidden_spam": 98,
+                                "needs_attention": 33,
+                                "sent_rate": 0.8416,
+                            },
+                            "delivered_count": 696,
+                            "delivery_rate": 0.9993,
+                            "last_sent_at": "2026-07-27T18:22:00+09:00",
                             "total_sent": 1280,
                             "total_failed": 3,
+                            "total_unconfirmed": 0,
                             "created_at": "2026-05-01T09:00:00+09:00",
                             "started_at": "2026-05-01T09:05:00+09:00",
                         }
@@ -416,6 +482,141 @@ class AdminCampaignResumeView(APIView):
         return Response({"id": str(campaign.id), "status": campaign.status})
 
 
+class AdminCampaignQueueStateView(APIView):
+    """캠페인 순차 발송 큐 현황 (cross-workspace, DM-3)."""
+
+    permission_classes = [IsAdminUser]
+    serializer_class = DMQueueStateSerializer
+
+    @extend_schema(
+        tags=[TAG],
+        summary="[관리자] 캠페인 큐 현황",
+        description="""
+## 개요
+"지금 이 캠페인이 얼마나 대기 중인지"를 어드민에서 봅니다. 유저 콘솔의
+`GET /integrations/dm-verification/queue-state/?campaign_id=` 와 **응답 스키마·집계가
+완전히 동일**하며(`apps.integrations.queue_state.build_queue_state_payload` 단일 소스),
+워크스페이스 멤버십 대신 `IsAdminUser` 로만 게이트합니다 — 어드민은 교차-워크스페이스로
+봐야 하므로 유저 경로를 그대로 부를 수 없습니다.
+
+## 사용 시나리오
+- 캠페인 상세에서 대기 인원/ETA 확인 (5~10초 폴링)
+- **`blocking_reason` 감시** — 고객 문의 전에 정지 상태를 먼저 발견:
+  - `action_block_cooldown`: Meta Action Block 쿨다운 중
+    (`action_block_cooldown_seconds` 로 잔여 시간)
+  - `monthly_quota_reached`: 월 DM 한도 소진 (대기 건이 있는데 못 나감 → 업셀 신호)
+  - `null`: 차단 없음
+
+## 인증
+- `Authorization: Bearer <staff_access_token>` (is_staff=True)
+
+## 비즈니스 로직
+- `gauge` 는 **발송 이벤트** 단위, `people` 은 **사람** 단위입니다. `people` 은
+  `campaign_stats.people_rollup` 이라 캠페인 상세 `stats` 의 `unique_*`(DM-1) 와 정의가
+  같아 두 화면이 자동으로 정합합니다 (`total = sent + waiting + failed` 항등).
+- `account_waiting` / `ahead_of_this_campaign` 은 **계정(IG 연동) 단위** — 같은 계정의 다른
+  캠페인 대기 건이 앞에 있으면 그만큼 늦어집니다(페이서가 계정 공유 포인터를 씀).
+- `eta_*` 는 확정 슬롯(next_retry_at)과 미클레임 추정의 합성이며
+  `eta_is_estimate=true` 면 추정이 섞였다는 뜻입니다. 대기 0 이면 `eta_seconds=0`,
+  `eta_finish_at=null`.
+- 읽기 전용 — AdminActionLog 감사 기록 없음.
+
+## 주의사항
+- 캠페인 UUID 가 없으면 404.
+        """,
+        parameters=[
+            OpenApiParameter("pk", str, OpenApiParameter.PATH, description="캠페인 UUID."),
+        ],
+        responses={
+            200: DMQueueStateSerializer,
+            401: OpenApiResponse(description="인증 누락/만료"),
+            403: OpenApiResponse(description="관리자 권한 없음"),
+            404: OpenApiResponse(description="캠페인 없음"),
+        },
+    )
+    def get(self, request, pk):
+        campaign = get_object_or_404(
+            AutoDMCampaign.objects.select_related("ig_connection__workspace__owner"), pk=pk
+        )
+        payload = build_queue_state_payload(campaign.ig_connection, campaign)
+        return Response(DMQueueStateSerializer(payload).data)
+
+
+class AdminCampaignTimeseriesView(APIView):
+    """캠페인 신규 요청자 시계열 (cross-workspace, DM-3)."""
+
+    permission_classes = [IsAdminUser]
+    serializer_class = CampaignTimeseriesSerializer
+
+    @extend_schema(
+        tags=[TAG],
+        summary="[관리자] 캠페인 신규 요청자 시계열",
+        description="""
+## 개요
+캠페인의 **신규 요청자**(그 버킷에 처음 트리거한 사람 수) 시계열입니다. 유저 콘솔의
+`GET /integrations/auto-dm/campaigns/{id}/timeseries/` 와 **응답 스키마·집계가 동일**
+(`campaign_stats.new_requester_timeseries` 단일 소스)하며 워크스페이스 필터만 없습니다.
+
+## 사용 시나리오
+- 캠페인 상세의 진행/모멘텀 차트 (아직 유입이 있는지, 언제 꺾였는지)
+
+## 인증
+- `Authorization: Bearer <staff_access_token>` (is_staff=True)
+
+## 비즈니스 로직
+- **사람 단위**: 한 사람의 최초 루트 DM 시각을 요청 시점으로 보고, 같은 사람이 여러 번
+  댓글을 달아도 최초 1회만 셉니다 → `range=all` 이면
+  `Σ series[].new_requesters == totals.lifetime_unique_requesters` 이고 이 값은
+  캠페인 상세 `stats.unique_targets` 와 같은 정의입니다.
+- 버킷: KST(Asia/Seoul) 벽시계 절단 — `all`·`7d`=일, `24h`=시간. 빈 구간 제로필.
+- `history_complete=false` 면 로그 보존정책으로 과거 구간이 잘렸다는 뜻입니다.
+
+## 주의사항
+- `range` 는 `all`(기본) / `24h` / `7d` 만 허용 — 그 외 값은 **400**.
+        """,
+        parameters=[
+            OpenApiParameter("pk", str, OpenApiParameter.PATH, description="캠페인 UUID."),
+            OpenApiParameter(
+                "range",
+                str,
+                OpenApiParameter.QUERY,
+                required=False,
+                enum=sorted(TIMESERIES_RANGES),
+                description="집계 범위 (기본 all). all·7d=일 버킷 / 24h=시간 버킷.",
+            ),
+        ],
+        responses={
+            200: CampaignTimeseriesSerializer,
+            400: OpenApiResponse(description="range 값 오류 (프로젝트 에러 포맷)"),
+            401: OpenApiResponse(description="인증 누락/만료"),
+            403: OpenApiResponse(description="관리자 권한 없음"),
+            404: OpenApiResponse(description="캠페인 없음"),
+        },
+    )
+    def get(self, request, pk):
+        range_key = request.query_params.get("range", "all")
+        if range_key not in TIMESERIES_RANGES:
+            return Response(
+                {
+                    "success": False,
+                    "error": {
+                        "code": 400,
+                        "message": f"잘못된 range 값입니다: {range_key!r}",
+                        "details": {"allowed": sorted(TIMESERIES_RANGES)},
+                    },
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        campaign = get_object_or_404(AutoDMCampaign, pk=pk)
+        data = new_requester_timeseries(campaign, range_key)
+        data.update(
+            campaign_id=campaign.id,
+            campaign_status=campaign.status,
+            is_active=campaign.status == AutoDMCampaign.Status.ACTIVE,
+        )
+        return Response(CampaignTimeseriesSerializer(data).data)
+
+
 # ===== DM 로그 =====
 
 
@@ -629,6 +830,18 @@ class AdminDMLogDetailView(generics.RetrieveAPIView):
 ## 비즈니스 로직
 - 전역 조회 — 워크스페이스 멤버십을 검사하지 않습니다.
 
+### 오류 원인·조치 (DM-2)
+`error_subcode` + `error_title` / `error_cause` / `error_action` / `recoverable` 이 함께
+내려갑니다. 판정은 운영 대시보드 `failure_breakdown` 과 **같은 서버 사전**
+(`dm_error_catalog`, `(code,subcode)` → `(code,status)` → `(code)` → `status` 4단 폴백)이라
+로그 1건을 열었을 때 대시보드로 돌아가 코드를 대조할 필요가 없습니다.
+사전에 없는 조합은 네 필드가 **빈 문자열**(recoverable=false)이니 프론트 로컬 사전으로
+폴백하세요. 새 코드가 나와도 사전이 서버에 있어 프론트 배포는 필요 없습니다.
+
+- `error_subcode` 는 사전 판정 1순위 키입니다 — `100/2534025`(숨김함 유입, **복구 대상**)와
+  `100/2534022`(윈도우 만료, 정상 실패)는 조치가 정반대라 subcode 없이는 구분할 수 없습니다.
+- `recoverable=true` → 재발송/재검증 버튼 노출 (failed_no_trace·recovery_*·failed_param@2534025).
+
 ## 주의사항
 - comment_text/message_sent 는 개인정보를 포함할 수 있으므로 취급에 유의하세요.
         """,
@@ -646,6 +859,31 @@ class AdminDMLogDetailView(generics.RetrieveAPIView):
             403: OpenApiResponse(description="관리자 권한 없음"),
             404: OpenApiResponse(description="로그 없음"),
         },
+        examples=[
+            OpenApiExample(
+                "숨김함 유입(복구 대상) 로그 상세",
+                response_only=True,
+                value={
+                    "id": "5b1f0c2e-0000-4a00-9c00-000000000001",
+                    "campaign": {
+                        "id": "8b1c0e2a-1111-4a2b-9c3d-aaaaaaaaaaaa",
+                        "name": "여름 공구 오픈",
+                    },
+                    "recipient_username": "buyer_a",
+                    "status": "recovery_pending",
+                    "error_code": "100",
+                    "error_subcode": "2534025",
+                    "error_title": "숨겨진 요청 · 스팸함 유입",
+                    "error_cause": "수신자가 아직 팔로워가 아니라 DM 채널이 열려 있지 않아, "
+                    "첫 DM 이 상대의 '숨겨진 요청/스팸함'으로 들어갔습니다. …",
+                    "error_action": "실패가 아니라 복구 대상입니다. 해당 워크스페이스의 "
+                    "'실패 DM 복구'(프로 전용)를 켜면 …",
+                    "recoverable": True,
+                    "error_message": "(#100) Param recipient[id] ...",
+                    "retry_count": 0,
+                },
+            )
+        ],
     )
     def get(self, request, *args, **kwargs):
         return super().get(request, *args, **kwargs)
@@ -1164,6 +1402,7 @@ curl -H "Authorization: Bearer <staff_token>" \\
                             "opening_count": 1,
                             "interaction_count": 2,
                             "latest_status": "read",
+                            "error_title": "",
                             "first_sent_at": "2026-07-20T10:00:00+09:00",
                             "last_activity_at": "2026-07-20T10:05:00+09:00",
                         }
@@ -1253,7 +1492,10 @@ curl -H "Authorization: Bearer <staff_token>" \\
 
         # latest_status: 현재 페이지 (campaign, recipient) 쌍의 최신 로그 상태 1건씩
         # (Postgres DISTINCT ON — over-fetch 후 정확 매칭). 페이지 20행이라 부담 없음.
+        # DM-2: 같은 행에서 error_code/subcode 도 함께 당겨 error_title 을 만든다
+        # (별도 쿼리 없음). 최신 로그가 오류가 아니면 사전 판정 결과가 빈 문자열이다.
         latest_status_map: dict = {}
+        latest_error_title: dict = {}
         if page_rows:
             camp_ids = {r["campaign_id"] for r in page_rows}
             rcpt_ids = {r["recipient_user_id"] for r in page_rows}
@@ -1261,9 +1503,13 @@ curl -H "Authorization: Bearer <staff_token>" \\
                 SentDMLog.objects.filter(campaign_id__in=camp_ids, recipient_user_id__in=rcpt_ids)
                 .order_by("campaign_id", "recipient_user_id", "-created_at")
                 .distinct("campaign_id", "recipient_user_id")
-                .values("campaign_id", "recipient_user_id", "status")
+                .values("campaign_id", "recipient_user_id", "status", "error_code", "error_subcode")
             ):
-                latest_status_map[(row["campaign_id"], row["recipient_user_id"])] = row["status"]
+                key = (row["campaign_id"], row["recipient_user_id"])
+                latest_status_map[key] = row["status"]
+                latest_error_title[key] = describe_for_log(
+                    row["error_code"], row["error_subcode"], row["status"]
+                )["error_title"]
 
         results = []
         for r in page_rows:
@@ -1290,6 +1536,7 @@ curl -H "Authorization: Bearer <staff_token>" \\
                     "opening_count": r["opening_count"],
                     "interaction_count": r["interaction_count"],
                     "latest_status": latest_status_map.get((r["campaign_id"], rid), ""),
+                    "error_title": latest_error_title.get((r["campaign_id"], rid), ""),
                     "first_sent_at": r["first_sent_at"],
                     "last_activity_at": r["last_activity_at"],
                 }

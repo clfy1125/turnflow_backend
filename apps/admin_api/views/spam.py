@@ -107,9 +107,12 @@ class AdminSpamLogListView(APIView):
 
 ## 비즈니스 로직
 - **전역 조회** — request.user 워크스페이스로 필터링하지 않습니다.
-- 기간 규약은 운영 대시보드와 **동일**합니다: `window` = `1h`|`24h`(기본)|`today`|`7d`|`30d`,
+- 기간 규약은 운영 대시보드와 **동일**합니다: `window` = `1h`|`24h`(기본)|`today`|`7d`|`30d`|`all`,
   또는 커스텀 `start`&`end`(YYYY-MM-DD, Asia/Seoul 로컬 날짜, 최대 92일). 둘을 함께 주면
   커스텀이 우선하고 `window` 는 무시됩니다. 범위는 `[since, until)`.
+  `all`(OPS-4) = DM 로그·스팸 로그를 통틀어 가장 이른 `created_at` ~ 현재 — `ALLOWED_WINDOWS` 를
+  운영 대시보드와 공유하므로 대시보드에서 전체 기간을 고른 뒤 '자세히 보기' 로 넘어와도
+  같은 `window` 값이 그대로 통합니다.
 - `status` 미지정 시 **detected + hidden + failed**(=`clean` 제외)를 모두 포함하며,
   이때 `total` 은 같은 기간 `dashboard/operations` 의 **`spam.detected` 와 일치**합니다.
   (`spam.checked` 는 `clean` 을 포함한 전체 검사 수라 값이 다릅니다 — 정상입니다.)
@@ -145,7 +148,9 @@ curl -H "Authorization: Bearer <staff_token>" \\
                 location=OpenApiParameter.QUERY,
                 required=False,
                 enum=list(ALLOWED_WINDOWS),
-                description="기간 프리셋 (기본 24h). start&end 를 함께 주면 무시됩니다.",
+                description="기간 프리셋 (기본 24h). `all`=전체 기간(OPS-4 — 운영 대시보드에서 "
+                "전체 기간을 고른 뒤 '자세히 보기' 로 넘어와도 그대로 동작). "
+                "start&end 를 함께 주면 무시됩니다.",
             ),
             OpenApiParameter(
                 name="start",

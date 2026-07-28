@@ -21,6 +21,8 @@
 
 from __future__ import annotations
 
+from apps.integrations.dm_status_groups import HIDDEN_SPAM_SUBCODE
+
 # ── (code, subcode) 정확 일치 ────────────────────────────────────────
 _BY_CODE_SUBCODE: dict[tuple[str, str], dict] = {
     ("100", "2534025"): {
@@ -216,6 +218,40 @@ def describe(code: str, subcode: str, status: str) -> dict:
         or _EMPTY
     )
     return dict(entry)
+
+
+# 복구/재검증 경로가 있는 상태 — recoverable=true 판정 대상.
+#   - failed_no_trace: 능동 재검증(GET /{message_id})으로 delivered 승격 가능
+#   - recovery_pending/expired: 숨김채널 재댓글 복구 플로우 대상
+#   - failed_param@2534025: 숨김채널 복구 대상 (아래 함수가 subcode 로 분기)
+_RECOVERABLE_STATUSES = frozenset(("failed_no_trace", "recovery_pending", "recovery_expired"))
+
+
+def is_recoverable(status: str, error_subcode: str = "") -> bool:
+    """이 실패가 복구/재검증 경로를 갖는가 (운영 대시보드 failure_breakdown · 로그 상세 공용).
+
+    recovery 퍼널(recovery_*)보다 넓은 개념 — failed_no_trace(재검증)와
+    failed_param@2534025(숨김채널 복구)도 true. 프론트의 '재발송/재검증' 버튼 노출 판단용.
+    """
+    if status in _RECOVERABLE_STATUSES:
+        return True
+    return status == "failed_param" and str(error_subcode or "").strip() == HIDDEN_SPAM_SUBCODE
+
+
+def describe_for_log(code: str, subcode: str, status: str) -> dict:
+    """로그 **상세/목록 행**용 평면 dict — ``describe()`` 결과에 ``error_`` 접두를 붙이고
+    ``recoverable`` 을 함께 낸다 (DM-2).
+
+    로그 상세는 error_code/error_message 등 다른 필드와 한 객체에 섞이므로 대시보드
+    (`failure_breakdown`)의 title/cause/action 과 달리 접두를 둔다.
+    """
+    described = describe(code, subcode, status)
+    return {
+        "error_title": described["title"],
+        "error_cause": described["cause"],
+        "error_action": described["action"],
+        "recoverable": is_recoverable(status, subcode),
+    }
 
 
 def truncate_message(message: str) -> str:
