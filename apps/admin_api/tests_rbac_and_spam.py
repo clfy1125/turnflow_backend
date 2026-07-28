@@ -133,7 +133,7 @@ class TestAdminMeRole:
 class TestSectionGuard:
     ALLOWED = (ME_URL, MARKETING_URL)
     # 화이트리스트 밖 — 신규 엔드포인트가 추가돼도 기본 차단인지 확인하는 대표 표본
-    BLOCKED = (
+    BLOCKED_LIST = (
         OPS_URL,
         "/api/v1/admin/metrics/overview/",
         "/api/v1/admin/users/",
@@ -141,14 +141,18 @@ class TestSectionGuard:
         "/api/v1/admin/pages/",
         "/api/v1/admin/auto-dm/logs/",
         "/api/v1/admin/auto-dm/campaigns/",
-        # DM-3 신규 — pk 경로도 기본 차단인지 (ROLE_ALLOWED_PATTERNS 가 넓어지지 않았는지)
-        "/api/v1/admin/auto-dm/campaigns/8b1c0e2a-1111-4a2b-9c3d-aaaaaaaaaaaa/queue-state/",
-        "/api/v1/admin/auto-dm/campaigns/8b1c0e2a-1111-4a2b-9c3d-aaaaaaaaaaaa/timeseries/",
         "/api/v1/admin/ig-connections/",
         "/api/v1/admin/spam/logs/",
         "/api/v1/admin/referral-codes/",
         "/api/v1/admin/subscription-plans/",
     )
+    # DM-3 신규 — pk 경로도 기본 차단인지 (ROLE_ALLOWED_PATTERNS 가 넓어지지 않았는지).
+    # 존재하지 않는 pk 라서 full 역할이면 404 가 정답 — 200 단언 대상이 아니다.
+    BLOCKED_DETAIL = (
+        "/api/v1/admin/auto-dm/campaigns/8b1c0e2a-1111-4a2b-9c3d-aaaaaaaaaaaa/queue-state/",
+        "/api/v1/admin/auto-dm/campaigns/8b1c0e2a-1111-4a2b-9c3d-aaaaaaaaaaaa/timeseries/",
+    )
+    BLOCKED = BLOCKED_LIST + BLOCKED_DETAIL
 
     @pytest.mark.parametrize("url", ALLOWED)
     def test_whitelisted_paths_pass(self, viewer, url):
@@ -181,8 +185,11 @@ class TestSectionGuard:
     def test_full_admin_unaffected(self, full_admin):
         """회귀 방어 — 기존 스태프는 전 구간 그대로."""
         client = _login(full_admin)
-        for url in (ME_URL, MARKETING_URL, LINKS_URL, *self.BLOCKED):
+        for url in (ME_URL, MARKETING_URL, LINKS_URL, *self.BLOCKED_LIST):
             assert client.get(url).status_code == 200, url
+        # pk 경로는 대상 캠페인이 없으니 404 가 정상 — 게이트에 막히지만(403) 않으면 된다.
+        for url in self.BLOCKED_DETAIL:
+            assert client.get(url).status_code != 403, url
 
     def test_denied_attempt_is_audited(self, viewer):
         from apps.admin_api.models import AdminActionLog
