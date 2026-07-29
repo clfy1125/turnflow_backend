@@ -28,11 +28,30 @@ git pull origin "$(git rev-parse --abbrev-ref HEAD)"
 TAG="$(git rev-parse --short HEAD)"
 IMAGE="turnflow_instagram_web:${TAG}"
 echo "    building $IMAGE"
-APP_IMAGE="$IMAGE" $COMPOSE build
+# ⚠️ 반드시 **web_webhook 만** 빌드한다 (인자 없는 `build` 금지).
+# 앱 이미지는 web_webhook 하나만 `build:` 컨텍스트를 갖고 web_dashboard/web_external/
+# celery_* 는 `image: *app_image` 로 공유하므로 **결과 이미지는 완전히 동일**하다.
+# 그런데 인자를 안 주면 buildx bake 가 db 서비스의 이미지(deploy/backups/Dockerfile,
+# turnflow_instagram_db_pgbackrest:16)까지 함께 구워 manifest 가 새로 생기고, 그러면
+# 아래 3/6 의 `up -d db` 가 **running db 컨테이너를 재생성**한다(~48초 DB 블립).
+# 2026-06-30·07-07·07-14·07-15·07-16 배포에서 매번 재현됐고 2026-07-30 에 이렇게 제거.
+APP_IMAGE="$IMAGE" $COMPOSE build web_webhook
 docker tag "$IMAGE" turnflow_instagram_web:latest
 
-echo "==> 3/6 bring up stateful tier (no-op if already running)"
-APP_IMAGE="$IMAGE" $COMPOSE up -d db pgbouncer redis
+echo "==> 3/6 bring up stateful tier (이미 running 이면 손대지 않는다)"
+# `up -d db pgbouncer redis` 를 무조건 호출하면, config drift(이미지 manifest 변경·
+# .env.production 수정)를 compose 가 감지해 **정상 동작 중인 db 를 재생성**한다.
+# 위에서 build 를 한정해 주 원인은 없앴지만, env 변경만으로도 같은 일이 벌어지므로
+# (2026-07-14 실측) "떠 있으면 스킵"으로 이중 방어한다. 내려가 있을 때만 올린다.
+for svc in db pgbouncer redis; do
+  cid="$(APP_IMAGE="$IMAGE" $COMPOSE ps -q "$svc" 2>/dev/null || true)"
+  if [ -n "$cid" ] && [ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)" = "true" ]; then
+    echo "    $svc already running — skip (재생성 방지)"
+  else
+    echo "    starting $svc ..."
+    APP_IMAGE="$IMAGE" $COMPOSE up -d --no-deps "$svc"
+  fi
+done
 
 echo "==> 4/6 GATED migrations (one-shot, DIRECT to db:5432 — bypass PgBouncer txn pool)"
 # Session-mode connection for DDL: override DB_HOST/PORT to hit Postgres directly.
