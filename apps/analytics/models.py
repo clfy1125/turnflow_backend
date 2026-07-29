@@ -49,13 +49,16 @@ class LandingVisit(models.Model):
         verbose_name="방문자 ID",
         help_text="클라이언트가 생성해 localStorage(tf_vid)에 영구 보관하는 UUID.",
     )
-    utm_source = models.CharField(max_length=100, blank=True, default="", verbose_name="utm_source")
-    utm_medium = models.CharField(max_length=100, blank=True, default="", verbose_name="utm_medium")
+    # UTM 4필드 상한 200 — MarketingChannelLink(어드민 저장 링크)와 **반드시 동일**해야
+    # 한다. 한쪽만 짧으면 그 길이를 넘는 캠페인명이 어드민에서 저장 불가/절단되어
+    # 4-튜플 매칭이 깨지고 트래픽이 '저장 안 된 링크(UTM)'로 샌다.
+    utm_source = models.CharField(max_length=200, blank=True, default="", verbose_name="utm_source")
+    utm_medium = models.CharField(max_length=200, blank=True, default="", verbose_name="utm_medium")
     utm_campaign = models.CharField(
-        max_length=150, blank=True, default="", verbose_name="utm_campaign"
+        max_length=200, blank=True, default="", verbose_name="utm_campaign"
     )
     utm_content = models.CharField(
-        max_length=150, blank=True, default="", verbose_name="utm_content"
+        max_length=200, blank=True, default="", verbose_name="utm_content"
     )
     referrer = models.CharField(
         max_length=500,
@@ -139,13 +142,14 @@ class SignupAttribution(models.Model):
         verbose_name="방문자 ID",
         help_text="LandingVisit 과 조인하는 키. 랜딩을 거치지 않은 가입은 NULL.",
     )
-    utm_source = models.CharField(max_length=100, blank=True, default="", verbose_name="utm_source")
-    utm_medium = models.CharField(max_length=100, blank=True, default="", verbose_name="utm_medium")
+    # 상한 200 — LandingVisit·MarketingChannelLink 와 동일 (위 모델 주석 참고)
+    utm_source = models.CharField(max_length=200, blank=True, default="", verbose_name="utm_source")
+    utm_medium = models.CharField(max_length=200, blank=True, default="", verbose_name="utm_medium")
     utm_campaign = models.CharField(
-        max_length=150, blank=True, default="", verbose_name="utm_campaign"
+        max_length=200, blank=True, default="", verbose_name="utm_campaign"
     )
     utm_content = models.CharField(
-        max_length=150, blank=True, default="", verbose_name="utm_content"
+        max_length=200, blank=True, default="", verbose_name="utm_content"
     )
     referrer = models.CharField(max_length=500, blank=True, default="", verbose_name="리퍼러 URL")
     landing_path = models.CharField(

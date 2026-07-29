@@ -186,9 +186,29 @@ class TestRenameAndDelete:
         assert res.status_code == 201
         assert res.data["name"] == long_name
 
-    def test_name_over_255_is_400(self, staff_client):
-        res = staff_client.post(URL, {**PAYLOAD, "name": "가" * 256}, format="json")
+    def test_name_over_512_is_400(self, staff_client):
+        """상한 512 (프론트가 `캠페인(200) · 콘텐츠(200)` 로 자동 조합 = 최대 403자)."""
+        res = staff_client.post(URL, {**PAYLOAD, "name": "가" * 513}, format="json")
         assert res.status_code == 400
+
+    def test_long_name_over_audit_column_still_201(self, staff_client):
+        """이름이 감사 로그 라벨 컬럼(255)보다 길어도 생성은 성공해야 한다.
+
+        log_admin_action 이 target_repr 을 절단한다 — 안 하면 DataError 로 **생성 자체가
+        500** 이 된다(감사 로그가 본 요청을 깨뜨리면 안 된다).
+        """
+        long_name = "가" * 400
+        res = staff_client.post(URL, {**PAYLOAD, "name": long_name}, format="json")
+        assert res.status_code == 201, res.data
+        log = (
+            AdminActionLog.objects.filter(
+                action=AdminActionLog.Action.CHANNEL_LINK_CREATE, target_id=res.data["id"]
+            )
+            .order_by("-id")
+            .first()
+        )
+        assert log is not None
+        assert len(log.target_repr) == 255
 
     def test_delete_204(self, staff_client):
         link_id = staff_client.post(URL, PAYLOAD, format="json").data["id"]
@@ -244,3 +264,89 @@ class TestExcludeFromStats:
         """빈 PATCH 가 감사 로그만 남기고 지나가지 않게."""
         link_id = staff_client.post(URL, PAYLOAD, format="json").data["id"]
         assert staff_client.patch(f"{URL}{link_id}/", {}, format="json").status_code == 400
+
+
+class TestKoreanUtmNormalization:
+    """한국어 UTM 하드닝 (2026-07-30) — NFC/공백/길이/URL 상한.
+
+    배경: 대시보드는 UTM 4-튜플 **완전일치**로 유입을 저장 링크에 붙인다. 한글은 저장
+    경로에 따라 NFC/NFD 가 섞이고(macOS 복붙) 공백류도 달라지는데, 두 값이 화면상
+    똑같아 보여 매칭 실패를 눈으로 진단할 수 없다 → 저장 시 표준형으로 접는다.
+    """
+
+    def test_nfd_korean_is_stored_as_nfc(self, staff_client):
+        """macOS 복붙(NFD) 한글로 저장해도 DB 는 NFC — 방문 기록과 매칭되어야 한다."""
+        import unicodedata
+
+        nfc = "테스트 캠페인"
+        nfd = unicodedata.normalize("NFD", nfc)
+        assert nfd != nfc  # 전제: 두 문자열은 다르다(화면상 동일)
+
+        res = staff_client.post(
+            URL, {**PAYLOAD, "utm_campaign": nfd, "utm_content": "릴스"}, format="json"
+        )
+        assert res.status_code == 201
+        link = MarketingChannelLink.objects.get(pk=res.data["id"])
+        assert link.utm_campaign == nfc
+        assert unicodedata.is_normalized("NFC", link.utm_campaign)
+
+    def test_nfd_duplicate_is_rejected(self, staff_client):
+        """NFC 로 접은 뒤 중복 판정 — '눈에 똑같은' 조합의 링크가 둘 생기면 안 된다."""
+        import unicodedata
+
+        first = staff_client.post(URL, {**PAYLOAD, "utm_campaign": "여름 세일"}, format="json")
+        assert first.status_code == 201
+        dupe = staff_client.post(
+            URL,
+            {
+                **PAYLOAD,
+                "name": "다른 이름",
+                "utm_campaign": unicodedata.normalize("NFD", "여름 세일"),
+            },
+            format="json",
+        )
+        assert dupe.status_code == 400
+
+    def test_nbsp_and_double_space_collapse(self, staff_client):
+        """NBSP/연속 공백(엑셀·슬랙 복붙)은 보통 공백 1칸으로 축약."""
+        res = staff_client.post(
+            URL, {**PAYLOAD, "utm_campaign": "  여름\u00a0\u00a0세일  "}, format="json"
+        )
+        assert res.status_code == 201
+        assert MarketingChannelLink.objects.get(pk=res.data["id"]).utm_campaign == "여름 세일"
+
+    def test_long_korean_campaign_up_to_200_chars(self, staff_client):
+        """방문 기록(LandingVisit)과 같은 200자 — 짧으면 그 유입은 링크 저장이 불가해진다."""
+        res = staff_client.post(
+            URL,
+            {
+                **PAYLOAD,
+                "base_url": "https://turnflow.link/",
+                "utm_campaign": "가" * 200,
+                "utm_content": "",
+            },
+            format="json",
+        )
+        assert res.status_code == 201, res.data
+        assert len(MarketingChannelLink.objects.get(pk=res.data["id"]).utm_campaign) == 200
+
+    def test_url_over_limit_is_400_not_500(self, staff_client):
+        """한글은 인코딩 시 글자당 9자 → 완성 URL 상한 초과는 **400**(DB DataError 금지)."""
+        res = staff_client.post(
+            URL,
+            {**PAYLOAD, "utm_campaign": "가" * 200, "utm_content": "나" * 200},
+            format="json",
+        )
+        assert res.status_code == 400
+        assert "URL" in str(res.data)
+        assert not MarketingChannelLink.objects.filter(utm_campaign="가" * 200).exists()
+
+    def test_korean_utm_source_derives_channel(self, staff_client):
+        """한글 utm_source 별칭 — '메타'가 other_campaign 이 아니라 meta_ads 로 파생."""
+        res = staff_client.post(
+            URL,
+            {**PAYLOAD, "utm_source": "메타", "utm_campaign": "한글소스", "utm_content": ""},
+            format="json",
+        )
+        assert res.status_code == 201
+        assert res.data["channel"] == "meta_ads"

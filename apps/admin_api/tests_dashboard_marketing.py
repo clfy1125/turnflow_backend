@@ -3158,3 +3158,74 @@ class TestFunnelNodeDeltas:
         v = _variant(staff_client.get(URL, {"period": "30d"}), str(link.pk))
         assert v["activation"]["previous"] == 0
         assert v["activation"]["delta_pct"] is None  # 0 분모 → null
+
+
+class TestCacheRefreshBypass:
+    """?refresh=1 — 캐시 우회 (2026-07-30).
+
+    방문/가입 적재에는 캐시 무효화 훅이 없어 신규 유입은 TTL 만큼 늦게 보인다.
+    화면의 '새로고침' 버튼이 이 파라미터를 실어 보내 즉시 재계산한다.
+    """
+
+    def test_second_call_is_cache_hit(self, staff_client):
+        first = staff_client.get(URL, {"period": "30d"})
+        assert first.status_code == 200
+        assert first["X-Cache"] == "MISS"
+        second = staff_client.get(URL, {"period": "30d"})
+        assert second["X-Cache"] == "HIT"
+        # 캐시 히트는 집계를 다시 하지 않으므로 generated_at 이 그대로다
+        assert second.data["generated_at"] == first.data["generated_at"]
+
+    def test_refresh_bypasses_cache_and_recomputes(self, staff_client):
+        first = staff_client.get(URL, {"period": "30d"})
+        refreshed = staff_client.get(URL, {"period": "30d", "refresh": "1"})
+        assert refreshed.status_code == 200
+        assert refreshed["X-Cache"] == "BYPASS"
+        assert refreshed.data["generated_at"] != first.data["generated_at"]
+        # 우회 후 응답을 **다시 적재**해야 한다 (다음 호출은 갱신된 값으로 히트)
+        after = staff_client.get(URL, {"period": "30d"})
+        assert after["X-Cache"] == "HIT"
+        assert after.data["generated_at"] == refreshed.data["generated_at"]
+
+    def test_refresh_also_recomputes_snapshot(self, staff_client):
+        """고정 패널(snapshot)은 별도 900초 키 — 함께 갱신되지 않으면
+        '새로고침했는데 일부 숫자만 안 바뀐다'가 된다."""
+        first = staff_client.get(URL, {"period": "30d"})
+        refreshed = staff_client.get(URL, {"period": "30d", "refresh": "1"})
+        assert refreshed.data["snapshot"]["as_of"] != first.data["snapshot"]["as_of"]
+
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
+    def test_truthy_values(self, staff_client, value):
+        staff_client.get(URL, {"period": "30d"})
+        assert staff_client.get(URL, {"period": "30d", "refresh": value})["X-Cache"] == "BYPASS"
+
+    @pytest.mark.parametrize("value", ["0", "false", "", "no"])
+    def test_falsy_values_keep_cache(self, staff_client, value):
+        staff_client.get(URL, {"period": "30d"})
+        assert staff_client.get(URL, {"period": "30d", "refresh": value})["X-Cache"] == "HIT"
+
+    def test_marketing_viewer_refresh_is_ignored_not_403(self, db):
+        """제한 역할(외주)은 비싼 재계산을 반복시킬 수 없다 — 403 대신 조용히 무시.
+
+        역할은 **미들웨어**가 판정해 request.admin_role 로 캐싱하므로, 이 검증은
+        미들웨어를 타는 세션 로그인(django test Client)으로 해야 한다 —
+        APIClient.force_authenticate 는 미들웨어 시점에 아직 익명이라 full 로 굳는다
+        (tests_rbac_and_spam.py 와 같은 이유).
+        """
+        from django.contrib.auth.models import Group
+        from django.test import Client as DjangoClient
+
+        from apps.admin_api.roles import ROLE_MARKETING_VIEWER
+
+        viewer = _mk_user(email=f"viewer-{uuid.uuid4().hex[:6]}@example.com", staff=True)
+        group, _ = Group.objects.get_or_create(name=ROLE_MARKETING_VIEWER)
+        viewer.groups.add(group)
+        session_client = DjangoClient()
+        session_client.force_login(viewer)
+
+        first = session_client.get(URL, {"period": "30d"})
+        assert first.status_code == 200
+        second = session_client.get(URL, {"period": "30d", "refresh": "1"})
+        assert second.status_code == 200
+        assert second["X-Cache"] == "HIT"
+        assert second.json()["generated_at"] == first.json()["generated_at"]

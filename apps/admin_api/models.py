@@ -89,17 +89,24 @@ class MarketingChannelLink(models.Model):
     """
 
     # MKT-13: 프론트가 링크 이름 입력칸을 없애고 `utm_campaign · utm_content` 로 자동
-    # 조합한다 → 100(캠페인) + 3(구분자) + 100(콘텐츠) = 최대 203자. 100 이면 잘린다.
-    name = models.CharField(max_length=255, verbose_name="링크 이름")
+    # 조합한다 → 200(캠페인) + 3(구분자) + 200(콘텐츠) = 최대 403자.
+    name = models.CharField(max_length=512, verbose_name="링크 이름")
     base_url = models.URLField(max_length=500, verbose_name="기본 URL")
-    utm_source = models.CharField(max_length=100, blank=True, default="")
-    utm_medium = models.CharField(max_length=100, blank=True, default="")
-    utm_campaign = models.CharField(max_length=100, blank=True, default="")
-    utm_content = models.CharField(max_length=100, blank=True, default="")
+    # UTM 4필드 상한 200 — analytics.LandingVisit/SignupAttribution 과 **동일해야 한다**.
+    # 방문 쪽이 더 길면 그 값으로 들어온 유입에 대응하는 링크를 어드민에서 저장할 수 없어
+    # (400) 영구히 '저장 안 된 링크(UTM)' 행으로 샌다. 한글 캠페인명 실사용 대비 상향.
+    utm_source = models.CharField(max_length=200, blank=True, default="")
+    utm_medium = models.CharField(max_length=200, blank=True, default="")
+    utm_campaign = models.CharField(max_length=200, blank=True, default="")
+    utm_content = models.CharField(max_length=200, blank=True, default="")
     url = models.URLField(
-        max_length=1000,
+        max_length=2000,
         verbose_name="완성 URL",
-        help_text="base_url + utm 파라미터 조합 (서버 계산, 기존 동일 utm 키는 교체)",
+        help_text=(
+            "base_url + utm 파라미터 조합 (서버 계산, 기존 동일 utm 키는 교체). "
+            "한글 UTM 은 퍼센트 인코딩으로 글자당 9자로 부풀기 때문에(1글자=3바이트×'%XX') "
+            "2000자 상한을 넘을 수 있다 → 시리얼라이저가 400 으로 먼저 막는다"
+        ),
     )
     channel = models.CharField(
         max_length=32,

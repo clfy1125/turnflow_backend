@@ -14,6 +14,7 @@ import uuid
 
 from .channels import CH_UNKNOWN, derive_channel
 from .models import SignupAttribution
+from .utm import UTM_MAX_LENGTH, normalize_utm
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,13 @@ def capture_signup_attribution(user, payload, signup_kind: str) -> None:
             value = data.get(key)
             return value.strip()[:max_len] if isinstance(value, str) else ""
 
+        def _utm(key: str) -> str:
+            """UTM 은 방문 기록(LandingVisit)과 **같은 표준형**으로 저장해야 한다 —
+            대시보드가 4-튜플 완전일치로 저장 링크를 찾기 때문. 절단은 정규화 **뒤에**
+            해야 NFD 한글이 부풀어 엉뚱한 위치에서 잘리지 않는다."""
+            value = data.get(key)
+            return normalize_utm(value)[:UTM_MAX_LENGTH] if isinstance(value, str) else ""
+
         visitor_id = None
         if data.get("visitor_id"):
             try:
@@ -42,10 +50,10 @@ def capture_signup_attribution(user, payload, signup_kind: str) -> None:
             except (ValueError, TypeError, AttributeError):
                 visitor_id = None  # 깨진 visitor_id 는 버리고 나머지는 저장
 
-        utm_source = _s("utm_source", 100)
-        utm_medium = _s("utm_medium", 100)
-        utm_campaign = _s("utm_campaign", 150)
-        utm_content = _s("utm_content", 150)
+        utm_source = _utm("utm_source")
+        utm_medium = _utm("utm_medium")
+        utm_campaign = _utm("utm_campaign")
+        utm_content = _utm("utm_content")
         referrer = _s("referrer", 500)
         landing_path = _s("landing_path", 300)
 

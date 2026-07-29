@@ -24,10 +24,15 @@ from apps.admin_api.roles import (
     resolve_admin_role,
 )
 from apps.analytics.channels import derive_channel
+from apps.analytics.utm import UTM_FIELDS, normalize_utm_payload
 
-_UTM_FIELDS = ("utm_source", "utm_medium", "utm_campaign", "utm_content")
+_UTM_FIELDS = UTM_FIELDS  # 방문 기록과 같은 필드 집합 (단일 소스: analytics.channels)
 # request 없이 직렬화될 때(스키마 생성 등)의 안전 기본값 — 제한을 걸지 않는다
 ROLE_FULL_FALLBACK = ROLE_FULL
+
+# 완성 URL 상한 = MarketingChannelLink.url.max_length. 초과 시 DB DataError(500) 대신
+# 400 으로 막는다 — 한글 UTM 은 퍼센트 인코딩으로 글자당 9자가 되어 넘길 수 있다.
+URL_MAX_LENGTH = 2000
 
 
 def build_channel_url(base_url: str, utm: dict) -> str:
@@ -116,16 +121,25 @@ class AdminChannelLinkSerializer(serializers.ModelSerializer):
 
 
 class AdminChannelLinkWriteSerializer(serializers.ModelSerializer):
-    """생성 입력 — name/base_url 필수, utm_* 선택. url/channel 은 서버 계산."""
+    """생성 입력 — name/base_url 필수, utm_* 선택. url/channel 은 서버 계산.
+
+    **한글 UTM 대응(2026-07-30)**: UTM 4필드는 ``to_internal_value`` 에서 ``max_length``
+    검증보다 먼저 NFC 표준형으로 정규화된다 — 방문 기록(LandingVisit)과 같은 표준형이어야
+    대시보드의 4-튜플 매칭이 성립하고, macOS 복붙 NFD 한글이 3배로 부풀어 길이 초과 400 이
+    나는 것도 막는다. 정규화 단일 소스는 :func:`apps.analytics.channels.normalize_utm`.
+    """
 
     class Meta:
         model = MarketingChannelLink
         fields = ["name", "base_url", "utm_source", "utm_medium", "utm_campaign", "utm_content"]
         extra_kwargs = {
-            # MKT-13: 프론트가 `캠페인 이름 · 콘텐츠 이름` 으로 자동 조합해 최대 203자
-            "name": {"help_text": "링크 이름 (최대 255자)"},
+            # MKT-13: 프론트가 `캠페인 이름 · 콘텐츠 이름` 으로 자동 조합해 최대 403자
+            "name": {"help_text": "링크 이름 (최대 512자)"},
             "base_url": {"help_text": "utm 을 붙일 기본 URL (http/https)"},
         }
+
+    def to_internal_value(self, data):
+        return super().to_internal_value(normalize_utm_payload(data))
 
     def validate_base_url(self, value: str) -> str:
         parts = urlsplit(value)
@@ -134,9 +148,9 @@ class AdminChannelLinkWriteSerializer(serializers.ModelSerializer):
         return value
 
     def validate(self, attrs: dict) -> dict:
-        # utm 값 정규화(공백 제거) — 채널 파생/URL 조합 모두 동일 값 사용
+        # utm 값은 to_internal_value 에서 이미 NFC·공백 표준화됨. 미전송 필드만 "" 로 채운다.
         for field in _UTM_FIELDS:
-            attrs[field] = (attrs.get(field) or "").strip()
+            attrs[field] = attrs.get(field) or ""
         # MKT-2: 같은 utm 4-튜플 링크가 둘이면 대시보드가 그 트래픽을 **어느 행에 붙일지
         # 모호해진다**(현재 규칙은 '집계에 포함된 링크 우선 → 먼저 만든 링크'). 애초에
         # 만들지 못하게 막는다. 매칭은 대소문자·공백 무시라 여기 중복 판정도 iexact.
@@ -159,11 +173,30 @@ class AdminChannelLinkWriteSerializer(serializers.ModelSerializer):
                     )
                 }
             )
+
+        # 완성 URL 길이 검증 — 여기서 막지 않으면 create() 가 그대로 INSERT 해
+        # DB DataError(500) 가 난다(url 은 write 필드가 아니라 시리얼라이저 검증을 안 탄다).
+        # 한글 UTM 은 퍼센트 인코딩으로 1글자 → 9자가 되므로 현실적으로 도달 가능하다.
+        url = build_channel_url(attrs["base_url"], {f: attrs.get(f, "") for f in _UTM_FIELDS})
+        if len(url) > URL_MAX_LENGTH:
+            raise serializers.ValidationError(
+                {
+                    "utm_campaign": (
+                        f"완성 URL 이 {len(url)}자로 상한({URL_MAX_LENGTH}자)을 넘습니다. "
+                        "한글은 URL 인코딩 시 한 글자가 9자로 늘어나므로 캠페인/콘텐츠 이름을 "
+                        "줄이거나 영문 약어를 쓰세요."
+                    )
+                }
+            )
+        attrs["url"] = url
         return attrs
 
     def create(self, validated_data: dict) -> MarketingChannelLink:
         utm = {f: validated_data.get(f, "") for f in _UTM_FIELDS}
-        validated_data["url"] = build_channel_url(validated_data["base_url"], utm)
+        # url 은 validate() 에서 이미 계산·검증됨 (없을 때만 재계산 — 방어)
+        validated_data["url"] = validated_data.get("url") or build_channel_url(
+            validated_data["base_url"], utm
+        )
         # 링크 자체엔 리퍼러 개념이 없으므로 referrer="" — utm 만으로 파생
         validated_data["channel"] = derive_channel(utm["utm_source"], utm["utm_medium"], "")
         request = self.context.get("request")
@@ -187,7 +220,7 @@ class AdminChannelLinkUpdateSerializer(serializers.ModelSerializer):
         model = MarketingChannelLink
         fields = ["name", "excluded_from_stats"]
         extra_kwargs = {
-            "name": {"required": False, "help_text": "변경할 링크 이름 (최대 255자)"},
+            "name": {"required": False, "help_text": "변경할 링크 이름 (최대 512자)"},
             "excluded_from_stats": {
                 "required": False,
                 "help_text": "true 면 채널별 성과·추이·퍼널에서 행을 빼고 인원은 '기타'로 "

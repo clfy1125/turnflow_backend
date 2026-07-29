@@ -424,7 +424,7 @@ curl -X PATCH -H "Authorization: Bearer <staff_token>" -H "Content-Type: applica
             action=AdminActionLog.Action.ADMIN_ACCESS_DENIED,
             target_type="channel_link",
             target_id=link.pk,
-            target_repr=f"{verb} {link.name}"[:255],
+            target_repr=f"{verb} {link.name}",  # 절단은 log_admin_action 이 담당
             changes={"admin_role": role, "reason": NOT_LINK_OWNER_CODE},
         )
         logger.warning(
@@ -461,7 +461,7 @@ curl -X PATCH -H "Authorization: Bearer <staff_token>" -H "Content-Type: applica
             action=AdminActionLog.Action.ADMIN_ACCESS_DENIED,
             target_type="channel_link",
             target_id=link.pk,
-            target_repr=f"EXCLUDE {link.name}"[:255],
+            target_repr=f"EXCLUDE {link.name}",  # 절단은 log_admin_action 이 담당
             changes={"admin_role": role, "reason": EXCLUDE_FORBIDDEN_CODE},
         )
         logger.warning(

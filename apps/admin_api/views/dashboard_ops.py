@@ -35,6 +35,13 @@ from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.admin_api.dashboard_cache import (
+    CACHE_BYPASS,
+    CACHE_HEADER,
+    CACHE_HIT,
+    CACHE_MISS,
+    wants_cache_bypass,
+)
 from apps.admin_api.dashboard_constants import (
     DM_DELIVERY_CRITICAL_THRESHOLD,
     DM_DELIVERY_WARNING_THRESHOLD,
@@ -1126,6 +1133,16 @@ curl -H "Authorization: Bearer <staff_token>" \\
                 description="커스텀 범위 종료일 (YYYY-MM-DD, 포함). span 최대 92일. "
                 "end < start / 파싱불가 / 단독 사용 시 400.",
             ),
+            OpenApiParameter(
+                name="refresh",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="`1`/`true` 면 캐시를 건너뛰고 즉시 재계산합니다(응답 헤더 "
+                "`X-Cache: HIT | MISS | BYPASS`). **`full` 역할만 유효** — 그 외 역할이 "
+                "보내면 조용히 무시되고 캐시된 응답이 옵니다. 기본 TTL 은 30초"
+                "(`window=all` 은 900초).",
+            ),
         ],
         responses={
             200: AdminOpsDashboardSerializer,
@@ -1377,9 +1394,14 @@ curl -H "Authorization: Bearer <staff_token>" \\
             # OPS-4: all 은 계산량이 가장 크고 분 단위로 값이 안 변함 → 900초
             cache_ttl = OPS_DASHBOARD_ALL_CACHE_TTL if window == "all" else OPS_DASHBOARD_CACHE_TTL
 
-        cached = cache.get(cache_key)
-        if cached is not None:
-            return Response(cached)
+        # ?refresh=1 (full 역할만) — 캐시를 건너뛰고 재계산. 마케팅 대시보드와 동일 규약
+        # (apps/admin_api/dashboard_cache.py). 운영 지표는 TTL 이 짧지만(30초) window=all
+        # 은 900초라 여기서도 즉시 확인 경로가 필요하다.
+        bypass = wants_cache_bypass(request)
+        if not bypass:
+            cached = cache.get(cache_key)
+            if cached is not None:
+                return Response(cached, headers={CACHE_HEADER: CACHE_HIT})
 
         dm_block, dm_agg = _dm_quality(until, since, granularity)
         ig_block = _ig_connections(now)
@@ -1409,10 +1431,11 @@ curl -H "Authorization: Bearer <staff_token>" \\
         cache.set(cache_key, data, cache_ttl)
 
         logger.info(
-            "[admin-dash-ops] req=%s window=%s overall=%s dm_rate=%s",
+            "[admin-dash-ops] req=%s window=%s overall=%s dm_rate=%s cache=%s",
             request_id,
             window,
             payload["status_summary"]["overall"],
             dm_block["delivery_rate"],
+            CACHE_BYPASS if bypass else CACHE_MISS,
         )
-        return Response(data)
+        return Response(data, headers={CACHE_HEADER: CACHE_BYPASS if bypass else CACHE_MISS})

@@ -39,7 +39,11 @@
   별도 캐시 키(``admin:dash:mkt:snapshot``)라 모든 period 응답이 같은 값을 공유한다.
 - 무료체험 집계(R-4)는 **카드 등록 완료**(billing_key_issued_at) 체험만 —
   어드민이 수동 부여한 무카드 계정을 전환 실적에서 제외한다 (퍼널/채널 공통).
-- 모든 카운트는 전사(GLOBAL). 응답은 Redis 5분 캐시 (키 ``admin:dash:mkt:{period}``).
+- 모든 카운트는 전사(GLOBAL). 응답은 Redis 캐시 (키 ``admin:dash:mkt:{period}``, 60초 —
+  ``period=all``/``snapshot`` 은 900초). **방문/가입 적재에는 캐시 무효화 훅이 없다**
+  (공개 비콘·가입 경로가 어드민 캐시를 알아선 안 된다) → 신규 유입은 구조적으로 TTL 만큼
+  늦게 보인다. 즉시 확인이 필요하면 ``?refresh=1``(full 역할 전용, dashboard_cache
+  ``wants_cache_bypass``) — 화면의 '새로고침' 버튼이 실어 보낸다.
 """
 
 from __future__ import annotations
@@ -61,9 +65,14 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.admin_api.dashboard_cache import (
+    CACHE_BYPASS,
+    CACHE_HEADER,
+    CACHE_HIT,
+    CACHE_MISS,
     MKT_CACHE_KEY_CUSTOM_TMPL,
     MKT_CACHE_KEY_SNAPSHOT,
     MKT_CACHE_KEY_TMPL,
+    wants_cache_bypass,
 )
 from apps.admin_api.dashboard_constants import (
     CANCEL_REASONS_TOP,
@@ -132,6 +141,16 @@ except (ImportError, RuntimeError):
     LandingVisit = None
     SignupAttribution = None
     ATTRIBUTION_AVAILABLE = False
+
+# UTM 표준화(NFC·공백) — 모델 의존이 없는 순수 모듈이라 위 guard 와 별개로 임포트한다.
+# 앱 자체가 없을 때만 폴백(그 경우 매칭할 방문 데이터도 없다).
+try:
+    from apps.analytics.utm import normalize_utm
+except ImportError:  # pragma: no cover — analytics 앱 미배치
+
+    def normalize_utm(value):
+        return (value or "").strip()
+
 
 # ── 결제 진입 텔레메트리 (apps.analytics.CheckoutEvent) — 별도 guarded import ──
 # 마이그레이션 전(프론트 이벤트 미전송)이어도 대시보드는 entry_paths_available=false 로
@@ -298,8 +317,14 @@ VISIT_ROWS_WARN = 300_000
 
 
 def _norm(value: str) -> str:
-    """UTM 값 정규화 — 앞뒤 공백 제거 + 소문자. None/빈 문자열은 ""."""
-    return (value or "").strip().lower()
+    """UTM 값 매칭 정규화 — NFC + 공백류 축약(normalize_utm) + 소문자. None/빈 문자열은 "".
+
+    ⚠️ 반드시 ``analytics.channels.normalize_utm`` 을 통과시킬 것 — 한글 UTM 은 저장 경로에
+    따라 NFC/NFD 가 섞일 수 있고(macOS·iOS 복붙), 그러면 **화면상 완전히 같은 두 값**이
+    다른 문자열로 취급돼 저장 링크 매칭이 조용히 실패한다. 여기서 정규화하면 정규화 이전에
+    적재된 과거 행도 함께 구제된다(읽기 시점 정규화).
+    """
+    return normalize_utm(value).lower()
 
 
 def _utm_key(source: str, medium: str, campaign: str, content: str) -> tuple:
@@ -3464,18 +3489,23 @@ def _snapshot(now) -> dict:
     }
 
 
-def _snapshot_cached(now) -> dict:
-    """R-6 ②: 기간과 무관하므로 별도 캐시 키 — 모든 period 응답이 계산 1회를 공유."""
-    cached = cache.get(CACHE_KEY_SNAPSHOT)
-    if cached is not None:
-        return cached
+def _snapshot_cached(now, *, bypass: bool = False) -> dict:
+    """R-6 ②: 기간과 무관하므로 별도 캐시 키 — 모든 period 응답이 계산 1회를 공유.
+
+    ``bypass=True``(?refresh=1)면 이 키까지 재계산한다 — 안 그러면 새로고침 후에도
+    상단 고정 패널만 최대 15분 스테일로 남아 "일부 숫자만 안 바뀐다"가 된다.
+    """
+    if not bypass:
+        cached = cache.get(CACHE_KEY_SNAPSHOT)
+        if cached is not None:
+            return cached
     data = _snapshot(now)
     cache.set(CACHE_KEY_SNAPSHOT, data, MARKETING_DASHBOARD_SNAPSHOT_CACHE_TTL)
     return data
 
 
 class AdminMarketingDashboardView(APIView):
-    """어드민 마케팅 대시보드 집계 (단일 GET, Redis 5분 캐시)."""
+    """어드민 마케팅 대시보드 집계 (단일 GET, Redis 60초 캐시 · ?refresh=1 로 우회)."""
 
     permission_classes = [IsAdminUser]
     serializer_class = AdminMarketingDashboardSerializer
@@ -3677,9 +3707,14 @@ KPI(기간 비교), 가입 코호트 퍼널, 채널별 성과, 업셀 후보, �
   트리거, `CheckoutEvent` 귀속 — 미수집 시 `entry_paths_available=false`) (3)
   `post_payment_usage` 결제 후 7일 내 실제 사용 기능별 유저 수. **'무엇 때문에 결제했나'를
   단정하지 않고** 진입 경로/사용을 분리 제시.
-- 응답은 Redis 에 **300초(5분) 캐시** (프리셋 키 `admin:dash:mkt:{period}`,
+- 응답은 Redis 에 **60초 캐시** (프리셋 키 `admin:dash:mkt:{period}`,
   커스텀 키 `admin:dash:mkt:custom:{start}:{end}`). 단 `period=all` 은 **900초(15분)**,
   `snapshot` 은 별도 키 `admin:dash:mkt:snapshot` 에 **900초** (모든 period 공유).
+- **신선도**: 채널 링크 저장/수정/삭제는 캐시를 즉시 무효화하지만, **방문·가입 적재는
+  하지 않습니다** → 방금 들어온 유입은 최대 TTL 만큼 늦게 보입니다. `?refresh=1`
+  (full 역할 전용)로 캐시를 우회해 즉시 재계산할 수 있고, 실제 적용 여부는 응답 헤더
+  `X-Cache`(HIT/MISS/BYPASS)로 확인합니다. 화면에는 바디의 `generated_at`(집계 시각)을
+  "N분 전 기준"으로 표시하는 것을 권장합니다 — 캐시 히트 시 이 값이 과거 시각입니다.
 
 ## 주의사항
 - 결제/토큰 비밀값은 직렬화하지 않습니다. 읽기 전용 — 감사 로그 없음.
@@ -3722,6 +3757,20 @@ curl -H "Authorization: Bearer <staff_token>" \\
                 required=False,
                 description="커스텀 범위 종료일 (YYYY-MM-DD, 포함). span 최대 366일. "
                 "end < start / 파싱불가 / 단독 사용 시 400.",
+            ),
+            OpenApiParameter(
+                name="refresh",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="`1`/`true` 면 **캐시를 건너뛰고 즉시 재계산**한 뒤 다시 캐시에 "
+                "적재합니다(고정 패널 snapshot 키까지 함께 갱신). 화면의 '새로고침' 버튼에 "
+                "실어 보내세요 — 신규 방문/가입은 적재 시 캐시 무효화가 없어 기본적으로 "
+                "TTL(60초, period=all 은 900초)만큼 늦게 보입니다. "
+                "**`full` 역할만 유효** — `marketing_viewer` 가 보내면 403 이 아니라 "
+                "조용히 무시되고 캐시된 응답이 옵니다(비싼 재계산 반복 방지). "
+                "응답 헤더 `X-Cache: HIT | MISS | BYPASS` 로 실제 적용 여부를 확인하세요. "
+                "신선도 표시는 응답 바디의 `generated_at`(집계 수행 시각)을 쓰면 됩니다.",
             ),
         ],
         responses={
@@ -4448,9 +4497,14 @@ curl -H "Authorization: Bearer <staff_token>" \\
         # RBAC-3: 캐시에는 **원본**을 저장하고, 꺼낸 뒤 요청자 역할로 마스킹한다
         # (마스킹본을 캐시에 넣으면 full 역할이 마스킹된 값을 받는다).
         role = resolve_admin_role(request)
-        cached = cache.get(cache_key)
-        if cached is not None:
-            return Response(apply_pii_policy(cached, role=role))
+        # ?refresh=1 (full 역할만) — 캐시를 건너뛰고 재계산 후 다시 적재한다.
+        bypass = wants_cache_bypass(request)
+        if not bypass:
+            cached = cache.get(cache_key)
+            if cached is not None:
+                return Response(
+                    apply_pii_policy(cached, role=role), headers={CACHE_HEADER: CACHE_HIT}
+                )
 
         mrr_breakdown = _mrr_breakdown()
         cohort = _cohort_agg(*cur)
@@ -4487,7 +4541,7 @@ curl -H "Authorization: Bearer <staff_token>" \\
             },
             "generated_at": timezone.localtime(now).isoformat(),
             "attribution_available": ATTRIBUTION_AVAILABLE,
-            "snapshot": _snapshot_cached(now),
+            "snapshot": _snapshot_cached(now, bypass=bypass),
             "kpis": _kpis(cur, prev, mrr_breakdown["total"]),
             "funnel": _funnel(
                 cohort,
@@ -4516,12 +4570,16 @@ curl -H "Authorization: Bearer <staff_token>" \\
         cache.set(cache_key, data, cache_ttl)
 
         logger.info(
-            "[admin-dash-mkt] req=%s period=%s role=%s signups=%s mrr=%s attribution=%s",
+            "[admin-dash-mkt] req=%s period=%s role=%s signups=%s mrr=%s attribution=%s cache=%s",
             request_id,
             period,
             role,
             cohort["signups"],
             mrr_breakdown["total"],
             ATTRIBUTION_AVAILABLE,
+            CACHE_BYPASS if bypass else CACHE_MISS,
         )
-        return Response(apply_pii_policy(data, role=role))
+        return Response(
+            apply_pii_policy(data, role=role),
+            headers={CACHE_HEADER: CACHE_BYPASS if bypass else CACHE_MISS},
+        )

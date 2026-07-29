@@ -19,6 +19,15 @@ from django.conf import settings
 
 from .models import UAClass
 
+# UTM 표준화는 모델 의존이 없는 .utm 모듈이 단일 소스 — 여기서 재수출해 기존 임포트
+# 경로(apps.analytics.channels)를 유지한다. **한국어 UTM 함정 설명은 utm.py docstring.**
+from .utm import (  # noqa: F401 — 재수출
+    UTM_FIELDS,
+    UTM_MAX_LENGTH,
+    normalize_utm,
+    normalize_utm_payload,
+)
+
 # ── 채널 키 (프론트/대시보드 계약 — 함부로 이름 바꾸지 말 것) ──────────────
 CH_META_ADS = "meta_ads"
 CH_GOOGLE_ADS = "google_ads"
@@ -62,14 +71,52 @@ UTM_SOURCE_MAP = {
     "x": CH_X_ADS,
     "twitter": CH_X_ADS,
     "linkedin": CH_LINKEDIN_ADS,
+    # 한국어 utm_source 별칭 (2026-07-30). 마케팅팀이 한글 UTM 을 쓰면 여기 없는 값은
+    # other_campaign('기타 캠페인')으로 떨어져 채널 라벨이 뭉개진다 → 1:1 로 명확한 것만 별칭.
+    # ⚠️ 여전히 **권장은 영문 소문자 고정 어휘** — source/medium 은 채널 파생의 입력이라
+    # 표기 변형이 늘수록 새는 경로도 늘어난다. 한글은 campaign/content 에만 쓰는 게 안전하다.
+    # ⚠️ 매핑 추가는 소급되지 않는다 (채널은 방문/가입 저장 시점에 확정).
+    "메타": CH_META_ADS,
+    "페이스북": CH_META_ADS,
+    "페북": CH_META_ADS,
+    "인스타그램": CH_META_ADS,
+    "인스타": CH_META_ADS,
+    "구글": CH_GOOGLE_ADS,
+    "유튜브광고": CH_GOOGLE_ADS,
+    "네이버": CH_NAVER_ADS,
+    "카카오": CH_KAKAO_ADS,
+    "카카오톡": CH_KAKAO_ADS,
+    "틱톡": CH_TIKTOK_ADS,
+    "링크드인": CH_LINKEDIN_ADS,
 }
 
 # utm_medium 이 이 집합이면 utm_source 매핑보다 우선해 influencer 로 분류
 # (인플루언서 IG 포스팅은 utm_source=instagram&utm_medium=influencer — meta_ads 로 새면 안 됨)
-INFLUENCER_MEDIUMS = {"influencer", "creator", "ambassador", "kol"}
+INFLUENCER_MEDIUMS = {
+    "influencer",
+    "creator",
+    "ambassador",
+    "kol",
+    # 한국어 별칭 (UTM_SOURCE_MAP 과 같은 주의사항 적용)
+    "인플루언서",
+    "크리에이터",
+    "협찬",
+}
 
 # utm_source 가 매핑에 없어도 medium 이 유료성이면 paid_other
-PAID_MEDIUMS = {"cpc", "ppc", "paid", "paid_social", "display", "banner"}
+PAID_MEDIUMS = {
+    "cpc",
+    "ppc",
+    "paid",
+    "paid_social",
+    "display",
+    "banner",
+    # 한국어 별칭
+    "유료",
+    "광고",
+    "배너",
+    "디스플레이",
+}
 
 # 리퍼러 도메인 suffix → 채널 (utm 이 전혀 없을 때만 사용).
 # ⚠️ 순서 의미 있음 — suffix 루프에서 blog.naver.com 이 naver.com 보다 먼저 매칭돼야 한다.
@@ -138,8 +185,10 @@ def derive_channel(utm_source: str, utm_medium: str, referrer: str) -> str:
          미매칭 외부 도메인 → other_referral
       6. 아무 신호 없음 → direct
     """
-    source = (utm_source or "").strip().lower()
-    medium = (utm_medium or "").strip().lower()
+    # 한글 별칭 매칭은 NFC 표준형에서만 성립한다(NFD 로 온 "메타"는 다른 문자열) →
+    # normalize_utm 을 반드시 통과시킨다. lower() 는 영문 별칭용.
+    source = normalize_utm(utm_source).lower()
+    medium = normalize_utm(utm_medium).lower()
 
     if medium in INFLUENCER_MEDIUMS:
         return CH_INFLUENCER

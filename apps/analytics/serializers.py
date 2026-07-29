@@ -9,25 +9,43 @@ max_length 초과(봇이 보내는 10KB utm 등)도 페이로드 전체를 inval
 from rest_framework import serializers
 
 from .models import CancellationEventType, CheckoutEventType
+from .utm import UTM_MAX_LENGTH, normalize_utm_payload
 
 
 class TrackVisitSerializer(serializers.Serializer):
-    """POST /api/v1/track/visit/ 요청 바디."""
+    """POST /api/v1/track/visit/ 요청 바디.
+
+    UTM 4필드는 ``to_internal_value`` 에서 **max_length 검증보다 먼저** NFC 표준형으로
+    정규화된다 (analytics.channels.normalize_utm) — NFD 로 온 한글이 3배로 부풀어
+    길이 초과 → silent-204(기록 없음)로 조용히 사라지는 것을 막는다.
+    """
 
     visitor_id = serializers.UUIDField(
         help_text="클라이언트 생성 UUID (localStorage tf_vid). 필수.",
     )
     utm_source = serializers.CharField(
-        required=False, allow_blank=True, max_length=100, help_text="utm_source 쿼리 파라미터"
+        required=False,
+        allow_blank=True,
+        max_length=UTM_MAX_LENGTH,
+        help_text="utm_source 쿼리 파라미터",
     )
     utm_medium = serializers.CharField(
-        required=False, allow_blank=True, max_length=100, help_text="utm_medium 쿼리 파라미터"
+        required=False,
+        allow_blank=True,
+        max_length=UTM_MAX_LENGTH,
+        help_text="utm_medium 쿼리 파라미터",
     )
     utm_campaign = serializers.CharField(
-        required=False, allow_blank=True, max_length=150, help_text="utm_campaign 쿼리 파라미터"
+        required=False,
+        allow_blank=True,
+        max_length=UTM_MAX_LENGTH,
+        help_text="utm_campaign 쿼리 파라미터 (한글 가능 — NFC 정규화 후 200자)",
     )
     utm_content = serializers.CharField(
-        required=False, allow_blank=True, max_length=150, help_text="utm_content 쿼리 파라미터"
+        required=False,
+        allow_blank=True,
+        max_length=UTM_MAX_LENGTH,
+        help_text="utm_content 쿼리 파라미터 (한글 가능 — NFC 정규화 후 200자)",
     )
     referrer = serializers.CharField(
         required=False,
@@ -41,6 +59,9 @@ class TrackVisitSerializer(serializers.Serializer):
         max_length=300,
         help_text="랜딩 경로 (location.pathname). 비우면 '/' 저장",
     )
+
+    def to_internal_value(self, data):
+        return super().to_internal_value(normalize_utm_payload(data))
 
 
 class CheckoutEventSerializer(serializers.Serializer):

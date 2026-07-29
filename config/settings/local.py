@@ -35,6 +35,9 @@ CORS_ALLOW_HEADERS = [
     "x-requested-with",
     "ngrok-skip-browser-warning",  # ngrok 경고 스킵용 헤더
 ]
+# 브라우저 JS 에 노출할 응답 헤더 (prod.py 와 동일하게 유지) —
+# X-Cache = 어드민 대시보드 캐시 히트 여부(HIT/MISS/BYPASS, ?refresh=1 적용 확인용)
+CORS_EXPOSE_HEADERS = ["X-Cache", "X-Request-ID"]
 
 # REST Framework - Add BrowsableAPIRenderer for development
 REST_FRAMEWORK["DEFAULT_RENDERER_CLASSES"] = [

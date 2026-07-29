@@ -76,6 +76,10 @@ CORS_ALLOW_HEADERS = [
     "x-requested-with",
     "ngrok-skip-browser-warning",
 ]
+# 브라우저 JS 가 읽을 수 있게 노출하는 응답 헤더 (기본은 CORS 표준 6개만 읽힌다).
+# X-Cache: 어드민 대시보드 응답이 캐시 히트인지(HIT/MISS/BYPASS) — ?refresh=1 적용 확인용.
+# X-Request-ID: 프론트가 오류 리포트에 요청 ID 를 붙일 수 있게 한다.
+CORS_EXPOSE_HEADERS = ["X-Cache", "X-Request-ID"]
 
 # Email backend for production (configure with actual email service)
 EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"

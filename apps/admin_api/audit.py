@@ -11,6 +11,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# AdminActionLog.target_repr 컬럼 상한 — 호출부가 아니라 여기서 절단한다(단일 소스).
+TARGET_REPR_MAX = 255
+
 
 def _client_ip(request):
     """X-Forwarded-For 우선, 없으면 REMOTE_ADDR."""
@@ -37,6 +40,7 @@ def log_admin_action(
         target_type: 대상 종류 (예: ``"user"`` / ``"workspace"`` / ``"page"``).
         target_id: 대상 PK (int/uuid/slug 모두 str 로 저장).
         target_repr: 사람이 읽을 대상 라벨 (email/name/slug 등).
+            **호출부에서 자를 필요 없다** — 여기서 컬럼 상한(255)으로 절단한다.
         changes: ``{"field": {"before": x, "after": y}}`` 형태 dict (선택).
     """
     from .models import AdminActionLog
@@ -50,7 +54,9 @@ def log_admin_action(
             action=action,
             target_type=target_type or "",
             target_id=str(target_id) if target_id != "" else "",
-            target_repr=target_repr or "",
+            # 라벨은 컬럼 상한에서 절단 — 감사 로그 실패로 본 요청이 500 이 되면 안 된다.
+            # (예: 채널 링크 이름은 512자까지 허용되지만 여기 컬럼은 255)
+            target_repr=(target_repr or "")[:TARGET_REPR_MAX],
             changes=changes or {},
             request_id=request_id,
             ip=_client_ip(request),

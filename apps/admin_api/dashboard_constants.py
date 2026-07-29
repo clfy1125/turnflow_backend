@@ -117,8 +117,16 @@ OPS_DASHBOARD_CACHE_TTL = 30  # 초 — 어드민 30~60s 폴링 대비
 # window=all(전체 기간)은 계산량이 가장 크고 분 단위로 값이 변하지 않음 → 더 긴 TTL (OPS-4).
 # 마케팅 period=all 과 같은 900초.
 OPS_DASHBOARD_ALL_CACHE_TTL = 900  # 초
-MARKETING_DASHBOARD_CACHE_TTL = 300  # 초
+# 2026-07-30: 300 → 60. 방문/가입 적재에는 캐시 무효화 훅이 없어(넣을 수도 없다 —
+# 공개 비콘·가입 경로가 어드민 캐시를 알면 안 된다) **신규 유입은 구조적으로 TTL 만큼
+# 늦게 보인다**. 5분은 "링크 만들고 바로 눌러봤는데 안 잡힌다"는 오진으로 이어졌다
+# (실측: 링크 저장 직후 조회로 '방문 0' 응답이 캐시에 박혀 5분 유지). 관리자 동시 사용자가
+# 소수라 재계산 비용보다 신선도가 중요하다. 데이터가 커지면(VISIT_ROWS_WARN) 재검토.
+MARKETING_DASHBOARD_CACHE_TTL = 60  # 초
 # period=all(전체 기간)은 계산량이 가장 크고 분 단위로 값이 변하지 않음 → 더 긴 TTL (R-6).
+# 즉시 확인이 필요하면 ?refresh=1 (full 역할) 로 캐시를 우회한다.
 MARKETING_DASHBOARD_ALL_CACHE_TTL = 900  # 초
 # snapshot(고정 패널)은 기간과 무관 → 별도 키로 분리해 모든 period 응답이 공유 (R-6).
+# ⚠️ refresh=1 은 이 키까지 함께 우회해야 한다 — 안 그러면 상단 고정 패널만 15분 스테일로
+# 남아 "새로고침했는데 일부 숫자만 안 바뀐다"가 된다.
 MARKETING_DASHBOARD_SNAPSHOT_CACHE_TTL = 900  # 초
