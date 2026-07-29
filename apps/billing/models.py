@@ -852,6 +852,15 @@ class ReferralCode(models.Model):
         verbose_name="트라이얼 기간(일)",
     )
     is_active = models.BooleanField(default=True, verbose_name="활성")
+    excluded_from_stats = models.BooleanField(
+        default=False,
+        verbose_name="집계 제외",
+        help_text=(
+            "어드민 마케팅 대시보드 집계에서만 제외한다(MKT-14). "
+            "⚠️ **고객 동작에는 영향이 없다** — is_redeemable() 이 이 값을 보지 않으므로 "
+            "제외된 코드도 평소처럼 입력·트라이얼 시작이 된다. 통계 전용 플래그다."
+        ),
+    )
     max_uses = models.PositiveIntegerField(
         null=True,
         blank=True,
@@ -890,7 +899,12 @@ class ReferralCode(models.Model):
         super().save(*args, **kwargs)
 
     def is_redeemable(self) -> tuple[bool, str]:
-        """현재 시점에서 사용 가능한지 + 사유 메시지."""
+        """현재 시점에서 사용 가능한지 + 사유 메시지.
+
+        ⚠️ ``excluded_from_stats`` 는 **여기서 절대 보지 않는다**(MKT-14). 그 필드는 어드민
+        대시보드 집계에서만 빼는 통계 전용 플래그이고, 고객의 코드 사용을 막는 스위치는
+        ``is_active`` 다. 둘을 섞으면 "표에서 정리했더니 고객이 코드를 못 쓴다"가 된다.
+        """
         if not self.is_active:
             return False, "비활성화된 코드입니다."
         now = timezone.now()

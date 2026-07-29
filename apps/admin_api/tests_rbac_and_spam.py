@@ -424,6 +424,88 @@ class TestChannelLinkViewerScope:
         link.refresh_from_db()
         assert link.name == "새 이름"
 
+    def test_can_exclude_is_false_for_viewer_even_on_own_link(self, viewer):
+        """MKT-12 — 집계 제외는 **소유자여도 불가**(삭제와 판정이 다르다).
+
+        외주가 자기 링크를 집계에서 빼면 운영자가 그 성과를 볼 수 없게 된다 —
+        '자기가 만든 것을 치우는' 삭제와 성격이 다르다.
+        """
+        _mk_link(viewer, "외주 링크")
+        row = next(
+            r for r in _login(viewer).get(LINKS_URL).json()["results"] if r["name"] == "외주 링크"
+        )
+        assert row["can_delete"] is True  # 삭제는 소유자라 가능
+        assert row["can_exclude"] is False  # 집계 제외는 불가
+
+    def test_exclude_guard_holds_even_if_path_is_opened(self, viewer):
+        """경로를 열어도 집계 제외는 막힌다 — can_exclude 와 같은 판정."""
+        import re
+        from unittest.mock import patch as mock_patch
+
+        from apps.admin_api import roles as roles_mod
+
+        mine = _mk_link(viewer, "외주 링크")
+        opened = dict(roles_mod.ROLE_ALLOWED_PATTERNS)
+        opened[ROLE_MARKETING_VIEWER] = [
+            *opened[ROLE_MARKETING_VIEWER],
+            ("PATCH", re.compile(rf"^{re.escape(roles_mod.CHANNEL_LINKS_PATH)}\d+/$")),
+        ]
+        with mock_patch.object(roles_mod, "ROLE_ALLOWED_PATTERNS", opened):
+            client = _login(viewer)
+            blocked = client.patch(
+                f"{LINKS_URL}{mine.pk}/",
+                {"excluded_from_stats": True},
+                content_type="application/json",
+            )
+            # 같은 링크의 이름 수정은 소유자라 통과 — 게이트가 필드 단위로 갈린다
+            renamed = client.patch(
+                f"{LINKS_URL}{mine.pk}/", {"name": "이름만"}, content_type="application/json"
+            )
+        assert blocked.status_code == 403
+        assert blocked.json()["error"]["details"]["code"] == "exclude_not_allowed"
+        mine.refresh_from_db()
+        assert mine.excluded_from_stats is False
+        assert renamed.status_code == 200
+        assert mine.name == "이름만"
+
+    def test_code_row_can_exclude_is_false_for_viewer(self, viewer, full_admin):
+        """MKT-15 — 대시보드 코드 행의 can_exclude 는 **캐시 이후** 역할별로 갈린다.
+
+        뷰가 full 기준(True)으로 채우므로, full 이 먼저 조회해 캐시를 채운 뒤 viewer 가
+        같은 캐시를 받아도 false 여야 한다(그렇지 않으면 화면에 토글이 뜨고 누르면 403).
+        """
+        from django.core.cache import cache
+
+        from apps.billing.models import ReferralCode, SubscriptionPlan
+
+        plan, _ = SubscriptionPlan.objects.get_or_create(
+            name="pro", defaults={"display_name": "프로", "monthly_price": 14900, "sort_order": 2}
+        )
+        ReferralCode.objects.create(code="VIEWERGATE", target_plan=plan)
+        url = "/api/v1/admin/dashboard/marketing/?period=30d"
+        cache.delete("admin:dash:mkt:30d")
+
+        full_rows = _login(full_admin).get(url).json()["channels"]["rows"]
+        full_row = next(r for r in full_rows if r["key"] == "VIEWERGATE")
+        assert full_row["can_exclude"] is True
+
+        # 캐시가 채워진 상태에서 제한 역할이 같은 응답을 받는다
+        viewer_rows = _login(viewer).get(url).json()["channels"]["rows"]
+        viewer_row = next(r for r in viewer_rows if r["key"] == "VIEWERGATE")
+        assert viewer_row["can_exclude"] is False
+        assert viewer_row["code_id"] == full_row["code_id"]  # uuid 는 PII 가 아니라 그대로
+
+    def test_full_admin_can_exclude(self, full_admin):
+        link = _mk_link(full_admin, "집계에서 뺄 링크")
+        res = _login(full_admin).patch(
+            f"{LINKS_URL}{link.pk}/",
+            {"excluded_from_stats": True},
+            content_type="application/json",
+        )
+        assert res.status_code == 200
+        assert res.json()["excluded_from_stats"] is True
+        assert res.json()["can_exclude"] is True
+
     def test_viewer_cannot_delete_others_link(self, viewer, full_admin):
         """이번 요청의 핵심 안전장치 — 내부 팀 링크는 외주가 못 지운다."""
         link = _mk_link(full_admin, "내부 팀 링크")

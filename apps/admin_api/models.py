@@ -88,7 +88,9 @@ class MarketingChannelLink(models.Model):
     조회 스코프는 전 관리자 공용(생성자 무관 전체 노출), created_by 는 표기용.
     """
 
-    name = models.CharField(max_length=100, verbose_name="링크 이름")
+    # MKT-13: 프론트가 링크 이름 입력칸을 없애고 `utm_campaign · utm_content` 로 자동
+    # 조합한다 → 100(캠페인) + 3(구분자) + 100(콘텐츠) = 최대 203자. 100 이면 잘린다.
+    name = models.CharField(max_length=255, verbose_name="링크 이름")
     base_url = models.URLField(max_length=500, verbose_name="기본 URL")
     utm_source = models.CharField(max_length=100, blank=True, default="")
     utm_medium = models.CharField(max_length=100, blank=True, default="")
@@ -103,6 +105,15 @@ class MarketingChannelLink(models.Model):
         max_length=32,
         verbose_name="파생 채널 키",
         help_text="derive_channel(utm_source, utm_medium) 결과 — 대시보드 채널 키와 동일 어휘",
+    )
+    excluded_from_stats = models.BooleanField(
+        default=False,
+        verbose_name="집계 제외",
+        help_text=(
+            "채널별 성과·추이·퍼널에서 이 링크의 행을 빼고, 이 링크로 들어온 인원은 "
+            "'기타' 행으로 흡수한다(인원을 총합에서 없애지는 않는다 — MKT-12). "
+            "테스트/오생성/종료된 캠페인 링크가 표에 쌓이는 것을 정리하는 용도."
+        ),
     )
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,

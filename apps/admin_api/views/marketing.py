@@ -38,14 +38,17 @@ from apps.admin_api.audit import log_admin_action
 from apps.admin_api.dashboard_cache import bust_marketing_dashboard_cache
 from apps.admin_api.models import AdminActionLog, MarketingChannelLink
 from apps.admin_api.roles import (
+    EXCLUDE_FORBIDDEN_CODE,
+    EXCLUDE_FORBIDDEN_MESSAGE,
     NOT_LINK_OWNER_CODE,
     NOT_LINK_OWNER_MESSAGE,
     can_delete_channel_link,
+    can_exclude_channel_link_from_stats,
     resolve_admin_role,
 )
 from apps.admin_api.serializers.marketing import (
-    AdminChannelLinkRenameSerializer,
     AdminChannelLinkSerializer,
+    AdminChannelLinkUpdateSerializer,
     AdminChannelLinkWriteSerializer,
 )
 
@@ -64,13 +67,21 @@ _EXAMPLE_LINK = {
         "&utm_campaign=2026-07-retargeting&utm_content=video_a"
     ),
     "channel": "tiktok_ads",
+    "excluded_from_stats": False,
     "created_by_email": "marketer@clfy.ai.kr",
     "can_delete": True,
+    "can_exclude": True,
     "created_at": "2026-07-26T10:00:00+09:00",
     "updated_at": "2026-07-26T10:00:00+09:00",
 }
-# 외주(마케팅 조회 전용) 계정이 같은 링크를 봤을 때 — 내부 직원 이메일 비노출 + 남의 링크
-_EXAMPLE_LINK_VIEWER = {**_EXAMPLE_LINK, "created_by_email": "", "can_delete": False}
+# 외주(마케팅 조회 전용) 계정이 같은 링크를 봤을 때 — 내부 직원 이메일 비노출 + 남의 링크.
+# can_exclude 는 소유자 여부와 무관하게 항상 false (MKT-12: full 전용).
+_EXAMPLE_LINK_VIEWER = {
+    **_EXAMPLE_LINK,
+    "created_by_email": "",
+    "can_delete": False,
+    "can_exclude": False,
+}
 
 
 class AdminChannelLinkListCreateView(generics.ListCreateAPIView):
@@ -282,7 +293,7 @@ class AdminChannelLinkDetailView(generics.RetrieveUpdateDestroyAPIView):
 
     def get_serializer_class(self):
         if self.request.method in ("PATCH", "PUT"):
-            return AdminChannelLinkRenameSerializer
+            return AdminChannelLinkUpdateSerializer
         return AdminChannelLinkSerializer
 
     @extend_schema(
@@ -313,10 +324,11 @@ class AdminChannelLinkDetailView(generics.RetrieveUpdateDestroyAPIView):
 
     @extend_schema(
         tags=["admin-marketing"],
-        summary="[관리자] 채널 링크 이름 수정",
+        summary="[관리자] 채널 링크 수정 (이름 / 집계 제외)",
         description="""
 ## 개요
-저장된 채널 링크의 **이름만** 수정합니다(PATCH).
+저장된 채널 링크의 **이름**과 **집계 제외 여부**를 수정합니다(PATCH). 둘 다 선택 필드이고
+보낸 것만 바뀝니다(둘 다 없으면 400).
 
 ## 인증
 - `Authorization: Bearer <staff_access_token>` (is_staff=True)
@@ -324,30 +336,75 @@ class AdminChannelLinkDetailView(generics.RetrieveUpdateDestroyAPIView):
 ## 요청 필드
 | 필드 | 필수 | 타입 | 설명 |
 |------|------|------|------|
-| `name` | ✅ | string | 변경할 이름 (최대 100자) |
+| `name` | ❌ | string | 변경할 이름 (최대 **255자**) |
+| `excluded_from_stats` | ❌ | boolean | `true` 면 마케팅 대시보드 집계에서 제외 (아래) |
 
-## 소유자 스코프
-- `full` 역할: 모든 링크 수정 가능 (기존 동작 그대로).
-- `marketing_viewer`(외주): 이 엔드포인트는 **화이트리스트에 없어 미들웨어에서 403**
-  (`section_forbidden`) 입니다. 경로를 열더라도 삭제와 **같은 소유자 판정**을 거치므로
-  남의 링크는 `not_link_owner` 403 입니다.
+## `excluded_from_stats` 동작 (MKT-12)
+테스트/오생성/종료된 캠페인 링크가 채널별 성과 표에 계속 쌓이는 것을 정리하는 용도입니다.
+`true` 로 켜면 **세 카드에서 함께** 빠집니다 — 한 곳만 빠지면 같은 키가 카드마다 다른
+인원을 뜻하게 됩니다:
+
+1. `channels.rows` — 이 링크의 행이 사라집니다
+2. `trends.by_channel` — 이 키가 사라집니다
+3. `funnel.available_channels` / `funnel.variants` — 드롭다운에서 사라집니다
+
+⚠️ **인원은 사라지지 않습니다.** 이 링크로 들어온 방문·가입은 `other` 행으로 흡수되고
+펼침에서 `sources[key="excluded_link"]`("집계에서 뺀 링크") 줄로 보입니다. 따라서
+`Σrows[].signups + attribution_gap.signups_unattributed == 기간 가입자 수` 항등이
+**그대로 유지**됩니다. (숨기는 것과 없애는 것은 다른 얘기라 흡수를 택했습니다.)
+
+- **목록 API 에는 제외한 링크도 계속 나옵니다** — 되돌릴 경로를 유지합니다.
+- `false` 로 되돌리면 행과 수치가 즉시 복구됩니다(과거 유입 소급 반영).
+- 저장 유도 목록(`unsaved_utm.combos`)에는 **실리지 않습니다** — 이미 저장된 링크라
+  그 조합으로 새로 만들면 중복 400 이 납니다.
+
+## 권한
+- `name`: `full` 은 전체, 제한 역할은 소유자 판정(`can_delete`)과 동일.
+- `excluded_from_stats`: **`full` 전용**입니다. 집계 제외는 다른 사람이 보는 숫자를 바꾸는
+  행위라 소유자 여부와 무관하게 제한 역할에 허용하지 않습니다(삭제와 판정이 다릅니다).
+  응답의 **`can_exclude`** 로 판정을 내려주니 그 값으로 토글을 렌더하세요 — `false` 인데
+  보내면 **403** `{"details": {"code": "exclude_not_allowed"}}` 입니다.
+- 현재 PATCH 경로 자체가 제한 역할 화이트리스트에 없어 미들웨어에서 먼저 403
+  (`section_forbidden`) 입니다. 위 판정은 경로를 열더라도 구멍이 생기지 않게 미리 닫아둔 것입니다.
 
 ## 주의사항
-- `base_url`/`utm_*` 는 수정할 수 없습니다 — `url`·`channel` 파생값과의 일관성을 위해
-  UTM 조합을 바꾸려면 **삭제 후 재생성**하세요 (보내도 무시됩니다).
-- 성공 시 `AdminActionLog(channel_link.update)` 감사 기록. PUT 은 비활성화.
+- `base_url`/`utm_*` 는 수정할 수 없습니다 — `url`·`channel` 파생값과 방문 매칭 4-튜플의
+  일관성을 위해 UTM 조합을 바꾸려면 **삭제 후 재생성**하세요 (보내도 무시됩니다).
+- 성공 시 `AdminActionLog(channel_link.update)` 감사 기록(바뀐 필드만). PUT 은 비활성화.
+- 대시보드 캐시(`admin:dash:mkt:*`)를 즉시 무효화하므로 다음 조회에 바로 반영됩니다.
+
+### 요청 예시
+```bash
+# 집계에서 빼기
+curl -X PATCH -H "Authorization: Bearer <staff_token>" -H "Content-Type: application/json" \\
+  -d '{"excluded_from_stats": true}' \\
+  "https://api.example.com/api/v1/admin/marketing/channel-links/3/"
+```
         """,
-        request=AdminChannelLinkRenameSerializer,
+        request=AdminChannelLinkUpdateSerializer,
         responses={
             200: AdminChannelLinkSerializer,
-            400: OpenApiResponse(description="검증 실패 (name 누락/길이 초과)"),
+            400: OpenApiResponse(description="검증 실패 (필드 없음/길이 초과)"),
             401: OpenApiResponse(description="인증 누락/만료"),
-            403: OpenApiResponse(description="관리자 권한 없음 (is_staff=False)"),
+            403: OpenApiResponse(
+                description="관리자 권한 없음(is_staff=False) / 남이 만든 링크"
+                '(details.code="not_link_owner") / 집계 제외 권한 없음'
+                '(details.code="exclude_not_allowed")'
+            ),
             404: OpenApiResponse(description="해당 링크 없음"),
             500: OpenApiResponse(description="서버 오류"),
         },
         examples=[
-            OpenApiExample("요청 예시", request_only=True, value={"name": "7월 틱톡 리타겟팅 v2"}),
+            OpenApiExample(
+                "요청 예시 (이름 수정)",
+                request_only=True,
+                value={"name": "7월 틱톡 리타겟팅 v2"},
+            ),
+            OpenApiExample(
+                "요청 예시 (집계에서 빼기)",
+                request_only=True,
+                value={"excluded_from_stats": True},
+            ),
         ],
     )
     def patch(self, request, *args, **kwargs):
@@ -389,6 +446,42 @@ class AdminChannelLinkDetailView(generics.RetrieveUpdateDestroyAPIView):
             status=status.HTTP_403_FORBIDDEN,
         )
 
+    def _exclude_guard(self, request, link):
+        """MKT-12 — 집계 제외 토글은 full 전용. 통과면 None, 아니면 403 Response.
+
+        소유자 스코프(_owner_guard)와 **별도 게이트**다: 삭제는 자기가 만든 것을 치우는
+        일이지만, 집계 제외는 다른 사람이 보는 숫자를 바꾼다. 응답의 ``can_exclude`` 와
+        같은 함수를 쓴다 — 갈라지면 화면 토글과 실제 동작이 어긋난다.
+        """
+        role = resolve_admin_role(request)
+        if can_exclude_channel_link_from_stats(role):
+            return None
+        log_admin_action(
+            request=request,
+            action=AdminActionLog.Action.ADMIN_ACCESS_DENIED,
+            target_type="channel_link",
+            target_id=link.pk,
+            target_repr=f"EXCLUDE {link.name}"[:255],
+            changes={"admin_role": role, "reason": EXCLUDE_FORBIDDEN_CODE},
+        )
+        logger.warning(
+            "[admin-marketing] req=%s role=%s 집계 제외 토글 차단 id=%s",
+            getattr(request, "id", ""),
+            role,
+            link.pk,
+        )
+        return Response(
+            {
+                "success": False,
+                "error": {
+                    "code": 403,
+                    "message": EXCLUDE_FORBIDDEN_MESSAGE,
+                    "details": {"code": EXCLUDE_FORBIDDEN_CODE, "admin_role": role},
+                },
+            },
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
     def update(self, request, *args, **kwargs):
         link = self.get_object()
         # 현재 PATCH 는 제한 역할 화이트리스트에 없어 미들웨어에서 먼저 막힌다. 그래도 여기서
@@ -397,27 +490,43 @@ class AdminChannelLinkDetailView(generics.RetrieveUpdateDestroyAPIView):
         denied = self._owner_guard(request, link, "PATCH")
         if denied is not None:
             return denied
-        before_name = link.name
+        # MKT-12: 집계 제외를 **건드리려 할 때만** 추가 게이트. 이름만 바꾸는 PATCH 는
+        # 기존 소유자 판정 그대로 통과한다(경로가 열릴 때를 대비한 선반영).
+        if "excluded_from_stats" in request.data:
+            denied = self._exclude_guard(request, link)
+            if denied is not None:
+                return denied
+        before_name, before_excluded = link.name, link.excluded_from_stats
 
         serializer = self.get_serializer(link, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
 
+        changes: dict = {}
         if link.name != before_name:
+            changes["name"] = {"before": before_name, "after": link.name}
+        if link.excluded_from_stats != before_excluded:
+            changes["excluded_from_stats"] = {
+                "before": before_excluded,
+                "after": link.excluded_from_stats,
+            }
+        if changes:
             log_admin_action(
                 request=request,
                 action=AdminActionLog.Action.CHANNEL_LINK_UPDATE,
                 target_type="channel_link",
                 target_id=link.pk,
                 target_repr=link.name,
-                changes={"name": {"before": before_name, "after": link.name}},
+                changes=changes,
             )
             logger.info(
-                "[admin-marketing] req=%s 채널 링크 이름 수정 id=%s",
+                "[admin-marketing] req=%s 채널 링크 수정 id=%s fields=%s",
                 getattr(request, "id", ""),
                 link.pk,
+                ",".join(changes),
             )
-        # MKT-11: 이름은 채널별 성과 행의 label 이므로 캐시를 지워야 즉시 반영된다
+        # MKT-11: 이름은 채널별 성과 행의 label, excluded_from_stats 는 행 자체의 유무를
+        # 바꾸므로 둘 다 캐시를 지워야 즉시 반영된다 (안 지우면 최대 5분간 안 사라진다).
         bust_marketing_dashboard_cache(reason="channel_link.update")
         read = AdminChannelLinkSerializer(link, context=self.get_serializer_context())
         return Response(read.data)

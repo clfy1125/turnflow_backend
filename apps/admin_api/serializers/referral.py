@@ -16,6 +16,7 @@ import re
 from django.utils import timezone
 from rest_framework import serializers
 
+from apps.admin_api.roles import ROLE_FULL, can_exclude_channel_link_from_stats, resolve_admin_role
 from apps.billing.models import ReferralCode, ReferralRedemption, SubscriptionPlan
 
 from .billing import AdminSubscriptionPlanSerializer
@@ -32,7 +33,9 @@ class AdminReferralCodeSerializer(serializers.ModelSerializer):
     """
 
     target_plan = AdminSubscriptionPlanSerializer(read_only=True)
-    redemptions_count = serializers.SerializerMethodField(help_text="이 코드로 시작된 총 트라이얼 수")
+    redemptions_count = serializers.SerializerMethodField(
+        help_text="이 코드로 시작된 총 트라이얼 수"
+    )
     converted_count = serializers.SerializerMethodField(
         help_text="트라이얼 후 유료 결제로 전환된 수"
     )
@@ -41,6 +44,12 @@ class AdminReferralCodeSerializer(serializers.ModelSerializer):
     )
     redeemable_reason = serializers.SerializerMethodField(
         help_text="사용 불가 사유 (is_redeemable=false 일 때만 채워짐)"
+    )
+    can_exclude = serializers.SerializerMethodField(
+        help_text="이 요청자가 excluded_from_stats 를 토글할 수 있는지(서버 판정, MKT-14). "
+        "**full 만 true** — 집계 제외는 다른 사람이 보는 숫자를 바꾸는 행위다. "
+        "false 면 토글을 렌더하지 마세요 — 보내면 403(exclude_not_allowed). "
+        "채널 링크의 can_exclude 와 **같은 판정 함수**를 씁니다"
     )
 
     class Meta:
@@ -52,6 +61,7 @@ class AdminReferralCodeSerializer(serializers.ModelSerializer):
             "target_plan",
             "trial_days",
             "is_active",
+            "excluded_from_stats",
             "max_uses",
             "current_uses",
             "valid_from",
@@ -60,10 +70,19 @@ class AdminReferralCodeSerializer(serializers.ModelSerializer):
             "converted_count",
             "is_redeemable",
             "redeemable_reason",
+            "can_exclude",
             "created_at",
             "updated_at",
         ]
         read_only_fields = fields
+        extra_kwargs = {
+            "excluded_from_stats": {
+                "help_text": "true 면 마케팅 대시보드(채널별 성과 표·추이·퍼널)에서 이 코드의 "
+                "행이 빠지고 가입자는 '기타' 행으로 흡수됩니다(총합 불변 — MKT-14/15). "
+                "⚠️ **고객 동작에는 영향 없음** — 제외된 코드도 평소처럼 사용됩니다"
+                "(막으려면 is_active=false). 목록에는 제외한 코드도 계속 나옵니다"
+            }
+        }
 
     def get_redemptions_count(self, obj) -> int:
         annotated = getattr(obj, "redemptions_count", None)
@@ -84,6 +103,12 @@ class AdminReferralCodeSerializer(serializers.ModelSerializer):
     def get_redeemable_reason(self, obj) -> str:
         _, reason = obj.is_redeemable()
         return reason
+
+    def get_can_exclude(self, obj) -> bool:
+        # 채널 링크와 **같은 판정 함수** — 두 화면에서 규칙이 갈라지지 않게 (MKT-14).
+        request = self.context.get("request")
+        role = resolve_admin_role(request) if request is not None else ROLE_FULL
+        return can_exclude_channel_link_from_stats(role)
 
 
 class AdminReferralCodeWriteSerializer(serializers.ModelSerializer):
@@ -151,6 +176,10 @@ class AdminReferralCodeWriteSerializer(serializers.ModelSerializer):
             "target_plan",
             "trial_days",
             "is_active",
+            # MKT-14: 통계 전용 플래그. 고객의 코드 사용을 막는 스위치는 is_active 다
+            # (여기 넣어도 is_redeemable 은 이 값을 보지 않는다).
+            # 토글 권한은 full 전용 — 게이트는 뷰(_exclude_guard)가 판정한다.
+            "excluded_from_stats",
             "max_uses",
             "valid_from",
             "valid_until",

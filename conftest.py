@@ -56,6 +56,16 @@ def assert_celery_broker_isolated():
 def django_db_setup():
     """Setup test database.
 
+    ⚠️ **이 오버라이드는 실효가 없다 — 테스트는 dev DB(`instagram_service`)를 직접 쓴다.**
+    아래처럼 ``settings.DATABASES`` 를 바꿔도 커넥션이 이미 자기 ``settings_dict`` 를 들고
+    있어 반영되지 않는다(실측: 테스트 안에서 ``connection.settings_dict`` 가
+    NAME=instagram_service / HOST=db). 그래서:
+      - **모델 필드를 추가하면 dev DB 에 migrate 를 먼저 해야** 테스트가 돈다
+        (test_ 접두 DB 가 자동 생성되지 않는다).
+      - 집계 테스트는 dev 잔여 데이터 때문에 **절대 카운트를 단언하면 안 된다**(델타로).
+    고치려면 별도 테스트 DB 를 실제로 만들어야 하는데, 현재 스위트가 dev 데이터에
+    의존하는 단언을 갖고 있어 별건으로 다뤄야 한다.
+
     ``DATABASES["default"]`` 를 통째로 덮어쓸 땐 ``ATOMIC_REQUESTS`` 같은
     Django 가 `connections.settings` 에서 직접 lookup 하는 키를 빼먹으면
     ``make_view_atomic`` 에서 ``KeyError`` 가 터진다 (DRF view 가 시작도 못함).
