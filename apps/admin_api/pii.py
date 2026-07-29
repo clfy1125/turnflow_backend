@@ -16,7 +16,11 @@ from __future__ import annotations
 
 import copy
 
-from apps.admin_api.roles import ROLE_MARKETING_VIEWER, user_ref
+from apps.admin_api.roles import (
+    ROLE_MARKETING_VIEWER,
+    can_exclude_channel_link_from_stats,
+    user_ref,
+)
 
 # 마스킹 이메일의 고정 별표 수 — 실제 길이만큼 찍으면 로컬파트 길이가 유출되어
 # 다른 필드와 조합한 재식별 단서가 된다 (프론트 요청 그대로 3개 고정).
@@ -101,9 +105,15 @@ def apply_pii_policy(data: dict, *, role: str) -> dict:
         #    제휴인지" 적은 라벨("크리에이터 협업 · 10% 쿠폰")이고, 코드 문자열·사용 인원·
         #    전환율은 이미 다 보인다. 설명만 가리면 "무슨 코드인지 모르는 숫자"가 되어
         #    **가려서 얻는 보호 없이 실용만 잃는다**. 개인정보(이메일·회원 식별자)는 그대로 가린다.
+        # MKT-15: ``can_exclude`` 는 **역할 의존 값**이다. 뷰는 full 기준(True)으로 채우고,
+        # 제한 역할에서만 여기서 닫는다 — 게이트 판정은 PATCH 게이트와 **같은 함수**를 쓴다.
+        # ⚠️ 이 루프는 반드시 ``if mask`` 안에 있어야 한다: mask 가 아니면 ``out is data``
+        #    (캐시에 든 그 dict)라 여기서 쓰면 **캐시를 오염**시킨다.
         for row in _rows_at(out, ("channels", "rows")):
             if isinstance(row, dict) and "created_by_email" in row:
                 row["created_by_email"] = ""
+            if isinstance(row, dict) and "can_exclude" in row:
+                row["can_exclude"] = can_exclude_channel_link_from_stats(role)
 
     out["pii_masked"] = mask
     return out

@@ -27,7 +27,14 @@ from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
 
 from apps.admin_api.audit import log_admin_action
+from apps.admin_api.dashboard_cache import bust_marketing_dashboard_cache
 from apps.admin_api.models import AdminActionLog
+from apps.admin_api.roles import (
+    EXCLUDE_FORBIDDEN_CODE,
+    EXCLUDE_FORBIDDEN_MESSAGE,
+    can_exclude_channel_link_from_stats,
+    resolve_admin_role,
+)
 from apps.admin_api.serializers.referral import (
     AdminReferralCodeSerializer,
     AdminReferralCodeWriteSerializer,
@@ -43,6 +50,8 @@ _TRACKED_FIELDS = [
     "description",
     "trial_days",
     "is_active",
+    # MKT-14: 집계 제외 토글도 감사 대상 — 남이 보는 숫자를 바꾸는 행위라 누가 켰는지 남는다
+    "excluded_from_stats",
     "max_uses",
     "valid_from",
     "valid_until",
@@ -222,7 +231,9 @@ class AdminReferralCodeListCreateView(generics.ListCreateAPIView):
         request=AdminReferralCodeWriteSerializer,
         responses={
             201: AdminReferralCodeSerializer,
-            400: OpenApiResponse(description="검증 실패 (코드 형식/중복, 기간 역전, 플랜 미존재 등)"),
+            400: OpenApiResponse(
+                description="검증 실패 (코드 형식/중복, 기간 역전, 플랜 미존재 등)"
+            ),
             401: OpenApiResponse(description="인증 누락/만료"),
             403: OpenApiResponse(description="관리자 권한 없음 (is_staff=False)"),
         },
@@ -353,9 +364,7 @@ class AdminReferralCodeDetailView(generics.RetrieveUpdateDestroyAPIView):
         },
         examples=[
             OpenApiExample("요청 예시 (비활성화)", request_only=True, value={"is_active": False}),
-            OpenApiExample(
-                "요청 예시 (한도 상향)", request_only=True, value={"max_uses": 500}
-            ),
+            OpenApiExample("요청 예시 (한도 상향)", request_only=True, value={"max_uses": 500}),
         ],
     )
     def patch(self, request, *args, **kwargs):
@@ -363,6 +372,12 @@ class AdminReferralCodeDetailView(generics.RetrieveUpdateDestroyAPIView):
 
     def update(self, request, *args, **kwargs):
         code = self.get_object()
+        # MKT-14: 집계 제외를 **건드리려 할 때만** 추가 게이트 (다른 필드 수정은 기존 그대로).
+        # 채널 링크 PATCH 와 같은 판정 함수·같은 에러 코드를 쓴다 — 프론트 분기가 하나로 끝난다.
+        if "excluded_from_stats" in request.data:
+            denied = self._exclude_guard(request, code)
+            if denied is not None:
+                return denied
         before = {f: getattr(code, f) for f in _TRACKED_FIELDS}
         before_plan = code.target_plan.name
 
@@ -394,11 +409,51 @@ class AdminReferralCodeDetailView(generics.RetrieveUpdateDestroyAPIView):
                 code.code,
                 list(changes.keys()),
             )
+        # MKT-14/15: 코드 행은 마케팅 대시보드 응답(5분 캐시)의 일부라, 무효화하지 않으면
+        # 집계에서 뺀 코드가 최대 5분간 표에 남는다 — 링크 CRUD(MKT-11)와 같은 증상.
+        # 다른 필드 수정도 행 라벨/집계에 영향이 있어 조건 없이 지운다.
+        bust_marketing_dashboard_cache(reason="referral_code.update")
 
         read = AdminReferralCodeSerializer(
             _annotated_qs().get(pk=code.pk), context=self.get_serializer_context()
         )
         return Response(read.data)
+
+    def _exclude_guard(self, request, code):
+        """MKT-14 — 집계 제외 토글은 full 전용. 통과면 None, 아니면 403 Response.
+
+        응답의 ``can_exclude`` 와 **같은 함수**를 쓴다(갈라지면 화면 토글과 실제 동작이
+        어긋난다). 현재 이 경로는 제한 역할 화이트리스트에 없어 미들웨어가 먼저 막지만,
+        경로만 열었을 때 구멍이 되지 않게 뷰에서 미리 닫아둔다 — 채널 링크와 동일한 구조.
+        """
+        role = resolve_admin_role(request)
+        if can_exclude_channel_link_from_stats(role):
+            return None
+        log_admin_action(
+            request=request,
+            action=AdminActionLog.Action.ADMIN_ACCESS_DENIED,
+            target_type="referral_code",
+            target_id=code.pk,
+            target_repr=f"EXCLUDE {code.code}"[:255],
+            changes={"admin_role": role, "reason": EXCLUDE_FORBIDDEN_CODE},
+        )
+        logger.warning(
+            "[admin-referral] req=%s role=%s 집계 제외 토글 차단 code=%s",
+            getattr(request, "id", ""),
+            role,
+            code.code,
+        )
+        return Response(
+            {
+                "success": False,
+                "error": {
+                    "code": 403,
+                    "message": EXCLUDE_FORBIDDEN_MESSAGE,
+                    "details": {"code": EXCLUDE_FORBIDDEN_CODE, "admin_role": role},
+                },
+            },
+            status=status.HTTP_403_FORBIDDEN,
+        )
 
     @extend_schema(
         tags=["admin-referral"],

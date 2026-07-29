@@ -2497,6 +2497,134 @@ class TestLinkExcludedFromStats:
         assert _channel_row(res, active.pk)["visits"] == 1
 
 
+@requires_analytics
+class TestCodeExcludedFromStats:
+    """MKT-14/15 — 제휴 코드를 집계에서 빼면 행만 사라지고 가입자는 other 로 흡수된다."""
+
+    def _seed(self, pro_plan, *, excluded: bool, origin_link=None):
+        now = timezone.now()
+        code = ReferralCode.objects.create(
+            code=f"EX-{uuid.uuid4().hex[:6]}",
+            target_plan=pro_plan,
+            excluded_from_stats=excluded,
+        )
+        u = _mk_user(joined=now)
+        if origin_link is not None:  # 원래 귀속은 저장 링크 → 코드로 이동한 케이스
+            SignupAttribution.objects.create(
+                user=u,
+                channel="meta_ads",
+                signup_kind="email",
+                utm_source="meta",
+                utm_medium="cpc",
+                utm_campaign="ov",
+            )
+        ReferralRedemption.objects.create(
+            user=u,
+            referral_code=code,
+            trial_started_at=now,
+            trial_ends_at=now + timedelta(days=30),
+        )
+        return code, u
+
+    def test_row_disappears_but_signups_move_to_other(self, staff_client, clean_slate, pro_plan):
+        code, _u = self._seed(pro_plan, excluded=True)
+        res = staff_client.get(URL)
+
+        assert all(r["key"] != code.code for r in res.data["channels"]["rows"])
+        other = _channel_row(res, "other")
+        assert other["signups"] == 1
+        src = _source(res, "excluded_code")
+        assert src["label"] == "집계에서 뺀 제휴 코드"
+        assert src["signups"] == 1
+        assert src["visits"] == 0  # 코드는 URL 이 아니라 결제 화면 입력 → 방문 개념 없음
+        # 항등 유지 + 공백으로 새지 않는다 (코드 자체가 유입 경로)
+        gap = res.data["channels"]["attribution_gap"]["signups_unattributed"]
+        assert gap == 0
+        rows_signups = sum(r["signups"] for r in res.data["channels"]["rows"])
+        assert rows_signups + gap == _node(res, "signup")["count"] == 1
+
+    def test_not_folded_into_excluded_link(self, staff_client, clean_slate, pro_plan):
+        """링크와 코드를 한 줄로 합치면 뺀 것이 무엇인지 화면에서 구분할 수 없다."""
+        self._seed(pro_plan, excluded=True)
+        keys = {s["key"] for s in _channel_row(staff_client.get(URL), "other")["sources"]}
+        assert "excluded_code" in keys
+        assert "excluded_link" not in keys
+
+    def test_removed_from_trends_and_funnel(self, staff_client, clean_slate, pro_plan):
+        code, _u = self._seed(pro_plan, excluded=True)
+        res = staff_client.get(URL)
+
+        bucket = res.data["trends"]["buckets"][-1]
+        assert code.code not in bucket["by_channel"]
+        assert bucket["by_channel"]["other"]["signups"] == 1
+        assert bucket["unattributed"]["signups"] == 0  # 공백이 아니다
+        assert (
+            sum(s["signups"] for s in bucket["by_channel"].values())
+            + bucket["unattributed"]["signups"]
+            == bucket["signups"]
+        )
+        assert code.code not in {c["value"] for c in res.data["funnel"]["available_channels"]}
+        assert code.code not in res.data["funnel"]["variants"]
+
+    def test_code_row_carries_code_id_and_can_exclude(self, staff_client, clean_slate, pro_plan):
+        code, _u = self._seed(pro_plan, excluded=False)
+        row = _channel_row(staff_client.get(URL), code.code)
+        assert row["code_id"] == str(code.pk)  # PATCH 대상 uuid
+        assert row["can_exclude"] is True  # full 역할
+        # 링크/기타 행에는 붙지 않는다 (kind 전용 필드)
+        assert "code_id" not in _channel_row(staff_client.get(URL), "other")
+
+    def test_referral_overlap_not_inflated_when_origin_is_other(
+        self, staff_client, clean_slate, pro_plan
+    ):
+        """원 귀속이 other 였던 사람은 제외 시 **제자리로 돌아온다** — 과소집계가 없다.
+
+        그런데도 referral_overlap 을 올리면 "1명이 빠져나갔다"는 거짓 표기가 남는다.
+        """
+        now = timezone.now()
+        code = ReferralCode.objects.create(
+            code=f"OV-{uuid.uuid4().hex[:6]}", target_plan=pro_plan, excluded_from_stats=True
+        )
+        u = _mk_user(joined=now)
+        SignupAttribution.objects.create(user=u, channel="search_organic", signup_kind="email")
+        ReferralRedemption.objects.create(
+            user=u,
+            referral_code=code,
+            trial_started_at=now,
+            trial_ends_at=now + timedelta(days=30),
+        )
+        other = _channel_row(staff_client.get(URL), "other")
+        assert other["signups"] == 1
+        assert other["referral_overlap"] == 0
+
+    def test_referral_overlap_kept_when_origin_row_differs(
+        self, staff_client, clean_slate, pro_plan
+    ):
+        """원 귀속이 저장 링크였으면 그 링크는 실제로 과소 집계된다 → 보정 표기 유지."""
+        link = _mk_link("원 귀속 링크", source="meta", medium="cpc", campaign="ov")
+        self._seed(pro_plan, excluded=True, origin_link=link)
+        res = staff_client.get(URL)
+        assert _channel_row(res, link.pk)["referral_overlap"] == 1
+        assert _channel_row(res, link.pk)["signups"] == 0  # 이동했으므로
+
+    def test_customer_redemption_unaffected(self, db, pro_plan):
+        """⚠️ 집계 제외는 **고객 동작에 영향 없음** — is_redeemable 이 이 값을 보지 않는다."""
+        code = ReferralCode.objects.create(
+            code=f"CU-{uuid.uuid4().hex[:6]}", target_plan=pro_plan, excluded_from_stats=True
+        )
+        ok, reason = code.is_redeemable()
+        assert ok is True
+        assert reason == ""
+
+    def test_toggle_off_restores_the_row(self, staff_client, clean_slate, pro_plan):
+        code, _u = self._seed(pro_plan, excluded=True)
+        assert all(r["key"] != code.code for r in staff_client.get(URL).data["channels"]["rows"])
+        code.excluded_from_stats = False
+        code.save(update_fields=["excluded_from_stats"])
+        cache.delete_many(list(CACHE_KEYS))
+        assert _channel_row(staff_client.get(URL), code.code)["signups"] == 1
+
+
 class TestChannelLinkCacheBust:
     """MKT-11 — 저장 직후 확인하는 흐름이라 5분 지연이 '동작 안 함'으로 읽힌다."""
 

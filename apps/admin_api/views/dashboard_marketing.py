@@ -249,15 +249,19 @@ SOURCE_DIRECT = "direct"
 # combos 에 실려 "이 조합으로 링크 저장" 버튼이 뜨는데 누르면 중복 400 이 난다(링크가 이미
 # 있으니까). 자기 줄로 두면 "뺀 인원이 얼마인지"도 펼침에서 보인다.
 SOURCE_EXCLUDED_LINK = "excluded_link"
+# MKT-15: 집계에서 뺀 **제휴 코드**의 가입자. excluded_link 와 합치지 않는다 — 합치면
+# 뺀 것이 링크인지 코드인지 화면에서 구분할 수 없다(둘의 정리 주체·경로가 다르다).
+SOURCE_EXCLUDED_CODE = "excluded_code"
 # 초과분을 접는 버킷 (SOURCE_ROWS_MAX). 파생 채널 키를 그대로 재사용한다.
 SOURCE_OTHER_REFERRAL = "other_referral"
 # 접기·판별상 특별 취급하는 소스 — 신호가 크거나(direct) 조치 가능해서(biolink/unsaved_utm/
-# excluded_link) 순위와 무관하게 항상 자기 줄을 유지한다.
+# excluded_link/excluded_code) 순위와 무관하게 항상 자기 줄을 유지한다.
 _SOURCE_NEVER_FOLD = (
     SOURCE_DIRECT,
     SOURCE_BIOLINK,
     SOURCE_UNSAVED_UTM,
     SOURCE_EXCLUDED_LINK,
+    SOURCE_EXCLUDED_CODE,
 )
 
 # 소스 라벨 — CHANNEL_LABELS 보다 우선. direct 는 채널 표기("다이렉트")로 되돌리지 말 것:
@@ -269,6 +273,7 @@ _SOURCE_LABEL_OVERRIDES = {
     SOURCE_UNSAVED_UTM: "저장 안 된 링크(UTM)",
     SOURCE_DIRECT: "출처 미상",
     SOURCE_EXCLUDED_LINK: "집계에서 뺀 링크",
+    SOURCE_EXCLUDED_CODE: "집계에서 뺀 제휴 코드",
 }
 
 # 고객 바이오링크 페이지(turnflow.link/@slug)의 'Powered by' 배지가 붙이는 UTM.
@@ -676,10 +681,15 @@ def _trend_row_key_of(uid, attr_row: dict, referral_users: dict) -> str | None:
     ``other`` 키가 표·퍼널(제외)과 추이(포함)에서 다른 인원을 뜻한다 → 버킷의
     ``unattributed`` 로 빼고 by_channel 에서 제외한다. 코드 사용자는 귀속 행이 없어도
     공백이 아니다(코드 자체가 유입 경로) — 판정 순서를 바꾸지 말 것.
+
+    MKT-15: 코드가 집계 제외면 ``other`` 다(공백이 아니다). 표에서 그 사람들을
+    other/excluded_code 로 흡수하므로 추이도 같은 행으로 가야 한다.
     """
     code = referral_users.get(uid)
     if code:
         return code
+    if uid in referral_users:  # 집계 제외 코드 — 표와 같이 other 로
+        return OTHER_ROW_KEY
     bucket = attr_row.get(uid)
     return bucket[0] if bucket is not None else None
 
@@ -807,11 +817,7 @@ def _trends(start, end, visit_rows: list[tuple] | None = None) -> dict:
             "referrer",
         ):
             attr_row[uid] = _resolve_row_key(src, med, camp, content, referrer, channel, link_index)
-        referral_users = dict(
-            ReferralRedemption.objects.filter(user_id__in=involved).values_list(
-                "user_id", "referral_code__code"
-            )
-        )
+        referral_users = _referral_user_map(involved)
 
     # (버킷, row_key) 슬라이스 집계. 귀속 기록 없는 회원(row_key=None)은 by_channel 에서
     # 빼고 버킷의 unattributed 로 모은다 (MKT-10 을 추이에도 적용 — Q-B).
@@ -1254,6 +1260,33 @@ def _funnel(
 # ── 채널 ─────────────────────────────────────────────────────────────
 
 
+def _referral_user_map(user_ids) -> dict:
+    """{user_id: 코드 문자열 | None}. ``None`` = **집계에서 뺀 코드**(MKT-15).
+
+    키를 지우지 않고 None 을 넣는 이유는 ``_link_index`` 와 같다 — 세 가지 상태를
+    구분해야 하기 때문이다:
+
+    ==========================  ==================  ==========================
+    상태                        판정                 귀속
+    ==========================  ==================  ==========================
+    코드 없음                   ``uid not in map``   저장 채널(attr_row)
+    코드 사용                   ``map[uid]`` truthy  그 코드 행
+    코드 사용 + 집계 제외       값이 None            other / excluded_code
+    ==========================  ==================  ==========================
+
+    ⚠️ ``uid in referral_users`` 멤버십 판정이 **제외된 코드에도 True 로 남아야** 한다 —
+    ``_attribution_gap`` 이 이 멤버십으로 "코드 사용자는 계측 공백이 아니다"를 판정하므로,
+    키를 지우면 코드를 집계에서 뺀 순간 그 사람들이 갑자기 '귀속 기록 없음'으로 넘어가
+    ``signups_unattributed`` 가 부풀고 화면의 경고 줄이 잘못 뜬다.
+    """
+    return {
+        uid: (None if excluded else code)
+        for uid, code, excluded in ReferralRedemption.objects.filter(
+            user_id__in=user_ids
+        ).values_list("user_id", "referral_code__code", "referral_code__excluded_from_stats")
+    }
+
+
 def _cohort_flags(start, end) -> tuple:
     """가입 코호트 flag_rows + 어트리뷰션 맵 (채널/퍼널 공용, 중복 쿼리 방지).
 
@@ -1264,8 +1297,9 @@ def _cohort_flags(start, end) -> tuple:
     - attr_map: {user_id: channel} (SignupAttribution)
     - attr_utm: {user_id: (utm_source, utm_medium, utm_campaign, utm_content)} —
       MKT-5 저장 안 된 UTM 조합 분해용 (원문, 정규화 전)
-    - referral_users: {user_id: 제휴코드 문자열} (ReferralRedemption 보유 — 조회 시점
-      오버레이. `uid in referral_users` 멤버십 판정 + Q-4 referral 채널 코드 단위 분해 겸용)
+    - referral_users: {user_id: 제휴코드 문자열 | None} (ReferralRedemption 보유 — 조회 시점
+      오버레이. `uid in referral_users` 멤버십 판정 + Q-4 referral 채널 코드 단위 분해 겸용).
+      **None = 집계에서 뺀 코드**(MKT-15) — 자세한 규약은 :func:`_referral_user_map`
     - visits_by_channel: {channel: 고유 방문자 수(distinct visitor_id)} — 세션 수 아님
     - attr_row: {user_id: (row_key, source_key)} — MKT-2 채널 **행** 귀속
       (link / other+소스). 제휴코드 오버레이는 미적용 — 호출부가 먼저 본다.
@@ -1297,11 +1331,7 @@ def _cohort_flags(start, end) -> tuple:
         attr_map[uid] = channel
         attr_utm[uid] = (src or "", med or "", camp or "", content or "")
         attr_row[uid] = _resolve_row_key(src, med, camp, content, referrer, channel, link_index)
-    referral_users = dict(
-        ReferralRedemption.objects.filter(user_id__in=user_ids).values_list(
-            "user_id", "referral_code__code"
-        )
-    )
+    referral_users = _referral_user_map(user_ids)
     visits_by_channel = {
         r["channel"]: r["v"]
         for r in LandingVisit.objects.filter(created_at__gte=start, created_at__lt=end)
@@ -1353,9 +1383,11 @@ def _funnel_channel_variants(flags: tuple, visit_rows: list[tuple]) -> list[tupl
         tr, tr_no_card = _trial_flags(cur_plan, cur_status, cur_card)
         code = referral_users.get(uid)
         bucket = attr_row.get(uid)
-        if code is None and bucket is None:
+        has_code = uid in referral_users
+        if not has_code and bucket is None:
             continue  # MKT-10: 귀속 기록 없는 회원은 채널 variant 에서도 제외 (표와 동일 모집단)
-        channel = code or bucket[0]
+        # MKT-15: 집계 제외 코드(has_code 지만 code is None)는 other — 표와 같은 귀속.
+        channel = code or (OTHER_ROW_KEY if has_code else bucket[0])
         slot = per_channel[channel]
         slot["signups"] += 1
         if ig:
@@ -1599,13 +1631,23 @@ def _channel_rows(start, end, flags: tuple, visit_rows: list[tuple]) -> list[dic
         trialing, _no_card = _trial_flags(cur_plan, cur_status, cur_card)
         code = referral_users.get(uid)
         bucket = attr_row.get(uid)
-        if code:
+        if code or uid in referral_users:
             # 제휴코드 행으로 이동 — 원래 있었을 행에 과소 집계량을 표기.
             # ⚠️ 코드 사용자는 귀속 행이 없어도 **채널을 안다**(코드 자체가 유입 경로) →
             #    attribution_gap 이 아니다. 원 행이 없으면 보정할 대상도 없다.
-            if bucket is not None:
+            #
+            # MKT-15: 코드가 집계 제외면(code is None) 도착지가 코드 행이 아니라
+            # other/excluded_code 다. 그러면 원 행이 **other 였던 사람은 제자리로 돌아온
+            # 것**이라 과소 집계가 없다 → referral_overlap 을 올리면 거짓이 된다.
+            # 그래서 "도착지가 원 행과 다를 때만" 올린다(제외 없을 땐 기존과 동일).
+            dest_row = code or OTHER_ROW_KEY
+            if bucket is not None and dest_row != bucket[0]:
                 referral_overlap[bucket[0]] += 1
-            _accumulate_perf(per_row[code], ig, pgc, pg, cp, pd, trialing)
+            if code:
+                _accumulate_perf(per_row[code], ig, pgc, pg, cp, pd, trialing)
+            else:
+                _accumulate_perf(per_row[OTHER_ROW_KEY], ig, pgc, pg, cp, pd, trialing)
+                _accumulate_perf(per_source[SOURCE_EXCLUDED_CODE], ig, pgc, pg, cp, pd, trialing)
             continue
         if bucket is None:
             # MKT-10: 귀속 기록이 아예 없는 회원 — 사용자 행동이 아니라 **우리 계측 공백**이다.
@@ -1712,13 +1754,23 @@ def _channel_rows(start, end, flags: tuple, visit_rows: list[tuple]) -> list[dic
         )
     }
     code_rows = []
-    for code_obj in ReferralCode.objects.all():
+    # MKT-15: 집계 제외 코드는 행이 없다. 가입자는 위 루프에서 other/excluded_code 로
+    # 흡수되므로 `Σrows.signups + attribution_gap == 기간 가입자 수` 항등은 유지된다.
+    for code_obj in ReferralCode.objects.filter(excluded_from_stats=False):
         code = code_obj.code
         agg = redemption_agg.get(code) or {"redemptions": 0, "converted": 0}
         code_rows.append(
             {
                 "kind": ROW_KIND_REFERRAL_CODE,
                 "key": code,
+                # MKT-15: PATCH 대상 uuid. key 는 코드 문자열이라 이것 없이는 프론트가
+                # /admin/referral-codes/ 를 조인해야 하는데, 그 경로는 marketing_viewer 가
+                # 읽을 수 없어 권한을 이중 판정하게 된다.
+                "code_id": str(code_obj.pk),
+                # ⚠️ 역할 의존 값이지만 여기서는 **full 기준(True)** 으로 넣는다 —
+                #    제한 역할용 False 는 캐시 이후 apply_pii_policy 가 덮는다.
+                #    여기서 역할별로 만들면 full 이 채운 캐시를 제한 역할이 그대로 받는다.
+                "can_exclude": True,
                 "label": code,
                 "description": code_obj.description or "",
                 **_perf_payload(per_row.get(code) or _empty_perf_slot(), None),
@@ -1754,6 +1806,9 @@ def _attribution_gap(flags: tuple) -> dict:
 
     ⚠️ **제휴코드 사용자는 공백이 아니다** — 귀속 행이 없어도 코드 자체가 유입 경로라
     코드 행에 집계된다. 여기서 세면 rows 합과 이 값이 겹쳐 항등이 깨진다.
+    코드를 집계에서 뺐어도(MKT-15) 마찬가지다 — 그 사람들은 other/excluded_code 로
+    흡수되므로 여전히 공백이 아니다. ``referral_users`` 는 제외된 코드도 **키를 유지**하니
+    아래 멤버십 판정이 그대로 성립한다(:func:`_referral_user_map` 참고).
     """
     flag_rows, _attr_map, _attr_utm, referral_users, _visits_by_channel, attr_row = flags
     total = len(flag_rows)

@@ -312,6 +312,48 @@ class TestUpdate:
         assert log is not None
         assert log.changes["trial_days"] == {"before": 30, "after": 60}
 
+    def test_exclude_from_stats_toggle(self, staff_client, pro_plan):
+        """MKT-14 — 집계 제외 토글 + can_exclude(full=true) + 감사 로그."""
+        code = _make_code(pro_plan, code="EXCLUDEME")
+        detail = f"/api/v1/admin/referral-codes/{code.id}/"
+
+        before = staff_client.get(detail)
+        assert before.data["excluded_from_stats"] is False
+        assert before.data["can_exclude"] is True
+
+        res = staff_client.patch(detail, {"excluded_from_stats": True}, format="json")
+        assert res.status_code == 200
+        assert res.data["excluded_from_stats"] is True
+        code.refresh_from_db()
+        assert code.excluded_from_stats is True
+        # 목록에도 계속 나온다 (되돌릴 경로 유지)
+        listed = staff_client.get("/api/v1/admin/referral-codes/", {"search": "EXCLUDEME"})
+        assert listed.data["results"][0]["excluded_from_stats"] is True
+
+        log = (
+            AdminActionLog.objects.filter(
+                action=AdminActionLog.Action.REFERRAL_UPDATE, target_id=str(code.id)
+            )
+            .order_by("-id")
+            .first()
+        )
+        assert log.changes["excluded_from_stats"] == {"before": False, "after": True}
+
+    def test_exclude_does_not_block_customer_redemption(self, staff_client, pro_plan):
+        """⚠️ 집계 제외는 통계 전용 — 고객의 코드 사용을 막는 스위치는 is_active 다."""
+        code = _make_code(pro_plan, code="STILLUSABLE")
+        staff_client.patch(
+            f"/api/v1/admin/referral-codes/{code.id}/",
+            {"excluded_from_stats": True},
+            format="json",
+        )
+        code.refresh_from_db()
+        ok, reason = code.is_redeemable()
+        assert ok is True and reason == ""
+        # 어드민 응답의 is_redeemable 도 그대로 true
+        res = staff_client.get(f"/api/v1/admin/referral-codes/{code.id}/")
+        assert res.data["is_redeemable"] is True
+
     def test_max_uses_below_current_uses_400(self, staff_client, pro_plan):
         code = _make_code(pro_plan, code="TOOLOW", max_uses=10)
         _redeem(code, "u1@example.com")
@@ -344,9 +386,7 @@ class TestUpdate:
         assert res.data["description"] == "수정"
 
     def test_retrieve_404(self, staff_client):
-        res = staff_client.get(
-            "/api/v1/admin/referral-codes/00000000-0000-0000-0000-000000000000/"
-        )
+        res = staff_client.get("/api/v1/admin/referral-codes/00000000-0000-0000-0000-000000000000/")
         assert res.status_code == 404
 
 
