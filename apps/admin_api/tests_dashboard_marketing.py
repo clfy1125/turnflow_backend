@@ -2403,6 +2403,100 @@ class TestAttributionGap:
         assert bucket["unattributed"]["signups"] == 0
 
 
+@requires_analytics
+class TestLinkExcludedFromStats:
+    """MKT-12 — 링크를 집계에서 빼면 **행만** 사라지고 인원은 other 로 흡수된다.
+
+    인원까지 총합에서 없애면 `Σrows.signups + attribution_gap == 기간 가입자 수` 항등이
+    깨지고, 화면에서 "합계가 왜 안 맞나"를 설명해야 한다. 그 항등은 Q-C 로 고정한 것이다.
+    """
+
+    def _seed(self, *, excluded: bool):
+        now = timezone.now()
+        link = _mk_link("종료된 캠페인", source="meta", medium="cpc", campaign="ended")
+        if excluded:
+            link.excluded_from_stats = True
+            link.save(update_fields=["excluded_from_stats"])
+        utm = {"utm_source": "meta", "utm_medium": "cpc", "utm_campaign": "ended"}
+        LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="meta_ads", **utm)
+        u = _mk_user(joined=now)
+        SignupAttribution.objects.create(user=u, channel="meta_ads", signup_kind="email", **utm)
+        _mk_campaign(_mk_conn(u))  # 활성화까지 도달 — 파생 지표도 같이 흡수되는지 본다
+        return link
+
+    def test_row_disappears_but_people_move_to_other(self, staff_client, clean_slate):
+        link = self._seed(excluded=True)
+        res = staff_client.get(URL)
+
+        assert all(r["key"] != str(link.pk) for r in res.data["channels"]["rows"])
+        # 인원은 other 로 흡수 — 없어지지 않는다
+        other = _channel_row(res, "other")
+        assert other["signups"] == 1
+        assert other["visits"] == 1
+        src = _source(res, "excluded_link")
+        assert src["label"] == "집계에서 뺀 링크"
+        assert (src["visits"], src["signups"]) == (1, 1)
+        # 파생 지표도 같이 따라온다 (가입만 옮기고 활성화를 두면 other 가 어긋난다)
+        assert src["dm_campaign"] == 1
+        # 항등 유지 (Q-C)
+        gap = res.data["channels"]["attribution_gap"]["signups_unattributed"]
+        rows_signups = sum(r["signups"] for r in res.data["channels"]["rows"])
+        assert rows_signups + gap == _node(res, "signup")["count"]
+
+    def test_not_folded_into_unsaved_utm(self, staff_client, clean_slate):
+        """'저장 안 된 링크' 로 합치면 라벨이 거짓이 되고 combos 의 저장 버튼이 400 을 낸다."""
+        self._seed(excluded=True)
+        res = staff_client.get(URL)
+        keys = {s["key"] for s in _channel_row(res, "other")["sources"]}
+        assert "excluded_link" in keys
+        assert "unsaved_utm" not in keys
+        # 저장 유도 목록(combos)에도 실리지 않는다
+        assert "combos" not in _source(res, "excluded_link")
+
+    def test_removed_from_trends_and_funnel_too(self, staff_client, clean_slate):
+        """Q-B 교훈 — 한 곳만 고치면 같은 키가 카드마다 다른 인원을 뜻한다."""
+        link = self._seed(excluded=True)
+        res = staff_client.get(URL)
+
+        bucket = res.data["trends"]["buckets"][-1]
+        assert str(link.pk) not in bucket["by_channel"]
+        assert bucket["by_channel"]["other"]["signups"] == 1
+        # 버킷 총량·unattributed 는 그대로 (인원이 사라진 게 아니므로 항등 유지)
+        assert (
+            sum(s["signups"] for s in bucket["by_channel"].values())
+            + bucket["unattributed"]["signups"]
+            == bucket["signups"]
+        )
+        assert str(link.pk) not in {c["value"] for c in res.data["funnel"]["available_channels"]}
+        assert str(link.pk) not in res.data["funnel"]["variants"]
+
+    def test_toggle_off_restores_the_row(self, staff_client, clean_slate):
+        """되돌릴 경로가 없어지면 안 된다 — 목록에 남아 있고 다시 켜면 행이 돌아온다."""
+        link = self._seed(excluded=True)
+        assert all(r["key"] != str(link.pk) for r in staff_client.get(URL).data["channels"]["rows"])
+        link.excluded_from_stats = False
+        link.save(update_fields=["excluded_from_stats"])
+        cache.delete_many(list(CACHE_KEYS))
+        row = _channel_row(staff_client.get(URL), link.pk)
+        assert (row["visits"], row["signups"]) == (1, 1)
+
+    def test_active_link_wins_over_excluded_on_same_utm(self, staff_client, clean_slate):
+        """같은 4-튜플이 둘일 때(레거시) 제외된 쪽이 이기면 살아있는 행이 0 이 된다."""
+        excluded = _mk_link("옛 링크", source="meta", medium="cpc", campaign="dup")
+        excluded.excluded_from_stats = True
+        excluded.save(update_fields=["excluded_from_stats"])
+        active = _mk_link("새 링크", source="meta", medium="cpc", campaign="dup")
+        LandingVisit.objects.create(
+            visitor_id=uuid.uuid4(),
+            channel="meta_ads",
+            utm_source="meta",
+            utm_medium="cpc",
+            utm_campaign="dup",
+        )
+        res = staff_client.get(URL)
+        assert _channel_row(res, active.pk)["visits"] == 1
+
+
 class TestChannelLinkCacheBust:
     """MKT-11 — 저장 직후 확인하는 흐름이라 5분 지연이 '동작 안 함'으로 읽힌다."""
 

@@ -240,15 +240,25 @@ ROW_KIND_REFERRAL_CODE = "referral_code"
 OTHER_ROW_KEY = "other"
 OTHER_ROW_LABEL = "기타 (기본 링크로 들어옴)"
 
-# other 행 안의 소스 키 (리퍼러 파생 채널 + 아래 2개 특수 소스)
+# other 행 안의 소스 키 (리퍼러 파생 채널 + 아래 특수 소스들)
 SOURCE_BIOLINK = "biolink"
 SOURCE_UNSAVED_UTM = "unsaved_utm"
 SOURCE_DIRECT = "direct"
+# MKT-12: 저장은 됐지만 집계에서 뺀 링크로 들어온 유입. **unsaved_utm 으로 합치지 않는다** —
+# ① 라벨이 "저장 안 된 링크"인데 실제로는 저장돼 있어 거짓말이 되고, ② unsaved_utm 의
+# combos 에 실려 "이 조합으로 링크 저장" 버튼이 뜨는데 누르면 중복 400 이 난다(링크가 이미
+# 있으니까). 자기 줄로 두면 "뺀 인원이 얼마인지"도 펼침에서 보인다.
+SOURCE_EXCLUDED_LINK = "excluded_link"
 # 초과분을 접는 버킷 (SOURCE_ROWS_MAX). 파생 채널 키를 그대로 재사용한다.
 SOURCE_OTHER_REFERRAL = "other_referral"
-# 접기·판별상 특별 취급하는 소스 — 신호가 크거나(direct) 조치 가능해서(biolink/unsaved_utm)
-# 순위와 무관하게 항상 자기 줄을 유지한다.
-_SOURCE_NEVER_FOLD = (SOURCE_DIRECT, SOURCE_BIOLINK, SOURCE_UNSAVED_UTM)
+# 접기·판별상 특별 취급하는 소스 — 신호가 크거나(direct) 조치 가능해서(biolink/unsaved_utm/
+# excluded_link) 순위와 무관하게 항상 자기 줄을 유지한다.
+_SOURCE_NEVER_FOLD = (
+    SOURCE_DIRECT,
+    SOURCE_BIOLINK,
+    SOURCE_UNSAVED_UTM,
+    SOURCE_EXCLUDED_LINK,
+)
 
 # 소스 라벨 — CHANNEL_LABELS 보다 우선. direct 는 채널 표기("다이렉트")로 되돌리지 말 것:
 # 실제 의미는 "주소를 직접 입력했다"가 아니라 **리퍼러가 아예 없었다**(앱 내 이동·메신저
@@ -258,6 +268,7 @@ _SOURCE_LABEL_OVERRIDES = {
     SOURCE_BIOLINK: "고객 바이오링크 페이지",
     SOURCE_UNSAVED_UTM: "저장 안 된 링크(UTM)",
     SOURCE_DIRECT: "출처 미상",
+    SOURCE_EXCLUDED_LINK: "집계에서 뺀 링크",
 }
 
 # 고객 바이오링크 페이지(turnflow.link/@slug)의 'Powered by' 배지가 붙이는 UTM.
@@ -314,6 +325,7 @@ def _resolve_row_key(source, medium, campaign, content, referrer, channel, link_
     판정 순서 (앞이 이김):
       1. 바이오링크 경유          → other / biolink
       2. UTM 있음 + 저장 링크 일치 → 그 링크 행
+      2b. 그 링크가 집계 제외      → other / excluded_link  (MKT-12 — 행은 없애고 인원은 흡수)
       3. UTM 있음 + 미매칭        → other / unsaved_utm  ("링크를 저장 안 하고 쓰는 중" 신호)
       4. UTM 없음                → other / 저장된 파생 채널(리퍼러 추정)
     제휴코드 오버레이는 **가입자에게만** 적용되며 호출부에서 먼저 처리한다.
@@ -330,6 +342,10 @@ def _resolve_row_key(source, medium, campaign, content, referrer, channel, link_
         link_pk = link_index.get(key)
         if link_pk is not None:
             return str(link_pk), None
+        # MKT-12: 값이 None 이면서 키가 있는 경우 = **저장은 됐지만 집계 제외된 링크**.
+        # 없는 키(get→None)와 구분해야 하므로 `in` 으로 다시 본다.
+        if key in link_index:
+            return OTHER_ROW_KEY, SOURCE_EXCLUDED_LINK
         return OTHER_ROW_KEY, SOURCE_UNSAVED_UTM
     if not channel or channel == "unknown":
         return OTHER_ROW_KEY, SOURCE_DIRECT
@@ -337,16 +353,22 @@ def _resolve_row_key(source, medium, campaign, content, referrer, channel, link_
 
 
 def _link_index(links) -> dict:
-    """[MarketingChannelLink] → {4-튜플: pk}. 같은 조합이 둘이면 **먼저 만든 링크**가 이긴다.
+    """[MarketingChannelLink] → {4-튜플: pk | None}. ``None`` = **집계 제외된 링크**(MKT-12).
 
-    저장 시 중복 조합은 시리얼라이저가 400 으로 막지만(serializers.marketing),
-    그 검증 이전에 만들어진 데이터가 있을 수 있어 결정적 규칙을 둔다.
+    키를 지우지 않고 None 을 넣는 이유: 지우면 그 유입이 '저장 안 된 링크(UTM)'로 흘러가
+    라벨이 거짓이 되고 combos 의 "이 조합으로 링크 저장"이 중복 400 을 낸다. 키를 남겨
+    ``_resolve_row_key`` 가 전용 소스로 보낸다.
+
+    같은 조합이 둘이면 **집계에 포함된 링크가 먼저**, 그 다음 **먼저 만든 링크**가 이긴다.
+    저장 시 중복 조합은 시리얼라이저가 400 으로 막지만(serializers.marketing) 그 검증
+    이전 데이터가 있을 수 있고, 활성 링크를 우선하지 않으면 **동일 조합의 다른 링크를
+    제외했을 때 살아있는 링크의 행이 0 이 되는** 놀라운 동작이 된다.
     """
     index: dict = {}
-    for link in sorted(links, key=lambda x: (x.created_at, x.pk)):
+    for link in sorted(links, key=lambda x: (x.excluded_from_stats, x.created_at, x.pk)):
         index.setdefault(
             _utm_key(link.utm_source, link.utm_medium, link.utm_campaign, link.utm_content),
-            link.pk,
+            None if link.excluded_from_stats else link.pk,
         )
     return index
 
@@ -1554,6 +1576,8 @@ def _channel_rows(start, end, flags: tuple, visit_rows: list[tuple]) -> list[dic
       Σsources.visits > other.visits 가 될 수 있다(둘 다 정확한 값).
     - link: 저장한 채널 링크 1개 = 1행. **방문 0이어도 행이 나온다** — "만들었는데
       아무도 안 온 링크"를 보는 것이 이 화면의 용도다.
+      단 ``excluded_from_stats=True`` 인 링크는 **행이 나오지 않고**(MKT-12) 그 유입은
+      other 행의 ``excluded_link`` 소스로 흡수된다 — 인원을 총합에서 빼지는 않는다.
     - referral_code: 제휴코드 1개 = 1행, 최상위. 코드는 채널과 같은 층의 유입 경로다.
       사용 0건이어도 행이 나오고, visits/signup_rate 는 항상 null.
 
@@ -1667,6 +1691,10 @@ def _channel_rows(start, end, flags: tuple, visit_rows: list[tuple]) -> list[dic
             "referral_overlap": referral_overlap.get(str(link.pk), 0),
         }
         for link in links
+        # MKT-12 의 '행 제거' 지점. 인원은 사라지지 않는다 — _link_index 가 이 링크의
+        # 4-튜플을 None 으로 표시해 유입이 other/excluded_link 로 흡수되므로
+        # `Σrows.signups + attribution_gap == 기간 가입자 수` 항등이 유지된다.
+        if not link.excluded_from_stats
     ]
     link_rows.sort(key=lambda r: (-r["signups"], -(r["visits"] or 0), r["label"]))
     rows.extend(link_rows)

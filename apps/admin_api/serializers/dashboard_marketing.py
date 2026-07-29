@@ -290,9 +290,10 @@ class _ChannelSourceRowSerializer(_ChannelPerfMixin):
     key = serializers.CharField(
         help_text="소스 키. **리퍼러 파생 채널 9종**(instagram_organic / facebook_organic / "
         "youtube_organic / tiktok_organic / threads_organic / blog_organic / search_organic / "
-        "other_referral / direct) + **특수 2종**: biolink(고객 바이오링크 배지 경유) / "
-        "unsaved_utm(UTM 은 있는데 저장된 채널 링크와 매칭 안 됨). "
-        "UTM 이 붙은 유입은 링크 행 아니면 unsaved_utm 으로 가므로 **유료 채널 키"
+        "other_referral / direct) + **특수 3종**: biolink(고객 바이오링크 배지 경유) / "
+        "unsaved_utm(UTM 은 있는데 저장된 채널 링크와 매칭 안 됨) / "
+        "**excluded_link**(저장은 됐지만 집계에서 뺀 링크 — MKT-12). "
+        "UTM 이 붙은 유입은 링크 행 아니면 unsaved_utm/excluded_link 으로 가므로 **유료 채널 키"
         "(meta_ads 등)는 여기 나타나지 않는다**. "
         'direct 는 "가입 귀속 기록 없음"(구 unknown)까지 포함한다'
     )
@@ -314,7 +315,7 @@ class _ChannelRowSerializer(_ChannelPerfMixin):
     | kind | 무엇 | 전용 필드 |
     |---|---|---|
     | `other` | 리퍼러로 '추정'한 유입 전부를 접은 1행 (항상 첫 행, 1개) | `sources` |
-    | `link` | 저장한 채널 링크 1개 (방문 0이어도 행이 나온다) | `channel`,`url`,`utm`,`created_by_email` |
+    | `link` | 저장한 채널 링크 1개 (방문 0이어도 행이 나온다. **집계 제외 링크는 행이 없다** — MKT-12) | `channel`,`url`,`utm`,`created_by_email` |
     | `referral_code` | 제휴 코드 1개 (사용 0건이어도 행이 나온다) | `description`,`redemptions`,`converted`,`conversion_rate` |
 
     배열 **순서를 그대로 렌더**하면 된다 (정렬 정책은 서버 소유): other → link(가입 desc)
@@ -419,7 +420,11 @@ class _ChannelsSerializer(serializers.Serializer):
     rows = _ChannelRowSerializer(
         many=True,
         help_text="채널별 성과 3종 (other → link → referral_code, 각 그룹 내부는 가입 desc). "
-        "어트리뷰션 미탑재여도 link/referral_code 행은 나온다(각각 admin/billing 소스)",
+        "어트리뷰션 미탑재여도 link/referral_code 행은 나온다(각각 admin/billing 소스). "
+        "**개수 상한 없음** — 1(other) + 저장 링크 전체 + 제휴 코드 전체가 전부 실린다"
+        "(잘리지 않으므로 `_truncated` 플래그도 없다). 표가 길어지면 링크를 "
+        "`excluded_from_stats` 로 빼는 것이 정리 수단이다(MKT-12). 상한이 있는 것은 "
+        "`sources`(8) · `funnel.available_channels`(저장 링크 10) · `combos`(10) 뿐이다",
     )
     attribution_gap = _AttributionGapSerializer(
         help_text="MKT-10 — 어느 채널에도 집계되지 않은 가입 인원 (채널 행이 아니라 표의 "

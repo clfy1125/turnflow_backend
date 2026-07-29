@@ -179,6 +179,17 @@ class TestRenameAndDelete:
             action=AdminActionLog.Action.CHANNEL_LINK_UPDATE
         ).exists()
 
+    def test_name_accepts_255_chars(self, staff_client):
+        """MKT-13 — 프론트가 `캠페인 · 콘텐츠` 로 자동 조합해 최대 203자가 된다."""
+        long_name = "가" * 255
+        res = staff_client.post(URL, {**PAYLOAD, "name": long_name}, format="json")
+        assert res.status_code == 201
+        assert res.data["name"] == long_name
+
+    def test_name_over_255_is_400(self, staff_client):
+        res = staff_client.post(URL, {**PAYLOAD, "name": "가" * 256}, format="json")
+        assert res.status_code == 400
+
     def test_delete_204(self, staff_client):
         link_id = staff_client.post(URL, PAYLOAD, format="json").data["id"]
         res = staff_client.delete(f"{URL}{link_id}/")
@@ -190,3 +201,46 @@ class TestRenameAndDelete:
 
     def test_delete_missing_404(self, staff_client):
         assert staff_client.delete(f"{URL}999999/").status_code == 404
+
+
+class TestExcludeFromStats:
+    """MKT-12 — 집계 제외 토글 + 되돌리기 + 감사 로그."""
+
+    def test_default_false_and_can_exclude_true_for_full(self, staff_client):
+        res = staff_client.post(URL, PAYLOAD, format="json")
+        assert res.data["excluded_from_stats"] is False
+        assert res.data["can_exclude"] is True  # full 역할
+
+    def test_toggle_on_and_off(self, staff_client):
+        link_id = staff_client.post(URL, PAYLOAD, format="json").data["id"]
+
+        on = staff_client.patch(f"{URL}{link_id}/", {"excluded_from_stats": True}, format="json")
+        assert on.status_code == 200
+        assert on.data["excluded_from_stats"] is True
+        assert on.data["name"] == PAYLOAD["name"]  # 이름은 안 건드림
+
+        # 목록에는 계속 나온다 — 되돌릴 경로가 없어지면 안 된다
+        listed = staff_client.get(URL, {"search": PAYLOAD["name"]})
+        row = next(r for r in listed.data["results"] if r["id"] == link_id)
+        assert row["excluded_from_stats"] is True
+
+        off = staff_client.patch(f"{URL}{link_id}/", {"excluded_from_stats": False}, format="json")
+        assert off.data["excluded_from_stats"] is False
+
+    def test_toggle_is_audited(self, staff_client):
+        link_id = staff_client.post(URL, PAYLOAD, format="json").data["id"]
+        staff_client.patch(f"{URL}{link_id}/", {"excluded_from_stats": True}, format="json")
+        log = (
+            AdminActionLog.objects.filter(
+                action=AdminActionLog.Action.CHANNEL_LINK_UPDATE, target_id=link_id
+            )
+            .order_by("-id")
+            .first()
+        )
+        assert log is not None
+        assert log.changes["excluded_from_stats"] == {"before": False, "after": True}
+
+    def test_empty_patch_is_400(self, staff_client):
+        """빈 PATCH 가 감사 로그만 남기고 지나가지 않게."""
+        link_id = staff_client.post(URL, PAYLOAD, format="json").data["id"]
+        assert staff_client.patch(f"{URL}{link_id}/", {}, format="json").status_code == 400

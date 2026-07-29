@@ -87,6 +87,9 @@ FORBIDDEN_MESSAGE = "이 계정에 허용되지 않은 어드민 영역입니다
 # RBAC-4-b: 경로는 허용됐지만 **남의 링크**라 거부 — 프론트가 다른 문구를 띄운다.
 NOT_LINK_OWNER_CODE = "not_link_owner"
 NOT_LINK_OWNER_MESSAGE = "다른 관리자가 만든 링크는 삭제할 수 없습니다."
+# MKT-12: 집계 제외 토글은 **다른 사람이 보는 숫자를 바꾸는 행위**라 full 전용.
+EXCLUDE_FORBIDDEN_CODE = "exclude_not_allowed"
+EXCLUDE_FORBIDDEN_MESSAGE = "집계 제외 설정은 전체 권한 관리자만 변경할 수 있습니다."
 
 
 def admin_role(user) -> str:
@@ -166,6 +169,20 @@ def can_delete_channel_link(role: str, user, link) -> bool:
         return True
     owner_id = getattr(link, "created_by_id", None)
     return bool(owner_id) and owner_id == getattr(user, "id", None)
+
+
+def can_exclude_channel_link_from_stats(role: str) -> bool:
+    """이 요청자가 채널 링크를 **집계에서 뺄** 수 있는가 (MKT-12 단일 소스).
+
+    삭제(:func:`can_delete_channel_link`)와 성격이 다르므로 판정도 다르다:
+    - 삭제는 "자기가 만든 것을 치우는" 일이라 소유자 스코프로 충분하다.
+    - 집계 제외는 **다른 사람이 보는 숫자를 바꾼다** — 외주가 자기 링크를 숨기면
+      운영자가 그 성과를 볼 수 없게 된다. 그래서 소유자 여부와 무관하게 full 전용.
+
+    응답의 ``can_exclude`` 플래그와 PATCH 게이트가 반드시 이 함수를 함께 써야 한다
+    (갈라지면 화면의 토글과 실제 동작이 어긋난다).
+    """
+    return not is_restricted(role)
 
 
 def user_ref(user_id) -> str:
