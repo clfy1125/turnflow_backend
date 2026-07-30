@@ -4457,6 +4457,112 @@ def _verify_webhook_signature(request, logger) -> bool:
     return _hmac.compare_digest(received, expected)
 
 
+def _capture_comment_webhook_raw(payload: dict, logger) -> None:
+    """댓글 웹훅 **원문 계측** (관측 전용 — 발송/스팸 로직에 일절 영향 없음).
+
+    왜 필요한가 (2026-07-30):
+        광고(Paid partnership)로 유입된 댓글이 comments 웹훅으로 오는지, 온다면 어떤
+        형태인지를 **데이터로** 판정할 수단이 지금 없다. 현재 원문이 남는 곳은
+        ``SentDMLog.webhook_payload``(=캠페인이 매칭돼 DM 이 생긴 건만)와
+        ``SpamCommentLog``(=스팸필터 활성 계정만)뿐이라, **매칭되지 않은 댓글은 흔적
+        없이 사라진다** — 즉 "웹훅이 안 왔다"와 "왔는데 우리가 버렸다"를 구분할 수 없다.
+
+    Meta 공식 문서(Webhook Notification Examples)는 로그인 방식별로 payload 가 다르다:
+        - Business Login for Instagram(우리 방식): ``entry.field`` / ``entry.value``
+          (changes 배열 **없음**), ``value.id``, ``media={id, media_product_type}``
+        - Facebook Login for Business: ``entry.changes[].value``, ``value.comment_id``,
+          ``media={id, ad_id, ad_title, original_media_id, media_product_type}``
+      우리 뷰는 ``entry.changes[]`` 만 읽는다 → 만약 일부 알림이 flat 형태로 온다면
+      **뷰에서 조용히 버려진다**. 이 계측은 그 형태(shape)까지 기록해 판정한다.
+
+    저장소: 기존 ``EventInbox``(일별 파티션, ``maintain_partitions`` 가 7일 후 DROP)
+        → **마이그레이션 불필요·TTL 자동**. ``event_key`` 에 수신 시각(µs)을 넣어 매 도착을
+        개별 행으로 남긴다(Meta 의 중복 알림 자체가 관측 대상이므로 dedupe 하지 않는다).
+
+    볼륨: messaging(echo/read, 7일 4.6만건)은 제외하고 댓글류만 → 일 ~1천건.
+
+    실패는 전부 삼킨다 — Meta 에 200 을 돌려주는 것이 최우선이며, 이 함수는 진단용이다.
+    """
+    if not getattr(settings, "COMMENT_WEBHOOK_RAW_CAPTURE", True):
+        return
+    try:
+        from .models import EventInbox
+
+        now = timezone.now()
+        stamp = int(now.timestamp() * 1_000_000)
+        rows = []
+        for idx, entry in enumerate(payload.get("entry") or []):
+            if not isinstance(entry, dict):
+                continue
+            # messaging(DM echo/read)은 고볼륨 — 계측 대상 아님
+            if entry.get("messaging"):
+                continue
+
+            changes = entry.get("changes")
+            if isinstance(changes, list) and changes:
+                shape, units = "changes", changes
+            elif entry.get("field") is not None:
+                shape, units = "flat", [entry]  # ★ 현재 뷰가 처리하지 못하는 형태
+            else:
+                shape, units = "unknown", [entry]
+
+            for uidx, unit in enumerate(units):
+                unit = unit if isinstance(unit, dict) else {}
+                value = unit.get("value") if isinstance(unit.get("value"), dict) else {}
+                media = value.get("media") if isinstance(value.get("media"), dict) else {}
+                frm = value.get("from") if isinstance(value.get("from"), dict) else {}
+                cid = str(value.get("id") or value.get("comment_id") or "")
+                extracted = {
+                    "shape": shape,
+                    "field": unit.get("field"),
+                    "entry_id": entry.get("id"),
+                    "entry_time": entry.get("time"),
+                    "comment_id": cid,
+                    "parent_id": value.get("parent_id"),
+                    "from_id": frm.get("id"),
+                    "from_username": frm.get("username"),
+                    "text": value.get("text"),
+                    "media_id": media.get("id"),
+                    "media_product_type": media.get("media_product_type"),
+                    # ★ 광고 판정 3종 — 우리 로그인 방식에서 실제로 오는지가 이 계측의 핵심
+                    "ad_id": media.get("ad_id"),
+                    "ad_title": media.get("ad_title"),
+                    "original_media_id": media.get("original_media_id"),
+                    "media_keys": sorted(media.keys()),
+                    "value_keys": sorted(value.keys()),
+                }
+                is_ad = bool(
+                    media.get("ad_id")
+                    or media.get("ad_title")
+                    or media.get("original_media_id")
+                    or str(media.get("media_product_type") or "").upper() == "AD"
+                )
+                rows.append(
+                    EventInbox(
+                        event_key=f"cmtraw:{stamp}:{idx}:{uidx}:{cid[:40]}"[:255],
+                        event_type="comment_raw_ad" if is_ad else "comment_raw",
+                        payload={"extracted": extracted, "entry": entry},
+                        processed_at=now,  # 후속 처리 대상 아님 — pending 조회에 안 걸리게
+                    )
+                )
+        if rows:
+            EventInbox.objects.bulk_create(rows, ignore_conflicts=True)
+            ads = [r for r in rows if r.event_type == "comment_raw_ad"]
+            if ads:
+                logger.warning(
+                    "AD COMMENT WEBHOOK DETECTED: %s",
+                    [r.payload["extracted"] for r in ads],
+                )
+            flats = [r for r in rows if r.payload["extracted"]["shape"] != "changes"]
+            if flats:
+                logger.warning(
+                    "NON-CHANGES WEBHOOK SHAPE DETECTED (현재 뷰가 처리 못 하는 형태): %s",
+                    [r.payload["extracted"] for r in flats],
+                )
+    except Exception:  # noqa: BLE001
+        logger.debug("comment webhook raw capture 실패 (non-fatal)", exc_info=True)
+
+
 @api_view(["GET", "POST"])
 @permission_classes([AllowAny])
 def instagram_webhook(request):
@@ -4510,6 +4616,12 @@ def instagram_webhook(request):
             if payload.get("object") != "instagram":
                 logger.warning(f"Unknown webhook object type: {payload.get('object')}")
                 return HttpResponse("EVENT_RECEIVED", status=200)
+
+            # ★ 진단 계측 (관측 전용, 실패 무해) — 광고 유입 댓글이 comments 웹훅으로
+            #   오는지 / changes·flat 어느 형태로 오는지를 원문째로 남긴다.
+            #   반드시 아래 dispatch 루프 **전에**, 형태 해석 없이 호출한다(버려지는
+            #   payload 까지 잡아야 하므로). 상세는 _capture_comment_webhook_raw docstring.
+            _capture_comment_webhook_raw(payload, logger)
 
             # entry 배열 처리
             entries = payload.get("entry", [])
