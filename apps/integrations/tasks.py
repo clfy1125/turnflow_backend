@@ -608,6 +608,24 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
         from_username = str(from_user.get("username") or "")
         media = value.get("media") or {}
         media_id = str(media.get("id") or "")
+        # ★ 광고(Paid partnership/부스팅) 유입 댓글 — 2026-07-30 prod 실측으로 확인.
+        #   광고 배포로 들어온 사용자가 댓글을 달면 payload 의 ``media.id`` 는 **광고 카피의
+        #   미디어 id** 이고, 원본 게시물은 ``media.original_media_id`` 로만 내려온다:
+        #     media = {"id": "18083495273654753", "ad_id": "120250784238480294",
+        #              "original_media_id": "18085701743661167", "media_product_type": "AD"}
+        #   media.id 단독 비교로는 캠페인이 매칭되지 않아 **DM·장부·로그 어디에도 흔적 없이
+        #   드롭됐다**(@ellisa_levelup AI Note2 실측: SentDMLog 0건 / SeenComment 0건).
+        #   광고 미디어는 organic comments edge 에도 안 나와(별개 permalink) 폴링 보정도 불가 →
+        #   웹훅에서 original_media_id 를 살리는 것이 유일한 회수 경로다.
+        #   ⚠️ Meta 공식 문서의 "Business Login for Instagram" 예제에는 이 필드가 없지만
+        #      실제로는 온다(문서가 불완전). 판정 근거는 계측 원문 — views.py
+        #      _capture_comment_webhook_raw 참고.
+        origin_media_id = str(media.get("original_media_id") or "")
+        # 매칭 후보 = 광고 미디어 + 원본 미디어 (일반 댓글은 원소 1개로 기존과 동일 동작)
+        media_id_candidates = [m for m in (media_id, origin_media_id) if m]
+        # 캠페인·장부·next_media attach 처럼 "원본 게시물" 기준이어야 하는 곳에 쓸 id.
+        # 광고 카피 id 로 캠페인을 attach 하거나 폴링 앵커를 남기면 안 된다.
+        canonical_media_id = origin_media_id or media_id
         page_ig_user_id = str(webhook_payload.get("entry_id") or "")
 
         # 필수: comment_id + entry_id + 신원키(id/username 중 하나).
@@ -644,7 +662,7 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
                 from_username=from_username,
                 comment_id=comment_id,
                 comment_text=comment_text,
-                media_id=media_id,
+                media_id=canonical_media_id,
                 source="webhook_reply",
             )
             if routed:
@@ -656,7 +674,7 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
         #   매체 불문 True 라 오발송 위험. SeenComment/next_media attach 도 media 가 필요.
         #   복구 재댓글 라우팅만 시도한다 (media 미상이므로 SPECIFIC_MEDIA pending 은
         #   matches_media 스코핑이 fail-closed, ANY_MEDIA 만 라우팅 가능).
-        if not media_id:
+        if not media_id_candidates:
             routed = _maybe_route_recovery_recomment(
                 page_ig_user_id=page_ig_user_id,
                 from_user_id=from_user_id,
@@ -684,10 +702,14 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
         for c in candidate_qs:
             if (
                 c.trigger_type == AutoDMCampaign.TriggerType.SPECIFIC_MEDIA
-                and c.media_id == media_id
+                and c.media_id in media_id_candidates
             ):
                 seen_conn_ids.add(c.ig_connection_id)
-            if c.matches_media(media_id) and c.matches_keyword(comment_text):
+            # 광고 유입은 media.id(광고 카피) 대신 original_media_id 로 매칭돼야 한다 →
+            # 후보 중 하나라도 맞으면 매칭. 일반 댓글은 후보가 1개라 기존 동작과 동일.
+            if any(c.matches_media(m) for m in media_id_candidates) and c.matches_keyword(
+                comment_text
+            ):
                 matched_campaigns.append(c)
 
         # ★ 누락 보정 장부 기록: 웹훅 payload(value.id / value.media.id)만으로 생성 — 별도 Meta API 불필요.
@@ -697,7 +719,7 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
                 _record_seen_comment(
                     ig_connection_id=conn_id,
                     comment_id=comment_id,
-                    media_id=media_id,
+                    media_id=canonical_media_id,
                     source=SeenComment.Source.WEBHOOK,
                     triggered=bool(matched_campaigns),
                 )
@@ -718,7 +740,7 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
         if unattached_next:
             attached_now = _maybe_attach_next_media_from_webhook(
                 unattached_campaigns=unattached_next,
-                webhook_media_id=media_id,
+                webhook_media_id=canonical_media_id,
                 comment_text=comment_text,
             )
             if attached_now:
@@ -737,7 +759,7 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
             from_username=from_username,
             comment_id=comment_id,
             comment_text=comment_text,
-            media_id=media_id,
+            media_id=canonical_media_id,
             source="webhook",
         )
 
@@ -801,7 +823,11 @@ def run_spam_filter_check(self, webhook_payload: dict):
         from_user_id = from_user.get("id")
         from_username = from_user.get("username")
         media = value.get("media", {})
-        media_id = media.get("id")
+        # ★ 광고 유입 댓글은 media.id 가 광고 카피의 미디어라 원본 게시물 기준으로 봐야 한다.
+        #   여기서 원본으로 정규화해야 _comment_triggers_active_campaign(캠페인 트리거 댓글
+        #   스팸 면제)이 제대로 동작한다 — 안 그러면 광고로 들어온 정상 트리거 댓글이
+        #   면제를 못 받고 스팸으로 숨겨질 수 있다. 상세는 process_comment_and_send_dm 주석.
+        media_id = media.get("original_media_id") or media.get("id")
         entry_id = str(webhook_payload.get("entry_id") or "")
 
         if not all([comment_id, from_user_id, entry_id]):
