@@ -24,6 +24,9 @@ urlpatterns = [
     path("ai/", include("apps.ai_jobs.urls", namespace="ai_jobs")),
     path("insights/", include("apps.insights.urls", namespace="insights")),
     path("track/", include("apps.analytics.urls", namespace="analytics")),
+    # 인스타 성장 리포트(프로 전용, PDF). integrations 라우터가 `instagram` 을 ViewSet
+    # prefix 로 쓰고 있어 `integrations/instagram/reports/` 는 pk="reports" 로 먹힌다 → 별도 prefix.
+    path("insta-reports/", include("apps.insta_reports.urls", namespace="insta_reports")),
     path("admin/emails/", include("apps.emails.urls_admin", namespace="admin_emails")),
     path("admin/", include("apps.pages.admin_urls", namespace="admin_pages")),
     path("admin/", include("apps.admin_api.urls", namespace="admin_api")),

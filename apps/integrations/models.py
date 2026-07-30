@@ -91,6 +91,18 @@ class IGAccountConnection(models.Model):
         verbose_name="Profile Picture Last Synced At",
     )
 
+    # ── 프로필 통계 캐시 ──
+    # 분석 팝업이 "@reels_drgn · 팔로워 98,293 · 게시물 672개" 를 그리는 데 쓴다.
+    # IG /me 응답을 그대로 캐싱하고, 6시간 지나면 조회 시점에 갱신한다
+    # (apps.insta_reports.ig_profile.refresh_stats — fail-soft, 실패 시 캐시값 유지).
+    followers_count = models.PositiveIntegerField(null=True, blank=True, verbose_name="팔로워 수")
+    follows_count = models.PositiveIntegerField(null=True, blank=True, verbose_name="팔로잉 수")
+    media_count = models.PositiveIntegerField(null=True, blank=True, verbose_name="게시물 수")
+    biography = models.TextField(blank=True, default="", verbose_name="프로필 소개글")
+    stats_synced_at = models.DateTimeField(
+        null=True, blank=True, verbose_name="프로필 통계 갱신 시각"
+    )
+
     # OAuth Tokens (encrypted)
     _encrypted_access_token = models.TextField(verbose_name="Encrypted Access Token")
     access_token = EncryptedTextField("_encrypted_access_token")

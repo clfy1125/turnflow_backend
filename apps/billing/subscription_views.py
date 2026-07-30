@@ -98,7 +98,9 @@ class SubscriptionPlanListView(APIView):
   "analytics_export": false, // 기간별 분석·엑셀 다운로드 제공 여부
   "spam_filter": false,      // 스팸 댓글 필터링 제공 여부
   "dm_recovery": false,      // 실패 DM 복구(대댓글 안내→재전송) 제공 여부 (프로 전용)
-  "max_ig_accounts": 1       // 연동 가능 IG 계정 수 (-1 = 무제한, 프로는 추가 구매 가능)
+  "max_ig_accounts": 1,      // 연동 가능 IG 계정 수 (-1 = 무제한, 프로는 추가 구매 가능)
+  "insta_report": false,     // 인스타 성장 리포트(PDF) 제공 여부 (프로 전용)
+  "insta_report_monthly_per_account": 0  // IG 계정당 월 리포트 생성 횟수 (프로 1, -1 = 무제한)
 }
 ```
 
@@ -143,6 +145,8 @@ plans.forEach(plan => {
                                     "spam_filter": False,
                                     "dm_recovery": False,
                                     "max_ig_accounts": 1,
+                                    "insta_report": False,
+                                    "insta_report_monthly_per_account": 0,
                                 },
                                 "sort_order": 0,
                             },
@@ -163,6 +167,8 @@ plans.forEach(plan => {
                                     "spam_filter": False,
                                     "dm_recovery": False,
                                     "max_ig_accounts": 1,
+                                    "insta_report": False,
+                                    "insta_report_monthly_per_account": 0,
                                 },
                                 "sort_order": 1,
                             },
@@ -183,6 +189,8 @@ plans.forEach(plan => {
                                     "spam_filter": True,
                                     "dm_recovery": True,
                                     "max_ig_accounts": 1,
+                                    "insta_report": True,
+                                    "insta_report_monthly_per_account": 1,
                                 },
                                 "sort_order": 2,
                             },

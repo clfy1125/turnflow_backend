@@ -343,6 +343,33 @@ services:
     networks:
       - turnflow_instagram_net
 
+  # ── Celery: 인스타 성장 리포트 전용 — 1건 13~18분(영상 30여개 다운로드 + Gemini 30콜 +
+  #    추론모델 합성 + Chromium PDF). 다른 큐를 head-of-line blocking 하지 않게 완전 분리한다.
+  #    ⚠️ --max-tasks-per-child=1 필수: 태스크마다 영상 임시파일 + Chromium 을 확실히 회수한다
+  #       (미설정 시 자식이 살아남아 메모리가 누적된다 — dev 워커 27GiB 사례).
+  celery_reports:
+    image: *app_image
+    restart: unless-stopped
+    init: true
+    logging: *default_logging
+    ulimits: *default_ulimits
+    shm_size: "1gb"   # Chromium(PDF 변환) 렌더용 shm
+    command: >
+      celery -A config worker --concurrency=2 --prefetch-multiplier=1
+      --max-tasks-per-child=1 -l info -Q reports
+    env_file: [.env.production]
+    environment: *app_env
+    volumes:
+      - turnflow_instagram_logs:/app/logs
+    depends_on:
+      pgbouncer: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "4", memory: 8G }
+    networks:
+      - turnflow_instagram_net
+
   # ── Celery: billing batches + backup health-check (low rate, isolated) ──
   celery_billing:
     image: *app_image

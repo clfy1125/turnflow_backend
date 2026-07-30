@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from apps.emails.constants import (
     TEMPLATE_EMAIL_VERIFICATION,
+    TEMPLATE_INSTA_REPORT_READY,
     TEMPLATE_ONBOARDING_DAY_3,
     TEMPLATE_ONBOARDING_DAY_7,
     TEMPLATE_ONBOARDING_DAY_14,
@@ -296,6 +297,29 @@ DEFAULTS: dict[str, dict[str, str]] = {
             preheader="{{ service_name }} 캠페인 데이터가 그대로 보관돼 있어요",
         ),
     },
+    TEMPLATE_INSTA_REPORT_READY: {
+        "subject": "[{{ service_name }}] @{{ ig_username }} 인스타 분석 리포트가 완성됐어요 📊",
+        "html_body": _wrap(
+            """
+<p style="font-size:18px;font-weight:700;color:#111827;margin:0 0 4px;">리포트가 완성됐어요 📊</p>
+<p style="margin:0 0 6px;color:#4b5563;"><strong>{{ full_name }}</strong>님, 요청하신 <strong>@{{ ig_username }}</strong> 계정의 성장 리포트가 준비됐습니다. 아래 버튼으로 열어 보세요.</p>
+"""
+            + _detail_rows(
+                [
+                    ("분석한 계정", "{{ ig_name }} (@{{ ig_username }})"),
+                    ("분석 기간", "{{ period_text }}"),
+                    ("분석한 게시물", "{{ posts_analyzed }}개"),
+                    ("AI 가 본 영상", "{{ videos_analyzed }}개"),
+                    ("분석한 댓글", "{{ comments_analyzed }}개"),
+                ]
+            )
+            + _btn("{{ report_url }}", "리포트 열어보기")
+            + """
+<p style="font-size:13px;color:#9ca3af;margin:0;">리포트는 콘솔에 계속 보관되니 언제든 다시 내려받을 수 있어요. 문의 사항은 <a href="mailto:{{ support_email }}" style="color:#7C3AED;">{{ support_email }}</a>로 알려 주세요.</p>
+""",
+            preheader="@{{ ig_username }} 성장 리포트 · {{ period_text }}",
+        ),
+    },
 }
 
 
@@ -332,6 +356,14 @@ SAMPLE_CONTEXT: dict[str, str] = {
     # pause resume / winback
     "resume_date": "2026-12-03",
     "resubscribe_url": "https://app.turnflow.link/billing/plans",
+    # insta report ready
+    "ig_username": "reels_drgn",
+    "ig_name": "이지용 | 릴스 드래곤",
+    "period_text": "2026-02-03 ~ 2026-07-28",
+    "posts_analyzed": "100",
+    "videos_analyzed": "28",
+    "comments_analyzed": "214",
+    "report_url": "https://app.turnflow.link/insta-reports/8f14e45f",
     # company footer
     "company_name": "주식회사 씨엘에프와이 (CLFY Co., Ltd.)",
     "company_ceo": "김시현",

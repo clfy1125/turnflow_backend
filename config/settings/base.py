@@ -46,6 +46,7 @@ INSTALLED_APPS = [
     "apps.youtube",
     "apps.admin_api",
     "apps.analytics",
+    "apps.insta_reports",
 ]
 
 MIDDLEWARE = [
@@ -397,6 +398,9 @@ CELERY_TASK_ROUTES = {
     "apps.ai_jobs.tasks.*": {"queue": "ai_jobs"},
     # DM 캠페인 이전 분석(최대 ~25분 LLM/IO) — dm_send/webhook 큐 블로킹 방지 위해 ai_jobs 로.
     "integrations.run_dm_migration_job": {"queue": "ai_jobs"},
+    # 인스타 성장 리포트 — 1건 13~18분(영상 30여개 AI 분석 + 추론모델 합성 + Chromium PDF).
+    # 전용 큐 + 전용 워커(-Q reports -c 2 --max-tasks-per-child=1) 로 완전 격리한다.
+    "insta_reports.*": {"queue": "reports"},
 }
 
 # Celery Beat Schedule (정기 결제 + DM 발송 보증 워커)
@@ -598,6 +602,20 @@ CELERY_BEAT_SCHEDULE = {
     #     "task": "insights.refresh_account_audience_insights",
     #     "schedule": 60 * 60 * 24,  # 24시간 — 계정 단위 follow_type 도달 분포
     # },
+    # ===== 인스타 성장 리포트 =====
+    # 30분마다 — 워커 OOM/강제종료로 running 에 박힌 잡을 실패 확정(동시 생성 1건 제한 해제).
+    # 실제 구동은 core.ScheduledJob(0011 시드). CELERY_BEAT_SCHEDULE 은 dev 패리티/문서용.
+    "insta-reports-sweep-stale": {
+        "task": "insta_reports.sweep_stale",
+        "schedule": 60 * 30,  # 30분
+        "options": {"queue": "reports"},
+    },
+    # 매일 KST 04:40 — 90일 경과 AI 캐시(댓글 분류) 정리. 리포트 PDF·집계는 보관.
+    "insta-reports-purge-caches": {
+        "task": "insta_reports.purge_caches",
+        "schedule": crontab(hour=4, minute=40),  # CELERY_TIMEZONE=Asia/Seoul 기준
+        "options": {"queue": "reports"},
+    },
     # NOTE: 아래는 deprecate (v3.5/v3.6) 로 Beat 에서 제거됨:
     #   - dm-expire-gate-pending: Follow-gate 가 deprecated 됨
     #   - dm-poll-new-media-for-next-campaigns: next_media 가 webhook 기반으로 전환
@@ -887,6 +905,35 @@ LANDING_VISIT_RETENTION_DAYS = config("LANDING_VISIT_RETENTION_DAYS", default=18
 TRACK_VISIT_MAX_WRITES_PER_VISITOR_HOUR = config(
     "TRACK_VISIT_MAX_WRITES_PER_VISITOR_HOUR", default=6, cast=int
 )
+
+# ─────────────────────────────────────────────────────────────
+# 인스타 성장 리포트 (apps.insta_reports — 프로 전용, IG 계정당 월 1회)
+# ─────────────────────────────────────────────────────────────
+# 리포트 1건 실비 $0.4~0.6 · 소요 13~18분. 구성 요소:
+#   · Apify(공개 조회수·댓글 수집) — insights 권한 미승인 상태를 메우는 필수 소스
+#   · Gemini(영상 1편=1콜, 30여 콜) — 지각 피처 추출
+#   · DeepSeek(추론 모델, 1~4콜) — 서술 슬롯 합성
+# ⚠️ 키가 비면 생성이 VIEWS_UNAVAILABLE/EXTRACT_FAILED 로 실패한다(이용 횟수는 미차감).
+INSTA_REPORT_APIFY_API_KEY = config("APIFY_API_KEY", default="")
+INSTA_REPORT_APIFY_ACTOR = config("APIFY_ACTOR", default="apify~instagram-scraper")
+# 원가 장부용 단가(게시물당 USD). Apify 청구서로 실측치를 확인해 맞추면 cost_usd 가 정확해진다.
+INSTA_REPORT_APIFY_USD_PER_POST = config(
+    "INSTA_REPORT_APIFY_USD_PER_POST", default=0.0027, cast=float
+)
+INSTA_REPORT_GEMINI_API_KEY = config("GEMINI_API_KEY", default="")
+INSTA_REPORT_GEMINI_BASE = config(
+    "GEMINI_BASE", default="https://generativelanguage.googleapis.com/v1beta"
+)
+INSTA_REPORT_EXTRACT_MODEL = config("INSTA_REPORT_EXTRACT_MODEL", default="gemini-3.5-flash")
+INSTA_REPORT_DEEPSEEK_API_KEY = config("DEEPSEEK_API_KEY", default="")
+INSTA_REPORT_DEEPSEEK_BASE = config("DEEPSEEK_BASE", default="https://api.deepseek.com")
+# deepseek-v4-pro(추론 모델)가 기본. flash 로 내리면 ~7분으로 빨라지지만 한자 혼입·용어
+# 뒤섞임이 재발한다(랩 실측) — 품질 회귀를 감수할 때만 내릴 것.
+INSTA_REPORT_SYNTH_MODEL = config("INSTA_REPORT_SYNTH_MODEL", default="deepseek-v4-pro")
+INSTA_REPORT_EXTRACT_CONCURRENCY = config("INSTA_REPORT_EXTRACT_CONCURRENCY", default=6, cast=int)
+# 개발/테스트용 오프라인 모드 — 외부 호출 0으로 합성 데이터로 전 구간 통과(프론트 통합용).
+# ⚠️ prod 에서 True 면 가짜 리포트가 발급된다. 절대 켜지 말 것.
+INSTA_REPORT_FAKE_MODE = config("INSTA_REPORT_FAKE_MODE", default=False, cast=bool)
 
 # ===== 댓글 웹훅 누락 보정 (integrations.poll_missed_comments) =====
 # Instagram comments 웹훅이 유실되면 트리거 댓글이 누락되므로, 시간당 댓글 edge 를 재조회해

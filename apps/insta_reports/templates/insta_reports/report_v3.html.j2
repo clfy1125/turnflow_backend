@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="ko"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>내 인스타 성장 리포트 · @{{ a.username }}</title>
+<!-- Chart.js 는 같은 디렉터리의 벤더링 사본을 쓴다(pdf.py 가 HTML 옆에 복사) — PDF 렌더는
+     네트워크 없이 끝나야 하고, CDN 의존은 만료·차단 시 빈 차트로 이어진다. -->
+<script src="chart.umd.min.js"></script>
+<style>
+:root{--bg:#0d0b14;--card:#17141f;--card2:#1e1a2b;--ink:#f2eefa;--mut:#a99fc0;--line:#2c2739;
+--g1:#833ab4;--g2:#e1306c;--g3:#fd7e2a;--good:#34d399;--warn:#fbbf24;--bad:#f87171;--info:#6ea8fe;
+--grad:linear-gradient(135deg,#405de6,#833ab4,#e1306c,#fd7e2a);}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Pretendard','Apple SD Gothic Neo','Malgun Gothic',system-ui,sans-serif;background:var(--bg);color:var(--ink);line-height:1.65}
+.wrap{max-width:1040px;margin:0 auto;padding:0 20px 90px}
+.hero{background:linear-gradient(135deg,#833ab4,#e1306c 55%,#fd7e2a);padding:44px 20px 40px;margin-bottom:10px}
+.hero-in{max-width:1040px;margin:0 auto;display:flex;gap:22px;align-items:center;flex-wrap:wrap}
+.hero img.pfp{width:92px;height:92px;border-radius:50%;border:3px solid rgba(255,255,255,.85);object-fit:cover}
+.hlabel{font-size:12px;letter-spacing:2px;opacity:.85;text-transform:uppercase}
+.hname{font-size:25px;font-weight:800;margin:2px 0}
+.huser{opacity:.92;font-size:15px}
+.hbio{opacity:.9;font-size:12.5px;margin-top:8px;white-space:pre-line;max-width:560px}
+.brand{display:inline-flex;align-items:center;gap:7px;margin-top:9px;padding:4px 10px;border-radius:20px;background:rgba(255,255,255,.14);font-size:11px;font-weight:700;letter-spacing:.4px}
+.tabs{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin:20px 0;position:sticky;top:0;background:var(--bg);padding:12px 0;z-index:30}
+.tab{background:var(--card);border:1px solid var(--line);color:var(--mut);padding:9px 18px;border-radius:30px;cursor:pointer;font-size:14px;font-weight:600;transition:.2s}
+.tab:hover{color:var(--ink);border-color:var(--g2)}
+.tab.active{background:var(--grad);color:#fff;border-color:transparent}
+section{display:none;animation:fade .35s ease}section.active{display:block}
+@keyframes fade{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+h2{font-size:19px;margin:34px 0 6px;display:flex;align-items:center;gap:9px;font-weight:800}
+h2 .bar{width:5px;height:20px;border-radius:3px;background:linear-gradient(var(--g1),var(--g2))}
+.sub{color:var(--mut);font-size:14px;margin-bottom:16px;line-height:1.7}
+.grid{display:grid;gap:14px}
+.kpis{grid-template-columns:repeat(4,1fr)}.g3{grid-template-columns:repeat(3,1fr)}.g2{grid-template-columns:repeat(2,1fr)}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:18px}
+.kpi .v{font-size:25px;font-weight:800;background:linear-gradient(90deg,#c86dd7,#f79d5c);-webkit-background-clip:text;background-clip:text;color:transparent}
+.kpi .l{color:var(--mut);font-size:12.5px;margin-top:2px}
+.kpi .s{color:#8f86a6;font-size:11px;margin-top:6px;line-height:1.5}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px}
+.chartbox{position:relative;height:300px}.chartbox.sm{height:250px}.chartbox.xs{height:200px}
+h3{font-size:15px;margin:0 0 10px;font-weight:700}
+table{width:100%;border-collapse:collapse;font-size:13.5px}
+th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--mut);font-weight:600;font-size:12px}
+td.v{font-weight:700;color:var(--g3);white-space:nowrap}
+.expl{display:block;font-size:11.5px;color:#8f86a6;font-weight:400;margin-top:3px;line-height:1.5}
+.insight{background:var(--card2);border-left:3px solid var(--g2);border-radius:0 12px 12px 0;padding:16px 18px;margin:11px 0;font-size:15px;line-height:1.75}
+.insight b{color:var(--g3)}
+.insight.good{border-left-color:var(--good)}.insight.warn{border-left-color:var(--warn)}.insight.info{border-left-color:var(--info)}
+.posts{grid-template-columns:repeat(3,1fr)}
+.post{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden;color:inherit;display:block;text-decoration:none}
+.post:hover{border-color:#6b4b9e}
+.thumb{position:relative;aspect-ratio:4/5;background:#000;overflow:hidden}
+.thumb img{width:100%;height:100%;object-fit:cover}
+.rank{position:absolute;top:8px;left:8px;background:rgba(0,0,0,.6);border-radius:20px;padding:2px 9px;font-size:14px;font-weight:700}
+.views{position:absolute;top:8px;right:8px;background:rgba(0,0,0,.65);border-radius:8px;padding:3px 8px;font-size:12px;font-weight:700}
+.pbody{padding:12px}
+.ptitle{font-size:13px;font-weight:600;line-height:1.4;min-height:36px}
+.pmeta{display:flex;gap:10px;margin-top:8px;font-size:12px;color:var(--mut)}
+.pmeta .pd{margin-left:auto;color:#7d7397;font-size:11px}
+.why{margin-top:10px;padding:10px 12px;background:var(--card2);border-radius:10px;font-size:12.5px;color:#cdbde6;line-height:1.65}
+.why b{color:var(--good)}
+.wchips{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}
+.wchip{font-size:10.5px;border-radius:6px;padding:2px 8px;font-weight:600;background:rgba(52,211,153,.14);color:var(--good)}
+.chips{display:flex;flex-wrap:wrap;gap:8px}
+.chip{background:var(--card2);border:1px solid var(--line);border-radius:20px;padding:6px 12px;font-size:13px;color:#cdbde6}
+.chip b{color:var(--g3);margin-left:3px}
+.bench{display:flex;border-radius:14px;overflow:hidden;border:1px solid var(--line)}
+.bench>div{flex:1;padding:16px 12px;text-align:center;background:var(--card)}
+.bench>div+div{border-left:1px solid var(--line)}
+.bench .bn{font-size:22px;font-weight:800}.bench .bn small{font-size:12px;color:var(--mut);font-weight:600}
+.bench .bl{font-size:11.5px;color:var(--mut);margin-top:4px;line-height:1.45}
+.b1 .bn{color:var(--mut)}.b3 .bn{color:var(--warn)}.b4 .bn{color:var(--good)}
+.rec{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin-bottom:13px;position:relative;overflow:hidden}
+.rec::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--grad)}
+.rec .pri{font-size:11px;font-weight:700;padding:3px 10px;border-radius:20px;float:right}
+.pri.high{background:rgba(248,113,113,.18);color:var(--bad)}.pri.mid{background:rgba(251,191,36,.18);color:var(--warn)}
+.rec p{color:var(--mut);font-size:14.5px;line-height:1.75}.rec b{color:var(--ink)}
+.rec .why-line{margin-top:8px;font-size:13.5px;color:#bdb2d4}
+.rec .ev{margin-top:10px;padding:9px 13px;background:var(--card2);border-radius:9px;font-size:12.5px;color:#cdbde6;line-height:1.6}
+.rec .ev .evl{display:block;font-size:10.5px;font-weight:700;color:var(--good);margin-bottom:3px;letter-spacing:.3px}
+.badge{display:inline-block;font-size:10.5px;font-weight:700;padding:2px 8px;border-radius:12px;margin-right:6px}
+.badge.obs{background:rgba(52,211,153,.15);color:var(--good)}
+.badge.exp{background:rgba(110,168,254,.16);color:var(--info)}
+.badge.gen{background:rgba(169,159,192,.16);color:var(--mut)}
+.badge.reason{background:rgba(253,126,42,.16);color:var(--g3)}
+.warnbox{background:rgba(251,191,36,.10);border:1px solid rgba(251,191,36,.42);border-radius:14px;padding:15px 18px;margin:12px 0 18px;font-size:13.5px;color:#e8d9b0;line-height:1.75}
+.warnbox b{color:var(--warn)}
+.muted{color:var(--mut);font-size:12.5px;margin-top:6px}.hookq{font-style:italic;color:var(--ink)}
+.pill{display:inline-block;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:600}
+.up2{background:rgba(52,211,153,.15);color:var(--good)}.down2{background:rgba(248,113,113,.15);color:var(--bad)}
+.note{background:rgba(64,93,230,.08);border:1px solid rgba(131,58,180,.35);border-radius:14px;padding:12px 16px;color:var(--mut);font-size:12px;margin:4px 0 22px;line-height:1.7}.note b{color:var(--ink)}
+.vs{display:grid;grid-template-columns:1fr auto 1fr;gap:10px;align-items:center;text-align:center}
+.check{display:flex;align-items:flex-start;gap:10px;padding:11px 14px;background:var(--card2);border:1px solid var(--line);border-radius:12px;margin-bottom:9px;cursor:pointer;transition:.15s}
+.check:hover{border-color:var(--g2)}.check input{margin-top:4px;accent-color:var(--g2);width:16px;height:16px}
+.check.done{opacity:.45;text-decoration:line-through}.check .cd{font-size:13.5px}
+.quote{background:var(--card2);border-radius:12px;padding:12px 15px;margin-bottom:9px;font-size:13.5px;line-height:1.6}
+.quote .qt{color:var(--ink)}
+.quote .qm{display:block;font-size:11px;color:#8f86a6;margin-top:5px}
+.mbar{margin-bottom:14px}
+.mbar .ml{display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px}
+.mbar .ml b{color:var(--ink)}.mbar .ml span{color:var(--mut)}
+.mbar .mtrack{height:10px;background:var(--card2);border-radius:6px;overflow:hidden}
+.mbar .mfill{height:100%;border-radius:6px;background:linear-gradient(90deg,#833ab4,#e1306c)}
+.mbar .mdesc{font-size:11.5px;color:#8f86a6;margin-top:4px;line-height:1.5}
+.persona{display:flex;gap:14px;align-items:flex-start;background:var(--card2);border-radius:12px;padding:14px 16px;margin-bottom:10px}
+.persona .pi{font-size:26px}
+.persona .pt{font-size:13.5px;line-height:1.7;color:#d9cfee}.persona .pt b{color:var(--ink)}
+.dl-card{display:flex;align-items:center;gap:14px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin-bottom:12px}
+.dl-card .di{font-size:30px}
+.dl-card .dt{flex:1}.dl-card .dt h3{margin:0}.dl-card .dt p{font-size:12.5px;color:var(--mut);margin-top:3px}
+.dl-btn{background:var(--grad);color:#fff;border:none;border-radius:10px;padding:10px 18px;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit}
+.dl-btn:hover{opacity:.9}
+.dl-btn.ghost{background:var(--card2);border:1px solid var(--line);color:var(--ink)}
+footer{text-align:center;color:#6d6485;font-size:12px;margin-top:44px;padding-top:20px;border-top:1px solid var(--line);line-height:1.8}
+@media(max-width:760px){.kpis,.g3{grid-template-columns:repeat(2,1fr)}.g2{grid-template-columns:1fr}.posts{grid-template-columns:1fr 1fr}.bench{flex-wrap:wrap}.bench>div{flex:1 1 45%}}
+/* ── PDF(인쇄) 레이아웃 ─────────────────────────────────────────────
+   최종 산출물은 PDF 다. 탭은 클릭할 수 없으니 4개 섹션을 전부 펼쳐 한 문서로 잇고,
+   카드가 페이지 경계에서 잘리지 않게 한다. Chromium page.pdf() 가 print 미디어를 쓴다. */
+@media print{
+  @page{size:A4;margin:0}
+  html,body{background:#0d0b14!important;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  .tabs{display:none!important}
+  section{display:block!important;animation:none!important;break-before:page;page-break-before:always}
+  section#ov{break-before:auto;page-break-before:auto}
+  section>h2:first-child{margin-top:0}
+  .card,.kpi,.post,.postcard,.rec,.check,.strength,.warnbox,.note,table{break-inside:avoid;page-break-inside:avoid}
+  .chartbox{height:260px!important;break-inside:avoid;page-break-inside:avoid}
+  .wrap{padding-bottom:0}
+  h2{break-after:avoid;page-break-after:avoid}
+  footer{break-before:avoid;page-break-before:avoid}
+}
+</style></head><body>
+<div class="hero"><div class="hero-in">
+  {% if pfp_data_uri %}<img class="pfp" src="{{ pfp_data_uri }}" alt="">{% endif %}
+  <div><div class="hlabel">TURNFLOW · 내 인스타 성장 리포트</div>
+  <div class="hname">{{ a.name }}</div>
+  <div class="huser">@{{ a.username }} · 팔로워 {{ "{:,}".format(a.followers) }} · 게시물 {{ a.posts_total }}개</div>
+  <div class="hbio">{{ a.biography }}</div>
+  <div class="brand">최근 게시물 {{ cov.posts_analyzed }}개 · 릴스 {{ cov.reels_with_views }}개 · 댓글 {{ cstats.n_analyzed }}개를 분석했어요</div></div>
+</div></div>
+<div class="wrap">
+<div class="tabs">
+  <div class="tab active" data-t="ov">📌 개요</div>
+  <div class="tab" data-t="content">🎬 콘텐츠 분석</div>
+  <div class="tab" data-t="fans">💬 팔로워 인사이트</div>
+  <div class="tab" data-t="strategy">🚀 강점 & 전략</div>
+</div>
+<!-- TAB 1 · 개요 -->
+<section id="ov" class="active">
+  <div class="sub" style="margin-top:6px">최근 게시물 {{ cov.posts_analyzed }}개 중 조회수를 확인할 수 있는 릴스 {{ cov.reels_with_views }}개 기준 · {{ data_date }} · 조회수는 사람 수가 아니라 재생된 횟수예요</div>
+  <div class="grid kpis">
+    <div class="kpi"><div class="v">{{ "{:,}".format(a.followers) }}</div><div class="l">팔로워</div><div class="s">게시물 {{ a.posts_total }}개를 운영 중이에요</div></div>
+    <div class="kpi"><div class="v">{{ man(vs.median) }}</div><div class="l">평소 조회수 (가운데 값)</div><div class="s">영상들을 조회수 순으로 줄 세운 <b>가운데 값</b>이에요(평균 아님). 새 영상이 이걸 넘으면 평소보다 잘된 거예요</div></div>
+    <div class="kpi"><div class="v">{{ man(vs.max) }}</div><div class="l">최고 조회수 (회)</div><div class="s">{{ top1_date }} 게시물이 기록했어요</div></div>
+    <div class="kpi"><div class="v">{{ eng.comment_per_100 }}개</div><div class="l">조회 100회당 댓글</div><div class="s">100번 재생될 때 댓글 {{ eng.comment_per_100 }}개 · 좋아요 {{ eng.like_per_100 }}개가 달려요</div></div>
+  </div>
+
+  <h2><span class="bar"></span>가장 중요한 3가지</h2>
+  {% for t in slots.top3 %}
+  <div class="insight{% if t.tone == 'good' %} good{% elif t.tone == 'warn' %} warn{% endif %}"><b>{{ ["①","②","③"][loop.index0] }} {{ t.headline }}</b> — {{ t.body }}</div>
+  {% endfor %}
+
+  <h2><span class="bar"></span>다음 영상부터 이렇게 해보세요</h2>
+  {% for r in slots.recommendations %}
+  <div class="rec"><span class="pri {{ 'high' if r.priority == 'high' else 'mid' }}">{{ '먼저' if r.priority == 'high' else '추천' }}</span><h3>{{ loop.index }}. {{ r.title }}</h3>
+    <p><span class="badge {{ {'data_observation':'obs','experiment_suggestion':'exp','general_guide':'gen'}[r.basis] }}">{{ {'data_observation':'내 데이터에서 확인','experiment_suggestion':'해보고 확인할 것','general_guide':'일반적인 조언'}[r.basis] }}</span>{{ r.what_to_do or r.body }}</p>
+    {% if r.why %}<p class="why-line"><span class="badge reason">이유</span>{{ r.why }}</p>{% endif %}
+    {% if r.evidence_line %}<div class="ev"><span class="evl">근거가 된 숫자</span>{{ r.evidence_line }}</div>{% endif %}</div>
+  {% endfor %}
+
+  <h2><span class="bar"></span>내 조회수는 어떻게 변해왔나</h2>
+  <div class="sub">분석한 영상은 <b>{{ cov.period_from }} ~ {{ cov.period_to }}</b> 사이에 올린 것들이에요. <b>분홍 선</b>은 그달의 평소 조회수(가운데 값), <b>주황 점선</b>은 평균(대박 영상까지 다 더해 나눈 값)이에요. 두 선이 벌어져 있으면 소수 영상이 크게 터진 달이에요.{% if monthly_dropped_note %} {{ monthly_dropped_note }}{% endif %}{% if monthly_immature_note %} {{ monthly_immature_note }}{% endif %}</div>
+  <div class="card"><div class="chartbox"><canvas id="monChart"></canvas></div></div>
+  <div class="insight warn"><b>이 시기 관찰:</b> {{ slots.monthly_observation.text }}</div>
+
+  <h2><span class="bar"></span>내 영상은 보통 어디쯤일까?</h2>
+  <div class="card"><div class="chartbox sm"><canvas id="distChart"></canvas></div></div>
+</section>
+
+<!-- TAB 2 · 콘텐츠 분석 -->
+<section id="content">
+  <h2><span class="bar"></span>내 콘텐츠 성공 공식</h2>
+  <div class="sub">AI가 릴스 {{ agg.video_analyzed }}개를 실제로 보고, 잘된 영상들의 공통 재료를 뽑았어요.</div>
+  <div class="card">
+    <div class="persona"><div class="pi">🎯</div><div class="pt"><b>누가 내 영상을 보나 (핵심 시청자)</b><br>{{ slots.success_formula.persona.text }}</div></div>
+    <div class="persona"><div class="pi">🧲</div><div class="pt"><b>잘 먹힌 시작 공식</b><br>{{ slots.success_formula.winning_pattern.text }}</div></div>
+  </div>
+
+  {% if video_on %}
+  <h2><span class="bar"></span>어떤 '첫 마디'로 시작한 영상이 잘됐을까?</h2>
+  <div class="sub">영상이 시작되고 <b>처음 3초에 나온 첫 문장</b>을 스타일별로 나눠봤어요. 첫 문장은 시청자가 넘길지 볼지 정하는 0.5초 승부처예요.</div>
+  <div class="card"><table><thead><tr><th>첫 문장 스타일<br><span style="font-weight:400">(이런 식으로 시작하는 것)</span></th><th>영상 수</th><th>평소<br>조회수</th><th>가장<br>잘됐을 때</th></tr></thead><tbody>
+    {% for c in hook_rows %}<tr><td><b>{{ c.label }}</b><span class="expl">{{ c.desc }}{% for ex in c.examples %}<br>예{{ loop.index }}: {{ ex }}{% endfor %}</span></td><td>{{ c.n }}개</td><td class="v">{{ man(c.median) }}</td><td class="v">{{ man(c.max) }}</td></tr>{% endfor %}
+  </tbody></table>
+  {% if hook_low_note %}<p class="muted">{{ hook_low_note }}</p>{% endif %}</div>
+  <div class="insight good">{{ slots.hook_note.text }}</div>
+
+  <h2><span class="bar"></span>시작 3초, 화면에 뭐가 보였나?</h2>
+  <div class="sub">첫 문장(귀)과 별개로, <b>눈에 처음 보이는 화면</b>도 나눠봤어요.</div>
+  <div class="card"><table><thead><tr><th>시작 3초 화면</th><th>영상 수</th><th>평소<br>조회수</th><th>가장<br>잘됐을 때</th></tr></thead><tbody>
+    {% for c in opening_rows %}<tr><td><b>{{ c.label }}</b><span class="expl">{{ c.desc }}{% for ex in c.examples %}<br>예{{ loop.index }}: {{ ex }}{% endfor %}</span></td><td>{{ c.n }}개</td><td class="v">{{ man(c.median) }}</td><td class="v">{{ man(c.max) }}</td></tr>{% endfor %}
+  </tbody></table></div>
+  <div class="insight">{{ slots.opening_note.text }}</div>
+  {% endif %}
+
+  <h2><span class="bar"></span>잘된 게시물 TOP {{ top_posts | length }} — 왜 잘됐을까?</h2>
+  <div class="sub">각 영상 아래에 <b>AI가 영상을 직접 보고 찾은 "잘된 이유"</b>를 적었어요.</div>
+  <div class="grid posts">
+    {% for p in top_posts %}
+    <a class="post" href="{{ p.permalink }}" target="_blank" rel="noopener">
+      <div class="thumb">{% if p.thumb_data_uri %}<img src="{{ p.thumb_data_uri }}" loading="lazy" alt="">{% endif %}
+        <span class="rank">{{ ["🥇","🥈","🥉"][loop.index0] if loop.index0 < 3 else loop.index }}</span>
+        <span class="views">▶ {{ man(p.views) }}</span></div>
+      <div class="pbody"><div class="ptitle">{{ p.title }}</div>
+      <div class="pmeta"><span>❤️ {{ "{:,}".format(p.likes or 0) }}</span><span>💬 {{ "{:,}".format(p.comments or 0) }}</span><span class="pd">{{ p.date_short }}</span></div>
+      {% if p.why %}<div class="why"><b>첫 3초에 왜 멈췄나:</b> {{ p.why }}</div>{% endif %}</div>
+    </a>
+    {% endfor %}
+  </div>
+
+  <h2><span class="bar"></span>아쉬웠던 영상 {{ low_posts | length }}개 — 공통점이 있었어요</h2>
+  <div class="sub">{{ slots.low_line.text }}</div>
+  <div class="card"><table><thead><tr><th>조회수</th><th>날짜</th><th>이 영상의 시작</th></tr></thead><tbody>
+    {% for p in low_posts %}<tr><td class="v" style="color:var(--bad)">{{ "{:,}".format(p.views) }}</td><td>{{ p.date_short }}</td><td class="hookq">{{ p.start_desc }}</td></tr>{% endfor %}
+  </tbody></table></div>
+</section>
+
+<!-- TAB 3 · 팔로워 인사이트 -->
+<section id="fans">
+  <h2><span class="bar"></span>댓글 {{ cstats.n_analyzed }}개를 읽고 분류했어요</h2>
+  <div class="sub">수집된 댓글 {{ cfilter.total_collected }}개 중 <b>내가 단 답글 {{ cfilter.owner_removed }}개, DM 캠페인 댓글(자동 DM을 받으려고 키워드나 이모지만 남긴 댓글) {{ cfilter.excluded_trigger + cfilter.excluded_repeat + cfilter.excluded_meaningless }}개를 뺀 {{ cstats.n_analyzed }}개</b>만 분석했어요. "댓글에 OO 남겨주세요"에 응답한 댓글은 팔로워의 진짜 생각이 아니라서 제외했어요.</div>
+  {% if cstats.insufficient %}
+  <div class="warnbox"><b>⚠️ 이 계정은 댓글 분석을 신뢰하기 어려워요</b><br>
+  이 아래 내용은 <b>댓글 {{ cstats.n_analyzed }}개</b>만 보고 만든 거예요. 수집된 댓글 {{ cfilter.total_collected }}개의 대부분({{ ((cfilter.excluded_trigger + cfilter.excluded_repeat + cfilter.excluded_meaningless) / cfilter.total_collected * 100) | round | int }}%)이 자동 DM을 받기 위해 키워드나 이모지만 남긴 것이어서, 팔로워의 생각을 읽어낼 만한 양이 안 됩니다({{ cstats.min_for_insight }}개 이상은 되어야 참고할 만해요).<br>
+  <b>그래서 아래 비율과 인용은 "경향 참고"로만 보세요.</b> 댓글 유도 문구를 키워드 대신 "어떤 게 제일 궁금하세요?"처럼 <b>의견을 묻는 방식</b>으로 몇 편 바꿔보면, 다음 리포트에서 훨씬 정확한 팔로워 분석이 가능해져요.</div>
+  {% endif %}
+  <div class="grid g2">
+    <div class="card"><div class="chartbox xs"><canvas id="commentChart"></canvas></div></div>
+    <div class="card"><h3>각 분류의 의미</h3>
+      {% for r in donut_legend %}
+      <p class="muted" style="margin-top:{{ '0' if loop.first else '6px' }}"><b style="color:{{ r.color }}">{{ r.label }} ({{ r.pct }}%)</b> — {{ r.desc }}</p>
+      {% endfor %}</div>
+  </div>
+
+  <h2><span class="bar"></span>팔로워가 진짜 원하는 것</h2>
+  <div class="sub">댓글에서 반복해서 나타난 요구를 3가지로 정리했어요. 실제 댓글을 그대로 옮겼어요.</div>
+  <div class="grid g3">
+    {% for w in fans_wants %}
+    <div class="card"><h3>{{ ["📦","🐣","💡"][loop.index0] }} {{ w.title }}</h3>
+      <div class="quote"><span class="qt">"{{ w.quote_text }}"</span><span class="qm">💬 실제 댓글 · {{ w.quote_meta }}</span></div>
+      <p class="muted">{{ w.note }}</p></div>
+    {% endfor %}
+  </div>
+
+  {% if dm_issue.count %}
+  <h2><span class="bar"></span>⚠️ 자동 DM이 안 갔다는 문의 {{ dm_issue.count }}건</h2>
+  <div class="sub">분석한 댓글 {{ cstats.n_analyzed }}개 중 {{ dm_issue.count }}개({{ dm_issue.pct }}%)가 <b>"약속한 자료·DM을 못 받았다"</b>는 문의였어요. 이건 팔로워가 원하는 것이 아니라 <b>자동 DM 발송이 실패했다는 신호</b>예요. 이 댓글을 남긴 분들은 이미 관심을 보인 사람들이라, 놓치면 가장 아까운 반응이에요.</div>
+  <div class="card">
+    {% for q in dm_issue.quotes %}<div class="quote"><span class="qt">"{{ q.text }}"</span></div>{% endfor %}
+    <p class="muted">자동 DM 설정(키워드·발송 조건)을 점검하고, 이미 문의한 분들에게는 수동으로라도 자료를 보내주세요.</p></div>
+  {% endif %}
+
+  <h2><span class="bar"></span>놓치고 있는 기회</h2>
+  {% for o in slots.opportunities %}
+  <div class="insight info">{{ o.text }}</div>
+  {% endfor %}
+
+  <h2><span class="bar"></span>팔로워는 왜 내 계정을 볼까?</h2>
+  <div class="sub">분류한 댓글 {{ cstats.n_analyzed }}개에서 각 동기 유형이 차지한 <b>실제 비율</b>이에요. 점수가 아니라 관찰된 비중입니다.</div>
+  <div class="card">
+    {% for m in motivations %}
+    <div class="mbar"><div class="ml"><b>{{ m.icon }} {{ m.label }}</b><span>{{ m.pct }}%</span></div><div class="mtrack"><div class="mfill" style="width:{{ m.pct }}%"></div></div><div class="mdesc">{{ m.desc }}</div></div>
+    {% endfor %}
+  </div>
+</section>
+
+<!-- TAB 4 · 강점 & 전략 -->
+<section id="strategy">
+  <h2><span class="bar"></span>내 계정의 강점 3가지</h2>
+  <div class="grid g3">
+    {% for s in slots.strengths %}
+    <div class="kpi"><div class="v">{{ s.value }}</div><div class="l">{{ s.title }}</div><div class="s">{{ s.desc }}</div></div>
+    {% endfor %}
+  </div>
+
+  <h2><span class="bar"></span>내 포지션 — 한 문장으로</h2>
+  <div class="persona"><div class="pi">🧭</div><div class="pt"><b>"{{ slots.positioning.oneliner }}"</b><br>{{ slots.positioning.body }}</div></div>
+
+  <h2><span class="bar"></span>다음 영상에 바로 쓰는 구성 공식</h2>
+  <div class="sub">잘된 영상들의 구조를 그대로 템플릿으로 만들었어요.</div>
+  <div class="card"><table><thead><tr><th style="width:90px">구간</th><th>할 것</th><th>내 계정의 실제 예</th></tr></thead><tbody>
+    {% for r in slots.formula_rows %}<tr><td class="v">{{ r.phase }}</td><td><b>{{ r.action }}</b><span class="expl">{{ r.detail }}</span></td><td class="hookq">{{ r.example }}</td></tr>{% endfor %}
+  </tbody></table></div>
+
+  <h2><span class="bar"></span>다음 영상, 조회수 목표는 이 정도</h2>
+  <div class="sub">지금까지 올린 릴스 {{ cov.reels_with_views }}개의 <b>조회수</b>로 나눈 내 계정만의 성적표예요. 새 영상을 올리고 며칠 지난 뒤, 조회수가 어느 칸에 있는지 보세요.{% if cov.reels_with_views < 30 %} 아직 영상 수가 적어 참고용이에요.{% endif %}</div>
+  <div class="bench">
+    <div class="b1"><div class="bn">{{ man(bench.tiers[0]) }}<small> 회</small></div><div class="bl">아쉬워요 😟<br>첫 3초를 점검해요</div></div>
+    <div class="b2"><div class="bn">{{ man(bench.tiers[1]) }}<small> 회</small></div><div class="bl">평소 수준 🙂<br>내 영상의 중간 성적</div></div>
+    <div class="b3"><div class="bn">{{ man(bench.tiers[2]) }}<small> 회</small></div><div class="bl">잘됐어요 👍<br>비슷한 영상 또 만들기</div></div>
+    <div class="b4"><div class="bn">{{ man(bench.tiers[3]) }}<small> 회</small></div><div class="bl">대박이에요 🎉<br>후속편 바로 준비</div></div>
+  </div>
+
+  <h2><span class="bar"></span>올리기 전 체크</h2>
+  <div class="sub">다 맞출 필요 없어요. 이번 영상에서 1~2개만 골라 바꿔보세요.</div>
+  <div>
+    {% for c in slots.checklist %}
+    <label class="check"><input type="checkbox"><span class="cd">{{ c }}</span></label>
+    {% endfor %}
+  </div>
+</section>
+
+<!-- (구) TAB 5 저장하기 — PDF 로 제공하므로 제거. 화면 내 내려받기 버튼이 필요 없어졌다. -->
+
+<footer>@{{ a.username }} 내 인스타 성장 리포트 · 최근 게시물 {{ cov.posts_analyzed }}개 중 릴스 {{ cov.reels_with_views }}개 · 댓글 {{ cstats.n_analyzed }}개 기준 · {{ data_date }} · AI 영상 분석 {{ agg.video_analyzed }}/{{ agg.video_total }}개<br>
+공개된 조회수·좋아요·댓글을 바탕으로 만들었어요. 도달·저장 수·시청 시간은 인스타그램이 공개하지 않아 포함되지 않아요.<br>TURNFLOW</footer>
+</div>
+<script>
+const D={{ chart_data | safe }};
+Chart.defaults.color="#a99fc0";Chart.defaults.font.family="'Pretendard','Apple SD Gothic Neo',sans-serif";Chart.defaults.borderColor="#2c2739";
+// PDF 는 한 프레임만 캡쳐하므로 애니메이션이 켜져 있으면 차트가 절반만 그려진 채 인쇄된다.
+Chart.defaults.animation=false;Chart.defaults.responsiveAnimationDuration=0;
+// pdf.py 가 기다리는 준비 플래그. 차트 생성보다 **먼저** 등록해 둔다 — 아래에서 예외가 나도
+// load 시점에 플래그가 서서, 20초 타임아웃을 태우지 않고 (차트만 빈) PDF 로 진행한다.
+window.addEventListener('load',()=>setTimeout(()=>{window.__chartsReady=true;},50));
+const GRAD=(c,a,b)=>{const x=c.chart.ctx,g=x.createLinearGradient(0,0,0,300);g.addColorStop(0,a);g.addColorStop(1,b);return g;};
+const man=v=>v>=10000?(Math.round(v/1000)/10)+'만':(v==null?'—':v.toLocaleString());
+document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>{
+  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  document.querySelectorAll('section').forEach(s=>s.classList.remove('active'));
+  t.classList.add('active');document.getElementById(t.dataset.t).classList.add('active');
+  window.scrollTo({top:0,behavior:'smooth'});}));
+document.querySelectorAll('.check input').forEach(c=>c.addEventListener('change',()=>c.closest('.check').classList.toggle('done',c.checked)));
+new Chart(distChart,{type:'bar',data:{labels:D.dist_labels,datasets:[{data:D.dist,backgroundColor:c=>GRAD(c,'#e1306c','#833ab4'),borderRadius:8,borderSkipped:false,maxBarThickness:60}]},options:{maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:i=>i.parsed.y+'개'}}},scales:{y:{title:{display:true,text:'릴스 수'}},x:{grid:{display:false}}}}});
+new Chart(monChart,{type:'bar',data:{labels:D.months,datasets:[
+ {type:'line',label:'평소 조회수',data:D.mon_med,borderColor:'#e1306c',backgroundColor:'rgba(225,48,108,.12)',fill:true,tension:.35,pointRadius:4,yAxisID:'y'},
+ {type:'line',label:'대박 영상 포함 평균',data:D.mon_avg,borderColor:'#fd7e2a',borderDash:[6,4],tension:.35,pointRadius:3,yAxisID:'y'},
+ {type:'bar',label:'올린 영상 수',data:D.mon_cnt,backgroundColor:'rgba(169,159,192,.18)',yAxisID:'y1',borderRadius:4,maxBarThickness:44}]},
+ options:{maintainAspectRatio:false,plugins:{tooltip:{callbacks:{label:i=>i.dataset.label+': '+(i.datasetIndex<2?man(i.parsed.y)+'회':i.parsed.y+'개')}}},scales:{y:{ticks:{callback:v=>man(v)},title:{display:true,text:'조회수(회)'}},y1:{position:'right',grid:{display:false},title:{display:true,text:'영상 수'}},x:{grid:{display:false}}}}});
+new Chart(commentChart,{type:'doughnut',data:{labels:D.cmt_labels,datasets:[{data:D.cmt,backgroundColor:D.cmt_colors,borderWidth:0}]},options:{maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'right',labels:{boxWidth:12,padding:10}},tooltip:{callbacks:{label:i=>i.label+': '+i.parsed+'개'}}}}});
+</script>
+</body></html>

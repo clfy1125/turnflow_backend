@@ -56,6 +56,10 @@ django-storages[s3]==1.14.4
 # Email (Cloudflare Email Service — email_sending.send)
 cloudflare>=5.4.0
 
+# 인스타 성장 리포트 렌더러 (apps/insta_reports) — 리포트 HTML 템플릿이 Jinja2 문법
+# ({{ "{:,}".format(x) }} · | tojson 등)을 쓴다. Django 템플릿으로는 대체 불가.
+Jinja2==3.1.4
+
 # Image Pipeline (정제·압축·EXIF 제거·SVG sanitize)
 Pillow==10.4.0
 defusedxml==0.7.1

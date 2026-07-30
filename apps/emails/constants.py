@@ -18,6 +18,7 @@ TEMPLATE_PAYMENT_SUCCESS = "payment_success"
 TEMPLATE_PAYMENT_FAILED = "payment_failed"
 TEMPLATE_PAUSE_RESUME_REMINDER = "pause_resume_reminder"
 TEMPLATE_WINBACK = "winback"
+TEMPLATE_INSTA_REPORT_READY = "insta_report_ready"
 
 TEMPLATE_KEYS = [
     TEMPLATE_EMAIL_VERIFICATION,
@@ -30,6 +31,7 @@ TEMPLATE_KEYS = [
     TEMPLATE_PAYMENT_FAILED,
     TEMPLATE_PAUSE_RESUME_REMINDER,
     TEMPLATE_WINBACK,
+    TEMPLATE_INSTA_REPORT_READY,
 ]
 
 TEMPLATE_CHOICES = [(k, k) for k in TEMPLATE_KEYS]
@@ -119,6 +121,18 @@ AVAILABLE_VARIABLES: dict[str, dict[str, str]] = {
         "service_name": "서비스명",
         "resubscribe_url": "다시 구독하러 가는 URL (요금제/결제 페이지)",
         "billing_url": "콘솔 결제 설정 URL",
+        "support_email": "고객센터 이메일",
+    },
+    TEMPLATE_INSTA_REPORT_READY: {
+        "full_name": "수신자 이름",
+        "ig_username": "분석한 인스타 계정 username (@ 없음)",
+        "ig_name": "분석한 인스타 계정 표시명",
+        "period_text": "분석 기간 (예: 2026-02-03 ~ 2026-07-28)",
+        "posts_analyzed": "분석한 게시물 수",
+        "videos_analyzed": "AI 가 본 영상 수",
+        "comments_analyzed": "분석한 댓글 수",
+        "report_url": "콘솔에서 리포트를 열 수 있는 URL",
+        "service_name": "서비스명",
         "support_email": "고객센터 이메일",
     },
 }

@@ -14,6 +14,7 @@ from django.utils import timezone
 
 from .constants import (
     TEMPLATE_EMAIL_VERIFICATION,
+    TEMPLATE_INSTA_REPORT_READY,
     TEMPLATE_ONBOARDING_DAY_3,
     TEMPLATE_ONBOARDING_DAY_7,
     TEMPLATE_ONBOARDING_DAY_14,
@@ -272,3 +273,42 @@ def schedule_onboarding(user_id: int) -> None:
             defaults={"scheduled_for": scheduled_for, "sent_at": None, "cancelled_at": None},
         )
         send_onboarding_drip.apply_async(args=[user.id, day], eta=scheduled_for)
+
+
+@shared_task(name="emails.send_insta_report_ready_email")
+def send_insta_report_ready_email(user_id: int, report_id: str) -> None:
+    """인스타 성장 리포트 완성 알림.
+
+    insta_reports.generate_report 가 성공 직후 호출한다. 사용자가 브라우저를 닫아도
+    결과를 알 수 있게 하는 유일한 경로이므로, 실패해도 리포트 자체에는 영향이 없다.
+    (실패 리포트는 메일을 보내지 않는다 — 인앱 표시로 충분하고 노이즈만 된다.)
+    """
+    from apps.insta_reports.models import InstagramReport
+
+    try:
+        user = User.objects.get(pk=user_id, is_active=True)
+    except User.DoesNotExist:
+        return
+    report = InstagramReport.objects.filter(pk=report_id).first()
+    if report is None:
+        return
+
+    period = ""
+    if report.period_from and report.period_to:
+        period = f"{report.period_from:%Y-%m-%d} ~ {report.period_to:%Y-%m-%d}"
+    ctx = {
+        "full_name": user.full_name or user.email.split("@")[0],
+        "ig_username": report.ig_username or "",
+        "ig_name": report.ig_name or report.ig_username or "",
+        "period_text": period,
+        "posts_analyzed": f"{report.posts_analyzed:,}",
+        "videos_analyzed": f"{report.videos_analyzed:,}",
+        "comments_analyzed": f"{report.comments_analyzed:,}",
+        "report_url": f"{settings.FRONTEND_URL}/insta-reports/{report.id}",
+        "service_name": settings.SERVICE_NAME,
+        "support_email": settings.SUPPORT_EMAIL,
+    }
+    try:
+        send_email(TEMPLATE_INSTA_REPORT_READY, user.email, ctx, user=user)
+    except EmailTemplateMissing:
+        logger.error("insta_report_ready template missing — run seed_email_templates")

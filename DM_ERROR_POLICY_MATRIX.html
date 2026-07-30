@@ -1,0 +1,999 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DM 오류 처리방침 분류표 (전수 · 쉬운 설명판)</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --panel:#fff; --panel2:#fbfcfd; --ink:#16181d; --ink2:#4d525c; --ink3:#868c99;
+    --line:#e3e6ec; --line2:#eef0f4;
+    --red:#d92b2b; --redbg:#fdecec; --orange:#c46a00; --orangebg:#fff3e2;
+    --blue:#1f68d6; --bluebg:#eaf1fd; --purple:#7a45c9; --purplebg:#f3ecfd;
+    --gray:#6b7280; --graybg:#f0f1f4; --green:#12805c; --greenbg:#e7f6ef;
+    --shadow:0 1px 2px rgba(16,18,24,.05),0 4px 12px rgba(16,18,24,.04);
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#0f1115; --panel:#171a20; --panel2:#1c2027; --ink:#e8eaef; --ink2:#aeb5c1; --ink3:#7b828f;
+      --line:#282d36; --line2:#22262e;
+      --red:#ff6b6b; --redbg:#3a1c1e; --orange:#ffb057; --orangebg:#3a2a14;
+      --blue:#6fa8ff; --bluebg:#16253d; --purple:#b98cff; --purplebg:#2a1f3d;
+      --gray:#9aa1ad; --graybg:#232830; --green:#4ecfa0; --greenbg:#122b23;
+      --shadow:0 1px 2px rgba(0,0,0,.3),0 4px 14px rgba(0,0,0,.25);
+    }
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Malgun Gothic","Apple SD Gothic Neo",
+      "Noto Sans KR",Roboto,sans-serif;
+    font-size:14px; line-height:1.72; -webkit-font-smoothing:antialiased;
+  }
+  code,.mono{font-family:"Cascadia Mono",Consolas,"SF Mono",Menlo,monospace}
+  .wrap{max-width:1180px;margin:0 auto;padding:28px 20px 140px}
+  h1{font-size:23px;margin:0 0 8px;letter-spacing:-.01em}
+  .lede{margin:0;color:var(--ink2);max-width:82ch}
+  .meta-line{margin-top:10px;color:var(--ink3);font-size:12.5px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);
+    padding:16px 18px;margin:18px 0}
+  .card h3{margin:0 0 10px;font-size:15px}
+
+  /* ── 발송 흐름 ── */
+  .flow{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:8px;margin-top:6px}
+  .step{border:1px solid var(--line);border-radius:9px;padding:9px 11px;background:var(--panel2)}
+  .step b{display:block;font-size:12.5px}
+  .step .no{color:var(--ink3);font-size:11px;letter-spacing:.05em}
+  .step span{color:var(--ink2);font-size:12px;display:block;margin-top:3px}
+  .step em{display:block;margin-top:5px;font-style:normal;font-size:11.5px;color:var(--red)}
+
+  /* ── 용어 사전 ── */
+  details.glo{margin:18px 0}
+  details.glo > summary{cursor:pointer;font-weight:600;font-size:15px;padding:10px 14px;
+    background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow)}
+  .glogrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:8px;margin-top:10px}
+  .term{border:1px solid var(--line);border-radius:9px;padding:9px 12px;background:var(--panel)}
+  .term b{font-size:12.8px}
+  .term .en{font-family:"Cascadia Mono",Consolas,monospace;font-size:11.5px;color:var(--ink3);margin-left:5px}
+  .term p{margin:2px 0 0;color:var(--ink2);font-size:12.5px}
+
+  /* ── 버킷 안내 ── */
+  .legend{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:10px;margin:18px 0}
+  .lg{border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:var(--panel)}
+  .lg b{display:block;font-size:13px}
+  .lg span{color:var(--ink2);font-size:12px}
+  .lg.investigate{border-left:4px solid var(--red)}
+  .lg.user_action{border-left:4px solid var(--orange)}
+  .lg.admin_action{border-left:4px solid var(--blue)}
+  .lg.recipient{border-left:4px solid var(--purple)}
+  .lg.normal{border-left:4px solid var(--gray)}
+
+  /* ── 툴바 ── */
+  .toolbar{position:sticky;top:0;z-index:20;background:var(--bg);padding:10px 0 12px;
+    border-bottom:1px solid var(--line);margin-bottom:18px}
+  .toolbar .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  .chip{border:1px solid var(--line);background:var(--panel);color:var(--ink2);border-radius:999px;
+    padding:5px 12px;font-size:12.5px;cursor:pointer}
+  .chip[aria-pressed="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+  .btn{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:8px;
+    padding:6px 12px;font-size:12.5px;cursor:pointer}
+  .btn:hover{border-color:var(--ink3)}
+  .btn.primary{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+  .spacer{flex:1}
+  .progress{font-size:12.5px;color:var(--ink2);white-space:nowrap}
+  .progress b{color:var(--ink)}
+  .tally{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+  .tally span{font-size:12px;border-radius:6px;padding:2px 8px;border:1px solid var(--line)}
+  .t-investigate{color:var(--red);background:var(--redbg)}
+  .t-user_action{color:var(--orange);background:var(--orangebg)}
+  .t-admin_action{color:var(--blue);background:var(--bluebg)}
+  .t-recipient{color:var(--purple);background:var(--purplebg)}
+  .t-normal{color:var(--gray);background:var(--graybg)}
+  .t-none{color:var(--ink3)}
+  .t-ask{color:var(--green);background:var(--greenbg)}
+
+  /* ── 섹션 ── */
+  section{margin:28px 0}
+  section > h2{font-size:16px;margin:0 0 4px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  section > h2 .n{font-size:11.5px;color:var(--ink3);font-weight:400}
+  section > p.note{margin:0 0 12px;color:var(--ink2);font-size:13px;max-width:94ch;
+    background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--ink3);
+    border-radius:8px;padding:9px 13px}
+
+  /* ── 행 ── */
+  .row-card{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--gray);
+    border-radius:10px;margin-bottom:10px;overflow:hidden}
+  .row-card[data-pick="investigate"]{border-left-color:var(--red)}
+  .row-card[data-pick="user_action"]{border-left-color:var(--orange)}
+  .row-card[data-pick="admin_action"]{border-left-color:var(--blue)}
+  .row-card[data-pick="recipient"]{border-left-color:var(--purple)}
+  .row-card[data-pick="normal"]{border-left-color:var(--gray)}
+  .row-card[data-pick=""]{border-left-color:var(--line);border-left-style:dashed}
+  .row-card.ask{box-shadow:0 0 0 2px var(--green) inset}
+
+  .row-top{display:flex;gap:10px;align-items:baseline;padding:12px 15px 4px;flex-wrap:wrap}
+  .title{font-weight:700;font-size:15px;flex:1 1 240px;min-width:200px}
+  .flags{display:flex;gap:5px;flex-wrap:wrap;align-items:center}
+  .flag{font-size:11px;border-radius:5px;padding:1px 7px;border:1px solid var(--line);color:var(--ink3);
+    background:var(--panel2)}
+  .flag.rec{color:var(--blue);background:var(--bluebg);border-color:transparent}
+  .flag.gap{color:var(--red);background:var(--redbg);border-color:transparent}
+
+  .simple{margin:2px 15px 10px;padding:9px 13px;background:var(--panel2);border-radius:9px;
+    border:1px solid var(--line2);font-size:14px}
+  .simple b{color:var(--ink)}
+  .simple .tag{display:inline-block;font-size:10.5px;letter-spacing:.05em;color:var(--ink3);
+    margin-right:7px;vertical-align:1px}
+
+  .kv{padding:0 15px 4px}
+  .kv .k2{display:grid;grid-template-columns:112px 1fr;gap:10px;padding:6px 0;
+    border-top:1px solid var(--line2);align-items:start}
+  @media (max-width:700px){.kv .k2{grid-template-columns:1fr;gap:2px}}
+  .kv .k2 > .lab{font-size:11.5px;color:var(--ink3);font-weight:600;padding-top:2px}
+  .kv .k2 > .val{color:var(--ink2);font-size:13.2px}
+  .kv .k2 > .val b{color:var(--ink)}
+  .keys{display:flex;gap:5px;flex-wrap:wrap}
+  .k{font-family:"Cascadia Mono",Consolas,monospace;font-size:11.5px;border:1px solid var(--line);
+    background:var(--panel2);border-radius:5px;padding:1px 6px;color:var(--ink2);white-space:nowrap}
+  .k b{color:var(--ink);font-weight:600}
+  .src{font-family:"Cascadia Mono",Consolas,monospace;font-size:11px;color:var(--ink3)}
+
+  .pickrow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:10px 15px;
+    background:var(--panel2);border-top:1px solid var(--line2);margin-top:6px}
+  .picks{display:flex;gap:4px;flex-wrap:wrap}
+  .pick{border:1px solid var(--line);background:var(--panel);border-radius:7px;padding:4px 10px;
+    font-size:12px;cursor:pointer;color:var(--ink2);white-space:nowrap}
+  .pick:hover{border-color:var(--ink3)}
+  .pick[aria-pressed="true"]{font-weight:600;border-color:transparent}
+  .pick[data-b="investigate"][aria-pressed="true"]{color:#fff;background:var(--red)}
+  .pick[data-b="user_action"][aria-pressed="true"]{color:#fff;background:var(--orange)}
+  .pick[data-b="admin_action"][aria-pressed="true"]{color:#fff;background:var(--blue)}
+  .pick[data-b="recipient"][aria-pressed="true"]{color:#fff;background:var(--purple)}
+  .pick[data-b="normal"][aria-pressed="true"]{color:#fff;background:var(--gray)}
+  .askbtn{border:1px solid var(--line);background:var(--panel);border-radius:7px;padding:4px 10px;
+    font-size:12px;cursor:pointer;color:var(--ink2);white-space:nowrap}
+  .askbtn[aria-pressed="true"]{background:var(--green);color:#fff;border-color:transparent;font-weight:600}
+  .chg{font-size:11px;color:var(--ink3)}
+  .chg.on{color:var(--green);font-weight:600}
+  .memo{flex:1 1 200px;min-width:150px;border:1px solid var(--line);border-radius:7px;
+    padding:5px 9px;font-size:12.5px;background:var(--panel);color:var(--ink)}
+  .memo::placeholder{color:var(--ink3)}
+
+  .hidden{display:none !important}
+  body.brief .kv{display:none}
+  pre.out{white-space:pre-wrap;word-break:break-all;background:var(--panel2);border:1px solid var(--line);
+    border-radius:8px;padding:12px;font-size:11.5px;max-height:360px;overflow:auto;margin:10px 0 0}
+  .warn{border-left:4px solid var(--orange);background:var(--orangebg);border-radius:8px;
+    padding:11px 14px;font-size:13px;color:var(--ink);margin:14px 0}
+  footer{margin-top:44px;color:var(--ink3);font-size:12px;border-top:1px solid var(--line);padding-top:14px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>DM 오류 처리방침 분류표 — 전수 · 쉬운 설명판</h1>
+  <p class="lede">
+    자동 DM 이 실패하거나 건너뛰어지는 <b>모든 경우 51가지</b>를 한 줄씩 뽑고,
+    각각 <b>무슨 일이 벌어진 건지 · 고객 화면엔 어떻게 보이는지 · 우리가 뭘 해야 하는지</b>를 붙였습니다.
+    아래 5개 버킷 중 하나를 고르면 자동 저장됩니다. 기본값은 이미 채워져 있으니 <b>바꿀 것만 바꾸시면</b> 됩니다.
+  </p>
+  <p class="meta-line">
+    코드 출처: <span class="mono">apps/admin_api/dm_error_catalog.py</span> ·
+    <span class="mono">apps/integrations/dm_exceptions.py</span> ·
+    <span class="mono">apps/integrations/dm_status_groups.py</span> ·
+    <span class="mono">apps/admin_api/views/dashboard_ops.py</span> ·
+    <span class="mono">apps/integrations/dm_frontend_actions.py</span>
+    &nbsp;|&nbsp; 기준 2026-07-30 · 브랜치 feat/toss-billing
+  </p>
+</header>
+
+<div class="card">
+  <h3>0. 먼저 — 자동 DM 한 통이 나가는 전체 과정</h3>
+  <p style="margin:0 0 8px;color:var(--ink2);font-size:13px">
+    아래 7단계 중 <b>어느 단계에서 멈췄느냐</b>가 곧 오류 종류입니다. 빨간 글씨가 그 단계에서 생기는 실패입니다.
+  </p>
+  <div class="flow">
+    <div class="step"><span class="no">STEP 1</span><b>누가 댓글을 답니다</b>
+      <span>인스타가 우리 서버로 "댓글 달렸다"고 알림(웹훅)을 보냅니다.</span>
+      <em>알림 누락 → 매시간 보정 배치가 주움</em></div>
+    <div class="step"><span class="no">STEP 2</span><b>캠페인 조건 확인</b>
+      <span>키워드가 맞는지, 캠페인이 켜져 있는지, 발송 시간대인지 봅니다.</span>
+      <em>여기서 취소 = "건너뜀(skipped)" ④번 섹션</em></div>
+    <div class="step"><span class="no">STEP 3</span><b>발송 줄 세우기(큐)</b>
+      <span>인스타가 한 번에 많이 못 보내게 하므로 3~8초 간격으로 천천히 보냅니다.</span>
+      <em>기다리는 사이 24시간이 끝날 수 있음</em></div>
+    <div class="step"><span class="no">STEP 4</span><b>토큰 확인 후 호출</b>
+      <span>인스타 로그인 열쇠(토큰)가 살아 있는지 보고 API 를 부릅니다.</span>
+      <em>열쇠 죽었으면 호출도 안 하고 실패 처리</em></div>
+    <div class="step"><span class="no">STEP 5</span><b>인스타 응답</b>
+      <span>성공이면 메시지 번호를 줍니다. 실패면 오류 번호(code/subcode)를 줍니다.</span>
+      <em>①②③번 섹션의 대부분이 여기</em></div>
+    <div class="step"><span class="no">STEP 6</span><b>진짜 도착했는지 35분간 추적</b>
+      <span>"접수했다"는 답과 실제 도착은 다릅니다. 웹훅·대화 조회로 확인합니다.</span>
+      <em>흔적 없으면 "도착 미확인"</em></div>
+    <div class="step"><span class="no">STEP 7</span><b>최종 상태 확정</b>
+      <span>도착 / 읽음 / 실패 / 숨겨진 요청 중 하나로 굳습니다.</span>
+      <em>복구 기능이 켜져 있으면 일부는 재도전</em></div>
+  </div>
+</div>
+
+<details class="glo" open>
+  <summary>용어 사전 — 표에 나오는 말 (모르는 단어 있으면 여기부터)</summary>
+  <div class="glogrid">
+    <div class="term"><b>code / subcode</b><span class="en">오류 번호</span>
+      <p>인스타가 실패할 때 주는 번호 두 개. <b>code</b>는 큰 분류(예: 100 = 값이 잘못됨),
+      <b>subcode</b>는 세부 이유(예: 2534022 = 24시간 지남). subcode 가 있으면 원인이 확실하고,
+      없으면 큰 번호만으로 추측해야 합니다.</p></div>
+    <div class="term"><b>status</b><span class="en">우리가 붙이는 상태</span>
+      <p>인스타 번호를 보고 <b>우리 서버가</b> 결론 내린 상태값. failed_token(열쇠 문제),
+      failed_window(24시간 끝남), failed_param(값 문제), failed_no_trace(도착 확인 못 함) 등.
+      DB 의 <span class="mono">SentDMLog.status</span> 컬럼에 저장됩니다.</p></div>
+    <div class="term"><b>비공개 답장</b><span class="en">Private Reply</span>
+      <p>"댓글에 대한 답으로 DM 을 보내는" 인스타 전용 기능. 우리 자동 DM 의 핵심입니다.
+      제약 2개: <b>댓글 1개당 딱 1번</b>, <b>댓글 달린 지 7일 이내</b>.</p></div>
+    <div class="term"><b>24시간 창</b><span class="en">messaging window</span>
+      <p>상대가 우리에게 반응(댓글·DM·스토리답장)한 시점부터 <b>24시간 안에만</b> DM 을 보낼 수 있다는
+      인스타 정책. 지나면 상대가 다시 반응해야 열립니다. 우리 잘못이 아니라 정책입니다.</p></div>
+    <div class="term"><b>토큰</b><span class="en">access token</span>
+      <p>고객이 인스타 연동할 때 받는 <b>로그인 열쇠 문자열</b>. 60일이면 만료되고, 비밀번호 변경이나
+      권한 해제로도 죽습니다. 죽으면 그 계정의 DM 이 전부 멈춥니다 → 고객이 재연동해야 함.</p></div>
+    <div class="term"><b>숨겨진 요청 / 스팸함</b>
+      <p>서로 팔로우가 아닌 사람에게 처음 DM 을 보내면, 바로 대화방에 안 들어가고 상대의
+      <b>"메시지 요청" 탭</b>으로 갑니다. 상대가 수락해야 진짜 도착입니다. 실패는 아니지만 도착도 아닌 애매한 상태.</p></div>
+    <div class="term"><b>복구</b><span class="en">recovery</span>
+      <p>위 "숨겨진 요청"으로 간 건을 구제하는 우리 기능(프로 플랜 전용). 그 댓글에 공개 답글로
+      "요청함에서 수락하고 다시 댓글 달아주세요"를 남기고, 다시 댓글이 오면 자동 재발송합니다.</p></div>
+    <div class="term"><b>도착 미확인</b><span class="en">failed_no_trace</span>
+      <p>인스타가 "접수했다"고 답은 했는데, 35분을 지켜봐도 실제로 도착한 흔적이 없는 상태.
+      실패로 세지만 <b>재검증(reverify)</b> 버튼으로 다시 확인해서 성공으로 되돌릴 수 있습니다.</p></div>
+    <div class="term"><b>건너뜀</b><span class="en">skipped</span>
+      <p>인스타에 <b>요청조차 안 보내고</b> 우리가 스스로 취소한 것. 실패가 아니라 "시작 안 함"입니다.
+      월 한도 소진, 캠페인 정지, 발송 시간대 밖 등이 여기 해당합니다.</p></div>
+    <div class="term"><b>레이트 리밋</b><span class="en">rate limit</span>
+      <p>"너무 빨리 많이 부르지 마라"고 인스타가 잠깐 막는 것. <b>실패가 아니라 지연</b>이며
+      서버가 알아서 나중에 다시 시도합니다.</p></div>
+    <div class="term"><b>폴백</b><span class="en">fallback</span>
+      <p>"딱 맞는 게 없을 때 쓰는 차선책". 우리 오류 사전은 ①(code+subcode) → ②(code+status) →
+      ③code → ④status 순으로 찾고, 앞에서 못 찾으면 뒤로 내려갑니다. 뒤로 갈수록 설명이 뭉뚱그려집니다.</p></div>
+    <div class="term"><b>레거시</b><span class="en">legacy</span>
+      <p>"지금은 안 쓰는데 옛날 데이터/코드가 남아 있는 것". 과거 기록이면 그냥 두면 되지만,
+      <b>최근 날짜로 새로 찍히면 버그</b>입니다.</p></div>
+    <div class="term"><b>센티넬</b><span class="en">sentinel</span>
+      <p>진짜 값이 없을 때 "값 없음"을 나타내려고 자리에 끼워 넣는 <b>표식용 가짜 값</b>.
+      이 표에 하나 나오는데, 실제로는 안 쓰이는 걸로 보입니다.</p></div>
+    <div class="term"><b>오류 사전</b><span class="en">dm_error_catalog.py</span>
+      <p>번호를 한국어 원인·조치 문구로 바꿔주는 서버 쪽 표. 여기 없으면 운영 화면 팝업에
+      설명이 <b>빈칸</b>으로 나옵니다. 이 HTML 이 바로 그 사전의 전수 목록입니다.</p></div>
+  </div>
+</details>
+
+<h3 style="margin:22px 0 6px;font-size:15px">분류 5가지 — 무슨 뜻인가</h3>
+<div class="legend">
+  <div class="lg investigate"><b>🔴 확인해야함</b><span>원인을 아직 모르는 것. 로그 원문을 열어보거나 코드를 봐야 답이 나옵니다. "일단 조사 대상" 서랍.</span></div>
+  <div class="lg user_action"><b>🟠 사용자 조치</b><span>고객이 직접 해야 풀립니다. 우리는 안내만 가능 — 재연동 / 플랜 업그레이드 / 인스타 설정 변경.</span></div>
+  <div class="lg admin_action"><b>🔵 관리자 조치</b><span>우리(운영팀) 손이 필요합니다 — 재검증 버튼, 중복 캠페인 정리, 게시물 교체 안내, 영업 연락.</span></div>
+  <div class="lg recipient"><b>🟣 수신자 사정</b><span>상대방 계정 문제라 우리도 고객도 못 고칩니다. 비율만 지켜봅니다.</span></div>
+  <div class="lg normal"><b>⚪ 정책상 정상</b><span>설계·정책대로 동작한 것. 아무것도 안 해도 됩니다.</span></div>
+</div>
+
+<div class="warn">
+  <b>🙋 "설명 더 필요" 버튼</b> — 읽어도 이해가 안 되거나 판단이 안 서는 행은 각 줄 오른쪽의
+  <b>🙋 설명 더 필요</b> 를 눌러주세요. 분류(빨강/주황/…)와 <b>따로</b> 기록돼서, 내보내기 JSON 에
+  <span class="mono">needs_explanation: true</span> 로 나옵니다. "조사해야 할 오류(🔴)"와
+  "설명이 부족한 항목(🙋)"을 섞지 않으려고 나눠 뒀습니다.
+</div>
+
+<div class="toolbar">
+  <div class="row">
+    <button class="chip" data-filter="all" aria-pressed="true">전체</button>
+    <button class="chip" data-filter="ask" aria-pressed="false">🙋 설명 더 필요</button>
+    <button class="chip" data-filter="changed" aria-pressed="false">기본값에서 바꾼 것</button>
+    <button class="chip" data-filter="investigate" aria-pressed="false">🔴 확인해야함</button>
+    <button class="chip" data-filter="user_action" aria-pressed="false">🟠 사용자</button>
+    <button class="chip" data-filter="admin_action" aria-pressed="false">🔵 관리자</button>
+    <button class="chip" data-filter="recipient" aria-pressed="false">🟣 수신자</button>
+    <button class="chip" data-filter="normal" aria-pressed="false">⚪ 정상</button>
+    <span class="spacer"></span>
+    <span class="progress" id="progress"></span>
+    <button class="btn" id="brief">간단히 보기</button>
+    <button class="btn" id="reset">기본값으로 되돌리기</button>
+    <button class="btn primary" id="export">결과 내보내기</button>
+  </div>
+  <div class="tally" id="tally"></div>
+</div>
+
+<div id="sections"></div>
+
+<section id="exportBox" class="hidden">
+  <h2>결과 내보내기</h2>
+  <p class="note">이 JSON 을 그대로 주시면 <span class="mono">dm_error_catalog.py</span> 에
+    분류 필드로 반영하고, 운영 대시보드에서 색·필터로 쓸 수 있게 만들어 드립니다.
+    <span class="mono">needs_explanation: true</span> 인 항목은 설명을 더 풀어서 다시 드리겠습니다.</p>
+  <div class="row" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:4px">
+    <button class="btn primary" data-fmt="json">JSON</button>
+    <button class="btn" data-fmt="md">Markdown 표</button>
+    <button class="btn" id="copyOut">복사</button>
+  </div>
+  <pre class="out" id="out"></pre>
+</section>
+
+<footer>
+  분류 결과는 이 브라우저에만 저장됩니다(localStorage 키 <span class="mono">dm_error_policy_v2</span>).
+  다른 PC 로 옮기려면 JSON 을 내보내세요. · 기본값 = 2026-07-28 1차 제안값
+</footer>
+
+</div>
+
+<script>
+/* ══════════════════════════════════════════════════════════════
+   데이터 — 코드에서 뽑은 전수 51건. def = 기본 선택값(1차 제안값).
+   ══════════════════════════════════════════════════════════════ */
+const BUCKETS=[
+  {id:"investigate",label:"🔴 확인해야함"},
+  {id:"user_action",label:"🟠 사용자 조치"},
+  {id:"admin_action",label:"🔵 관리자 조치"},
+  {id:"recipient",label:"🟣 수신자 사정"},
+  {id:"normal",label:"⚪ 정책상 정상"},
+];
+const GROUP_FLAG={
+  attention:"고객 화면: 확인 필요 탭",
+  hidden_spam:"고객 화면: 숨겨진 요청·스팸 탭",
+  waiting:"고객 화면: 대기중 탭",
+  sent:"고객 화면: 전송됨 탭",
+  read:"고객 화면: 읽음 탭",
+  none:"해당 없음",
+};
+
+const SECTIONS=[
+/* ───────────────────────── 섹션 1 ───────────────────────── */
+{
+ id:"s1",
+ title:"① 인스타가 세부 이유까지 정확히 알려준 실패",
+ note:"오류 번호 두 개(code + subcode)가 다 있어서 원인이 100% 확정된 것들입니다. 우리 사전이 가장 먼저 찾는 자리라, 여기 걸리면 아래 ②③번은 아예 보지 않습니다.",
+ rows:[
+ {id:"100/2534025",code:"100",subcode:"2534025",status:"failed_param → 숨겨진 요청·스팸으로 재분류",
+  group:"hidden_spam",rec:true,src:"dm_error_catalog.py:28",def:"user_action",
+  title:"숨겨진 요청 · 스팸함으로 들어감",
+  simple:"DM 은 보냈는데 상대가 우리를 <b>팔로우한 적이 없어서</b> 대화방이 아니라 상대의 '메시지 요청' 탭에 떨어진 것. 편지를 부쳤는데 우체통이 아니라 경비실에 맡겨진 상태입니다.",
+  story:"인스타는 서로 모르는 사이끼리 DM 방을 바로 열어주지 않습니다. 그래서 <b>첫 DM 은 상대의 '요청/스팸' 탭</b>으로 가고, 상대가 그걸 눌러 수락해야 진짜 대화가 시작됩니다. 우리 입장에서는 '보내긴 했는데 도착은 확인 못 함' 상태로 남습니다. 비팔로워 대상 캠페인이면 흔하게 나옵니다.",
+  tech:"Meta 응답 code=100, subcode=2534025. 우리 status 는 failed_param 이지만 화면에서는 실패에서 빼고 '숨겨진 요청·스팸'이라는 별도 그룹으로 셉니다(실패율이 부풀어 보이지 않도록).",
+  todo:"우리가 대신 해줄 수 있는 게 없습니다. 고객이 <b>'실패 DM 복구'를 켜야</b> 회수됩니다(프로 플랜 전용). 켜면 우리가 그 댓글에 '요청함에서 수락하고 다시 댓글 달아주세요' 답글을 달고, 재댓글이 오면 자동 재발송합니다.",
+  why:"기능을 켜는 것도, 프로 플랜으로 올리는 것도 고객만 할 수 있어서 사용자 조치."},
+
+ {id:"100/2534014",code:"100",subcode:"2534014",status:"failed_param",group:"attention",rec:false,
+  src:"dm_error_catalog.py:35",def:"recipient",
+  title:"받을 사람을 찾을 수 없음",
+  simple:"인스타가 <b>\"그 사람이 누군지 모르겠다\"</b>고 답한 것. 이사 간 집에 편지 보낸 격입니다.",
+  story:"댓글 단 사람이 그 사이 계정을 삭제했거나, 비활성화했거나, 우리 계정을 차단했을 때 납니다. 또 하나 원인이 있는데 — 인스타는 <b>보는 계정마다 사람 ID 를 다르게 줍니다</b>(계정 전용 ID). 그래서 고객이 인스타를 재연동하면 예전에 저장해 둔 수신자 ID 가 통째로 무효가 될 수 있습니다.",
+  tech:"code=100 + subcode=2534014. status 는 failed_param 이고 '확인 필요' 탭에 들어갑니다.",
+  todo:"1~2건이면 무시해도 됩니다. <b>한 고객 계정에서 계속 나오면</b> 재연동 문제일 수 있으니 재연동 + 수신자 재수집을 안내하세요.",
+  why:"대부분 상대 계정 사정이라 수신자 사정. 다만 한 계정에 몰리면 재연동 신호라 임계치를 정해둘 필요는 있습니다."},
+
+ {id:"100/2534022",code:"100",subcode:"2534022",status:"failed_param",group:"attention",rec:false,
+  src:"dm_error_catalog.py:42",def:"normal",
+  title:"24시간 대화 창이 닫힘",
+  simple:"상대가 마지막으로 반응한 지 <b>24시간이 지나서</b> 인스타가 문을 닫은 것.",
+  story:"인스타 정책상, 상대가 우리에게 반응(댓글·DM·스토리 답장)한 시점부터 <b>24시간 안에만</b> DM 을 자유롭게 보낼 수 있습니다. 그 뒤로는 상대가 다시 반응하기 전까지 못 보냅니다. 오래된 댓글에 뒤늦게 발송을 시도했을 때 나옵니다.",
+  tech:"code=100 + subcode=2534022. 같은 사유를 code 10 으로 주는 경우도 있어서 두 조합을 다 등록해 뒀습니다.",
+  todo:"없습니다. 정책입니다. 비율이 갑자기 치솟으면 우리 발송이 느려진 건 아닌지만 확인하세요.",
+  why:"인스타 규칙대로 동작한 것이라 무조치."},
+
+ {id:"100/2534023",code:"100",subcode:"2534023",status:"failed_no_trace",group:"attention",rec:true,
+  src:"dm_error_catalog.py:47 · dm_exceptions.py:110",def:"admin_action",
+  title:"그 댓글엔 이미 답장이 달려 있음",
+  simple:"인스타의 비공개 답장은 <b>댓글 하나당 딱 한 번</b>만 됩니다. 이미 누가 답을 달아서 두 번째는 거부된 것.",
+  story:"원인이 두 가지입니다. ① <b>우리가 두 번 보낸 경우</b> — 1차 발송이 사실은 성공했는데 인스타 응답이 끊겨서(500/타임아웃) 우리 서버가 실패한 줄 알고 재시도한 자기충돌. ② <b>다른 툴과 충돌</b> — 매니챗 같은 자동 DM 툴이 같은 계정에 붙어 있어서 걔가 먼저 답글을 단 경우. 실제로 2026-07-21 에 ①번으로 같은 건을 1시간마다 24번씩 재시도하는 사고가 있었고, 지금은 이 번호가 뜨면 재시도 없이 즉시 종결합니다.",
+  tech:"subcode 2534023 은 예외 타입보다 우선 판정합니다 — 인스타가 http 500 으로 줘도 '일시 오류'로 보지 않고 영구 실패로 끊습니다.",
+  todo:"① 같은 게시물에 <b>활성 캠페인이 2개 이상</b> 붙어 있는지 확인 ② 고객이 <b>다른 DM 자동화 툴</b>을 같이 쓰는지 확인하고 해제 안내(가이드 문서 있음).",
+  why:"중복 캠페인은 우리 쪽 결함 영역이고, 타사 툴 충돌은 우리가 찾아서 안내해야 하므로 관리자 조치."},
+
+ {id:"10/2534022",code:"10",subcode:"2534022",status:"failed_window",group:"attention",rec:false,
+  src:"dm_error_catalog.py:54 · dm_exceptions.py:139",def:"normal",
+  title:"24시간 대화 창이 닫힘 (code 10 버전)",
+  simple:"바로 위와 <b>완전히 같은 사유</b>인데, 인스타가 큰 번호를 100 대신 10 으로 준 경우.",
+  story:"인스타는 같은 이유를 상황에 따라 다른 큰 번호로 주는 경우가 있습니다. 그래서 우리 사전에는 (100+2534022)와 (10+2534022) 두 줄을 다 넣어 뒀습니다.",
+  tech:"code=10 + subcode 2534022 → status failed_window 로 확정.",
+  todo:"없습니다.",
+  why:"인스타 규칙대로 동작한 것."},
+
+ {id:"10/2018278",code:"10",subcode:"2018278",status:"failed_window",group:"attention",rec:false,
+  src:"dm_error_catalog.py:59 · dm_exceptions.py:139",def:"normal",
+  title:"24시간 대화 창이 닫힘 (세부 번호 다른 버전)",
+  simple:"역시 24시간 만료인데 <b>세부 번호만 다른</b> 버전입니다.",
+  story:"인스타가 같은 사유에 2534022 또는 2018278 을 섞어서 줍니다. 둘 다 윈도우 만료로 취급합니다.",
+  tech:"code=10 + subcode 2018278 → failed_window.",
+  todo:"없습니다.",
+  why:"위와 동일."},
+
+ {id:"200/2534066",code:"200",subcode:"2534066",status:"failed_no_trace",group:"attention",rec:true,
+  src:"dm_error_catalog.py:64",def:"admin_action",
+  title:"그 게시물만 자동 DM 이 막힘",
+  simple:"토큰도 멀쩡하고 다른 게시물은 잘 나가는데, <b>특정 게시물 하나에서만</b> 전부 실패하는 상태. 인스타가 그 게시물에 자동 메시징 딱지를 붙인 겁니다.",
+  story:"과거에 그 게시물로 다른 툴이 대량 발송을 했던 이력이 있으면 이렇게 막힙니다. 중요한 건 <b>계정 문제가 아니라 게시물 문제</b>라는 점 — 같은 토큰으로 새 게시물에 캠페인을 걸면 정상 발송됩니다. 그리고 <b>한 번 막힌 게시물은 풀 방법이 없습니다</b>(고객센터로도 안 됨).",
+  tech:"code=200 + subcode=2534066. 연결 전체를 죽이지 않도록 '도착 미확인'으로 분류합니다.",
+  todo:"그 게시물은 포기하고 <b>새 게시물로 캠페인을 옮기라고 안내</b>. 그리고 짧은 시간에 몰아서 대량 발송하지 않도록 안내하세요.",
+  why:"고객은 원인을 알 수 없습니다. 우리가 로그를 보고 판단해서 알려줘야 하므로 관리자 조치."},
+ ]
+},
+/* ───────────────────────── 섹션 2 ───────────────────────── */
+{
+ id:"s2",
+ title:"② 인스타가 큰 번호만 주고 세부 이유는 안 준 실패",
+ note:"세부 번호(subcode)가 없거나 우리가 모르는 번호라, 큰 번호(code) 하나만 보고 판단하는 자리입니다. ①번보다 설명이 뭉뚱그려질 수밖에 없습니다.",
+ rows:[
+ {id:"190",code:"190",subcode:"(전부)",status:"failed_token",group:"attention",rec:false,
+  src:"dm_error_catalog.py:88 · dm_exceptions.py:118",def:"user_action",
+  title:"토큰(로그인 열쇠) 만료 · 권한 회수",
+  simple:"인스타 <b>로그인 열쇠가 죽었습니다</b>. 문 자체를 못 엽니다.",
+  story:"고객이 인스타 비밀번호를 바꿨거나, 인스타 설정에서 우리 앱 권한을 해제했거나, 60일짜리 장기 토큰이 그냥 만료됐을 때 납니다. 이 번호가 뜨면 <b>그 계정의 DM 이 전부 멈춥니다</b> — 연결 상태를 error 로 바꿔서 이후 발송은 시도조차 하지 않습니다. 다만 단발 실패 한 건으로 바로 막지는 않고, 인스타에 '나 누구야?'(/me)를 한 번 물어서 진짜 죽었는지 확인한 뒤에 막습니다.",
+  tech:"code=190 은 subcode 무관하게 전부 토큰 오류. code 102(세션 무효)와 같은 취급.",
+  todo:"고객에게 <b>인스타 재연동</b> 안내. 어드민 <span class='mono'>/admin/ig-connections/</span> 에서 연결 상태를 볼 수 있습니다.",
+  why:"재연동은 고객만 할 수 있습니다. 우리는 알려줄 뿐."},
+
+ {id:"102",code:"102",subcode:"(전부)",status:"failed_token",group:"attention",rec:false,
+  src:"dm_error_catalog.py:95 · dm_exceptions.py:118",def:"user_action",
+  title:"세션 무효 (열쇠 계열)",
+  simple:"위 190 과 거의 같습니다. 인스타가 <b>\"이 세션은 더 이상 유효하지 않다\"</b>고 답한 경우.",
+  story:"190 이 '열쇠 만료'라면 102 는 '세션 끊김'에 가깝지만, 우리 대응은 똑같습니다 — 재연동. 코드에서도 190 과 한 묶음(TOKEN_CODES)으로 처리합니다.",
+  tech:"code=102 → failed_token → 연결 브릭 대상.",
+  todo:"고객에게 인스타 재연동 안내.",
+  why:"190 과 같은 뿌리."},
+
+ {id:"10",code:"10",subcode:"(없음)",status:"권한 문제인지 24시간 문제인지 미정",group:"attention",rec:false,
+  src:"dm_error_catalog.py:100",def:"investigate",
+  title:"10번인데 세부 번호가 없음 — 두 가지 뜻이 섞임",
+  simple:"인스타가 <b>\"10번 오류\"라고만 하고 세부 이유를 안 줬습니다.</b> 문제는 10번 안에 <b>조치가 정반대인 두 원인</b>이 섞여 있다는 것.",
+  story:"code 10 은 ① <b>권한 부족</b>(앱 검수·권한 범위 문제 → 고객 재연동 필요)과 ② <b>24시간 창 만료</b>(정상 실패, 무조치)를 같이 씁니다. 세부 번호(2534022·2018278)가 있으면 ②로 확정되는데, 세부 번호가 비어 있으면 번호만으로는 못 가릅니다. 한쪽은 고객에게 연락해야 하고 한쪽은 아무것도 안 해도 되니, 잘못 판단하면 둘 다 손해입니다.",
+  tech:"우리 분류기가 status 로 이미 갈라놨으면 그걸 신뢰합니다(③번 섹션 첫 줄). 그것도 없으면 이 줄로 옵니다.",
+  todo:"로그 상세의 <b>원문 오류 메시지</b>(sample_error_message)를 읽어서 어느 쪽인지 판단하세요. 권한 쪽이면 재연동 안내, 윈도우 쪽이면 무조치.",
+  why:"원인이 확정 안 된 상태 = 조사 대상. 실측에서 건수가 많으면 원문 패턴으로 자동 분기 규칙을 추가하는 게 다음 작업입니다."},
+
+ {id:"100",code:"100",subcode:"(없음 또는 모르는 번호)",status:"failed_param",group:"attention",rec:false,
+  src:"dm_error_catalog.py:107 · dm_exceptions.py:164",def:"normal",
+  title:"값이 잘못됨 — 대부분 '댓글이 7일 넘음'",
+  simple:"\"요청 값이 잘못됐다\"는 뜻인데, 실제로는 대부분 <b>댓글이 달린 지 7일이 지나서</b>입니다.",
+  story:"인스타의 비공개 답장은 <b>댓글 작성 후 7일 이내</b>에만 됩니다. 오래된 게시물에 캠페인을 걸어두면 옛날 댓글에 답장하려다 이 오류가 납니다. 드물게 '수신자 ID 가 이 계정에서 무효'인 경우도 여기 섞입니다.",
+  tech:"code=100 이고 우리가 아는 세부 번호(2534025/2534014/2534022/2534023)가 아닌 경우 이 줄로 폴백합니다.",
+  todo:"원문 메시지로 어느 쪽인지 확인. 7일 초과면 무조치, 수신자 ID 무효가 반복되면 재연동 + 수신자 재수집.",
+  why:"7일 초과가 다수라 정상으로 두되, 실측에서 다른 사유가 많으면 조사로 올려야 합니다."},
+
+ {id:"200",code:"200",subcode:"(없음 · 2534066 아님)",status:"failed_no_trace",group:"attention",rec:true,
+  src:"dm_error_catalog.py:114 · dm_exceptions.py:156",def:"investigate",
+  title:"권한 계열 200번인데 세부 이유 없음",
+  simple:"\"권한 문제\" 계열인데 <b>정확히 뭔지 모르는</b> 상태입니다.",
+  story:"예전에는 200 을 토큰 오류로 취급했는데, 그러다 <b>딱 한 건의 200 실패 때문에 1,274건을 정상 발송하던 계정 전체가 잠기는 사고</b>가 났습니다(2026-07-15 수정). 지금은 200 을 '연결 전체 문제'가 아니라 '이 수신자·이 게시물 하나의 문제'로 보고 도착 미확인으로 처리합니다. 덕분에 계정이 죽지는 않지만, 대신 원인이 불명확한 채로 남습니다.",
+  tech:"code=200 → failed_no_trace. 토큰 오류 집합(TOKEN_CODES)에서 일부러 뺐습니다.",
+  todo:"<b>한 게시물에 몰려 있으면</b> 게시물 차단(2534066)일 가능성이 높으니 게시물 교체 안내. 여러 게시물에 흩어져 있으면 원문 메시지 확인.",
+  why:"세부 번호 없는 200 은 아직 원인 미확정이라 조사 대상. 몰림 여부를 먼저 봐야 합니다."},
+
+ {id:"551",code:"551",subcode:"(전부)",status:"failed_no_trace",group:"attention",rec:true,
+  src:"dm_error_catalog.py:121 · dm_exceptions.py:173",def:"recipient",
+  title:"상대가 메시지를 받을 수 없는 상태",
+  simple:"상대방이 <b>우리 메시지를 받을 수 없게 막아둔</b> 경우입니다.",
+  story:"차단했거나, 메시지 요청을 거부 설정했거나, 비공개 계정이라 통로가 없는 경우입니다. 우리가 무엇을 해도 안 갑니다.",
+  tech:"code=551 → failed_no_trace(사용자 자가 점검 영역)로 통일.",
+  todo:"없습니다. 다만 한 캠페인에서 이 비율이 유난히 높으면 타깃이나 문구를 의심해볼 만합니다.",
+  why:"상대 계정 설정이라 우리도 고객도 못 바꿉니다."},
+
+ {id:"613",code:"613",subcode:"(전부)",status:"rate_limited",group:"waiting",rec:false,
+  src:"dm_error_catalog.py:126 · dm_exceptions.py:113",def:"normal",
+  title:"너무 빨리 불러서 잠깐 막힘 (레이트 리밋)",
+  simple:"<b>실패가 아니라 \"조금 있다 다시\"</b>입니다. 인스타가 속도를 늦추라고 한 것.",
+  story:"우리 서버가 자동으로 시간 간격을 두고 다시 시도하기 때문에 대부분 결국 성공합니다. 이 상태로 최종 종결되지 않습니다.",
+  tech:"code=613 은 재시도 가능 집합(RETRIABLE_CODES)에 포함 → status rate_limited(대기중 탭).",
+  todo:"없습니다. 계속 나오면 발송 속도(페이서) 설정을 낮추는 걸 검토하세요.",
+  why:"자동으로 회복되는 지연이라 무조치."},
+
+ {id:"4",code:"4",subcode:"(전부)",status:"rate_limited",group:"waiting",rec:false,
+  src:"dm_error_catalog.py:131 · dm_exceptions.py:113",def:"normal",
+  title:"앱 전체 호출 한도 초과",
+  simple:"특정 계정이 아니라 <b>우리 앱 전체</b>가 인스타 호출 한도에 걸린 것. 역시 자동 재시도됩니다.",
+  story:"613 이 계정·엔드포인트 단위라면 4 는 앱 단위입니다. 대량 발송이 한 시간에 몰리면 나올 수 있습니다.",
+  tech:"code=4 → rate_limited, 자동 재시도.",
+  todo:"없습니다. 반복되면 발송량을 시간대별로 분산하는 걸 검토하세요.",
+  why:"자동 회복."},
+
+ {id:"-1",code:"-1",subcode:"(전부)",status:"상황에 따라 다름",group:"attention",rec:false,
+  src:"dm_error_catalog.py:136",def:"investigate",
+  title:"인스타가 이유를 아예 안 알려준 실패",
+  simple:"<b>가장 답답한 케이스.</b> 실패했다는 것만 알고 이유는 안 줬습니다.",
+  story:"보통 인스타 쪽 서버가 잠깐 맛이 갔을 때(500번대) 이렇게 옵니다. 드문드문 섞이면 정상 범위인데, <b>특정 고객 계정이나 특정 게시물에만 몰리면</b> 그쪽에 진짜 문제가 있는 겁니다.",
+  tech:"code 가 -1 로 기록된 경우. 실제 사유는 error_message 원문에만 있습니다.",
+  todo:"원문 메시지를 읽고, 계정·게시물별로 몰려 있는지 확인하세요. 몰려 있으면 토큰/게시물 상태 점검.",
+  why:"이름 그대로 미분류입니다. 빨간색 대표 케이스."},
+
+ {id:"no_trace-sentinel",code:"no_trace",subcode:"(가짜 값·센티넬)",status:"failed_no_trace",
+  group:"attention",rec:true,src:"dm_error_catalog.py:144",def:"admin_action",gap:"실제로 안 쓰이는 듯",
+  title:"도착 미확인용 '가짜 번호' 항목 — 죽은 코드로 보임",
+  simple:"이건 인스타가 준 번호가 아니라 <b>우리가 자리를 채우려고 만든 표식(센티넬)</b>입니다. 그런데 실제 데이터에는 이 값이 안 들어가는 것 같습니다.",
+  story:"사전에는 error_code 자리에 'no_trace' 라는 글자가 들어오는 경우를 대비한 항목이 있습니다. 그런데 실제 로그를 보면 이 상황의 error_code 는 <b>그냥 빈 문자열</b>이고, 테스트도 빈 문자열을 단언하고 있습니다. 즉 이 항목은 안 불리는 죽은 코드일 가능성이 큽니다 — <b>실제로 화면에 뜨는 건 ③번 섹션의 '도착 미확인' 행</b>입니다.",
+  tech:"_BY_CODE['no_trace'] 항목. 기능상 해는 없지만 사전을 읽는 사람이 헷갈립니다.",
+  todo:"운영 조치는 없습니다. 코드 정리 대상인지만 확인하면 됩니다(제거해도 동작 변화 없음).",
+  why:"오류 대응이 아니라 코드 정리 이슈라 관리자 쪽. 실제 대응은 ③번 '도착 미확인' 행을 보세요."},
+ ]
+},
+/* ───────────────────────── 섹션 3 ───────────────────────── */
+{
+ id:"s3",
+ title:"③ 인스타 번호가 아예 없는 실패 (우리 내부 판단)",
+ note:"인스타에 물어보기도 전에 우리가 막았거나, 보낸 뒤 도착을 확인 못 했거나, 예전 버전 코드가 남긴 기록입니다. 우리 상태값(status)만 보고 설명을 붙이는 마지막 폴백입니다.",
+ rows:[
+ {id:"st:10+failed_window",code:"10",subcode:"(없음)",status:"failed_window",group:"attention",rec:false,
+  src:"dm_error_catalog.py:78",def:"normal",
+  title:"10번인데 우리가 이미 '24시간 만료'로 판정한 건",
+  simple:"②번의 애매한 10번 중에서, <b>우리 분류기가 이미 결론을 내린</b> 것들입니다.",
+  story:"사전은 정확한 열쇠부터 순서대로 찾습니다: ①(큰번호+세부번호) → ②(<b>큰번호+우리 상태</b>) → ③큰번호 → ④우리 상태. 이 행이 바로 ②번 자리입니다. 세부 번호가 없어도 우리 분류기가 이미 윈도우 만료로 갈라놨다면 그 판단을 믿고 정상 실패로 처리합니다.",
+  tech:"_BY_CODE_STATUS[('10','failed_window')].",
+  todo:"없습니다.",
+  why:"이미 확정된 정상 실패."},
+
+ {id:"st:failed_token",code:"(없음)",subcode:"",status:"failed_token",group:"attention",rec:false,
+  src:"dm_error_catalog.py:156",def:"user_action",
+  title:"열쇠가 없어서 보내기 전에 우리가 막음",
+  simple:"인스타를 <b>부르지도 않고</b> 우리가 문 앞에서 되돌린 것. 이미 토큰이 죽은 걸 알고 있으니까요.",
+  story:"190/102 로 연결이 이미 error 상태면, 새 발송 건은 인스타를 호출하지 않고 바로 실패 처리합니다(쓸데없는 호출로 상황을 더 악화시키지 않으려고). 원인은 190/102 이고 이건 그 결과입니다.",
+  tech:"발송 전 pre-send 검사에서 종결. Meta 호출 자체가 없어 error_code 가 비어 있습니다.",
+  todo:"고객에게 인스타 재연동 안내. (190/102 와 같은 대응)",
+  why:"재연동은 고객만 가능."},
+
+ {id:"st:failed_window",code:"(없음)",subcode:"",status:"failed_window",group:"attention",rec:false,
+  src:"dm_error_catalog.py:161",def:"normal",
+  title:"줄 서서 기다리는 사이 24시간이 끝남",
+  simple:"우리 <b>발송 순번을 기다리는 동안</b> 24시간이 지나버린 경우입니다.",
+  story:"우리는 인스타 제한 때문에 DM 을 한 번에 다 못 보내고 줄을 세워(큐) 3~8초 간격으로 천천히 보냅니다. 앞에 밀린 게 많으면 내 차례가 왔을 때 이미 24시간이 지나 있을 수 있습니다. <b>이건 상대 탓이 아니라 우리 적체 탓일 수 있다</b>는 점이 위 ①번의 24시간 만료와 다릅니다.",
+  tech:"큐 대기 중 윈도우 만료로 종결된 건. 코드 없이 status 만 남습니다.",
+  todo:"평소엔 무조치. <b>갑자기 늘면</b> 발송 속도·시간당 한도를 점검하세요(우리 책임일 수 있음).",
+  why:"기본은 정상이지만, 급증은 우리 문제 신호라 모니터링 대상입니다."},
+
+ {id:"st:failed_param",code:"(없음)",subcode:"(2534025 아님)",status:"failed_param",group:"attention",rec:false,
+  src:"dm_error_catalog.py:166",def:"normal",
+  title:"값이 잘못됐다는 기록인데 번호가 안 남음",
+  simple:"②번의 100번과 같은 뜻인데 <b>번호가 기록에 안 남은</b> 경우입니다. 역시 대부분 댓글 7일 초과.",
+  story:"세부 번호 2534025(숨겨진 요청)만 예외적으로 다른 그룹으로 빠지고, 나머지는 여기로 옵니다.",
+  tech:"_BY_STATUS['failed_param'].",
+  todo:"원문 메시지에서 어떤 값이 문제였는지 확인.",
+  why:"7일 초과가 다수."},
+
+ {id:"st:failed_no_trace",code:"(없음)",subcode:"",status:"failed_no_trace",group:"attention",rec:true,
+  src:"dm_error_catalog.py:171 · dm_frontend_actions.py:178",def:"admin_action",
+  title:"도착 미확인 — 실무에서 실제로 자주 보게 될 행",
+  simple:"인스타는 <b>\"접수했다\"</b>고 답했는데, 35분을 지켜봐도 <b>실제로 도착한 흔적이 없는</b> 것.",
+  story:"우리는 발송 후 두 가지로 도착을 확인합니다: 인스타가 보내주는 <b>웹훅(echo)</b>과 <b>대화 조회 API</b>. 35분 안에 아무 흔적이 없으면 이 상태로 종결합니다. 흔한 원인 셋 — ① 고객 인스타의 <b>'메시지 액세스 허용'이 꺼져 있음</b>, ② 다른 DM 툴이 같은 계정에 붙어 메시지 경로를 가로챔, ③ 수신자 계정 제한.",
+  tech:"이 상태는 '되살릴 수 있음(recoverable)'으로 표시돼 재검증 버튼이 뜹니다. 재검증이 성공하면 도착으로 승격됩니다.",
+  todo:"어드민에서 <span class='mono'>/admin/auto-dm/logs/{id}/reverify/</span> 로 <b>재검증</b>. 그래도 남으면 고객에게 위 ①②번 설정 점검을 안내하세요.",
+  why:"먼저 우리가 재검증을 돌려보고, 남는 것만 고객 안내로 넘기는 순서라 관리자 조치."},
+
+ {id:"st:failed",code:"(없음)",subcode:"",status:"failed (예전 버전)",group:"attention",rec:false,
+  src:"dm_error_catalog.py:176",def:"investigate",
+  title:"예전 버전이 남긴 '그냥 실패'",
+  simple:"이유가 안 남아 있는 <b>옛날 형식</b>의 실패 기록입니다.",
+  story:"상태를 세분화하기 전 버전이라 원인 코드가 없습니다. <b>과거 날짜 데이터면 그냥 두면 되고, 최근 날짜로 새로 찍혔다면 버그입니다</b> — 지금 코드가 옛 경로를 타고 있다는 뜻이니까요.",
+  tech:"legacy status. 현재 코드 경로에서는 생성되지 않아야 정상.",
+  todo:"<b>최근 발생분이 있는지만</b> 확인하세요. 있으면 조사 대상입니다.",
+  why:"신규 발생 자체가 결함 신호라 조사."},
+
+ {id:"st:failed_api",code:"(없음)",subcode:"",status:"failed_api (예전 버전)",group:"attention",rec:false,
+  src:"dm_error_catalog.py:181",def:"investigate",
+  title:"예전 버전이 남긴 'API 실패'",
+  simple:"위와 같은 성격의 <b>옛날 형식</b> 기록입니다.",
+  story:"세분화 이전의 Meta API 실패. 현재 코드에서는 더 이상 만들어지지 않아야 합니다.",
+  tech:"legacy alias. 호환 위해 상태값만 남아 있습니다.",
+  todo:"최근 발생분이 있으면 백엔드에 알려주세요.",
+  why:"신규 발생 자체가 결함 신호."},
+
+ {id:"st:recovery_pending",code:"(없음)",subcode:"",status:"recovery_pending",group:"hidden_spam",rec:true,
+  src:"dm_error_catalog.py:187",def:"normal",
+  title:"복구 진행 중 (안내 답글 달고 기다리는 중)",
+  simple:"<b>아직 실패가 아닙니다.</b> '요청함에서 수락하고 다시 댓글 달아주세요' 안내를 달아놓고 기다리는 중입니다.",
+  story:"①번 첫 줄(숨겨진 요청)에 대한 구제 절차입니다. 우리가 그 댓글에 공개 답글로 안내를 남기고, 상대가 다시 댓글을 달면 그때 DM 을 재발송합니다. 성공하면 '복구 성공'으로 자동 승격되고, 기한이 지나면 아래 '복구 만료'가 됩니다.",
+  tech:"고객 화면에서는 '숨겨진 요청·스팸' 탭에 묶입니다(실패 탭 아님).",
+  todo:"없습니다. 자동으로 진행됩니다.",
+  why:"진행 중인 상태라 실패로 세면 안 됩니다."},
+
+ {id:"st:recovery_expired",code:"(없음)",subcode:"",status:"recovery_expired",group:"hidden_spam",rec:true,
+  src:"dm_error_catalog.py:193",def:"normal",
+  title:"복구 만료 (기한 내 재댓글 없음)",
+  simple:"안내 답글은 달았는데 <b>상대가 기한 안에 다시 댓글을 안 달아서</b> 끝난 것.",
+  story:"상대가 움직이지 않은 것이라 계정주가 할 일은 없습니다. 다만 이 비율이 너무 높으면 안내 문구가 잘 안 읽히는 것일 수 있습니다(문구 30종 중 회전 사용).",
+  tech:"복구 퍼널의 마지막 상태.",
+  todo:"없습니다. 비율이 높으면 안내 문구를 점검해볼 만합니다.",
+  why:"상대가 반응하지 않은 것."},
+ ]
+},
+/* ───────────────────────── 섹션 4 ───────────────────────── */
+{
+ id:"s4",
+ title:"④ 인스타에 보내지도 않고 우리가 건너뛴 것",
+ note:"'실패'가 아니라 '시작 안 함'입니다. 지금은 사유를 저장하는 컬럼이 따로 없어서 오류 메시지 문자열을 부분 검색해 분류합니다 — 즉 발송 코드의 문구를 바꾸면 이 표도 같이 고쳐야 하고, 안 고치면 전부 '기타'로 흘러듭니다.",
+ rows:[
+ {id:"sk:monthly_dm_limit",code:"—",subcode:"monthly_dm_limit_reached",status:"skipped",group:"attention",
+  rec:false,src:"dashboard_ops.py:150",def:"user_action",
+  title:"이번 달 DM 한도를 다 씀",
+  simple:"플랜에 걸린 <b>월 발송 개수를 다 써서</b> 더 안 보낸 것.",
+  story:"한도로 건너뛴 건은 <b>'되살릴 수 있음'</b>으로 표시됩니다 — 다음 달이 되거나 플랜을 올리면 다시 보낼 수 있습니다. 코드상 '조치 필요(actionable)=true' 로 표시되는 <b>유일한</b> 건너뜀 사유이기도 합니다. 즉 건너뜀 패널에서 이 숫자만 영업 신호입니다.",
+  tech:"error_message 에 monthly_dm_limit_reached 가 들어갑니다.",
+  todo:"<b>플랜 업그레이드 안내 / 영업 연락.</b> 업셀 신호로 쓰세요.",
+  why:"업그레이드 결정은 고객 몫."},
+
+ {id:"sk:campaign_not_active",code:"—",subcode:"campaign not active",status:"skipped",group:"attention",
+  rec:false,src:"dashboard_ops.py:151",def:"normal",
+  title:"캠페인이 꺼져 있었음",
+  simple:"고객이 <b>캠페인을 일시정지</b>해 둔 상태에서 댓글이 들어온 것.",
+  story:"고객 의도대로 동작한 것입니다.",
+  tech:"error_message 에 'campaign not active'.",
+  todo:"없습니다.",
+  why:"고객이 끈 것."},
+
+ {id:"sk:outside_schedule_window",code:"—",subcode:"outside active schedule window",status:"skipped",
+  group:"attention",rec:false,src:"dashboard_ops.py:152",def:"normal",
+  title:"발송 시간대가 아니었음",
+  simple:"고객이 정해둔 <b>예약 발송 시간대 밖</b>에 들어온 댓글.",
+  story:"예: '오전 9시~오후 6시만 발송' 으로 설정해 뒀는데 새벽 2시에 댓글이 달린 경우.",
+  tech:"error_message 에 'outside active schedule window'.",
+  todo:"없습니다.",
+  why:"설정대로 동작."},
+
+ {id:"sk:ig_account_inactive",code:"—",subcode:"ig account deactivated",status:"skipped",group:"attention",
+  rec:false,src:"dashboard_ops.py:153",def:"user_action",
+  title:"그 인스타 계정이 '비활성' 상태",
+  simple:"고객이 <b>요금제를 줄여서</b> 그 인스타 계정이 비활성이 된 것. 연동은 남아 있지만 기능은 안 돕니다.",
+  story:"추가 계정 수를 줄이면 계정을 지우지 않고 <b>비활성으로만</b> 둡니다(토큰은 보존). 허용 개수는 활성 계정 수 기준이라, 비활성 계정으로 오는 댓글은 전부 건너뜁니다. <b>어떤 계정을 활성으로 쓸지는 고객이 직접 골라야</b> 합니다.",
+  tech:"error_message 에 'ig account deactivated'. 활성 선택은 /billing/ig-account-activation/ 에서.",
+  todo:"고객에게 '활성 계정 선택' 또는 '추가 계정 구매' 안내.",
+  why:"활성 계정 선택·구매는 고객 몫."},
+
+ {id:"sk:self_recipient",code:"—",subcode:"self recipient",status:"skipped",group:"attention",
+  rec:false,src:"dashboard_ops.py:154",def:"normal",
+  title:"계정 주인이 자기 게시물에 단 댓글",
+  simple:"<b>자기 자신에게 DM 보내는 걸 막은</b> 안전장치입니다.",
+  story:"이 장치가 없던 시절, 우리가 보낸 DM 이 다시 우리 웹훅을 때려서 무한히 자기 자신에게 DM 을 보내는 사고가 있었습니다(3개 계정 보정). 지금은 정상 차단입니다.",
+  tech:"error_message 에 'self recipient'.",
+  todo:"없습니다.",
+  why:"안전장치가 제대로 동작한 것."},
+
+ {id:"sk:connection_disconnected",code:"—",subcode:"ig connection disconnected",status:"skipped",
+  group:"attention",rec:false,src:"dashboard_ops.py:155",def:"normal",
+  title:"연동이 끊긴 뒤 남은 대기건 정리",
+  simple:"고객이 인스타 연동을 끊었는데 <b>줄에 남아 있던 건들</b>을 정리한 기록입니다.",
+  story:"보낼 대상이 없어졌으니 큐를 비우는 뒷정리입니다.",
+  tech:"error_message 에 'ig connection disconnected'.",
+  todo:"없습니다.",
+  why:"뒷정리 로그."},
+
+ {id:"sk:duplicate_campaign_cleanup",code:"—",subcode:"duplicate campaign on same media",status:"skipped",
+  group:"attention",rec:false,src:"dashboard_ops.py:156",def:"admin_action",
+  title:"같은 게시물에 캠페인이 둘 붙어서 생긴 중복 정리",
+  simple:"원칙은 <b>게시물 1개 = 활성 캠페인 1개</b>인데, 두 개가 겹쳐서 생긴 중복 대기건을 지운 것.",
+  story:"'다음 게시물' 트리거가 잘못된 기준으로 붙으면서 한 게시물에 캠페인 두 개가 활성화되는 버그가 있었습니다. 운영 DB 는 수동으로 정리했고, 코드 수정분은 아직 배포 전입니다.",
+  tech:"error_message 에 'duplicate campaign on same media'.",
+  todo:"새로 찍히는지 감시하세요. 찍히면 그 게시물의 활성 캠페인 개수를 확인해야 합니다.",
+  why:"우리 쪽 결함의 흔적이라 관리자 감시 대상."},
+
+ {id:"sk:ghost_opening_cleanup",code:"—",subcode:"유령 오프닝",status:"skipped",group:"attention",
+  rec:false,src:"dashboard_ops.py:162",def:"admin_action",
+  title:"과거 사고 때 사람이 직접 정리한 흔적",
+  simple:"코드가 만든 게 아니라 <b>운영자가 손으로 지운</b> 기록입니다.",
+  story:"①번의 '이미 답글 있음'(2534023)이 무한 재시도되며 쌓인 유령 대기건을, 사고 대응 중에 셸에서 직접 지웠습니다. 문구가 사전에 있는 이유는 <b>운영 실측 66건 중 40건이 이 문구</b>였기 때문입니다 — 지우면 건너뜀 패널의 절반이 '기타'로 보입니다.",
+  tech:"error_message 에 '유령 오프닝'. 코드 경로가 아닌 수동 조치.",
+  todo:"새로 찍히면 누가 또 수동 작업을 했거나 사고가 재발한 것이니 즉시 확인.",
+  why:"사람 개입 기록이라 관리자 영역."},
+
+ {id:"sk:other",code:"—",subcode:"(위 8개 어디에도 안 걸림)",status:"skipped",group:"attention",
+  rec:false,src:"dashboard_ops.py:164",def:"investigate",gap:"사전 공백",
+  title:"기타 — 사전에 없는 건너뜀 문구",
+  simple:"우리 사전의 8개 문구 <b>어디에도 안 걸린 나머지</b>입니다.",
+  story:"발송 코드에서 건너뜀 문구를 바꾸고 이 표를 안 고치면 전부 여기로 들어옵니다. 즉 <b>'기타'가 늘어나는 건 대개 사전이 낡았다는 신호</b>입니다.",
+  tech:"미매칭은 전부 other 로 흡수 — 합계는 항상 맞지만 내용은 안 보입니다.",
+  todo:"원문을 열어 새 사유를 SKIPPED_REASONS 표에 추가하세요.",
+  why:"정의상 미분류."},
+ ]
+},
+/* ───────────────────────── 섹션 5 ───────────────────────── */
+{
+ id:"s5",
+ title:"⑤ 위 어디에도 안 걸리는 나머지 (규칙만 있고 설명은 없음)",
+ note:"분류 규칙은 있어서 상태는 정해지는데, 오류 사전에 항목이 없어서 운영 화면 팝업에 원인·조치가 빈칸이거나 뭉뚱그려 나오는 경로입니다.",
+ rows:[
+ {id:"rule:retriable",code:"1, 2, 17, 32, 368",subcode:"(전부)",status:"rate_limited",group:"waiting",
+  rec:false,src:"dm_exceptions.py:113",def:"normal",gap:"사전 공백",
+  title:"재시도하면 되는 일시 오류 번호들",
+  simple:"일시적인 오류라 <b>자동 재시도</b>되는 번호들입니다. 이 중 4·613 만 사전에 설명이 있고 나머지는 없습니다.",
+  story:"재시도 대상 번호는 총 7개(1, 2, 4, 17, 32, 368, 613)인데 사전에는 2개만 등록돼 있습니다. 나머지 5개가 뜨면 팝업에 상태 문구만 나오고 원인 설명이 안 뜹니다.",
+  tech:"RETRIABLE_CODES 집합. status 는 rate_limited(대기중 탭).",
+  todo:"없습니다. 다만 실측에서 자주 보이면 사전에 줄을 추가하는 게 좋습니다.",
+  why:"자동 회복 경로. 사전 보강은 '있으면 좋은' 수준."},
+
+ {id:"rule:5xx",code:"(없음)",subcode:"",status:"rate_limited",group:"waiting",rec:false,
+  src:"dm_exceptions.py:189",def:"normal",
+  title:"인스타 서버가 잠깐 아픈 것 (500번대)",
+  simple:"<b>4xx 는 \"요청이 잘못됐다\", 5xx 는 \"서버가 잘못됐다\"</b>는 뜻입니다. 5xx 는 우리 잘못이 아니므로 그냥 다시 시도합니다.",
+  story:"인스타 장애 시간대에 몰려서 나옵니다. 자동 재시도로 대부분 해결됩니다.",
+  tech:"http_status 500~599 → rate_limited(재시도).",
+  todo:"없습니다.",
+  why:"자동 회복."},
+
+ {id:"rule:4xx",code:"(우리가 모르는 번호)",subcode:"",status:"failed_no_trace",group:"attention",rec:true,
+  src:"dm_exceptions.py:197",def:"investigate",gap:"사전 공백",
+  title:"우리가 모르는 4xx — 원인 불명으로 종결",
+  simple:"우리가 아는 번호(100·190·200·551…) <b>어디에도 안 걸리는</b> 요청 오류. 이유를 모른 채 실패로 끝납니다.",
+  story:"인스타가 새 오류 번호를 도입했거나, 우리가 아직 안 만나본 상황일 때 여기로 옵니다. <b>새 규칙을 추가해야 하는 1순위 후보</b>입니다.",
+  tech:"http 400~499 이면서 위 분기 어디에도 안 걸린 경우 → failed_no_trace.",
+  todo:"원문을 확인해 분류기(dm_exceptions.py)와 사전에 규칙을 추가하세요.",
+  why:"미분류의 정의 그 자체."},
+
+ {id:"rule:unknown",code:"(없음)",subcode:"",status:"rate_limited",group:"waiting",rec:false,
+  src:"dm_exceptions.py:205",def:"investigate",
+  title:"번호도 없고 http 상태도 없음 — 단서 0",
+  simple:"응답에서 <b>아무 단서도 못 얻은</b> 경우. 일단 일시 오류로 보고 재시도합니다.",
+  story:"네트워크가 끊겼거나 응답을 해석하지 못했을 때입니다. 문제는 <b>진짜로는 영구 실패인데 재시도하면</b> 같은 건이 계속 큐에 남아 유령 대기건이 쌓인다는 점입니다 — 2026-07-21 의 24회 재시도 사고가 정확히 이 패턴이었습니다(지금은 2534023 만 예외 처리해 막아둔 상태).",
+  tech:"마지막 fallback → rate_limited(retriable=true).",
+  todo:"재시도가 반복되는 건이 있는지 큐를 확인하세요.",
+  why:"단서가 없는 데다 무한 재시도 위험이 있어 조사 대상."},
+
+ {id:"rule:anomaly",code:"(200 성공 응답)",subcode:"message_id 없음",status:"rate_limited → 도착 검증 큐",
+  group:"waiting",rec:false,src:"dm_exceptions.py:72,234",def:"normal",
+  title:"성공이라는데 메시지 번호를 안 줌",
+  simple:"인스타가 <b>\"성공\"이라 해놓고 영수증(메시지 번호)을 안 준</b> 상황입니다.",
+  story:"메시지 번호(message_id)가 없으면 나중에 '이 DM 이 도착했나?'를 조회할 방법이 없습니다. 그래서 실패로 보지 않고 <b>도착 검증 큐</b>로 보내 35분간 추적합니다. 흔적이 없으면 결국 '도착 미확인'이 됩니다.",
+  tech:"DMAnomalyError → rate_limited 로 분류해 능동 검증 경로를 태웁니다.",
+  todo:"없습니다. 자동 검증이 받아냅니다.",
+  why:"자동 처리 경로가 있음."},
+
+ {id:"rule:catalog_missing",code:"(아무 번호)",subcode:"(아무 번호)",status:"(아무 상태)",group:"attention",
+  rec:false,src:"dm_error_catalog.py:206",def:"investigate",gap:"사전 공백",
+  title:"사전에 아예 없는 조합 — 팝업이 빈칸으로 나감",
+  simple:"번호·상태 조합이 사전 <b>어디에도 없어서</b> 원인·조치가 <b>빈칸</b>으로 나가는 경우입니다.",
+  story:"이러면 운영 대시보드 오류 팝업에 설명이 안 뜨고, 프론트가 자기 로컬 사전으로 대충 메웁니다. 새 번호가 등장하면 자동으로 이 상태가 되므로, 주기적으로 점검해야 합니다.",
+  tech:"describe() 가 어느 키에도 못 걸리면 빈 문자열 3개를 반환합니다. dump_dm_error_census 를 돌리면 이런 줄이 <span class='mono'>catalog=MISSING</span> 으로 표시됩니다.",
+  todo:"census 를 돌려 MISSING 줄을 뽑고 사전에 추가하세요.",
+  why:"화면에 설명이 안 뜨는 상태 = 무조건 조사."},
+ ]
+},
+/* ───────────────────────── 섹션 6 ───────────────────────── */
+{
+ id:"s6",
+ title:"⑥ 초안에는 있는데 우리 시스템엔 없는 것",
+ note:"처음 주신 표에 있었지만 저장소 전체를 검색해도 흔적이 없는 항목입니다. 방침을 정하면 사전에 새로 추가해야 합니다.",
+ rows:[
+ {id:"gap:2534001",code:"100 (추정)",subcode:"2534001",status:"failed_param (추정)",group:"attention",
+  rec:false,src:"저장소에 없음",def:"recipient",gap:"우리 시스템 미등록",
+  title:"대화방 삭제 · 보관 (초안에 적혀 있던 항목)",
+  simple:"초안에는 '대화방 삭제·보관'이라고 적혀 있는데, <b>우리 코드·사전·테스트 어디에도 이 번호가 없습니다.</b>",
+  story:"즉 지금 이 번호가 오면 우리 시스템은 세부 이유를 모른 채 '큰 번호 100' 폴백으로 처리합니다(= ②번 섹션의 '값이 잘못됨' 줄). 그리고 이 번호의 의미가 정말 '대화방 삭제·보관'인지도 <b>우리가 확인한 적이 없습니다</b>.",
+  tech:"grep 결과 0건. Meta 공식 문서 기준 의미도 미검증.",
+  todo:"먼저 <span class='mono'>dump_dm_error_census</span> 로 <b>실제로 나오는 번호인지</b> 확인하세요. 나오면 사전에 줄을 추가하겠습니다.",
+  why:"초안의 판단(수신자 사정)을 그대로 기본값으로 뒀습니다. 실측 확인 전이라 잠정입니다."},
+ ]
+},
+/* ───────────────────────── 섹션 7 ───────────────────────── */
+{
+ id:"s7",
+ title:"⑦ (참고) 실패가 아닌 상태들",
+ note:"오류 표에 섞여 들어오지 않도록 함께 적어 둡니다. 실패 집계에서 제외되는 상태들이라 분류할 필요는 없지만, 상태 이름을 볼 일이 많아 설명을 붙였습니다.",
+ rows:[
+ {id:"ok:queued",code:"—",subcode:"",status:"queued",group:"waiting",rec:false,src:"models.py:1353",def:"normal",
+  title:"큐 대기",simple:"발송 <b>순번을 기다리는 중</b>. 아직 인스타에 안 보냈습니다.",
+  story:"우리는 3~8초 간격으로 천천히 보내기 때문에 대기 시간이 생깁니다. 고객 화면에는 '대기중' 탭에 남은 개수와 예상 시간이 나옵니다.",
+  tech:"—",todo:"없습니다.",why:"정상 흐름."},
+ {id:"ok:submitting",code:"—",subcode:"",status:"submitting",group:"waiting",rec:false,src:"models.py:1354",def:"normal",
+  title:"인스타 호출 중",simple:"지금 <b>인스타에 요청을 보내고 답을 기다리는</b> 찰나의 상태.",
+  story:"보통 몇 초 안에 다음 상태로 넘어갑니다. 여기 오래 머물러 있으면 응답이 끊긴 것입니다.",
+  tech:"—",todo:"없습니다.",why:"정상 흐름."},
+ {id:"ok:rate_limited",code:"—",subcode:"",status:"rate_limited",group:"waiting",rec:false,src:"models.py:1369",def:"normal",
+  title:"지연 (레이트 리밋 대기)",simple:"인스타가 속도를 늦추라고 해서 <b>잠시 쉬는 중</b>. 실패가 아닙니다.",
+  story:"자동으로 다시 시도합니다.",tech:"—",todo:"없습니다(계속되면 페이서 점검).",why:"자동 회복."},
+ {id:"ok:pending",code:"—",subcode:"",status:"pending (예전 버전)",group:"waiting",rec:false,src:"models.py:1360",def:"normal",
+  title:"대기중 (옛 형식)",simple:"예전 버전의 대기 상태값입니다.",
+  story:"현재는 queued 를 씁니다. 과거 데이터 호환용으로만 남아 있습니다.",tech:"—",todo:"없습니다.",why:"과거 데이터."},
+ {id:"ok:accepted",code:"—",subcode:"",status:"accepted",group:"sent",rec:false,src:"models.py:1355",def:"normal",
+  title:"인스타가 접수함 (도착 확인 중)",simple:"인스타가 <b>\"받았다\"</b>고 답한 상태. 아직 <b>진짜 도착은 확인 전</b>입니다.",
+  story:"여기서 35분간 추적해서 도착이 확인되면 delivered, 안 되면 '도착 미확인'이 됩니다. 이 둘의 차이를 헷갈리기 쉬우니 주의하세요.",
+  tech:"—",todo:"없습니다.",why:"정상 흐름."},
+ {id:"ok:delivered",code:"—",subcode:"",status:"delivered",group:"sent",rec:false,src:"models.py:1356",def:"normal",
+  title:"도착 확인",simple:"<b>진짜로 도착</b>한 게 확인된 상태입니다.",
+  story:"웹훅(echo)이나 대화 조회로 확인됐습니다.",tech:"—",todo:"없습니다.",why:"성공."},
+ {id:"ok:read",code:"—",subcode:"",status:"read",group:"read",rec:false,src:"models.py:1357",def:"normal",
+  title:"읽음",simple:"수신자가 <b>읽었습니다</b>.",story:"최고의 결과입니다.",tech:"—",todo:"없습니다.",why:"성공."},
+ {id:"ok:sent",code:"—",subcode:"",status:"sent (예전 버전)",group:"sent",rec:false,src:"models.py:1361",def:"normal",
+  title:"발송완료 (옛 형식)",simple:"예전 버전의 성공 상태값입니다.",
+  story:"지금은 accepted/delivered 로 나뉘어 있습니다.",tech:"—",todo:"없습니다.",why:"과거 데이터."},
+ {id:"ok:recovery_delivered",code:"—",subcode:"",status:"recovery_delivered",group:"sent",rec:false,src:"models.py:1380",def:"normal",
+  title:"복구 성공 (재댓글로 재발송 도착)",simple:"첫 발송은 실패했지만 <b>안내를 보고 다시 댓글을 달아줘서</b> 재발송이 도착한 경우.",
+  story:"'실패 DM 복구' 기능의 해피엔딩입니다. 자동으로 이 상태로 승격됩니다.",tech:"—",todo:"없습니다.",why:"성공."},
+ ]
+},
+];
+
+/* ══════════════════════ 상태 관리 ══════════════════════ */
+const KEY="dm_error_policy_v2";
+let state=JSON.parse(localStorage.getItem(KEY)||"{}");
+let filter="all", fmt="json";
+const allRows=SECTIONS.flatMap(s=>s.rows.map(r=>({...r,section:s.title})));
+const byId=Object.fromEntries(allRows.map(r=>[r.id,r]));
+
+function save(){localStorage.setItem(KEY,JSON.stringify(state));}
+function pickOf(id){
+  if(state[id]&&typeof state[id].pick==="string") return state[id].pick;
+  return byId[id]?byId[id].def:"";
+}
+function askOf(id){return !!(state[id]&&state[id].ask);}
+function memoOf(id){return (state[id]&&state[id].memo)||"";}
+function changed(id){return pickOf(id)!==(byId[id]?byId[id].def:"");}
+
+function esc(s){return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
+function escAttr(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+
+function rowHTML(r){
+  const keys=[];
+  if(r.code) keys.push(`<span class="k">code <b>${esc(r.code)}</b></span>`);
+  if(r.subcode) keys.push(`<span class="k">subcode <b>${esc(r.subcode)}</b></span>`);
+  if(r.status) keys.push(`<span class="k">우리 상태 <b>${esc(r.status)}</b></span>`);
+  const kv=[
+    ["실제 상황",r.story],
+    ["기술 메모",r.tech&&r.tech!=="—"?r.tech:""],
+    ["우리가 할 일",r.todo],
+    ["이 분류인 이유",r.why],
+    ["번호 · 코드 위치",`<span class="keys">${keys.join("")}</span>
+       <div style="margin-top:5px"><span class="src">${esc(r.src)}</span>
+       &nbsp;<span class="flag">${esc(GROUP_FLAG[r.group]||"")}</span>
+       ${r.rec?'<span class="flag rec">재검증·복구 가능</span>':""}</div>`],
+  ].filter(x=>x[1]);
+  return `
+  <div class="row-card${askOf(r.id)?" ask":""}" data-id="${escAttr(r.id)}" data-pick="${escAttr(pickOf(r.id))}">
+    <div class="row-top">
+      <div class="title">${esc(r.title)}</div>
+      <div class="flags">${r.gap?`<span class="flag gap">${esc(r.gap)}</span>`:""}</div>
+    </div>
+    <div class="simple"><span class="tag">한 줄로</span>${r.simple}</div>
+    <div class="kv">
+      ${kv.map(([k,v])=>`<div class="k2"><div class="lab">${k}</div><div class="val">${v}</div></div>`).join("")}
+    </div>
+    <div class="pickrow">
+      <div class="picks">
+        ${BUCKETS.map(b=>`<button class="pick" data-b="${b.id}" data-id="${escAttr(r.id)}"
+           aria-pressed="${pickOf(r.id)===b.id}">${b.label}</button>`).join("")}
+      </div>
+      <button class="askbtn" data-ask="${escAttr(r.id)}" aria-pressed="${askOf(r.id)}">🙋 설명 더 필요</button>
+      <span class="chg ${changed(r.id)?"on":""}">${changed(r.id)?"기본값에서 변경됨":"기본값"}</span>
+      <input class="memo" data-id="${escAttr(r.id)}" placeholder="메모 · 질문 적어두기" value="${escAttr(memoOf(r.id))}">
+    </div>
+  </div>`;
+}
+
+function render(){
+  document.getElementById("sections").innerHTML=SECTIONS.map(s=>`
+    <section data-sec="${s.id}">
+      <h2>${esc(s.title)} <span class="n">${s.rows.length}건</span></h2>
+      <p class="note">${esc(s.note)}</p>
+      ${s.rows.map(rowHTML).join("")}
+    </section>`).join("");
+  applyFilter();updateTally();
+}
+
+function applyFilter(){
+  document.querySelectorAll(".row-card").forEach(el=>{
+    const id=el.dataset.id,p=pickOf(id);
+    const show = filter==="all" ? true
+      : filter==="ask" ? askOf(id)
+      : filter==="changed" ? changed(id)
+      : p===filter;
+    el.classList.toggle("hidden",!show);
+  });
+  document.querySelectorAll("section[data-sec]").forEach(sec=>{
+    const any=[...sec.querySelectorAll(".row-card")].some(el=>!el.classList.contains("hidden"));
+    sec.classList.toggle("hidden",!any);
+  });
+}
+
+function updateTally(){
+  const counts={};BUCKETS.forEach(b=>counts[b.id]=0);
+  let ask=0,chg=0,none=0;
+  allRows.forEach(r=>{
+    const p=pickOf(r.id);
+    if(p)counts[p]=(counts[p]||0)+1;else none++;
+    if(askOf(r.id))ask++;
+    if(changed(r.id))chg++;
+  });
+  document.getElementById("progress").innerHTML=
+    `전체 <b>${allRows.length}</b> · 변경 <b>${chg}</b> · 설명요청 <b>${ask}</b>`;
+  document.getElementById("tally").innerHTML=
+    BUCKETS.map(b=>`<span class="t-${b.id}">${b.label} ${counts[b.id]}</span>`).join("")
+    +(none?`<span class="t-none">미선택 ${none}</span>`:"")
+    +`<span class="t-ask">🙋 설명 더 필요 ${ask}</span>`;
+}
+
+/* ══════════════════════ 이벤트 ══════════════════════ */
+document.addEventListener("click",e=>{
+  const pick=e.target.closest(".pick");
+  if(pick){
+    const id=pick.dataset.id,b=pick.dataset.b;
+    state[id]=state[id]||{};
+    state[id].pick = pickOf(id)===b ? "" : b;
+    save();
+    const card=document.querySelector(`.row-card[data-id="${CSS.escape(id)}"]`);
+    card.dataset.pick=pickOf(id);
+    card.querySelectorAll(".pick").forEach(p=>p.setAttribute("aria-pressed",p.dataset.b===pickOf(id)));
+    const chg=card.querySelector(".chg");
+    chg.className="chg"+(changed(id)?" on":"");
+    chg.textContent=changed(id)?"기본값에서 변경됨":"기본값";
+    updateTally();
+    if(filter!=="all")applyFilter();
+    return;
+  }
+  const ask=e.target.closest("[data-ask]");
+  if(ask){
+    const id=ask.dataset.ask;
+    state[id]=state[id]||{};
+    state[id].ask=!askOf(id);
+    save();
+    ask.setAttribute("aria-pressed",askOf(id));
+    ask.closest(".row-card").classList.toggle("ask",askOf(id));
+    updateTally();
+    if(filter!=="all")applyFilter();
+    return;
+  }
+  const chip=e.target.closest(".chip");
+  if(chip){
+    filter=chip.dataset.filter;
+    document.querySelectorAll(".chip").forEach(c=>c.setAttribute("aria-pressed",c===chip));
+    applyFilter();return;
+  }
+  const fb=e.target.closest("[data-fmt]");
+  if(fb){
+    fmt=fb.dataset.fmt;
+    document.querySelectorAll("[data-fmt]").forEach(x=>x.classList.toggle("primary",x===fb));
+    buildOut();
+  }
+});
+document.addEventListener("input",e=>{
+  const m=e.target.closest(".memo");if(!m)return;
+  state[m.dataset.id]=state[m.dataset.id]||{};
+  state[m.dataset.id].memo=m.value;save();
+});
+document.getElementById("brief").onclick=()=>{
+  document.body.classList.toggle("brief");
+  document.getElementById("brief").textContent=
+    document.body.classList.contains("brief")?"자세히 보기":"간단히 보기";
+};
+document.getElementById("reset").onclick=()=>{
+  if(!confirm("바꾼 분류·메모·설명요청을 모두 지우고 기본값으로 되돌립니다. 계속할까요?"))return;
+  state={};save();render();
+};
+document.getElementById("export").onclick=()=>{
+  const box=document.getElementById("exportBox");
+  box.classList.remove("hidden");buildOut();box.scrollIntoView({behavior:"smooth"});
+};
+document.getElementById("copyOut").onclick=async()=>{
+  const t=document.getElementById("out").textContent;
+  const btn=document.getElementById("copyOut");
+  try{await navigator.clipboard.writeText(t);btn.textContent="복사됨";
+    setTimeout(()=>btn.textContent="복사",1200);}
+  catch(_){const r=document.createRange();r.selectNodeContents(document.getElementById("out"));
+    getSelection().removeAllRanges();getSelection().addRange(r);}
+};
+function buildOut(){
+  const rows=allRows.map(r=>({
+    section:r.section,code:r.code,subcode:r.subcode,status:r.status,title:r.title,
+    default_bucket:r.def,decided:pickOf(r.id)||null,changed_from_default:changed(r.id),
+    needs_explanation:askOf(r.id),memo:memoOf(r.id)||null,source:r.src,
+  }));
+  let text;
+  if(fmt==="json"){
+    text=JSON.stringify({
+      generated_for:"DM 오류 처리방침 (쉬운 설명판)",
+      total:rows.length,
+      changed:rows.filter(r=>r.changed_from_default).length,
+      needs_explanation:rows.filter(r=>r.needs_explanation).length,
+      rows
+    },null,2);
+  }else{
+    const head="| 섹션 | code | subcode | status | 제목 | 기본값 | 결정 | 설명요청 | 메모 |\n|---|---|---|---|---|---|---|---|---|";
+    text=head+"\n"+rows.map(r=>`| ${r.section} | ${r.code} | ${r.subcode||""} | ${r.status} | ${r.title} | ${r.default_bucket} | ${r.decided||"미선택"} | ${r.needs_explanation?"🙋":""} | ${(r.memo||"").replace(/\|/g,"/")} |`).join("\n");
+  }
+  document.getElementById("out").textContent=text;
+}
+render();
+</script>
+</body>
+</html>

@@ -84,6 +84,8 @@ services:
     # 전용 큐로 라우팅하므로, 이 큐들을 안 먹으면 dev 에서 DM/AI/스팸필터가 적체돼 멈춘다.
     # (prod 는 docker-compose.prod.yml 에서 큐별 전용 워커로 분리 — dev 는 통합 1개로 단순 유지.)
     # ai_jobs: run_ai_job(AI 페이지 생성) + run_spam_filter_check(gemma 스팸 판정) 라우팅 대상.
+    # reports: insta_reports.generate_report(1건 13~18분, 영상 다운로드 + Chromium PDF).
+    #   dev 는 통합 워커라 이 큐를 안 먹으면 리포트가 queued 로 영구 적체된다.
     # 처리량은 prefork 기본(=CPU 코어수). DM 동시성 데모가 필요하면 threads 워커를 따로 띄울 것(아래 주석).
     # --max-tasks-per-child / --max-memory-per-child: prefork 자식을 주기적으로 재활용.
     #   없으면 자식 20개가 며칠 살면서 누적분을 안 놓아 박스 메모리를 전부 먹는다
@@ -92,7 +94,7 @@ services:
     command: >
       celery -A config worker -l info --concurrency=20
       --max-tasks-per-child=100 --max-memory-per-child=250000
-      -Q celery,snapshot,billing,dm_send,webhook_followup,verify,ai_jobs
+      -Q celery,snapshot,billing,dm_send,webhook_followup,verify,ai_jobs,reports
     # 워커가 새도 Django(web)까지 끌고 내려가지 않게 하는 격리 가드.
     # 한도를 넘으면 워커 컨테이너만 OOM 으로 재시작되고 API 는 살아 있는다.
     mem_limit: 8g

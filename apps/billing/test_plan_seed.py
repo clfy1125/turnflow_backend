@@ -17,8 +17,15 @@ REQUIRED_KEYS = {
     "spam_filter",
     "dm_recovery",
     "max_ig_accounts",
+    "insta_report",
+    "insta_report_monthly_per_account",
 }
 
+# ⚠️ monthly_price 는 **운영에서 바꾸는 값**이다(billing/0014 주석: "프로모 종료 시 운영에서
+#    monthly_price만 올리면 됨"). 마이그레이션 시드는 론칭 프로모(3,900/9,900) 였고 이후
+#    운영에서 조정됐다 — 2026-07 정책 인하(-1,000)로 현재 prod 는 basic 4,900 / pro 14,900
+#    이고 list_price == monthly_price(할인 미표시)다.
+#    가격 정책이 바뀌면 이 표를 prod 실값에 맞춰 갱신할 것.
 EXPECTED = {
     "free": {
         "monthly_price": 0,
@@ -32,10 +39,12 @@ EXPECTED = {
         "max_ig_accounts": 1,
         "ai_unlimited": False,
         "custom_css": True,
+        "insta_report": False,
+        "insta_report_monthly_per_account": 0,
     },
     "basic": {
-        "monthly_price": 3900,
-        "list_price": 5900,
+        "monthly_price": 4900,
+        "list_price": 4900,  # 할인 미표시 (list == monthly)
         "max_pages": 5,
         "remove_logo": True,
         "dm_monthly_limit": 200,
@@ -45,10 +54,12 @@ EXPECTED = {
         "max_ig_accounts": 1,
         "ai_unlimited": True,
         "custom_css": True,
+        "insta_report": False,
+        "insta_report_monthly_per_account": 0,
     },
     "pro": {
-        "monthly_price": 9900,  # 론칭 프로모 (정가 15,900)
-        "list_price": 15900,
+        "monthly_price": 14900,  # 운영값(2026-07 정책 인하 -1,000)
+        "list_price": 14900,  # 할인 미표시 (list == monthly)
         "max_pages": 5,
         "remove_logo": True,
         "dm_monthly_limit": -1,
@@ -58,6 +69,9 @@ EXPECTED = {
         "max_ig_accounts": 1,  # 기본 1 — 추가는 구독 extra_ig_accounts
         "ai_unlimited": True,
         "custom_css": True,
+        # 인스타 성장 리포트: IG 계정당 월 1회 (추가 계정마다 1회씩 총량 증가)
+        "insta_report": True,
+        "insta_report_monthly_per_account": 1,
     },
 }
 
@@ -99,7 +113,7 @@ class TestPlanListApi:
         assert {"free", "basic", "pro"} <= set(by_name.keys())
         assert "admin" not in by_name  # 비활성 — 노출 금지
         assert "pro_plus" not in by_name
-        assert by_name["basic"]["list_price"] == 5900
-        assert by_name["pro"]["monthly_price"] == 9900
-        assert by_name["pro"]["list_price"] == 15900
+        assert by_name["basic"]["list_price"] == 4900
+        assert by_name["pro"]["monthly_price"] == 14900
+        assert by_name["pro"]["list_price"] == 14900
         assert by_name["pro"]["features"]["dm_monthly_limit"] == -1
