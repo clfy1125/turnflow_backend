@@ -555,6 +555,44 @@ def _flip_recovery_on_success(log, campaign) -> int:
     return len(pendings)
 
 
+def _maybe_enqueue_public_reply(log, campaign) -> bool:
+    """공개 답글 게시 예약 — 발송 성공 경로와 도착 승격 경로가 **공유하는 단일 지점**.
+
+    왜 분리했나 (2026-07-30):
+        예약 코드가 ``send_dm_task`` 의 정상 성공 분기(mark_accepted 직후)에만 있어서,
+        ``_confirm_delivered_via_conv`` 로 **도착 승격된 건은 대댓글이 달리지 않았다.**
+        통계는 delivered 로 정확한데 게시물에는 답글이 없어, 사내/고객이 게시물을 보고
+        "이 사람 DM 안 간 거 아니냐" 고 의심하는 원인이 됐다(자격증 캠페인 @y000hee·
+        @luv_56789 2건, subcode 2534023). 대댓글은 "DM 갔다"는 사회적 증거라 중요하다.
+
+    게이트는 성공 경로와 동일하다:
+      - ``public_reply_enabled`` + 템플릿(신형 list 또는 legacy 단일) 존재
+      - ``comment_id`` 존재 (Story 답장 캠페인은 댓글이 없어 공개 답글 불가)
+      - reward DM 은 제외 (오프닝에 이미 답글을 달았으므로)
+      - 캠페인 상한 미도달 (best-effort 라 도달 시 태스크 미적재)
+    상한·배치 스로틀·중복(``already = bool(public_reply_id)``) 은 ``post_public_reply``
+    내부에서 재확인하므로 여기서는 무의미한 적재만 걸러낸다.
+
+    Returns: 예약했으면 True.
+    """
+    has_reply_content = bool(
+        (campaign.public_reply_templates or []) or (campaign.public_reply_template or "").strip()
+    )
+    if not (
+        campaign.public_reply_enabled
+        and has_reply_content
+        and log.comment_id
+        and log.dm_kind != SentDMLog.DMKind.REWARD
+        and not campaign.public_reply_limit_reached()
+    ):
+        return False
+    # 5~15초 지터를 enqueue 시점에서 적용 (Instagram 봇 검사 회피)
+    import random as _r
+
+    post_public_reply.apply_async(args=[str(log.id)], countdown=_r.randint(5, 15))
+    return True
+
+
 def _confirm_delivered_via_conv(log, campaign, tag: str) -> dict:
     """Conversations 로 '이미 우리가 이 수신자에게 보냈음'이 확인된 발송을 도착 확정 처리.
 
@@ -568,7 +606,10 @@ def _confirm_delivered_via_conv(log, campaign, tag: str) -> dict:
     _flip_recovery_on_success(log, campaign)
     log.mark_delivered(via=SentDMLog.VerifiedVia.CONV_API)
     log.append_verification_log({"path": tag, "result": "confirmed_sent"})
-    return {"status": "delivered", "via": f"{tag}_conv_api"}
+    # ★ 도착이 확정됐으면 정상 성공과 동일하게 공개 답글도 게시한다 — 이 경로에 예약이
+    #   빠져 있어서 "DM 은 갔는데 게시물에 대댓글이 없는" 상태가 만들어졌다.
+    queued_reply = _maybe_enqueue_public_reply(log, campaign)
+    return {"status": "delivered", "via": f"{tag}_conv_api", "public_reply_queued": queued_reply}
 
 
 # ===== 진입점 =====
@@ -1763,25 +1804,9 @@ def send_dm_task(self, log_id: str):
     verify_dm_delivery.apply_async(args=[str(log.id)], countdown=600)
 
     # public_reply_enabled 면 댓글에 공개 답글도 게시 (best-effort)
-    # v3.5: public_reply_templates(list) 또는 legacy public_reply_template 중 하나라도 있으면 OK
-    # v3.7: Story 답장 캠페인 (comment_id 없음) 은 공개 답글 불가능 → skip
-    has_reply_content = bool(
-        (campaign.public_reply_templates or []) or (campaign.public_reply_template or "").strip()
-    )
-    if (
-        campaign.public_reply_enabled
-        and has_reply_content
-        and log.comment_id  # Story 답장은 comment_id 없음 → 공개 답글 skip
-        and log.dm_kind != SentDMLog.DMKind.REWARD
-        and not campaign.public_reply_limit_reached()  # 상한 도달 시 무의미한 태스크 미적재(best-effort)
-    ):
-        # 5~15초 지터를 enqueue 시점에서 적용 (Instagram 봇 검사 회피)
-        import random as _r
-
-        post_public_reply.apply_async(
-            args=[str(log.id)],
-            countdown=_r.randint(5, 15),
-        )
+    # 게이트·지터는 _maybe_enqueue_public_reply 단일 지점 — 도착 승격 경로
+    # (_confirm_delivered_via_conv)와 동일한 조건을 공유해야 하므로 헬퍼로 뺐다.
+    _maybe_enqueue_public_reply(log, campaign)
 
     return {
         "status": "accepted",
@@ -2814,6 +2839,10 @@ def poll_missed_comments():
 
     polled = 0
     total_misses = 0
+    # 종료 사유 분포 — anchor 가 압도적이면 "리스트 맨 위 갭만 볼 수 있다"는 구조적 한계가
+    # 실제로 작동 중이라는 뜻이고, budget_exhausted 가 보이면 페이지 상한이 모자란다는 뜻이다.
+    # (이 분포 없이 폴러 개선 여부를 판단하려다 오판했다 — 2026-07-30)
+    stop_reasons: dict[str, int] = {}
     for conn_id, media_id in targets:
         conn = conns.get(conn_id)
         if conn is None:
@@ -2821,13 +2850,48 @@ def poll_missed_comments():
         try:
             result = _poll_one_media(conn, media_id, now)
             total_misses += result.get("misses", 0)
+            _stop = str(result.get("stop") or "unknown")
+            stop_reasons[_stop] = stop_reasons.get(_stop, 0) + 1
             polled += 1
         except Exception:
             logger.exception("poll_missed_comments: 실패 conn=%s media=%s", conn_id, media_id)
+            stop_reasons["error"] = stop_reasons.get("error", 0) + 1
 
     if total_misses:
         logger.info("poll_missed_comments: polled=%s misses(enqueued)=%s", polled, total_misses)
-    return {"targets": len(targets), "polled": polled, "misses": total_misses}
+
+    # ★ 결과 적재 (2026-07-30) — 웹훅 유실률을 **장기 추적**하기 위한 계측.
+    #   지금까지는 misses>0 일 때만 logger.info 였고 컨테이너 로그는 재시작 시 소실돼
+    #   (실측: 16시간분만 남아 있었다) "웹훅이 실제로 얼마나 유실되는가" 를 답할 수 없었다.
+    #   그 결과 폴러 개선(K-연속 앵커/딥 스윕)의 필요성조차 판단할 수 없었다.
+    #   저장소는 기존 EventInbox(일별 파티션·7일 후 자동 DROP) 재사용 → 마이그레이션 불필요.
+    #   misses 는 '실제로 enqueue 된 누락분' 이라 오탐이 0인 지표다.
+    try:
+        from django.utils import timezone as _tz
+
+        from .models import EventInbox as _EI
+
+        _now = _tz.now()
+        _EI.objects.create(
+            event_key=f"pollstat:{int(_now.timestamp() * 1_000_000)}",
+            event_type="poll_missed_stat",
+            payload={
+                "targets": len(targets),
+                "polled": polled,
+                "misses": total_misses,
+                "stops": stop_reasons,
+            },
+            processed_at=_now,  # 후속 워커 pending 조회에 안 걸리게
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("poll_missed_comments 결과 적재 실패 (non-fatal)", exc_info=True)
+
+    return {
+        "targets": len(targets),
+        "polled": polled,
+        "misses": total_misses,
+        "stops": stop_reasons,
+    }
 
 
 @shared_task(name="integrations.cleanup_comment_ledger")

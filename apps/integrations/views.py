@@ -4460,7 +4460,18 @@ def _verify_webhook_signature(request, logger) -> bool:
 def _capture_comment_webhook_raw(payload: dict, logger) -> None:
     """댓글 웹훅 **원문 계측** (관측 전용 — 발송/스팸 로직에 일절 영향 없음).
 
-    왜 필요한가 (2026-07-30):
+    ⚠️ 범위 축소 (2026-07-30, 판정 완료 후):
+        최초 목적("광고 유입 댓글이 웹훅으로 오는가 / 어떤 형태로 오는가")은
+        **실측으로 판정이 끝났다** — 광고 댓글은 온다. `media.id` 가 광고 카피이고
+        원본은 `media.original_media_id` 로 온다(증거: AD_COMMENT_WEBHOOK_EVIDENCE.md).
+        그래서 **일반 댓글은 더 이상 적재하지 않고**, 아래 두 부류만 남긴다:
+          (a) 광고 관련(`ad_id`/`ad_title`/`original_media_id`/`media_product_type=AD`)
+              → 광고 대응 로직의 회귀 감시 + 새 필드 조합 발견
+          (b) `changes` 가 아닌 형태(flat/unknown) → 뷰가 처리하지 못하는 payload 조기 발견
+        일반 댓글까지 담던 시기의 적재량은 일 ~1천건이었고, 축소 후엔 사실상 0 이다.
+        완전히 끄려면 `COMMENT_WEBHOOK_RAW_CAPTURE=False`.
+
+    왜 필요했는가 (기록):
         광고(Paid partnership)로 유입된 댓글이 comments 웹훅으로 오는지, 온다면 어떤
         형태인지를 **데이터로** 판정할 수단이 지금 없다. 현재 원문이 남는 곳은
         ``SentDMLog.webhook_payload``(=캠페인이 매칭돼 DM 이 생긴 건만)와
@@ -4537,6 +4548,9 @@ def _capture_comment_webhook_raw(payload: dict, logger) -> None:
                     or media.get("original_media_id")
                     or str(media.get("media_product_type") or "").upper() == "AD"
                 )
+                # ★ 축소된 적재 기준: 광고 관련 또는 비정상 형태만. 일반 댓글은 버린다.
+                if not (is_ad or shape != "changes"):
+                    continue
                 rows.append(
                     EventInbox(
                         event_key=f"cmtraw:{stamp}:{idx}:{uidx}:{cid[:40]}"[:255],

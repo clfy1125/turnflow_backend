@@ -1046,7 +1046,12 @@ ACCEPTED 상태에서 echo 웹훅 누락이 의심될 때, `GET /{message_id}` �
 
 ## 비즈니스 로직
 - 이미 도착 확인(DELIVERED/READ) 된 건은 즉시 found_in_meta=true 로 short-circuit 반환.
-- `meta_message_id` 가 없으면 400.
+- `meta_message_id` 가 **있으면** `GET /{message_id}` 로 조회합니다.
+- `meta_message_id` 가 **없으면**(성공 ack 유실 건 = failed_no_trace 다수) Conversations API 로
+  '이 수신자에게 보낸 흔적'을 조회해 판정합니다 — 창은 로그 생성 시각부터 현재까지입니다.
+  흔적 있으면 도착 확정(200/found_in_meta=true), 없으면 상태 변경 없이 200/false,
+  조회 불확실이면 상태 변경 없이 200/false + `unverifiable` 검증로그.
+  `recipient_user_id` 까지 없는 건만 400 입니다.
 - Meta API 일시 오류(DMTransientError)/그 외 API 오류(DMSendError) 는 502.
 - 200 + 메시지 존재 → mark_delivered(conv_api) 후 found_in_meta=true.
 - 404(미발견) → 검증 로그에 not_found 기록, 상태 변경 없이 found_in_meta=false (200).
@@ -1073,7 +1078,9 @@ ACCEPTED 상태에서 echo 웹훅 누락이 의심될 때, `GET /{message_id}` �
                     )
                 ],
             ),
-            400: OpenApiResponse(description="message_id 없음 — 재검증 불가"),
+            400: OpenApiResponse(
+                description="message_id·recipient_user_id 둘 다 없음 — 재검증 불가"
+            ),
             401: OpenApiResponse(description="인증 누락/만료"),
             403: OpenApiResponse(description="관리자 권한 없음"),
             404: OpenApiResponse(description="로그 없음"),
@@ -1096,20 +1103,88 @@ ACCEPTED 상태에서 echo 웹훅 누락이 의심될 때, `GET /{message_id}` �
                 }
             )
 
+        ig_conn = log.campaign.ig_connection
+
+        # ★ message_id 가 없는 건도 재검증 가능해야 한다 (2026-07-30).
+        #   성공 ack 가 유실된 발송(사설답장 delivered-but-500 → 재시도 2534023 자기충돌)은
+        #   **정의상 message_id 가 비어 있다**. 그런데 프론트는 recoverable=true 판정에
+        #   failed_no_trace 를 포함해 재검증 버튼을 노출하므로, 운영자가 누르면 100% 400 이
+        #   떴다(prod 76건 전부 해당 = 유일한 수동 정리 경로가 막혀 있었음).
+        #   message_id 가 없으면 Conversations API 로 '이 수신자에게 최근 보낸 흔적'을
+        #   조회해 도착을 확정한다 — send_dm_task 의 승격 게이트와 같은 신호원.
         if not log.meta_message_id:
+            if not log.recipient_user_id:
+                return Response(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": 400,
+                            "message": "message_id 와 수신자 IGSID 가 모두 없어 재검증할 수 없습니다.",
+                            "details": {"status": log.status},
+                        },
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            # 로그 생성 시점부터 지금까지를 창으로 잡는다(오래된 건도 조회되도록).
+            age_s = int((timezone.now() - log.created_at).total_seconds()) + 120
+            recent = InstagramMessagingService.has_recent_message_to_recipient(
+                ig_user_id=ig_conn.external_account_id,
+                recipient_id=log.recipient_user_id,
+                access_token=ig_conn.access_token,
+                since_seconds=age_s,
+            )
+            if recent is True:
+                log.append_verification_log(
+                    {
+                        "path": "conv_api",
+                        "result": "found_without_mid",
+                        "trigger": "admin_manual",
+                        "since_seconds": age_s,
+                    }
+                )
+                log.mark_delivered(via=SentDMLog.VerifiedVia.CONV_API)
+                log_admin_action(
+                    request=request,
+                    action=AdminActionLog.Action.DMLOG_REVERIFY,
+                    target_type="dmlog",
+                    target_id=log.pk,
+                    target_repr=log.recipient_username,
+                )
+                return Response(
+                    {
+                        "log_id": str(log.id),
+                        "previous_status": prev,
+                        "new_status": log.status,
+                        "verified_via": log.verified_via or "",
+                        "found_in_meta": True,
+                        "detail": (
+                            "message_id 는 없지만 Conversations API 로 이 수신자에게 보낸 "
+                            "메시지가 확인돼 도착으로 확정했습니다."
+                        ),
+                    }
+                )
+            log.append_verification_log(
+                {
+                    "path": "conv_api",
+                    "result": "not_found_without_mid" if recent is False else "unverifiable",
+                    "trigger": "admin_manual",
+                    "since_seconds": age_s,
+                }
+            )
             return Response(
                 {
-                    "success": False,
-                    "error": {
-                        "code": 400,
-                        "message": "이 로그는 Meta message_id 가 없어 재검증할 수 없습니다.",
-                        "details": {"status": log.status},
-                    },
-                },
-                status=status.HTTP_400_BAD_REQUEST,
+                    "log_id": str(log.id),
+                    "previous_status": prev,
+                    "new_status": log.status,
+                    "verified_via": log.verified_via or "",
+                    "found_in_meta": False,
+                    "detail": (
+                        "발송 흔적을 찾지 못했습니다."
+                        if recent is False
+                        else "Meta 조회가 불확실해 판정하지 못했습니다(상태 변경 없음)."
+                    ),
+                }
             )
-
-        ig_conn = log.campaign.ig_connection
 
         try:
             message = InstagramMessagingService.fetch_message(

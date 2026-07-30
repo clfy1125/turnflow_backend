@@ -283,3 +283,84 @@ class TestSpamFilterUsesOriginalMedia:
             if run.called:
                 assert run.call_args.kwargs["media_id"] == ORIGIN_MEDIA
         assert result["status"] in ("processed", "skipped"), result
+
+
+class TestPublicReplyOnDeliveryPromotion:
+    """도착 승격 경로도 공개 대댓글을 예약한다 (2026-07-30 결함 ②).
+
+    _confirm_delivered_via_conv 는 mark_accepted+mark_delivered 만 하고 공개 답글을
+    예약하지 않아, "DM 은 갔는데 게시물에 대댓글이 없는" 상태가 만들어졌다.
+    """
+
+    def _log(self, campaign, **kwargs):
+        defaults = {
+            "campaign": campaign,
+            "recipient_user_id": "igsid_promo",
+            "recipient_username": "promo_user",
+            "comment_id": "cmt_promo",
+            "message_sent": "본문",
+            "status": SentDMLog.Status.SUBMITTING,
+            "dm_kind": SentDMLog.DMKind.OPENING,
+            "idempotency_key": f"idem_{uuid.uuid4().hex}",
+        }
+        defaults.update(kwargs)
+        return SentDMLog.objects.create(**defaults)
+
+    def test_promotion_enqueues_public_reply(self, ig_connection):
+        from apps.integrations.tasks import _confirm_delivered_via_conv
+
+        campaign = _campaign(
+            ig_connection, public_reply_enabled=True, public_reply_templates=["DM 보냈어요!"]
+        )
+        log = self._log(campaign)
+        with patch("apps.integrations.tasks.post_public_reply.apply_async") as ap:
+            result = _confirm_delivered_via_conv(log, campaign, "err_code_2")
+
+        assert result["status"] == "delivered"
+        assert result["public_reply_queued"] is True
+        assert ap.call_count == 1
+        log.refresh_from_db()
+        assert log.status == SentDMLog.Status.DELIVERED
+
+    def test_promotion_skips_reply_for_reward(self, ig_connection):
+        """reward DM 은 공개 답글 대상이 아니다(오프닝에 이미 달림)."""
+        from apps.integrations.tasks import _confirm_delivered_via_conv
+
+        campaign = _campaign(
+            ig_connection, public_reply_enabled=True, public_reply_templates=["DM 보냈어요!"]
+        )
+        log = self._log(campaign, dm_kind=SentDMLog.DMKind.REWARD, comment_id="")
+        with patch("apps.integrations.tasks.post_public_reply.apply_async") as ap:
+            result = _confirm_delivered_via_conv(log, campaign, "err_code_2")
+
+        assert result["public_reply_queued"] is False
+        assert ap.call_count == 0
+
+    def test_promotion_skips_when_disabled(self, ig_connection):
+        from apps.integrations.tasks import _confirm_delivered_via_conv
+
+        campaign = _campaign(ig_connection, public_reply_enabled=False)
+        log = self._log(campaign)
+        with patch("apps.integrations.tasks.post_public_reply.apply_async") as ap:
+            result = _confirm_delivered_via_conv(log, campaign, "err_code_2")
+
+        assert result["public_reply_queued"] is False
+        assert ap.call_count == 0
+
+    def test_promotion_skips_when_limit_reached(self, ig_connection):
+        """공개답글 상한 도달 캠페인은 무의미한 태스크를 적재하지 않는다."""
+        from apps.integrations.tasks import _confirm_delivered_via_conv
+
+        campaign = _campaign(
+            ig_connection,
+            public_reply_enabled=True,
+            public_reply_templates=["DM 보냈어요!"],
+            public_reply_limit=1,
+            public_reply_posted_count=1,
+        )
+        log = self._log(campaign)
+        with patch("apps.integrations.tasks.post_public_reply.apply_async") as ap:
+            result = _confirm_delivered_via_conv(log, campaign, "err_code_2")
+
+        assert result["public_reply_queued"] is False
+        assert ap.call_count == 0
