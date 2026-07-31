@@ -193,38 +193,65 @@ class TestClassifier:
         리드젠/짧은 요청 댓글을 스팸으로 몰던 원인이 프롬프트였으므로, 시스템 프롬프트가
         리드젠 맥락·짧은 키워드/요청·이모지를 NOT SPAM 으로 안내하는지 고정한다. 특히
         옛 프롬프트의 "'DM 주세요' 유인 = SPAM" 프라이밍이 되살아나지 않게 한다.
+
+        v5(한국어 프롬프트, 2026-07-31)로 교체되며 단언을 한국어 표현으로 옮겼다 —
+        고정하는 **정책 의도는 v3 때와 동일**하다.
         """
         p = spam_classifier._SPAM_SYSTEM_PROMPT
-        # 리드젠/이벤트 맥락을 명시
-        assert "lead-generation" in p and "giveaway" in p
-        # 짧은 키워드/요청/이모지를 NOT SPAM 으로 안내
-        assert "REQUESTS for themselves" in p or "REQUESTS" in p
-        assert "emoji-only" in p
-        # 애매하면 정상으로
-        assert "default is_spam=false" in p
+        # 리드젠/이벤트 캠페인 맥락을 명시
+        assert "댓글 키워드→DM으로 가이드/링크/자료 제공" in p and "캠페인" in p
+        # 본인이 받으려는 요청은 CLEAN — 가장 흔한 정상 리드젠 댓글
+        assert "본인이 받으려는 요청도 CLEAN" in p
+        assert "'DM 주세요'" in p and "'설치링크 부탁드려요'" in p
+        # 짧은 댓글/이모지를 CLEAN 으로 안내
+        assert "한 단어" in p and "이모지는 CLEAN" in p
+        # 애매하면 정상으로(fail-open 방향)
+        assert "목적지와 유인이 모두 불명확하면 CLEAN" in p
         # 옛 프롬프트의 위험한 프라이밍(무조건 'DM 주세요'=스팸)이 남아있지 않아야 함
         assert "'DM 주세요' 유인)" not in p
 
-    def test_prompt_v3_policy_abuse_is_not_spam(self):
-        """프롬프트 v3 정책 핀(spam-lab 2026-07-23, 운영자 확정): 악플은 스팸이 아니다.
+    def test_prompt_policy_abuse_is_not_spam(self):
+        """정책 핀(운영자 확정 2026-07-23): 악플은 스팸이 아니다 — 절대 숨기지 않는다.
 
-        욕설·조롱·혐오는 무례해도 절대 숨기지 않는다 — 스팸(유인·사기·광고)만 잡는다.
-        abuse 검출 버전(lab v2)이 정책과 반대라 폐기된 이력이 있어 회귀를 여기서 고정한다.
+        욕설·조롱·혐오는 무례해도 숨기지 않는다 — 스팸(유인·사기·광고)만 잡는다.
+        abuse 검출 버전(lab v2/v4)이 정책과 반대라 폐기된 이력이 있어 회귀를 여기서 고정한다.
+
+        v5 는 추가로 **출력 enum 에서 abuse 를 제거**해, gemma 가 abuse 를 고신뢰로 뱉어
+        정책과 반대로 숨기던 잠재 경로까지 구조적으로 막는다(v3 에 남아 있던 구멍).
         """
         p = spam_classifier._SPAM_SYSTEM_PROMPT
-        assert "Never hide these" in p
-        assert "even if rude or angry" in p
+        assert "무례해도 SPAM이 아니다" in p
+        assert "절대 숨기지 마라" in p
+        assert "abuse(악플) 카테고리는 쓰지 마라" in p
+        # 출력 스키마에서 abuse 가 빠져 있어야 한다(본문 지시와 스키마가 같은 방향)
+        assert '"<clean|scam|adult|phishing|promo>"' in p
+        assert "abuse>" not in p
 
-    def test_prompt_v3_byte_identical_to_lab(self):
-        """이식 드리프트 가드(lab PORT.md): 운영 프롬프트는 lab v3 와 바이트 동일해야 한다.
+    def test_prompt_v5_deobfuscation_and_indirect_lure(self):
+        """v5 가 v3 대비 추가한 것(2026-07-31 이식): 난독화 복원 + 간접 유인 판정.
 
-        sha 는 lab `spam_filter/prompt.py` 의 PROMPT_SHA256(2026.07.23-v3). 프롬프트를
-        정당하게 갱신할 때는 lab 에서 A/B 검증(CFPR 비악화) 후 이 sha 도 함께 올린다.
+        난독 도메인(',COM'·'. C 0 M'·'。net')을 복원해 목적지로 취급하고, 직접 명령이 없어도
+        '목적지 노출 + 후기/추천/보상'이면 SPAM 으로 본다. 이 지시가 사라지면 스텔스 스팸
+        재현율이 떨어지므로 고정한다.
+        """
+        p = spam_classifier._SPAM_SYSTEM_PROMPT
+        assert "난독화를 먼저 복원하라" in p
+        assert "',COM'" in p and "'。net'" in p
+        assert "간접 유인이므로 SPAM" in p
+
+    def test_prompt_byte_identical_to_lab(self):
+        """이식 드리프트 가드(lab PORT.md): 운영 프롬프트는 lab 승격분과 바이트 동일해야 한다.
+
+        sha 는 lab `spam_filter/prompt_variants.py` 의 `_V5_SPAM_ONLY`(main 747b153,
+        2026.07.31-v5). 프롬프트를 정당하게 갱신할 때는 lab 에서 A/B 검증(CFPR 비악화·
+        clean→spam FLIP 0) 후 이 sha 도 함께 올린다.
+
+        이력: v3 = 5e6b06680d30(590 tokens) → v5 = 69ef69bbd8fb(1038 tokens, 2026-07-31).
         """
         import hashlib
 
         p = spam_classifier._SPAM_SYSTEM_PROMPT
-        assert hashlib.sha256(p.encode("utf-8")).hexdigest()[:12] == "5e6b06680d30"
+        assert hashlib.sha256(p.encode("utf-8")).hexdigest()[:12] == "69ef69bbd8fb"
 
 
 # ───────────────────────── 규칙 키워드 2-티어 (spam-lab 2-1·2-2 이식) ─────────────────────────
