@@ -1425,6 +1425,64 @@ _STATUS_DISPLAY = {
 }
 
 
+class _FollowUpBlockSerializer(serializers.Serializer):
+    """후속 DM(리워드) 사람 단위 블록 (DM-6).
+
+    **집계 규칙이 오프닝 축과 다르다.** 오프닝은 "루트 DM 이 하나라도 발송되면 전송됨"
+    (버킷 우선순위)이지만, 후속은 한 사람이 여러 번 받을 수 있어 그렇게 접으면
+    *첫 후속은 갔지만 마지막 후속이 실패한 사람*이 성공으로 잡힌다. 운영자가 알아야 하는
+    것은 그 사람의 **현재 상태**이므로 **마지막 후속 DM 1건**으로 판정한다.
+
+    ⚠️ DM-17 — 오프닝 축(`unique_*`)과 **부모 집합이 반대인 키**가 있다. 한 헬퍼로 두 축을
+    돌리지 말 것. 화면의 줄 계산은 이렇게 다르다::
+
+        대기중     오프닝 = unique_waiting + unique_accepted_pending
+                   후속   = follow_up.waiting              (단독)
+        발송 안 됨  오프닝 = unique_failed  + unique_unconfirmed
+                   후속   = follow_up.failed               (단독)
+    """
+
+    targets = serializers.IntegerField(help_text="후속 DM 을 1건 이상 받은 고유 인원")
+    delivered = serializers.IntegerField(
+        help_text="마지막 후속 DM 이 확정 도착(delivered/read/recovery_delivered)한 인원"
+    )
+    read = serializers.IntegerField(help_text="마지막 후속 DM 을 읽은 인원 (delivered 의 부분집합)")
+    waiting = serializers.IntegerField(
+        help_text=(
+            "마지막 후속 DM 이 큐 대기 또는 Meta 접수 후 도착 대기인 인원. "
+            "화면 '대기중' 줄에 **이 값 하나만** 쓴다 — 오프닝 축처럼 accepted_pending 을 "
+            "더하면 이중 계상이다(아래 참고)."
+        )
+    )
+    accepted_pending_in_waiting = serializers.IntegerField(
+        help_text=(
+            "waiting 중 '큐 대기'가 아니라 'Meta 접수 후 도착 대기'인 인원 — "
+            "**waiting 의 부분집합**. ⚠️ 오프닝 축의 `unique_accepted_pending` 은 반대로 "
+            "`unique_sent` 의 부분집합이라, 이름을 같게 두면 화면 합계가 조용히 틀린다. "
+            "그래서 부모 집합을 키 이름에 박았다 (DM-17)."
+        )
+    )
+    failed = serializers.IntegerField(
+        help_text=(
+            "마지막 후속 DM 이 실패·정체로 끝난 인원 — 화면 '발송 안 됨' 줄에 "
+            "**이 값 하나만** 쓴다(unconfirmed 를 더하지 말 것 · 아래 참고)."
+        )
+    )
+    unconfirmed = serializers.IntegerField(
+        help_text=(
+            "마지막 후속 DM 이 '도착 미확인(failed_no_trace)'인 인원. "
+            "⚠️ 오프닝 축과 달리 **failed 의 부분집합**이다 (화면의 '발송 안 됨' 줄이 failed 를 쓰므로)."
+        )
+    )
+    reach_rate = serializers.FloatField(help_text="delivered / targets (0~1)")
+    basis = serializers.CharField(
+        help_text="집계 규칙 명시 — 현재 항상 `latest_per_person`(사람별 마지막 후속 DM 1건 기준)."
+    )
+
+    class Meta:
+        ref_name = "DMFollowUpBlock"
+
+
 class DMVerificationStatsSerializer(serializers.Serializer):
     """DM 발송 통계 응답 (캠페인 단위 — v3.3 — gate/kind 분리 포함)"""
 
@@ -1557,6 +1615,29 @@ class DMVerificationStatsSerializer(serializers.Serializer):
         help_text=(
             "숨겨진 요청·스팸을 뺀 '확인 필요' 인원 "
             "(= unique_needs_attention − unique_hidden_spam). 새 '확인 필요' 카드용."
+        )
+    )
+
+    # ── DM-11 (2026-07-31) — 화면 '대기중' 줄의 나머지 절반 ────────────────────
+    unique_accepted_pending = serializers.IntegerField(
+        help_text=(
+            "Meta 가 접수했지만 아직 도착도 미확인도 아닌 사람 수 "
+            "(= unique_sent − unique_delivered − unique_unconfirmed). "
+            "화면의 '대기중' 줄 = **unique_waiting + unique_accepted_pending**. "
+            "프론트에서 뺄셈으로 유도하지 말 것 — 상태 집합이 바뀌면 조용히 틀린다(DM-5 유형). "
+            "⚠️ 부모 집합은 `unique_waiting` 이 아니라 **`unique_sent`** 다. 후속 축의 같은 "
+            "개념은 `waiting` 의 부분집합이라 키 이름이 다르다"
+            "(`follow_up.accepted_pending_in_waiting` — DM-17)."
+        )
+    )
+
+    # ── DM-6 (2026-07-31) — 후속 DM(리워드) 사람 단위 축 ───────────────────────
+    follow_up = _FollowUpBlockSerializer(
+        help_text=(
+            "후속 DM(`dm_kind=reward`, 버튼/게이트 통과 후 나가는 두 번째 DM)의 **사람 단위** 지표. "
+            "위 unique_* 는 전부 루트 DM(오프닝) 기준이라 후속 DM 이 어느 필드에도 안 들어온다. "
+            "⚠️ 집계 규칙이 오프닝과 다르다 — 한 사람이 후속을 여러 번 받을 수 있어 "
+            "**마지막 후속 DM 1건**으로 판정한다(`basis`)."
         )
     )
 

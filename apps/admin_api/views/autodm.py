@@ -32,7 +32,28 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.admin_api.audit import log_admin_action
-from apps.admin_api.dm_error_catalog import describe_for_log
+from apps.admin_api.dm_error_catalog import INVESTIGATE as POLICY_INVESTIGATE
+from apps.admin_api.dm_error_catalog import NORMAL as POLICY_NORMAL
+from apps.admin_api.dm_error_catalog import reason_policy_map
+from apps.admin_api.dm_error_filters import (
+    SCOPE_ALL,
+    SCOPES,
+    is_known_reason,
+    policy_q,
+    reason_q,
+    scope_q,
+)
+from apps.admin_api.dm_policy_rollup import (
+    AXES,
+    AXIS_FOLLOW_UP,
+    AXIS_OPENING,
+    FOLLOWUP_NOT_SENT_HAVING,
+    OPENING_NOT_SENT_HAVING,
+    followup_not_sent_annotations,
+    opening_not_sent_annotations,
+    person_rep_map,
+    rep_log_qs,
+)
 from apps.admin_api.models import AdminActionLog
 from apps.admin_api.serializers.autodm import (
     AdminCampaignDetailSerializer,
@@ -49,6 +70,7 @@ from apps.integrations.campaign_stats import (
     TIMESERIES_RANGES,
     annotate_campaign_people,
     annotate_campaign_stats,
+    latest_followup_rows,
     new_requester_timeseries,
 )
 from apps.integrations.dm_exceptions import DMSendError, DMTransientError
@@ -73,6 +95,82 @@ from apps.integrations.services import InstagramMessagingService
 logger = logging.getLogger(__name__)
 
 TAG = "admin-auto-dm"
+
+
+# ===== 오류 분류 필터 (DM-14 / DM-15) =====
+#
+# `?error_policy=` · `?error_reason=` · `?error_scope=` 는 로그 목록(이벤트 단위)과
+# 수신자 목록(사람 단위)에서 **같은 어휘**로 동작해야 한다 — 운영 대시보드 팝업의
+# `보러가기` 가 두 화면 어디로든 착지하기 때문이다. 그래서 검증·Q 조립을 여기 모은다.
+#
+# 판정은 `dm_error_filters` 가 사전을 SQL 로 컴파일한 것이라 **상한이 없다**
+# (11차의 500쌍 OR 체인 → 폐기, DM-15). 마이그레이션도 없다.
+
+
+def _bad_request(message: str, *, field: str, allowed=None, code: int = 400) -> Response:
+    """공통 오류 포맷 (apps/core/exceptions 규약과 동일한 모양)."""
+    details: dict = {"field": field}
+    if allowed is not None:
+        details["allowed"] = allowed
+    return Response(
+        {"success": False, "error": {"code": code, "message": message, "details": details}},
+        status=status.HTTP_400_BAD_REQUEST,
+    )
+
+
+def _classification_error(params) -> Response | None:
+    """분류 필터 파라미터 검증 — 잘못된 값이면 400 Response, 정상이면 None.
+
+    허용값을 응답 `details.allowed` 로 함께 준다(프론트가 목록을 하드코딩하지 않도록).
+    """
+    scope = params.get("error_scope") or SCOPE_ALL
+    if scope not in SCOPES:
+        return _bad_request(
+            f"error_scope 값이 올바르지 않습니다: {scope!r}",
+            field="error_scope",
+            allowed=list(SCOPES),
+        )
+    policy = params.get("error_policy")
+    if policy and policy != "all" and policy not in (POLICY_INVESTIGATE, POLICY_NORMAL):
+        return _bad_request(
+            "error_policy 값이 올바르지 않습니다. (all/investigate/normal)",
+            field="error_policy",
+            allowed=["all", POLICY_INVESTIGATE, POLICY_NORMAL],
+        )
+    reason = params.get("error_reason")
+    if reason and reason != "all" and not is_known_reason(reason):
+        return _bad_request(
+            f"error_reason 값이 올바르지 않습니다: {reason!r}. "
+            "값은 dm_quality.failure_breakdown[].reason / skipped_breakdown[].reason 에서 옵니다.",
+            field="error_reason",
+            allowed=sorted(reason_policy_map()),
+        )
+    return None
+
+
+def _classification_q(params) -> Q | None:
+    """분류 필터 파라미터 → 로그 1건에 대한 Q. 지정된 게 없으면 None.
+
+    ``error_reason`` 은 사유 키 자체가 스코프를 담고 있다(오류 사유 vs 건너뜀 사유).
+    ``error_policy`` 의 모수는 **오류 8종 + 건너뜀**이며 ``error_scope`` 로 한쪽만 볼 수 있다.
+    """
+    scope = params.get("error_scope") or SCOPE_ALL
+    policy = params.get("error_policy")
+    reason = params.get("error_reason")
+
+    parts: list[Q] = []
+    if scope != SCOPE_ALL:
+        parts.append(scope_q(scope))
+    if reason and reason != "all":
+        parts.append(reason_q(reason))
+    if policy and policy != "all":
+        parts.append(policy_q(policy, scope=scope))
+    if not parts:
+        return None
+    combined = parts[0]
+    for part in parts[1:]:
+        combined &= part
+    return combined
 
 
 # ===== 캠페인 =====
@@ -654,7 +752,20 @@ class AdminDMLogListView(generics.ListAPIView):
             qs = qs.filter(campaign__ig_connection_id=ig_connection_id)
         if since:
             qs = qs.filter(created_at__gte=since)
+        # DM-14/15 — 운영 대시보드 팝업의 `보러가기` 착지점. 이벤트 단위라
+        # failure_breakdown[].count / skipped_breakdown[].count 와 그대로 대응한다.
+        classification = _classification_q(params)
+        if classification is not None:
+            qs = qs.filter(classification)
         return qs
+
+    def list(self, request, *args, **kwargs):
+        # ListAPIView 는 get_queryset 에서 400 을 낼 수 없어 여기서 먼저 검증한다
+        # (잘못된 값을 조용히 무시하면 "필터했는데 전체가 나온다"가 된다).
+        invalid = _classification_error(request.query_params)
+        if invalid is not None:
+            return invalid
+        return super().list(request, *args, **kwargs)
 
     @extend_schema(
         tags=[TAG],
@@ -684,6 +795,25 @@ class AdminDMLogListView(generics.ListAPIView):
   사용합니다 (부분일치 `recipient` 와 별개 파라미터). `recipient_user_id` 가 1순위 키이며
   비어 있는 수신자는 `recipient_username` exact 로 폴백하세요.
 - `since` 는 ISO datetime (예: `2026-05-01T00:00:00Z`).
+
+## 오류 분류 드릴다운 (DM-14 / DM-15)
+운영 대시보드 팝업의 `보러가기` 착지점입니다. 이 목록은 **이벤트(발송 1건) 단위**라
+`dm_quality` 의 두 표와 그대로 대응합니다.
+
+| 파라미터 | 값의 출처 | 대응 |
+|---|---|---|
+| `?error_reason=` | `failure_breakdown[].reason` · `skipped_breakdown[].reason` | 그 행(들)의 `count` 합 |
+| `?error_policy=` | `investigate` / `normal` | Σ 같은 policy 행들의 `count` |
+| `?error_scope=` | `all`(기본) / `error` / `skipped` | 오류 8종만 / 건너뜀만 |
+
+- **상한이 없습니다.** 사유·분류 판정을 SQL 로 컴파일하므로 전사 범위에서 ⚪ 전체를 훑어도
+  400 이 나지 않습니다 (11차의 500쌍 상한은 폐기).
+- `error_policy` 의 모수는 **오류 8종 + 건너뜀**입니다. 성공·진행 중 로그는 어느 쪽에도
+  들어가지 않습니다 (`normal` 을 눌렀을 때 도착한 DM 전부가 딸려 나오면 무의미하므로).
+  팝업에 건너뜀 표를 그리지 않는다면 `&error_scope=error` 로 모수를 맞추세요.
+- `error_reason` 은 사유 키 자체가 스코프를 담습니다 — 건너뜀 사유를 주면 자동으로
+  `status=skipped` 안에서만 찾습니다.
+- 셋을 함께 주면 AND 입니다. 잘못된 값은 조용히 무시하지 않고 **400**(`details.field`).
         """,
         parameters=[
             OpenApiParameter(
@@ -692,6 +822,31 @@ class AdminDMLogListView(generics.ListAPIView):
                 OpenApiParameter.QUERY,
                 required=False,
                 description="발송 상태 (queued/submitting/accepted/delivered/read/failed_* 등).",
+            ),
+            OpenApiParameter(
+                "error_reason",
+                str,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="DM-14 — 사유 머신 키로 필터. 값은 `dm_quality.failure_breakdown[].reason` "
+                "또는 `skipped_breakdown[].reason` 을 그대로 싣는다(한국어 문구·code 로 필터하지 말 것 — "
+                "문구는 다듬어지고, 한 사유가 code 여러 조합으로 온다). 미등록 값은 400.",
+            ),
+            OpenApiParameter(
+                "error_policy",
+                str,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="DM-15 — 분류로 필터: all(기본)/investigate(🔴 조사 필요)/normal(⚪ 자동 처리). "
+                "모수는 오류 8종 + 건너뜀이며 **상한 없음**.",
+            ),
+            OpenApiParameter(
+                "error_scope",
+                str,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="분류 필터의 모수: all(기본 — 오류+건너뜀)/error(오류 8종 = "
+                "failure_breakdown 모수)/skipped(건너뜀 = skipped_breakdown 모수).",
             ),
             OpenApiParameter(
                 "dm_kind",
@@ -1380,6 +1535,31 @@ class AdminDMRecipientListView(APIView):
 - 표준 PageNumberPagination(page_size=20) → `{count, next, previous, results}`.
   정렬 tie-break 로 (campaign_id, recipient_user_id) 를 덧붙여 페이지 경계 안정.
 
+## '발송 안 됨' 드릴다운 (DM-13 / DM-14 / DM-15)
+캠페인 상세의 카드 4개(오프닝·후속 × 조사 필요·자동 처리)를 눌렀을 때 **그 사람들만** 뜨게
+하는 필터입니다. 판정 규칙이 `stats.not_sent` 집계와 같은 코드(`dm_policy_rollup`)에서 나와
+**카드 인원 == 목록 `count`** 가 구조적으로 성립합니다.
+
+| 파라미터 | 값 | 의미 |
+|---|---|---|
+| `?dm_axis=` | `opening` / `follow_up` / `all`(기본) | 축 |
+| `?error_policy=` | `investigate` / `normal` / `all` | 분류 |
+| `?error_reason=` | `breakdown[].reason` | 사유 1종 |
+
+- **`dm_axis` 는 그 축의 '발송 안 됨' 모수로 좁힙니다** (단순히 판정 근거만 바꾸는 게
+  아닙니다) — 그래야 카드 숫자와 행 수가 맞습니다.
+  - `opening` = 루트 DM 이 발송/대기 어디에도 못 간 사람 + 도착 미확인으로 끝난 사람
+    (= `unique_failed + unique_unconfirmed`)
+  - `follow_up` = **마지막** 후속 DM 이 실패인 사람 (= `stats.follow_up.not_sent.total`)
+- 보장되는 항등:
+  - `stats.not_sent.investigate` == `?dm_axis=opening&error_policy=investigate` 의 `count`
+  - `stats.follow_up.not_sent.investigate` == `?dm_axis=follow_up&error_policy=investigate`
+  - `not_sent.breakdown[].people` == `?dm_axis=<축>&error_reason=<그 reason>` 의 `count`
+- `dm_axis` 를 주면 `error_title` · `error_reason` · `error_policy` 도 **그 축의 대표 로그**
+  기준이 됩니다. 안 주면 축을 가리지 않은 '가장 최근 실패·정체 로그' 기준입니다.
+- **상한 없음** — 사유·분류를 SQL 로 컴파일하므로 전역 조회도 400 이 나지 않습니다
+  (11차의 500쌍 상한은 폐기, DM-15).
+
 ## 주의사항
 - `campaign_id` 미지정 시 전역 `(campaign, recipient)` 그룹 집계라 대용량에서 무거울 수 있습니다.
   캠페인/계정 진입 동선에서는 `campaign_id` 또는 `ig_connection_id` 로 좁혀 호출하세요.
@@ -1387,8 +1567,10 @@ class AdminDMRecipientListView(APIView):
 
 ### 요청 예시
 ```bash
+# 캠페인 상세 "오프닝 · 조사 필요 34명" 카드 드릴다운
 curl -H "Authorization: Bearer <staff_token>" \\
-  "https://api.example.com/api/v1/admin/auto-dm/recipients/?campaign_id=<uuid>&status_group=read"
+  "https://api.example.com/api/v1/admin/auto-dm/recipients/\\
+?campaign_id=<uuid>&dm_axis=opening&error_policy=investigate"
 ```
         """,
         parameters=[
@@ -1406,6 +1588,38 @@ curl -H "Authorization: Bearer <staff_token>" \\
                 required=False,
                 description="코스 상태 그룹 필터 — all(기본)/waiting/sent/read/hidden_spam/attention. "
                 "사용자용 recipients 와 동일 어휘·판정.",
+            ),
+            OpenApiParameter(
+                "dm_axis",
+                str,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="DM-13 — 축 필터: all(기본 · 두 축 합침)/opening(루트 DM 기준 '발송 안 됨')/"
+                "follow_up(마지막 후속 DM 기준 '발송 안 됨'). error_policy·error_reason 과 조합 가능. "
+                "허용값 외는 400(details.field='dm_axis').",
+            ),
+            OpenApiParameter(
+                "error_policy",
+                str,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="분류 필터 — all(기본)/investigate(🔴 조사 필요)/normal(⚪ 자동 처리). "
+                "판정은 그 사람의 **대표 로그** 1건 기준이며 상한이 없다(DM-15).",
+            ),
+            OpenApiParameter(
+                "error_reason",
+                str,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="DM-14 — 사유 머신 키 필터. 값은 `stats.not_sent.breakdown[].reason` "
+                "또는 운영 대시보드 `failure_breakdown[].reason` 을 그대로 싣는다. 미등록 값은 400.",
+            ),
+            OpenApiParameter(
+                "error_scope",
+                str,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="분류 필터의 모수 — all(기본 · 오류+건너뜀)/error(오류 8종)/skipped(건너뜀).",
             ),
             OpenApiParameter(
                 "recipient",
@@ -1445,7 +1659,10 @@ curl -H "Authorization: Bearer <staff_token>" \\
         ],
         responses={
             200: AdminDMRecipientSerializer(many=True),
-            400: OpenApiResponse(description="status_group 값 오류 (프로젝트 에러 포맷)"),
+            400: OpenApiResponse(
+                description="status_group / dm_axis / error_policy / error_reason / error_scope "
+                "값 오류 (프로젝트 에러 포맷 · details.field 로 어느 파라미터인지 지목)"
+            ),
             401: OpenApiResponse(description="인증 누락/만료"),
             403: OpenApiResponse(description="관리자 권한 없음"),
         },
@@ -1489,6 +1706,20 @@ curl -H "Authorization: Bearer <staff_token>" \\
     )
     def get(self, request):
         params = request.query_params
+        invalid = _classification_error(params)
+        if invalid is not None:
+            return invalid
+        axis = params.get("dm_axis")
+        if axis and axis != "all":
+            if axis not in AXES:
+                return _bad_request(
+                    f"dm_axis 값이 올바르지 않습니다: {axis!r}",
+                    field="dm_axis",
+                    allowed=["all", *AXES],
+                )
+        else:
+            axis = None
+
         qs = SentDMLog.objects.all()
 
         campaign_id = params.get("campaign_id")
@@ -1556,6 +1787,27 @@ curl -H "Authorization: Bearer <staff_token>" \\
                 )
             rows = rows.filter(having[status_group_param])
 
+        # DM-13 — 축 필터. 캠페인 상세 카드가 4개(오프닝·후속 × 조사 필요·자동 처리)라
+        #   축을 못 가르면 둘이 합쳐진 인원만 나온다. 판정은 `dm_policy_rollup` 의
+        #   `not_sent` 집계와 **같은 규칙**을 HAVING 으로 옮긴 것이므로 카드 인원 == 행 수다.
+        if axis == AXIS_OPENING:
+            rows = rows.annotate(**opening_not_sent_annotations()).filter(OPENING_NOT_SENT_HAVING)
+        elif axis == AXIS_FOLLOW_UP:
+            rows = rows.annotate(**followup_not_sent_annotations(qs)).filter(
+                FOLLOWUP_NOT_SENT_HAVING
+            )
+
+        # DM-8/14/15 — policy·사유 서버 필터 (카드/팝업 드릴다운 착지점).
+        #   사람 단위이므로 **대표 로그 1건**에 조건을 건다: 대표 로그를 DISTINCT ON
+        #   서브쿼리로 뽑아(id 목록) 그룹 안에 그 id 가 있는지로 HAVING 한다.
+        #   쌍 OR 체인을 쓰던 11차 방식과 달리 상한이 없다(DM-15).
+        classification = _classification_q(params)
+        if classification is not None:
+            rep_ids = rep_log_qs(qs, axis=axis, group_by_campaign=True).values("id")
+            rows = rows.annotate(
+                classified_n=Count("id", filter=Q(id__in=rep_ids) & classification)
+            ).filter(classified_n__gt=0)
+
         ordering = params.get("ordering", "-last_activity_at")
         if ordering not in self.ALLOWED_ORDERING:
             ordering = "-last_activity_at"
@@ -1567,29 +1819,40 @@ curl -H "Authorization: Bearer <staff_token>" \\
 
         # latest_status: 현재 페이지 (campaign, recipient) 쌍의 최신 로그 상태 1건씩
         # (Postgres DISTINCT ON — over-fetch 후 정확 매칭). 페이지 20행이라 부담 없음.
-        # DM-2: 같은 행에서 error_code/subcode 도 함께 당겨 error_title 을 만든다
-        # (별도 쿼리 없음). 최신 로그가 오류가 아니면 사전 판정 결과가 빈 문자열이다.
+        # 이건 "지금 상태"라서 성공 로그도 후보다 — 사유(error_*)와 근거 로그가 다르다.
         latest_status_map: dict = {}
-        latest_error_title: dict = {}
+        latest_followup_map: dict = {}
+        rep_map: dict = {}
         if page_rows:
             camp_ids = {r["campaign_id"] for r in page_rows}
             rcpt_ids = {r["recipient_user_id"] for r in page_rows}
+            page_scope = SentDMLog.objects.filter(
+                campaign_id__in=camp_ids, recipient_user_id__in=rcpt_ids
+            )
             for row in (
-                SentDMLog.objects.filter(campaign_id__in=camp_ids, recipient_user_id__in=rcpt_ids)
-                .order_by("campaign_id", "recipient_user_id", "-created_at")
+                page_scope.order_by("campaign_id", "recipient_user_id", "-created_at")
                 .distinct("campaign_id", "recipient_user_id")
-                .values("campaign_id", "recipient_user_id", "status", "error_code", "error_subcode")
+                .values("campaign_id", "recipient_user_id", "status")
             ):
-                key = (row["campaign_id"], row["recipient_user_id"])
-                latest_status_map[key] = row["status"]
-                latest_error_title[key] = describe_for_log(
-                    row["error_code"], row["error_subcode"], row["status"]
-                )["error_title"]
+                latest_status_map[(row["campaign_id"], row["recipient_user_id"])] = row["status"]
+
+            # DM-16 — 사유(error_title/reason)와 분류(error_policy)를 **한 로그**에서 뽑는다:
+            # 그 사람의 가장 최근 **실패·정체** 로그(축을 주면 그 축의 대표 로그).
+            # 11차까지는 title 만 '최신 로그' 기준이라, 과거에 실패했다가 결국 성공한 사람의
+            # 행이 policy 는 🔴 인데 사유 열만 비어 보였다("조사 필요 34명" 목록에 빈칸 행).
+            rep_map = person_rep_map(page_scope, axis=axis)
+
+            # DM-8 — 후속 DM 표(캠페인 상세)와 행을 맞추기 위한 '마지막 후속 DM 상태'.
+            # latest_status(전체 로그 기준)로는 오프닝이 최신인 사람의 후속 상태를 알 수 없다.
+            for row in latest_followup_rows(page_scope, group_by_campaign=True):
+                latest_followup_map[(row["campaign_id"], row["recipient_user_id"])] = row["status"]
 
         results = []
+        empty_rep = {"policy": "", "reason": "", "title": ""}
         for r in page_rows:
             grp = self._person_status_group(r)
             rid = r["recipient_user_id"]
+            rep = rep_map.get((r["campaign_id"], rid), empty_rep)
             results.append(
                 {
                     "recipient_user_id": rid,
@@ -1611,7 +1874,10 @@ curl -H "Authorization: Bearer <staff_token>" \\
                     "opening_count": r["opening_count"],
                     "interaction_count": r["interaction_count"],
                     "latest_status": latest_status_map.get((r["campaign_id"], rid), ""),
-                    "error_title": latest_error_title.get((r["campaign_id"], rid), ""),
+                    "latest_followup_status": latest_followup_map.get((r["campaign_id"], rid), ""),
+                    "error_title": rep["title"],
+                    "error_reason": rep["reason"],
+                    "error_policy": rep["policy"],
                     "first_sent_at": r["first_sent_at"],
                     "last_activity_at": r["last_activity_at"],
                 }

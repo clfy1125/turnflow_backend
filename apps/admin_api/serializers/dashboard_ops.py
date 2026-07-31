@@ -184,6 +184,16 @@ class _DmFailureBreakdownSerializer(serializers.Serializer):
         help_text="OPS-2-a — 이 그룹의 **가장 최근 1건 Meta 원문 오류 메시지**(최대 500자, "
         "초과 시 말줄임). '무슨 파라미터인지'를 알 수 있는 유일한 정보. 원문이 없으면 빈 문자열",
     )
+    reason = serializers.CharField(
+        help_text="**DM-14 — 사유 머신 키**. 문구(title)가 바뀌어도 고정이므로 사유별 "
+        "`보러가기` 링크에 이 값을 그대로 실어 `GET /admin/auto-dm/logs/?error_reason=` · "
+        "`/admin/auto-dm/recipients/?error_reason=` 로 드릴다운한다. "
+        "⚠️ `(code,subcode)` 로는 대체 불가 — 한 사유가 코드 4조합으로 오고(예: "
+        "`window_after_close` = 100/2534022, 10/2534022, 10/2018278, 10@failed_window), "
+        "반대로 code 10 하나가 두 사유로 갈린다. `reason` ↔ `title` 은 1:1 이라 "
+        "프론트는 reason 으로 묶고 title 을 보여주면 된다. "
+        "불변식: 이 행의 count == 같은 reason 행들의 count 합 == `?error_reason=` 결과 수."
+    )
     title = serializers.CharField(
         allow_blank=True,
         help_text="OPS-2-b — 짧은 한국어 라벨 (예: '토큰 만료 · 무효'). 서버 사전에 없으면 "
@@ -195,6 +205,15 @@ class _DmFailureBreakdownSerializer(serializers.Serializer):
     action = serializers.CharField(
         allow_blank=True, help_text="OPS-2-b — 운영자가 무엇을 해야 하는가. 없으면 빈 문자열"
     )
+    policy = serializers.CharField(
+        help_text="**분류 (2026-07-31)** — `investigate`(🔴 조사 필요: 원인 미확정이거나 "
+        "우리 판단·조치 필요) | `normal`(⚪ 자동 처리: 대응이 정해져 있어 자동 처리·안내). "
+        "화면의 색·필터·정렬은 이 값 하나만 보면 된다. 사전에 없는 조합은 investigate 다. "
+        "`?error_policy=` 로 로그·수신자 목록을 같은 기준으로 필터할 수 있다(상한 없음)."
+    )
+    policy_display = serializers.CharField(
+        help_text="분류 한국어 표시명 ('조사 필요' / '자동 처리') — 프론트 하드코딩 불필요"
+    )
 
 
 class _DmSkippedBreakdownSerializer(serializers.Serializer):
@@ -204,7 +223,9 @@ class _DmSkippedBreakdownSerializer(serializers.Serializer):
         help_text="사유 머신값 — monthly_dm_limit / campaign_not_active / "
         "outside_schedule_window / ig_account_inactive / self_recipient / "
         "connection_disconnected / duplicate_campaign_cleanup / ghost_opening_cleanup / "
-        "other(미분류). 뒤 2개는 운영 중 수동 정리로 찍힌 과거 데이터"
+        "other(미분류). 뒤 2개는 운영 중 수동 정리로 찍힌 과거 데이터. "
+        "DM-14 — failure_breakdown[].reason 과 **같은 네임스페이스**라(키가 겹치지 않는다) "
+        "`?error_reason=` 한 파라미터로 두 표 모두 드릴다운된다."
     )
     label = serializers.CharField(help_text="한국어 표시명 (서버 제공 — 프론트 하드코딩 불필요)")
     count = serializers.IntegerField(help_text="윈도우 내 해당 사유 건수")
@@ -212,6 +233,12 @@ class _DmSkippedBreakdownSerializer(serializers.Serializer):
         help_text="운영 조치가 필요한 신호인가. 현재 true 는 monthly_dm_limit(업셀 기회) 하나뿐 — "
         "나머지는 일시정지·예약창 밖·자기 댓글 등 **정상 동작**이다."
     )
+    policy = serializers.CharField(
+        help_text="**분류 (2026-07-31)** — 건너뜀은 전부 `normal`(⚪ 설정대로 동작)이고, "
+        "미분류(`other`)만 `investigate`(🔴). 사전에 없는 문구가 찍혔다는 뜻이라 사람이 봐야 한다. "
+        "failure_breakdown 의 policy 와 같은 어휘."
+    )
+    policy_display = serializers.CharField(help_text="분류 한국어 표시명 ('조사 필요'/'자동 처리')")
 
 
 class _DmRecoverySerializer(serializers.Serializer):

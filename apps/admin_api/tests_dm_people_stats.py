@@ -26,6 +26,7 @@ from django.contrib.auth import get_user_model
 from django.utils import timezone
 from rest_framework.test import APIClient
 
+from apps.admin_api.dm_error_catalog import describe
 from apps.integrations.campaign_stats import (
     annotate_campaign_people,
     build_dm_stats,
@@ -296,6 +297,9 @@ class TestCampaignListPeople:
             "unconfirmed": 0,
             "hidden_spam": 0,
             "needs_attention": 0,
+            # DM-11 (2026-07-31) — 화면 '대기중' 줄의 나머지 절반. 목록·상세 두 경로가
+            # 같은 _derive_people 을 쓰므로 여기에도 함께 나온다.
+            "accepted_pending": 0,
             "sent_rate": 0.0,
         }
 
@@ -438,7 +442,8 @@ class TestLogErrorCatalog:
         camp = _mk_campaign()
         log = _mk_log(camp, "r1", SentDMLog.Status.FAILED_WINDOW, code="100", subcode="2534022")
         data = staff_client.get(f"{LOGS_URL}{log.id}/").data
-        assert "윈도우" in data["error_title"]
+        # 문구는 서버 사전이 정본 — 단어를 하드코딩하지 않는다(2026-07-31 문구 교체 회귀).
+        assert data["error_title"] == describe("100", "2534022", "failed_window")["title"]
         assert data["recoverable"] is False
 
     def test_unknown_combination_returns_blanks_not_error(self, staff_client):
@@ -455,20 +460,36 @@ class TestLogErrorCatalog:
         _mk_log(camp, "r1", SentDMLog.Status.FAILED_TOKEN, code="190")
         row = staff_client.get(LOGS_URL, {"campaign_id": str(camp.id)}).data["results"][0]
         assert row["error_subcode"] == ""
-        assert "토큰" in row["error_title"]
+        assert row["error_title"] == describe("190", "", "failed_token")["title"]
 
-    def test_recipient_row_has_title_from_latest_log(self, staff_client):
+    def test_recipient_row_has_title_from_latest_failure_log(self, staff_client):
         camp = _mk_campaign()
         _mk_log(camp, "r1", SentDMLog.Status.FAILED_TOKEN, code="190")
         row = staff_client.get(RECIPIENTS_URL, {"campaign_id": str(camp.id)}).data["results"][0]
-        assert "토큰" in row["error_title"]
+        assert row["error_title"] == describe("190", "", "failed_token")["title"]
 
-    def test_recipient_row_title_blank_when_latest_is_success(self, staff_client):
+    def test_recipient_row_title_survives_later_success(self, staff_client):
+        """DM-16 — 기준이 '최신 로그'가 아니라 '최신 **실패** 로그'다.
+
+        전에는 과거에 실패했다가 결국 성공한 사람의 행이 `error_policy` 는 🔴 인데
+        사유 열만 비어 보였다 — "조사 필요" 로 필터한 목록에 빈칸 행이 섞이는 문제
+        (어드민팀 DM-16). 이제 두 값이 **같은 로그**에서 나온다.
+        """
         camp = _mk_campaign()
         _mk_log(camp, "r1", SentDMLog.Status.FAILED_TOKEN, code="190")
         _mk_log(camp, "r1", SentDMLog.Status.READ)  # 최신 로그는 성공
         row = staff_client.get(RECIPIENTS_URL, {"campaign_id": str(camp.id)}).data["results"][0]
+        assert row["latest_status"] == "read"  # '지금 상태'는 그대로 최신 로그 기준
+        assert row["error_title"] == describe("190", "", "failed_token")["title"]
+        assert row["error_policy"]  # 사유가 있으면 분류도 있다 (둘이 함께 비거나 함께 찬다)
+
+    def test_recipient_row_error_fields_blank_without_failure(self, staff_client):
+        camp = _mk_campaign()
+        _mk_log(camp, "r1", SentDMLog.Status.READ)
+        row = staff_client.get(RECIPIENTS_URL, {"campaign_id": str(camp.id)}).data["results"][0]
         assert row["error_title"] == ""
+        assert row["error_reason"] == ""
+        assert row["error_policy"] == ""
 
 
 # ─── DM-3: 어드민 queue-state / timeseries ────────────────────────────

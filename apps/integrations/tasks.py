@@ -299,6 +299,31 @@ def _ig_token_confirmed_dead(ig_conn) -> bool:
     return dead
 
 
+def _window_expiry_kind(log) -> str:
+    """메시징 창 만료가 **우리 방치**인지 **순간 피크**인지 판정 (2026-07-31).
+
+    둘 다 status=failed_window / error_code="" 로 같아서 화면에서 구분할 수 없었는데,
+    조치는 정반대다(방치=파이프라인 점검 / 피크=고객 안내만).
+
+    판정 근거는 defer 경로가 남기는 흔적이다 — 페이서 슬롯 대기(``_rate_defer``)도,
+    일시 오류 백오프(``_defer_or_fail``)도 매번 ``next_retry_at`` 을 **미래로 갱신**한다.
+    그 시각을 한참(임계 = DM_BACKLOG_OLDEST_ALERT_HOURS) 넘기도록 아직 큐에 남아 있다면
+    아무도 집어가지 않았다는 뜻이다(워커 중단·태스크 유실·재큐 워커 정지).
+
+    ⚠️ SentDMLog 에는 ``updated_at`` 이 없다(auto_now 컬럼 미보유). 마지막으로 손댄 흔적은
+    ``next_retry_at``(defer 예약) → ``submitted_at``(Meta 호출) 순으로 본다. 둘 다 없다면
+    **한 번도 defer 되지도, 호출되지도 않은 채 창이 다 지난 것**이므로 방치로 본다.
+    """
+    from .dm_status_groups import WINDOW_PEAK_SUBCODE, WINDOW_STALLED_SUBCODE
+
+    ref = log.next_retry_at or log.submitted_at
+    if ref is None:
+        return WINDOW_STALLED_SUBCODE
+    stall_hours = getattr(settings, "DM_BACKLOG_OLDEST_ALERT_HOURS", 2)
+    overdue = timezone.now() - ref
+    return WINDOW_STALLED_SUBCODE if overdue > timedelta(hours=stall_hours) else WINDOW_PEAK_SUBCODE
+
+
 def _defer_or_fail(log, campaign, ig_conn, exc) -> dict:
     """발송 예외를 분류해 defer(재시도 대기) 또는 종결 처리하고 결과 dict 반환.
 
@@ -1622,14 +1647,25 @@ def send_dm_task(self, log_id: str):
     # rate-limit/한도 초과로 계속 defer 되더라도 comment 7일 / user_id 24h 가 지나면
     # Meta 가 무조건 거부하므로 FAILED_WINDOW 로 종결한다(= rate-limit 실패가 아닌 윈도우 만료).
     age = timezone.now() - log.created_at
-    if age >= _messaging_window(log):
+    window = _messaging_window(log)
+    if age >= window:
+        # 원인이 두 가지고 조치가 정반대라 종결 시점에 갈라 둔다(2026-07-31):
+        #   peak    — 페이서/백오프가 계속 슬롯을 잡아주는 사이 창이 지남 → 정상(유저 안내)
+        #   stalled — 예약된 재시도 시각을 한참 넘기도록 방치됨 → 발송 파이프라인 문제(조사)
+        # 판정 근거: defer 경로는 매번 next_retry_at 을 미래로 갱신한다(_rate_defer / _defer_or_fail).
+        kind = _window_expiry_kind(log)
         log.mark_failed(
             status=SentDMLog.Status.FAILED_WINDOW,
-            error_message="Messaging window expired while waiting for send capacity",
+            error_message=(
+                "Messaging window expired while waiting for send capacity "
+                f"(window={'7d(comment)' if log.comment_id else '24h(user_id)'}, "
+                f"kind={kind}, retry_count={log.retry_count or 0})"
+            ),
+            error_subcode=kind,
         )
         if log.parent_log_id is None:
             campaign.increment_failed()
-        return {"status": "failed_window", "reason": "window_expired"}
+        return {"status": "failed_window", "reason": "window_expired", "kind": kind}
 
     # ★ 플랜 월간 DM 한도 가드 (free/basic 200건 — pro/admin 은 -1이라 COUNT 자체 생략):
     # 모든 발송 경로(opening/reward/revive/requeue)가 이 태스크를 지나므로 우회 불가.

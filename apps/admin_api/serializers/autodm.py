@@ -22,6 +22,7 @@ from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from apps.admin_api.dm_error_catalog import describe_for_log
+from apps.admin_api.dm_policy_rollup import followup_not_sent, opening_not_sent
 from apps.integrations.campaign_stats import (
     build_dm_stats,
     compute_campaign_enrichment,
@@ -75,8 +76,16 @@ def _build_stats(queryset) -> dict:
     (:func:`apps.integrations.campaign_stats.build_dm_stats`) 를 호출한다.
     사본 시절에는 이벤트 단위 필드만 있고 ``unique_*``(사람 단위)가 통째로 빠져 있어서
     같은 캠페인의 숫자가 어드민/유저 화면에서 달랐다. 필드를 여기 복사하지 말 것.
+
+    DM-7: 여기에만 ``not_sent``(사람 단위 policy 분해)를 얹는다 — `policy`(확인해야함/정상)는
+    **운영자 어휘**라 유저 콘솔 응답에 실리면 안 되므로 공용 함수가 아니라 이 어댑터에서 붙인다.
     """
-    return build_dm_stats(queryset)
+    stats = build_dm_stats(queryset)
+    stats["not_sent"] = opening_not_sent(queryset)
+    # 후속 축은 build_dm_stats 가 만든 follow_up 블록 **안**에 같은 모양으로 넣는다.
+    if isinstance(stats.get("follow_up"), dict):
+        stats["follow_up"]["not_sent"] = followup_not_sent(queryset)
+    return stats
 
 
 # ===== 캠페인 =====
@@ -213,7 +222,15 @@ class AdminCampaignDetailSerializer(serializers.ModelSerializer):
     stats = serializers.SerializerMethodField(
         help_text=(
             "이 캠페인의 dm_logs 를 DMVerificationStatsSerializer 와 동일한 형태로 집계한 dict "
-            "(delivery_rate/read_rate/gate_passthrough_rate 포함)."
+            "(delivery_rate/read_rate/gate_passthrough_rate 포함). "
+            "어드민 전용으로 두 블록이 더 붙는다 (DM-7):\n"
+            "- `not_sent` — 오프닝 축 '발송 안 됨' 인원의 분류·사유 분해\n"
+            "- `follow_up.not_sent` — 후속 DM 축 같은 것\n"
+            "각 블록: `{total, investigate, normal, breakdown[{reason, policy, policy_display, "
+            "title, people}]}`. 계약: `investigate + normal == total == Σ breakdown[].people`, "
+            "breakdown 은 🔴 먼저·인원 많은 순 정렬. `reason` 은 문구가 바뀌어도 고정인 머신 키로, "
+            "그대로 `GET /admin/auto-dm/recipients/?dm_axis=<축>&error_reason=<reason>` 에 실으면 "
+            "그 인원이 목록에 뜬다 (DM-13/14)."
         )
     )
 
@@ -287,6 +304,21 @@ class AdminDMLogListSerializer(serializers.ModelSerializer):
         )
     )
 
+    error_policy = serializers.SerializerMethodField(
+        help_text=(
+            "**분류 (2026-07-31)** — `investigate`(🔴 조사 필요) | `normal`(⚪ 자동 처리). "
+            "행 색·필터를 이 값 하나로 그린다. 오류가 아닌 행(delivered/read 등)은 normal. "
+            "`?error_policy=` 로 서버 필터 가능(상한 없음)."
+        )
+    )
+    error_reason = serializers.SerializerMethodField(
+        help_text=(
+            "DM-14 — 사유 머신 키(예: `window_after_close`). 문구가 바뀌어도 고정이라 "
+            "'이 행과 같은 사유 보기'를 `?error_reason=` 로 그대로 만들 수 있다. "
+            "운영 대시보드 `failure_breakdown[].reason` · `skipped_breakdown[].reason` 과 "
+            "같은 네임스페이스. 오류·건너뜀이 아닌 행은 빈 문자열."
+        )
+    )
     error_title = serializers.SerializerMethodField(
         help_text=(
             "DM-2 — 오류의 짧은 한국어 라벨 (예: '숨겨진 요청 · 스팸함 유입'). 서버 사전"
@@ -313,13 +345,32 @@ class AdminDMLogListSerializer(serializers.ModelSerializer):
             # (100/2534025 숨김함=복구 대상 vs 100/2534022 윈도우 만료=정상 실패는 조치가 정반대).
             "error_subcode",
             "error_title",
+            "error_reason",
+            "error_policy",
             "created_at",
             "delivered_at",
         ]
         read_only_fields = fields
 
+    def _described(self, obj: SentDMLog) -> dict:
+        cached = getattr(obj, "_described_error", None)
+        if cached is None:
+            # error_message 를 함께 넘긴다 — 건너뜀(skipped)은 사유 컬럼이 없어 원문으로
+            # 사유가 갈리기 때문(dm_error_catalog.classify).
+            cached = describe_for_log(
+                obj.error_code, obj.error_subcode, obj.status, obj.error_message
+            )
+            obj._described_error = cached
+        return cached
+
+    def get_error_reason(self, obj: SentDMLog) -> str:
+        return self._described(obj)["error_reason"]
+
     def get_error_title(self, obj: SentDMLog) -> str:
-        return describe_for_log(obj.error_code, obj.error_subcode, obj.status)["error_title"]
+        return self._described(obj)["error_title"]
+
+    def get_error_policy(self, obj: SentDMLog) -> str:
+        return self._described(obj)["error_policy"]
 
     @extend_schema_field(
         serializers.ChoiceField(choices=["opening", "retry", "reward", "standalone"])
@@ -359,6 +410,22 @@ class AdminDMLogDetailSerializer(serializers.ModelSerializer):
             "failed_no_trace(재검증)·recovery_*·failed_param@2534025(숨김채널 복구)=true."
         )
     )
+    error_policy = serializers.SerializerMethodField(
+        help_text=(
+            "**분류 (2026-07-31)** — `investigate`(🔴 조사 필요) | `normal`(⚪ 자동 처리). "
+            "운영 대시보드 failure_breakdown.policy 와 같은 어휘·같은 사전이다. "
+            "오류가 아닌 상태(delivered/read 등)는 normal."
+        )
+    )
+    error_policy_display = serializers.SerializerMethodField(
+        help_text="분류 한국어 표시명 ('조사 필요' / '자동 처리')."
+    )
+    error_reason = serializers.SerializerMethodField(
+        help_text=(
+            "DM-14 — 사유 머신 키(예: `window_after_close`). `?error_reason=` 로 "
+            "'같은 사유 전체 보기'를 만들 때 쓴다. 오류·건너뜀이 아니면 빈 문자열."
+        )
+    )
 
     class Meta:
         model = SentDMLog
@@ -376,6 +443,9 @@ class AdminDMLogDetailSerializer(serializers.ModelSerializer):
             "error_title",
             "error_cause",
             "error_action",
+            "error_reason",
+            "error_policy",
+            "error_policy_display",
             "recoverable",
             "created_at",
             "delivered_at",
@@ -393,9 +463,16 @@ class AdminDMLogDetailSerializer(serializers.ModelSerializer):
     def _described(self, obj: SentDMLog) -> dict:
         cached = getattr(obj, "_described_error", None)
         if cached is None:
-            cached = describe_for_log(obj.error_code, obj.error_subcode, obj.status)
+            # error_message 를 함께 넘긴다 — 건너뜀(skipped)은 사유 컬럼이 없어 원문으로
+            # 사유가 갈리기 때문(dm_error_catalog.classify).
+            cached = describe_for_log(
+                obj.error_code, obj.error_subcode, obj.status, obj.error_message
+            )
             obj._described_error = cached
         return cached
+
+    def get_error_reason(self, obj: SentDMLog) -> str:
+        return self._described(obj)["error_reason"]
 
     def get_error_title(self, obj: SentDMLog) -> str:
         return self._described(obj)["error_title"]
@@ -405,6 +482,12 @@ class AdminDMLogDetailSerializer(serializers.ModelSerializer):
 
     def get_error_action(self, obj: SentDMLog) -> str:
         return self._described(obj)["error_action"]
+
+    def get_error_policy(self, obj: SentDMLog) -> str:
+        return self._described(obj)["error_policy"]
+
+    def get_error_policy_display(self, obj: SentDMLog) -> str:
+        return self._described(obj)["error_policy_display"]
 
     def get_recoverable(self, obj: SentDMLog) -> bool:
         return self._described(obj)["recoverable"]
@@ -469,12 +552,43 @@ class AdminDMRecipientSerializer(serializers.Serializer):
     latest_status = serializers.CharField(
         allow_blank=True, help_text="가장 최근 발송의 SentDMLog.status (배지 보조용)."
     )
+    latest_followup_status = serializers.CharField(
+        allow_blank=True,
+        help_text=(
+            "DM-8 — **마지막 후속 DM**(dm_kind=reward)의 status. 후속을 받은 적이 없으면 빈 문자열. "
+            "캠페인 상세의 후속 DM 표(stats.follow_up)와 **같은 규칙**(사람별 마지막 1건)이라 "
+            "표의 인원과 목록 행이 어긋나지 않는다. `latest_status`(전체 로그 기준)로는 "
+            "오프닝이 최신인 사람의 후속 상태를 알 수 없다."
+        ),
+    )
     error_title = serializers.CharField(
         allow_blank=True,
         help_text=(
-            "DM-2 — **가장 최근 로그**의 오류 라벨 (서버 사전 dm_error_catalog 판정). "
-            "최신 로그가 오류가 아니거나 사전에 없으면 빈 문자열. 원인·조치 전문은 "
-            "`GET /admin/auto-dm/logs/{id}/` 상세에 있다."
+            "이 사람의 오류 사유 라벨 (서버 사전 dm_error_catalog 판정). "
+            "**DM-16 (2026-07-31) — 기준을 '가장 최근 로그' → '가장 최근 실패·정체 로그'로 "
+            "바꿨다.** `error_policy` 와 근거 로그가 같아졌으므로, `?error_policy=investigate` "
+            "로 필터한 목록에 사유가 빈 행이 섞이지 않는다(과거 실패 후 결국 성공한 사람). "
+            "실패 이력이 아예 없으면 `error_policy` 와 함께 빈 문자열이다. "
+            "원인·조치 전문은 `GET /admin/auto-dm/logs/{id}/` 상세에 있다."
+        ),
+    )
+    error_reason = serializers.CharField(
+        allow_blank=True,
+        help_text=(
+            "DM-14 — 이 사람의 사유 머신 키. `error_title` 과 **같은 로그** 기준이며 "
+            "`stats.not_sent.breakdown[].reason` 과 같은 값이라, 카드의 사유 칩을 눌러 "
+            "`?error_reason=` 로 드릴다운했을 때 이 열이 전부 그 사유다. 없으면 빈 문자열."
+        ),
+    )
+    error_policy = serializers.CharField(
+        allow_blank=True,
+        help_text=(
+            "DM-8 — 이 사람의 분류: `investigate`(🔴 조사 필요) | `normal`(⚪ 자동 처리) | "
+            '`""`(실패·정체 로그가 없어 분류할 사유 자체가 없음). '
+            "판정은 **가장 최근 실패·정체 로그** 1건 기준으로, 캠페인 상세의 "
+            "`stats.not_sent` 분해와 **같은 규칙**이다(카드 인원 = 필터 결과). "
+            "`?dm_axis=` 를 주면 그 축의 대표 로그 기준으로 바뀐다(DM-13). "
+            "`?error_policy=` 로 서버 필터 가능 — **상한 없음**(DM-15)."
         ),
     )
     first_sent_at = serializers.DateTimeField(

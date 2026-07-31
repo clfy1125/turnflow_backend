@@ -148,6 +148,14 @@ def _derive_people(
         "unconfirmed": unconfirmed,
         "hidden_spam": hidden_spam,
         "needs_attention": max(failed + unconfirmed - hidden_spam, 0),
+        # DM-11 — Meta 가 접수했지만 아직 도착도 미확인도 아닌 사람(=도착 대기).
+        # 화면의 '대기중' 줄은 waiting(큐 대기) + 이 값이다. 프론트에서
+        # sent − delivered − unconfirmed 로 유도하면 상태 집합이 바뀔 때 **조용히** 틀리므로
+        # (DM-5 회귀 유형) 뺄셈을 여기 한 곳에만 둔다.
+        # ⚠️ 부모 집합은 **sent** 다(대기중 줄에 더해 보이지만 waiting 의 부분집합이 아니다).
+        #    후속 축의 동명 개념은 반대로 waiting 의 부분집합이라 이름이 다르다
+        #    (`follow_up.accepted_pending_in_waiting` — DM-17).
+        "accepted_pending": max(sent - confirmed - unconfirmed, 0),
         "sent_rate": round(sent / targets, 4) if targets else 0.0,
     }
 
@@ -187,6 +195,119 @@ def people_rollup_full(log_qs) -> dict:
         hidden_or_sent_waiting=_uniq(status_group_q(HIDDEN_SPAM) | sent_or_waiting_q),
     )
     return _derive_people(**{k: v or 0 for k, v in agg.items()})
+
+
+# ── 후속 DM(follow-up) 사람 단위 축 — DM-6 ────────────────────────────────────
+# 후속 DM = ``dm_kind = reward`` (오프닝 이후 버튼/게이트 통과로 나가는 두 번째 DM).
+# "오프닝 제외 전부"(~ROOT_DM_Q)로 잡지 않는 이유: 오프닝 **재시도**(dm_kind=opening +
+# parent_log 있음, flow_role=retry)까지 섞인다. 재시도는 상호작용이 아니라 같은 첫 DM 의
+# 재시도이고 오프닝 축에서 사람 단위로 이미 흡수되므로, 여기서 또 세면 이중 계상이다.
+FOLLOW_UP_KIND = SentDMLog.DMKind.REWARD
+
+# 마지막 후속 DM 의 status → 버킷. 오프닝 축(버킷 우선순위 sent>waiting>failed)과 달리
+# **최신 1건**으로만 판정한다 — 한 사람이 후속을 여러 번 받을 수 있어서, "하나라도 성공"
+# 으로 접으면 첫 후속은 갔지만 마지막이 실패한 사람이 성공으로 잡힌다.
+_FOLLOW_UP_DELIVERED = set(CONFIRMED_DELIVERED_STATUSES)
+_FOLLOW_UP_WAITING = set(QUEUE_WAITING_STATUSES) | {
+    SentDMLog.Status.ACCEPTED,
+    SentDMLog.Status.SENT,  # legacy — 발송은 됐고 도착 미확정
+}
+
+
+# 후속 축에서 '발송 안 됨'이 **아닌** 상태 전부 (= delivered ∪ waiting).
+# followup_bucket 의 SQL 판(followup_failed_q)이 같은 집합을 보도록 여기서 한 번만 만든다.
+FOLLOW_UP_OK_STATUSES = sorted(_FOLLOW_UP_DELIVERED | _FOLLOW_UP_WAITING)
+
+
+def followup_bucket(status: str) -> str:
+    """마지막 후속 DM status → ``delivered`` | ``waiting`` | ``failed``.
+
+    세 버킷이 서로소·전체를 덮으므로 ``targets == delivered + waiting + failed`` 가
+    산술이 아니라 **구조적으로** 성립한다(사람당 1건만 보므로).
+    """
+    if status in _FOLLOW_UP_DELIVERED:
+        return "delivered"
+    if status in _FOLLOW_UP_WAITING:
+        return "waiting"
+    return "failed"
+
+
+def followup_failed_q() -> Q:
+    """``followup_bucket(status) == "failed"`` 의 SQL 판 (어드민 목록 필터 DM-13 용).
+
+    파이썬 판정과 갈라지면 카드 인원과 목록 행 수가 어긋나므로, 두 함수가 같은
+    :data:`FOLLOW_UP_OK_STATUSES` 를 본다(회귀 테스트가 전 status 를 대조한다).
+    """
+    return ~Q(status__in=FOLLOW_UP_OK_STATUSES)
+
+
+def latest_followup_rows(log_qs, *extra_fields, group_by_campaign: bool = False):
+    """사람별 **마지막** 후속 DM 1행 (Postgres DISTINCT ON) — 판정 규칙의 단일 소스.
+
+    어드민의 `not_sent` 분해(policy 집계)와 수신자 목록의 ``latest_followup_status`` 도
+    이 함수를 통해 같은 행을 본다 — 규칙을 복제하면 표의 인원수와 행의 배지가
+    갈라진다(DM-5 회귀 유형).
+
+    ``group_by_campaign=True`` 면 (campaign, recipient) 단위로 접는다 — 여러 캠페인을
+    한 목록에 섞어 보는 어드민 수신자 목록용(그 화면의 행 키가 그 쌍이다).
+    ``extra_fields`` 로 error_code/error_subcode 등을 함께 당길 수 있다.
+    """
+    keys = ["campaign_id", "recipient_user_id"] if group_by_campaign else ["recipient_user_id"]
+    return (
+        log_qs.filter(dm_kind=FOLLOW_UP_KIND)
+        .order_by(*keys, "-created_at")
+        .distinct(*keys)
+        .values(*keys, "status", *extra_fields)
+    )
+
+
+def followup_rollup(log_qs) -> dict:
+    """후속 DM 사람 단위 롤업 — **마지막 후속 DM 기준**(basis=latest_per_person).
+
+    오프닝 축(:func:`people_rollup_full`)과 **집계 규칙이 다르다**. 응답의 ``basis`` 로
+    그 사실을 명시하므로 프론트가 두 블록을 같은 규칙으로 오해하지 않는다.
+
+    ⚠️ **부분집합 관계가 오프닝 축과 반대인 키가 둘 있다** (DM-17 — 같은 이름으로 읽으면
+    화면 합계가 조용히 틀린다):
+
+    ==========================  =====================  ==========================
+    키                           후속 축                 오프닝 축의 동명 키
+    ==========================  =====================  ==========================
+    ``unconfirmed``              ⊆ ``failed``           ⊆ ``sent``
+    ``accepted_pending_in_waiting``  ⊆ ``waiting``      ``accepted_pending`` ⊆ ``sent``
+    ==========================  =====================  ==========================
+
+    후속 축은 ``ACCEPTED`` 를 '아직 도착 안 한 대기'로 보고 오프닝 축은 '발송됨'으로 보기
+    때문이다. 그래서 후속 쪽 키에는 부모 집합을 이름에 박았다 — 한 헬퍼로 두 축을 돌리면
+    후속 합계가 ``targets`` 를 넘는다.
+    """
+    counts = Counter()
+    unconfirmed = 0
+    read = 0
+    accepted_pending_in_waiting = 0
+    for row in latest_followup_rows(log_qs):
+        bucket = followup_bucket(row["status"])
+        counts[bucket] += 1
+        if row["status"] == SentDMLog.Status.READ:
+            read += 1
+        elif row["status"] == SentDMLog.Status.FAILED_NO_TRACE:
+            unconfirmed += 1
+        if bucket == "waiting" and row["status"] not in QUEUE_WAITING_STATUSES:
+            accepted_pending_in_waiting += 1
+
+    targets = sum(counts.values())
+    delivered = counts["delivered"]
+    return {
+        "targets": targets,
+        "delivered": delivered,
+        "read": read,
+        "waiting": counts["waiting"],
+        "accepted_pending_in_waiting": accepted_pending_in_waiting,
+        "failed": counts["failed"],
+        "unconfirmed": unconfirmed,
+        "reach_rate": round(delivered / targets, 4) if targets else 0.0,
+        "basis": "latest_per_person",
+    }
 
 
 def people_rollup(log_qs) -> dict:
@@ -373,6 +494,10 @@ def build_dm_stats(log_qs) -> dict:
             "unique_reach_rate": round(unique_reach_rate, 4),
             "unique_sent_rate": round(unique_sent_rate, 4),
             "unique_hidden_spam": people["hidden_spam"],
+            # DM-11 — 화면 '대기중' 줄 = unique_waiting + unique_accepted_pending.
+            "unique_accepted_pending": people["accepted_pending"],
+            # DM-6 — 후속 DM(리워드) 사람 단위 축. 규칙이 오프닝과 달라 basis 를 함께 준다.
+            "follow_up": followup_rollup(log_qs),
             # 기존 '확인 필요' 총합(= failed + 도착미확인). hidden_spam ⊆ failed 라
             # excl_hidden(= people.needs_attention) 은 항상 ≥ 0.
             "unique_needs_attention": people["failed"] + people["unconfirmed"],

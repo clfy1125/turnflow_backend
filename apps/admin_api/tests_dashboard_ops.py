@@ -22,6 +22,7 @@ from django.core.cache import cache
 from django.utils import timezone
 from rest_framework.test import APIClient
 
+from apps.admin_api.dm_error_catalog import POLICY_DISPLAY
 from apps.admin_api.views.dashboard_ops import _granularity_for_span, _service_start, _window_bounds
 from apps.billing.models import (
     PaymentHistory,
@@ -738,6 +739,62 @@ class TestFailureBreakdown:
         counts = [r["count"] for r in bd]
         assert counts == sorted(counts, reverse=True)
 
+    def test_breakdown_rows_carry_reason_key(self, staff_client, clean_slate):
+        """DM-14 — 사유 머신 키. 한 사유가 코드 여러 조합으로 오므로 그걸로 묶어야 한다."""
+        camp = _mk_campaign(_mk_conn())
+        _mk_dms(camp, SentDMLog.Status.FAILED_WINDOW, 3, error_code="100", error_subcode="2534022")
+        _mk_dms(camp, SentDMLog.Status.FAILED_WINDOW, 2, error_code="10", error_subcode="2018278")
+
+        bd = staff_client.get(URL).data["dm_quality"]["failure_breakdown"]
+        window_rows = [r for r in bd if r["reason"] == "window_after_close"]
+        # (code,subcode) 는 2행이지만 사유는 하나 — 프론트는 reason 으로 묶는다
+        assert len(window_rows) == 2
+        assert sum(r["count"] for r in window_rows) == 5
+        assert len({r["title"] for r in window_rows}) == 1  # reason ↔ title 1:1
+
+    def test_breakdown_count_equals_logs_filter_count(self, staff_client, clean_slate):
+        """DM-14 계약 — `breakdown[].count` == `GET /admin/auto-dm/logs/?error_reason=` 의 count.
+
+        팝업의 사유별 `보러가기` 가 이 항등 위에 서 있다. 건너뜀 표(skipped_breakdown)도
+        같은 파라미터로 착지하므로 함께 검증한다.
+        """
+        camp = _mk_campaign(_mk_conn())
+        _mk_dms(camp, SentDMLog.Status.FAILED_WINDOW, 3, error_code="100", error_subcode="2534022")
+        _mk_dms(camp, SentDMLog.Status.FAILED_WINDOW, 2, error_code="10", error_subcode="2018278")
+        _mk_dms(camp, SentDMLog.Status.FAILED_TOKEN, 4, error_code="190")
+        _mk_dms(camp, SentDMLog.Status.FAILED_NO_TRACE, 6)
+        _mk_dms(camp, SentDMLog.Status.SKIPPED, 5, error_message="monthly_dm_limit_reached")
+        _mk_dms(camp, SentDMLog.Status.SKIPPED, 2, error_message="처음 보는 문구")
+        _mk_dms(camp, SentDMLog.Status.DELIVERED, 7)  # 모수 밖
+
+        dmq = staff_client.get(URL).data["dm_quality"]
+        logs_url = "/api/v1/admin/auto-dm/logs/"
+
+        def logs_count(**params):
+            return staff_client.get(logs_url, params).data["count"]
+
+        # 사유별 — 같은 reason 을 쓰는 행이 여러 개면 합계와 비교
+        for rows, count_key in (
+            (dmq["failure_breakdown"], "count"),
+            (dmq["skipped_breakdown"], "count"),
+        ):
+            by_reason: dict[str, int] = {}
+            for row in rows:
+                by_reason[row["reason"]] = by_reason.get(row["reason"], 0) + row[count_key]
+            for reason, expected in by_reason.items():
+                assert logs_count(error_reason=reason) == expected, reason
+
+        # 분류별 — 팝업의 `전체 보러가기`. 모수는 오류 8종 + 건너뜀이므로 두 표의 합이다.
+        for policy in ("investigate", "normal"):
+            expected = sum(
+                r["count"] for r in dmq["failure_breakdown"] if r["policy"] == policy
+            ) + sum(r["count"] for r in dmq["skipped_breakdown"] if r["policy"] == policy)
+            assert logs_count(error_policy=policy) == expected, policy
+            # error_scope 로 한쪽만 볼 수도 있다 (팝업이 오류 표만 그릴 때)
+            assert logs_count(error_policy=policy, error_scope="error") == sum(
+                r["count"] for r in dmq["failure_breakdown"] if r["policy"] == policy
+            ), policy
+
     def test_recovery_funnel(self, staff_client, clean_slate):
         camp = _mk_campaign(_mk_conn())
         _mk_dms(camp, SentDMLog.Status.RECOVERY_PENDING, 5)
@@ -874,10 +931,19 @@ class TestFailureBreakdownDescriptions:
             r["code"] + ":" + r["subcode"]: r
             for r in staff_client.get(URL).data["dm_quality"]["failure_breakdown"]
         }
+        # 문구 자체를 하드코딩하지 않는다 — 서버 사전이 정본이므로 사전과 대조한다.
+        # (2026-07-31 DM-9/10 문구 전면 교체 때 '토큰'·'윈도우' 같은 단어를 단언하던
+        #  테스트 4건이 한꺼번에 깨졌다. 계약은 "사전 값이 그대로 실려 나가는가"다.)
+        from apps.admin_api.dm_error_catalog import describe
+
         token = bd["190:"]
-        assert "토큰" in token["title"] and token["cause"] and token["action"]
+        expected = describe("190", "", SentDMLog.Status.FAILED_TOKEN)
+        assert token["title"] == expected["title"]
+        assert token["cause"] == expected["cause"] and token["action"] == expected["action"]
+        assert token["title"] and token["cause"] and token["action"]
+
         hidden = bd["100:2534025"]
-        assert "숨겨진" in hidden["title"]
+        assert hidden["title"] == describe("100", "2534025", SentDMLog.Status.FAILED_PARAM)["title"]
         assert hidden["group"] == "hidden_spam"
 
     def test_unknown_code_falls_back_to_status_entry(self, staff_client, clean_slate):
@@ -1017,7 +1083,16 @@ class TestSkippedBreakdown:
         _mk_dms(camp, SentDMLog.Status.SKIPPED, 2, error_message="something we never wrote")
         dq = staff_client.get(URL).data["dm_quality"]
         assert dq["skipped_breakdown"] == [
-            {"reason": "other", "label": "기타", "count": 2, "actionable": False}
+            {
+                "reason": "other",
+                "label": "기타",
+                "count": 2,
+                "actionable": False,
+                # 2026-07-31 — 미분류 건너뜀은 '사전에 없는 문구가 찍혔다'는 뜻이라
+                # 유일하게 사람이 봐야 하는 건너뜀 사유다(나머지는 전부 설정대로 동작).
+                "policy": "investigate",
+                "policy_display": POLICY_DISPLAY["investigate"],
+            }
         ]
         assert sum(r["count"] for r in dq["skipped_breakdown"]) == dq["skipped"]
 

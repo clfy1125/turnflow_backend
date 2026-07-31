@@ -47,6 +47,17 @@ GROUP_DISPLAY = {
 # 비팔로워 채널 미개설 → 첫 DM 이 상대 숨겨진 요청/스팸함으로 (복구 기능 대상 사유).
 HIDDEN_SPAM_SUBCODE = "2534025"
 
+# ── 내부 표식 subcode (Meta 가 준 값이 아니라 **우리가 붙이는 값**) ──────────
+# 메시징 창 만료는 원인이 두 가지고 조치가 정반대인데, 둘 다 status=failed_window +
+# error_code="" 로 같아서 화면에서 구분할 수 없었다. 종결 시점에만 알 수 있는 정보
+# (예약 재시도 시각을 넘겼는가)를 subcode 자리에 남겨 사후 분류를 가능하게 한다.
+#   - window_stalled: 예약된 재시도 시각을 한참 넘기도록 방치됨 → 발송 파이프라인 문제
+#   - window_peak:    페이서 대기열이 길어진 사이 만료 → 정상(피크)
+# Meta subcode 는 항상 숫자라 값 공간이 겹치지 않는다. 내부 가드가 종결하는 건은
+# subcode 가 원래 비어 있어 덮어쓸 값도 없다.
+WINDOW_STALLED_SUBCODE = "window_stalled"
+WINDOW_PEAK_SUBCODE = "window_peak"
+
 # hidden_spam 으로 접히는 상태들 (recovery 는 항상, failed_param 은 2534025 subcode 일 때만).
 HIDDEN_SPAM_STATUSES = ["recovery_pending", "recovery_expired"]
 

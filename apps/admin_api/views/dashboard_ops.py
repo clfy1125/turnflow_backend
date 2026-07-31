@@ -63,9 +63,12 @@ from apps.admin_api.dashboard_constants import (
     WEBHOOK_BACKLOG_CRITICAL_MINUTES,
     WEBHOOK_BACKLOG_STALE_MINUTES,
 )
+from apps.admin_api.dm_error_catalog import classify_skipped, truncate_message
 from apps.admin_api.dm_error_catalog import describe as describe_dm_error
 from apps.admin_api.dm_error_catalog import is_recoverable as _error_is_recoverable
-from apps.admin_api.dm_error_catalog import truncate_message
+from apps.admin_api.dm_error_catalog import policy_display as _policy_display
+from apps.admin_api.dm_error_catalog import policy_for as _policy_for
+from apps.admin_api.dm_error_catalog import reason_for as _reason_for
 from apps.admin_api.serializers.dashboard_ops import AdminOpsDashboardSerializer
 
 # delivery_rate 표준 공식 재사용 (dm-verification/stats 와 동일 정의 — 복제 금지)
@@ -143,41 +146,10 @@ DM_ERROR_STATUSES = (
     SentDMLog.Status.RECOVERY_EXPIRED,
 )
 # ── DM-4: 건너뜀(skipped) 사유 분해 ──────────────────────────────────
-# skipped = "Meta 에 요청을 보내지 않고 취소한 건". **실패가 아니라 발송을 시작하지 않은
-# 상태**이며, 조치가 필요한 것은 월 DM 한도 하나뿐이다(업셀 신호).
-# 사유 컬럼이 따로 없어 error_message 문자열로 판별하지만, 규칙을 **여기 한 곳**에 모아
-# 두었으니 발송 경로의 문구를 바꾸면 이 표를 함께 고칠 것.
-#   (원문 출처: integrations/tasks.py 의 log.mark_skipped(...) 호출부 +
-#    integrations/models.py 의 IGAccountConnection._halt_automation)
-# ⚠️ 아래 뒤 2개는 **운영 중 수동 정리**로 찍힌 문구다(2026-07 중복 캠페인/유령 오프닝
-#    사고 대응). 코드 경로가 아니라 사고 대응 셸에서 나왔지만 prod 실측 66건 중 40건을
-#    차지해, 없으면 패널의 다수가 '기타'로 보인다 — 지우지 말 것.
-# 형식: (reason 키, 한국어 라벨, actionable, 매칭 부분문자열들)
-SKIPPED_REASONS: tuple[tuple[str, str, bool, tuple[str, ...]], ...] = (
-    ("monthly_dm_limit", "월 DM 한도 도달", True, ("monthly_dm_limit_reached",)),
-    ("campaign_not_active", "캠페인 일시정지 중", False, ("campaign not active",)),
-    ("outside_schedule_window", "예약 발송 창 밖", False, ("outside active schedule window",)),
-    ("ig_account_inactive", "IG 계정 비활성(플랜 축소)", False, ("ig account deactivated",)),
-    ("self_recipient", "계정 자신의 댓글", False, ("self recipient",)),
-    ("connection_disconnected", "IG 연결 해제 정리", False, ("ig connection disconnected",)),
-    (
-        "duplicate_campaign_cleanup",
-        "같은 게시물 중복 캠페인 정리",
-        False,
-        ("duplicate campaign on same media",),
-    ),
-    ("ghost_opening_cleanup", "유령 오프닝 정리(운영 조치)", False, ("유령 오프닝",)),
-)
-SKIPPED_OTHER = ("other", "기타", False)
-
-
-def _classify_skipped(message: str) -> tuple[str, str, bool]:
-    """skipped 로그의 error_message → (reason, label, actionable). 미매칭은 other."""
-    text = (message or "").strip().lower()
-    for reason, label, actionable, needles in SKIPPED_REASONS:
-        if any(n in text for n in needles):
-            return reason, label, actionable
-    return SKIPPED_OTHER
+# 사유 표(SKIPPED_REASONS)와 판정(classify_skipped)은 2026-07-31 에 `dm_error_catalog` 로
+# 옮겼다 — 오류 사전과 **같은 reason 네임스페이스**를 쓰고(`?error_reason=` 한 파라미터로
+# 둘 다 드릴다운), 캠페인 상세의 `not_sent` 분해도 건너뜀 로그에 사유 라벨을 붙일 수
+# 있어야 하기 때문이다. 여기서는 화면 형태로만 접는다.
 
 
 def _skipped_breakdown(in_range) -> list[dict]:
@@ -192,9 +164,20 @@ def _skipped_breakdown(in_range) -> list[dict]:
         .annotate(count=Count("id"))
     )
     for row in rows:
-        reason, label, actionable = _classify_skipped(row["error_message"])
+        reason, label, actionable = classify_skipped(row["error_message"])
+        # 건너뜀은 전부 '설정대로 동작'이라 정상이다 — 유일한 예외가 미분류(other)로,
+        # 사전에 없는 문구가 찍혔다는 뜻이므로 사람이 봐야 한다(오류 사전과 같은 규칙).
+        policy = _policy_for("", "", SentDMLog.Status.SKIPPED, row["error_message"])
         slot = buckets.setdefault(
-            reason, {"reason": reason, "label": label, "count": 0, "actionable": actionable}
+            reason,
+            {
+                "reason": reason,
+                "label": label,
+                "count": 0,
+                "actionable": actionable,
+                "policy": policy,
+                "policy_display": _policy_display(policy),
+            },
         )
         slot["count"] += row["count"]
     return sorted(buckets.values(), key=lambda b: (-b["count"], b["reason"]))
@@ -463,6 +446,17 @@ def _dm_quality(until, since, granularity: str) -> tuple[dict, dict]:
                 ((row["error_code"] or ""), (row["error_subcode"] or ""), row["status"]), ""
             ),
             **describe_dm_error(row["error_code"], row["error_subcode"], row["status"]),
+            # ★ 분류·사유는 describe() 값을 그대로 쓰지 않고 policy_for/reason_for 로 덮는다 —
+            #   사전 미등록 조합은 둘 다 빈 문자열인데, 설명조차 못 다는 실패는
+            #   곧 '우리가 모르는 실패'이므로 investigate/unclassified 로 떨어져야 한다.
+            # DM-14: reason 은 문구가 바뀌어도 고정인 머신 키다. 프론트는 사유별
+            #   `보러가기` 링크에 이 값을 그대로 실어 `?error_reason=` 로 드릴다운한다
+            #   (code 로는 대체 불가 — 한 사유가 code 4조합, 한 code 가 두 사유).
+            "reason": _reason_for(row["error_code"], row["error_subcode"], row["status"]),
+            "policy": _policy_for(row["error_code"], row["error_subcode"], row["status"]),
+            "policy_display": _policy_display(
+                _policy_for(row["error_code"], row["error_subcode"], row["status"])
+            ),
         }
         for row in (
             error_rows.values("error_code", "error_subcode", "status")
