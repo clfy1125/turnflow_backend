@@ -908,6 +908,18 @@ class TestMonthlyChartSurvivesSparsePosting:
         assert m["monthly_low_sample"] is True
         assert not m["monthly_dropped"], "되살린 경우 '빼놨다' 안내가 남아 있으면 모순이다"
 
+    def test_notes_carry_no_html_tags(self, tmp_path):
+        """안내문에 HTML 태그를 넣으면 autoescape 때문에 사용자가 `&lt;b&gt;` 를 글자로 본다."""
+        from .pipeline import render
+
+        canon = self._sparse_canon(tmp_path, per_month=2, months=6)
+        from .pipeline import metrics as metrics_mod
+
+        m = metrics_mod.build_metrics(canon)
+        note = render._monthly_notes(m)[1]
+        assert note, "희소 계정에는 안내문이 있어야 한다"
+        assert "<" not in note and ">" not in note, note
+
     def test_dense_account_keeps_the_min3_rule(self, tmp_path):
         """월 8~10개 올리는 계정은 기존 규칙(희소한 달 제외)이 그대로 유지돼야 한다."""
         from .pipeline import config, fake_mode, normalize
