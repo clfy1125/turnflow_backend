@@ -825,3 +825,43 @@ class TestSamplerRunsBeforeDownload:
         assert out["features"] == {}
         assert "영상 파일 없음" in out["failures"]["SC0"]
         assert "썸네일 파일 없음" in out["failures"]["SC1"]
+
+
+class TestRunDirVisibleInWorkerThreads:
+    """런 디렉터리는 **워커 스레드에서도** 보여야 한다.
+
+    2026-08-03 운영 실측 결함: 바인딩을 ContextVar 단독으로 들고 있었는데 **새 스레드는 빈
+    컨텍스트로 시작해 ContextVar 가 전파되지 않는다** → 추출을 도는
+    `ThreadPoolExecutor` 워커에서 `config.FEATURE_DIR` 접근이 RuntimeError 로 죽어
+    영상 분석이 전량 실패했다(`성공 0 / 실패 14`). 메인 스레드만 검사하면 못 잡는다.
+    """
+
+    def test_paths_resolve_inside_thread_pool(self, tmp_path):
+        import concurrent.futures as cf
+
+        from .pipeline import config
+
+        config.bind_run(tmp_path)
+        expected = str(tmp_path / "features")
+
+        def read_in_thread():
+            return str(config.FEATURE_DIR), str(config.MEDIA_DIR)
+
+        with cf.ThreadPoolExecutor(max_workers=3) as ex:
+            got = [f.result() for f in [ex.submit(read_in_thread) for _ in range(3)]]
+
+        for feat, media_dir in got:
+            assert feat == expected, "워커 스레드에서 런 디렉터리를 못 본다"
+            assert media_dir == str(tmp_path / "media")
+
+    def test_unbound_still_raises(self, monkeypatch):
+        """폴백이 '바인딩 안 했는데 조용히 동작' 으로 퇴화하지 않게 한다."""
+        from .pipeline import config
+
+        monkeypatch.setattr(config, "_RUN_DIR_PROCESS", None)
+        token = config._RUN_DIR.set(None)
+        try:
+            with pytest.raises(RuntimeError, match="bind_run"):
+                _ = config.MEDIA_DIR
+        finally:
+            config._RUN_DIR.reset(token)

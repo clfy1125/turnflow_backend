@@ -8,8 +8,14 @@
    PEP 562 `__getattr__` 가 그때그때 해석한다. 파이프라인 모듈 코드는 손대지 않는다.
 2) **키·모델명이 Django settings 에서 온다.** (.env → settings → 여기)
 
-⚠️ Celery prefork 는 태스크당 프로세스가 갈리므로 전역 바인딩이 새지 않는다. 그래도
-   스레드 실행(테스트 등)에서 안전하도록 ContextVar 로 들고 있는다.
+⚠️ Celery prefork 는 태스크당 프로세스가 갈리므로 전역 바인딩이 새지 않는다.
+
+⚠️⚠️ **ContextVar 단독으로는 안 된다 (2026-08-03 운영 실측).** 파이프라인은 추출·다운로드를
+   `ThreadPoolExecutor` 로 병렬 실행하는데, **새 스레드는 빈 컨텍스트로 시작하므로
+   ContextVar 가 전파되지 않는다** → 워커 스레드에서 `_RUN_DIR.get()` 이 default(None) 을
+   집어 `config.FEATURE_DIR` 접근이 RuntimeError 로 죽었다. 실계정 리포트가 영상 분석
+   전량 실패(`성공 0 / 실패 14`)로 무너진 원인. 그래서 **프로세스 전역 폴백**을 함께 둔다:
+   ContextVar 가 비어 있으면 같은 프로세스의 마지막 바인딩을 쓴다(prefork 라 잡 간 누수 없음).
 """
 
 from __future__ import annotations
@@ -23,6 +29,8 @@ from django.conf import settings
 _RUN_DIR: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
     "insta_report_run_dir", default=None
 )
+# 스레드용 폴백 — ContextVar 는 ThreadPoolExecutor 워커로 전파되지 않는다(위 docstring).
+_RUN_DIR_PROCESS: Path | None = None
 
 # 속성 이름 → 작업 디렉터리 하위 경로
 _DIRS = {
@@ -38,15 +46,20 @@ _DIRS = {
 
 def bind_run(run_dir: str | Path) -> Path:
     """이 리포트 런이 쓸 작업 디렉터리를 바인딩하고 하위 디렉터리를 만든다."""
+    global _RUN_DIR_PROCESS
+
     base = Path(run_dir)
     for sub in _DIRS.values():
         (base / sub).mkdir(parents=True, exist_ok=True)
     _RUN_DIR.set(base)
+    _RUN_DIR_PROCESS = base  # 워커 스레드가 볼 수 있게
     return base
 
 
 def current_run_dir() -> Path:
-    base = _RUN_DIR.get()
+    # ContextVar 우선(같은 스레드의 중첩/격리된 바인딩 존중) → 없으면 프로세스 전역 폴백.
+    # 폴백이 실제로 쓰이는 곳: 추출/다운로드의 ThreadPoolExecutor 워커 스레드.
+    base = _RUN_DIR.get() or _RUN_DIR_PROCESS
     if base is None:
         raise RuntimeError(
             "insta_reports 파이프라인 경로가 바인딩되지 않았습니다 — config.bind_run(dir) 먼저 호출"
