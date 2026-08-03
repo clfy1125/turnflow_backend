@@ -228,6 +228,64 @@ def synthesize(
     return _synthesize_impl(agg_input, ledger, error_feedback, prompt, only_slots)
 
 
+# 계정 규모별 조언 방향 — 이게 없으면 모든 계정에 **중간 규모용 조언 하나**만 나간다.
+_SCALE_GUIDANCE = {
+    "starting": (
+        "이 계정은 **막 시작한 단계**입니다(평소 조회수 1,000 미만). "
+        "'분석'보다 **횟수와 실험**이 답입니다. 표본이 작아 어떤 비교도 우연일 수 있다는 점을 "
+        "분명히 하고, 무엇을 몇 편 더 올려서 무엇을 확인할지의 **실험 계획**을 주세요. "
+        "정교한 최적화(올리는 시간·자막 스타일 미세조정) 조언은 지금 단계에서 무의미합니다."
+    ),
+    "growing": (
+        "이 계정은 **성장 중**입니다. 잘된 소수의 영상에서 **반복 가능한 공식**을 찾아내 "
+        "그것을 굳히는 데 집중시키세요. 아직 규모가 작아 한두 편의 대박이 평균을 흔든다는 점을 "
+        "감안해 '가운데 값' 기준으로 말하세요."
+    ),
+    "established": (
+        "이 계정은 **자리 잡은 단계**입니다. 평균을 올리는 것보다 **하위 영상의 이유를 없애는 것**이 "
+        "효율적입니다. 잘되는 패턴은 이미 있으니, 편차를 줄이는 쪽으로 조언하세요."
+    ),
+    "large": (
+        "이 계정은 **대형**입니다(평소 조회수 10만 이상). 이미 도달은 충분하므로 "
+        "'조회수를 늘리세요' 류의 조언은 **쓸모없습니다**. 대신 ①이 도달을 무엇으로 전환할지"
+        "(팔로워·저장·외부 링크·판매) ②편차와 리스크 관리 ③재현 가능한 제작 공정 "
+        "관점으로 조언하세요."
+    ),
+}
+_REACH_GUIDANCE = {
+    "explore_driven": (
+        "**도달 방식이 핵심 진단입니다**: 평소 조회수가 팔로워 수보다 훨씬 많습니다 — "
+        "즉 팔로워 밖(탐색·추천)에서 대부분 보고 있고, **본 사람이 팔로워로 남지 않고 있습니다**. "
+        "조회수 늘리기가 아니라 **팔로워 전환**(프로필 첫인상·고정 게시물·시리즈화·영상 안 팔로우 "
+        "이유 제시)을 최우선으로 조언하세요."
+    ),
+    "follower_driven": (
+        "**도달 방식이 핵심 진단입니다**: 평소 조회수가 팔로워 수보다 적습니다 — "
+        "새 시청자에게 퍼지지 않고 기존 팔로워 안에서만 돌고 있습니다. "
+        "**초반 이탈을 줄이고 저장·공유를 유도**하는 쪽으로 조언하세요."
+    ),
+    "balanced": "",
+    "unknown": "",
+}
+
+
+def _audience_guidance(agg_input: dict) -> str:
+    """집계에 담긴 계정 성격(scale/reach_mode)에 맞는 조언 방향을 프롬프트에 덧붙인다."""
+    aud = (agg_input.get("audience") or {}) if isinstance(agg_input, dict) else {}
+    parts = [
+        _SCALE_GUIDANCE.get(aud.get("scale"), ""),
+        _REACH_GUIDANCE.get(aud.get("reach_mode"), ""),
+    ]
+    body = "\n".join(p for p in parts if p)
+    if not body:
+        return ""
+    return (
+        "\n\n## 이 계정에 맞는 조언 방향 (반드시 반영)\n"
+        + body
+        + "\n위 방향과 어긋나는 일반론은 쓰지 마세요. 숫자는 여전히 입력에 있는 것만 씁니다."
+    )
+
+
 def _synthesize_impl(
     agg_input: dict,
     ledger: CostLedger,
@@ -240,6 +298,7 @@ def _synthesize_impl(
         + json.dumps(agg_input, ensure_ascii=False)
         + "\n```"
     )
+    user += _audience_guidance(agg_input)
     if error_feedback:
         user += "\n\n## 이전 시도 반려 사유 — 반드시 고쳐서 다시 쓰세요\n" + error_feedback
     if only_slots:

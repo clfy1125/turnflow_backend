@@ -65,6 +65,63 @@ def _round_tier(v: float) -> int:
     return int(round(v / d) * d)
 
 
+# ── 계정 성격 판정 ───────────────────────────────────────────────────
+# ⚠️ 왜 필요한가: 이게 없으면 리포트가 **중간 규모 계정 기준의 조언 하나**만 반복한다.
+#    "막 시작한 사람"에게 필요한 말과 "영상마다 터지는 대형 계정"에 필요한 말은 정반대다.
+#    (실측 @jinyongjin92: 팔로워 25,934 인데 평소 조회수 41.3만 = **도달 16배**.
+#     이 계정에 "조회수를 늘리세요" 는 무의미하고, 문제는 팔로워 전환이다.)
+SCALE_THRESHOLDS = [
+    # (키, 라벨, 평소 조회수 상한)
+    ("starting", "막 시작한 단계", 1_000),
+    ("growing", "성장 중", 10_000),
+    ("established", "자리 잡은 단계", 100_000),
+    ("large", "대형", None),
+]
+# 평소 조회수 / 팔로워 수 — 이 배수가 크면 팔로워 밖(탐색·추천)에서 보고 있다는 뜻.
+EXPLORE_RATIO = 3.0
+LOYAL_RATIO = 0.5
+
+
+def _audience_profile(canon: dict, m: dict) -> dict:
+    """계정 규모(scale) + 도달 방식(reach_mode). 조언 분기의 단일 소스."""
+    followers = (canon.get("account") or {}).get("followers") or 0
+    med = m["views_stats"]["median"]
+
+    scale, scale_label = "large", "대형"
+    for key, label, upper in SCALE_THRESHOLDS:
+        if upper is None or med < upper:
+            scale, scale_label = key, label
+            break
+
+    ratio = round(med / followers, 1) if followers else None
+    if ratio is None:
+        reach_mode, reach_label = "unknown", "팔로워 수를 확인할 수 없어요"
+    elif ratio >= EXPLORE_RATIO:
+        reach_mode = "explore_driven"
+        reach_label = (
+            f"팔로워({followers:,}명)보다 평소 조회수가 {ratio}배 많아요 — "
+            "팔로워 밖(탐색·추천)에서 대부분 보고 있어요"
+        )
+    elif ratio <= LOYAL_RATIO:
+        reach_mode = "follower_driven"
+        reach_label = (
+            f"평소 조회수가 팔로워({followers:,}명)의 {ratio}배예요 — "
+            "새 시청자에게 퍼지지 않고 기존 팔로워 안에서만 돌고 있어요"
+        )
+    else:
+        reach_mode = "balanced"
+        reach_label = f"팔로워({followers:,}명) 규모에 맞는 조회수가 나오고 있어요"
+
+    return {
+        "followers": followers,
+        "scale": scale,
+        "scale_label": scale_label,
+        "views_per_follower": ratio,
+        "reach_mode": reach_mode,
+        "reach_label": reach_label,
+    }
+
+
 def build_metrics(canon: dict) -> dict:
     posts = canon["posts"]
     now = datetime.now(UTC)
@@ -156,6 +213,9 @@ def build_metrics(canon: dict) -> dict:
         mon["count"].append(len(vs))
         mon["immature"].append(young > len(vs) / 2)
     m["monthly"] = mon
+
+    # ── 계정 성격 (조언을 여기서 갈라야 한다) ──
+    m["audience"] = _audience_profile(canon, m)
 
     # ── 벤치마크 티어 (분위수 라운딩, 단조 강제) ──
     tiers = [_round_tier(_pct(views, q)) for q in (0.25, 0.50, 0.75, 0.90)]

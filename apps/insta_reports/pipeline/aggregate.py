@@ -180,6 +180,11 @@ def build_aggregates(canon: dict, metrics: dict, extraction: dict, sample: dict)
         pcts.append(
             {"key": f"dist.counts[{i}]/total", "value": round(c / max(1, sum(d["counts"])) * 100)}
         )
+    # 도달 배수(평소 조회수 ÷ 팔로워) — 계정 성격 진단의 핵심 숫자다. 여기 넣지 않으면
+    # 합성이 "팔로워보다 16배" 라고 써도 게이트가 "지표에 없는 숫자" 로 반려한다.
+    vpf = (metrics.get("audience") or {}).get("views_per_follower")
+    if vpf:
+        ratios.append({"key": "views.median/followers", "value": vpf})
     agg["derived"] = {"ratios": ratios, "pcts": pcts}
     return agg
 

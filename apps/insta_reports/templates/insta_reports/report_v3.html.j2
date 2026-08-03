@@ -267,6 +267,11 @@ footer{text-align:center;color:#6d6485;font-size:12px;margin-top:44px;padding-to
   이 아래 내용은 <b>댓글 {{ cstats.n_analyzed }}개</b>만 보고 만든 거예요. 수집된 댓글 {{ cfilter.total_collected }}개의 대부분({{ ((cfilter.excluded_trigger + cfilter.excluded_repeat + cfilter.excluded_meaningless) / cfilter.total_collected * 100) | round | int }}%)이 자동 DM을 받기 위해 키워드나 이모지만 남긴 것이어서, 팔로워의 생각을 읽어낼 만한 양이 안 됩니다({{ cstats.min_for_insight }}개 이상은 되어야 참고할 만해요).<br>
   <b>그래서 아래 비율과 인용은 "경향 참고"로만 보세요.</b> 댓글 유도 문구를 키워드 대신 "어떤 게 제일 궁금하세요?"처럼 <b>의견을 묻는 방식</b>으로 몇 편 바꿔보면, 다음 리포트에서 훨씬 정확한 팔로워 분석이 가능해져요.</div>
   {% endif %}
+  {% if cstats.classify_unreliable %}
+  <div class="warnbox"><b>⚠️ 댓글 분류 신뢰도가 낮아요</b><br>
+  분석한 댓글 {{ cstats.n_analyzed }}개 중 {{ cstats.unclassified }}개({{ cstats.unclassified_pct }}%)를 분류하지 못했어요.
+  아래 비율은 <b>분류에 성공한 댓글 기준</b>으로만 읽어 주세요.</div>
+  {% endif %}
   <div class="grid g2">
     <div class="card"><div class="chartbox xs"><canvas id="commentChart"></canvas></div></div>
     <div class="card"><h3>각 분류의 의미</h3>
@@ -274,6 +279,16 @@ footer{text-align:center;color:#6d6485;font-size:12px;margin-top:44px;padding-to
       <p class="muted" style="margin-top:{{ '0' if loop.first else '6px' }}"><b style="color:{{ r.color }}">{{ r.label }} ({{ r.pct }}%)</b> — {{ r.desc }}</p>
       {% endfor %}</div>
   </div>
+
+  {% if cstats.tones %}
+  <h2><span class="bar"></span>내 댓글창은 어떤 곳일까?</h2>
+  <div class="sub">댓글을 성격별로 크게 묶어봤어요. 어떤 대화가 벌어지는 곳인지가 <b>다음에 무엇을 만들지</b>와 <b>협업·판매에 쓸 수 있는 계정인지</b>를 가릅니다.</div>
+  <div class="card">
+    {% for t in cstats.tones %}
+    <div class="mbar"><div class="ml"><b>{{ t.label }}</b><span>{{ t.pct }}% · {{ t.count }}개</span></div><div class="mtrack"><div class="mfill" style="width:{{ t.pct }}%"></div></div><div class="mdesc">{{ tone_desc.get(t.key, '') }}</div></div>
+    {% endfor %}
+  </div>
+  {% endif %}
 
   <h2><span class="bar"></span>팔로워가 진짜 원하는 것</h2>
   <div class="sub">댓글에서 반복해서 나타난 요구를 3가지로 정리했어요. 실제 댓글을 그대로 옮겼어요.</div>

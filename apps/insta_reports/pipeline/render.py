@@ -150,7 +150,25 @@ DONUT_GROUPS = [
     ("응원·팬심", ["support"], "#c86dd7", "크리에이터 자체를 좋아하는 반응이에요."),
     ("기타", ["other"], "#6d6485", "이모지·짧은 반응 등이에요."),
 ]
-MOTIVATION_ICON = {"practical": "🛠️", "question": "🐣", "wow": "😮", "fan": "🤝"}
+MOTIVATION_ICON = {
+    "practical": "🛠️",
+    "question": "🐣",
+    "wow": "😮",
+    "fan": "🤝",
+    "voice": "🗣️",
+}
+
+# 댓글창 분위기 묶음 설명 — 숫자만 보여주면 "그래서 뭘 하라고?" 가 된다.
+TONE_DESC = {
+    "positive": "내용이 좋았다는 신호예요. 이 비중이 높으면 같은 결의 콘텐츠를 더 밀어도 좋아요.",
+    "engaged": "사람들이 자기 얘기를 하고 있어요 — 여기 나온 궁금증과 사연이 다음 소재예요.",
+    "conflict": (
+        "시청자끼리 다투는 댓글이에요. 노출은 커지지만 브랜드 협업·판매에는 부담이 되니, "
+        "논쟁을 부르는 소재의 비중을 의도적으로 조절해 보세요."
+    ),
+    "funnel": "자료·조건을 묻는 댓글이에요. 자동 DM이나 안내 문구로 바로 이어줄 수 있어요.",
+    "foreign": "해외에서 유입되고 있어요. 자막·번역을 붙이면 이 비중이 더 늘어날 수 있어요.",
+}
 
 
 def render_report_v3(
@@ -368,6 +386,7 @@ def render_report_v3(
         donut_legend=donut_legend,
         fans_wants=fans_wants,
         motivations=motivations,
+        tone_desc=TONE_DESC,
         dm_issue={
             "count": cstats.get("dm_not_received_count", 0),
             "pct": cstats.get("dm_not_received_pct", 0),

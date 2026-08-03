@@ -572,6 +572,9 @@ def build_synth_input(
             "followers": canon["account"].get("followers"),
         },
         "coverage": m["coverage"],
+        # 계정 규모·도달 방식 — 합성 프롬프트가 이걸 보고 조언 방향을 바꾼다
+        # (`synthesize._audience_guidance`). 빼면 다시 "중간 규모용 조언" 하나만 나온다.
+        "audience": m.get("audience") or {},
         "views_stats": m["views_stats"],
         "dist": m["dist"],
         "monthly": m["monthly"],

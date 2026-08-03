@@ -433,6 +433,67 @@ def post_ref(post: dict, rank: int = 1) -> str:
     return f"{rank}위 영상{tail}"
 
 
+def _audience_recs(metrics: dict) -> list[dict]:
+    """계정 성격(규모·도달 방식)에 맞는 폴백 추천 0~1개.
+
+    ⚠️ 이게 없으면 폴백이 **모든 계정에 같은 중간 규모용 조언**을 준다. 대형 계정에
+    "조회수를 늘리세요", 막 시작한 계정에 "올리는 시간을 실험하세요" 는 둘 다 헛말이다.
+    """
+    aud = metrics.get("audience") or {}
+    vs = metrics["views_stats"]
+    followers = aud.get("followers") or 0
+    ratio = aud.get("views_per_follower")
+
+    if aud.get("reach_mode") == "explore_driven" and followers:
+        return [
+            {
+                "title": "본 사람을 팔로워로 남기기",
+                "what_to_do": "영상 마지막에 '이런 내용 더 보려면 팔로우'를 한 문장으로 넣고, "
+                "프로필 첫 화면(소개글·고정 게시물)이 '무슨 계정인지' 3초에 보이게 정리해 보세요.",
+                "why": f"평소 조회수 {man(vs['median'])}이 팔로워 {man(followers)}보다 "
+                f"{ratio}배 많아요 — 팔로워 밖에서 보고 있는데 팔로워로 남지는 않고 있어요.",
+                "evidence_line": f"평소 조회수 {man(vs['median'])} vs 팔로워 {man(followers)} "
+                f"({ratio}배)",
+                "priority": "high",
+                "basis": "data_observation",
+                "evidence_keys": ["views_stats", "audience"],
+                "numbers_used": [],
+            }
+        ]
+    if aud.get("reach_mode") == "follower_driven" and followers:
+        return [
+            {
+                "title": "팔로워 밖으로 퍼지게 하기",
+                "what_to_do": "이미 아는 사람만 이해하는 표현을 줄이고, 처음 보는 사람도 3초에 "
+                "상황을 알 수 있게 첫 문장과 자막을 바꿔 보세요.",
+                "why": f"평소 조회수 {man(vs['median'])}이 팔로워 {man(followers)}의 "
+                f"{ratio}배예요 — 새 시청자에게 퍼지지 않고 있어요.",
+                "evidence_line": f"평소 조회수 {man(vs['median'])} vs 팔로워 {man(followers)} "
+                f"({ratio}배)",
+                "priority": "high",
+                "basis": "data_observation",
+                "evidence_keys": ["views_stats", "audience"],
+                "numbers_used": [],
+            }
+        ]
+    if aud.get("scale") == "starting":
+        return [
+            {
+                "title": "먼저 편수를 쌓기",
+                "what_to_do": "다음 2주 동안 같은 주제로 6편을 올려 보세요. 편집·시간대는 "
+                "바꾸지 말고 주제만 고정합니다.",
+                "why": f"지금은 영상 {metrics['coverage']['reels_with_views']}개라 "
+                "무엇이 통했는지 가려낼 수 없어요. 비교할 수 있는 양이 먼저 필요해요.",
+                "evidence_line": f"분석한 영상 {metrics['coverage']['reels_with_views']}개",
+                "priority": "high",
+                "basis": "experiment_suggestion",
+                "evidence_keys": ["coverage"],
+                "numbers_used": [],
+            }
+        ]
+    return []
+
+
 def fallback_slots_v3(metrics: dict, agg: dict) -> dict:
     """전 슬롯 결정적 폴백 — 숫자만 끼운 안전 문장."""
     vs = metrics["views_stats"]
@@ -442,8 +503,12 @@ def fallback_slots_v3(metrics: dict, agg: dict) -> dict:
         "pcts": {},
         "quote_pool": {},
         "motivations": [],
+        "tones": [],
         "n_analyzed": 0,
         "save_mentions": 0,
+        "unclassified": 0,
+        "unclassified_pct": 0,
+        "classify_unreliable": False,
     }
     top1 = (metrics.get("top_posts") or [{}])[0]
 
@@ -597,7 +662,11 @@ def fallback_slots_v3(metrics: dict, agg: dict) -> dict:
                 "example": "주제에 맞는 단어로",
             },
         ],
-        "recommendations": [
+        # 계정 성격에 맞는 조언을 **맨 앞에** 놓고 일반 조언을 뒤로 밀어낸다.
+        # 폴백도 분기해야 하는 이유: 게이트가 AI 문장을 반려하면 결국 여기가 사용자에게
+        # 보이는 최종 조언이 된다(실측 2건 모두 recommendations 폴백).
+        "recommendations": _audience_recs(metrics)
+        + [
             {
                 "title": "잘됐던 주제 다시 만들기",
                 "what_to_do": "가장 잘된 영상의 주제를 최신 내용으로 다시 만들어 보세요.",
@@ -659,7 +728,7 @@ def fallback_slots_v3(metrics: dict, agg: dict) -> dict:
                 "evidence_keys": [],
                 "numbers_used": [],
             },
-        ],
+        ][: 5 - len(_audience_recs(metrics))],
         "checklist": [
             "첫 문장이 궁금하게 만들거나 필요하게 만드나요?",
             "제목이나 자막에 숫자나 결과가 있나요?",

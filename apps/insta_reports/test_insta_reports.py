@@ -734,7 +734,11 @@ class TestReportWording:
         agg = aggregate.build_aggregates(canon, metrics, extraction, sample)
 
         slots = verify_v3.fallback_slots_v3(metrics, agg)
-        why = slots["recommendations"][0]["why"]
+        # recommendations[0] 은 계정 성격에 따라 달라진다(_audience_recs) → 게시물을 지목하는
+        # 그 추천을 제목으로 찾는다.
+        why = next(
+            r["why"] for r in slots["recommendations"] if r["title"] == "잘됐던 주제 다시 만들기"
+        )
         assert POST_IDENTIFIED.search(why), why
         assert "만를" not in why  # 조사 오류 회귀 방지
         assert "이 영상은" not in why  # 정체 불명 지시어 회귀 방지
@@ -1023,3 +1027,137 @@ class TestCommentsComeFromGraphNotApify:
         monkeypatch.setattr(co.time, "sleep", lambda *_: None)
         co.fetch_comments([{"id": "a", "comments_count": 0}, {"id": "b", "comments_count": 3}], "t")
         assert calls == ["b"]
+
+
+class TestCommentClassificationRobustness:
+    """분류 응답이 잘려도 살릴 수 있는 만큼 살리고, 실패는 '기타' 로 위장하지 않는다.
+
+    2026-08-04 실측 결함: 이 모델은 thinking 토큰이 `maxOutputTokens`(4096) 예산을 공유해
+    thoughts 3,933 + 출력 148 → finishReason=MAX_TOKENS 로 JSON 이 10번째 항목에서 잘렸고,
+    `except: pass` 가 이를 삼켜 **청크 전체가 '기타'** 가 됐다(@jinyongjin92 886개 중 91% 기타).
+    """
+
+    def test_truncated_json_salvages_complete_items(self):
+        from .pipeline.comments import _parse_classifications
+
+        truncated = (
+            '{\n "classifications": [\n'
+            '  {"i": 0, "c": "praise"},\n'
+            '  {"i": 1, "c": "debate"},\n'
+            '  {"i": 2, "c": "hos'  # ← 여기서 잘림
+        )
+        got = _parse_classifications(truncated, 40)
+        assert got == {0: "praise", 1: "debate"}
+
+    def test_unknown_category_is_rejected(self):
+        from .pipeline.comments import _parse_classifications
+
+        payload = '{"classifications": [{"i": 0, "c": "praise"}, {"i": 1, "c": "made_up"}]}'
+        assert _parse_classifications(payload, 5) == {0: "praise"}
+
+    def test_out_of_range_index_is_rejected(self):
+        from .pipeline.comments import _parse_classifications
+
+        payload = '{"classifications": [{"i": 0, "c": "praise"}, {"i": 99, "c": "praise"}]}'
+        assert _parse_classifications(payload, 3) == {0: "praise"}
+
+    def test_thinking_is_disabled_for_classification(self):
+        """thinkingBudget 을 0 으로 두지 않으면 다시 출력이 잘린다 — 설정을 고정한다."""
+        import inspect
+
+        from .pipeline import comments as C
+
+        src = inspect.getsource(C.classify_comments)
+        assert '"thinkingConfig": {"thinkingBudget": 0}' in src
+        assert C.CLASSIFY_MAX_OUTPUT_TOKENS >= 8192
+
+    def test_failures_are_marked_unclassified_not_other(self):
+        """분류 실패는 '기타' 와 구분돼야 리포트가 거짓말하지 않는다."""
+        from .pipeline.comments import CATEGORIES, comment_stats
+
+        pool = [{"id": f"c{i}", "text": "댓글", "likes": 0, "shortcode": "S"} for i in range(10)]
+        classes = {"c0": "praise", "c1": "other"}  # 나머지 8개는 분류 못함
+        st = comment_stats(pool, classes, {"posts": []})
+        assert "unclassified" in CATEGORIES
+        assert st["counts"]["unclassified"] == 8
+        assert st["counts"]["other"] == 1
+        assert st["unclassified_pct"] == 80
+        assert st["classify_unreliable"] is True
+        assert "unclassified" not in st["quote_pool"]
+
+    def test_general_purpose_categories_cover_real_comment_kinds(self):
+        """리드젠 퍼널 전용이 아니어야 한다 — 논쟁·혐오·의견·경험담·외국어 칸이 있어야 한다."""
+        from .pipeline.comments import CATEGORIES, CATEGORY_KO, TONE_MAP
+
+        for cat in ("debate", "hostile", "opinion", "personal_story", "foreign", "curiosity"):
+            assert cat in CATEGORIES, cat
+            assert CATEGORY_KO.get(cat), cat
+        # 모든 카테고리가 어느 분위기 묶음이나 예외 목록에 들어가야 한다(누락 방지)
+        grouped = {c for t in TONE_MAP.values() for c in t["cats"]}
+        assert set(CATEGORIES) - grouped == {"other", "unclassified"}
+
+
+class TestAdviceBranchesByAccountScale:
+    """조언이 계정 규모·도달 방식에 따라 갈려야 한다.
+
+    2026-08-04 운영자 지적: 대형 인플루언서와 막 시작한 사람에게 같은 조언이 나갔다.
+    @jinyongjin92 는 팔로워 25,934 인데 평소 조회수 41.3만(도달 16배) — 이 계정에
+    "조회수를 늘리세요" 는 무의미하고 진짜 문제는 팔로워 전환이다.
+    """
+
+    def _metrics(self, followers, median, reels=13):
+        return {
+            "views_stats": {"median": median, "p75": median * 2, "p90": median * 3},
+            "coverage": {"reels_with_views": reels},
+            "audience": None,  # _audience_profile 로 채운다
+        }
+
+    def _profile(self, followers, median):
+        from .pipeline.metrics import _audience_profile
+
+        m = self._metrics(followers, median)
+        return _audience_profile({"account": {"followers": followers}}, m)
+
+    def test_explore_driven_large_account(self):
+        aud = self._profile(25_934, 413_000)  # 진용진 실측
+        assert aud["scale"] == "large"
+        assert aud["reach_mode"] == "explore_driven"
+        assert aud["views_per_follower"] >= 3
+
+    def test_follower_driven_account(self):
+        aud = self._profile(50_000, 8_000)
+        assert aud["reach_mode"] == "follower_driven"
+        assert aud["scale"] == "growing"
+
+    def test_starting_account(self):
+        aud = self._profile(300, 400)
+        assert aud["scale"] == "starting"
+
+    def test_missing_followers_does_not_crash(self):
+        aud = self._profile(0, 5_000)
+        assert aud["reach_mode"] == "unknown"
+        assert aud["views_per_follower"] is None
+
+    def test_fallback_lead_advice_differs_by_reach_mode(self):
+        from .pipeline.verify_v3 import _audience_recs
+
+        m = self._metrics(25_934, 413_000)
+        m["audience"] = self._profile(25_934, 413_000)
+        explore = _audience_recs(m)
+        assert explore and "팔로워로 남기기" in explore[0]["title"]
+
+        m2 = self._metrics(50_000, 8_000)
+        m2["audience"] = self._profile(50_000, 8_000)
+        loyal = _audience_recs(m2)
+        assert loyal and "퍼지게" in loyal[0]["title"]
+        assert explore[0]["title"] != loyal[0]["title"]
+
+    def test_prompt_guidance_differs_by_scale(self):
+        from .pipeline.synthesize import _audience_guidance
+
+        big = _audience_guidance({"audience": {"scale": "large", "reach_mode": "explore_driven"}})
+        small = _audience_guidance({"audience": {"scale": "starting", "reach_mode": "balanced"}})
+        assert "대형" in big and "팔로워 전환" in big
+        assert "막 시작한" in small
+        assert big != small
+        assert _audience_guidance({}) == ""

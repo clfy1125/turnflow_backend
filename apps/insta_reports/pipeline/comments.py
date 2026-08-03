@@ -12,6 +12,7 @@
 """
 
 import json
+import logging
 import re
 import time
 from collections import Counter
@@ -21,37 +22,94 @@ import requests
 from . import config
 from .costs import CostLedger
 
+logger = logging.getLogger(__name__)
+
 REPEAT_THRESHOLD = 5
-CLASSIFY_CACHE_VERSION = 3  # v3: dm_not_received 정의 정밀화(상품 고객지원 문의 분리)
+# v4: 분류 체계를 리드젠 퍼널 전용 → **범용**으로 재설계(카테고리가 바뀌어 구 캐시 무효).
+CLASSIFY_CACHE_VERSION = 4
 # 팔로워 인사이트를 만들기에 댓글이 이만큼 미만이면 "표본 부족" 경고를 리포트에 노출
 MIN_COMMENTS_FOR_INSIGHT = 60
+# 분류 실패가 이 비율을 넘으면 리포트에 "분류 신뢰도 낮음"을 노출한다(조용히 기타로 넘기지 않는다).
+MAX_UNCLASSIFIED_PCT = 20
+
+# ⚠️ **범용 분류 (2026-08-04 재설계).** 이전 8종은 `request`("코드 주세요")·`dm_not_received`
+#    ("DM 안 왔어요") 중심의 **리드젠 퍼널 계정 전용**이었다. 그래서 일반 크리에이터 계정은
+#    댓글 대부분이 정직하게 `other` 로 떨어졌다(@jinyongjin92 실측 91%). 실제 댓글을 표본
+#    조사해 보니 논쟁·혐오·의견·경험담·외국어가 다수인데 담을 칸이 아예 없었다.
 CATEGORIES = [
-    "request",
-    "dm_not_received",
-    "question",
-    "praise",
-    "empathy",
-    "support",
-    "testimonial",
+    # ── 콘텐츠 반응 (계정 종류와 무관하게 가장 흔함)
+    "reaction",  # 짧은 감탄·웃음·이모지 ("ㅋㅋㅋ", "미쳤다", "쫀득")
+    "praise",  # 콘텐츠 내용을 칭찬
+    "empathy",  # 공감·동의
+    "support",  # 크리에이터 응원·팬심
+    # ── 대화·참여 (다음 소재와 커뮤니티 건강도의 근거)
+    "curiosity",  # 영상 내용에 대한 추가 궁금증 ("저기 어디예요?", "다음편 언제")
+    "opinion",  # 자기 주장·정보 보충·훈수 (상대를 공격하지 않음)
+    "debate",  # 다른 시청자와의 반박·언쟁 (보통 @멘션 대댓)
+    "hostile",  # 욕설·혐오·비방·조롱
+    "personal_story",  # 자기 경험·사연 공유
+    # ── 전환 신호 (퍼널 계정에서 중요 — 유지)
+    "request",  # 자료·링크·혜택 요청
+    "question",  # 조건·방법·가능 여부 질문 (실행/구매 결정형)
+    "testimonial",  # 직접 해본 후기
+    "dm_not_received",  # 약속한 자동 DM 미수신 문의
+    # ── 기타
+    "foreign",  # 한국어가 아닌 댓글 (해외 유입 신호)
     "other",
+    "unclassified",  # 분류 호출 실패 — **기타와 구분한다**(리포트가 거짓말하지 않게)
 ]
 CATEGORY_KO = {
-    "request": "자료 요청",
-    "dm_not_received": "DM 못 받았다는 문의",
-    "question": "질문",
+    "reaction": "짧은 반응",
     "praise": "감탄·칭찬",
     "empathy": "공감",
     "support": "응원·팬심",
-    "testimonial": "후기·경험담",
+    "curiosity": "더 알고 싶다는 궁금증",
+    "opinion": "자기 의견·정보 보충",
+    "debate": "시청자끼리의 논쟁",
+    "hostile": "욕설·비방",
+    "personal_story": "자기 경험담",
+    "request": "자료 요청",
+    "question": "조건·방법 질문",
+    "testimonial": "직접 해본 후기",
+    "dm_not_received": "DM 못 받았다는 문의",
+    "foreign": "외국어 댓글",
     "other": "기타",
+    "unclassified": "분류 못함",
 }
+
+# 댓글 분위기 묶음 — "이 계정 댓글창이 어떤 곳인가"를 한 줄로 말해 주는 상위 축.
+# 카테고리 하나하나의 %보다 이 묶음이 실제 피드백이 된다(논쟁 41% 같은 신호).
+TONE_MAP = {
+    "positive": {
+        "label": "호응·공감",
+        "cats": ["reaction", "praise", "empathy", "support", "testimonial"],
+    },
+    "engaged": {
+        "label": "대화·참여",
+        "cats": ["curiosity", "opinion", "personal_story"],
+    },
+    "conflict": {"label": "논쟁·비방", "cats": ["debate", "hostile"]},
+    "funnel": {"label": "전환 신호", "cats": ["request", "question", "dm_not_received"]},
+    "foreign": {"label": "외국어", "cats": ["foreign"]},
+}
+
 # 팔로워 동기 매핑 (코드 고정 — pct 는 코드 계산)
 # dm_not_received 는 팔로워 '동기'가 아니라 발송 사고 신호이므로 어느 동기에도 넣지 않는다.
 MOTIVATION_MAP = {
     "practical": {"label": "실용 — 따라해서 결과를 얻고 싶다", "cats": ["request", "testimonial"]},
-    "question": {"label": "확신 — 나도 할 수 있는지 확인하고 싶다", "cats": ["question"]},
-    "wow": {"label": "감탄 — 내용·결과물이 신기하다", "cats": ["praise", "empathy"]},
+    "question": {
+        "label": "확신 — 나도 할 수 있는지 확인하고 싶다",
+        "cats": ["question", "curiosity"],
+    },
+    "wow": {
+        "label": "감탄 — 내용·결과물이 신기하다",
+        "cats": ["praise", "empathy", "reaction"],
+    },
     "fan": {"label": "응원 — 크리에이터 자체를 좋아한다", "cats": ["support"]},
+    "voice": {
+        "label": "발언 — 내 생각·경험을 말하고 싶다",
+        "cats": ["opinion", "personal_story", "debate"],
+    },
 }
 
 EMOJI_RE = re.compile(r"[\U0001F000-\U0001FAFF☀-➿️‍]+")
@@ -137,37 +195,79 @@ CLASSIFY_SCHEMA = {
 }
 
 CLASSIFY_PROMPT = """인스타그램 게시물에 달린 팔로워 댓글들을 분류하세요. 각 댓글의 번호(i)와 분류(c)만 출력합니다.
+**모든 번호를 빠짐없이** 출력하세요.
 
-[분류 기준 — 댓글의 '주된' 성격 1개]
+[분류 기준 — 댓글의 '주된' 성격 1개. 애매하면 더 구체적인 쪽을 고르고, other 는 최후에만]
+- reaction: 짧은 감탄·웃음·이모지만 ("ㅋㅋㅋㅋ", "미쳤다", "와", "쫀득❤️", "소름")
+  → 내용 언급 없이 반응만 있으면 이것. 칭찬 대상이 분명하면 praise.
+- praise: 콘텐츠 내용을 칭찬 ("이 영상 진짜 유익해요", "편집 미쳤네요", "꿀팁이네요")
+- empathy: 공감·동의 ("저도 그랬어요", "완전 공감", "이거 맞아요", "인정합니다")
+- support: 크리에이터 자체를 응원·팬심 ("항상 잘 보고 있어요", "팬이에요", "감사해요")
+- curiosity: 영상 내용을 더 알고 싶다는 궁금증·요청 ("저기 어디예요?", "다음편 언제 나와요?",
+  "그 사람 누구예요?", "2편 해주세요") → **다음 콘텐츠 소재 신호**
+- opinion: 자기 주장·정보 보충·훈수. 특정 시청자를 공격하지 않음
+  ("국제재판 하면 분쟁지역 인정이 됩니다", "무임승차 없애고 월 60회로 하자", "일반화는 위험해요")
+- debate: **다른 시청자와 다투는 댓글** — 반박·언쟁·조롱. 보통 @멘션으로 시작
+  ("@abc 뭐라는거야 애초에", "@abc 진짜 긁혔네ㅋㅋ", "댓글 단 사람들 정신착란인가")
+- hostile: 욕설·혐오·비방 (성별·지역·국적·외모 비하, 인신공격, 협박)
+  → 대상이 시청자든 크리에이터든 제3자든 **표현이 공격적이면** 이것(debate 보다 우선).
+- personal_story: 자기 경험·사연을 나눔 ("저희 아버지도 갈곳이 없어 지하철 타세요",
+  "일본에서 고등학교 나왔는데 진짜 그렇게 가르쳐요")
 - request: 자료·링크·혜택을 처음 요청 ("코드 주세요", "저도 보내주세요", "자료 받고 싶어요")
+- question: 조건·방법·가능 여부 질문 — **실행/구매 결정과 연결** ("무료인가요?",
+  "맥에서도 되나요?", "초보도 되나요?") → 영상 내용에 대한 단순 궁금증은 curiosity.
+- testimonial: 직접 해본 후기·결과 ("따라해봤는데 됐어요", "저 이걸로 효과 봤어요")
 - dm_not_received: **댓글 이벤트로 약속한 자동 DM·자료가 오지 않았다는 문의**
-  ("DM 안 왔어요", "메시지가 안 오는데요", "댓글 남겼는데 아직 못 받았어요",
-   "다시 보내주세요", "저는 왜 안 오나요", "두 번 남겼어요")
-  → 이 계정은 댓글 키워드로 자동 DM을 보내는데, 발송이 실패하면 이런 댓글이 달립니다.
-  ⚠️ **아래는 이 분류가 아닙니다**:
+  ("DM 안 왔어요", "메시지가 안 오는데요", "댓글 남겼는데 아직 못 받았어요", "저는 왜 안 오나요")
+  ⚠️ 아래는 이 분류가 **아닙니다**:
     · 유료 상품(전자책·강의·멤버십) 구매 후 생긴 문제 → question
-      (예: "전자책 구매했는데 노션 페이지가 없어졌어요", "결제했는데 강의가 안 열려요")
-    · 단순히 자료를 처음 요청하는 것 → request
-    이 분류는 **'댓글 남기면 보내드립니다'에 응답했는데 DM이 안 온 경우'만** 해당합니다.
-- question: 방법·조건·가능 여부 질문 ("무료인가요?", "맥에서도 되나요?", "초보도 되나요?")
-- praise: 감탄·칭찬 ("와 대박", "미쳤다", "꿀팁이네요")
-- empathy: 공감·동의 ("저도 그랬어요", "완전 공감", "이거 맞아요")
-- support: 크리에이터 응원·팬심 ("영상 잘 보고 있어요", "항상 감사해요", "팬이에요")
-- testimonial: 직접 해본 후기·경험 ("따라해봤는데 됐어요", "저 이걸로 효과 봤어요")
-- other: 위 어디에도 안 맞음
+    · 단순히 자료를 처음 요청 → request
+- foreign: 한국어가 아닌 댓글 (일본어·중국어·영어 등). 내용 성격과 무관하게 언어로 판단.
+- other: 위 어디에도 안 맞음 (광고 문구, 무의미한 문자열, 판단 불가)
 
 댓글 목록:
 """
 
 
+CHUNK_SIZE = 40
+# 이 모델은 thinking 토큰을 쓰고 **그게 maxOutputTokens 예산을 공유한다**.
+# 4096 이던 시절 실측: thoughts 3,933 + 출력 148 → finishReason=MAX_TOKENS 로 JSON 이 10번째
+# 항목에서 잘렸고, 파싱 실패를 조용히 삼켜 **청크 40~50개가 통째로 '기타'** 가 됐다
+# (@jinyongjin92 886개 중 808개=91% 기타). 분류는 추론이 필요 없는 작업이라 thinking 을 끈다.
+CLASSIFY_MAX_OUTPUT_TOKENS = 8192
+# 잘린 JSON 에서라도 살려내기 위한 항목 패턴 (부분 복구).
+ITEM_RE = re.compile(r'\{\s*"i"\s*:\s*(\d+)\s*,\s*"c"\s*:\s*"([a-z_]+)"\s*\}')
+
+
+def _parse_classifications(text: str, n: int) -> dict[int, str]:
+    """응답 텍스트 → {index: category}. 잘린 JSON 도 **완전한 항목까지는 살린다**."""
+    valid = set(CATEGORIES)
+    out: dict[int, str] = {}
+    try:
+        for item in (json.loads(text) or {}).get("classifications", []):
+            i, c = item.get("i"), item.get("c")
+            if isinstance(i, int) and 0 <= i < n and c in valid:
+                out[i] = c
+        return out
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        pass
+    # 파싱 실패(대개 MAX_TOKENS 로 잘림) → 정규식으로 완전한 항목만 회수
+    for m in ITEM_RE.finditer(text or ""):
+        i, c = int(m.group(1)), m.group(2)
+        if 0 <= i < n and c in valid:
+            out[i] = c
+    return out
+
+
 def classify_comments(pool: list, ledger: CostLedger, username: str) -> dict:
-    """{comment_id: category}. 계정 단위 캐시."""
+    """{comment_id: category}. 계정 단위 캐시. 실패분은 ``unclassified`` 로 **명시**한다."""
     cache_p = config.FEATURE_DIR / f"comments_{username}@v{CLASSIFY_CACHE_VERSION}.json"
     cache = json.loads(cache_p.read_text(encoding="utf-8")) if cache_p.exists() else {}
     todo = [c for c in pool if c["id"] not in cache]
 
-    for chunk_start in range(0, len(todo), 50):
-        chunk = todo[chunk_start : chunk_start + 50]
+    chunks_failed = 0
+    for chunk_start in range(0, len(todo), CHUNK_SIZE):
+        chunk = todo[chunk_start : chunk_start + CHUNK_SIZE]
         listing = "\n".join(f"{i}. {c['text'][:150]}" for i, c in enumerate(chunk))
         body = {
             "contents": [{"role": "user", "parts": [{"text": CLASSIFY_PROMPT + listing}]}],
@@ -175,10 +275,13 @@ def classify_comments(pool: list, ledger: CostLedger, username: str) -> dict:
                 "temperature": 0,
                 "responseMimeType": "application/json",
                 "responseSchema": CLASSIFY_SCHEMA,
-                "maxOutputTokens": 4096,
+                "maxOutputTokens": CLASSIFY_MAX_OUTPUT_TOKENS,
+                # ⚠️ 되돌리지 말 것 — thinking 이 출력 예산을 먹어 응답이 잘린다(위 주석).
+                "thinkingConfig": {"thinkingBudget": 0},
             },
         }
         backoff = 2
+        got: dict[int, str] = {}
         for _ in range(5):
             r = requests.post(
                 f"{config.GEMINI_BASE}/models/{config.EXTRACT_MODEL}:generateContent",
@@ -201,38 +304,63 @@ def classify_comments(pool: list, ledger: CostLedger, username: str) -> dict:
                 config.EXTRACT_MODEL,
                 u.get("promptTokenCount", 0),
                 u.get("candidatesTokenCount", 0) + u.get("thoughtsTokenCount", 0),
-                note=f"chunk {chunk_start//50}",
+                note=f"chunk {chunk_start // CHUNK_SIZE}",
             )
-            try:
-                out = json.loads(d["candidates"][0]["content"]["parts"][0]["text"])
-                for item in out.get("classifications", []):
-                    i = item["i"]
-                    if 0 <= i < len(chunk):
-                        cache[chunk[i]["id"]] = item["c"]
-            except (json.JSONDecodeError, KeyError):
-                pass  # 이 청크는 미분류로 남김(other 처리)
+            cand = (d.get("candidates") or [{}])[0]
+            parts = (cand.get("content") or {}).get("parts") or []
+            text = parts[0].get("text", "") if parts else ""
+            got = _parse_classifications(text, len(chunk))
+            if len(got) < len(chunk):
+                # 조용히 넘기지 않는다 — 이 결함이 91% 기타로 몇 달을 갔다.
+                chunks_failed += 1
+                logger.warning(
+                    "insta_report: 댓글 분류 부분 실패 %s/%s (finish=%s, thoughts=%s, out=%s)",
+                    len(got),
+                    len(chunk),
+                    cand.get("finishReason"),
+                    u.get("thoughtsTokenCount"),
+                    u.get("candidatesTokenCount"),
+                )
             break
+        for i, c in enumerate(chunk):
+            cache[c["id"]] = got.get(i, "unclassified")
 
     config.FEATURE_DIR.mkdir(parents=True, exist_ok=True)
     cache_p.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
-    return {c["id"]: cache.get(c["id"], "other") for c in pool}
+    if chunks_failed:
+        logger.warning("insta_report: 댓글 분류 청크 %s개에서 누락 발생", chunks_failed)
+    return {c["id"]: cache.get(c["id"], "unclassified") for c in pool}
 
 
 def comment_stats(pool: list, classes: dict, canon: dict) -> dict:
     """도넛/동기/인용풀/기회 후보 — 전부 코드 계산."""
     by_cat: dict[str, list] = {c: [] for c in CATEGORIES}
     for c in pool:
-        by_cat[classes.get(c["id"], "other")].append(c)
+        cat = classes.get(c["id"], "unclassified")
+        by_cat.setdefault(cat, []).append(c)
     n = max(1, len(pool))
     counts = {k: len(v) for k, v in by_cat.items()}
     pcts = {k: round(v / n * 100) for k, v in counts.items()}
 
     motivations = []
     for key, m in MOTIVATION_MAP.items():
-        cnt = sum(counts[c] for c in m["cats"])
+        cnt = sum(counts.get(c, 0) for c in m["cats"])
         motivations.append(
             {"key": key, "label": m["label"], "pct": round(cnt / n * 100), "count": cnt}
         )
+
+    # 댓글창 분위기 — 카테고리 하나하나보다 이 묶음이 실제 피드백이 된다.
+    tones = []
+    for key, t in TONE_MAP.items():
+        cnt = sum(counts.get(c, 0) for c in t["cats"])
+        if cnt:
+            tones.append(
+                {"key": key, "label": t["label"], "count": cnt, "pct": round(cnt / n * 100)}
+            )
+    tones.sort(key=lambda x: -x["count"])
+
+    unclassified = counts.get("unclassified", 0)
+    unclassified_pct = round(unclassified / n * 100)
 
     def top_quotes(cat, k=6):
         # 인용은 길이가 있는 것 우선(짧은 "저요" 류보다 맥락이 보이는 댓글)
@@ -249,9 +377,17 @@ def comment_stats(pool: list, classes: dict, canon: dict) -> dict:
         "min_for_insight": MIN_COMMENTS_FOR_INSIGHT,
         "category_ko": CATEGORY_KO,
         "motivations": motivations,
+        "tones": tones,
+        # 분류 실패는 '기타' 와 구분해 드러낸다 — 예전에는 실패가 기타로 섞여 리포트가
+        # "기타 91%" 라고 거짓말했다.
+        "unclassified": unclassified,
+        "unclassified_pct": unclassified_pct,
+        "classify_unreliable": unclassified_pct > MAX_UNCLASSIFIED_PCT,
         # DM 미수신 문의는 팔로워 니즈가 아니라 발송 사고 신호 → 인용 풀에서 제외
         "quote_pool": {
-            cat: top_quotes(cat) for cat in CATEGORIES if by_cat[cat] and cat != "dm_not_received"
+            cat: top_quotes(cat)
+            for cat in CATEGORIES
+            if by_cat.get(cat) and cat not in ("dm_not_received", "unclassified")
         },
         "dm_not_received_quotes": top_quotes("dm_not_received", 3),
         "dm_not_received_count": dm_issue,
