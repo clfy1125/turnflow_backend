@@ -155,6 +155,15 @@ class AdminCampaignListSerializer(serializers.ModelSerializer):
     last_sent_at = serializers.SerializerMethodField(
         help_text="이 캠페인의 마지막 DM 로그 생성 시각 (로그 0건이면 null)."
     )
+    media_permalink = serializers.SerializerMethodField(
+        help_text=(
+            "인스타그램 게시물 영구 링크 — `trigger_type=specific_media` 캠페인의 '게시물 보기' "
+            "버튼용. media_url 이 instagram.com permalink 면 그 값, 아니면 빈 문자열. "
+            "빈 값일 수 있는 경우: any_media/next_media(미부착) 캠페인, 게시물이 삭제된 캠페인, "
+            "IG 연동이 끊긴 캠페인. **빈 문자열이면 링크를 숨기고 media_id 만 표시할 것.** "
+            "상세(GET /admin/auto-dm/campaigns/{id}/)의 같은 이름 필드와 정의가 동일하다."
+        )
+    )
 
     class Meta:
         model = AutoDMCampaign
@@ -165,6 +174,8 @@ class AdminCampaignListSerializer(serializers.ModelSerializer):
             "owner",
             "status",
             "trigger_type",
+            "media_id",
+            "media_permalink",
             "people",
             "delivered_count",
             "delivery_rate",
@@ -199,6 +210,11 @@ class AdminCampaignListSerializer(serializers.ModelSerializer):
     @extend_schema_field(serializers.DateTimeField(allow_null=True))
     def get_last_sent_at(self, obj: AutoDMCampaign):
         return self._enrichment(obj)["last_sent_at"]
+
+    def get_media_permalink(self, obj: AutoDMCampaign) -> str:
+        # 상세 시리얼라이저와 동일 판정 (media_url 은 CDN 이미지 URL 일 수 있어 host 로 가른다).
+        url = obj.media_url or ""
+        return url if is_instagram_permalink(url) else ""
 
 
 class AdminCampaignDetailSerializer(serializers.ModelSerializer):
@@ -252,6 +268,10 @@ class AdminCampaignDetailSerializer(serializers.ModelSerializer):
             "keyword_mode",
             "message_template",
             "opening_message_template",
+            # C-1: 회원이 유저 콘솔에서 설정한 값은 **전부** 보여야 문의 대응이 된다.
+            # opening_message_template 만 보면 실제 발송 문구를 알 수 없다(회전 변형이 있으면
+            # 그중 하나가 나간다).
+            "opening_message_templates",
             "public_reply_enabled",
             "public_reply_template",
             "public_reply_templates",
@@ -262,6 +282,7 @@ class AdminCampaignDetailSerializer(serializers.ModelSerializer):
             "follow_gate_enabled",
             "gate_verify_follow",
             "follow_gate_prompt",
+            "follow_gate_prompt_templates",  # C-1: 게이트 오프닝 회전 변형
             "follow_gate_button_label",
             "follow_gate_retry_message",
             "reward_message_template",
@@ -269,6 +290,13 @@ class AdminCampaignDetailSerializer(serializers.ModelSerializer):
             "link_button_url",
             "link_button_label",
             "link_buttons",
+            # C-1: 실패 DM 복구(프로 전용) 설정 3종 — "복구가 왜 안 도나" 문의의 확인 대상
+            "recovery_reply_enabled",
+            "recovery_reply_templates",
+            "recovery_ttl_seconds",
+            # C-1: 예약 발송 — "active 인데 발송이 없다" 문의의 1차 확인 대상
+            "scheduled_start_at",
+            "scheduled_end_at",
             "total_sent",
             "total_failed",
             "total_unconfirmed",

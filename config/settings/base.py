@@ -582,6 +582,14 @@ CELERY_BEAT_SCHEDULE = {
         "task": "integrations.purge_dm_migration_raw",
         "schedule": crontab(hour=5, minute=0),  # CELERY_TIMEZONE=Asia/Seoul 기준
     },
+    # 6시간마다 — media_url 이 빈 specific_media 캠페인의 게시물 permalink 백필 안전망.
+    # 어드민 캠페인 목록/상세의 '게시물 보기' 링크 소스. 생성 경로마다 훅이 걸려 있지만
+    # 새 경로 누락·생성 시점 IG API 일시실패를 이 스위퍼가 메꾼다.
+    # 실제 구동은 core.ScheduledJob(0012 시드). CELERY_BEAT_SCHEDULE 은 dev 패리티/문서용.
+    "dm-sweep-media-permalinks": {
+        "task": "integrations.sweep_missing_media_permalinks",
+        "schedule": 60 * 60 * 6,  # 6시간
+    },
     # ===== Instagram Insights 동기화 (임시 비활성) =====
     # insights 기능 출시 보류 — Meta IG insights API 호출이 발생하지 않도록 4개 beat 모두 주석 처리.
     # 활성화 시점에 아래 4개를 복원 + INSIGHTS_API_ENABLED=True 로 전환.

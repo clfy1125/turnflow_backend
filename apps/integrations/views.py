@@ -75,7 +75,7 @@ from .serializers import (
     SpamFilterConfigUpdateSerializer,
     WebhookResubscribeResponseSerializer,
 )
-from .services import InstagramOAuthService, MockInstagramProvider
+from .services import InstagramOAuthService, MockInstagramProvider, is_instagram_permalink
 
 logger = logging.getLogger(__name__)
 
@@ -3417,10 +3417,9 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
 
         # specific_media: media_url 이 참고용 자유입력이라 permalink 가 아닐 수 있음 →
         # 어드민/표시용 게시물 링크(IG permalink)를 비동기 백필 (best-effort, 요청 경로 비차단).
-        if campaign.trigger_type == AutoDMCampaign.TriggerType.SPECIFIC_MEDIA and campaign.media_id:
-            from .tasks import backfill_campaign_media_permalink
+        from .tasks import enqueue_media_permalink_backfill
 
-            backfill_campaign_media_permalink.delay(str(campaign.id))
+        enqueue_media_permalink_backfill(campaign)
 
         response_serializer = AutoDMCampaignSerializer(campaign)
         return Response(response_serializer.data, status=status.HTTP_201_CREATED)
@@ -3458,7 +3457,9 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(campaign, data=request.data, partial=False)
         serializer.is_valid(raise_exception=True)
         self._guard_update_active_conflict(campaign, serializer.validated_data)
+        before = (campaign.media_id, campaign.trigger_type)
         serializer.save()
+        self._backfill_permalink_if_media_changed(campaign, before)
         return Response(serializer.data)
 
     @extend_schema(
@@ -3496,8 +3497,28 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(campaign, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         self._guard_update_active_conflict(campaign, serializer.validated_data)
+        before = (campaign.media_id, campaign.trigger_type)
         serializer.save()
+        self._backfill_permalink_if_media_changed(campaign, before)
         return Response(serializer.data)
+
+    def _backfill_permalink_if_media_changed(self, campaign, before) -> None:
+        """수정으로 게시물이 바뀌었으면 permalink 를 다시 백필한다 (best-effort).
+
+        (media_id, trigger_type) 이 그대로면 아무것도 하지 않는다 — 일시정지/문구 수정 같은
+        흔한 PATCH 마다 IG 조회를 태우지 않기 위함. 바뀌었으면 이전 게시물의 permalink 가
+        남아 잘못된 링크를 가리키므로 비운 뒤 다시 채운다.
+        """
+        from .tasks import enqueue_media_permalink_backfill
+
+        campaign.refresh_from_db()
+        if (campaign.media_id, campaign.trigger_type) == before:
+            return
+        if campaign.media_id and is_instagram_permalink(campaign.media_url):
+            # 옛 게시물 링크가 남아 있으면 백필 태스크가 'already permalink' 로 건너뛴다 → 비운다.
+            campaign.media_url = ""
+            campaign.save(update_fields=["media_url", "updated_at"])
+        enqueue_media_permalink_backfill(campaign)
 
     def _guard_update_active_conflict(self, campaign, validated_data):
         """수정(PUT/PATCH) 결과가 ACTIVE 일 때만 중복 검사.
@@ -3861,6 +3882,11 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         in_ser = AutoDMCampaignCopySerializer(data=request.data)
         in_ser.is_valid(raise_exception=True)
         new_campaign = source.copy(new_name=in_ser.validated_data.get("name") or None)
+        # 복사본은 media_id 를 그대로 물려받지만 media_url 은 원본이 비어 있으면 같이 빈다 →
+        # 어드민 게시물 링크용 permalink 를 여기서도 백필한다.
+        from .tasks import enqueue_media_permalink_backfill
+
+        enqueue_media_permalink_backfill(new_campaign)
         return Response(
             AutoDMCampaignSerializer(new_campaign).data,
             status=status.HTTP_201_CREATED,

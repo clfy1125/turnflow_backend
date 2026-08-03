@@ -1018,6 +1018,13 @@ class AutoDMCampaign(models.Model):
             winner.trigger_type = cls.TriggerType.SPECIFIC_MEDIA
             winner.save(update_fields=fields)
 
+            # next_media → specific_media 전환도 '게시물이 정해진' 순간이다 → 어드민 게시물
+            # 링크용 permalink 백필. media_url 로 넘어온 값은 CDN 이미지 URL 일 수 있어
+            # permalink 를 따로 확보해야 한다 (on_commit — 이 atomic 블록 커밋 후 발행).
+            from .tasks import enqueue_media_permalink_backfill
+
+            enqueue_media_permalink_backfill(winner)
+
             paused_ids = []
             for loser in losers:
                 loser.status = cls.Status.PAUSED

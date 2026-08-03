@@ -13,12 +13,7 @@ from datetime import timedelta
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
 from django.utils import timezone
-from drf_spectacular.utils import (
-    OpenApiExample,
-    OpenApiParameter,
-    OpenApiResponse,
-    extend_schema,
-)
+from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import APIException, NotFound, PermissionDenied
@@ -546,6 +541,10 @@ class DMCampaignCandidateViewSet(_WorkspaceScopedViewSet):
                     "updated_at",
                 ]
             )
+            # 어드민 게시물 링크용 permalink 백필 (on_commit — 이 atomic 블록 커밋 후 발행).
+            from .tasks import enqueue_media_permalink_backfill
+
+            enqueue_media_permalink_backfill(campaign)
 
         return Response(
             {

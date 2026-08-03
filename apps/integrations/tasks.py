@@ -2426,6 +2426,69 @@ def backfill_campaign_media_permalink(campaign_id: str) -> dict:
     return {"status": "ok", "permalink": permalink}
 
 
+def enqueue_media_permalink_backfill(campaign) -> bool:
+    """specific_media 캠페인의 permalink 백필을 커밋 후에 예약 (best-effort).
+
+    캠페인이 만들어지는/게시물이 바뀌는 **모든** 경로가 이 함수를 불러야 한다 — 직접 생성만
+    훅이 걸려 있어서 복사(copy)·DM 이전 apply·next_media attach·media_id 수정으로 생긴
+    캠페인은 어드민에 게시물 링크가 안 떴다(2026-08-03 실측: specific_media 63건 중 41건 빈값).
+
+    ``on_commit`` 인 이유: attach 는 ``transaction.atomic()`` 안에서 일어나므로 즉시 발행하면
+    워커가 커밋 전 행(옛 media_id 또는 아예 없는 행)을 읽는다. 실패는 삼킨다 —
+    표시용 보강이라 캠페인 생성 자체를 되돌릴 이유가 없고, 주기 스위퍼가 나중에 다시 채운다.
+    """
+    from django.db import transaction
+
+    if campaign is None:
+        return False
+    if campaign.trigger_type != AutoDMCampaign.TriggerType.SPECIFIC_MEDIA:
+        return False
+    if not campaign.media_id:
+        return False
+    try:
+        cid = str(campaign.id)
+        transaction.on_commit(lambda: backfill_campaign_media_permalink.delay(cid))
+        return True
+    except Exception:  # noqa: BLE001
+        logger.exception("enqueue_media_permalink_backfill 실패 cid=%s", campaign.id)
+        return False
+
+
+@shared_task(name="integrations.sweep_missing_media_permalinks")
+def sweep_missing_media_permalinks(limit: int = 100) -> dict:
+    """media_url 이 비어 있는 specific_media 캠페인의 permalink 를 주기적으로 채운다.
+
+    enqueue 훅을 전 경로에 배선했어도 새 경로가 생기면 또 빠질 수 있고, 생성 시점에 IG API 가
+    일시적으로 실패한 건도 스스로 낫지 않는다. 이 스위퍼가 최종 안전망이다.
+
+    - 대상은 **빈값만**. 사용자가 넣은 참고 URL(permalink 아님)은 건드리지 않는다 —
+      덮어쓰면 사용자 입력이 소실된다.
+    - 게시물이 삭제된 캠페인은 매번 no_permalink 로 실패한다 → ``created_at`` 최신순으로
+      limit 만큼만 훑어 오래된 영구실패 건이 슬롯을 독점하지 않게 한다.
+    """
+    from django.db.models import Q
+
+    ids = list(
+        AutoDMCampaign.objects.filter(trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA)
+        .filter(Q(media_url="") | Q(media_url__isnull=True))
+        .exclude(media_id="")
+        .order_by("-created_at")
+        .values_list("id", flat=True)[:limit]
+    )
+    stats: dict = {}
+    for cid in ids:
+        try:
+            res = backfill_campaign_media_permalink(str(cid))
+        except Exception:  # noqa: BLE001 - 건별 실패가 스위프를 멈추지 않게
+            logger.exception("sweep_missing_media_permalinks: 실패 cid=%s", cid)
+            res = {"status": "error"}
+        key = res.get("status", "unknown")
+        stats[key] = stats.get(key, 0) + 1
+    if ids:
+        logger.info("sweep_missing_media_permalinks: scanned=%s %s", len(ids), stats)
+    return {"scanned": len(ids), **stats}
+
+
 @shared_task
 def poll_new_media_for_next_campaigns():
     """
