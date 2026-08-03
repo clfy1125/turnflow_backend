@@ -358,6 +358,37 @@ class UserSubscription(models.Model):
         verbose_name="프로 트라이얼 사용 시각",
         help_text="카드등록 무료 1개월은 1인 1회 — 다운그레이드돼도 지우지 않음(어뷰징 방어)",
     )
+    # T-1: 아래 두 필드는 **내구 기록**이다 — trial_used_at 과 같이 다운그레이드
+    # (_downgrade_to_free)에서도 지우지 않는다. 지우면 "체험을 어느 플랜으로 시작했고
+    # 체험 중에 취소했는가"를 나중에 복원할 방법이 없다(cancelled_at 은 만료 다운그레이드가
+    # 덮어쓰고, current_period_end 는 다운그레이드가 지운다).
+    trial_plan = models.ForeignKey(
+        "billing.SubscriptionPlan",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        verbose_name="체험 대상 플랜",
+        help_text=(
+            "체험을 시작한 플랜 (카드등록 체험·쿠폰 체험 공통). plan 은 만료 시 free 로 "
+            "바뀌므로 '무슨 플랜 체험이었나'의 내구 기록이 따로 필요하다."
+        ),
+    )
+    cancelled_during_trial_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="체험 중 취소 시각",
+        help_text=(
+            "체험(TRIALING) 상태에서 구독 취소가 일어난 시각 (T-1). "
+            "⚠️ cancelled_at 과 다르다 — cancelled_at 은 ①사용자 취소 ②만료 다운그레이드 "
+            "③카드 삭제 강제해지가 **모두 덮어쓰는** 필드라 '체험 중 취소'를 사후에 "
+            "가려낼 수 없다. 이 필드는 취소 시점에 status==TRIALING 이었을 때만 기록된다. "
+            "포함 범위: 사용자의 취소 + 카드 삭제로 인한 강제 해지(결과가 같다). "
+            "재체험해도 지우지 않는다(지우면 지나간 기간의 집계가 나중에 줄어든다) — "
+            "다만 한 행에 1건만 담기므로 두 번 취소하면 최신 것이 앞의 것을 덮는다."
+        ),
+    )
 
     # ── Dunning (갱신 실패 재시도) ──
     renewal_attempts = models.PositiveSmallIntegerField(

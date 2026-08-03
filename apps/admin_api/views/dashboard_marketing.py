@@ -207,6 +207,13 @@ TRIALS_ENDED_CONVERSION_FORMULA = (
     "실제 결제(Toss PAID)로 이어진 비율 · 체험 길이가 가변이라 시작이 아닌 "
     "종료 시점 기준으로 집계 · 전환 판정은 조회 시점"
 )
+# T-1: '체험 중 취소'는 종료 후 미결제(ended - ended_converted)와 다르다 — 그냥 만료된
+# 회원과 카드 승인 실패 회원이 섞이지 않도록 취소 시점 상태로만 판정한다.
+TRIALS_CANCEL_FORMULA = (
+    "이 기간에 무료체험을 쓰던 중 구독을 취소한 회원 수 ÷ 이 기간 체험을 시작한 회원 수 × 100\n"
+    "같은 회원은 한 번만 계산하며, 취소 시점에 체험 중이었던 경우만 포함합니다. "
+    "체험이 그냥 끝난 경우와 결제가 실패한 경우는 포함하지 않습니다."
+)
 
 # period → 일수. "all"(R-1) = 서비스 오픈부터 now 까지라 고정 일수가 없어 None,
 # 이 경우에만 previous 구간을 만들지 않는다(prev=None → delta 전부 null).
@@ -2061,6 +2068,73 @@ def _upsell_candidates(now) -> list[dict]:
 # ── 기능별 통계 ──────────────────────────────────────────────────────
 
 
+# T-2: '체험 중 취소'가 정확해지는 경계 = 이 마이그레이션이 **그 환경에** 적용된 시각.
+# 상수로 박지 않는 이유: dev/prod 적용 시각이 다르고, 상수는 재배포 없이 못 고친다.
+_TRIAL_CANCEL_MIGRATION = ("billing", "0024_subscription_trial_history")
+
+
+def _cancel_accurate_since():
+    """``cancelled_during_trial_at`` 기록이 시작된 시각 (없으면 None).
+
+    이 시각 **이후**의 취소만 정확하다. 이전 것은 cancelled_at 이 만료 다운그레이드로
+    덮여 복원이 불가능하고, 마이그레이션 백필이 되살릴 수 있었던 행(당시 아직 cancelled
+    상태로 남아 있던 것)만 들어 있다 — 그래서 과거 기간은 과소 집계된다.
+
+    django_migrations 를 읽는다: 환경별로 자동으로 맞고, 스쿼시/이름 변경으로 못 찾으면
+    None 을 돌려 프론트가 '표시하지 않음'으로 안전하게 떨어진다.
+    """
+    try:
+        from django.db.migrations.recorder import MigrationRecorder
+
+        app, name = _TRIAL_CANCEL_MIGRATION
+        row = MigrationRecorder.Migration.objects.filter(app=app, name=name).first()
+        return row.applied if row else None
+    except Exception:  # noqa: BLE001 — 관측용 부가 정보라 실패해도 대시보드는 떠야 한다
+        logger.warning("[admin-dash-mkt] cancel_accurate_since 조회 실패", exc_info=True)
+        return None
+
+
+def _trials_cancelled(start, end, started_users: int) -> dict:
+    """T-1: 기간 내 **체험 중 취소**한 고유 회원 수 + 플랜 분해 + 취소율.
+
+    ``ended - ended_converted``(체험 종료 후 미결제)와 **다르다** — 그 값에는 취소를 누르지
+    않고 그냥 만료된 회원과 카드 승인 실패 회원이 섞인다. 여기서는 취소 시점에
+    ``status == TRIALING`` 이었던 것만 센다(:attr:`UserSubscription.cancelled_during_trial_at`).
+
+    플랜은 ``trial_plan``(체험 시작 시 기록한 내구 값) 기준이다 — ``plan`` 은 만료 시 free 로
+    바뀌므로 그걸 쓰면 취소한 프로 체험이 전부 free 로 보인다.
+
+    ⚠️ 이 지표는 필드 도입(billing 0024) **이후의 취소만 정확**하다. 그 이전 취소는
+    cancelled_at 이 만료 다운그레이드로 덮여 복원 불가라, 마이그레이션이 복원할 수 있었던
+    행(아직 CANCELLED 로 남아 있던 것)만 들어 있다. 과거 기간 조회 시 과소 집계된다.
+    """
+    rows = (
+        UserSubscription.objects.filter(
+            cancelled_during_trial_at__gte=start, cancelled_during_trial_at__lt=end
+        )
+        .order_by()
+        .values("trial_plan__name", "trial_plan__display_name")
+        .annotate(c=Count("user_id", distinct=True))
+    )
+    by_plan = [
+        {
+            "name": r["trial_plan__name"] or "unknown",
+            "display_name": r["trial_plan__display_name"] or "알 수 없음",
+            "count": r["c"],
+        }
+        for r in rows
+    ]
+    by_plan.sort(key=lambda x: (-x["count"], x["name"]))
+    total = sum(x["count"] for x in by_plan)
+    return {
+        "cancelled_during_trial": total,
+        "cancelled_during_trial_by_plan": by_plan,
+        "trial_cancel_rate": _rate(total, started_users),
+        "trial_cancel_formula": TRIALS_CANCEL_FORMULA,
+        "cancel_accurate_since": _cancel_accurate_since(),
+    }
+
+
 def _trials_ended(start, end) -> dict:
     """P-1: '이 기간에 무료체험이 끝난' 회원 수 + 그중 실결제 유지 수 (유저 dedupe).
 
@@ -2341,6 +2415,9 @@ def _feature_stats(cur: tuple, prev: tuple | None) -> dict:
             "paid_conversion_formula": TRIALS_PAID_CONVERSION_FORMULA,
             # P-1: 종료 시점 기준 대표 지표 (ended/ended_converted/rate/formula)
             **_trials_ended(*cur),
+            # T-1: 체험 중 취소 (분모는 회원 단위 체험 시작자 — started 는 이벤트 합산이라
+            # 레퍼럴+카드를 둘 다 쓴 회원이 2로 세어져 분모로는 부적합)
+            **_trials_cancelled(*cur, started_users=len(starter_uids)),
         },
     }
 
@@ -3438,6 +3515,87 @@ def _plan_count_rows(subs) -> tuple[list[dict], int]:
     return rows, sum(r["count"] for r in rows)
 
 
+def _trial_now(now) -> dict:
+    """S-2: **지금 체험 기간 중인** 회원 + 결제 여부 3분해 (기간 무관 스냅샷).
+
+    ``trialing`` 과 다른 두 가지:
+    ① **취소자를 포함한다.** 취소 시점에 status 가 CANCELLED 로 바뀌지만(subscription_views)
+       그 회원은 **기간말까지 여전히 프로를 쓰는 체험자**다. 빼면 타일의 합이 안 맞는다.
+    ② **카드 미등록 체험자도 포함한다.** ``trialing`` 은 카드 보유만 세는데, 쿠폰 체험자는
+       카드 없이 체험 중일 수 있다(prod 실측 9명) — 빼면 "체험 인원"이 실제보다 작게 나온다.
+
+    분해 (``will_charge + cancelled + no_card == total``):
+    - will_charge — 체험 중 + 카드 있음 + 미취소 → 기간말에 **과금된다**
+    - cancelled   — 체험 중 취소(기간 남음) → 과금 없이 free 로 내려간다
+    - no_card     — 체험 중 + **카드 없음** + 미취소 → 과금 대상이 아니다(쿠폰 체험).
+      프론트 요청은 2분해였지만 이 인원이 실재해 3번째 버킷이 필요하다 — will_charge 에
+      넣으면 "결제 예약"이 거짓이 되고, total 에서 빼면 체험 인원이 축소된다.
+
+    플랜 축은 **현재 ``plan``** 이다(누적 지표의 ``trial_plan`` 과 다르다) — '지금 쓰는 플랜'을
+    묻는 값이고, 취소자도 아직 다운그레이드 전이라 plan 이 유효하다.
+    """
+    base = UserSubscription.objects.exclude(plan__name__in=_PAID_EXCLUDE).filter(
+        current_period_end__gt=now
+    )
+    trialing = base.filter(status=SubscriptionStatus.TRIALING)
+    # 체험 중 취소 — 이 기간 안에서 일어난 취소만. ⚠️ cancelled_during_trial_at 은 재체험
+    # 시에도 지우지 않으므로(T-3-②) 과거 체험의 취소 기록이 남아 있을 수 있다. 그 값으로
+    # '지금 유료 기간을 취소한 사람'을 체험 취소로 오인하지 않도록 **현재 기간 포함**을 본다.
+    cancelled_qs = base.filter(
+        status=SubscriptionStatus.CANCELLED,
+        cancelled_during_trial_at__isnull=False,
+        current_period_start__isnull=False,
+        cancelled_during_trial_at__gte=F("current_period_start"),
+    )
+
+    will_charge = trialing.filter(billing_key_issued_at__isnull=False).count()
+    no_card = trialing.filter(billing_key_issued_at__isnull=True).count()
+    cancelled = cancelled_qs.count()
+    # by_plan 은 세 버킷을 합친 모집단 — Σ count == total 이 성립해야 한다
+    rows, total = _plan_count_rows(base.filter(Q(pk__in=trialing) | Q(pk__in=cancelled_qs)))
+    return {
+        "total": total,
+        "by_plan": rows,
+        "will_charge": will_charge,
+        "cancelled": cancelled,
+        "no_card": no_card,
+    }
+
+
+def _trial_plan_rows(*, cancelled_only: bool = False) -> tuple[list[dict], int]:
+    """누적 체험 인원의 플랜 분해 + 총계 — **시작(T-1)과 취소(S-1)의 공용 축**.
+
+    판정은 ``trial_plan`` 보유 여부 하나다 — 카드 체험(toss_flows)·쿠폰 체험
+    (referral_views)이 시작 시점에 모두 이 필드를 쓰므로 두 종류가 한 축에 모인다.
+    admin 플랜은 마케팅 무관이라 제외 (paying/trialing 과 동일 정책).
+
+    ⚠️ 두 지표가 **반드시 같은 함수**를 써야 한다: 취소 집합은 시작 집합의 부분집합이라
+    `trial_cancelled.total <= trial_started.total` 이 화면 계약인데, 축이 갈라지면
+    (한쪽만 admin 제외, 한쪽만 unknown 버킷 …) 취소가 시작보다 큰 줄이 생긴다.
+    ``trial_plan`` 이 비어 있는 행(플랜 레코드 삭제 → SET_NULL)은 **양쪽에서 함께 빠져**
+    부분집합 관계가 유지된다.
+    """
+    qs = UserSubscription.objects.filter(trial_plan__isnull=False)
+    if cancelled_only:
+        qs = qs.filter(cancelled_during_trial_at__isnull=False)
+    rows = (
+        qs.exclude(trial_plan__name__in=_PAID_EXCLUDE)
+        .order_by()
+        .values("trial_plan__name", "trial_plan__display_name")
+        .annotate(c=Count("user_id", distinct=True))
+    )
+    by_plan = [
+        {
+            "name": r["trial_plan__name"],
+            "display_name": r["trial_plan__display_name"] or r["trial_plan__name"],
+            "count": r["c"],
+        }
+        for r in rows
+    ]
+    by_plan.sort(key=lambda x: (-x["count"], x["name"]))
+    return by_plan, sum(x["count"] for x in by_plan)
+
+
 def _snapshot(now) -> dict:
     """상단 고정 패널 — **전체 기간 누적**, period/커스텀 범위와 무관 (R-2).
 
@@ -3465,6 +3623,12 @@ def _snapshot(now) -> dict:
             status=SubscriptionStatus.TRIALING, billing_key_issued_at__isnull=False
         ).exclude(plan__name__in=_PAID_EXCLUDE)
     )
+    # T-1/S-1: 전체 기간 **누적** 체험 시작·취소 인원 + 플랜 분해. feature_stats 쪽 값은
+    # [start, end) 로 자른 기간 종속 값이라 이 패널(기간 무관)에 얹으면 한 타일 안에서
+    # 시간축이 섞인다. 플랜 축은 trial_plan(내구 기록) — plan 을 쓰면 만료해 free 로
+    # 내려간 사람이 free 체험자로 잡힌다. 같은 함수라 cancelled <= started 가 보장된다.
+    started_rows, started_total = _trial_plan_rows()
+    cancelled_rows, cancelled_total = _trial_plan_rows(cancelled_only=True)
 
     visitors = 0
     if ATTRIBUTION_AVAILABLE:
@@ -3483,6 +3647,9 @@ def _snapshot(now) -> dict:
         "as_of": timezone.localtime(now).isoformat(),
         "paying": {"total": paying_total, "by_plan": paying_rows},
         "trialing": {"total": trial_total, "by_plan": trial_rows},
+        "trial_now": _trial_now(now),
+        "trial_started": {"total": started_total, "by_plan": started_rows},
+        "trial_cancelled": {"total": cancelled_total, "by_plan": cancelled_rows},
         "visitors": visitors,
         "signups": User.objects.count(),
         "activated": len(page_owners | campaign_owners),

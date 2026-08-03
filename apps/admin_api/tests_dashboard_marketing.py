@@ -1750,6 +1750,298 @@ class TestChannelPaidVsFreeTrial:
 # ─── P-1: 무료체험 종료 시점 기준 전환율 ─────────────────────────────────
 
 
+class TestTrialsCancelledDuringTrial:
+    """T-1 — '체험 중 취소'는 `ended - ended_converted`(종료 후 미결제)와 다른 값이다."""
+
+    def _cancelled_trial_sub(self, user, plan, *, cancelled_at, trial_plan=None):
+        sub = UserSubscription.objects.create(
+            user=user, plan=plan, status=SubscriptionStatus.CANCELLED
+        )
+        UserSubscription.objects.filter(pk=sub.pk).update(
+            trial_used_at=cancelled_at - timedelta(days=1),
+            cancelled_at=cancelled_at,
+            cancelled_during_trial_at=cancelled_at,
+            trial_plan=trial_plan or plan,
+        )
+        return sub
+
+    def test_counts_only_cancels_during_trial(self, staff_client, clean_slate, pro_plan):
+        now = timezone.now()
+        # ① 체험 중 취소 — 카운트 대상
+        self._cancelled_trial_sub(_mk_user(), pro_plan, cancelled_at=now - timedelta(days=2))
+        # ② 그냥 만료(취소 안 누름) — cancelled_during_trial_at 없음 → 제외
+        u_exp = _mk_user()
+        s = UserSubscription.objects.create(
+            user=u_exp, plan=pro_plan, status=SubscriptionStatus.CANCELLED
+        )
+        UserSubscription.objects.filter(pk=s.pk).update(
+            trial_used_at=now - timedelta(days=40), cancelled_at=now - timedelta(days=2)
+        )
+        # ③ 체험 중이지만 아직 취소 안 함 → 제외
+        UserSubscription.objects.create(
+            user=_mk_user(),
+            plan=pro_plan,
+            status=SubscriptionStatus.TRIALING,
+            trial_used_at=now - timedelta(days=1),
+        )
+
+        trials = staff_client.get(URL).data["feature_stats"]["trials"]
+        assert trials["cancelled_during_trial"] == 1
+        assert trials["cancelled_during_trial_by_plan"] == [
+            {"name": "pro", "display_name": pro_plan.display_name, "count": 1}
+        ]
+        # 만료 이탈은 ended 쪽에만 잡힌다 — 두 값이 다르다는 것이 이 요청의 출발점
+        assert trials["ended"] >= 1
+
+    def test_by_plan_uses_trial_plan_not_current_plan(
+        self, staff_client, clean_slate, pro_plan, free_plan
+    ):
+        """만료로 free 가 된 회원이 free 체험자로 보이면 안 된다."""
+        now = timezone.now()
+        u = _mk_user()
+        sub = UserSubscription.objects.create(
+            user=u, plan=free_plan, status=SubscriptionStatus.ACTIVE
+        )
+        UserSubscription.objects.filter(pk=sub.pk).update(
+            trial_used_at=now - timedelta(days=3),
+            cancelled_during_trial_at=now - timedelta(days=2),
+            trial_plan=pro_plan,  # 체험은 프로였다
+        )
+        trials = staff_client.get(URL).data["feature_stats"]["trials"]
+        assert trials["cancelled_during_trial"] == 1
+        assert [r["name"] for r in trials["cancelled_during_trial_by_plan"]] == ["pro"]
+
+    def test_sum_by_plan_equals_total(self, staff_client, clean_slate, pro_plan):
+        now = timezone.now()
+        basic_plan, _ = SubscriptionPlan.objects.get_or_create(
+            name="basic",
+            defaults={"display_name": "베이직", "monthly_price": 4900, "sort_order": 1},
+        )
+        for plan in (pro_plan, pro_plan, basic_plan):
+            self._cancelled_trial_sub(_mk_user(), plan, cancelled_at=now - timedelta(days=1))
+        trials = staff_client.get(URL).data["feature_stats"]["trials"]
+        assert sum(r["count"] for r in trials["cancelled_during_trial_by_plan"]) == (
+            trials["cancelled_during_trial"]
+        )
+        assert trials["cancelled_during_trial"] == 3
+
+    def test_rate_denominator_is_started_members(self, staff_client, clean_slate, pro_plan):
+        """분모는 회원 단위 체험 시작자 — started(이벤트 합산)와 다르다."""
+        now = timezone.now()
+        u = _mk_user()
+        sub = UserSubscription.objects.create(
+            user=u, plan=pro_plan, status=SubscriptionStatus.CANCELLED
+        )
+        UserSubscription.objects.filter(pk=sub.pk).update(
+            trial_used_at=now - timedelta(days=2),  # 이번 기간 체험 시작 → 분모 1
+            cancelled_during_trial_at=now - timedelta(days=1),
+            trial_plan=pro_plan,
+        )
+        trials = staff_client.get(URL).data["feature_stats"]["trials"]
+        assert trials["trial_cancel_rate"] == 1.0
+        assert "무료체험을 쓰던 중" in trials["trial_cancel_formula"]
+
+    def test_rate_null_when_no_starters(self, staff_client, clean_slate):
+        assert staff_client.get(URL).data["feature_stats"]["trials"]["trial_cancel_rate"] is None
+
+    def test_snapshot_trial_started_is_cumulative_by_trial_plan(
+        self, staff_client, clean_slate, pro_plan, free_plan
+    ):
+        """snapshot.trial_started 는 '지금 체험 중'이 아니라 '시작한 적 있는' 누적이다."""
+        now = timezone.now()
+        # 체험 후 만료돼 free 로 내려간 회원 — trialing 에는 없지만 trial_started 에는 남는다
+        u = _mk_user()
+        sub = UserSubscription.objects.create(
+            user=u, plan=free_plan, status=SubscriptionStatus.ACTIVE
+        )
+        UserSubscription.objects.filter(pk=sub.pk).update(
+            trial_used_at=now - timedelta(days=60), trial_plan=pro_plan
+        )
+        cache.delete_many(CACHE_KEYS)
+        snap = staff_client.get(URL, {"refresh": "1"}).data["snapshot"]["trial_started"]
+        assert snap["total"] >= 1
+        assert sum(r["count"] for r in snap["by_plan"]) == snap["total"]
+        assert "pro" in {r["name"] for r in snap["by_plan"]}
+
+    def test_cancel_accurate_since_is_migration_time(self, staff_client, clean_slate):
+        """T-2 — 기준일은 상수가 아니라 그 환경의 마이그레이션 적용 시각이어야 한다."""
+        from django.db.migrations.recorder import MigrationRecorder
+
+        trials = staff_client.get(URL).data["feature_stats"]["trials"]
+        row = MigrationRecorder.Migration.objects.filter(
+            app="billing", name="0024_subscription_trial_history"
+        ).first()
+        if row is None:  # 스쿼시 등으로 못 찾으면 null 이어야 한다(추측 금지)
+            assert trials["cancel_accurate_since"] is None
+        else:
+            assert trials["cancel_accurate_since"] is not None
+            assert datetime.fromisoformat(str(trials["cancel_accurate_since"])) == row.applied
+
+
+@requires_analytics
+class TestSnapshotTrialNow:
+    """S-2 — 지금 체험 중인 인원 3분해. **will_charge + cancelled + no_card == total**.
+
+    NOTE(test-db-not-clean): snapshot 은 기간 무관 누적이라 dev 잔여가 섞인다 → 델타 단언.
+    """
+
+    def _snap(self, staff_client):
+        cache.delete_many(CACHE_KEYS)
+        return staff_client.get(URL, {"refresh": "1"}).data["snapshot"]["trial_now"]
+
+    def _trialing(self, plan, *, card: bool):
+        sub = UserSubscription.objects.create(
+            user=_mk_user(), plan=plan, status=SubscriptionStatus.TRIALING
+        )
+        UserSubscription.objects.filter(pk=sub.pk).update(
+            current_period_start=timezone.now() - timedelta(days=3),
+            current_period_end=timezone.now() + timedelta(days=27),
+            billing_key_issued_at=timezone.now() if card else None,
+        )
+        return sub
+
+    def _cancelled_in_trial(self, plan, *, cancelled_at=None, period_start=None):
+        sub = UserSubscription.objects.create(
+            user=_mk_user(), plan=plan, status=SubscriptionStatus.CANCELLED
+        )
+        start = period_start or (timezone.now() - timedelta(days=3))
+        UserSubscription.objects.filter(pk=sub.pk).update(
+            current_period_start=start,
+            current_period_end=timezone.now() + timedelta(days=27),
+            cancelled_during_trial_at=cancelled_at or (timezone.now() - timedelta(days=1)),
+            billing_key_issued_at=timezone.now(),
+        )
+        return sub
+
+    def test_three_buckets_sum_to_total(self, staff_client, clean_slate, pro_plan):
+        before = self._snap(staff_client)
+        self._trialing(pro_plan, card=True)
+        self._trialing(pro_plan, card=True)
+        self._trialing(pro_plan, card=False)  # 쿠폰 체험(카드 없음)
+        self._cancelled_in_trial(pro_plan)
+
+        after = self._snap(staff_client)
+        assert after["will_charge"] == before["will_charge"] + 2
+        assert after["no_card"] == before["no_card"] + 1
+        assert after["cancelled"] == before["cancelled"] + 1
+        assert after["total"] == before["total"] + 4
+        # 계약
+        assert after["will_charge"] + after["cancelled"] + after["no_card"] == after["total"]
+        assert sum(r["count"] for r in after["by_plan"]) == after["total"]
+
+    def test_cancelled_trialist_is_included_unlike_trialing(
+        self, staff_client, clean_slate, pro_plan
+    ):
+        """취소자는 status 가 CANCELLED 지만 기간말까지 체험자다 — 빼면 타일 합이 깨진다."""
+        before = self._snap(staff_client)
+        before_trialing = staff_client.get(URL).data["snapshot"]["trialing"]["total"]
+        self._cancelled_in_trial(pro_plan)
+
+        after = self._snap(staff_client)
+        assert after["total"] == before["total"] + 1
+        assert after["cancelled"] == before["cancelled"] + 1
+        # 기존 trialing 은 status 필터라 이 사람을 못 센다 (S-2 가 필요한 이유)
+        assert staff_client.get(URL).data["snapshot"]["trialing"]["total"] == before_trialing
+
+    def test_expired_period_is_excluded(self, staff_client, clean_slate, pro_plan):
+        """'지금' 체험 중이 아니면 빠진다 — 기간이 지난 건 만료 배치 대상이다."""
+        before = self._snap(staff_client)
+        sub = UserSubscription.objects.create(
+            user=_mk_user(), plan=pro_plan, status=SubscriptionStatus.TRIALING
+        )
+        UserSubscription.objects.filter(pk=sub.pk).update(
+            current_period_start=timezone.now() - timedelta(days=40),
+            current_period_end=timezone.now() - timedelta(days=1),  # 이미 지남
+            billing_key_issued_at=timezone.now(),
+        )
+        assert self._snap(staff_client)["total"] == before["total"]
+
+    def test_stale_trial_cancel_from_previous_trial_is_not_counted(
+        self, staff_client, clean_slate, pro_plan
+    ):
+        """T-3-② 로 재체험 시 기록을 남기게 됐으므로, **과거 체험의 취소**가 지금 유료
+        기간을 해지한 회원을 '체험 중 취소'로 오인하지 않아야 한다."""
+        before = self._snap(staff_client)
+        # 지금 기간은 유료 기간(3일 전 시작)인데, 체험 취소 기록은 그보다 훨씬 과거
+        self._cancelled_in_trial(
+            pro_plan,
+            period_start=timezone.now() - timedelta(days=3),
+            cancelled_at=timezone.now() - timedelta(days=90),  # 이전 체험 때의 기록
+        )
+        after = self._snap(staff_client)
+        assert after["cancelled"] == before["cancelled"]
+        assert after["total"] == before["total"]
+
+
+@requires_analytics
+class TestSnapshotTrialCancelled:
+    """S-1 — 누적 체험 취소 인원. trial_started 와 **같은 축**이어야 한다.
+
+    NOTE(test-db-not-clean): snapshot 은 **기간 무관 누적**이라 clean_slate 로도 dev 잔여
+    행이 빠지지 않는다 → 절대 카운트 금지, 반드시 **델타**로 단언한다.
+    """
+
+    def _cancelled(self, user, trial_plan, current_plan):
+        sub = UserSubscription.objects.create(
+            user=user, plan=current_plan, status=SubscriptionStatus.CANCELLED
+        )
+        now = timezone.now()
+        UserSubscription.objects.filter(pk=sub.pk).update(
+            trial_used_at=now - timedelta(days=400),  # 기간(30d) 밖 — 누적값임을 보이기 위해
+            cancelled_during_trial_at=now - timedelta(days=399),
+            trial_plan=trial_plan,
+        )
+        return sub
+
+    def _snap(self, staff_client):
+        cache.delete_many(CACHE_KEYS)
+        return staff_client.get(URL, {"refresh": "1"}).data["snapshot"]
+
+    def test_cumulative_and_independent_of_period(
+        self, staff_client, clean_slate, pro_plan, free_plan
+    ):
+        before = self._snap(staff_client)["trial_cancelled"]["total"]
+        # 체험 후 만료돼 free 로 내려간 취소자 — 기간(30d) 밖이지만 누적엔 남아야 한다
+        self._cancelled(_mk_user(), trial_plan=pro_plan, current_plan=free_plan)
+        after = self._snap(staff_client)["trial_cancelled"]
+        assert after["total"] == before + 1
+        assert sum(r["count"] for r in after["by_plan"]) == after["total"]
+        # 같은 응답의 기간 종속 값은 0 — 이 둘을 한 타일에 섞으면 안 된다는 근거
+        assert staff_client.get(URL).data["feature_stats"]["trials"]["cancelled_during_trial"] == 0
+
+    def test_is_subset_of_trial_started(self, staff_client, clean_slate, pro_plan, free_plan):
+        """화면 계약: trial_cancelled.total <= trial_started.total (같은 축이라 구조적 보장)."""
+        before = self._snap(staff_client)
+        self._cancelled(_mk_user(), trial_plan=pro_plan, current_plan=free_plan)
+        # 취소하지 않은 체험자도 하나
+        s = UserSubscription.objects.create(
+            user=_mk_user(), plan=pro_plan, status=SubscriptionStatus.ACTIVE
+        )
+        UserSubscription.objects.filter(pk=s.pk).update(
+            trial_used_at=timezone.now() - timedelta(days=300), trial_plan=pro_plan
+        )
+        after = self._snap(staff_client)
+        assert after["trial_cancelled"]["total"] == before["trial_cancelled"]["total"] + 1
+        assert after["trial_started"]["total"] == before["trial_started"]["total"] + 2
+        assert after["trial_cancelled"]["total"] <= after["trial_started"]["total"]
+        assert sum(r["count"] for r in after["trial_cancelled"]["by_plan"]) == (
+            after["trial_cancelled"]["total"]
+        )
+
+    def test_row_without_trial_plan_is_in_neither(self, staff_client, clean_slate, free_plan):
+        """플랜 레코드가 지워진 행은 양쪽에서 함께 빠져야 부분집합이 유지된다."""
+        before = self._snap(staff_client)
+        s = UserSubscription.objects.create(
+            user=_mk_user(), plan=free_plan, status=SubscriptionStatus.CANCELLED
+        )
+        UserSubscription.objects.filter(pk=s.pk).update(
+            cancelled_during_trial_at=timezone.now() - timedelta(days=1), trial_plan=None
+        )
+        after = self._snap(staff_client)
+        assert after["trial_cancelled"]["total"] == before["trial_cancelled"]["total"]
+        assert after["trial_started"]["total"] == before["trial_started"]["total"]
+
+
 class TestTrialsEnded:
     def test_ended_cohort_all_end_types(self, staff_client, clean_slate, pro_plan):
         now = timezone.now()

@@ -809,8 +809,14 @@ if (res.ok) {
         # 빌링키는 유지해 기간 내 재개(resume)를 즉시 가능하게 한다.
         # 기간 만료 시 handle_cancelled_expiry 가 다운그레이드 + 빌링키 삭제를 수행.
         update_fields = ["status", "cancelled_at", "updated_at"]
+        now = timezone.now()
+        # T-1: '체험 중 취소'는 취소 **시점에만** 알 수 있다 — 이 뒤 만료 다운그레이드가
+        # cancelled_at 을 덮고 current_period_end 를 지우므로 사후 복원이 불가능하다.
+        if sub.status == SubscriptionStatus.TRIALING:
+            sub.cancelled_during_trial_at = now
+            update_fields.append("cancelled_during_trial_at")
         sub.status = SubscriptionStatus.CANCELLED
-        sub.cancelled_at = timezone.now()
+        sub.cancelled_at = now
         # 정지 중 완전 해지 — 정지 예약 필드 정리(자동 재개 방지).
         if sub.pause_ends_at or sub.paused_months:
             sub.pause_ends_at = None

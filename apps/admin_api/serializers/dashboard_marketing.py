@@ -575,6 +575,19 @@ class _SpamFeatureStatsSerializer(serializers.Serializer):
     hidden = _DeltaMetricSerializer(help_text="기간 내 숨김 처리 수")
 
 
+class _SnapshotPlanCountSerializer(serializers.Serializer):
+    """플랜 분해 1행 — Σ count == 상위 total 보장.
+
+    고정 패널(R-2)에서 시작해 T-1 의 체험 지표까지 함께 쓴다. 플랜 축이 '현재 구독 플랜'인지
+    '체험 시작 플랜(trial_plan)'인지는 **쓰는 쪽 help_text** 에 적는다 — 두 축이 섞이면
+    만료로 free 가 된 회원이 free 체험자로 보인다.
+    """
+
+    name = serializers.CharField(help_text="SubscriptionPlan.name (pro/basic)")
+    display_name = serializers.CharField(help_text="플랜 표시명 (프로/베이직)")
+    count = serializers.IntegerField(help_text="해당 플랜 회원 수")
+
+
 class _TrialsStatsSerializer(serializers.Serializer):
     """트라이얼 통계 — started 는 레퍼럴+카드등록, 전환은 레퍼럴 코호트만.
 
@@ -623,6 +636,41 @@ class _TrialsStatsSerializer(serializers.Serializer):
     )
     ended_conversion_formula = serializers.CharField(
         help_text="ended_conversion_rate 의 한국어 계산식 (i-아이콘 툴팁 정본)"
+    )
+    # ── T-1: 체험 중 취소 ──
+    # ⚠️ `ended - ended_converted`(종료 후 미결제)와 **다른 값**이다. 그쪽에는 취소를 누르지
+    #    않고 그냥 만료된 회원과 카드 승인 실패 회원이 섞인다. 여기는 취소 시점에
+    #    status==TRIALING 이었던 것만 센다.
+    cancelled_during_trial = serializers.IntegerField(
+        help_text="T-1 — 이 기간에 **무료체험 중 구독을 취소**한 고유 회원 수 "
+        "(쿠폰·카드 체험 공통, 회원 dedupe). 취소 시점 상태로 판정하므로 그냥 만료된 회원과 "
+        "결제 실패 회원은 포함되지 않는다. "
+        "⚠️ **billing 0024 배포 이후의 취소만 정확** — 그 이전 취소는 cancelled_at 이 만료 "
+        "다운그레이드로 덮여 복원이 불가능하고, 마이그레이션이 되살릴 수 있었던 행"
+        "(아직 cancelled 로 남아 있던 것)만 들어 있다. 과거 기간일수록 과소 집계"
+    )
+    cancelled_during_trial_by_plan = _SnapshotPlanCountSerializer(
+        many=True,
+        help_text="플랜 분해 (Σ count == cancelled_during_trial). 플랜 축은 **체험을 시작한 "
+        "플랜**(trial_plan) — 현재 plan 을 쓰면 만료로 free 가 된 회원이 free 로 잡힌다. "
+        "플랜 레코드가 지워진 경우만 name='unknown'",
+    )
+    trial_cancel_rate = serializers.FloatField(
+        allow_null=True,
+        help_text="cancelled_during_trial ÷ 이 기간 체험 시작 **회원 수**(레퍼럴+카드 dedupe, "
+        "= paid_conversion_rate 의 분모와 동일). 분모 0 → null. "
+        "⚠️ `started.count` 는 이벤트 합산이라 두 종류를 다 쓴 회원이 2로 세어져 분모가 다르다",
+    )
+    trial_cancel_formula = serializers.CharField(
+        help_text="trial_cancel_rate 의 한국어 계산식 (i-아이콘 툴팁 정본)"
+    )
+    cancel_accurate_since = serializers.DateTimeField(
+        allow_null=True,
+        help_text="T-2 — 이 시각 **이후**의 체험 취소는 정확하다는 기준(해당 환경에 "
+        "billing 0024 가 적용된 시각). 이전 취소는 cancelled_at 이 만료 다운그레이드로 덮여 "
+        "복원 불가라 마이그레이션이 되살릴 수 있었던 행만 들어 있다 → 조회 구간 시작이 이 "
+        "시각보다 앞서면 과소 집계임을 화면에서 구분하세요. "
+        "**null 이면 표시하지 마세요**(마이그레이션 기록을 못 찾은 경우 — 추측 금지)",
     )
 
 
@@ -1199,14 +1247,6 @@ class _CustomerActionsSerializer(serializers.Serializer):
     )
 
 
-class _SnapshotPlanCountSerializer(serializers.Serializer):
-    """고정 패널의 플랜 분해 1행 (R-2) — Σ count == 상위 total 보장."""
-
-    name = serializers.CharField(help_text="SubscriptionPlan.name (pro/basic)")
-    display_name = serializers.CharField(help_text="플랜 표시명 (프로/베이직)")
-    count = serializers.IntegerField(help_text="해당 플랜 회원 수 (현재 구독 플랜 기준)")
-
-
 class _SnapshotPayingSerializer(serializers.Serializer):
     """실제 결제 인원 (R-2 ①) — PAID 이력 보유 + 현재 유료 ACTIVE 구독."""
 
@@ -1233,6 +1273,86 @@ class _SnapshotTrialingSerializer(serializers.Serializer):
     )
 
 
+class _SnapshotTrialStartedSerializer(serializers.Serializer):
+    """누적 체험 시작 인원 (T-1) — ``trialing`` 과 다르다.
+
+    ``trialing`` 은 **지금 체험 중**인 사람, 이쪽은 **한 번이라도 체험을 시작한** 사람이다
+    (전환·만료·취소 후에도 남는다). 화면 상단에서 `프로 체험 인원 / 그중 취소` 를 한 줄로
+    만들 때 분모로 쓰라고 만든 값이다.
+    """
+
+    total = serializers.IntegerField(
+        help_text="전체 기간 누적, 체험을 시작한 적 있는 고유 회원 수 "
+        "(카드등록 체험 + 쿠폰 체험, admin 플랜 제외). feature_stats.trials.started 는 "
+        "**기간 델타 + 이벤트 합산**이라 이 값과 단위가 다르다"
+    )
+    by_plan = _SnapshotPlanCountSerializer(
+        many=True,
+        help_text="체험을 시작한 플랜 기준 분해 (Σ count == total). 현재 plan 이 아니라 "
+        "**trial_plan**(시작 시점 기록)이라 만료로 free 가 된 회원도 pro 로 남는다",
+    )
+
+
+class _SnapshotTrialNowSerializer(serializers.Serializer):
+    """S-2 — **지금 체험 기간 중인** 회원 + 과금 여부 3분해 (상단 타일 전용).
+
+    ``trialing`` / ``trial_started`` 와 무엇이 다른가:
+
+    | 필드 | 모집단 |
+    |---|---|
+    | `trialing` | status==TRIALING **+ 카드 보유** (취소자·무카드 제외) |
+    | `trial_started` | 전체 기간 **누적** 시작자 (전환·만료·취소 포함) |
+    | **`trial_now`** | **지금 체험 기간 중**인 회원 전부 (취소자·무카드 **포함**) |
+
+    누적값으로 타일을 만들면 "6명인데 진행 중 0 · 취소 0" 처럼 합이 맞지 않는다 —
+    누적에는 이미 결제로 넘어간 회원과 만료된 회원이 섞여 있기 때문이다.
+    """
+
+    total = serializers.IntegerField(
+        help_text="지금 체험 기간 중(`current_period_end` 미도래)인 유료플랜 회원 수. "
+        "**취소자도 포함**한다 — 취소하면 status 는 CANCELLED 로 바뀌지만 그 회원은 "
+        "기간말까지 여전히 프로를 쓰는 체험자다. **카드 미등록 체험자도 포함**한다"
+    )
+    by_plan = _SnapshotPlanCountSerializer(
+        many=True,
+        help_text="플랜 분해 (Σ count == total). 축은 **현재 plan** — 누적 지표의 trial_plan 과 "
+        "다르다('지금 쓰는 플랜'을 묻는 값이고 취소자도 아직 다운그레이드 전이다)",
+    )
+    will_charge = serializers.IntegerField(
+        help_text="체험 중 + **카드 있음** + 미취소 → 체험이 끝나면 실제로 과금된다"
+    )
+    cancelled = serializers.IntegerField(
+        help_text="체험 중 취소를 예약한 회원(기간 남음) → 과금 없이 free 로 내려간다. "
+        "판정: `cancelled_during_trial_at` 이 있고 **현재 기간 안**에서 일어난 취소 "
+        "(재체험 시 과거 기록을 지우지 않으므로 기간 포함까지 봐야 유료 해지와 안 섞인다)"
+    )
+    no_card = serializers.IntegerField(
+        help_text="체험 중 + **카드 없음** + 미취소 → 과금 대상이 아니다(쿠폰 체험). "
+        "요청은 2분해였지만 이 인원이 실재하므로(prod 실측 9명) 3번째 버킷이 필요하다 — "
+        "will_charge 에 넣으면 '결제 예약'이 거짓이 되고, total 에서 빼면 체험 인원이 축소된다. "
+        "**계약: will_charge + cancelled + no_card == total**"
+    )
+
+
+class _SnapshotTrialCancelledSerializer(serializers.Serializer):
+    """누적 체험 취소 인원 (S-1) — ``trial_started`` 의 부분집합.
+
+    ``feature_stats.trials.cancelled_during_trial`` 은 **기간 종속**(``[start, end)``)이라
+    이 패널(기간 무관)에 얹으면 한 타일 안에서 시간축이 섞인다. 그래서 누적판을 따로 둔다.
+    """
+
+    total = serializers.IntegerField(
+        help_text="전체 기간 누적, 체험 중 구독을 취소한 적 있는 고유 회원 수 "
+        "(admin 플랜 제외). trial_started 와 **같은 함수·같은 축**이라 "
+        "`total <= trial_started.total` 이 항상 성립한다. "
+        "⚠️ 정확도 경계는 feature_stats.trials.cancel_accurate_since 참고"
+    )
+    by_plan = _SnapshotPlanCountSerializer(
+        many=True,
+        help_text="체험을 시작한 플랜 기준 분해 (Σ count == total) — trial_started 와 동일 축",
+    )
+
+
 class _SnapshotSerializer(serializers.Serializer):
     """상단 고정 패널 (R-2) — **전체 기간 누적, period/커스텀 범위와 무관**.
 
@@ -1242,6 +1362,19 @@ class _SnapshotSerializer(serializers.Serializer):
     as_of = serializers.DateTimeField(help_text="스냅샷 산출 시각 (Asia/Seoul ISO)")
     paying = _SnapshotPayingSerializer(help_text="① 실제 결제 인원")
     trialing = _SnapshotTrialingSerializer(help_text="② 체험 인원 (카드 등록 완료 기준)")
+    trial_now = _SnapshotTrialNowSerializer(
+        help_text="② S-2 — **지금 체험 기간 중**인 회원 + 과금 여부 3분해. "
+        "상단 체험 타일은 이 값으로 만드세요(`will_charge + cancelled + no_card == total`). "
+        "`trialing` 은 취소자·무카드가 빠져 합이 맞지 않습니다"
+    )
+    trial_started = _SnapshotTrialStartedSerializer(
+        help_text="②' T-1 — 전체 기간 누적 **체험을 시작한 적 있는** 회원 (현재 진행 여부 무관). "
+        "누적이라 상단 타일에는 부적합 — CSV 추이용"
+    )
+    trial_cancelled = _SnapshotTrialCancelledSerializer(
+        help_text="②'' S-1 — 전체 기간 누적 **체험 중 취소한** 회원. trial_started 와 같은 "
+        "축이라 `trial_cancelled.total <= trial_started.total` 이 항상 성립한다"
+    )
     visitors = serializers.IntegerField(
         help_text="③ 전체 기간 고유 방문자 수 (distinct visitor_id). "
         "attribution_available=false 면 0"

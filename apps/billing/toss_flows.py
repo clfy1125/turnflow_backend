@@ -272,6 +272,21 @@ def _activate_all_pages(user):
     Page.objects.filter(user=user, is_active=False).update(is_active=True)
 
 
+def _schedule_quota_skipped_revive(user):
+    """유료 전환/업그레이드 직후, 월 DM 한도로 스킵된 DM 되살림을 예약 (best-effort).
+
+    커밋 후에 태스크를 던진다 — 커밋 전에 던지면 워커가 옛 플랜을 읽어 '아직 한도 초과'로
+    판단하고 아무것도 되살리지 않는다. 실패는 삼킨다: 결제는 이미 성공했고, 되살림은
+    부가 효과다(놓치면 고객이 대시보드에서 재발송을 누를 수 있다).
+    """
+    from .tasks import revive_quota_skipped_dms
+
+    try:
+        transaction.on_commit(lambda: revive_quota_skipped_dms.delay(str(user.id)))
+    except Exception:  # noqa: BLE001
+        logger.exception("한도 스킵 DM 되살림 예약 실패: user=%s", user.email)
+
+
 # ──────────────────────────────────────────────
 # 과금 실행 (1회성 — 최초 결제 / 추가 계정)
 # ──────────────────────────────────────────────
@@ -590,6 +605,13 @@ def confirm_billing(
             locked.monthly_amount_snapshot = get_current_selling_price(new_plan)
             locked.extra_ig_accounts = extra_ig_accounts
             locked.trial_used_at = now
+            # T-1: 무슨 플랜 체험이었는지의 내구 기록 (plan 은 만료 시 free 로 바뀐다)
+            locked.trial_plan = new_plan
+            # ⚠️ T-3: cancelled_during_trial_at 은 **여기서 초기화하지 않는다**(2026-08-03).
+            #    초기화하면 재체험하는 순간 과거 취소 기록이 사라져 **이미 지나간 기간의
+            #    집계가 나중에 줄어든다**(7월 숫자가 8월에 바뀐다). 재체험해도 "그때 취소한
+            #    것"은 사실이므로 남긴다. 남은 한계: 한 행에 1건만 담기므로 두 번 취소하면
+            #    최신 것이 앞의 것을 덮는다(이력이 필요해지면 별도 이벤트 테이블로).
             locked.cancelled_at = None
             locked.renewal_attempts = 0
             locked.next_billing_retry_at = None
@@ -604,6 +626,7 @@ def confirm_billing(
                     "monthly_amount_snapshot",
                     "extra_ig_accounts",
                     "trial_used_at",
+                    "trial_plan",
                     "cancelled_at",
                     "renewal_attempts",
                     "next_billing_retry_at",
@@ -614,6 +637,7 @@ def confirm_billing(
             if referral:
                 _consume_referral(user, referral, now, trial_ends)
             _activate_all_pages(user)
+            _schedule_quota_skipped_revive(user)
         else:
             # attach_only / card_change / charge_now(키 먼저 저장, 과금은 아래서)
             locked.save(update_fields=key_fields + ["updated_at"])
@@ -709,6 +733,7 @@ def confirm_billing(
             ]
         )
     _activate_all_pages(user)
+    _schedule_quota_skipped_revive(user)
     mark_converted_to_paid(user, now)
 
     sub.refresh_from_db()
@@ -767,6 +792,8 @@ def _apply_upgrade_state(sub_pk, new_plan, extra_ig_accounts: int, now=None):
             ]
         )
     _activate_all_pages(locked.user)
+    # 업그레이드로 한도가 풀렸으면(basic 200 → pro 무제한) 그 사이 스킵된 DM 을 되살린다.
+    _schedule_quota_skipped_revive(locked.user)
     mark_converted_to_paid(locked.user, now)
     return locked
 

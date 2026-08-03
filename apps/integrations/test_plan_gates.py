@@ -217,6 +217,157 @@ class TestDmMonthlyLimit:
 
 
 # ──────────────────────────────────────────────
+# 업그레이드 후 한도 스킵 DM 되살림 (CS #4f7efa1d)
+# ──────────────────────────────────────────────
+
+
+@pytest.mark.django_db
+class TestQuotaSkippedRevive:
+    """billing.revive_quota_skipped_dms — 유료 전환 직후 한도로 스킵된 DM 을 되살린다."""
+
+    def _skipped_log(
+        self, campaign, *, reason="monthly_dm_limit_reached", age_hours=1, comment=True
+    ):
+        log = SentDMLog.objects.create(
+            campaign=campaign,
+            # comment_id 없음("") = user_id 트리거 → 메시징 윈도우 24h (댓글은 7일)
+            comment_id=f"c{uuid.uuid4().hex[:8]}" if comment else "",
+            recipient_user_id=f"ru{uuid.uuid4().hex[:8]}",
+            recipient_username="run",
+            message_sent="hi",
+            idempotency_key=f"rev-{uuid.uuid4().hex[:8]}",
+            status=SentDMLog.Status.SKIPPED,
+            error_message=reason,
+        )
+        # created_at 은 auto_now_add — 나이는 UPDATE 로 소급한다.
+        SentDMLog.objects.filter(pk=log.pk).update(
+            created_at=timezone.now() - timedelta(hours=age_hours)
+        )
+        log.refresh_from_db()
+        return log
+
+    def _setup(self, monkeypatch, plan_name):
+        """되살림 대상 오너 + 캠페인. send_dm_task 발행은 막고 호출만 기록한다."""
+        from apps.integrations import tasks as ig_tasks
+
+        cache.clear()
+        user = _user()
+        _give_plan(user, plan_name)
+        campaign = _campaign(_conn(_ws(user)))
+        enqueued = []
+        monkeypatch.setattr(ig_tasks.send_dm_task, "delay", lambda lid: enqueued.append(lid))
+        return user, campaign, enqueued
+
+    def test_upgrade_revives_quota_skipped_logs(self, monkeypatch):
+        from apps.billing.tasks import revive_quota_skipped_dms
+
+        user, campaign, enqueued = self._setup(monkeypatch, "pro")
+        logs = [self._skipped_log(campaign) for _ in range(3)]
+
+        result = revive_quota_skipped_dms.apply(args=[str(user.id)]).get()
+
+        assert result["revived"] == 3
+        for log in logs:
+            log.refresh_from_db()
+            assert log.status == SentDMLog.Status.QUEUED
+        assert len(enqueued) == 3
+
+    def test_does_not_touch_other_skip_reasons(self, monkeypatch):
+        """캠페인 일시정지·시간대 밖 스킵은 그 조건이 풀릴 때 되살아나야 한다 — 건드리지 않음."""
+        from apps.billing.tasks import revive_quota_skipped_dms
+
+        user, campaign, _ = self._setup(monkeypatch, "pro")
+        quota = self._skipped_log(campaign)
+        paused = self._skipped_log(campaign, reason="campaign_not_active")
+
+        result = revive_quota_skipped_dms.apply(args=[str(user.id)]).get()
+
+        assert result["revived"] == 1 and result["scanned"] == 1
+        quota.refresh_from_db()
+        paused.refresh_from_db()
+        assert quota.status == SentDMLog.Status.QUEUED
+        assert paused.status == SentDMLog.Status.SKIPPED
+
+    def test_no_revive_when_new_plan_still_over_limit(self, monkeypatch):
+        """free→basic 처럼 한도가 그대로면 되살리지 않는다 (즉시 재스킵 방지)."""
+        from apps.billing.tasks import revive_quota_skipped_dms
+
+        user, campaign, enqueued = self._setup(monkeypatch, "basic")
+        log = self._skipped_log(campaign)
+        monkeypatch.setattr("apps.billing.dm_limits.count_owner_dms_this_month", lambda owner: 200)
+
+        result = revive_quota_skipped_dms.apply(args=[str(user.id)]).get()
+
+        assert result["revived"] == 0 and result["reason"] == "still_over_limit"
+        log.refresh_from_db()
+        assert log.status == SentDMLog.Status.SKIPPED
+        assert enqueued == []
+
+    def test_stale_quota_flag_does_not_block_revive(self, monkeypatch):
+        """이전 플랜에서 세워둔 '한도 도달' 캐시 플래그가 되살림을 막지 않는다."""
+        from apps.billing.dm_limits import _quota_hit_cache_key
+        from apps.billing.tasks import revive_quota_skipped_dms
+
+        user, campaign, _ = self._setup(monkeypatch, "basic")
+        log = self._skipped_log(campaign)
+        cache.set(_quota_hit_cache_key(user.id), True, timeout=3600)
+        # 새 플랜에서는 실제 사용량이 한도 아래 — 플래그를 안 걷으면 차단으로 오판한다.
+        monkeypatch.setattr("apps.billing.dm_limits.count_owner_dms_this_month", lambda owner: 10)
+
+        result = revive_quota_skipped_dms.apply(args=[str(user.id)]).get()
+
+        assert result["revived"] == 1
+        log.refresh_from_db()
+        assert log.status == SentDMLog.Status.QUEUED
+
+    def test_expired_messaging_window_is_not_revived(self, monkeypatch):
+        """user_id 트리거(윈도우 24h)가 지난 건은 되살리지 않는다 — Meta 가 어차피 거부."""
+        from apps.billing.tasks import revive_quota_skipped_dms
+
+        user, campaign, enqueued = self._setup(monkeypatch, "pro")
+        fresh = self._skipped_log(campaign, age_hours=2, comment=False)
+        stale = self._skipped_log(campaign, age_hours=30, comment=False)
+
+        result = revive_quota_skipped_dms.apply(args=[str(user.id)]).get()
+
+        assert result["revived"] == 1 and result["scanned"] == 2
+        fresh.refresh_from_db()
+        stale.refresh_from_db()
+        assert fresh.status == SentDMLog.Status.QUEUED
+        assert stale.status == SentDMLog.Status.SKIPPED
+        assert len(enqueued) == 1
+
+    def test_upgrade_flow_schedules_revive_after_commit(
+        self, monkeypatch, django_capture_on_commit_callbacks
+    ):
+        """_apply_upgrade_state 는 되살림을 '커밋 후'에 발행한다.
+
+        커밋 전에 발행하면 워커가 옛 플랜(basic)을 읽어 '아직 한도 초과'로 판단하고
+        아무것도 되살리지 않는다 — on_commit 여부가 기능의 성패를 가른다.
+        """
+        from apps.billing import toss_flows
+        from apps.billing.models import SubscriptionPlan
+
+        cache.clear()
+        user = _user()
+        _give_plan(user, "basic")
+        sub = UserSubscription.objects.get(user=user)
+        called = []
+        monkeypatch.setattr(
+            "apps.billing.tasks.revive_quota_skipped_dms.delay",
+            lambda uid: called.append(uid),
+        )
+        pro = SubscriptionPlan.objects.get(name="pro")
+
+        with django_capture_on_commit_callbacks(execute=True) as callbacks:
+            toss_flows._apply_upgrade_state(sub.pk, pro, 0)
+            assert called == []  # 커밋 전에는 발행되지 않아야 한다
+
+        assert len(callbacks) >= 1
+        assert called == [str(user.id)]
+
+
+# ──────────────────────────────────────────────
 # 스팸필터 (pro 전용)
 # ──────────────────────────────────────────────
 

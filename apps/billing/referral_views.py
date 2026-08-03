@@ -458,6 +458,11 @@ if (res.ok) {
                 sub.status = SubscriptionStatus.TRIALING
                 sub.current_period_start = now
                 sub.current_period_end = trial_ends
+                # T-1: 쿠폰 체험도 같은 구독을 TRIALING 으로 만든다 — 체험 플랜의 내구
+                # 기록을 카드 체험과 동일하게 남긴다.
+                # ⚠️ T-3: cancelled_during_trial_at 은 **초기화하지 않는다** — 재체험 시
+                #    과거 취소가 지워져 이미 지나간 기간의 집계가 줄어든다(toss_flows 동일).
+                sub.trial_plan = code.target_plan
                 sub.cancelled_at = None
                 sub.save(
                     update_fields=[
@@ -465,6 +470,7 @@ if (res.ok) {
                         "status",
                         "current_period_start",
                         "current_period_end",
+                        "trial_plan",
                         "cancelled_at",
                         "updated_at",
                     ]

@@ -316,3 +316,85 @@ def test_cancellation_event_offer_saved(client, user):
     ev = CancellationEvent.objects.filter(user=user, event="offer_accepted").first()
     assert ev is not None
     assert ev.offer == "pause"
+
+
+# ─── T-1: 체험 중 취소의 내구 기록 ────────────────────────────────────
+
+
+class TestCancelledDuringTrialRecording:
+    """T-1 — '체험 중 취소'는 취소 **시점에만** 알 수 있어 그때 기록해야 한다.
+
+    cancelled_at 은 ①사용자 취소 ②만료 다운그레이드 ③카드 삭제 강제해지가 모두 덮어쓰므로
+    사후에 가려낼 수 없다. 그래서 전용 필드를 둔다.
+    """
+
+    CANCEL_URL = "/api/v1/billing/cancel/"
+
+    def test_cancel_during_trial_is_recorded(self, client, user):
+        sub = _paid_sub(user, status=SubscriptionStatus.TRIALING)
+        assert client.post(self.CANCEL_URL).status_code == 200
+        sub.refresh_from_db()
+        assert sub.status == SubscriptionStatus.CANCELLED
+        assert sub.cancelled_during_trial_at is not None
+        assert sub.cancelled_during_trial_at == sub.cancelled_at
+
+    def test_cancel_while_active_is_not_a_trial_cancel(self, client, user):
+        """유료 구독 해지는 체험 취소가 아니다 — 섞이면 지표가 부풀어 오른다."""
+        sub = _paid_sub(user, status=SubscriptionStatus.ACTIVE)
+        assert client.post(self.CANCEL_URL).status_code == 200
+        sub.refresh_from_db()
+        assert sub.status == SubscriptionStatus.CANCELLED
+        assert sub.cancelled_at is not None
+        assert sub.cancelled_during_trial_at is None
+
+    def test_expiry_downgrade_preserves_the_record(self, user):
+        """만료 다운그레이드가 cancelled_at 을 덮어써도 체험 취소 이력은 남아야 한다."""
+        from apps.billing.tasks import _downgrade_to_free
+
+        sub = _paid_sub(user, status=SubscriptionStatus.TRIALING)
+        cancelled_at = timezone.now() - timedelta(days=1)
+        type(sub).objects.filter(pk=sub.pk).update(
+            status=SubscriptionStatus.CANCELLED,
+            cancelled_at=cancelled_at,
+            cancelled_during_trial_at=cancelled_at,
+            trial_plan=sub.plan,
+        )
+        sub.refresh_from_db()
+
+        _downgrade_to_free(sub, SubscriptionPlan.objects.get(name="free"))
+
+        sub.refresh_from_db()
+        assert sub.plan.name == "free"
+        assert sub.cancelled_at > cancelled_at  # 덮어써졌다 (기존 동작)
+        # 그래도 체험 이력은 살아 있어야 한다 — 이게 이 필드의 존재 이유
+        assert sub.cancelled_during_trial_at == cancelled_at
+        assert sub.trial_plan is not None and sub.trial_plan.name == "pro"
+
+    def test_retrial_keeps_previous_cancel_record(self, client, user):
+        """T-3 — 재체험이 과거 취소를 지우면 **이미 지나간 기간의 집계가 나중에 줄어든다**.
+
+        쿠폰 재체험 엔드포인트를 실제로 태운다 — 필드 세팅을 흉내 내면 referral_views 에
+        초기화가 다시 들어와도 잡히지 않는다.
+        """
+        from apps.billing.models import ReferralCode
+
+        # 과거에 체험하다 취소한 이력 (free 로 내려간 상태)
+        sub = ensure_subscription(user)
+        sub.plan = SubscriptionPlan.objects.get(name="free")
+        sub.status = SubscriptionStatus.ACTIVE
+        sub.save()
+        first_cancel = timezone.now() - timedelta(days=60)
+        type(sub).objects.filter(pk=sub.pk).update(cancelled_during_trial_at=first_cancel)
+
+        code = ReferralCode.objects.create(
+            code=f"RT{uuid.uuid4().hex[:6].upper()}",
+            target_plan=SubscriptionPlan.objects.get(name="pro"),
+            trial_days=30,
+        )
+        res = client.post("/api/v1/billing/referral/redeem/", {"code": code.code}, format="json")
+        assert res.status_code == 200, res.data
+
+        sub.refresh_from_db()
+        assert sub.status == SubscriptionStatus.TRIALING  # 재체험은 정상 동작
+        assert sub.trial_plan is not None and sub.trial_plan.name == "pro"
+        assert sub.cancelled_during_trial_at == first_cancel  # 과거 기간 숫자가 유지된다

@@ -10,6 +10,8 @@ Billing Celery tasks — 토스 빌링 정기결제 배치.
 6. handle_grace_period_expiry  — past_due 7일 유예 만료 → free 다운그레이드
 7. handle_trial_expiry         — 빌링키 없는(무카드 레퍼럴) 트라이얼 만료 → 다운그레이드
 8. handle_cancelled_expiry     — 해지 예약 구독 기간 만료 → 다운그레이드
+9. revive_quota_skipped_dms    — 유료 전환/업그레이드 직후 월 DM 한도로 스킵된 DM 되살림
+   (주기 배치가 아니라 결제 확정 흐름이 on_commit 으로 호출)
 
 중복 과금 방지 원칙:
 - 과금 1회 시도 = PENDING PaymentHistory 1행. toss_order_id 는 주기·차수당
@@ -801,8 +803,13 @@ def _webhook_billing_deleted(log) -> None:
             SubscriptionStatus.PAUSED,
         ):
             # paused 중 카드 삭제 → 재개 과금이 불가하므로 해지로 전환(정지 필드는 정리).
+            # T-1: 체험 중이었다면 그것도 '체험 중 취소'다(사용자 행동으로 촉발된 해지).
+            cancelled_now = timezone.now()  # 두 필드가 **같은 시각**이어야 한다(취소 뷰와 동일)
+            if locked.status == SubscriptionStatus.TRIALING:
+                locked.cancelled_during_trial_at = cancelled_now
+                update_fields.append("cancelled_during_trial_at")
             locked.status = SubscriptionStatus.CANCELLED
-            locked.cancelled_at = timezone.now()
+            locked.cancelled_at = cancelled_now
             update_fields += ["status", "cancelled_at"]
             if locked.pause_ends_at or locked.paused_months:
                 locked.pause_ends_at = None
@@ -978,7 +985,9 @@ def _downgrade_to_free(sub, free_plan, reason: str = ""):
     """구독을 free 플랜으로 다운그레이드 + 페이지 축소 + 로고 복원.
 
     유지하는 것: trial_used_at(트라이얼 1인 1회 어뷰징 방어), toss_customer_key(유저 고정),
-    커스텀 CSS(free 도 허용 — 지우면 데이터 파괴).
+    커스텀 CSS(free 도 허용 — 지우면 데이터 파괴),
+    **trial_plan · cancelled_during_trial_at**(T-1 체험 이력의 내구 기록 — 아래 update_fields
+    에 넣지 말 것. 넣는 순간 "무슨 플랜 체험이었나 / 체험 중 취소였나"가 영구 소실된다).
     """
     from apps.pages.models import Page
 
@@ -1364,3 +1373,82 @@ def snapshot_daily_metrics(target_date: str | None = None):
         len(cohort),
     )
     return {"date": str(snap_date), "paying": agg["n"] or 0, "cohorts": len(cohort)}
+
+
+# 되살림 상한 — 한 번의 유료 전환에서 처리할 최대 건수 (비정상 폭주 방어).
+QUOTA_REVIVE_MAX_LOGS = 500
+
+
+@shared_task(name="billing.revive_quota_skipped_dms")
+def revive_quota_skipped_dms(user_id: str):
+    """유료 전환/업그레이드 직후, 월 DM 한도로 SKIPPED 된 DM 을 되살린다.
+
+    한도 소진으로 종결된 로그는 REVIVABLE 이지만 되살리는 주체가 없었다 — 고객이 돈을 더
+    내고 프로로 올려도 한도에 걸려 못 보낸 리드는 그대로 유실됐다(CS #4f7efa1d, 2026-08-03:
+    베이직 200건 소진 → 3시간 반 동안 25건 스킵 → 프로 업그레이드 후에도 자동 복구 없음).
+
+    - 대상: `error_message="monthly_dm_limit_reached"` 인 SKIPPED 만. 다른 사유의
+      SKIPPED(캠페인 일시정지·발송 시간대 밖)는 그 조건이 풀릴 때 되살아나야 하므로 건드리지
+      않는다.
+    - 되살림은 `SentDMLog.revive()` — 같은 row·같은 idempotency_key 재사용이라 중복 발송
+      위험이 없고, 메시징 윈도우(댓글 7일 / user_id 24h) 밖이면 스스로 거른다.
+      **24h 짜리(follow-gate reward·재안내)는 하루 안에 되살려야 살아난다** — 그래서 배치가
+      아니라 결제 확정 직후 호출한다.
+    - 새 플랜에서도 한도를 못 넘으면(free→basic 등 200 유지) 되살리지 않는다. 되살리자마자
+      다시 SKIPPED 되면 로그만 더럽히고 윈도우만 태운다.
+    - 실패는 삼킨다: 결제 확정 흐름의 부가 효과이므로 여기서 예외가 결제를 되돌리면 안 된다.
+    """
+    from django.contrib.auth import get_user_model
+    from django.core.cache import cache
+
+    from apps.integrations.models import SentDMLog
+
+    from .dm_limits import _quota_hit_cache_key, check_dm_quota
+
+    user = get_user_model().objects.filter(pk=user_id).first()
+    if not user:
+        return {"revived": 0, "reason": "user_not_found"}
+
+    # 이전 플랜에서 세워진 '한도 도달' 캐시 플래그를 먼저 걷어낸다 — 안 걷으면 아래
+    # check_dm_quota 가 재계산 없이 옛 결론(차단)을 그대로 반복한다.
+    try:
+        cache.delete(_quota_hit_cache_key(user.id))
+    except Exception:  # noqa: BLE001 - 캐시 장애가 되살림을 막을 이유는 없다
+        logger.warning("revive_quota_skipped_dms: 쿼터 플래그 삭제 실패 user=%s", user_id)
+
+    allowed, used, limit = check_dm_quota(user)
+    if not allowed:
+        logger.info(
+            "revive_quota_skipped_dms: 새 플랜도 한도 초과 — 되살림 없음 user=%s %s/%s",
+            user_id,
+            used,
+            limit,
+        )
+        return {"revived": 0, "reason": "still_over_limit", "used": used, "limit": limit}
+
+    logs = list(
+        SentDMLog.objects.filter(
+            campaign__ig_connection__workspace__owner=user,
+            status=SentDMLog.Status.SKIPPED,
+            error_message="monthly_dm_limit_reached",
+            # 최장 윈도우(댓글 7일)를 넘은 건은 revive() 가 어차피 거른다 — 스캔 자체를 줄인다.
+            created_at__gte=timezone.now() - timedelta(days=7),
+        ).order_by("created_at")[:QUOTA_REVIVE_MAX_LOGS]
+    )
+    revived = 0
+    for log in logs:
+        try:
+            if log.revive(reason="plan_upgrade_quota_revive"):
+                revived += 1
+        except Exception:  # noqa: BLE001 - 건별 실패가 나머지를 막지 않게
+            logger.exception("revive_quota_skipped_dms: revive 실패 log=%s", log.id)
+
+    if logs:
+        logger.info(
+            "revive_quota_skipped_dms: user=%s revived=%s/%s limit=%s",
+            user_id,
+            revived,
+            len(logs),
+            limit,
+        )
+    return {"revived": revived, "scanned": len(logs), "limit": limit}
