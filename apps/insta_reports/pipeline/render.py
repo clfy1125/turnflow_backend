@@ -135,21 +135,85 @@ def _top_cluster_line(top_posts: list) -> str:
     return "상위 영상이 여러 시기에 고르게 나왔어요"
 
 
-DONUT_GROUPS = [
-    ("감탄·공감", ["praise", "empathy"], "#34d399", "순수 호응이에요. 내용이 좋았다는 신호."),
-    ("자료 요청", ["request"], "#e1306c", "받아갈 것을 원해요. 관심이 가장 높은 반응이에요."),
-    (
-        "DM 못 받았다는 문의",
-        ["dm_not_received"],
-        "#f87171",
+# 도넛 = **댓글 분류 전량**. 카테고리마다 색·설명을 여기서 갖는다.
+# ⚠️ 예전에는 `DONUT_GROUPS` 가 옛 카테고리 7개를 하드코딩해, 분류 체계를 범용 15종으로
+#    넓힌 뒤 **새 카테고리 765개(886개 중)가 도넛에서 조용히 사라졌다**(2026-08-04 실측:
+#    도넛 합계 121/886). 그래서 이제 카테고리 목록에서 파생하고, 합계가 분석 수와 같은지
+#    테스트로 고정한다. 새 카테고리를 추가하면 여기에도 반드시 넣어야 한다(누락 시 테스트 실패).
+CATEGORY_DONUT = {
+    "opinion": ("#8b7bf0", "자기 생각·정보를 보태는 댓글이에요. 할 말이 있는 시청자예요."),
+    "debate": ("#f87171", "시청자끼리 맞서는 댓글이에요. 참여는 높지만 분위기를 해칠 수 있어요."),
+    "hostile": ("#dc2626", "욕설·비방이에요. 방치하면 다른 사람이 댓글을 남기기 꺼려져요."),
+    "reaction": ("#34d399", "ㅋㅋ·이모지 같은 짧은 반응이에요. 가볍게 재밌었다는 신호."),
+    "praise": ("#10b981", "내용을 콕 집어 칭찬한 댓글이에요. 무엇이 좋았는지 알 수 있어요."),
+    "empathy": ("#5eead4", "공감·동의예요. 소재가 시청자 경험과 맞닿았다는 뜻이에요."),
+    "support": ("#c86dd7", "크리에이터 자체를 좋아하는 반응이에요."),
+    "curiosity": ("#fd7e2a", "더 알고 싶다는 궁금증이에요 — 다음 콘텐츠 소재로 바로 쓸 수 있어요."),
+    "personal_story": ("#6ea8fe", "자기 경험을 나눈 댓글이에요. 소재 발굴에 가장 쓸모 있어요."),
+    "request": ("#e1306c", "자료·혜택을 원해요. 관심이 가장 높은 반응이에요."),
+    "question": ("#fbbf24", "조건·방법을 묻는 질문이에요. 시작을 망설이는 사람들이에요."),
+    "testimonial": ("#38bdf8", "직접 해본 후기예요 — 가장 강한 신뢰 신호예요."),
+    "dm_not_received": (
+        "#ef4444",
         "약속한 자료·DM이 안 갔다는 문의예요. 팔로워 니즈가 아니라 발송이 실패했다는 신호라서 "
         "따로 분리했어요.",
     ),
-    ("질문", ["question"], "#fd7e2a", "시작을 망설이는 사람들 — 다음 콘텐츠 소재이기도 해요."),
-    ("후기·경험", ["testimonial"], "#6ea8fe", "직접 해본 사람들 — 가장 강한 신뢰 신호예요."),
-    ("응원·팬심", ["support"], "#c86dd7", "크리에이터 자체를 좋아하는 반응이에요."),
-    ("기타", ["other"], "#6d6485", "이모지·짧은 반응 등이에요."),
-]
+    "foreign": ("#94a3b8", "한국어가 아닌 댓글이에요. 해외에서 유입되고 있다는 뜻이에요."),
+    "other": ("#6d6485", "위 어디에도 넣기 어려운 댓글이에요."),
+    "unclassified": (
+        "#475569",
+        "분류에 실패한 댓글이에요. 이 비중이 크면 아래 비율을 참고로만 보세요.",
+    ),
+}
+# 이 비율 미만 조각은 '기타'로 합쳐 도넛이 실오라기로 뒤덮이지 않게 한다.
+DONUT_MIN_PCT = 2
+
+
+def _build_donut(cstats: dict) -> tuple[list, list, list, list]:
+    """(labels, counts, colors, legend) — **분류 전량**이 들어간다(합계 = n_analyzed)."""
+    from .comments import CATEGORY_KO
+
+    n = max(1, cstats.get("n_analyzed") or 0)
+    counts = cstats.get("counts") or {}
+    rows, small = [], 0
+    for cat, cnt in sorted(counts.items(), key=lambda x: -x[1]):
+        if not cnt:
+            continue
+        color, desc = CATEGORY_DONUT.get(cat, ("#6d6485", ""))
+        pct = round(cnt / n * 100)
+        if cat != "other" and pct < DONUT_MIN_PCT:
+            small += cnt  # 작은 조각은 기타로 흡수
+            continue
+        rows.append(
+            {
+                "cat": cat,
+                "label": CATEGORY_KO.get(cat, cat),
+                "cnt": cnt,
+                "color": color,
+                "desc": desc,
+            }
+        )
+    if small:
+        etc = next((r for r in rows if r["cat"] == "other"), None)
+        if etc:
+            etc["cnt"] += small
+        else:
+            color, desc = CATEGORY_DONUT["other"]
+            rows.append(
+                {"cat": "other", "label": "기타", "cnt": small, "color": color, "desc": desc}
+            )
+        rows.sort(key=lambda r: -r["cnt"])
+
+    labels, vals, colors, legend = [], [], [], []
+    for r in rows:
+        pct = round(r["cnt"] / n * 100)
+        labels.append(f"{r['label']} {pct}%")
+        vals.append(r["cnt"])
+        colors.append(r["color"])
+        legend.append({"label": r["label"], "pct": pct, "color": r["color"], "desc": r["desc"]})
+    return labels, vals, colors, legend
+
+
 MOTIVATION_ICON = {
     "practical": "🛠️",
     "question": "🐣",
@@ -266,17 +330,8 @@ def render_report_v3(
             {**p, "date_short": p["date_kst"][2:].replace("-", "."), "start_desc": start}
         )
 
-    # 도넛 + 범례
-    donut_labels, donut_counts, donut_colors, donut_legend = [], [], [], []
-    for label, cats, color, desc in DONUT_GROUPS:
-        cnt = sum(cstats["counts"].get(c, 0) for c in cats)
-        if cnt == 0:
-            continue
-        pct = round(cnt / max(1, cstats["n_analyzed"]) * 100)
-        donut_labels.append(f"{label} {pct}%")
-        donut_counts.append(cnt)
-        donut_colors.append(color)
-        donut_legend.append({"label": label, "pct": pct, "color": color, "desc": desc})
+    # 도넛 + 범례 (분류 전량 — 합계가 n_analyzed 와 같아야 한다)
+    donut_labels, donut_counts, donut_colors, donut_legend = _build_donut(cstats)
 
     # 인용 해석 (quote_id → 원문)
     id2 = {}

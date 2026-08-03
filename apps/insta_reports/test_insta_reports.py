@@ -1097,6 +1097,69 @@ class TestCommentClassificationRobustness:
         assert set(CATEGORIES) - grouped == {"other", "unclassified"}
 
 
+class TestDonutShowsEveryComment:
+    """도넛은 **분류 전량**을 담아야 한다 (합계 = 분석한 댓글 수).
+
+    2026-08-04 실측 결함: `DONUT_GROUPS` 가 옛 카테고리 7개를 하드코딩하고 있어서, 분류를
+    범용 15종으로 넓힌 뒤 **새 카테고리 765개(886개 중)가 도넛에서 조용히 사라졌다**
+    (도넛 합계 121/886 = 14%). 데이터(`comment_stats.counts`)만 확인하고 화면을 안 봐서
+    놓쳤다 → 합계를 단언해 다시는 놓치지 않게 한다.
+    """
+
+    def _cstats(self, counts):
+        return {"counts": counts, "n_analyzed": sum(counts.values())}
+
+    def test_sum_equals_analyzed_total(self):
+        from .pipeline.render import _build_donut
+
+        counts = {  # 진용진 실측 분포
+            "opinion": 341,
+            "debate": 117,
+            "hostile": 114,
+            "reaction": 83,
+            "personal_story": 64,
+            "other": 40,
+            "praise": 38,
+            "curiosity": 30,
+            "support": 24,
+            "empathy": 16,
+            "foreign": 16,
+            "question": 3,
+        }
+        cs = self._cstats(counts)
+        _labels, vals, colors, legend = _build_donut(cs)
+        assert sum(vals) == cs["n_analyzed"], f"{sum(vals)} != {cs['n_analyzed']}"
+        assert len(vals) == len(colors) == len(legend)
+        assert sum(r["pct"] for r in legend) >= 97  # 반올림 오차만 허용
+
+    def test_every_category_has_a_colour_and_desc(self):
+        """새 카테고리를 추가하고 도넛에 안 넣으면 여기서 걸린다."""
+        from .pipeline.comments import CATEGORIES
+        from .pipeline.render import CATEGORY_DONUT
+
+        assert set(CATEGORIES) == set(CATEGORY_DONUT), set(CATEGORIES) ^ set(CATEGORY_DONUT)
+        for cat, (color, desc) in CATEGORY_DONUT.items():
+            assert color.startswith("#") and desc, cat
+
+    def test_tiny_slices_merge_into_other(self):
+        from .pipeline.render import _build_donut
+
+        cs = self._cstats({"opinion": 990, "question": 5, "foreign": 5, "other": 0})
+        _labels, vals, _colors, legend = _build_donut(cs)
+        assert sum(vals) == 1000
+        labels = [r["label"] for r in legend]
+        assert "기타" in labels and "조건·방법 질문" not in labels
+
+    def test_unclassified_is_visible_not_hidden(self):
+        """분류 실패는 숨기지 말고 보여야 한다(리포트가 거짓말하지 않게)."""
+        from .pipeline.render import _build_donut
+
+        cs = self._cstats({"opinion": 500, "unclassified": 500})
+        _labels, vals, _colors, legend = _build_donut(cs)
+        assert sum(vals) == 1000
+        assert any("분류 못함" in r["label"] for r in legend)
+
+
 class TestAdviceBranchesByAccountScale:
     """조언이 계정 규모·도달 방식에 따라 갈려야 한다.
 
