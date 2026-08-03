@@ -3,7 +3,7 @@
 ⚠️ 이 저장소의 pytest DB 는 dev DB 를 그대로 쓴다(깨끗하지 않다) → 전역 카운트 단언 금지,
    픽스처 이메일/슬러그는 uuid, 집계는 델타로 확인.
 ⚠️ 파일명은 `test_*.py` (tests_*.py 는 자동수집 안 됨).
-⚠️ dev 는 USE_R2=True 라 그냥 저장하면 **공유 R2 버킷**에 쓰인다 → PDF 를 만드는 테스트는
+⚠️ dev 는 USE_R2=True 라 그냥 저장하면 **공유 R2 버킷**에 쓰인다 → 산출물을 만드는 테스트는
    반드시 로컬 임시 스토리지로 오버라이드한다(`local_media` 픽스처).
 """
 
@@ -89,7 +89,7 @@ def pro_setup():
 
 @pytest.fixture
 def local_media(settings, tmp_path):
-    """PDF 를 공유 R2 대신 임시 로컬 디스크에 쓰게 한다."""
+    """리포트 파일을 공유 R2 대신 임시 로컬 디스크에 쓰게 한다."""
     settings.STORAGES = {
         "default": {
             "BACKEND": "django.core.files.storage.FileSystemStorage",
@@ -283,8 +283,8 @@ class TestDetailAndDownload:
         assert steps["collecting"] == "done"
         assert steps["extracting"] == "active"
         assert steps["synthesizing"] == "pending"
-        assert body["pdf_ready"] is False
-        assert body["pdf_download_url"] is None
+        assert body["download_ready"] is False
+        assert body["download_url"] is None
 
     def test_failed_detail_has_korean_message(self, pro_setup):
         user, ws, conn = pro_setup
@@ -311,9 +311,10 @@ class TestDetailAndDownload:
         )
         res = _client(user).get(f"{BASE}{report.id}/download/")
         assert res.status_code == 409
-        assert res.json()["error"]["details"]["code"] == "PDF_NOT_READY"
+        assert res.json()["error"]["details"]["code"] == "FILE_NOT_READY"
 
-    def test_download_serves_pdf(self, pro_setup, local_media):
+    def test_download_serves_html_as_attachment(self, pro_setup, local_media):
+        """리포트에 팔로워 댓글 원문 + 인라인 스크립트가 있으므로 절대 inline 렌더하지 않는다."""
         from django.core.files.base import ContentFile
 
         user, ws, conn = pro_setup
@@ -323,11 +324,13 @@ class TestDetailAndDownload:
             requested_by=user,
             status=ReportStatus.SUCCEEDED,
         )
-        report.pdf_file.save("x.pdf", ContentFile(b"%PDF-1.4 fake"), save=True)
+        report.html_file.save("x.html", ContentFile(b"<!DOCTYPE html><p>hi</p>"), save=True)
         res = _client(user).get(f"{BASE}{report.id}/download/")
         assert res.status_code == 200
-        assert res["Content-Type"] == "application/pdf"
-        assert "attachment" in res["Content-Disposition"]
+        assert res["Content-Type"] == "text/html; charset=utf-8"
+        assert res["Content-Disposition"].startswith("attachment")
+        assert res["Content-Disposition"].endswith('.html"')
+        assert res["X-Content-Type-Options"] == "nosniff"
 
     def test_other_user_cannot_read_or_download(self, pro_setup, local_media):
         from django.core.files.base import ContentFile
@@ -339,7 +342,7 @@ class TestDetailAndDownload:
             requested_by=user,
             status=ReportStatus.SUCCEEDED,
         )
-        report.pdf_file.save("x.pdf", ContentFile(b"%PDF-1.4 fake"), save=True)
+        report.html_file.save("x.html", ContentFile(b"<!DOCTYPE html>"), save=True)
         stranger = _client(_user("nosy"))
         assert stranger.get(f"{BASE}{report.id}/").status_code == 404
         assert stranger.get(f"{BASE}{report.id}/download/").status_code == 404
@@ -392,6 +395,40 @@ class TestQuotaUnit:
         assert verdict["limit"] == -1
         assert verdict["can_generate"] is True
 
+    def test_admin_plan_is_unlimited(self, monkeypatch):
+        """어드민 **플랜**(is_staff 아님)도 무제한 — features 가 -1 이라서.
+
+        내부 검증·CS 계정이 프론트 테스트를 반복할 수 있어야 한다.
+        """
+        user = _user("adminplan")
+        _plan(user, "admin")
+        ws = _ws(user)
+        conn = _conn(ws)
+        for _ in range(3):
+            InstagramReport.objects.create(
+                workspace=ws,
+                ig_connection=conn,
+                requested_by=user,
+                status=ReportStatus.SUCCEEDED,
+                quota_consumed=True,
+            )
+        assert quota.monthly_allowance(user) == -1
+        verdict = quota.evaluate(conn, user)
+        assert verdict["limit"] == -1
+        assert verdict["remaining"] == -1
+        assert verdict["can_generate"] is True
+        summary = quota.quota_summary(user, [conn])
+        assert summary["total_limit"] == -1
+        assert summary["total_remaining"] == -1
+
+        # API 로도 통과해야 한다(429 가 아니라 202)
+        monkeypatch.setattr(
+            "apps.insta_reports.views.generate_insta_report.delay",
+            lambda rid: type("R", (), {"id": "t"})(),
+        )
+        res = _client(user).post(BASE, {"connection_id": str(conn.id)}, format="json")
+        assert res.status_code == 202, res.content
+
 
 # ── 진행률 계약 ──────────────────────────────────────────────────────
 def test_progress_stages_cover_0_to_100_without_gaps():
@@ -427,10 +464,13 @@ class TestFakePipelineE2E:
     렌더 계약(템플릿 변수·차트 데이터)이 깨지면 여기서 잡힌다.
     """
 
-    def test_generate_produces_pdf_and_coverage(self, pro_setup, local_media, settings):
+    def test_generate_produces_selfcontained_html_and_coverage(
+        self, pro_setup, local_media, settings
+    ):
         from . import service
 
         settings.INSTA_REPORT_FAKE_MODE = True
+        settings.INSTA_REPORT_FAKE_DELAY_SECONDS = 0  # 테스트는 페이싱 대기 없이
         user, ws, conn = pro_setup
         report = InstagramReport.objects.create(
             workspace=ws,
@@ -445,8 +485,16 @@ class TestFakePipelineE2E:
         assert report.status == ReportStatus.SUCCEEDED
         assert report.stage == ReportStage.DONE
         assert report.progress == 100
-        assert report.pdf_bytes > 100_000, "PDF 가 너무 작다 — 차트/이미지 렌더 실패 의심"
-        assert report.pdf_file.name.endswith(".pdf")
+        assert report.html_bytes > 150_000, "HTML 이 너무 작다 — Chart.js 인라인 실패 의심"
+        assert report.html_file.name.endswith(".html")
+        # 다운로드한 파일이 인터넷 없이 열려야 한다: 외부 스크립트 참조 0 + 차트 라이브러리 내장
+        html = report.html_file.open("rb").read().decode("utf-8")
+        assert (
+            "<script src=" not in html
+        ), "외부 스크립트 참조가 남아 있으면 오프라인에서 차트가 빈다"
+        assert ".Chart=e()" in html, "Chart.js UMD 본문이 인라인되지 않았다"
+        assert html.count('class="tab"') + html.count('class="tab active"') == 4  # 탭 4개
+        assert "new Chart(" in html
         assert report.posts_analyzed > 0
         assert report.reels_with_views >= 5
         assert report.videos_analyzed > 0
@@ -461,6 +509,7 @@ class TestFakePipelineE2E:
         from .pipeline import fake_mode as fm
 
         settings.INSTA_REPORT_FAKE_MODE = True
+        settings.INSTA_REPORT_FAKE_DELAY_SECONDS = 0
         # 릴스가 3개뿐인 계정 → 진입 게이트(MIN_REELS_FOR_REPORT=5)에 걸려야 한다.
         original = fm.write_sources
         monkeypatch.setattr(
@@ -525,3 +574,168 @@ class TestTaskGuards:
         assert stale.error_code == ReportErrorCode.TIMEOUT
         assert stale.quota_consumed is False
         assert fresh.status == ReportStatus.RUNNING
+
+
+# ── 가짜 모드 페이싱 (프론트 진행률 UX 검증용) ────────────────────────
+@pytest.mark.django_db
+class TestFakePacing:
+    def test_scale_shrinks_expected_times_proportionally(self, settings):
+        """가짜 모드의 예상 소요는 실제 비중을 유지한 채 총 N초로 줄어든다."""
+        from . import service
+
+        settings.INSTA_REPORT_FAKE_MODE = True
+        settings.INSTA_REPORT_FAKE_DELAY_SECONDS = 10
+
+        scale = service.fake_time_scale()
+        assert 0 < scale < 1
+        # 실제 총합(대기 단계 제외) × 배율 ≈ 설정한 총 소요
+        assert round(service._PACED_TOTAL_EXPECTED * scale) == 10
+        # 가장 긴 구간(영상 분석 360s)이 여전히 가장 길다 = 비중 유지
+        assert service._expected(ReportStage.EXTRACTING) > service._expected(ReportStage.COLLECTING)
+        assert service._expected(ReportStage.RENDERING) >= 1  # 0초로 죽지 않는다
+
+    def test_scale_is_1_when_fake_mode_off(self, settings):
+        from . import service
+
+        settings.INSTA_REPORT_FAKE_MODE = False
+        assert service.fake_time_scale() == 1.0
+        assert service._expected(ReportStage.EXTRACTING) == progress.stage_expected(
+            ReportStage.EXTRACTING
+        )
+
+    def test_steps_and_eta_are_scaled_in_fake_mode(self, pro_setup, settings):
+        """서버가 10초에 끝나는데 프론트가 '18분 남음' 을 보면 안 된다."""
+        from .serializers import ReportSerializer
+
+        user, ws, conn = pro_setup
+        report = InstagramReport.objects.create(
+            workspace=ws,
+            ig_connection=conn,
+            requested_by=user,
+            status=ReportStatus.RUNNING,
+            stage=ReportStage.COLLECTING,
+            stage_started_at=timezone.now(),
+        )
+        settings.INSTA_REPORT_FAKE_MODE = False
+        real = ReportSerializer(report).data
+        settings.INSTA_REPORT_FAKE_MODE = True
+        settings.INSTA_REPORT_FAKE_DELAY_SECONDS = 10
+        fake = ReportSerializer(report).data
+
+        assert real["eta_seconds"] > 600  # 실제는 10분 이상
+        assert fake["eta_seconds"] <= 12  # 가짜는 10초 안팎
+        by_key = {s["key"]: s for s in fake["steps"]}
+        assert by_key["extracting"]["expected_seconds"] < 10
+        # 진행률 구간은 절대 바뀌지 않는다(퍼센트 계약은 그대로)
+        assert by_key["extracting"]["progress_start"] == 30
+        assert by_key["extracting"]["progress_end"] == 65
+
+    def test_pacer_spans_cover_full_timeline(self):
+        from .service import _PACED_STAGES, _FakePacer
+
+        pacer = _FakePacer(10)
+        spans = [pacer._span[s["key"]] for s in _PACED_STAGES]
+        assert spans[0][0] == 0.0
+        assert spans[-1][1] == pytest.approx(1.0)
+        # 인접 쌍 비교(pairwise) — 길이가 1 다르므로 strict=False 가 맞다
+        for prev, cur in zip(spans, spans[1:], strict=False):
+            assert prev[1] == pytest.approx(cur[0])  # 틈·겹침 없음
+
+    def test_pacing_actually_slows_the_run(self, pro_setup, local_media, settings):
+        """페이싱이 실제로 대기를 넣는지 — 같은 일을 하는 두 실행을 비교한다.
+
+        절대 시간으로 단언하면 PDF(Chromium) 속도에 따라 깨진다. 대기 예산만 다르게 준
+        두 실행의 차이로 검증하면 머신 속도와 무관하다.
+        """
+        import time as _time
+
+        from . import service
+
+        settings.INSTA_REPORT_FAKE_MODE = True
+        user, ws, conn = pro_setup
+
+        def _run(delay: float) -> float:
+            settings.INSTA_REPORT_FAKE_DELAY_SECONDS = delay
+            report = InstagramReport.objects.create(
+                workspace=ws, ig_connection=conn, requested_by=user, ig_username=conn.username
+            )
+            t0 = _time.monotonic()
+            service.generate(report)
+            report.refresh_from_db()
+            assert report.status == ReportStatus.SUCCEEDED
+            return _time.monotonic() - t0
+
+        instant = _run(0)  # 대기 없음 = 실작업 시간만
+        paced = _run(8)  # 예산 max(8-4, 2.4) = 4초 대기 추가
+        budget = 8 - service._FAKE_TAIL_RESERVE_SECONDS
+        assert paced >= instant + budget * 0.7, (instant, paced)
+        assert paced <= instant + budget + 5, (instant, paced)  # 과다 대기도 없어야
+
+
+# ── 리포트 문장 품질 (2026-08-03 사용자 피드백) ────────────────────────
+class TestReportWording:
+    """ "이 영상은 46.7만을 기록했고…" 처럼 **어떤 영상인지 모르는 문장**을 막는다."""
+
+    def test_object_particle_follows_final_consonant(self):
+        from .pipeline.verify_v3 import eul
+
+        assert eul("46.7만") == "을"  # 만 = 받침 있음
+        assert eul("9,596") == "을"  # 육 = 받침 있음
+        assert eul("12") == "를"  # 이 = 받침 없음
+        assert eul("3.1만") == "을"
+
+    def test_post_ref_names_rank_date_and_title(self):
+        from .pipeline.verify_v3 import post_ref
+
+        ref = post_ref(
+            {"date_kst": "2025-10-20", "title": "이제 이거 모르면 안됩니다...최신 트렌드 AI 공유"},
+            1,
+        )
+        assert ref.startswith("1위 영상")
+        assert "10월 20일" in ref
+        assert "“" in ref  # 첫 문장 인용
+        assert "..." not in ref  # 연속 말줄임은 …로 정리
+
+    @pytest.mark.parametrize(
+        "text,should_fail",
+        [
+            ("이 영상은 46.7만을 기록했고, 평소보다 훨씬 높았어요.", True),
+            ("그 영상은 좋았어요.", True),
+            ("1위 영상이 46.7만을 기록했어요.", False),  # 순위로 지목
+            ("이 영상(10월 20일)은 46.7만을 기록했어요.", False),  # 날짜로 지목
+            ("그 영상은 “이거 모르면 안됩니다”로 시작했어요.", False),  # 인용으로 지목
+            ("이 영상들은 대체로 조회수가 낮았어요.", False),  # 복수 = 특정 게시물 아님
+            ("영상 75개 중 32개가 1만 미만이에요.", False),
+        ],
+    )
+    def test_vague_post_reference_is_rejected(self, text, should_fail):
+        from .pipeline.verify_v3 import POST_IDENTIFIED, VAGUE_POST_REF
+
+        vague = bool(VAGUE_POST_REF.search(text))
+        identified = bool(POST_IDENTIFIED.search(text))
+        assert (vague and not identified) is should_fail, text
+
+    def test_fallback_recommendation_identifies_the_post(self, tmp_path):
+        """폴백 추천의 '이유' 는 반드시 어떤 영상인지 밝힌다.
+
+        지표 픽스처를 손으로 쓰면 실제 스키마와 어긋난다 → 합성 데이터로 **실제 지표 엔진**을
+        돌려서 얻는다(계약이 바뀌면 이 테스트가 먼저 깨진다).
+        """
+        from .pipeline import aggregate, config, fake_mode
+        from .pipeline import metrics as metrics_mod
+        from .pipeline import normalize, sampler, verify_v3
+        from .pipeline.verify_v3 import POST_IDENTIFIED
+
+        config.bind_run(tmp_path)
+        fake_mode.write_sources("wording_test")
+        canon = normalize.build_canonical("wording_test")
+        metrics = metrics_mod.build_metrics(canon)
+        sample = sampler.build_sample(canon)
+        extraction = fake_mode.fake_extraction(canon, sample)
+        agg = aggregate.build_aggregates(canon, metrics, extraction, sample)
+
+        slots = verify_v3.fallback_slots_v3(metrics, agg)
+        why = slots["recommendations"][0]["why"]
+        assert POST_IDENTIFIED.search(why), why
+        assert "만를" not in why  # 조사 오류 회귀 방지
+        assert "이 영상은" not in why  # 정체 불명 지시어 회귀 방지

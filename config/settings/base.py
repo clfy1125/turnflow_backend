@@ -398,7 +398,7 @@ CELERY_TASK_ROUTES = {
     "apps.ai_jobs.tasks.*": {"queue": "ai_jobs"},
     # DM 캠페인 이전 분석(최대 ~25분 LLM/IO) — dm_send/webhook 큐 블로킹 방지 위해 ai_jobs 로.
     "integrations.run_dm_migration_job": {"queue": "ai_jobs"},
-    # 인스타 성장 리포트 — 1건 13~18분(영상 30여개 AI 분석 + 추론모델 합성 + Chromium PDF).
+    # 인스타 성장 리포트 — 1건 13~18분(영상 30여개 AI 분석 + 추론모델 합성 + HTML 렌더).
     # 전용 큐 + 전용 워커(-Q reports -c 2 --max-tasks-per-child=1) 로 완전 격리한다.
     "insta_reports.*": {"queue": "reports"},
 }
@@ -934,6 +934,10 @@ INSTA_REPORT_EXTRACT_CONCURRENCY = config("INSTA_REPORT_EXTRACT_CONCURRENCY", de
 # 개발/테스트용 오프라인 모드 — 외부 호출 0으로 합성 데이터로 전 구간 통과(프론트 통합용).
 # ⚠️ prod 에서 True 면 가짜 리포트가 발급된다. 절대 켜지 말 것.
 INSTA_REPORT_FAKE_MODE = config("INSTA_REPORT_FAKE_MODE", default=False, cast=bool)
+# 가짜 모드 총 소요(초). 실제 단계 비중(수집 11%·영상분석 33%·합성 24% …)대로 이 시간에 걸쳐
+# 진행률이 흐른다 → 프론트가 퍼센트/단계 UX 를 실제와 같은 모양으로 검증할 수 있다.
+# 0 이면 대기 없이 최대 속도(테스트용). FAKE_MODE=False 면 무시된다.
+INSTA_REPORT_FAKE_DELAY_SECONDS = config("INSTA_REPORT_FAKE_DELAY_SECONDS", default=10, cast=float)
 
 # ===== 댓글 웹훅 누락 보정 (integrations.poll_missed_comments) =====
 # Instagram comments 웹훅이 유실되면 트리거 댓글이 누락되므로, 시간당 댓글 edge 를 재조회해

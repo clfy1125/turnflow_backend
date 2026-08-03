@@ -37,7 +37,9 @@ CORS_ALLOW_HEADERS = [
 ]
 # 브라우저 JS 에 노출할 응답 헤더 (prod.py 와 동일하게 유지) —
 # X-Cache = 어드민 대시보드 캐시 히트 여부(HIT/MISS/BYPASS, ?refresh=1 적용 확인용)
-CORS_EXPOSE_HEADERS = ["X-Cache", "X-Request-ID"]
+# Content-Disposition: 리포트 다운로드(insta-reports/{id}/download/)에서 프론트가 파일명을
+# 읽어야 한다 — 노출하지 않으면 크로스 오리진에서 JS 가 헤더를 볼 수 없다.
+CORS_EXPOSE_HEADERS = ["X-Cache", "X-Request-ID", "Content-Disposition"]
 
 # REST Framework - Add BrowsableAPIRenderer for development
 REST_FRAMEWORK["DEFAULT_RENDERER_CLASSES"] = [

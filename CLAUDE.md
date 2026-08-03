@@ -36,7 +36,7 @@ Instagram Business 계정의 댓글 수집/분류, 자동 DM 발송, 키워드 �
 | GeoIP | `geoip2` + GeoLite2-Country.mmdb |
 | LLM | `openai` SDK + `httpx` |
 | 결제 | 토스페이먼츠 빌링(자동결제) — httpx 직접 연동 (`apps/billing/toss_service.py`) |
-| 리포트 렌더 | Jinja2(리포트 HTML) + playwright/chromium(PDF) + Chart.js(벤더링) |
+| 리포트 렌더 | Jinja2 + Chart.js 인라인 → **자기완결 HTML 1파일**(다운로드 산출물) |
 | 테스트 | pytest + pytest-django + factory-boy + faker |
 | 포매터/린터 | Black, isort, Ruff, flake8 |
 | 컨테이너 | Docker + Docker Compose |
@@ -57,9 +57,9 @@ turnflow_backend/
 │   ├── pages/                  # 페이지/게시물/DM 관련 뷰 (multi_views, image_views, stats, aiviews)
 │   ├── ai_jobs/                # LLM 작업 큐 + services(llm_client, model_router, prompt_builder)
 │   ├── analytics/              # 랜딩 방문 추적(LandingVisit) + 가입 어트리뷰션(SignupAttribution) — POST /api/v1/track/visit/ (공개·silent 204), 채널 파생 단일 소스 channels.derive_channel()
-│   ├── insta_reports/          # 인스타 성장 리포트(프로 전용·IG 계정당 월1회) — 공개 데이터로 PDF 리포트 생성.
+│   ├── insta_reports/          # 인스타 성장 리포트(프로 전용·IG 계정당 월1회) — 공개 데이터로 HTML 리포트 생성.
 │   │                           #   pipeline/(랩 이식: 수집→지표→샘플→Gemini 피처→집계→DeepSeek 합성→검증→렌더) +
-│   │                           #   pdf.py(playwright) + quota.py + progress.py. 마운트: /api/v1/insta-reports/
+│   │                           #   quota.py + progress.py. 산출물=자기완결 HTML. 마운트: /api/v1/insta-reports/
 │   └── admin_api/              # 백오피스(어드민) 전용 API — 신원/대시보드(overview + 운영/마케팅: dashboard_ops·dashboard_marketing, 임계값=dashboard_constants.py)/회원/워크스페이스/페이지/자동DM 모니터링/레퍼럴 코드/마케팅 채널링크(marketing/channel-links — UTM 링크 서버 저장 CRUD, MarketingChannelLink·url/channel 서버 계산) (serializers/, views/ 패키지 + AdminActionLog 감사로그). 마운트: /api/v1/admin/
 ├── config/                     # Django 프로젝트 설정
 │   ├── settings/               # base.py / local.py / prod.py
@@ -262,12 +262,12 @@ make test-cov                             # HTML 커버리지 리포트
   - `billing.notify_pause_resume_reminder` — 매일 09:30 KST (정지 재개 3일 전 사전 고지 메일)
   - `billing.send_winback_emails` — 매일 10:00 KST (해지 후 복귀 유도, `WINBACK_ENABLED` 게이트·기본 dormant)
   - `insta_reports.sweep_stale` — 30분 (running 에 박힌 리포트 잡 실패 확정 — 동시생성 1건 제한 해제)
-  - `insta_reports.purge_caches` — 매일 04:40 KST (90일 경과 AI 캐시 정리, 리포트 PDF·집계는 보관)
+  - `insta_reports.purge_caches` — 매일 04:40 KST (90일 경과 AI 캐시 정리, 리포트 파일·집계는 보관)
   - `billing.snapshot_daily_metrics` — 매일 00:20 KST (일별 구독 상태/MRR/결제 코호트 스냅샷 적재 — 어드민 유지·해지 분석 P-4, 멱등 upsert, core 0010 시드)
 - 태스크 타임 리밋: 30분 (`CELERY_TASK_TIME_LIMIT`)
 - 큐: billing 등 기능별 `options: {queue: "..."}` 지정
 - `reports` 큐 = 인스타 성장 리포트 전용(1건 13~18분). prod 는 `celery_reports` 워커
-  (`-Q reports -c 2 --max-tasks-per-child=1`)가 소비 — child 재활용이 없으면 영상 임시파일·Chromium 이 누적된다.
+  (`-Q reports -c 2 --max-tasks-per-child=1`)가 소비 — child 재활용이 없으면 영상 임시파일이 누적된다.
 
 **주의**: Celery Beat 전용 컨테이너는 현재 compose에 없음 — 주기 배치가 필요하면 Beat를 별도 서비스로 추가하거나 `django-celery-beat`로 전환 고려.
 
@@ -345,7 +345,7 @@ make test-cov                             # HTML 커버리지 리포트
 - `CONNECT_CONFLICT_WARNING_FRONTEND.md` — 다른 DM 툴 충돌 경고 배너 프론트 스펙 (연결 직후 + 대시보드 상단, 닫기 규칙)
 - `DM_CAMPAIGN_MIGRATION_FRONTEND.md` — DM 캠페인 이전(매니챗 등→TurnFlow) 프론트 가이드. 연동 IG 계정의 최근 게시물·댓글·발신 DM(Conversations API) 분석→기존 DM 캠페인 추론→**비활성(INACTIVE) 초안 후보** 생성→검수·apply→활성화. `POST/GET /integrations/dm-migration/jobs/`(시작·폴링 3s·취소, 비종결1개+24h재사용+force쿨다운1h·429), `.../jobs/{id}/candidates/`(band=auto_draft/needs_review/template_only/excluded), `.../candidates/{id}/apply|dismiss/`(apply=AutoDMCampaignCreateSerializer 재사용·status=INACTIVE·활성 중복은 활성화 시점 발동). 전 플랜·v1 토큰차감 없음. 파이프라인=`apps/integrations/dm_migration/`(collect·analyze·llm·pipeline), 태스크 `integrations.run_dm_migration_job`(ai_jobs 큐, 체크포인트 재개·rate-pause)·`integrations.purge_dm_migration_raw`(원본 7일 파기+스테일 스위퍼, core 0008 시드). 자기발송 제외(SentDMLog mid/지문), Mock 픽스처+`DM_MIGRATION_FAKE_LLM`로 오프라인 e2e
 - `INSTA_REPORT_FRONTEND.md` — 인스타 성장 리포트 프론트 연동 가이드(프로 전용·계정당 월1회·평균 15분·3초 폴링·10단계
-  진행률 보간·PDF 인증 다운로드·완료 메일). 파이프라인 원본 실험은 `../insta_report_lab/PLAN.md`
+  진행률 보간·HTML 인증 다운로드·완료 메일). 파이프라인 원본 실험은 `../insta_report_lab/PLAN.md`
 - `SERVICE_DIFFERENTIATION.md` — 서비스 차별점/경쟁 비교 (세일즈·마케팅)
 - `개인정보처리방침_변호사_전달자료.md`, `이용약관_변호사_전달자료.md` — 법무 자료 (수정 금지, 요청 시에만)
 - `api-mcp/README.md` — 사내 API 문서 검색 MCP 서버

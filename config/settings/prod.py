@@ -79,7 +79,9 @@ CORS_ALLOW_HEADERS = [
 # 브라우저 JS 가 읽을 수 있게 노출하는 응답 헤더 (기본은 CORS 표준 6개만 읽힌다).
 # X-Cache: 어드민 대시보드 응답이 캐시 히트인지(HIT/MISS/BYPASS) — ?refresh=1 적용 확인용.
 # X-Request-ID: 프론트가 오류 리포트에 요청 ID 를 붙일 수 있게 한다.
-CORS_EXPOSE_HEADERS = ["X-Cache", "X-Request-ID"]
+# Content-Disposition: 리포트 다운로드(insta-reports/{id}/download/)에서 프론트가 파일명을
+# 읽어야 한다 — 노출하지 않으면 크로스 오리진에서 JS 가 헤더를 볼 수 없다.
+CORS_EXPOSE_HEADERS = ["X-Cache", "X-Request-ID", "Content-Disposition"]
 
 # Email backend for production (configure with actual email service)
 EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"

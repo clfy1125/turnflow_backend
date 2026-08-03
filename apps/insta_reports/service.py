@@ -1,9 +1,9 @@
-"""리포트 생성 엔진 — S1 수집 → S8 렌더 → PDF.
+"""리포트 생성 엔진 — S1 수집 → S8 렌더(자기완결 HTML).
 
 랩 `scripts/run_report.py` 의 오케스트레이션을 그대로 옮기고, 서버용으로 3가지를 더한다:
   · 단계별 진행률 기록(프론트 폴링용)
   · 영구 캐시 브릿지(DB ↔ 런 디렉터리) — 재분석 시 추출비 0
-  · 산출물 업로드(PDF) + 원가·커버리지 영속화, 런 디렉터리는 항상 파기
+  · 산출물 업로드(자기완결 HTML) + 원가·커버리지 영속화, 런 디렉터리는 항상 파기
 
 ⚠️ 실패 시 이용 횟수는 차감하지 않는다(`quota_consumed=False`). 사용자 귀책이 아니라
    외부 수집/모델 사정이 대부분이기 때문. 정책 변경 시 quota.py 문서도 함께 고칠 것.
@@ -24,7 +24,7 @@ from django.conf import settings
 from django.core.files.base import ContentFile
 from django.utils import timezone
 
-from . import ig_profile, pdf, progress
+from . import ig_profile, progress
 from .models import ReportErrorCode, ReportStage, ReportStatus
 from .pipeline import (
     aggregate,
@@ -35,15 +35,11 @@ from .pipeline import (
     config,
     extract,
     fake_mode,
-    media,
-    normalize,
-    render,
-    sampler,
-    synthesize,
-    verify_v3,
 )
 from .pipeline import feature_schema as fs
+from .pipeline import media
 from .pipeline import metrics as metrics_mod
+from .pipeline import normalize, render, sampler, synthesize, verify_v3
 from .pipeline.costs import CostLedger
 
 logger = logging.getLogger(__name__)
@@ -69,6 +65,71 @@ def _apify_cost_usd(post_count: int) -> float:
     return round(unit * max(post_count, 0), 6)
 
 
+# ── 가짜 모드 페이싱 ─────────────────────────────────────────────────
+# 가짜 모드는 실제 일을 안 하니 2~3초면 끝난다 → 진행률이 0에서 100으로 튀어 프론트가
+# 퍼센트/단계 UX 를 검증할 수 없다. 그래서 **실제 단계 비중대로** 총 N초에 걸쳐 흐르게 한다
+# (수집 11% · 영상분석 33% · 합성 24% … = 프로덕션과 같은 모양, 100배 빠르게).
+_PACED_STAGES = [s for s in progress.STAGES if s["key"] != ReportStage.QUEUED]
+_PACED_TOTAL_EXPECTED = sum(s["expected"] for s in _PACED_STAGES) or 1
+
+
+# 페이싱으로 흡수할 수 없는 실작업 예약분(초). 마지막 단계(렌더+저장)는 가짜 모드에서도 1초 남짓
+# 걸리고 그 시점엔 이미 마감 시각이 지나 있어 뒤로 튀어나온다 → 총 소요에서 미리 빼 둔다.
+# (PDF 변환을 쓰던 시절엔 4초였다. HTML 저장으로 바뀌어 크게 줄었다.)
+_FAKE_TAIL_RESERVE_SECONDS = 1.2
+
+
+def fake_delay_seconds() -> float:
+    return float(getattr(settings, "INSTA_REPORT_FAKE_DELAY_SECONDS", 10) or 0)
+
+
+def _fake_paced_budget() -> float:
+    """진행률 애니메이션에 쓸 대기 예산 = 목표 총 소요 − 실작업 예약분."""
+    total = fake_delay_seconds()
+    if total <= 0:
+        return 0.0
+    return max(total - _FAKE_TAIL_RESERVE_SECONDS, total * 0.3)
+
+
+def fake_time_scale() -> float:
+    """가짜 모드에서 '실제 예상 소요' 를 축소하는 배율 (꺼져 있으면 1.0).
+
+    프론트가 `stage_expected_seconds`/`eta_seconds` 로 진행률을 보간하므로, 이 값도 같이
+    줄여 주지 않으면 서버는 3초에 끝났는데 클라이언트 보간은 6분짜리로 기어간다.
+    """
+    if not fake_mode_enabled():
+        return 1.0
+    return max(fake_delay_seconds(), 0.0) / _PACED_TOTAL_EXPECTED
+
+
+def _expected(stage: str) -> int:
+    """이 단계의 예상 소요(초) — 가짜 모드면 축소 배율을 적용한다(최소 1초)."""
+    raw = progress.stage_expected(stage) * fake_time_scale()
+    return max(int(round(raw)), 1)
+
+
+class _FakePacer:
+    """단계 종료 시점을 절대 시각으로 맞춰 대기 — 실작업 시간을 흡수해 총 소요를 고정한다."""
+
+    def __init__(self, total_seconds: float):
+        self.total = max(total_seconds, 0.0)
+        self.t0 = time.monotonic()
+        self._span: dict[str, tuple[float, float]] = {}
+        acc = 0
+        for s in _PACED_STAGES:
+            start = acc / _PACED_TOTAL_EXPECTED
+            acc += s["expected"]
+            self._span[s["key"]] = (start, acc / _PACED_TOTAL_EXPECTED)
+
+    def wait(self, stage: str, ratio: float = 1.0) -> None:
+        """`stage` 의 ratio(0~1) 지점까지 대기. 이미 지났으면 즉시 반환."""
+        start, end = self._span.get(stage, (0.0, 1.0))
+        frac = start + (end - start) * min(max(ratio, 0.0), 1.0)
+        remaining = (self.t0 + self.total * frac) - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+
+
 def generate(report) -> dict:
     """리포트 1건 생성. 성공 시 report 를 succeeded 로 갱신하고 요약 dict 반환.
 
@@ -87,6 +148,8 @@ def generate(report) -> dict:
     report.save(update_fields=["status", "started_at", "updated_at"])
 
     t0 = time.monotonic()
+    # 가짜 모드에서만 동작 — 진행률이 실제와 같은 비중으로 흐르게 대기시킨다(프론트 UX 검증용).
+    pacer = _FakePacer(_fake_paced_budget()) if fake else None
     run_dir = Path(tempfile.mkdtemp(prefix=f"instarpt_{report.id.hex[:8]}_"))
     config.bind_run(run_dir)
     ledger = CostLedger(username)
@@ -97,7 +160,7 @@ def generate(report) -> dict:
             ReportStage.COLLECTING,
             3,
             "게시물을 모으고 있어요",
-            progress.stage_expected(ReportStage.COLLECTING),
+            _expected(ReportStage.COLLECTING),
         )
         collect_summary = _collect(report, connection, username, fake=fake)
         ledger.record_flat(
@@ -106,13 +169,15 @@ def generate(report) -> dict:
             0.0 if fake else _apify_cost_usd(collect_summary.get("post_count", 0)),
             note=f"posts={collect_summary.get('post_count')}",
         )
+        if pacer:
+            pacer.wait(ReportStage.COLLECTING)
 
         # ── S1' 정규화 + S2 지표 (1차: 샘플링 기준) ────────────────
         report.set_stage(
             ReportStage.METRICS,
             15,
             "숫자를 계산하고 있어요",
-            progress.stage_expected(ReportStage.METRICS),
+            _expected(ReportStage.METRICS),
         )
         canon = normalize.build_canonical(username)
         if not canon.get("posts"):
@@ -124,13 +189,15 @@ def generate(report) -> dict:
                 ReportErrorCode.NOT_ENOUGH_REELS,
                 f"조회수 있는 릴스 {reels}개 < {config.MIN_REELS_FOR_REPORT}",
             )
+        if pacer:
+            pacer.wait(ReportStage.METRICS)
 
         # ── S3 샘플러 + 미디어 다운로드 ────────────────────────────
         report.set_stage(
             ReportStage.PREPARING,
             20,
             "영상을 내려받고 있어요",
-            progress.stage_expected(ReportStage.PREPARING),
+            _expected(ReportStage.PREPARING),
         )
         sample = sampler.build_sample(canon)
         if not fake:
@@ -149,15 +216,19 @@ def generate(report) -> dict:
             # 다운로드 결과가 canon 에 반영되도록 재정규화(경로 필드가 파일 존재 기준이라서).
             canon = normalize.build_canonical(username)
         m = metrics_mod.save_metrics(username, canon)
+        if pacer:
+            pacer.wait(ReportStage.PREPARING)
 
         # ── S4 피처 추출 ───────────────────────────────────────────
         report.set_stage(
             ReportStage.EXTRACTING,
             30,
             "영상을 분석하고 있어요",
-            progress.stage_expected(ReportStage.EXTRACTING),
+            _expected(ReportStage.EXTRACTING),
         )
-        extraction = _extract(report, canon, sample, ledger, external_account_id, fake=fake)
+        extraction = _extract(
+            report, canon, sample, ledger, external_account_id, fake=fake, pacer=pacer
+        )
         if len(extraction["features"]) < MIN_FEATURES_FOR_REPORT:
             raise ReportFailure(
                 ReportErrorCode.EXTRACT_FAILED,
@@ -170,7 +241,7 @@ def generate(report) -> dict:
             ReportStage.COMMENTS,
             65,
             "댓글을 분석하고 있어요",
-            progress.stage_expected(ReportStage.COMMENTS),
+            _expected(ReportStage.COMMENTS),
         )
         agg = aggregate.build_aggregates(canon, m, extraction, sample)
         cstats, cfilter = _comments(
@@ -178,16 +249,18 @@ def generate(report) -> dict:
         )
         agg.update(aggregate.build_v3_extras(m, extraction, cstats, cfilter))
         aggregate.save_aggregates(username, agg)
+        if pacer:
+            pacer.wait(ReportStage.COMMENTS)
 
         # ── S6 합성 + S7 검증 ─────────────────────────────────────
         report.set_stage(
             ReportStage.SYNTHESIZING,
             72,
             "인사이트를 쓰고 있어요",
-            progress.stage_expected(ReportStage.SYNTHESIZING),
+            _expected(ReportStage.SYNTHESIZING),
         )
         slots, gate_meta = _synthesize_and_verify(
-            report, canon, m, agg, cstats, cfilter, ledger, username, fake=fake
+            report, canon, m, agg, cstats, cfilter, ledger, username, fake=fake, pacer=pacer
         )
 
         # ── S8 렌더 + PDF ─────────────────────────────────────────
@@ -195,30 +268,31 @@ def generate(report) -> dict:
             ReportStage.RENDERING,
             93,
             "리포트를 만들고 있어요",
-            progress.stage_expected(ReportStage.RENDERING),
+            _expected(ReportStage.RENDERING),
         )
         try:
             html_path = Path(render.render_report_v3(canon, m, agg, slots))
             html = html_path.read_text(encoding="utf-8")
         except Exception as e:  # noqa: BLE001
             raise ReportFailure(ReportErrorCode.RENDER_FAILED, f"{type(e).__name__}: {e}") from e
+        if pacer:
+            pacer.wait(ReportStage.RENDERING)
 
         report.set_stage(
             ReportStage.EXPORTING,
             97,
-            "PDF 로 만들고 있어요",
-            progress.stage_expected(ReportStage.EXPORTING),
+            "파일로 저장하고 있어요",
+            _expected(ReportStage.EXPORTING),
         )
-        try:
-            pdf_bytes = pdf.html_to_pdf(html)
-        except Exception as e:  # noqa: BLE001
-            raise ReportFailure(ReportErrorCode.PDF_FAILED, f"{type(e).__name__}: {e}") from e
+        html_bytes = html.encode("utf-8")
+        if pacer:
+            pacer.wait(ReportStage.EXPORTING)
 
         # ── 영속화 ────────────────────────────────────────────────
         cov = m.get("coverage") or {}
         cost = ledger.summary()
-        report.pdf_file.save(f"{report.id}.pdf", ContentFile(pdf_bytes), save=False)
-        report.pdf_bytes = len(pdf_bytes)
+        report.html_file.save(f"{report.id}.html", ContentFile(html_bytes), save=False)
+        report.html_bytes = len(html_bytes)
         report.metrics_json = m
         report.aggregates_json = agg
         report.slots_json = slots
@@ -270,7 +344,12 @@ def _collect(report, connection, username: str, *, fake: bool) -> dict:
         raise ReportFailure(ReportErrorCode.TOKEN_INVALID, "액세스 토큰이 없습니다.")
 
     try:
-        summary = collect_official.collect(username, connection.external_account_id, token)
+        summary = collect_official.collect(
+            username,
+            connection.external_account_id,
+            token,
+            fallback_profile_url=connection.profile_picture_url or "",
+        )
     except collect_official.CollectError as e:
         code = ReportErrorCode.TOKEN_INVALID if e.token_invalid else ReportErrorCode.NO_POSTS
         raise ReportFailure(code, str(e)) from e
@@ -310,10 +389,18 @@ def _collect(report, connection, username: str, *, fake: bool) -> dict:
 
 
 def _extract(
-    report, canon: dict, sample: dict, ledger, external_account_id: str, *, fake: bool
+    report, canon: dict, sample: dict, ledger, external_account_id: str, *, fake: bool, pacer=None
 ) -> dict:
     if fake:
-        return fake_mode.fake_extraction(canon, sample)
+        extraction = fake_mode.fake_extraction(canon, sample)
+        # 프론트가 "영상 분석 n/N" 하위 진행률을 확인할 수 있게 실제와 같은 리듬으로 흘린다.
+        done_list = list(extraction["features"])
+        total = len(done_list) or 1
+        for idx in range(total):
+            if pacer:
+                pacer.wait(ReportStage.EXTRACTING, (idx + 1) / total)
+            _tick(report, ReportStage.EXTRACTING, idx + 1, total, f"영상 분석 {idx + 1}/{total}")
+        return extraction
 
     shortcodes = [v["shortcode"] for v in sample.get("videos") or []]
     shortcodes += list(sample.get("light_images") or [])
@@ -378,10 +465,23 @@ def _synthesize_and_verify(
     username: str,
     *,
     fake: bool,
+    pacer=None,
 ) -> tuple[dict, dict]:
     if fake:
         # 가짜 모드는 AI 없이 폴백 슬롯(실코드)으로 렌더 계약을 검증한다.
-        return verify_v3.fallback_slots_v3(m, agg), {"fake": True, "fallback_slots": ["ALL"]}
+        slots = verify_v3.fallback_slots_v3(m, agg)
+        if pacer:
+            pacer.wait(ReportStage.SYNTHESIZING)
+        # 검수 단계도 프론트에 보여야 하므로(10단계 전부 확인) 실제 순서대로 밟는다.
+        report.set_stage(
+            ReportStage.VERIFYING,
+            88,
+            "숫자와 표현을 검수하고 있어요",
+            _expected(ReportStage.VERIFYING),
+        )
+        if pacer:
+            pacer.wait(ReportStage.VERIFYING)
+        return slots, {"fake": True, "fallback_slots": ["ALL"]}
 
     synth_input = build_synth_input(canon, m, agg, cstats, cfilter, username)
     try:
@@ -399,7 +499,7 @@ def _synthesize_and_verify(
         ReportStage.VERIFYING,
         88,
         "숫자와 표현을 검수하고 있어요",
-        progress.stage_expected(ReportStage.VERIFYING),
+        _expected(ReportStage.VERIFYING),
     )
     try:
         return verify_v3.run_gate_v3(

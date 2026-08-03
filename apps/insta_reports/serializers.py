@@ -1,6 +1,6 @@
 """인스타 성장 리포트 시리얼라이저.
 
-⚠️ `pdf_file.url`(공개 R2 URL) 을 절대 직렬화하지 않는다. 리포트에는 팔로워 댓글 원문이
+⚠️ `html_file.url`(공개 R2 URL) 을 절대 직렬화하지 않는다. 리포트에는 팔로워 댓글 원문이
    들어가므로 다운로드는 인증 엔드포인트(`GET /insta-reports/{id}/download/`)로만 제공한다.
 """
 
@@ -118,10 +118,10 @@ class ReportSerializer(serializers.ModelSerializer):
         read_only=True,
         help_text="실패 시 사용자에게 보여 줄 한국어 문구 (성공 시 빈 문자열)",
     )
-    pdf_download_url = serializers.SerializerMethodField(
-        help_text="완료 시 PDF 다운로드 경로(인증 필요). 미완료면 null"
+    download_url = serializers.SerializerMethodField(
+        help_text="완료 시 리포트(HTML) 다운로드 경로(인증 필요). 미완료면 null"
     )
-    pdf_ready = serializers.SerializerMethodField(help_text="PDF 준비 완료 여부")
+    download_ready = serializers.SerializerMethodField(help_text="리포트 파일 준비 완료 여부")
     account = serializers.SerializerMethodField(help_text="분석 대상 계정 스냅샷")
 
     class Meta:
@@ -144,9 +144,9 @@ class ReportSerializer(serializers.ModelSerializer):
             "comments_analyzed",
             "period_from",
             "period_to",
-            "pdf_ready",
-            "pdf_download_url",
-            "pdf_bytes",
+            "download_ready",
+            "download_url",
+            "html_bytes",
             "error_code",
             "error_message",
             "created_at",
@@ -160,16 +160,21 @@ class ReportSerializer(serializers.ModelSerializer):
         return progress.stage_label(obj.stage)
 
     def get_steps(self, obj) -> list:
-        return progress.steps_payload(obj)
+        from .service import fake_time_scale
+
+        return progress.steps_payload(obj, scale=fake_time_scale())
 
     def get_eta_seconds(self, obj) -> int | None:
-        return progress.eta_seconds(obj)
+        # 가짜 모드에서는 축소 배율을 반영해야 "10초 뒤 완료"가 "18분 남음"으로 안 보인다.
+        from .service import fake_time_scale
 
-    def get_pdf_ready(self, obj) -> bool:
-        return bool(obj.pdf_file)
+        return progress.eta_seconds(obj, scale=fake_time_scale())
 
-    def get_pdf_download_url(self, obj) -> str | None:
-        if not obj.pdf_file:
+    def get_download_ready(self, obj) -> bool:
+        return bool(obj.html_file)
+
+    def get_download_url(self, obj) -> str | None:
+        if not obj.html_file:
             return None
         return f"/api/v1/insta-reports/{obj.id}/download/"
 
@@ -186,8 +191,8 @@ class ReportSerializer(serializers.ModelSerializer):
 class ReportListItemSerializer(serializers.ModelSerializer):
     """히스토리 목록 행 (가벼운 필드만)."""
 
-    pdf_ready = serializers.SerializerMethodField()
-    pdf_download_url = serializers.SerializerMethodField()
+    download_ready = serializers.SerializerMethodField()
+    download_url = serializers.SerializerMethodField()
     error_message = serializers.CharField(source="error_message_ko", read_only=True)
 
     class Meta:
@@ -204,9 +209,9 @@ class ReportListItemSerializer(serializers.ModelSerializer):
             "comments_analyzed",
             "period_from",
             "period_to",
-            "pdf_ready",
-            "pdf_download_url",
-            "pdf_bytes",
+            "download_ready",
+            "download_url",
+            "html_bytes",
             "error_code",
             "error_message",
             "created_at",
@@ -214,10 +219,10 @@ class ReportListItemSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = fields
 
-    def get_pdf_ready(self, obj) -> bool:
-        return bool(obj.pdf_file)
+    def get_download_ready(self, obj) -> bool:
+        return bool(obj.html_file)
 
-    def get_pdf_download_url(self, obj) -> str | None:
-        if not obj.pdf_file:
+    def get_download_url(self, obj) -> str | None:
+        if not obj.html_file:
             return None
         return f"/api/v1/insta-reports/{obj.id}/download/"

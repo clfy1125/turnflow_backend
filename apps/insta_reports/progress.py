@@ -56,10 +56,10 @@ STAGES: list[dict] = [
     },
     {
         "key": ReportStage.EXPORTING,
-        "label": "PDF 만드는 중",
+        "label": "파일로 저장하는 중",
         "start": 97,
         "end": 100,
-        "expected": 20,
+        "expected": 8,
     },
 ]
 
@@ -94,10 +94,11 @@ def interpolate(stage: str, done: int, total: int) -> int:
     return int(round(start + (end - start) * ratio))
 
 
-def steps_payload(report) -> list[dict]:
+def steps_payload(report, scale: float = 1.0) -> list[dict]:
     """프론트 체크리스트용 단계 목록.
 
     status: done | active | pending | failed
+    ``scale`` = 가짜 모드 축소 배율(운영은 1.0) — 클라이언트 보간이 실제 속도와 맞게.
     """
     if report.status == ReportStatus.SUCCEEDED:
         cur_idx = len(STAGE_ORDER)
@@ -123,16 +124,18 @@ def steps_payload(report) -> list[dict]:
                 "detail": report.message if status in ("active", "failed") else "",
                 "progress_start": s["start"],
                 "progress_end": s["end"],
-                "expected_seconds": s["expected"],
+                "expected_seconds": max(int(round(s["expected"] * scale)), 1),
             }
         )
     return out
 
 
-def eta_seconds(report) -> int | None:
+def eta_seconds(report, scale: float = 1.0) -> int | None:
     """남은 예상 시간(초). 완료/실패면 None.
 
     현재 단계의 남은 시간 + 이후 단계 예상치의 합. 현재 단계가 예상을 넘겼으면 0으로 깎는다.
+    ``scale`` 은 가짜 모드 축소 배율(service.fake_time_scale) — 서버가 10초에 끝나는데
+    "18분 남음" 이라고 표시하지 않기 위한 보정이며, 운영에서는 항상 1.0 이다.
     """
     if report.is_terminal:
         return None
@@ -140,10 +143,10 @@ def eta_seconds(report) -> int | None:
         idx = STAGE_ORDER.index(report.stage)
     except ValueError:
         idx = 0
-    remaining = sum(s["expected"] for s in STAGES[idx + 1 :])
+    remaining = sum(s["expected"] for s in STAGES[idx + 1 :]) * scale
     cur = STAGES[idx]
     spent = 0
     if report.stage_started_at:
         spent = int((timezone.now() - report.stage_started_at).total_seconds())
-    remaining += max(cur["expected"] - spent, 0)
-    return remaining
+    remaining += max(cur["expected"] * scale - spent, 0)
+    return int(round(remaining))

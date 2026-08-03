@@ -83,6 +83,10 @@ def strip_quotes(text: str) -> str:
 _HANGUL_RE = re.compile(r"[가-힣]")
 _LATIN_WORD_RE = re.compile(r"[A-Za-z]{3,}")
 # 한자·일본어 문자 — 한국어 리포트에 들어갈 이유가 없다 (실측: flash 가 "글末尾" 출력)
+# 특정 게시물을 가리키지만 정체를 밝히지 않는 지시어 / 정체가 밝혀졌다고 볼 근거
+VAGUE_POST_REF = re.compile(r"(이|그|해당|저)\s*(영상|게시물|릴스)(?!들)")
+POST_IDENTIFIED = re.compile(r"(\d{1,2}\s*위|\d{1,2}\s*월\s*\d{1,2}\s*일|[“\"'‘][^”\"'’]{2,})")
+
 _CJK_RE = re.compile(r"[一-鿿぀-ヿ]")
 # 그대로 써도 되는 고유명사·널리 쓰는 약어
 ALLOWED_LATIN = {
@@ -210,6 +214,22 @@ def verify_slots_v3(slots: dict, metrics: dict, agg: dict) -> dict:
     recs = slots.get("recommendations", [])
     if not (5 <= len(recs) <= 6):
         errors.append({"slot": "recommendations", "error": "5~6개"})
+    # 어떤 영상인지 못 찾는 지시어 차단 — "이 영상은 46.7만을 기록했고"만 읽으면 독자는
+    # 그게 어느 게시물인지 알 수 없다(사용자 피드백 2026-08-03). 순위(N위)·날짜·인용 중
+    # 하나라도 있으면 통과. 순위 숫자 1~12 는 숫자 화이트리스트 면제 범위라 안전하다.
+    for i, r in enumerate(recs):
+        if r.get("_fb"):
+            continue
+        text = f"{r.get('what_to_do', '')} {r.get('why', '')}"
+        if VAGUE_POST_REF.search(text) and not POST_IDENTIFIED.search(text):
+            errors.append(
+                {
+                    "slot": f"recommendations[{i}]",
+                    "error": "어떤 영상인지 알 수 없어요 — '이 영상' 대신 '1위 영상'처럼 "
+                    "순위로 지목하거나 올린 날짜를 넣으세요",
+                }
+            )
+
     if sum(1 for r in recs if r.get("basis") == "data_observation") < 3:
         errors.append({"slot": "recommendations", "error": "data_observation 최소 3개"})
     for i, r in enumerate(recs):
@@ -361,6 +381,56 @@ def verify_slots_v3(slots: dict, metrics: dict, agg: dict) -> dict:
         mo["_auto_hedged"] = True
 
     return {"ok": not errors, "errors": errors}
+
+
+# 받침 유무로 목적격 조사를 고른다 — "46.7만를"(X) / "46.7만을"(O).
+# 숫자로 끝나면 읽는 소리로 판정: 영·일·삼·육·칠·팔 = 받침 있음, 이·사·오·구 = 없음.
+_DIGIT_HAS_FINAL = {
+    "0": True,
+    "1": True,
+    "3": True,
+    "6": True,
+    "7": True,
+    "8": True,
+    "2": False,
+    "4": False,
+    "5": False,
+    "9": False,
+}
+
+
+def _has_final(word: str) -> bool:
+    if not word:
+        return True
+    ch = word[-1]
+    if ch.isdigit():
+        return _DIGIT_HAS_FINAL.get(ch, True)
+    if "가" <= ch <= "힣":
+        return (ord(ch) - 0xAC00) % 28 != 0
+    return True
+
+
+def eul(word: str) -> str:
+    """목적격 조사 (을/를)."""
+    return "을" if _has_final(str(word)) else "를"
+
+
+def post_ref(post: dict, rank: int = 1) -> str:
+    """리포트 안에서 **어떤 영상인지 찾을 수 있게** 지목하는 문구.
+
+    "이 영상"만 쓰면 독자가 어느 게시물인지 알 수 없다(사용자 피드백 2026-08-03).
+    순위는 잘된 게시물 카드의 배지와 같고, 날짜·첫 문장은 그 카드에 그대로 적혀 있다.
+    ⚠️ 순위 숫자(1~6)는 검증 게이트의 숫자 화이트리스트 면제 범위(1~12)라 안전하다.
+    """
+    parts = []
+    date = (post.get("date_kst") or "")[:10]
+    if len(date) == 10:
+        parts.append(f"{int(date[5:7])}월 {int(date[8:10])}일")
+    title = re.sub(r"[.·…]{2,}", "…", (post.get("title") or "").strip()).strip(" …")
+    if title:
+        parts.append(f"“{title[:22].rstrip()}…”" if len(title) > 22 else f"“{title}”")
+    tail = f"({' · '.join(parts)})" if parts else ""
+    return f"{rank}위 영상{tail}"
 
 
 def fallback_slots_v3(metrics: dict, agg: dict) -> dict:
@@ -531,7 +601,8 @@ def fallback_slots_v3(metrics: dict, agg: dict) -> dict:
             {
                 "title": "잘됐던 주제 다시 만들기",
                 "what_to_do": "가장 잘된 영상의 주제를 최신 내용으로 다시 만들어 보세요.",
-                "why": f"이 영상은 {man(top1.get('views'))}를 기록했고, 평소 조회수 "
+                "why": f"{post_ref(top1)}이 {man(top1.get('views'))}"
+                f"{eul(man(top1.get('views')))} 기록했고, 평소 조회수 "
                 f"{man(vs['median'])}보다 훨씬 높았어요.",
                 "evidence_line": f"가장 잘된 영상 {man(top1.get('views'))} vs 평소 조회수 "
                 f"{man(vs['median'])} (영상 {cov['reels_with_views']}개 기준)",
@@ -542,8 +613,8 @@ def fallback_slots_v3(metrics: dict, agg: dict) -> dict:
             },
             {
                 "title": "다음 영상 목표 정하기",
-                "what_to_do": f"다음 영상은 {man(vs['p75'])}를 목표로 하고, {man(vs['p90'])}을 "
-                "넘기면 후속편을 바로 준비해 보세요.",
+                "what_to_do": f"다음 영상은 {man(vs['p75'])}{eul(man(vs['p75']))} 목표로 하고, "
+                f"{man(vs['p90'])}{eul(man(vs['p90']))} 넘기면 후속편을 바로 준비해 보세요.",
                 "why": f"지금 평소 조회수가 {man(vs['median'])}이라 이 정도가 현실적인 다음 목표예요.",
                 "evidence_line": f"평소 {man(vs['median'])} · 잘된 편 {man(vs['p75'])} · "
                 f"대박 {man(vs['p90'])}",

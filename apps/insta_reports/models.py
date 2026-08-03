@@ -4,8 +4,9 @@
 - ``IGVideoFeature``   : Gemini 영상 피처 추출 캐시. 같은 계정 재분석 비용을 $0.27 → $0 으로.
 - ``ReportAiCache``    : 댓글 분류 등 기타 AI 캐시(키-값).
 
-리포트 산출물은 **인증 다운로드 엔드포인트로만** 제공한다. 팔로워 댓글 원문이 들어가므로
-공개 R2 URL 을 직렬화에 노출하지 않는다(``pdf_file.url`` 을 시리얼라이저에 넣지 말 것).
+리포트 산출물은 **자기완결 HTML 1개 파일**(썸네일 data-URI + Chart.js 인라인)이며,
+**인증 다운로드 엔드포인트로만** 제공한다. 팔로워 댓글 원문이 들어가므로 공개 R2 URL 을
+직렬화에 노출하지 않는다(``html_file.url`` 을 시리얼라이저에 넣지 말 것).
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ class ReportStage(models.TextChoices):
     SYNTHESIZING = "synthesizing", "인사이트 쓰는 중"
     VERIFYING = "verifying", "검수하는 중"
     RENDERING = "rendering", "리포트 만드는 중"
-    EXPORTING = "exporting", "PDF 만드는 중"
+    EXPORTING = "exporting", "파일로 저장하는 중"
     DONE = "done", "완료"
 
 
@@ -51,7 +52,6 @@ class ReportErrorCode(models.TextChoices):
     EXTRACT_FAILED = "EXTRACT_FAILED", "영상 분석 실패"
     SYNTH_FAILED = "SYNTH_FAILED", "인사이트 작성 실패"
     RENDER_FAILED = "RENDER_FAILED", "리포트 생성 실패"
-    PDF_FAILED = "PDF_FAILED", "PDF 변환 실패"
     TIMEOUT = "TIMEOUT", "시간 초과"
     INTERNAL = "INTERNAL", "내부 오류"
 
@@ -71,16 +71,27 @@ ERROR_MESSAGES_KO = {
     ReportErrorCode.EXTRACT_FAILED: "영상 분석 중 문제가 생겼어요. 잠시 후 다시 시도해 주세요.",
     ReportErrorCode.SYNTH_FAILED: "리포트 문장을 만드는 중 문제가 생겼어요. 잠시 후 다시 시도해 주세요.",
     ReportErrorCode.RENDER_FAILED: "리포트를 만드는 중 문제가 생겼어요. 잠시 후 다시 시도해 주세요.",
-    ReportErrorCode.PDF_FAILED: "PDF 로 만드는 중 문제가 생겼어요. 잠시 후 다시 시도해 주세요.",
     ReportErrorCode.TIMEOUT: "생성 시간이 너무 오래 걸려 중단했어요. 잠시 후 다시 시도해 주세요.",
     ReportErrorCode.INTERNAL: "일시적인 오류로 리포트를 만들지 못했어요. 잠시 후 다시 시도해 주세요.",
 }
 
 
 def report_pdf_path(instance, filename: str) -> str:
-    """`insta_reports/2026/07/<uuid>.pdf` — 추측 불가 경로(그래도 노출은 인증 경유)."""
+    """**삭제 금지 — 0001_initial 이 참조한다.**
+
+    산출물은 2026-08-03 에 PDF → HTML 로 바뀌었고(마이그 0002) 이 함수는 더 쓰이지 않는다.
+    그래도 남겨두는 이유: `0001_initial` 은 이미 운영에 적용된 마이그레이션이고 Django 는
+    마이그레이션 모듈을 임포트할 때 이 `upload_to` 참조를 해석한다 → 지우면 `migrate`
+    (그리고 마이그레이션을 읽는 모든 커맨드)가 AttributeError 로 죽는다.
+    """
     now = timezone.now()
     return f"insta_reports/{now:%Y/%m}/{instance.id}.pdf"
+
+
+def report_html_path(instance, filename: str) -> str:
+    """`insta_reports/2026/07/<uuid>.html` — 추측 불가 경로(그래도 노출은 인증 경유)."""
+    now = timezone.now()
+    return f"insta_reports/{now:%Y/%m}/{instance.id}.html"
 
 
 class InstagramReport(models.Model):
@@ -156,10 +167,15 @@ class InstagramReport(models.Model):
     aggregates_json = models.JSONField(null=True, blank=True, verbose_name="집계(S5)")
     slots_json = models.JSONField(null=True, blank=True, verbose_name="서술 슬롯(S6·S7)")
     gate_meta = models.JSONField(default=dict, blank=True, verbose_name="검증 게이트 로그")
-    pdf_file = models.FileField(
-        upload_to=report_pdf_path, blank=True, null=True, max_length=500, verbose_name="PDF"
+    html_file = models.FileField(
+        upload_to=report_html_path,
+        blank=True,
+        null=True,
+        max_length=500,
+        verbose_name="리포트 HTML",
+        help_text="자기완결 HTML(썸네일 data-URI + Chart.js 인라인) — 인증 다운로드로만 제공",
     )
-    pdf_bytes = models.PositiveIntegerField(default=0, verbose_name="PDF 크기(byte)")
+    html_bytes = models.PositiveIntegerField(default=0, verbose_name="HTML 크기(byte)")
 
     # ── 커버리지 요약 (목록/카드에 그대로 뿌림) ──
     posts_analyzed = models.PositiveIntegerField(default=0, verbose_name="분석 게시물 수")

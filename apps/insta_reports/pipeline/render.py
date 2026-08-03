@@ -7,6 +7,7 @@
 import base64
 import io
 import json
+import pathlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -19,6 +20,20 @@ from . import feature_schema as fs
 from .metrics import man
 
 KST = timezone(timedelta(hours=9))
+
+
+# 최종 산출물은 **사용자가 내려받아 로컬에서 여는 자기완결 HTML** 이다 → 외부 스크립트 참조가
+# 있으면 인터넷 없이 차트가 안 뜬다. 벤더링한 Chart.js 를 파일 안에 직접 심는다(약 200KB).
+_CHARTJS_PATH = (
+    pathlib.Path(__file__).resolve().parent.parent / "static" / "insta_reports" / "chart.umd.min.js"
+)
+
+
+def _chartjs_source() -> str:
+    try:
+        return _CHARTJS_PATH.read_text(encoding="utf-8")
+    except OSError:  # pragma: no cover - 배포 누락 시 차트만 비고 나머지는 정상
+        return ""
 
 
 def _img_data_uri(path_or_url: str, width: int = 360) -> str:
@@ -318,7 +333,11 @@ def render_report_v3(
         + "."
         + (m["coverage"].get("data_date") or "      ")[6:8],
         top1_date=(m["top_posts"][0]["date_kst"][2:7].replace("-", ".") if m["top_posts"] else ""),
-        pfp_data_uri=_img_data_uri(a.get("profile_picture_url", ""), width=200),
+        # 프로필 사진: IG 서명 URL 이 만료됐으면 우리 스토리지 캐시본으로 대체한다.
+        pfp_data_uri=(
+            _img_data_uri(a.get("profile_picture_url", ""), width=200)
+            or _img_data_uri(a.get("profile_picture_fallback_url", ""), width=200)
+        ),
         hook_rows=hook_rows,
         opening_rows=opening_rows,
         hook_low_note=hook_low_note,
@@ -335,6 +354,7 @@ def render_report_v3(
         monthly_immature_note=monthly_immature_note,
         monthly_dropped_note=monthly_dropped_note,
         chart_data=chart_data,
+        chartjs_source=_chartjs_source(),
         csv_name=f"{a['username']}_report.csv",
         csv_data=csv_data,
         txt_name=f"{a['username']}_요약.txt",
@@ -503,7 +523,11 @@ def render_report(
         + "."
         + (m["coverage"].get("data_date") or "      ")[6:8],
         top1_date=(m["top_posts"][0]["date_kst"][2:7].replace("-", ".") if m["top_posts"] else ""),
-        pfp_data_uri=_img_data_uri(a.get("profile_picture_url", ""), width=200),
+        # 프로필 사진: IG 서명 URL 이 만료됐으면 우리 스토리지 캐시본으로 대체한다.
+        pfp_data_uri=(
+            _img_data_uri(a.get("profile_picture_url", ""), width=200)
+            or _img_data_uri(a.get("profile_picture_fallback_url", ""), width=200)
+        ),
         top_posts=top_posts,
         low_posts=low_posts,
         top_cluster_line=_top_cluster_line(m["top_posts"]),
@@ -522,6 +546,7 @@ def render_report(
         comment_gt_like_note=comment_gt_like_note,
         monthly_immature_note=monthly_immature_note,
         chart_data=chart_data,
+        chartjs_source=_chartjs_source(),
     )
     config.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     name = out_name or f"{canon['username']}_{datetime.now(KST):%Y%m%d}.html"

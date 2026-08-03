@@ -2,9 +2,9 @@
 <html lang="ko"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>내 인스타 성장 리포트 · @{{ a.username }}</title>
-<!-- Chart.js 는 같은 디렉터리의 벤더링 사본을 쓴다(pdf.py 가 HTML 옆에 복사) — PDF 렌더는
-     네트워크 없이 끝나야 하고, CDN 의존은 만료·차단 시 빈 차트로 이어진다. -->
-<script src="chart.umd.min.js"></script>
+<!-- Chart.js 를 파일 안에 인라인한다(CDN 의존 없음) — 사용자가 내려받아 인터넷 없이 열어도
+     차트가 그려져야 하고, 리포트는 단일 .html 파일로 자기완결이어야 한다. -->
+<script>{{ chartjs_source | safe }}</script>
 <style>
 :root{--bg:#0d0b14;--card:#17141f;--card2:#1e1a2b;--ink:#f2eefa;--mut:#a99fc0;--line:#2c2739;
 --g1:#833ab4;--g2:#e1306c;--g3:#fd7e2a;--good:#34d399;--warn:#fbbf24;--bad:#f87171;--info:#6ea8fe;
@@ -120,14 +120,43 @@ footer{text-align:center;color:#6d6485;font-size:12px;margin-top:44px;padding-to
   @page{size:A4;margin:0}
   html,body{background:#0d0b14!important;-webkit-print-color-adjust:exact;print-color-adjust:exact}
   .tabs{display:none!important}
-  section{display:block!important;animation:none!important;break-before:page;page-break-before:always}
-  section#ov{break-before:auto;page-break-before:auto}
+  /* 탭 4개를 한 문서로 이어 붙인다. 섹션마다 새 장을 강제하면(break-before:page) 직전 장이
+     최대 3/4 공백으로 남는다(실측: 13장 중 3장) → 연속 흐름 + 구분선으로 경계를 준다.
+     장 단위로 끊고 싶으면 아래 두 줄을 break-before:page 로 되돌리면 된다. */
+  section{display:block!important;animation:none!important}
+  section:not(#ov){margin-top:22px;padding-top:14px;border-top:2px solid var(--line)}
   section>h2:first-child{margin-top:0}
-  .card,.kpi,.post,.postcard,.rec,.check,.strength,.warnbox,.note,table{break-inside:avoid;page-break-inside:avoid}
+  .card,.kpi,.post,.postcard,.rec,.check,.strength,.warnbox,.note{break-inside:avoid;page-break-inside:avoid}
+  /* 긴 표는 통째로 다음 장에 밀리면(카드 avoid) 직전 장이 절반 공백이 된다 → 표는 장을 넘겨
+     쪼개되 헤더를 각 장에 반복 표시한다. 차트 카드는 위 규칙대로 계속 원자적으로 유지. */
+  .card:has(table){break-inside:auto!important;page-break-inside:auto!important}
+  table{break-inside:auto}
+  thead{display:table-header-group}
+  tr{break-inside:avoid;page-break-inside:avoid}
   .chartbox{height:260px!important;break-inside:avoid;page-break-inside:avoid}
   .wrap{padding-bottom:0}
   h2{break-after:avoid;page-break-after:avoid}
   footer{break-before:avoid;page-break-before:avoid}
+  /* CSS Grid 는 Chromium 인쇄에서 행을 쪼개지 못해, 한 행이 안 들어가면 통째로 다음 장으로
+     밀리고 앞 장 60%가 공백으로 남는다(실측: TOP6 카드가 장당 2개). 인쇄에서는 그리드를
+     버리고 2열 flex 로 흘려 보내고, 세로 썸네일 높이를 눌러 장당 4개가 들어가게 한다. */
+  .grid.posts,.posts{display:flex!important;flex-wrap:wrap;gap:12px}
+  .posts>*{flex:0 0 calc(50% - 6px)}
+  .thumb{aspect-ratio:auto!important;height:150px}
+  /* ⚠️ 다른 그리드(kpis/g3/g2)는 건드리지 말 것 — 한 행이라 페이지를 넘지 않고, flex 로 바꾸면
+     칸이 좁아져 KPI 설명 문구가 카드 밖으로 넘친다(실측). 문제는 .posts(카드 6개)뿐이었다. */
+  /* 한 글줄에 한글(Noto Sans CJK KR)과 숫자·괄호(Noto Sans)가 섞이면 PDF 에서 진행폭이 어긋나
+     글자가 겹친다(poppler·mupdf 두 엔진에서 동일 재현). 라틴까지 포함하는 CJK 패밀리로 통일한다. */
+  /* 이모지 패밀리를 명시해야 메달(🥇)·아이콘이 PDF 에서 빈 알약으로 나오지 않는다.
+     추가로 굵기를 합성(synthetic bold)하면 컬러 비트맵 이모지가 PDF 에서 사라진다 → 순위
+     배지는 인쇄에서 기본 굵기로 둔다. */
+  body,body *{font-family:"Noto Sans CJK KR","Noto Sans","Noto Color Emoji",sans-serif!important}
+  /* 그라디언트 텍스트(background-clip:text)는 PDF 로 나가면 글자 대신 색 박스가 그려진다
+     (두 엔진 동일). 인쇄에서는 단색으로 확정 — KPI 숫자는 반드시 읽혀야 한다. */
+  .rank{font-weight:400!important;font-synthesis:none}
+  .kpi .v{background:none!important;-webkit-background-clip:border-box!important;
+          background-clip:border-box!important;color:#f2a05f!important;
+          -webkit-text-fill-color:#f2a05f!important}
 }
 </style></head><body>
 <div class="hero"><div class="hero-in">
@@ -163,7 +192,9 @@ footer{text-align:center;color:#6d6485;font-size:12px;margin-top:44px;padding-to
   <h2><span class="bar"></span>다음 영상부터 이렇게 해보세요</h2>
   {% for r in slots.recommendations %}
   <div class="rec"><span class="pri {{ 'high' if r.priority == 'high' else 'mid' }}">{{ '먼저' if r.priority == 'high' else '추천' }}</span><h3>{{ loop.index }}. {{ r.title }}</h3>
-    <p><span class="badge {{ {'data_observation':'obs','experiment_suggestion':'exp','general_guide':'gen'}[r.basis] }}">{{ {'data_observation':'내 데이터에서 확인','experiment_suggestion':'해보고 확인할 것','general_guide':'일반적인 조언'}[r.basis] }}</span>{{ r.what_to_do or r.body }}</p>
+    <p>{# 근거 종류(내 데이터에서 확인/해보고 확인할 것/일반적인 조언)는 독자에게 의미가 없어
+       '제안' 하나로 통일했다(2026-08-03). 분류값 r.basis 는 검증 게이트가 계속 쓰므로 데이터는 유지. #}
+    <span class="badge obs">제안</span>{{ r.what_to_do or r.body }}</p>
     {% if r.why %}<p class="why-line"><span class="badge reason">이유</span>{{ r.why }}</p>{% endif %}
     {% if r.evidence_line %}<div class="ev"><span class="evl">근거가 된 숫자</span>{{ r.evidence_line }}</div>{% endif %}</div>
   {% endfor %}
@@ -208,7 +239,9 @@ footer{text-align:center;color:#6d6485;font-size:12px;margin-top:44px;padding-to
   <div class="grid posts">
     {% for p in top_posts %}
     <a class="post" href="{{ p.permalink }}" target="_blank" rel="noopener">
-      <div class="thumb">{% if p.thumb_data_uri %}<img src="{{ p.thumb_data_uri }}" loading="lazy" alt="">{% endif %}
+      {# loading="lazy" 금지 — 최종 산출물이 PDF 다. Chromium 은 page.pdf() 시 뷰포트 밖의
+         lazy 이미지를 로드하지 않아 썸네일이 검은 빈 박스로 인쇄된다(실측). #}
+      <div class="thumb">{% if p.thumb_data_uri %}<img src="{{ p.thumb_data_uri }}" alt="">{% endif %}
         <span class="rank">{{ ["🥇","🥈","🥉"][loop.index0] if loop.index0 < 3 else loop.index }}</span>
         <span class="views">▶ {{ man(p.views) }}</span></div>
       <div class="pbody"><div class="ptitle">{{ p.title }}</div>

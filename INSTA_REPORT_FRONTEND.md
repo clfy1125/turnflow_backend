@@ -1,7 +1,9 @@
 # 인스타 성장 리포트 — 프론트엔드 연동 가이드
 
 > **대상**: 유저 콘솔 프론트엔드
-> **백엔드 상태**: 구현 완료(2026-07-29) · dev 배포 대기 · 테스트 30건 통과
+> **백엔드 상태**: 구현 완료(2026-08-03) · **dev 반영 완료(FAKE 모드 ON, 약 10초)** · 테스트 36건 통과
+> **2026-08-03 변경**: 산출물을 **PDF → 자기완결 HTML 파일**로 통일. 필드명도 함께 바뀌었습니다
+>   (`pdf_ready`→`download_ready`, `pdf_download_url`→`download_url`, `pdf_bytes`→`html_bytes`).
 > **API 스펙 원본**: `/api/schema/` (사내 MCP 문서 서버가 읽는 것과 동일). 이 문서는 그 위의 **흐름·UX 계약** 설명서다.
 > API tag: **`insta-reports`** · operationId 접두: `insta_reports_*`
 
@@ -11,14 +13,14 @@
 
 | 항목 | 값 |
 |---|---|
-| 기능 | 연동된 인스타 계정의 최근 게시물(최대 100개)을 분석해 **PDF 성장 리포트** 생성 |
+| 기능 | 연동된 인스타 계정의 최근 게시물(최대 100개)을 분석해 **성장 리포트(HTML 파일)** 생성 |
 | 권한 | **프로 플랜 전용** (`insta_report`). 무료·베이직은 403 |
-| 이용 횟수 | **IG 계정 1개당 캘린더월 1회.** 추가 IG 계정(9,900원)마다 1회씩 늘어남 (연동 2개 = 각 1회 = 월 총 2회) |
+| 이용 횟수 | **IG 계정 1개당 캘린더월 1회.** 추가 IG 계정(9,900원)마다 1회씩 늘어남(연동 2개 = 각 1회 = 월 총 2회). `admin` 플랜·관리자 계정은 무제한(`limit: -1`) |
 | 소요 시간 | **평균 15~18분** (최대 30분). 서버 응답의 `estimated_minutes` 를 그대로 쓸 것 |
 | 진행 표시 | 10단계 · `progress` 0~100 · 3초 폴링 |
 | 완료 알림 | 프론트 팝업 + **이메일 자동 발송** (창을 닫아도 결과를 받는다) |
-| 산출물 | **PDF only** (HTML 제공 안 함). 인증 다운로드 엔드포인트로만 접근 |
-| 보관 | PDF·집계 **계속 보관** (자동 삭제 없음) |
+| 산출물 | **자기완결 HTML 1개 파일** (썸네일 data-URI + 차트 라이브러리 인라인 → 인터넷 없이 열림, 탭·차트 그대로 동작). 인증 다운로드 엔드포인트로만 접근 |
+| 보관 | 리포트 파일·집계 **계속 보관** (자동 삭제 없음) |
 | 실패 시 | **이용 횟수 미차감** → "다시 시도" 버튼을 열어 줘도 된다 |
 
 엔드포인트 4개 (모두 `Authorization: Bearer <access>` 필요):
@@ -29,7 +31,7 @@
 | POST | `/api/v1/insta-reports/` | 생성 시작 → **202** |
 | GET | `/api/v1/insta-reports/{id}/` | 진행 상태 폴링 / 완료 결과 |
 | GET | `/api/v1/insta-reports/` | 내 리포트 목록(히스토리, 페이지당 20) |
-| GET | `/api/v1/insta-reports/{id}/download/` | PDF 다운로드 (`application/pdf`) |
+| GET | `/api/v1/insta-reports/{id}/download/` | 리포트 다운로드 (`text/html`, 첨부) |
 
 ---
 
@@ -47,7 +49,7 @@
                         │  알려드려요."             │
                         └────────────┬─────────────┘
                                      │ status=succeeded
-                          완료 팝업 ─┴─▶ [PDF 다운로드]  (+ 서버가 이메일 발송)
+                          완료 팝업 ─┴─▶ [리포트 다운로드]  (+ 서버가 이메일 발송)
 ```
 
 **중요**: 사용자가 모달/브라우저를 닫아도 생성은 계속된다. 다시 들어오면 `targets/` 의
@@ -181,7 +183,7 @@ Content-Type: application/json
                "name": "이지용 | 릴스 드래곤", "followers_count": 98293, "media_count": 672 },
   "posts_analyzed": 0, "reels_with_views": 0, "videos_analyzed": 0, "comments_analyzed": 0,
   "period_from": null, "period_to": null,
-  "pdf_ready": false, "pdf_download_url": null, "pdf_bytes": 0,
+  "download_ready": false, "download_url": null, "html_bytes": 0,
   "error_code": "", "error_message": "",
   "created_at": "…", "started_at": "…", "finished_at": null, "elapsed_seconds": 0
 }
@@ -200,7 +202,7 @@ Content-Type: application/json
 | 7 | `synthesizing` | 인사이트 쓰는 중 | 72→88 | **260s** ← 서버 이벤트 없음 |
 | 8 | `verifying` | 검수하는 중 | 88→93 | 120s |
 | 9 | `rendering` | 리포트 만드는 중 | 93→97 | 5s |
-| 10 | `exporting` | PDF 만드는 중 | 97→100 | 20s |
+| 10 | `exporting` | 파일로 저장하는 중 | 97→100 | 8s |
 
 ### 멈춘 것처럼 보이지 않게 하기 (필수 UX)
 
@@ -222,7 +224,7 @@ function displayProgress(r: Report): number {
 
 | status | 처리 |
 |---|---|
-| `succeeded` | 완료 팝업 + `pdf_download_url` 로 다운로드. 요약 수치(`posts_analyzed`·`videos_analyzed`·`comments_analyzed`·`period_from~period_to`) 표시 |
+| `succeeded` | 완료 팝업 + `download_url` 로 다운로드. 요약 수치(`posts_analyzed`·`videos_analyzed`·`comments_analyzed`·`period_from~period_to`) 표시 |
 | `failed` | `error_message`(한국어 완성 문구)를 그대로 노출 + **다시 시도** 버튼(횟수 미차감) |
 | `cancelled` | 스위퍼/관리자에 의한 중단 — 다시 시도 안내 |
 
@@ -234,7 +236,7 @@ function displayProgress(r: Report): number {
 | `NOT_ENOUGH_REELS` | 조회수를 확인할 수 있는 릴스가 5개보다 적어 리포트를 만들 수 없어요. |
 | `NO_POSTS` | 분석할 게시물을 찾지 못했어요. |
 | `TOKEN_INVALID` | 인스타그램 연결이 만료됐어요. 계정을 다시 연결한 뒤 시도해 주세요. |
-| `EXTRACT_FAILED` / `SYNTH_FAILED` / `RENDER_FAILED` / `PDF_FAILED` | 각 단계 실패 — "잠시 후 다시 시도" |
+| `EXTRACT_FAILED` / `SYNTH_FAILED` / `RENDER_FAILED` | 각 단계 실패 — "잠시 후 다시 시도" |
 | `TIMEOUT` | 생성 시간이 너무 오래 걸려 중단했어요. |
 | `INTERNAL` | 일시적인 오류로 리포트를 만들지 못했어요. |
 
@@ -249,30 +251,48 @@ function displayProgress(r: Report): number {
 
 행 필드: `id`, `status`, `progress`, `ig_username`, `ig_name`, `posts_analyzed`,
 `reels_with_views`, `videos_analyzed`, `comments_analyzed`, `period_from`, `period_to`,
-`pdf_ready`, `pdf_download_url`, `pdf_bytes`, `error_code`, `error_message`,
+`download_ready`, `download_url`, `html_bytes`, `error_code`, `error_message`,
 `created_at`, `finished_at`.
 
-`pdf_ready === true` 인 행만 다운로드 버튼을 활성화한다.
+`download_ready === true` 인 행만 다운로드 버튼을 활성화한다.
 
 ---
 
-## 6. GET `/insta-reports/{id}/download/` — PDF
+## 6. GET `/insta-reports/{id}/download/` — 리포트 파일
 
-리포트에는 **팔로워 댓글 원문**이 들어가므로 공개 URL이 없다. 이 엔드포인트만이 접근 경로다.
-`<a href>` 로는 Authorization 헤더를 실을 수 없으니 fetch → blob 으로 저장한다.
+완료된 리포트를 **자기완결 HTML 파일 1개**로 내려준다.
+
+- 썸네일은 `data:` URI, 차트 라이브러리는 파일 안에 인라인 → **인터넷 없이 열어도** 그대로 보인다
+- 탭 4개(개요 / 콘텐츠 분석 / 팔로워 인사이트 / 강점&전략)와 차트 3종이 살아 있는 인터랙티브 문서
+- 사용자가 브라우저에서 `Ctrl+P` 로 인쇄·PDF 저장하면 인쇄용 레이아웃으로 나온다(CSS 준비돼 있음)
+- 크기: 보통 **300~500KB** (실측 355KB)
+
+### 보안 — 반드시 지킬 것
+
+리포트에는 **팔로워 댓글 원문**이 들어가고 파일 안에 스크립트가 인라인돼 있다.
+
+- 공개 URL 은 제공하지 않는다. 이 엔드포인트만이 접근 경로이며, 내 소유가 아니면 404.
+- 서버는 항상 `Content-Disposition: attachment` + `X-Content-Type-Options: nosniff` 로 내려준다
+  (브라우저가 우리 출처에서 실행하지 않고 저장하게).
+- **앱 안에서 미리보기**를 붙이려면 blob URL 을 `<iframe sandbox="allow-scripts">` 안에서 띄운다.
+  같은 출처에 그대로 렌더하지 말 것.
+
+### 프론트 구현
+
+`<a href>` 로는 Authorization 헤더를 실을 수 없으니 fetch → blob 저장을 쓴다.
 
 ```ts
 async function downloadReport(reportId: string, token: string) {
   const res = await fetch(`/api/v1/insta-reports/${reportId}/download/`, {
     headers: { Authorization: `Bearer ${token}` },
   });
-  if (res.status === 409) { /* 아직 준비 안 됨 (PDF_NOT_READY) */ return; }
+  if (res.status === 409) { /* 아직 준비 안 됨 (FILE_NOT_READY) */ return; }
   if (!res.ok) throw new Error(`download failed: ${res.status}`);
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `turnflow_report_${reportId}.pdf`;   // 서버도 Content-Disposition 을 준다
+  a.download = `turnflow_report_${reportId}.html`;   // 서버도 Content-Disposition 을 준다
   a.click();
   URL.revokeObjectURL(url);
 }
@@ -280,14 +300,9 @@ async function downloadReport(reportId: string, token: string) {
 
 | HTTP | 의미 |
 |---|---|
-| 200 | `application/pdf` (+ `Content-Disposition: attachment`) |
-| 409 | `PDF_NOT_READY` — 생성 중이거나 실패 |
+| 200 | `text/html; charset=utf-8` (+ `Content-Disposition: attachment`) |
+| 409 | `FILE_NOT_READY` — 생성 중이거나 실패 |
 | 404 | 없음 / 내 소유 아님 |
-
-PDF 는 A4 세로, 보통 **10~15페이지 / 2~5MB**다. 리포트는 4개 섹션(개요 · 콘텐츠 분석 ·
-팔로워 인사이트 · 강점&전략)이 한 문서로 이어진 형태다(화면용 탭·저장하기 탭은 제거됨).
-
----
 
 ## 7. 이메일 알림
 
@@ -302,14 +317,44 @@ PDF 는 A4 세로, 보통 **10~15페이지 / 2~5MB**다. 리포트는 4개 섹�
 
 ---
 
-## 8. 개발 중 15분 기다리지 않는 방법
+## 8. 개발 중 15분 기다리지 않는 방법 (dev FAKE 모드 — **현재 dev 에 켜져 있음**)
 
-dev 서버는 `INSTA_REPORT_FAKE_MODE=True` 로 켜면 **외부 호출 0, 합성 데이터, 약 3~5초**에
-완료된다. 상태 전이·`steps`·PDF 다운로드까지 실제와 동일한 경로를 탄다(내용만 더미).
+`INSTA_REPORT_FAKE_MODE=True` 면 외부 호출 0 · 합성 데이터로 **약 10초**에 완료된다.
+상태 전이·`steps`·파일 다운로드까지 실제와 동일한 경로를 탄다(숫자·문장만 더미).
 
-- 백엔드에 "dev FAKE 모드 켜 달라"고 요청하면 된다. (prod 는 항상 꺼져 있다)
-- 이 모드에서도 쿼터·플랜 게이트는 실제와 같이 동작하므로, 403/409/429 테스트도 가능하다.
-  같은 계정으로 반복 테스트가 필요하면 백엔드에 계정 쿼터 초기화를 요청하라.
+**진행률은 실제와 같은 비중으로 흐른다** — 10초를 실제 단계 가중치로 쪼개 대기하므로,
+프로덕션에서 볼 퍼센트 곡선을 100배 빠르게 그대로 볼 수 있다. dev 실측:
+
+| 경과 | stage | % | eta | message |
+|---|---|---|---|---|
+| 0.2s | queued | 0 | 10 | 대기 중이에요 |
+| 0.6s | collecting | 3 | 10 | 게시물을 모으고 있어요 |
+| 1.0s | preparing | 20 | 9 | 영상을 내려받고 있어요 |
+| 1.8s | extracting | 32 | 7 | 영상 분석 2/30 |
+| 3.0s | extracting | 53 | 7 | 영상 분석 20/30 |
+| 3.8s | comments | 65 | 4 | 댓글을 분석하고 있어요 |
+| 4.2s | synthesizing | 72 | 4 | 인사이트를 쓰고 있어요 |
+| 5.4s | verifying | 88 | 1 | 숫자와 표현을 검수하고 있어요 |
+| 6.3s | exporting | 97 | 0 | 파일로 저장하고 있어요 |
+| 9.5s | done | 100 | null | 리포트가 완성됐어요 |
+
+- `stage_expected_seconds` / `eta_seconds` 도 같은 배율로 축소돼서 온다 → **클라이언트 보간
+  코드를 그대로 검증할 수 있다**(서버는 10초에 끝나는데 "18분 남음"이 뜨는 일 없음).
+  `progress_start` / `progress_end`(퍼센트 구간)는 프로덕션과 **동일**하다.
+- `metrics` 단계는 전체의 0.5%라 순간에 지나간다(프로덕션도 마찬가지). 못 봐도 정상.
+- 소요 시간은 `INSTA_REPORT_FAKE_DELAY_SECONDS` 로 조절한다(기본 10초). 더 천천히 보고
+  싶으면 30~60초로 올려 달라고 요청하면 된다.
+- **prod 는 항상 꺼져 있다**(기본값 False). 가짜 리포트가 실사용자에게 갈 경로는 없다.
+
+### 반복 테스트 — 쿼터에 막히지 않으려면
+
+FAKE 모드에서도 **플랜 게이트·쿼터는 실제와 똑같이 동작한다**(그래서 403/409/429 화면도
+여기서 검증 가능하다). 다만 프로 계정은 **계정당 월 1회**라 두 번째부터 429가 뜬다.
+
+→ **테스트 계정을 `admin` 플랜으로 올리면 무제한**(`per_account_limit: -1`)이다.
+   프론트가 몇 번이든 눌러 볼 수 있고, `quota.total_limit/-remaining` 이 `-1` 로 오니
+   "무제한" 표기 분기도 함께 검증된다. 필요하면 백엔드에 어느 계정을 올릴지 알려 주면 된다.
+   (429 화면을 볼 차례가 되면 프로 계정으로 두 번 눌러 보면 된다.)
 
 ---
 
@@ -322,7 +367,7 @@ dev 서버는 `INSTA_REPORT_FAKE_MODE=True` 로 켜면 **외부 호출 0, 합성
 - [ ] `steps[]` 체크리스트 + `progress` 바 + `displayProgress()` 보간
 - [ ] "평균 15분 / 창을 닫아도 이메일로 알려드려요" 안내 문구
 - [ ] 모달 재진입 복구: `targets/` 의 `running_report_id`
-- [ ] 완료 팝업 + fetch/blob PDF 다운로드
+- [ ] 완료 팝업 + fetch/blob 리포트(HTML) 다운로드
 - [ ] 실패 시 `error_message` 노출 + 다시 시도 (횟수 미차감이라 즉시 재시도 가능)
 - [ ] 히스토리 목록 + 지난 리포트 재다운로드
 - [ ] 라우트 `/insta-reports/:id` (이메일 링크 대상)

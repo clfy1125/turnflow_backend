@@ -5,7 +5,7 @@
     POST .              생성 시작 (202)
     GET  .              내 리포트 목록
     GET  {id}/          진행 상태 폴링 / 완료 결과
-    GET  {id}/download/ PDF 다운로드 (인증 필수)
+    GET  {id}/download/ 리포트 HTML 다운로드 (인증 필수)
 
 프론트 계약의 단일 소스는 이 파일의 `@extend_schema` 다(사내 MCP 문서 서버가 OpenAPI
 스키마를 그대로 읽는다). 필드를 바꾸면 여기 설명도 함께 고칠 것.
@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 
 from django.http import FileResponse, Http404
+from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiExample, OpenApiResponse, extend_schema
 from rest_framework import status
 from rest_framework.generics import ListAPIView
@@ -276,7 +277,7 @@ class ReportListCreateView(ListAPIView):
         summary="내 리포트 목록",
         description="""
         ## 목적
-        지난 리포트를 다시 내려받을 수 있게 히스토리를 준다. **PDF·집계는 계속 보관**한다
+        지난 리포트를 다시 내려받을 수 있게 히스토리를 준다. **리포트 파일·집계는 계속 보관**한다
         (자동 삭제 없음).
 
         ## 인증
@@ -290,7 +291,7 @@ class ReportListCreateView(ListAPIView):
         | `page` | `2` | 페이지네이션(페이지당 20건) |
 
         ## 프론트 가이드
-        `pdf_ready=true` 인 행만 다운로드 버튼을 활성화하고 `pdf_download_url` 을 쓴다
+        `download_ready=true` 인 행만 다운로드 버튼을 활성화하고 `download_url` 을 쓴다
         (Authorization 헤더가 필요하므로 fetch → blob 저장 방식 권장).
         """,
         responses={200: ReportListItemSerializer(many=True), 401: ERR_401, 500: ERR_500},
@@ -303,7 +304,7 @@ class ReportListCreateView(ListAPIView):
         summary="리포트 생성 시작 (비동기)",
         description="""
         ## 목적
-        선택한 IG 계정의 최근 게시물(최대 100개)을 수집·분석해 **PDF 성장 리포트**를 만든다.
+        선택한 IG 계정의 최근 게시물(최대 100개)을 수집·분석해 **성장 리포트(HTML 파일)**를 만든다.
 
         ## ⏱️ 평균 15~18분 (최대 30분)
         영상 30여 개를 AI로 한 편씩 보고, 그 결과로 문장을 쓰는 구조라 오래 걸린다.
@@ -399,8 +400,8 @@ class ReportListCreateView(ListAPIView):
                         "followers_count": 98293,
                         "media_count": 672,
                     },
-                    "pdf_ready": False,
-                    "pdf_download_url": None,
+                    "download_ready": False,
+                    "download_url": None,
                     "error_code": "",
                     "error_message": "",
                 },
@@ -469,14 +470,13 @@ class ReportDetailView(APIView):
         ## 종료 판정
         | status | 처리 |
         |---|---|
-        | `succeeded` | 팝업 띄우고 `pdf_download_url` 로 다운로드 (이메일도 발송됨) |
+        | `succeeded` | 팝업 띄우고 `download_url` 로 다운로드 (이메일도 발송됨) |
         | `failed` | `error_message`(한국어) 노출 + 재시도 버튼. 실패는 이용 횟수 미차감 |
         | `cancelled` | 관리자/스위퍼가 중단 |
 
         ## 실패 코드 (`error_code`)
         `VIEWS_UNAVAILABLE`(조회수 수집 실패) · `NOT_ENOUGH_REELS`(릴스 5개 미만) ·
-        `TOKEN_INVALID`(연결 만료) · `EXTRACT_FAILED` · `SYNTH_FAILED` · `RENDER_FAILED` ·
-        `PDF_FAILED` · `TIMEOUT` · `INTERNAL`
+        `TOKEN_INVALID`(연결 만료) · `EXTRACT_FAILED` · `SYNTH_FAILED` · `RENDER_FAILED` · `TIMEOUT` · `INTERNAL`
         → 문구는 `error_message` 에 사람말로 이미 들어 있으니 그대로 써도 된다.
 
         ## 인증
@@ -496,8 +496,8 @@ class ReportDetailView(APIView):
                     "eta_seconds": 640,
                     "stage_started_at": "2026-07-29T20:41:02+09:00",
                     "stage_expected_seconds": 360,
-                    "pdf_ready": False,
-                    "pdf_download_url": None,
+                    "download_ready": False,
+                    "download_url": None,
                     "error_code": "",
                     "error_message": "",
                 },
@@ -519,9 +519,9 @@ class ReportDetailView(APIView):
                     "comments_analyzed": 214,
                     "period_from": "2026-02-03",
                     "period_to": "2026-07-28",
-                    "pdf_ready": True,
-                    "pdf_download_url": "/api/v1/insta-reports/8f14e45f…/download/",
-                    "pdf_bytes": 4128355,
+                    "download_ready": True,
+                    "download_url": "/api/v1/insta-reports/8f14e45f…/download/",
+                    "html_bytes": 486213,
                     "elapsed_seconds": 903,
                     "error_code": "",
                     "error_message": "",
@@ -538,44 +538,54 @@ class ReportDetailView(APIView):
 
 
 class ReportDownloadView(APIView):
-    """PDF 다운로드 (인증 필수 — 공개 URL 없음)."""
+    """리포트 HTML 다운로드 (인증 필수 — 공개 URL 없음)."""
 
     permission_classes = [IsAuthenticated]
 
     @extend_schema(
         tags=[TAG],
-        summary="리포트 PDF 다운로드",
+        summary="리포트 다운로드 (HTML 파일)",
         description="""
         ## 목적
-        완료된 리포트 PDF 를 내려준다.
+        완료된 리포트를 **자기완결 HTML 파일 1개**로 내려준다. 썸네일은 data-URI 로,
+        차트 라이브러리는 파일 안에 인라인돼 있어 **인터넷 없이 열어도** 그대로 보인다.
+        (탭 4개 · 차트 3종이 살아 있는 인터랙티브 문서다. 사용자가 브라우저에서
+        Ctrl+P 로 인쇄/PDF 저장하면 인쇄용 레이아웃으로 나오게 CSS 도 넣어 뒀다.)
 
         ## 보안
         리포트에는 **팔로워 댓글 원문**이 들어가므로 공개 URL 을 제공하지 않는다.
         이 엔드포인트만이 접근 경로이며, 내 워크스페이스 소유가 아니면 404 다.
-        (응답은 `application/pdf` + `Content-Disposition: attachment`)
+        응답은 항상 `Content-Disposition: attachment` (브라우저 내 실행 없이 저장)
+        + `X-Content-Type-Options: nosniff` 로 내려간다.
 
         ## 프론트 구현
-        `<a href>` 로는 Authorization 헤더를 실을 수 없다. 다음 형태를 쓴다:
+        `<a href>` 로는 Authorization 헤더를 실을 수 없다. fetch → blob 저장을 쓴다:
         ```js
         const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
         const blob = await res.blob();
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
-        a.download = 'turnflow_report.pdf';
+        a.download = 'turnflow_report.html';   // 서버도 Content-Disposition 을 준다
         a.click();
         ```
+        > 앱 안에서 바로 보여 주고 싶다면 blob URL 을 `<iframe sandbox>` 로 띄우면 된다.
+        > 같은 출처에 그대로 렌더하지는 말 것(리포트 안에 스크립트가 들어 있다).
 
         ## 오류
         | HTTP | 의미 |
         |---|---|
         | 404 | 리포트 없음 / 내 소유 아님 |
-        | 409 | 아직 생성 중이거나 실패해 PDF 가 없음 (`error.details.code = PDF_NOT_READY`) |
+        | 409 | 아직 생성 중이거나 실패해 파일이 없음 (`error.details.code = FILE_NOT_READY`) |
         """,
         responses={
-            (200, "application/pdf"): OpenApiResponse(description="PDF 바이너리"),
+            # 파일 응답임을 스키마에 명시 — 프론트(MCP)가 JSON 으로 오해하지 않게.
+            (200, "text/html"): OpenApiResponse(
+                response=OpenApiTypes.STR,
+                description="리포트 HTML (자기완결 단일 파일, 첨부 다운로드)",
+            ),
             401: ERR_401,
             404: ERR_404,
-            409: OpenApiResponse(description="PDF 미준비 (`PDF_NOT_READY`)"),
+            409: OpenApiResponse(description="파일 미준비 (`FILE_NOT_READY`)"),
             500: ERR_500,
         },
     )
@@ -583,22 +593,25 @@ class ReportDownloadView(APIView):
         report = _my_reports(request.user).filter(pk=pk).first()
         if report is None:
             raise Http404("리포트를 찾을 수 없습니다.")
-        if not report.pdf_file:
+        if not report.html_file:
             return Response(
                 {
                     "success": False,
                     "error": {
                         "code": status.HTTP_409_CONFLICT,
-                        "message": "아직 리포트 PDF 가 준비되지 않았어요.",
-                        "details": {"code": "PDF_NOT_READY", "status": report.status},
+                        "message": "아직 리포트 파일이 준비되지 않았어요.",
+                        "details": {"code": "FILE_NOT_READY", "status": report.status},
                     },
                 },
                 status=status.HTTP_409_CONFLICT,
             )
         filename = (
-            f"turnflow_report_{report.ig_username or 'instagram'}_"
-            f"{report.created_at:%Y%m%d}.pdf"
+            f"turnflow_report_{report.ig_username or 'instagram'}_{report.created_at:%Y%m%d}.html"
         )
-        response = FileResponse(report.pdf_file.open("rb"), content_type="application/pdf")
+        response = FileResponse(
+            report.html_file.open("rb"), content_type="text/html; charset=utf-8"
+        )
+        # 브라우저에서 바로 실행되지 않도록 항상 첨부로 내려보낸다(리포트에 인라인 스크립트가 있다).
         response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        response["X-Content-Type-Options"] = "nosniff"
         return response

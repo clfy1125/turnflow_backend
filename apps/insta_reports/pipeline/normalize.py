@@ -167,6 +167,8 @@ def build_canonical(username: str) -> dict:
             "followers": meta.get("followers_count"),
             "posts_total": meta.get("media_count"),
             "profile_picture_url": meta.get("profile_picture_url", ""),
+            # IG 서명 URL 만료 대비 — 우리 스토리지 캐시본(render 가 1차 실패 시 사용)
+            "profile_picture_fallback_url": meta.get("profile_picture_fallback_url", ""),
         },
         "views_field": views_field,
         "fetched_at_official": off_doc.get("fetched_at"),

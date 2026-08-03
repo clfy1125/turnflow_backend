@@ -107,9 +107,22 @@ def fetch_media(ig_user_id: str, token: str, target: int = TARGET_POSTS) -> tupl
     return posts[:target], used_fallback
 
 
-def collect(username: str, ig_user_id: str, token: str, *, target: int = TARGET_POSTS) -> dict:
-    """공식 수집 실행 → RAW_DIR/{username}.json 기록 후 요약 반환."""
+def collect(
+    username: str,
+    ig_user_id: str,
+    token: str,
+    *,
+    target: int = TARGET_POSTS,
+    fallback_profile_url: str = "",
+) -> dict:
+    """공식 수집 실행 → RAW_DIR/{username}.json 기록 후 요약 반환.
+
+    ``fallback_profile_url`` — IG 프로필 사진은 서명 URL 이라 만료·차단될 수 있다. 우리
+    스토리지에 캐싱해 둔 안정 URL 을 함께 넘겨 두면 렌더가 1차 실패 시 이걸로 대체한다.
+    """
     meta = fetch_account_meta(ig_user_id, token)
+    if fallback_profile_url:
+        meta = {**meta, "profile_picture_fallback_url": fallback_profile_url}
     posts, fallback = fetch_media(ig_user_id, token, target)
     if not posts:
         raise CollectError("게시물이 없습니다.")
