@@ -11,10 +11,22 @@ from datetime import UTC, datetime
 from . import config
 
 
-def build_sample(canon: dict) -> dict:
+def build_sample(canon: dict, *, require_local: bool = False) -> dict:
+    """층화 샘플 선정.
+
+    ``require_local`` — 후보를 "이미 내려받은 파일이 있는 것"으로 제한할지.
+    ⚠️ **기본값 False 여야 한다.** 백엔드 파이프라인은 이 함수를 **다운로드 전에** 호출하고
+    다운로드는 여기서 고른 것만 받는다(`media.download_for_run(…, sample)`). True 로 두면
+    파일이 아직 없어 후보가 0개가 되고, 영상 분석 입력이 통째로 비어 리포트가
+    `EXTRACT_FAILED` 로 죽는다 — 2026-08-03 운영 실측(`videos_requested: 0`).
+    FAKE 모드는 샘플링 전에 자리표시자 파일을 써 두기 때문에 이 결함을 가렸다.
+    랩처럼 "전량 다운로드 → 샘플링" 순서로 쓸 때만 True 를 준다.
+    """
     now = datetime.now(UTC)
     reels = [
-        p for p in canon["posts"] if p["media_type"] == "reel" and p["views"] and p["video_local"]
+        p
+        for p in canon["posts"]
+        if p["media_type"] == "reel" and p["views"] and (p["video_local"] or not require_local)
     ]
 
     def age(p):
@@ -60,11 +72,14 @@ def build_sample(canon: dict) -> dict:
         for p in reels:
             chosen.setdefault(p["shortcode"], "all")
 
-    # 캐러셀/이미지 경량 후보 (좋아요 상위, 썸네일 파일 있는 것)
+    # 캐러셀/이미지 경량 후보 (좋아요 상위). 썸네일도 이 선정 결과를 보고 내려받으므로
+    # require_local 을 강제하면 여기도 0개가 된다(위 docstring 참고).
     car = [
         p
         for p in canon["posts"]
-        if p["media_type"] in ("carousel", "image") and p["thumb_local"] and p["likes"]
+        if p["media_type"] in ("carousel", "image")
+        and p["likes"]
+        and (p["thumb_local"] or not require_local)
     ]
     car = sorted(car, key=lambda p: -p["likes"])[: config.CAROUSEL_LIGHT_MAX]
 

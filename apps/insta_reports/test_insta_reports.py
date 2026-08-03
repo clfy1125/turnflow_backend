@@ -721,9 +721,8 @@ class TestReportWording:
         지표 픽스처를 손으로 쓰면 실제 스키마와 어긋난다 → 합성 데이터로 **실제 지표 엔진**을
         돌려서 얻는다(계약이 바뀌면 이 테스트가 먼저 깨진다).
         """
-        from .pipeline import aggregate, config, fake_mode
+        from .pipeline import aggregate, config, fake_mode, normalize, sampler, verify_v3
         from .pipeline import metrics as metrics_mod
-        from .pipeline import normalize, sampler, verify_v3
         from .pipeline.verify_v3 import POST_IDENTIFIED
 
         config.bind_run(tmp_path)
@@ -739,3 +738,90 @@ class TestReportWording:
         assert POST_IDENTIFIED.search(why), why
         assert "만를" not in why  # 조사 오류 회귀 방지
         assert "이 영상은" not in why  # 정체 불명 지시어 회귀 방지
+
+
+class TestSamplerRunsBeforeDownload:
+    """샘플러는 **다운로드 전에** 돌고, 다운로드는 샘플러가 고른 것만 받는다.
+
+    2026-08-03 운영 실측 결함: 샘플러가 `video_local`(내려받은 파일)을 후보 조건으로 요구해
+    다운로드 전에는 후보가 0개 → `videos_requested: 0` → 영상 분석 입력 없음 →
+    첫 실계정 리포트 2건이 `EXTRACT_FAILED` 로 죽었다. FAKE 모드는 샘플링 전에 자리표시자
+    파일을 써 두기 때문에 E2E 테스트가 이 결함을 통과시켰다 → **파일 없는 canon 으로 직접** 검증한다.
+    """
+
+    def _canon_without_files(self, n=8):
+        from datetime import UTC, datetime, timedelta
+
+        now = datetime.now(UTC)
+        posts = []
+        for i in range(n):
+            posts.append(
+                {
+                    "shortcode": f"SC{i}",
+                    "media_type": "reel",
+                    "views": 1000 * (i + 1),
+                    "likes": 10 * (i + 1),
+                    "taken_at_utc": (now - timedelta(days=20 + i)).isoformat(),
+                    "video_local": None,  # ← 다운로드 전이라 아직 없다
+                    "thumb_local": None,
+                }
+            )
+        return {"username": "nofiles", "posts": posts}
+
+    def test_selects_candidates_with_no_local_files(self, tmp_path):
+        from .pipeline import config, sampler
+
+        config.bind_run(tmp_path)
+        sample = sampler.build_sample(self._canon_without_files())
+        assert sample["videos"], "다운로드 전에도 후보가 나와야 한다 (videos_requested>0 의 전제)"
+        assert sample["reels_with_views"] == 8
+
+    def test_require_local_true_is_lab_only_behaviour(self, tmp_path):
+        """랩 순서(전량 다운로드 → 샘플링)용 플래그는 여전히 파일을 요구한다."""
+        from .pipeline import config, sampler
+
+        config.bind_run(tmp_path)
+        sample = sampler.build_sample(self._canon_without_files(), require_local=True)
+        assert sample["videos"] == []
+
+    def test_download_requests_videos_for_chosen_sample(self, tmp_path):
+        """media.download_for_run 이 실제로 영상을 요청하는지 (다운로드는 하지 않는다)."""
+        from .pipeline import config, media, sampler
+
+        config.bind_run(tmp_path)
+        canon = self._canon_without_files(3)
+        sample = sampler.build_sample(canon)
+        official = {
+            "posts": [
+                {
+                    "permalink": f"https://www.instagram.com/reel/SC{i}/",
+                    "media_type": "VIDEO",
+                    "media_url": f"https://scontent.cdninstagram.com/v/SC{i}.mp4",
+                    "thumbnail_url": f"https://scontent.cdninstagram.com/v/SC{i}.jpg",
+                }
+                for i in range(3)
+            ]
+        }
+        calls = []
+
+        def fake_download(url, dest, min_bytes, kind):
+            calls.append(kind)
+            return "error:Blocked"  # 네트워크 안 탄다
+
+        media._download = fake_download
+        stats = media.download_for_run(official, {"top_posts": [], "low_posts": []}, sample)
+        assert stats["videos_requested"] == 3, stats
+        assert calls.count("video") == 3
+
+    def test_extract_records_reason_when_file_missing(self, tmp_path):
+        """다운로드가 실패한 건은 Path(None) TypeError 가 아니라 사유가 남아야 한다."""
+        from .pipeline import config, extract
+        from .pipeline.costs import CostLedger
+
+        config.bind_run(tmp_path)
+        canon = self._canon_without_files(2)
+        sample = {"videos": [{"shortcode": "SC0", "stratum": "top"}], "light_images": ["SC1"]}
+        out = extract.extract_sample(canon, sample, CostLedger("nofiles"))
+        assert out["features"] == {}
+        assert "영상 파일 없음" in out["failures"]["SC0"]
+        assert "썸네일 파일 없음" in out["failures"]["SC1"]

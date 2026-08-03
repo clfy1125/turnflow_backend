@@ -194,10 +194,29 @@ def extract_one(post: dict, ledger: CostLedger, mode: str = "video") -> dict:
 def extract_sample(canon: dict, sample: dict, ledger: CostLedger, progress=None) -> dict:
     """샘플 전체 추출 (병렬). 반환: {shortcode: envelope}, 실패는 failures 에."""
     by_sc = {p["shortcode"]: p for p in canon["posts"]}
-    jobs = [(by_sc[v["shortcode"]], "video") for v in sample["videos"] if v["shortcode"] in by_sc]
-    jobs += [(by_sc[sc], "image") for sc in sample.get("light_images", []) if sc in by_sc]
-
     results, failures = {}, {}
+
+    # 샘플은 다운로드 **전에** 정해지므로(sampler.build_sample 참고) 실제로 파일이 안 내려온
+    # 건이 섞일 수 있다(서명 URL 만료·403·용량 상한). 그대로 넘기면 Path(None) 이 TypeError 로
+    # 터져 사유가 안 남는다 → 여기서 걸러 실패로 명시 기록한다.
+    jobs = []
+    for v in sample["videos"]:
+        post = by_sc.get(v["shortcode"])
+        if post is None:
+            continue
+        if not post.get("video_local"):
+            failures[v["shortcode"]] = "영상 파일 없음 — 다운로드 실패(서명 URL 만료 추정)"
+            continue
+        jobs.append((post, "video"))
+    for sc in sample.get("light_images", []):
+        post = by_sc.get(sc)
+        if post is None:
+            continue
+        if not post.get("thumb_local"):
+            failures[sc] = "썸네일 파일 없음 — 다운로드 실패"
+            continue
+        jobs.append((post, "image"))
+
     with cf.ThreadPoolExecutor(max_workers=config.EXTRACT_CONCURRENCY) as ex:
         futs = {
             ex.submit(extract_one, post, ledger, mode): post["shortcode"] for post, mode in jobs
