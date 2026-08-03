@@ -269,6 +269,14 @@ _REACH_GUIDANCE = {
 }
 
 
+_CONFLICT_RULE = (
+    "**갈등을 일부러 만들라고 조언하지 마세요(금지).** 논쟁 댓글이 많다는 관찰은 써도 되지만, "
+    "'찬반으로 나뉠 주제를 만들라'·'남녀/세대/지역 갈등 소재를 다뤄라' 류의 제안은 반려됩니다. "
+    "댓글이 늘어도 욕설·비방이 함께 늘고 협업·판매에 해가 됩니다. 참여를 늘리려면 "
+    "'의견을 묻는 질문'이나 '경험 공유 요청'처럼 갈등 없이 말하게 하는 방법으로 쓰세요."
+)
+
+
 def _audience_guidance(agg_input: dict) -> str:
     """집계에 담긴 계정 성격(scale/reach_mode)에 맞는 조언 방향을 프롬프트에 덧붙인다."""
     aud = (agg_input.get("audience") or {}) if isinstance(agg_input, dict) else {}
@@ -276,9 +284,8 @@ def _audience_guidance(agg_input: dict) -> str:
         _SCALE_GUIDANCE.get(aud.get("scale"), ""),
         _REACH_GUIDANCE.get(aud.get("reach_mode"), ""),
     ]
+    parts.append(_CONFLICT_RULE)
     body = "\n".join(p for p in parts if p)
-    if not body:
-        return ""
     return (
         "\n\n## 이 계정에 맞는 조언 방향 (반드시 반영)\n"
         + body

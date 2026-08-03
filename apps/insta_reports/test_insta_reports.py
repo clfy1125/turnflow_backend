@@ -1160,4 +1160,47 @@ class TestAdviceBranchesByAccountScale:
         assert "대형" in big and "팔로워 전환" in big
         assert "막 시작한" in small
         assert big != small
-        assert _audience_guidance({}) == ""
+        # 갈등 유도 금지는 규모와 무관하게 **항상** 붙는다.
+        for g in (big, small, _audience_guidance({})):
+            assert "갈등을 일부러 만들라고 조언하지 마세요" in g
+
+
+class TestConflictBaitIsRejected:
+    """'갈등을 일부러 만들라'는 조언은 게이트가 반려한다.
+
+    2026-08-04 실측: 리포트가 "논쟁 주제로 댓글 참여 늘리기 — 찬반으로 나뉠 만한 주제
+    (예: 남녀 갈등, 세대 차이)를 선정해 영상으로 만드세요" 를 추천했다. 같은 리포트의
+    분위기 블록은 "논쟁·비방 26% 이니 줄이세요" 라고 말하고 있어 **정반대 조언**이었고,
+    욕설·비방이 이미 13% 인 계정에 갈등 소재를 권하는 것은 제품이 해선 안 되는 조언이다.
+    """
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "논쟁 주제로 댓글 참여 늘리기",
+            "찬반으로 나뉠 만한 주제를 선정해 영상으로 만드세요",
+            "남녀 갈등을 다루면 댓글이 늘어요",
+            "세대 갈등 소재로 제작해 보세요",
+            "갈등을 유도해 참여를 늘리세요",
+            "어그로를 키우면 노출이 늘어요",
+        ],
+    )
+    def test_bait_phrases_are_caught(self, text):
+        from .pipeline.verify_v3 import CONFLICT_BAIT
+
+        assert CONFLICT_BAIT.search(text), text
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "시청자끼리의 논쟁이 26%예요",
+            "논쟁·비방 비중을 의도적으로 조절해 보세요",
+            "의견을 묻는 질문을 한 줄 넣어 참여를 늘리세요",
+            "경험 공유를 요청해 보세요",
+            "댓글에 의견 남겨주세요 문구를 추가하세요",
+        ],
+    )
+    def test_descriptions_and_safe_advice_pass(self, text):
+        from .pipeline.verify_v3 import CONFLICT_BAIT
+
+        assert not CONFLICT_BAIT.search(text), text
