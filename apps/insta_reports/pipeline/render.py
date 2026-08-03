@@ -264,6 +264,16 @@ def render_report_v3(
             "그래프에서 빼놨어요 — 고정해둔 옛 게시물이 섞이면 흐름이 "
             "왜곡되기 때문이에요."
         )
+    elif m.get("monthly_low_sample"):
+        # 하한(3개)을 넘는 달이 1개뿐이라 전 구간을 되살린 경우 — 빼면 차트가 비어 버린다.
+        counts_ko = ", ".join(
+            f"{mo[:4]}년 {int(mo[5:7])}월({n}개)"
+            for mo, n in zip(mon["months"], mon["count"], strict=False)
+        )
+        monthly_dropped_note = (
+            f"한 달에 올린 영상이 적어서({counts_ko}) 점 하나가 영상 1~2개일 수 있어요 — "
+            "달마다의 오르내림보다 <b>전체 흐름</b>만 봐 주세요."
+        )
     else:
         monthly_dropped_note = ""
 

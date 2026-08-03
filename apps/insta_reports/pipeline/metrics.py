@@ -130,8 +130,15 @@ def build_metrics(canon: dict) -> dict:
     MIN_MONTH_N = 3
     by_month = {k: v for k, v in by_month_all.items() if len(v) >= MIN_MONTH_N}
     dropped = {k: len(v) for k, v in by_month_all.items() if len(v) < MIN_MONTH_N}
-    if not by_month:  # 전 구간이 희소하면 원본 유지(빈 차트 방지)
+    # ⚠️ **선을 그리려면 점이 2개 이상** 있어야 한다. 예전 방어는 `if not by_month` 였는데,
+    # 하한을 넘는 달이 딱 1개면 방어가 안 걸려 차트가 점 하나로 비었다 — 월 2~3개 올리는
+    # 계정은 이 경우가 정상이다(실측: @jinyongjin92 6개월간 릴스 13개 → 3월만 통과).
+    # 그때는 희소한 달까지 되살리고 low_sample 로 표시해 정직하게 보여 준다.
+    low_sample = False
+    if len(by_month) < 2:
         by_month, dropped = by_month_all, {}
+        low_sample = len(by_month) > 1
+    m["monthly_low_sample"] = low_sample
     months = sorted(by_month)
     m["coverage"]["months_span"] = len(months)
     all_dates = sorted(p["taken_at_kst"][:10] for p in rv)

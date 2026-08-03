@@ -109,8 +109,29 @@ def build_canonical(username: str) -> dict:
             views = int(v) if v and v > 0 else None
 
         mt = _media_type(off, api)
+        # 댓글 원천: **Graph(무료·전량) 우선**, 없으면 Apify latestComments 폴백.
+        # Apify 는 게시물당 2~10개만 준다(실측) → 그것만 쓰면 팔로워 인사이트가 전체의 2% 표본이
+        # 된다. Graph 는 우리 계정의 자기 게시물이라 무료로 다 받을 수 있다(collect_official).
         comments_sample = []
-        if api is not None:
+        graph_comments = (off or {}).get("comments") or []
+        if graph_comments:
+            for c in graph_comments:
+                txt = (c.get("text") or "").strip()
+                if not txt:
+                    continue
+                owner = (c.get("username") or "").lower()
+                comments_sample.append(
+                    {
+                        "id": str(c.get("id") or f"{sc}:{len(comments_sample)}"),
+                        "text": txt[:300],
+                        "owner": owner,
+                        # username 필드가 거부된 계정은 owner 가 빈 문자열이 된다 → 그때는
+                        # 본인 댓글을 못 걸러내지만, 분류 단계에서 'other' 로 흡수된다.
+                        "is_owner": bool(owner) and owner == username.lower(),
+                        "likes": int(c.get("like_count") or 0),
+                    }
+                )
+        elif api is not None:
             for c in (api.get("latestComments") or [])[:15]:
                 txt = (c.get("text") or "").strip()
                 if not txt:

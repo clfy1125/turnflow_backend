@@ -865,3 +865,149 @@ class TestRunDirVisibleInWorkerThreads:
                 _ = config.MEDIA_DIR
         finally:
             config._RUN_DIR.reset(token)
+
+
+class TestMonthlyChartSurvivesSparsePosting:
+    """월 2~3개만 올리는 계정에서도 월별 조회수 차트가 나와야 한다.
+
+    2026-08-04 운영 실측: @jinyongjin92(6개월간 릴스 13개)는 월 3개 하한을 넘는 달이 **3월
+    하나**뿐이라 차트에 점이 1개만 남아 선이 안 그려졌다. 빈-차트 방어가 `if not by_month`
+    (=0개일 때만)여서 '1개' 케이스를 놓쳤다. fake_mode 는 월 8~10개를 깔기 때문에 E2E 가
+    이 결함을 통과시켰다 → **희소 계정을 직접 만들어** 검증한다.
+    """
+
+    def _sparse_canon(self, tmp_path, per_month=2, months=6):
+        """실제 canon 스키마를 쓰되(손으로 쓰면 어긋난다) 날짜만 희소하게 바꾼다."""
+        from datetime import UTC, datetime, timedelta
+
+        from .pipeline import config, fake_mode, normalize
+
+        config.bind_run(tmp_path)
+        fake_mode.write_sources("sparse_test")
+        canon = normalize.build_canonical("sparse_test")
+
+        reels = [p for p in canon["posts"] if p["media_type"] == "reel" and p["views"]]
+        keep = reels[: per_month * months]
+        now = datetime.now(UTC).replace(microsecond=0)
+        for i, p in enumerate(keep):
+            # 각 달 15일로 몰아 넣는다 (달 경계 흔들림 방지)
+            ts = (now - timedelta(days=30 * (i // per_month) + 40)).replace(day=15)
+            p["taken_at_utc"] = ts.isoformat()
+            p["taken_at_kst"] = (ts + timedelta(hours=9)).isoformat()
+        canon["posts"] = keep
+        return canon
+
+    def test_sparse_account_still_gets_multi_point_chart(self, tmp_path):
+        from .pipeline import metrics as metrics_mod
+
+        canon = self._sparse_canon(tmp_path, per_month=2, months=6)
+        m = metrics_mod.build_metrics(canon)
+        mon = m["monthly"]
+        assert len(mon["months"]) >= 2, f"점이 1개면 선이 안 그려진다: {mon['months']}"
+        assert len(mon["median"]) == len(mon["months"])
+        assert m["monthly_low_sample"] is True
+        assert not m["monthly_dropped"], "되살린 경우 '빼놨다' 안내가 남아 있으면 모순이다"
+
+    def test_dense_account_keeps_the_min3_rule(self, tmp_path):
+        """월 8~10개 올리는 계정은 기존 규칙(희소한 달 제외)이 그대로 유지돼야 한다."""
+        from .pipeline import config, fake_mode, normalize
+        from .pipeline import metrics as metrics_mod
+
+        config.bind_run(tmp_path)
+        fake_mode.write_sources("dense_test")
+        m = metrics_mod.build_metrics(normalize.build_canonical("dense_test"))
+        assert len(m["monthly"]["months"]) >= 2
+        assert m["monthly_low_sample"] is False
+
+
+class TestCommentsComeFromGraphNotApify:
+    """댓글은 Graph(무료·전량) 를 쓰고 Apify latestComments 는 폴백이어야 한다.
+
+    2026-08-04 실측: Apify 는 게시물당 2~10개만 준다(@jinyongjin92 13게시물 = 86개,
+    실제 commentsCount 합계 3,797개 → 약 2%). 그 2% 로 팔로워 인사이트를 만들고 있었다.
+    """
+
+    def test_normalize_prefers_graph_comments(self, tmp_path):
+        import json
+
+        from .pipeline import config, fake_mode, normalize
+
+        config.bind_run(tmp_path)
+        fake_mode.write_sources("graphc_test")
+
+        raw = config.RAW_DIR / "graphc_test.json"
+        doc = json.loads(raw.read_text(encoding="utf-8"))
+        target = doc["posts"][0]
+        target["comments"] = [
+            {
+                "id": f"g{i}",
+                "text": f"그래프 댓글 {i} 입니다",
+                "like_count": i,
+                "username": "someone",
+            }
+            for i in range(40)
+        ]
+        raw.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+
+        canon = normalize.build_canonical("graphc_test")
+        sc = normalize._shortcode(target)
+        post = next(p for p in canon["posts"] if p["shortcode"] == sc)
+        assert len(post["comments_sample"]) == 40, "Graph 댓글 40개가 15개로 잘리면 안 된다"
+        assert post["comments_sample"][0]["id"] == "g0"
+        assert post["comments_sample"][0]["likes"] == 0
+
+    def test_owner_flag_survives_missing_username_field(self, tmp_path):
+        """username 필드가 거부된 계정에서 모든 댓글이 '본인 댓글' 로 오분류되지 않아야 한다."""
+        import json
+
+        from .pipeline import config, fake_mode, normalize
+
+        config.bind_run(tmp_path)
+        fake_mode.write_sources("ownerless")
+        raw = config.RAW_DIR / "ownerless.json"
+        doc = json.loads(raw.read_text(encoding="utf-8"))
+        doc["posts"][0]["comments"] = [{"id": "x1", "text": "댓글 하나"}]  # username 없음
+        raw.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+
+        canon = normalize.build_canonical("ownerless")
+        got = [c for p in canon["posts"] for c in p["comments_sample"] if c["id"] == "x1"]
+        assert got and got[0]["is_owner"] is False
+
+    def test_budget_spreads_across_posts(self, monkeypatch):
+        """게시물이 많아도 앞쪽 몇 개가 예산을 다 먹지 않아야 한다(breadth)."""
+        from .pipeline import collect_official as co
+
+        posts = [
+            {
+                "id": f"m{i}",
+                "comments_count": 500,
+                "timestamp": f"2026-0{1 + i % 6}-10T00:00:00+0000",
+            }
+            for i in range(100)
+        ]
+        asked = {}
+
+        def fake_one(media_id, token, want):
+            asked[media_id] = want
+            return [{"id": f"{media_id}:{j}", "text": "ㅋㅋ 재밌어요"} for j in range(want)]
+
+        monkeypatch.setattr(co, "fetch_comments_for_post", fake_one)
+        monkeypatch.setattr(co.time, "sleep", lambda *_: None)
+        out = co.fetch_comments(posts, "tok")
+
+        total = sum(len(v) for v in out.values())
+        assert total <= co.COMMENTS_TOTAL_MAX
+        assert max(asked.values()) <= co.COMMENTS_PER_POST_MAX
+        assert min(asked.values()) >= co.COMMENTS_PER_POST_MIN
+        assert len(out) >= 20, f"게시물 100개인데 {len(out)}개만 훑었다"
+
+    def test_zero_comment_posts_are_not_requested(self, monkeypatch):
+        from .pipeline import collect_official as co
+
+        calls = []
+        monkeypatch.setattr(
+            co, "fetch_comments_for_post", lambda mid, t, w: calls.append(mid) or []
+        )
+        monkeypatch.setattr(co.time, "sleep", lambda *_: None)
+        co.fetch_comments([{"id": "a", "comments_count": 0}, {"id": "b", "comments_count": 3}], "t")
+        assert calls == ["b"]
