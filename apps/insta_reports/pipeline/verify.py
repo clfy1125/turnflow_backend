@@ -119,6 +119,12 @@ def build_whitelist(metrics: dict, agg: dict) -> dict:
         if v is not None:
             raws.add(float(v))
             counts.add(float(v))
+    # ⚠️ **우리 리포트가 직접 쓰는 고정 분모** — "조회 100회당 댓글 N개"(engagement.*_per_100).
+    # 100 은 지표 '값' 으로는 등장하지 않아 화이트리스트에 없었고, AI 가 이 표기를 쓰면
+    # 무조건 "지표에 없는 숫자" 로 반려됐다. 실측(@jinyongjin92, 2026-08-04): 재작성 4회 중
+    # 3·4회차의 반려 사유가 **'100회' 단 2건**이어서 추천 슬롯이 폴백으로 떨어졌다.
+    if metrics.get("engagement"):
+        counts.add(100.0)
     return {"raw": raws, "man": mans, "bae": baes, "pct": pcts, "count": counts}
 
 

@@ -1190,6 +1190,25 @@ class TestConflictBaitIsRejected:
 
         assert CONFLICT_BAIT.search(text), text
 
+    def test_fixed_denominator_100_is_allowed(self):
+        """참여율의 고정 분모 100 을 AI 도 쓸 수 있어야 한다.
+
+        `"조회 100회당"` 은 이미 토큰화 제외지만 **`당` 이 없는 "100회"** 는 잡힌다.
+        2026-08-04 실측: 재작성 4회 중 3·4회차 반려 사유가 '100회' 단 2건이어서 추천 슬롯이
+        폴백으로 떨어졌다 — engagement 는 애초에 100 조회 기준으로 정의된 값이다.
+        """
+        from .pipeline.verify import build_whitelist, tokenize_numbers
+
+        toks = tokenize_numbers("조회 100회에 댓글 0.8개가 달려요")
+        hundred = [t for t in toks if t["value"] == 100]
+        assert hundred and hundred[0]["unit"] == "count", toks
+        assert 100.0 in build_whitelist({"engagement": {"comment_per_100": 0.8}}, {})["count"]
+
+    def test_denominator_not_allowed_without_engagement(self):
+        from .pipeline.verify import build_whitelist
+
+        assert 100.0 not in build_whitelist({}, {})["count"]
+
     @pytest.mark.parametrize(
         "text",
         [
