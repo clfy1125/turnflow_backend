@@ -256,7 +256,91 @@ def autofix_slots(slots: dict, agg: dict) -> list[str]:
         if slots.get(k) and EMOJI_RE.search(slots[k].get("text", "")):
             slots[k]["text"] = strip_emoji(slots[k]["text"])
             fixed.append(f"{k} 이모지 제거")
+
+    # 1:1 치환이 가능한 어려운 말은 **반려하지 말고 고친다**.
+    # 실측(@jinyongjin92 2026-08-04): 재작성 1회차 7건 중 5건이 `캡션`(3회)·`표본` 같은
+    # 단순 치환이었다 → 회당 3~4분짜리 추론모델 재작성을 한 번 더 태우고 있었다.
+    # 뜻이 달라질 수 있는 말(최적화·잠재력·한글 수량어)은 그대로 반려한다.
+    n_jargon = _autofix_jargon(slots)
+    if n_jargon:
+        fixed.append(f"어려운 말 {n_jargon}곳 자동 치환")
     return fixed
+
+
+# 1:1 로 바꿔도 뜻이 그대로인 것만. 뜻이 흐려지는 말은 넣지 말 것(반려가 맞다).
+JARGON_AUTOFIX = [
+    (re.compile(r"캡션"), "게시물 글"),
+    (re.compile(r"표본\s*수|표본"), "영상 수"),
+    (re.compile(r"오프닝|인트로"), "영상 시작 부분"),
+    (re.compile(r"썸네일"), "표지 화면"),
+    (re.compile(r"시그널"), "신호"),
+    (re.compile(r"변동성|편차"), "차이"),
+    (re.compile(r"니즈"), "원하는 것"),
+    (re.compile(r"중앙값"), "평소 조회수"),
+]
+
+
+def _autofix_jargon(obj) -> int:
+    """슬롯의 모든 문자열에서 1:1 치환 가능한 용어를 바꾼다. 반환: 바꾼 곳 수.
+
+    ⚠️ **따옴표 안(실제 영상 제목·댓글 원문)은 건드리지 않는다** — 인용을 고치면 원문이
+    아니게 된다. 검사도 따옴표 밖만 보므로(strip_quotes) 범위가 일치한다.
+    """
+    if isinstance(obj, dict):
+        n = 0
+        for k, v in obj.items():
+            if isinstance(v, str):
+                new = _sub_outside_quotes(v)
+                if new != v:
+                    obj[k] = new
+                    n += 1
+            else:
+                n += _autofix_jargon(v)
+        return n
+    if isinstance(obj, list):
+        return sum(_autofix_jargon(v) for v in obj)
+    return 0
+
+
+def _sub_outside_quotes(text: str) -> str:
+    out, last = [], 0
+    for m in QUOTED_RE.finditer(text):
+        out.append(_sub_all(text[last : m.start()]))
+        out.append(m.group(0))  # 인용은 원문 유지
+        last = m.end()
+    out.append(_sub_all(text[last:]))
+    return "".join(out)
+
+
+# 받침 유무로 형태가 갈리는 조사 — {받침 있을 때: 받침 없을 때}
+_PARTICLE_PAIRS = {"이": "가", "은": "는", "을": "를", "과": "와", "이나": "나", "이라": "라"}
+_PARTICLE_ALT = {**_PARTICLE_PAIRS, **{v: k for k, v in _PARTICLE_PAIRS.items()}}
+_PARTICLE_RE = "|".join(sorted(_PARTICLE_ALT, key=len, reverse=True))
+
+
+def _fix_particle(word: str, particle: str) -> str:
+    """치환된 단어의 받침에 맞는 조사로 바꾼다 ('표본이' → '영상 수**가**')."""
+    has = _has_final(word)
+    if particle in _PARTICLE_PAIRS:  # 받침 있을 때 쓰는 형태
+        return particle if has else _PARTICLE_ALT[particle]
+    return _PARTICLE_ALT[particle] if has else particle
+
+
+def _sub_all(seg: str) -> str:
+    """용어 치환 + **뒤따르는 조사 교정**.
+
+    ⚠️ 조사를 안 고치면 '표본이 작아요' → '영상 수이 작아요' 처럼 비문이 된다
+    (2026-08-04 테스트에서 잡음). 단어를 바꾸면 받침이 바뀌므로 조사도 함께 봐야 한다.
+    """
+    for rx, better in JARGON_AUTOFIX:
+        pat = re.compile(f"(?:{rx.pattern})({_PARTICLE_RE})?(?![가-힣])")
+
+        def rep(m, _better=better):
+            p = m.group(1)
+            return _better + (_fix_particle(_better, p) if p else "")
+
+        seg = pat.sub(rep, seg)
+    return seg
 
 
 def verify_slots_v3(slots: dict, metrics: dict, agg: dict) -> dict:

@@ -1155,6 +1155,66 @@ class TestJargonHintsMatchTheGate:
             assert not check_jargon(body), (name, check_jargon(body))
 
 
+class TestJargonAutofixSavesARetry:
+    """1:1 치환 가능한 어려운 말은 **반려하지 말고 고친다** (재작성 1회 = 3~4분).
+
+    2026-08-04 실측: 재작성 1회차 7건 중 5건이 `캡션`(3회)·`표본` 같은 단순 치환이었다.
+    """
+
+    def test_autofix_replaces_and_gate_then_passes(self):
+        from .pipeline.verify_v3 import autofix_slots, check_jargon
+
+        slots = {
+            "top3": [{"headline": "캡션이 좋았어요", "body": "표본이 작아요"}],
+            "recommendations": [{"title": "오프닝 손보기", "what_to_do": "썸네일을 바꿔요"}],
+        }
+        n = autofix_slots(slots, {})
+        assert n, "치환이 일어나야 한다"
+        assert slots["top3"][0]["headline"] == "게시물 글이 좋았어요"
+        assert slots["top3"][0]["body"] == "영상 수가 작아요"
+        assert slots["recommendations"][0]["title"] == "영상 시작 부분 손보기"
+        assert slots["recommendations"][0]["what_to_do"] == "표지 화면을 바꿔요"
+        # 치환 후에는 게이트가 더 이상 걸지 않아야 한다(= 재작성 불필요)
+        for s in ("top3", "recommendations"):
+            for row in slots[s]:
+                for v in row.values():
+                    assert not check_jargon(v), v
+
+    @pytest.mark.parametrize(
+        ("before", "after"),
+        [
+            ("표본이 작아요", "영상 수가 작아요"),
+            ("캡션이 좋아요", "게시물 글이 좋아요"),
+            ("캡션을 고쳐요", "게시물 글을 고쳐요"),
+            ("표본은 13개예요", "영상 수는 13개예요"),
+            ("썸네일과 첫 문장", "표지 화면과 첫 문장"),
+        ],
+    )
+    def test_particle_follows_the_new_word(self, before, after):
+        """단어를 바꾸면 받침이 바뀌므로 조사도 함께 고쳐야 한다(안 하면 비문)."""
+        from .pipeline.verify_v3 import _sub_all
+
+        assert _sub_all(before) == after
+
+    def test_quotes_are_never_rewritten(self):
+        """인용은 원문이다 — 고치면 거짓 인용이 된다."""
+        from .pipeline.verify_v3 import autofix_slots
+
+        slots = {"top3": [{"body": "팔로워가 “캡션 좀 길어요”라고 했어요. 캡션을 줄여보세요"}]}
+        autofix_slots(slots, {})
+        got = slots["top3"][0]["body"]
+        assert "“캡션 좀 길어요”" in got  # 인용 그대로
+        assert "게시물 글을 줄여보세요" in got  # 인용 밖은 치환
+
+    def test_ambiguous_terms_are_still_rejected(self):
+        """뜻이 흐려지는 말은 자동 치환하지 않고 반려해야 한다."""
+        from .pipeline.verify_v3 import autofix_slots, check_jargon
+
+        slots = {"top3": [{"body": "최적화로 잠재력을 극대화하세요"}]}
+        autofix_slots(slots, {})
+        assert check_jargon(slots["top3"][0]["body"])
+
+
 class TestRatioArithmeticIsAccepted:
     """허용된 두 지표를 나눈 값은 **환각이 아니라 맞는 산수**다 → 게이트가 통과시켜야 한다.
 
