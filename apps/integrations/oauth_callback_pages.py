@@ -8,11 +8,22 @@ Instagram OAuth 콜백 결과 페이지 (팝업 창에 렌더되는 사용자 �
 ⚠️ 프론트 연동 계약(변경 금지):
     각 페이지의 <script> 는 `window.opener.postMessage(...)` 로 부모 창(우리 웹앱)에
     결과를 전달한다. 부모는 아래 payload 필드로 분기하므로 값을 바꾸면 프론트가 깨진다.
-      - 성공: { type: 'INSTAGRAM_CONNECTED', success: true,  connection: {...} }
-      - 실패: { type: 'INSTAGRAM_ERROR',     success: false, errorCode: '...', message: '...' }
+      - 성공: { source: 'ig-connect', type: 'INSTAGRAM_CONNECTED', success: true,  connection: {...} }
+      - 실패: { source: 'ig-connect', type: 'INSTAGRAM_ERROR',     success: false, errorCode: '...', message: '...' }
     errorCode 값(OAUTH_AUTHORIZATION_FAILED / MISSING_PARAMETERS / INVALID_STATE /
     INSTAGRAM_API_ERROR / PLAN_LIMIT_EXCEEDED / ALREADY_CONNECTED_ELSEWHERE /
     INTERNAL_ERROR)도 계약의 일부다.
+
+    `source: 'ig-connect'` 는 2026-08-04 추가됐다 — 프론트가 이 필드로 우리 메시지를
+    식별한다(다른 확장/위젯의 postMessage 와 섞이지 않게). 기존 `type`/`success` 는
+    그대로 두었으므로 이전 방식으로 듣던 코드도 계속 동작한다.
+
+⚠️ targetOrigin (2026-08-04 보안 수정):
+    예전에는 `'*'` 로 브로드캐스트해 **어떤 opener 에게든** connection 페이로드가 전달됐다.
+    이제 허용목록(`oauth_return.postmessage_target_origins`)의 origin 에만 순차로 보낸다.
+    브라우저는 targetOrigin 이 실제 opener origin 과 일치할 때만 전달하므로 유출이 없다.
+    ⚠️ 이 페이지는 **API 오리진**(`https://turnflow-api.clfy.ai.kr`)에서 서빙된다 →
+       프론트의 수신 핸들러는 `event.origin` 이 API 오리진인 메시지를 신뢰해야 한다.
 
 디자인만 자유롭게 손봐도 되지만, postMessage payload / errorCode / auto-close 동작은 유지할 것.
 """
@@ -20,6 +31,8 @@ Instagram OAuth 콜백 결과 페이지 (팝업 창에 렌더되는 사용자 �
 import json
 
 from django.utils.html import escape
+
+from . import oauth_return
 
 
 def mask_email(email: str) -> str:
@@ -201,22 +214,31 @@ def _render(*, title: str, tone: str, icon: str, heading: str, body_html: str, s
     )
 
 
-def _wrap(post_js: str, close_ms: int) -> str:
+def _wrap(payload_js: str, close_ms: int, opener_origin: str = "") -> str:
     """부모 창 통지(계약) → 창 닫기 → 실패 시 수동 '창 닫기' 버튼 노출.
 
     ⭐ 닫힘 버그 방지의 핵심: `window.close()` 를 `window.opener` 유무와 **무관하게** 호출한다.
-    OAuth 도중 팝업이 교차 출처(facebook)를 거쳐 돌아오면 브라우저 정책(COOP 등)으로
+    OAuth 도중 팝업이 교차 출처(instagram.com)를 거쳐 돌아오면 브라우저 정책(COOP 등)으로
     `window.opener` 가 null 이 될 수 있는데, 예전 코드는 close 를 opener 가드 안에 둬서
     그때 창이 안 닫혔다. postMessage 만 opener 가 있을 때 보내고 close 는 항상 시도한다.
 
     그래도 브라우저가 스크립트 닫기를 거부하면(창이 그대로 남으면) 사용자가 직접 누를
     '창 닫기' 버튼을 띄운다 — 사용자 제스처 기반 close 는 가장 잘 허용된다.
+
+    `payload_js` 는 **객체 리터럴만** 넘긴다(postMessage 호출은 여기서 조립).
+    허용된 origin 마다 순차로 보내며, 브라우저는 실제 opener origin 과 일치하는
+    경우에만 전달하므로 `'*'` 없이도 모든 정상 케이스가 커버된다.
     """
+    origins = oauth_return.postmessage_target_origins(opener_origin)
     return (
         "(function () {\n"
+        "  var payload = " + payload_js + ";\n"
+        "  var origins = " + js_embed(origins) + ";\n"
         "  try {\n"
         "    if (window.opener && !window.opener.closed) {\n"
-        "      " + post_js + "\n"
+        "      for (var i = 0; i < origins.length; i++) {\n"
+        "        try { window.opener.postMessage(payload, origins[i]); } catch (e) {}\n"
+        "      }\n"
         "    }\n"
         "  } catch (e) {}\n"
         "  setTimeout(closeWindow, " + str(close_ms) + ");\n"
@@ -234,17 +256,20 @@ def _wrap(post_js: str, close_ms: int) -> str:
     )
 
 
-def _error_script(*, error_code: str, message: str, close_ms: int = 2000) -> str:
+def _error_script(
+    *, error_code: str, message: str, close_ms: int = 2000, opener_origin: str = ""
+) -> str:
     """실패 통지(INSTAGRAM_ERROR) + 창 닫기 폴백 스크립트."""
-    post_js = (
-        "window.opener.postMessage({\n"
+    payload_js = (
+        "{\n"
+        "        source: 'ig-connect',\n"
         "        type: 'INSTAGRAM_ERROR',\n"
         "        success: false,\n"
         f"        errorCode: '{error_code}',\n"
         f"        message: {js_embed(message)}\n"
-        "      }, '*');"
+        "      }"
     )
-    return _wrap(post_js, close_ms)
+    return _wrap(payload_js, close_ms, opener_origin)
 
 
 def _desc(*lines: str) -> str:
@@ -257,7 +282,7 @@ def _desc(*lines: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def oauth_error(error: str) -> str:
+def oauth_error(error: str, *, opener_origin: str = "") -> str:
     """사용자가 권한 승인을 취소했거나 Facebook 이 error 파라미터를 돌려준 경우."""
     return _render(
         title="Instagram 연동",
@@ -272,11 +297,12 @@ def oauth_error(error: str) -> str:
             error_code="OAUTH_AUTHORIZATION_FAILED",
             message="Instagram 권한 승인이 취소되었거나 처리 중 문제가 발생했습니다. 다시 시도해 주세요."
             + (f" ({error})" if error else ""),
+            opener_origin=opener_origin,
         ),
     )
 
 
-def missing_parameters() -> str:
+def missing_parameters(*, opener_origin: str = "") -> str:
     """code/state 파라미터가 누락된 경우."""
     return _render(
         title="Instagram 연동",
@@ -290,11 +316,12 @@ def missing_parameters() -> str:
         script=_error_script(
             error_code="MISSING_PARAMETERS",
             message="연동에 필요한 정보가 누락되었습니다. 처음부터 다시 시도해 주세요.",
+            opener_origin=opener_origin,
         ),
     )
 
 
-def invalid_state() -> str:
+def invalid_state(*, opener_origin: str = "") -> str:
     """state 가 없거나 만료된 경우 (CSRF 방어 / 세션 만료)."""
     return _render(
         title="Instagram 연동",
@@ -308,11 +335,12 @@ def invalid_state() -> str:
         script=_error_script(
             error_code="INVALID_STATE",
             message="세션이 만료되었거나 잘못된 요청입니다. 다시 시도해 주세요.",
+            opener_origin=opener_origin,
         ),
     )
 
 
-def instagram_api_error() -> str:
+def instagram_api_error(*, opener_origin: str = "") -> str:
     """Instagram Graph API 호출 중 예외가 발생한 경우."""
     return _render(
         title="Instagram 연동",
@@ -326,11 +354,12 @@ def instagram_api_error() -> str:
         script=_error_script(
             error_code="INSTAGRAM_API_ERROR",
             message="Instagram과 통신하는 중 문제가 발생했습니다. 잠시 후 다시 시도해 주세요.",
+            opener_origin=opener_origin,
         ),
     )
 
 
-def plan_limit_exceeded(allowance: int) -> str:
+def plan_limit_exceeded(allowance: int, *, opener_origin: str = "") -> str:
     """연동 가능한 IG 계정 수를 초과한 경우 (요금제 게이트)."""
     return _render(
         title="Instagram 연동",
@@ -346,11 +375,14 @@ def plan_limit_exceeded(allowance: int) -> str:
             error_code="PLAN_LIMIT_EXCEEDED",
             message="연결 가능한 Instagram 계정 수를 초과했습니다. "
             "요금제를 업그레이드하거나 추가 계정을 구매해 주세요.",
+            opener_origin=opener_origin,
         ),
     )
 
 
-def already_connected_elsewhere(*, owner_email: str, username: str = "") -> str:
+def already_connected_elsewhere(
+    *, owner_email: str, username: str = "", opener_origin: str = ""
+) -> str:
     """이 IG 계정이 이미 다른 워크스페이스에 연결돼 있어 신규 연동을 거부한 경우.
 
     하나의 Instagram 계정은 하나의 워크스페이스(TurnFlow 계정)에만 연결한다.
@@ -380,11 +412,12 @@ def already_connected_elsewhere(*, owner_email: str, username: str = "") -> str:
                 f"이 Instagram 계정은 이미 다른 워크스페이스({masked})에 연결되어 있습니다. "
                 "기존 연결을 해제한 후 다시 시도해 주세요."
             ),
+            opener_origin=opener_origin,
         ),
     )
 
 
-def connect_success(connection_data: dict) -> str:
+def connect_success(connection_data: dict, *, opener_origin: str = "") -> str:
     """연동 성공 — 계정 정보를 보여주고 부모 창에 connection 전달."""
     username = str(connection_data.get("username", ""))
     account_type = str(connection_data.get("account_type", "BUSINESS"))
@@ -403,14 +436,15 @@ def connect_success(connection_data: dict) -> str:
     )
     body_html = _desc("이제 댓글 수집과 자동 DM을 사용할 수 있어요.") + "\n" + account_box
 
-    post_js = (
-        "window.opener.postMessage({\n"
+    payload_js = (
+        "{\n"
+        "        source: 'ig-connect',\n"
         "        type: 'INSTAGRAM_CONNECTED',\n"
         "        success: true,\n"
         f"        connection: {js_embed(dict(connection_data))}\n"
-        "      }, '*');"
+        "      }"
     )
-    script = _wrap(post_js, 1500)
+    script = _wrap(payload_js, 1500, opener_origin)
 
     return _render(
         title="Instagram 연동 완료",
@@ -422,7 +456,7 @@ def connect_success(connection_data: dict) -> str:
     )
 
 
-def internal_error() -> str:
+def internal_error(*, opener_origin: str = "") -> str:
     """예상치 못한 서버 오류."""
     return _render(
         title="Instagram 연동",
@@ -436,5 +470,6 @@ def internal_error() -> str:
         script=_error_script(
             error_code="INTERNAL_ERROR",
             message="서버 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.",
+            opener_origin=opener_origin,
         ),
     )

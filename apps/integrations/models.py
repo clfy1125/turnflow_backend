@@ -346,6 +346,19 @@ class IGOAuthState(models.Model):
         related_name="ig_oauth_states",
         verbose_name="Workspace",
     )
+    # 팝업 없이 같은 탭으로 진행하는 모바일 경로(iOS 유니버설 링크 회피) — connect/start 에서
+    # 허용목록으로 검증한 뒤 저장하고, 콜백이 HTML 대신 이 주소로 302 시킨다.
+    # 빈 값이면 기존 팝업+HTML 동작(데스크탑) 그대로.
+    # ⚠️ **검증된 값만** 들어와야 한다(오픈 리다이렉트) — apps/integrations/oauth_return.py 참조.
+    return_to = models.URLField(
+        max_length=500, blank=True, default="", verbose_name="복귀 URL(검증됨)"
+    )
+    # 팝업 방식일 때 콜백 postMessage 의 targetOrigin 으로 우선 사용할 opener origin.
+    # connect/start 요청의 Origin 헤더를 허용목록으로 검증해 저장한다. 과거엔 '*' 로
+    # 브로드캐스트해 어떤 opener 에게든 connection 페이로드가 전달됐다.
+    opener_origin = models.CharField(
+        max_length=255, blank=True, default="", verbose_name="opener origin(검증됨)"
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     expires_at = models.DateTimeField()
 

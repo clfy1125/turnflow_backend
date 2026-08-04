@@ -165,6 +165,22 @@ class ConnectStartRequestSerializer(serializers.Serializer):
             "생략하면 신규 연동으로 간주."
         ),
     )
+    return_to = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        max_length=500,
+        help_text=(
+            "**모바일 권장 — 팝업을 쓰지 않는 같은-탭 플로우.** 지정하면 콜백이 결과 HTML 을 "
+            "렌더하지 않고 이 주소로 302 리다이렉트하며 `ig_result=connected|failed` "
+            "(+실패 시 `reason=<errorCode>`) 를 쿼리로 붙인다. 지정하지 않으면 기존 "
+            "팝업+postMessage 동작 그대로(데스크탑). "
+            "iOS 는 authorize URL 을 유니버설 링크로 보고 Instagram 앱을 띄우므로 팝업 플로우가 "
+            "돌아올 길이 없다 — 이 옵션이 그 문제의 해법이다. "
+            "**허용목록의 origin 과 완전일치**해야 하며(scheme+host+port), 불일치·비 http(s) 는 "
+            "400(`INVALID_RETURN_TO`). 경로·쿼리는 보존된다."
+        ),
+    )
 
 
 class ConnectionStartResponseSerializer(serializers.Serializer):

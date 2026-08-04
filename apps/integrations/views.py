@@ -10,7 +10,7 @@ import requests
 from django.conf import settings
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import Count, F, Q
-from django.http import HttpResponse
+from django.http import HttpResponse, HttpResponseRedirect
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
 from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiResponse, extend_schema
@@ -33,7 +33,7 @@ from apps.ai_jobs.serializers import (
 from apps.core.exceptions import DuplicateActiveCampaignError
 from apps.workspace.models import Workspace
 
-from . import oauth_callback_pages
+from . import oauth_callback_pages, oauth_return
 from .campaign_stats import (
     TIMESERIES_RANGES,
     annotate_campaign_stats,
@@ -142,11 +142,29 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         - **Bearer 토큰 필수**
 
         ## 동작 방식
-        1. Instagram OAuth 인증 URL 생성
-        2. 사용자를 Facebook OAuth 페이지로 리디렉션
+        1. Instagram OAuth 인증 URL 생성 — **`https://www.instagram.com/oauth/authorize`**
+           (Instagram Business Login. `facebook.com/dialog/oauth` 가 **아닙니다** —
+           호스트를 임의로 바꾸면 code 를 `api.instagram.com` 에서 교환할 수 없어 플로우가 깨집니다.)
+        2. 사용자를 그 URL 로 이동
         3. 사용자가 권한 승인
         4. Callback URL로 리디렉션됨
         5. 백엔드에서 토큰 교환 및 Instagram 계정 정보 조회
+
+        ## 📱 모바일(iOS)은 `return_to` 를 쓰세요 — 팝업 금지
+        iOS 는 `www.instagram.com` authorize URL 을 **유니버설 링크로 판정해 Instagram 앱을
+        띄웁니다.** 그러면 Safari 탭은 `about:blank` 로 남고 팝업 플로우는 결과를 돌려받을
+        길이 없습니다(앱 안에서 로그인이 끝나도 부모 창에 알릴 수 없음).
+
+        `return_to` 를 함께 보내면 콜백이 결과 HTML 을 렌더하지 않고 **그 주소로 302** 합니다:
+        ```
+        302 Location: {return_to}?ig_result=connected
+        302 Location: {return_to}?ig_result=failed&reason=PLAN_LIMIT_EXCEEDED
+        ```
+        - 같은 탭으로 진행하면 팝업 차단·유니버설 링크 문제에서 완전히 벗어납니다.
+        - `reason` 값은 팝업 방식의 `errorCode` 와 **동일한 어휘**입니다.
+        - `return_to` 는 **허용목록 origin 과 완전일치**해야 합니다(오픈 리다이렉트 방어).
+          불일치면 400 + `details.code = "INVALID_RETURN_TO"` (+ `details.allowed_origins`).
+        - 생략하면 기존 팝업 + `postMessage` 동작 그대로입니다(데스크탑 권장).
 
         ## 재연결(재인증) — `reconnect_connection_id` (선택)
         이미 연결된 계정의 **토큰만 재인증**(만료/오류 복구)하려는 경우, 그 연동의
@@ -157,13 +175,14 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         - ⚠️ 한도 우회는 불가합니다: 재연결로 시작했더라도 OAuth 에서 **다른(신규) 계정**을
           인증하면 콜백 단계에서 요금제 게이트가 다시 거절합니다.
 
-        ## 필요한 Facebook 권한
-        - `pages_show_list` - Facebook Page 목록 조회
-        - `pages_read_engagement` - Page 정보 및 engagement 읽기
-        - `instagram_basic` - Instagram 프로필 및 미디어 접근
-        - `instagram_manage_comments` - Instagram 댓글 관리
-        - `instagram_manage_messages` - Instagram DM 관리
-        - `business_management` - 비즈니스 계정 관리
+        ## 요청 권한(scope) — Instagram Business Login
+        `InstagramOAuthService.REQUIRED_SCOPES` 가 단일 소스입니다. 현재 값:
+        - `instagram_business_basic` - 프로필·미디어 조회
+        - `instagram_business_manage_comments` - 댓글 조회/답글
+        - `instagram_business_manage_messages` - DM 발송
+
+        (Facebook Page 계열 권한 `pages_show_list`/`instagram_basic` 등은 **쓰지 않습니다** —
+        Facebook Login for Business 방식의 권한이며 우리는 Instagram Login 을 씁니다.)
 
         ## 사용 예시
         ```javascript
@@ -193,14 +212,30 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         );
 
         const data = await response.json();
-        // 새 창으로 Facebook OAuth 페이지 열기
+        // 데스크탑: 팝업으로 열고 postMessage 를 기다린다
         window.open(data.authorization_url, '_blank', 'width=600,height=800');
+
+        // 📱 모바일 권장: 팝업 없이 같은 탭 — return_to 로 우리 주소로 되돌려받는다
+        const res = await fetch(
+            `/api/v1/integrations/instagram/workspaces/${workspaceId}/connect/start/`,
+            {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${accessToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ return_to: 'https://turnflow.link/settings?ig=done' })
+            }
+        );
+        const { authorization_url } = await res.json();
+        window.location.assign(authorization_url);   // 같은 탭으로 이동
+        // 복귀 시: https://turnflow.link/settings?ig=done&ig_result=connected
         ```
 
         ## 응답 예시
         ```json
         {
-            "authorization_url": "https://www.facebook.com/v24.0/dialog/oauth?client_id=...",
+            "authorization_url": "https://www.instagram.com/oauth/authorize?client_id=...&scope=instagram_business_basic%2C...",
             "state": "abc123...",
             "mode": "production"
         }
@@ -210,7 +245,13 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         responses={
             200: ConnectionStartResponseSerializer,
             400: OpenApiResponse(
-                description="reconnect_connection_id 가 이 워크스페이스 소속이 아니거나 이미 해제된 연동"
+                description=(
+                    "① reconnect_connection_id 가 이 워크스페이스 소속이 아니거나 이미 해제된 연동, "
+                    "또는 ② `return_to` 가 허용목록 origin 과 불일치 "
+                    '(`details.code = "INVALID_RETURN_TO"`, `details.reason` = '
+                    "origin_not_allowed / scheme_not_allowed / too_long / userinfo_not_allowed / "
+                    "illegal_characters / unparsable, `details.allowed_origins` = 허용 목록)"
+                )
             ),
             401: OpenApiResponse(description="인증 실패 - 유효하지 않은 토큰"),
             403: OpenApiResponse(description="권한 없음 - 워크스페이스 멤버가 아님"),
@@ -305,12 +346,54 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                     owner.id,
                 )
 
+        # ── 같은-탭 복귀(`return_to`) — 모바일 경로 ────────────────────────────────
+        # iOS 는 authorize URL(www.instagram.com)을 유니버설 링크로 보고 Instagram 앱을 띄운다.
+        # 그러면 팝업 플로우는 부모 창에 결과를 알릴 방법이 없어 영구 대기에 빠진다.
+        # return_to 가 오면 콜백이 HTML 대신 그 주소로 302 → 팝업·유니버설 링크 문제를 우회.
+        # ⚠️ 오픈 리다이렉트 방어: origin 완전일치 허용목록 (oauth_return.validate_return_to)
+        raw_return_to = request.data.get("return_to") or ""
+        return_to = ""
+        if raw_return_to:
+            return_to, reject_reason = oauth_return.validate_return_to(raw_return_to)
+            if not return_to:
+                return Response(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": 400,
+                            "message": (
+                                "return_to 가 허용되지 않은 주소입니다. "
+                                "허용된 프론트 origin 과 정확히 일치해야 합니다."
+                            ),
+                            "details": {
+                                "code": "INVALID_RETURN_TO",
+                                "reason": reject_reason,
+                                "allowed_origins": oauth_return.allowed_origins(),
+                            },
+                        },
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        # 팝업 방식일 때 콜백 postMessage 의 targetOrigin 으로 쓸 opener origin.
+        # 허용목록에 없으면 저장하지 않는다(콜백은 허용목록 전체에 순차 전송으로 폴백).
+        opener_origin = ""
+        _req_origin = oauth_return.normalize_origin(request.headers.get("Origin", "") or "")
+        if _req_origin and _req_origin in oauth_return.allowed_origins():
+            opener_origin = _req_origin
+
         # Generate state for CSRF protection
         state = secrets.token_urlsafe(32)
 
         # Persist state in DB instead of session so popup flows without cookie/session work
         expires_at = timezone.now() + timedelta(minutes=10)
-        IGOAuthState.objects.create(state=state, workspace=workspace, expires_at=expires_at)
+        IGOAuthState.objects.create(
+            state=state,
+            workspace=workspace,
+            expires_at=expires_at,
+            return_to=return_to,
+            opener_origin=opener_origin,
+        )
 
         # Build redirect URI - use INSTAGRAM_REDIRECT_URI from settings if available
         redirect_uri = settings.INSTAGRAM_REDIRECT_URI
@@ -426,17 +509,45 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         state = request.GET.get("state")
         error = request.GET.get("error")
 
+        # ── 결과 전달 방식 결정 ────────────────────────────────────────────────────
+        # connect/start 에서 검증된 return_to 를 받아 뒀다면 HTML 대신 그 주소로 302 시킨다
+        # (모바일: 팝업 없음 → iOS 유니버설 링크 문제 회피). 없으면 기존 팝업+HTML 그대로.
+        #
+        # state 행을 못 찾는 분기(missing_parameters / invalid_state)에서는 return_to 를
+        # 알 수 없다 → **검증 안 된 곳으로 리다이렉트하지 않는다**. HTML 로 종료한다.
+        state_obj = IGOAuthState.objects.filter(state=state).first() if state else None
+
+        # state 행은 성공 직전에 삭제되므로(아래 "Clean up persisted state") 값을 먼저 붙잡는다.
+        return_to_target = getattr(state_obj, "return_to", "") or ""
+        opener_origin = getattr(state_obj, "opener_origin", "") or ""
+
+        def _finish(html: str, *, result: str, reason: str = ""):
+            """return_to 가 있으면 302, 없으면 기존 HTML 응답."""
+            if return_to_target:
+                return HttpResponseRedirect(
+                    oauth_return.build_result_redirect(
+                        return_to_target, result=result, reason=reason
+                    )
+                )
+            return HttpResponse(html)
+
         # Check for errors
         if error:
-            return HttpResponse(oauth_callback_pages.oauth_error(error))
+            return _finish(
+                oauth_callback_pages.oauth_error(error, opener_origin=opener_origin),
+                result="failed",
+                reason="OAUTH_AUTHORIZATION_FAILED",
+            )
 
         if not code or not state:
-            return HttpResponse(oauth_callback_pages.missing_parameters())
+            # state 없이는 복귀 주소를 신뢰할 수 없다 → HTML 종료(리다이렉트 금지)
+            return HttpResponse(
+                oauth_callback_pages.missing_parameters(opener_origin=opener_origin)
+            )
 
         # Verify state (CSRF protection) using persisted IGOAuthState
-        state_obj = IGOAuthState.objects.filter(state=state).first()
         if not state_obj or state_obj.is_expired():
-            return HttpResponse(oauth_callback_pages.invalid_state())
+            return HttpResponse(oauth_callback_pages.invalid_state(opener_origin=opener_origin))
 
         try:
             workspace = state_obj.workspace
@@ -488,7 +599,11 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                     account_info = InstagramOAuthService.get_account_info(access_token)
                 except Exception as e:
                     logger.error(f"Exception during get_account_info: {str(e)}")
-                    return HttpResponse(oauth_callback_pages.instagram_api_error())
+                    return _finish(
+                        oauth_callback_pages.instagram_api_error(opener_origin=opener_origin),
+                        result="failed",
+                        reason="INSTAGRAM_API_ERROR",
+                    )
 
                 # Use user_id from token response or account_info
                 instagram_account_id = (
@@ -544,11 +659,14 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                             conflict.workspace_id,
                             conflict.id,
                         )
-                        return HttpResponse(
+                        return _finish(
                             oauth_callback_pages.already_connected_elsewhere(
                                 owner_email=conflict.workspace.owner.email,
                                 username=account_info.get("username", ""),
-                            )
+                                opener_origin=opener_origin,
+                            ),
+                            result="failed",
+                            reason="ALREADY_CONNECTED_ELSEWHERE",
                         )
                     connection = IGAccountConnection(
                         workspace=workspace,
@@ -573,7 +691,13 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                             workspace.id,
                             allowance,
                         )
-                        return HttpResponse(oauth_callback_pages.plan_limit_exceeded(allowance))
+                        return _finish(
+                            oauth_callback_pages.plan_limit_exceeded(
+                                allowance, opener_origin=opener_origin
+                            ),
+                            result="failed",
+                            reason="PLAN_LIMIT_EXCEEDED",
+                        )
 
                 # 기존/신규 공통: 모든 필드를 최신 값으로 덮어써 재연동이 곧 교체가 되게 한다.
                 connection.username = account_info.get("username", account_info.get("name", ""))
@@ -646,9 +770,14 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
             except Exception:
                 pass
 
-            # Return success response with HTML
+            # Return success response with HTML (또는 return_to 로 302)
             connection_data = IGAccountConnectionSerializer(connection).data
-            return HttpResponse(oauth_callback_pages.connect_success(dict(connection_data)))
+            return _finish(
+                oauth_callback_pages.connect_success(
+                    dict(connection_data), opener_origin=opener_origin
+                ),
+                result="connected",
+            )
 
         except Exception as e:
             # Meta/Instagram HTTPError 는 응답 본문에 실패 사유(JSON)가 들어있다.
@@ -664,7 +793,11 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 f"Fatal error in connect_callback: {type(e).__name__} - {str(e)}{meta_body}"
             )
 
-            return HttpResponse(oauth_callback_pages.internal_error())
+            return _finish(
+                oauth_callback_pages.internal_error(opener_origin=opener_origin),
+                result="failed",
+                reason="INTERNAL_ERROR",
+            )
 
     @extend_schema(
         summary="연결된 Instagram 계정 목록",

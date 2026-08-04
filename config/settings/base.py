@@ -709,6 +709,17 @@ INSTAGRAM_WEBHOOK_VERIFY_TOKEN = config(
     "INSTAGRAM_WEBHOOK_VERIFY_TOKEN", default="my_verify_token_12345"
 )
 
+# IG OAuth 복귀 대상(`return_to`) + 콜백 postMessage 대상으로 허용할 프론트 origin 목록.
+#   · 형식: 쉼표 구분 origin (예: "https://turnflow.link,https://app.turnflow.link")
+#   · **비워 두면 `CORS_ALLOWED_ORIGINS` 를 따른다**(이미 "신뢰하는 프론트" 목록이므로
+#     같은 값을 두 곳에서 관리하지 않는다). 판정 로직은 apps/integrations/oauth_return.py.
+#   · origin **완전일치**만 허용한다 — prefix/부분문자열 비교는 오픈 리다이렉트 구멍이다.
+IG_OAUTH_RETURN_TO_ORIGINS = config(
+    "IG_OAUTH_RETURN_TO_ORIGINS",
+    default="",
+    cast=lambda v: [s.strip() for s in v.split(",") if s.strip()],
+)
+
 # Meta App (Facebook Login for Instagram Business)
 META_APP_ID = config("META_APP_ID", default="")
 META_APP_SECRET = config("META_APP_SECRET", default="")
