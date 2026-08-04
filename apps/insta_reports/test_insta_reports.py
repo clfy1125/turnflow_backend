@@ -1188,6 +1188,8 @@ class TestJargonAutofixSavesARetry:
             ("캡션을 고쳐요", "게시물 글을 고쳐요"),
             ("표본은 13개예요", "영상 수는 13개예요"),
             ("썸네일과 첫 문장", "표지 화면과 첫 문장"),
+            ("CTA를 넣어요", "댓글 유도를 넣어요"),
+            ("말하는 얼굴이 많아요", "사람이 카메라를 보고 말하며 시작하는 영상이 많아요"),
         ],
     )
     def test_particle_follows_the_new_word(self, before, after):
