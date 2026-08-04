@@ -552,10 +552,20 @@ def build_synth_input(
             )
         return out
 
-    quote_pool_slim = {
-        cat: [{"quote_id": q["quote_id"], "text": q["text"][:100], "likes": q["likes"]} for q in qs]
+    # 분류 키(영어) → 사람말 라벨. AI 입력에는 라벨만 넣는다(위 comment_stats 주의사항 참고).
+    cat_ko = cstats.get("category_ko") or {}
+    quote_pool_ko = {
+        cat_ko.get(cat, cat): [
+            {"quote_id": q["quote_id"], "text": q["text"][:100], "likes": q["likes"]} for q in qs
+        ]
         for cat, qs in cstats["quote_pool"].items()
     }
+    counts_ko = {cat_ko.get(k, k): v for k, v in (cstats.get("counts") or {}).items() if v}
+    pcts_ko = {cat_ko.get(k, k): v for k, v in (cstats.get("pcts") or {}).items() if v}
+    tones_ko = [
+        {"name": t["label"], "pct": t["pct"], "count": t["count"]}
+        for t in (cstats.get("tones") or [])
+    ]
     low_feat_plain = [
         {
             "views": r["views"],
@@ -606,12 +616,17 @@ def build_synth_input(
         "derived": agg["derived"],
         "top_posts_meta": [{**tm} for tm in agg["top_posts_meta"]],
         "comment_stats": {
-            "counts": cstats["counts"],
-            "pcts": cstats["pcts"],
+            # ⚠️ **분류 키(영어)를 AI 에 넣지 않는다** — 2026-08-04 실측: `counts`/`pcts`/
+            # `quote_pool` 의 키를 그대로 넣었더니 모델이 `hostile`·`debate` 를 리포트 문장에
+            # 그대로 써서 게이트가 "영어 표현 금지" 로 반려했다(모듈 상단 주의사항 위반).
+            # 사람말 라벨만 넘긴다.
+            "counts": counts_ko,
+            "pcts": pcts_ko,
+            "tones": tones_ko,
             "n_analyzed": cstats["n_analyzed"],
             "save_mentions": cstats["save_mentions"],
             "motivations": cstats["motivations"],
-            "quote_pool": quote_pool_slim,
+            "quote_pool": quote_pool_ko,
             "dm_not_received_count": cstats.get("dm_not_received_count", 0),
             "dm_not_received_pct": cstats.get("dm_not_received_pct", 0),
             "insufficient": cstats.get("insufficient", False),

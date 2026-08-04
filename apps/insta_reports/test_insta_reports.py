@@ -1128,6 +1128,22 @@ class TestJargonHintsMatchTheGate:
         g = _audience_guidance({"audience": {"scale": "large", "reach_mode": "explore_driven"}})
         assert "쓰면 반려되는 말" in g
 
+    def test_guidance_itself_never_suggests_a_banned_phrase(self):
+        """가이드가 권하는 표현이 게이트에 걸리면 **재작성 무한 루프**가 된다.
+
+        2026-08-04 실측: explore_driven 가이드가 "팔로워 전환을 조언하세요" 라고 해서 모델이
+        '팔로우 전환' 을 썼고 게이트가 금칙어로 반려했다 — 우리가 시켜서 반려당한 것이다.
+        """
+        from .pipeline.synthesize import _REACH_GUIDANCE, _SCALE_GUIDANCE
+        from .pipeline.verify_v3 import check_jargon
+
+        for name, block in [*_SCALE_GUIDANCE.items(), *_REACH_GUIDANCE.items()]:
+            if not block:
+                continue
+            # 가이드는 '쓰지 마세요' 안내에서 금칙어를 일부러 언급한다 → 그 줄은 제외하고 본다.
+            body = "\n".join(ln for ln in block.splitlines() if "반려" not in ln)
+            assert not check_jargon(body), (name, check_jargon(body))
+
 
 class TestDonutShowsEveryComment:
     """도넛은 **분류 전량**을 담아야 한다 (합계 = 분석한 댓글 수).
@@ -1252,7 +1268,7 @@ class TestAdviceBranchesByAccountScale:
 
         big = _audience_guidance({"audience": {"scale": "large", "reach_mode": "explore_driven"}})
         small = _audience_guidance({"audience": {"scale": "starting", "reach_mode": "balanced"}})
-        assert "대형" in big and "팔로워 전환" in big
+        assert "대형" in big and "팔로워로 남기기" in big
         assert "막 시작한" in small
         assert big != small
         # 갈등 유도 금지는 규모와 무관하게 **항상** 붙는다.
