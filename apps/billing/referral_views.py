@@ -1,16 +1,20 @@
 """
-Referral API views — 레퍼럴 코드 입력 시 결제 없이 트라이얼 부여.
+Referral API views — 쿠폰(제휴/레퍼럴 코드) 검증 및 사용 이력.
 
-1. ValidateReferralCodeView   — 코드 사전 검증 (인증 불필요)
-2. RedeemReferralCodeView     — 코드 사용 (트라이얼 시작)
+1. ValidateReferralCodeView   — 코드 사전 검증 + **결제 전 미리보기** (인증 불필요)
+2. RedeemReferralCodeView     — **폐지**(항상 400). 쿠폰은 카드 등록 경로에서만 사용
 3. MyReferralRedemptionView   — 내 레퍼럴 사용 이력 조회
+
+⚠️ 쿠폰으로 트라이얼을 시작하는 경로는 **단 하나**다 —
+``POST /billing/toss/confirm/`` 에 ``referral_code`` 동봉
+(:func:`apps.billing.toss_flows.confirm_billing`, ``scenario="trial"``).
+여기에 두 번째 경로를 만들지 말 것: 과거 이 파일의 redeem 이 기본 체험 30일을
+빼먹어 "30일 + 14일" 쿠폰이 14일로 나갔다(2026-08-04 규명).
 """
 
 import logging
 from datetime import timedelta
 
-from django.db import transaction
-from django.db.models import F
 from django.utils import timezone
 from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import status
@@ -18,15 +22,13 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import ReferralCode, ReferralRedemption, SubscriptionStatus, UserSubscription
+from .models import ReferralCode, ReferralRedemption
 from .serializers import (
     ReferralCodeRedeemRequestSerializer,
     ReferralCodeValidateResponseSerializer,
     ReferralRedemptionSerializer,
     SubscriptionPlanSerializer,
-    UserSubscriptionSerializer,
 )
-from .subscription_utils import ensure_subscription
 
 logger = logging.getLogger(__name__)
 
@@ -213,17 +215,30 @@ if (data.valid) {
         if not ok:
             return Response({"valid": False, "reason": reason})
 
-        # 카드 등록(toss confirm) 시나리오 기준 총 무료 일수 = 기본 체험 + 코드 보너스.
-        # (카드 없이 /referral/redeem/ 로 쓰면 base 없이 trial_days 만 적용됨)
-        from .toss_flows import TRIAL_BASE_DAYS
+        # 총 무료 일수 = 기본 체험 + 코드 보너스. 쿠폰은 카드 등록 경로에서만 쓰이므로
+        # 이 값이 유일한 정답이다 (카드 없는 redeem 경로는 폐지 — 그 경로가 base 를
+        # 빼먹어 "30일 + 14일" 이 14일로 나가던 결함의 원인이었다).
+        from .models import EXTRA_IG_ACCOUNT_PRICE
+        from .toss_flows import TRIAL_BASE_DAYS, get_current_selling_price
+
+        total_days = TRIAL_BASE_DAYS + code.trial_days
+        # 미리보기 추정치 — 실제 확정은 confirm 시점의 now 기준
+        first_charge_at = timezone.now() + timedelta(days=total_days)
 
         return Response(
             {
                 "valid": True,
                 "trial_days": code.trial_days,
                 "base_trial_days": TRIAL_BASE_DAYS,
-                "total_trial_days": TRIAL_BASE_DAYS + code.trial_days,
+                "total_trial_days": total_days,
                 "plan": SubscriptionPlanSerializer(code.target_plan).data,
+                # 결제 전 미리보기 — 프론트가 "쿠폰 적용하고 결제하면 이렇게 됩니다" 를
+                # 카드 입력 **전에** 보여줄 수 있도록 서버가 계산해서 내려준다.
+                "requires_card": True,
+                "trial_ends_at": first_charge_at,
+                "first_charge_at": first_charge_at,
+                "first_charge_amount": get_current_selling_price(code.target_plan),
+                "extra_ig_account_price": EXTRA_IG_ACCOUNT_PRICE,
             }
         )
 
@@ -234,158 +249,69 @@ if (data.valid) {
 
 
 class RedeemReferralCodeView(APIView):
-    """레퍼럴 코드 사용 → 결제 없이 트라이얼 시작"""
+    """폐지됨 — 쿠폰은 카드 등록(toss confirm) 경로에서만 사용한다.
+
+    ⚠️ 이 경로는 ``code.trial_days`` 만 부여하고 **기본 체험 30일(TRIAL_BASE_DAYS)을
+    가산하지 않았다**. 그래서 14일 쿠폰 사용자가 "30일 + 14일 = 44일" 대신 **14일만**
+    받는 결함이 실서비스에서 발생했다(2026-08-04 규명, HLEVEL26 17건 중 3건 피해).
+
+    같은 쿠폰을 카드 등록에 동봉한 :func:`apps.billing.toss_flows.confirm_billing`
+    (``scenario="trial"``) 은 ``TRIAL_BASE_DAYS + bonus_days`` 로 44일을 정확히 줬다.
+    두 경로가 서로 다른 값을 주는 게 근본 원인이었으므로, 경로를 하나로 없앤다.
+
+    부수적으로 막히는 것: 이 경로는 ``trial_used_at`` 을 채우지 않아, 체험이 만료돼
+    free 로 강등된 뒤 카드를 등록하면 ``scenario="trial"`` 로 재판정돼 **30일 무료
+    체험이 한 번 더** 나갔다(1인 1회 원칙 우회). 경로 폐지로 이 구멍도 닫힌다.
+    """
 
     permission_classes = [IsAuthenticated]
 
     @extend_schema(
         tags=["레퍼럴"],
-        summary="레퍼럴 코드 사용 (트라이얼 시작)",
+        summary="[폐지] 카드 없이 쿠폰 사용",
+        deprecated=True,
         description="""
-## 목적
-입력한 레퍼럴 코드를 사용해 **결제 없이 N일 무료 트라이얼**을 시작합니다.
-결제 호출이 없으며, 카드 정보도 수집하지 않습니다.
+## ⛔ 폐지된 엔드포인트 — 항상 400 을 반환합니다
 
-> 💳 카드 등록과 함께 시작하는 프로 무료 체험(+제휴코드 연장)은
-> `POST /billing/toss/confirm/` 을 사용하세요. 제휴/레퍼럴 코드는 경로와 무관하게
-> **1인 1회**만 사용할 수 있습니다.
+이 경로는 **더 이상 트라이얼을 시작하지 않습니다.** 쿠폰(제휴/레퍼럴 코드)은
+**카드 등록과 함께** 사용하세요 → `POST /billing/toss/confirm/` 에 `referral_code` 동봉.
 
-## 인증
-`Authorization: Bearer <access_token>` 헤더 필수
+## 왜 폐지했는가
 
-## 동작
-성공 시 다음을 한 트랜잭션 안에서 수행합니다:
-1. `UserSubscription`을 다음 값으로 갱신
-   - `plan = referral_code.target_plan` (예: pro)
-   - `status = trialing`
-   - `current_period_start = now`
-   - `current_period_end = now + trial_days`
-   - `cancelled_at = null`
-2. 사용자의 모든 페이지를 활성화 (유료 동등 권한)
-3. `ReferralCode.current_uses += 1`
-4. `ReferralRedemption` 생성
+이 경로는 `code.trial_days` 만 부여하고 **기본 무료 체험 30일을 가산하지 않았습니다.**
+그래서 14일 쿠폰 사용자가 `30일 + 14일 = 44일` 이 아니라 **14일만** 받았습니다.
+같은 쿠폰을 카드 등록에 동봉하면 정상적으로 44일이 부여됩니다. 두 경로가 서로 다른
+값을 주는 것이 결함의 근본 원인이었으므로, 경로를 하나로 통일했습니다.
 
-> 📌 `pro_activated_at`은 **설정하지 않습니다**. 이 필드는 실제 첫 결제 시점에만 채워집니다.
-> 📌 AI 토큰은 별도 지급하지 않습니다 — 트라이얼 중에는 유료 플랜과 동일하게 AI 무제한입니다.
+## 프론트엔드가 해야 할 일
 
-## 트라이얼 만료 처리
-- `current_period_end`가 지나면 `billing.handle_trial_expiry` 배치가 free 플랜으로 자동 다운그레이드합니다.
-  (단, 트라이얼 중 카드를 등록했다면 만료 시점에 자동으로 첫 결제가 진행됩니다.)
-- 다운그레이드 시 페이지 비활성화/로고(배지) 복원이 함께 진행됩니다.
+1. 쿠폰 입력 → `GET /billing/referral/validate/?code=XXX` 로 검증 **및 미리보기 정보 획득**
+   - `total_trial_days` — 총 무료 일수 (예: 44). **`trial_days`(=14, 보너스분)를 그대로
+     노출하면 안 됩니다.**
+   - `first_charge_at` — 첫 결제 예정 시각 (= 무료 체험 종료 시각)
+   - `first_charge_amount` — 첫 결제 예정 금액(원)
+2. "쿠폰 적용 시 44일 무료, 2026-09-17에 14,900원 첫 결제" 를 **카드 입력 전에** 안내
+3. 카드 등록 시 `POST /billing/toss/confirm/` 에 `referral_code` 를 **함께** 전송
 
-## 트라이얼 → 유료 전환
-- 트라이얼 중 `POST /billing/toss/confirm/` 으로 카드를 등록하면 **잔여 트라이얼 기간은 유지**되고,
-  만료 시점에 첫 결제가 자동 진행됩니다.
-- 첫 결제 성공 시점에 `ReferralRedemption.converted_to_paid`가 자동으로 `True`로 마킹됩니다.
+## 응답
 
-## 사용 가능 조건 (모두 충족해야 함)
-| 조건 | 위반 시 |
-|------|---------|
-| 사용자 본인이 아직 레퍼럴 미사용 (1유저 1회) | 400 `이미 레퍼럴 코드를 사용하셨습니다.` |
-| 현재 무료 플랜 사용자 | 400 `이미 유료 플랜을 사용 중입니다.` |
-| 현재 트라이얼 중 아님 | 400 `이미 트라이얼이 진행 중입니다.` |
-| 코드 자체 사용 가능 (검증 API와 동일 검사) | 400 + 사유 메시지 |
-
-## 요청 필드
-| 필드 | 필수 | 타입 | 설명 |
-|------|------|------|------|
-| `code` | ✅ | string | 레퍼럴 코드. 대소문자 무시, 앞뒤 공백 자동 제거 |
-
-## 응답 필드
-| 필드 | 타입 | 설명 |
-|------|------|------|
-| `detail` | string | 처리 결과 메시지 |
-| `redemption` | object | 생성된 ReferralRedemption (trial 정보 포함) |
-| `subscription` | object | 갱신된 UserSubscription |
-
-## 프론트엔드 통합
-```typescript
-const res = await fetch('/api/v1/billing/referral/redeem/', {
-  method: 'POST',
-  headers: {
-    'Content-Type': 'application/json',
-    'Authorization': `Bearer ${accessToken}`,
-  },
-  body: JSON.stringify({ code: 'WELCOME2026' }),
-});
-
-if (res.ok) {
-  const data = await res.json();
-  const endsAt = new Date(data.redemption.trial_ends_at);
-  alert(`${endsAt.toLocaleDateString()}까지 무료 체험이 시작되었습니다!`);
-  // 구독 상태 재조회 → UI 갱신
-} else {
-  const err = await res.json();
-  showError(err.detail);
-}
-```
-
-## 에러
-| 코드 | 원인 |
-|------|------|
-| 400 | 위 "사용 가능 조건" 위반 / 코드 검증 실패 / `code` 누락 |
-| 401 | 인증 실패 |
+항상 `400` + `code: "REFERRAL_REQUIRES_CARD"`.
+`detail` 은 사용자에게 그대로 보여줄 수 있는 한국어 문장입니다.
         """,
         request=ReferralCodeRedeemRequestSerializer,
         responses={
-            200: OpenApiResponse(
-                description="트라이얼 시작 완료",
-                examples=[
-                    OpenApiExample(
-                        "성공",
-                        value={
-                            "detail": "트라이얼이 시작되었습니다.",
-                            "redemption": {
-                                "id": "f1e2d3c4-0000-0000-0000-000000000001",
-                                "referral_code_value": "WELCOME2026",
-                                "plan": {
-                                    "id": "550e8400-e29b-41d4-a716-446655440002",
-                                    "name": "pro",
-                                    "display_name": "프로",
-                                    "monthly_price": 9900,
-                                    "features": {"max_pages": 5, "ai_generation": True},
-                                    "sort_order": 1,
-                                },
-                                "trial_started_at": "2026-04-27T12:00:00Z",
-                                "trial_ends_at": "2026-05-27T12:00:00Z",
-                                "is_trial_active": True,
-                                "converted_to_paid": False,
-                                "converted_at": None,
-                                "created_at": "2026-04-27T12:00:00Z",
-                            },
-                            "subscription": {
-                                "id": "a1b2c3d4-0000-0000-0000-000000000002",
-                                "plan": {"name": "pro", "display_name": "프로"},
-                                "status": "trialing",
-                                "current_period_start": "2026-04-27T12:00:00Z",
-                                "current_period_end": "2026-05-27T12:00:00Z",
-                            },
-                        },
-                    ),
-                ],
-            ),
             400: OpenApiResponse(
-                description="사용 불가",
+                description="폐지됨 — 카드 등록 경로를 사용해야 함",
                 examples=[
                     OpenApiExample(
-                        "이미 사용함",
-                        value={"detail": "이미 레퍼럴 코드를 사용하셨습니다."},
-                    ),
-                    OpenApiExample(
-                        "유료 사용자",
-                        value={"detail": "이미 유료 플랜을 사용 중입니다."},
-                    ),
-                    OpenApiExample(
-                        "트라이얼 중",
-                        value={"detail": "이미 트라이얼이 진행 중입니다."},
-                    ),
-                    OpenApiExample(
-                        "코드 미존재",
-                        value={"detail": "존재하지 않는 코드입니다."},
-                    ),
-                    OpenApiExample(
-                        "기간 만료",
-                        value={"detail": "유효 기간이 만료된 코드입니다."},
+                        "폐지 안내",
+                        value={
+                            "detail": (
+                                "쿠폰은 카드 등록과 함께 사용해야 합니다. "
+                                "결제 수단을 등록하면 무료 체험이 시작됩니다."
+                            ),
+                            "code": "REFERRAL_REQUIRES_CARD",
+                        },
                     ),
                 ],
             ),
@@ -393,133 +319,25 @@ if (res.ok) {
         },
     )
     def post(self, request):
-        serializer = ReferralCodeRedeemRequestSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        code_str = _normalize_code(serializer.validated_data["code"])
+        """항상 400 — 쿠폰은 카드 등록 경로(toss/confirm)로만 사용한다.
 
-        if not code_str:
-            return Response(
-                {"detail": "코드를 입력해주세요."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # 이미 레퍼럴을 사용했는지 (1유저 1회)
-        if ReferralRedemption.objects.filter(user=request.user).exists():
-            return Response(
-                {"detail": "이미 레퍼럴 코드를 사용하셨습니다."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # 트랜잭션 + 코드 row 락
-        try:
-            with transaction.atomic():
-                try:
-                    code = (
-                        ReferralCode.objects.select_for_update()
-                        .select_related("target_plan")
-                        .get(code=code_str)
-                    )
-                except ReferralCode.DoesNotExist:
-                    return Response(
-                        {"detail": "존재하지 않는 코드입니다."},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
-
-                ok, reason = code.is_redeemable()
-                if not ok:
-                    return Response(
-                        {"detail": reason},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
-
-                sub = (
-                    UserSubscription.objects.select_for_update()
-                    .select_related("plan")
-                    .get(pk=ensure_subscription(request.user).pk)
-                )
-
-                # 이미 유료 플랜이거나 트라이얼 중이면 거부
-                if sub.status == SubscriptionStatus.TRIALING:
-                    return Response(
-                        {"detail": "이미 트라이얼이 진행 중입니다."},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
-                if sub.is_paid_plan:
-                    return Response(
-                        {"detail": "이미 유료 플랜을 사용 중입니다."},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
-
-                now = timezone.now()
-                trial_ends = now + timedelta(days=code.trial_days)
-
-                # 구독 갱신 — pro_activated_at은 결제 시점에만 설정하므로 건드리지 않음
-                sub.plan = code.target_plan
-                sub.status = SubscriptionStatus.TRIALING
-                sub.current_period_start = now
-                sub.current_period_end = trial_ends
-                # T-1: 쿠폰 체험도 같은 구독을 TRIALING 으로 만든다 — 체험 플랜의 내구
-                # 기록을 카드 체험과 동일하게 남긴다.
-                # ⚠️ T-3: cancelled_during_trial_at 은 **초기화하지 않는다** — 재체험 시
-                #    과거 취소가 지워져 이미 지나간 기간의 집계가 줄어든다(toss_flows 동일).
-                sub.trial_plan = code.target_plan
-                sub.cancelled_at = None
-                sub.save(
-                    update_fields=[
-                        "plan",
-                        "status",
-                        "current_period_start",
-                        "current_period_end",
-                        "trial_plan",
-                        "cancelled_at",
-                        "updated_at",
-                    ]
-                )
-
-                # 페이지 전체 활성화 (유료 동등)
-                from apps.pages.models import Page
-
-                Page.objects.filter(user=request.user, is_active=False).update(is_active=True)
-
-                # AI 토큰 지급 없음 — 유료(트라이얼 포함)는 토큰과 무관하게 AI 무제한
-                # (기존 지급 코드는 features 키 불일치로 실제 지급된 적 없던 죽은 경로였음)
-
-                # 사용 횟수 증가
-                ReferralCode.objects.filter(pk=code.pk).update(
-                    current_uses=F("current_uses") + 1,
-                    updated_at=now,
-                )
-
-                redemption = ReferralRedemption.objects.create(
-                    user=request.user,
-                    referral_code=code,
-                    trial_started_at=now,
-                    trial_ends_at=trial_ends,
-                )
-        except Exception:
-            logger.exception(
-                "레퍼럴 코드 사용 처리 오류: user=%s code=%s",
-                request.user.email,
-                code_str,
-            )
-            raise
-
+        구독 상태를 **전혀 건드리지 않는다**(읽기조차 하지 않는다). 이 뷰가 하던
+        트라이얼 시작 로직은 통째로 제거됐다 — 살려두면 base 30일을 빼먹는 두 번째
+        경로가 다시 생긴다.
+        """
         logger.info(
-            "레퍼럴 트라이얼 시작: user=%s code=%s plan=%s ends=%s",
+            "폐지된 카드없는 쿠폰 경로 호출 차단: user=%s",
             request.user.email,
-            code.code,
-            code.target_plan.name,
-            trial_ends.isoformat(),
         )
-
-        # 갱신된 인스턴스로 응답 (related 필드 보장)
-        sub.refresh_from_db()
         return Response(
             {
-                "detail": "트라이얼이 시작되었습니다.",
-                "redemption": ReferralRedemptionSerializer(redemption).data,
-                "subscription": UserSubscriptionSerializer(sub).data,
-            }
+                "detail": (
+                    "쿠폰은 카드 등록과 함께 사용해야 합니다. "
+                    "결제 수단을 등록하면 무료 체험이 시작됩니다."
+                ),
+                "code": "REFERRAL_REQUIRES_CARD",
+            },
+            status=status.HTTP_400_BAD_REQUEST,
         )
 
 
