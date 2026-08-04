@@ -303,7 +303,20 @@ class PublicPageView(APIView):
 | `false` | `is_enabled` 값만 적용 |
 | `true`, `publish_at`만 지정 | `publish_at` 도래 후 영구 노출 |
 | `true`, `hide_at`만 지정 | 지금부터 `hide_at` 전까지 노출 |
-| `true`, 둘 다 지정 | `publish_at` ~ `hide_at` 구간만 노출 |
+| `true`, 둘 다 지정 | `publish_at` 에서 `hide_at` 구간만 노출 |
+
+### 폴더(컨테이너) 블록
+`data.child_block_ids` 를 가진 폴더 블록이 위 규칙으로 **숨겨지면, 그 하위 블록도 함께 제외**됩니다
+(중첩 폴더는 재귀 적용). 폴더가 응답에 없으면 프론트는 그 블록들이 폴더 소속이라는 사실을
+알 수 없어 페이지 맨 아래에 낱개로 렌더하게 되기 때문입니다.
+
+| 폴더 상태 | 하위 블록 |
+|------|------|
+| 노출됨 | 그대로 내려감 (프론트가 폴더 안에 접어서 렌더) |
+| 숨겨짐 (`is_enabled: false` 또는 예약 구간 밖) | **응답에서 제외** |
+
+하위 블록의 `is_enabled` 값 자체는 바뀌지 않습니다 — 폴더를 다시 켜면 원래대로 노출됩니다.
+편집 화면용 `GET /api/v1/pages/multipages/{page_id}/blocks/` 는 지금처럼 전체 블록을 반환합니다.
 
 ## Request 예시
 ```typescript
@@ -395,10 +408,10 @@ class BlockListCreateView(APIView):
 `Authorization: Bearer <access_token>` 헤더 필수
 
 ## 공개 페이지와의 차이
-| API | is_enabled 필터 | 용도 |
+| API | 블록 필터 | 용도 |
 |-----|----------------|------|
 | `GET /api/pages/me/blocks/` | 없음 (전체) | 편집 화면 |
-| `GET /api/pages/@slug/` | is_enabled=true만 | 공개 렌더링 |
+| `GET /api/pages/@slug/` | is_enabled=true + 예약 조건 + **숨겨진 폴더의 하위 블록 제외** | 공개 렌더링 |
 
 ## 응답 필드 설명
 | 필드 | 타입 | 설명 |

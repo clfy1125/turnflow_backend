@@ -1,8 +1,7 @@
 from drf_spectacular.utils import OpenApiExample, extend_schema_field, extend_schema_serializer
 from rest_framework import serializers
-from django.db.models import Q
-from django.utils import timezone
 
+from .block_visibility import public_blocks
 from .models import Block, ContactInquiry, Page, PageMedia, PageSubscription
 from .validators import validate_block_data
 
@@ -202,7 +201,11 @@ class SlugCheckSerializer(serializers.Serializer):
 
 
 class PagePublicSerializer(serializers.ModelSerializer):
-    """공개 페이지 조회 - is_enabled=True 블록 포함."""
+    """공개 페이지 조회 - 노출 대상 블록만 포함.
+
+    가시성 규칙은 :mod:`apps.pages.block_visibility` 가 단일 소스다
+    (is_enabled + 예약 노출 + **숨겨진 폴더의 하위 블록 제외**).
+    """
 
     blocks = serializers.SerializerMethodField()
 
@@ -211,27 +214,7 @@ class PagePublicSerializer(serializers.ModelSerializer):
         fields = ["slug", "title", "is_public", "data", "custom_css", "blocks"]
 
     def get_blocks(self, obj):
-        now = timezone.now()
-        qs = obj.blocks.filter(
-            is_enabled=True
-        ).filter(
-            # schedule_enabled=False → 시간 제한 없이 표시
-            Q(schedule_enabled=False)
-            # schedule_enabled=True → publish_at 이후 and hide_at 이전
-            | Q(
-                schedule_enabled=True,
-                publish_at__isnull=False,
-                publish_at__lte=now,
-            ) & (Q(hide_at__isnull=True) | Q(hide_at__gt=now))
-            # publish_at 없이 hide_at만 있는 경우 (hide_at 이전에만 표시)
-            | Q(
-                schedule_enabled=True,
-                publish_at__isnull=True,
-                hide_at__isnull=False,
-                hide_at__gt=now,
-            )
-        ).order_by("order")
-        return BlockPublicSerializer(qs, many=True).data
+        return BlockPublicSerializer(public_blocks(obj), many=True).data
 
 
 class ReorderItemSerializer(serializers.Serializer):
