@@ -16,7 +16,9 @@ x-app-env: &app_env
   DJANGO_SETTINGS_MODULE: config.settings.prod
   DB_HOST: pgbouncer          # app talks to PgBouncer, NOT db directly
   DB_PORT: "6432"
-  REDIS_HOST: redis
+  # REDIS_HOST 는 .env.production 이 제공한다(2026-08-04 P0-2). 여기에 두면 env_file 을
+  #   덮어써서 Redis 인증정보가 앱에 전달되지 않는다. 되살리지 말 것.
+  # REDIS_HOST: redis
   REDIS_PORT: "6379"
 
 # 로그 로테이션(#7) — 기본 json-file 무제한 증가로 /var/lib/docker 가 차면 전 컨테이너 쓰기 정지.
@@ -124,11 +126,20 @@ services:
     ulimits: *default_ulimits
     # noeviction (NOT allkeys-lru): redis is the Celery broker (/0); evicting keys would drop queued tasks.
     # maxmemory is a host-OOM guard only.
-    command: redis-server --appendonly yes --maxmemory 8gb --maxmemory-policy noeviction
+    # requirepass: 2026-08-04 P0-2. ${VAR:?} 형태라 REDIS_PASSWORD 미설정 시 compose 가
+    #   즉시 실패한다 — 무인증 Redis 가 조용히 뜨는 사고를 막는다.
+    environment:
+      # healthcheck 가 컨테이너 셸에서 $$REDIS_PASSWORD 로 읽는다(보간 아님).
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD required}
+    command: >
+      redis-server --appendonly yes --maxmemory 8gb --maxmemory-policy noeviction
+      --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD required - run compose with --env-file .env.production}
     volumes:
       - turnflow_instagram_redis:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # 인증형 healthcheck: requirepass 가 걸리면 무인증 'redis-cli ping' 은 NOAUTH 로 실패하고
+      #   depends_on: service_healthy 가 앱 기동을 영구히 막는다.
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$${REDIS_PASSWORD}\" ping | grep -q PONG"]
       interval: 10s
       timeout: 3s
       retries: 5

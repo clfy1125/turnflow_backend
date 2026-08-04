@@ -28,5 +28,26 @@ for svc in web_external web_dashboard web_webhook; do
 done
 # 워커 — beat 는 절대 넣지 말 것 (위 주석). 목록은 deploy.sh 6/6 과 동일하게 유지한다.
 APP_IMAGE="$APP_IMAGE" $COMPOSE up -d --no-deps celery_dm celery_followup celery_default celery_billing celery_ai
+
+# celery_reports — deploy.sh 6b/6 과 같은 이유로 조건부(리포트 1건 13~18분). 빼두면 롤백 후
+# celery_reports 만 **새** 이미지로 남아 반대 방향 스큐가 생긴다.
+_rq="$(docker exec turnflow_instagram_redis sh -c \
+        'redis-cli --no-auth-warning -a "$REDIS_PASSWORD" llen reports' 2>/dev/null | tr -d '\r' || echo '?')"
+_ract="$(docker exec "$($COMPOSE ps -q celery_reports 2>/dev/null | head -1)" \
+          celery -A config inspect active -t 10 2>/dev/null | grep -c 'insta_reports' || echo '?')"
+echo "    celery_reports: 큐=${_rq} 진행중=${_ract}"
+if [ "${_rq}" = "0" ] && [ "${_ract}" = "0" ]; then
+  APP_IMAGE="$APP_IMAGE" $COMPOSE up -d --no-deps celery_reports
+else
+  echo "    ⏸ SKIPPED — 진행 중 리포트 보호. 완료 후: APP_IMAGE=$APP_IMAGE $COMPOSE up -d --no-deps celery_reports"
+fi
+
 echo "==> rolled back. If the issue is in the Caddy routing, also revert the Caddyfile and 'caddy reload'."
 docker ps --format '  {{.Names}}\t{{.Image}}\t{{.Status}}' | grep turnflow || true
+echo "==> image skew check (expect all = $APP_IMAGE)"
+docker ps --format '{{.Names}}' | grep -E '^turnflow' | while read -r c; do
+  img="$(docker inspect --format '{{.Config.Image}}' "$c" 2>/dev/null)"
+  case "$img" in
+    turnflow_instagram_web:*) [ "$img" = "$APP_IMAGE" ] || echo "    ✗ SKEW: $c = $img";;
+  esac
+done

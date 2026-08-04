@@ -74,6 +74,35 @@ echo "==> 6/6 recreate workers (celery_beat RETIRED — 외부 cron→/internal/
 # celery_beat 는 profiles:[fallback] 라 평상시 기동 안 함(이중 발사 방지). 긴급 폴백만 수동 기동.
 APP_IMAGE="$IMAGE" $COMPOSE up -d --no-deps celery_dm celery_followup celery_default celery_billing celery_ai
 
+# ── celery_reports (2026-08-05 추가) ──────────────────────────────────────────
+# 왜 따로 두는가: 리포트 1건이 13~18분이다. 다른 워커처럼 무조건 재생성하면 진행 중인
+# 리포트가 죽는다(compose 의 stop grace 는 10초, `--max-tasks-per-child=1` 이라 warm
+# shutdown 이 15분을 기다려주지 않는다). 그래서 **큐가 비고 진행 중 태스크가 없을 때만** 바꾼다.
+#
+# 이걸 아예 빼두면(2026-08-04 까지 그랬다) 배포마다 celery_reports 만 옛 이미지로 남아
+# 코드 스큐가 쌓인다 — 실제로 web 이 15커밋 앞선 상태가 발생했다.
+echo "==> 6b/6 recreate celery_reports (진행 중 리포트가 없을 때만)"
+_rq="$(docker exec turnflow_instagram_redis sh -c \
+        'redis-cli --no-auth-warning -a "$REDIS_PASSWORD" llen reports' 2>/dev/null | tr -d '\r' || echo '?')"
+_ract="$(docker exec "$($COMPOSE ps -q celery_reports 2>/dev/null | head -1)" \
+          celery -A config inspect active -t 10 2>/dev/null | grep -c 'insta_reports' || echo '?')"
+echo "    reports 큐=${_rq} 진행중=${_ract}"
+if [ "${_rq}" = "0" ] && [ "${_ract}" = "0" ]; then
+  APP_IMAGE="$IMAGE" $COMPOSE up -d --no-deps celery_reports
+else
+  echo "    ⏸ SKIPPED — 진행 중 리포트 보호. 완료 후 아래를 직접 실행하세요:"
+  echo "       APP_IMAGE=$IMAGE $COMPOSE up -d --no-deps celery_reports"
+fi
+
 echo "==> done. running images:"
 docker ps --format '  {{.Names}}\t{{.Image}}\t{{.Status}}' | grep turnflow || true
 echo "Verify: webhook p95, /api/v1/healthz, pg_stat_activity, queue lag. Rollback: deploy/scripts/rollback.sh"
+# 이미지 스큐 자동 점검 — 앱 컨테이너가 전부 같은 태그인지 (스킵된 celery_reports 를 놓치지 않게)
+echo "==> image skew check (expect all = $IMAGE)"
+docker ps --format '{{.Names}}' | grep -E '^turnflow' | while read -r c; do
+  img="$(docker inspect --format '{{.Config.Image}}' "$c" 2>/dev/null)"
+  case "$img" in
+    turnflow_instagram_web:*) [ "$img" = "$IMAGE" ] || echo "    ✗ SKEW: $c = $img";;
+  esac
+done
+echo "    (위에 ✗ 가 없으면 스큐 없음)"
