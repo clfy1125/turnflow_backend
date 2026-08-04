@@ -37,6 +37,8 @@ h2 .bar{width:5px;height:20px;border-radius:3px;background:linear-gradient(var(-
 .kpi .s{color:#8f86a6;font-size:11px;margin-top:6px;line-height:1.5}
 .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px}
 .chartbox{position:relative;height:300px}.chartbox.sm{height:250px}.chartbox.xs{height:200px}
+/* 댓글 분류 가로 막대 — 항목 11개 × 약 27px. 낮게 두면 라벨이 겹치거나 잘린다. */
+.chartbox.rows{height:340px}
 h3{font-size:15px;margin:0 0 10px;font-weight:700}
 table{width:100%;border-collapse:collapse;font-size:13.5px}
 th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--line);vertical-align:top}
@@ -273,7 +275,7 @@ footer{text-align:center;color:#6d6485;font-size:12px;margin-top:44px;padding-to
   아래 비율은 <b>분류에 성공한 댓글 기준</b>으로만 읽어 주세요.</div>
   {% endif %}
   <div class="grid g2">
-    <div class="card"><div class="chartbox sm"><canvas id="commentChart"></canvas></div></div>
+    <div class="card"><div class="chartbox rows"><canvas id="commentChart"></canvas></div></div>
     <div class="card"><h3>각 분류의 의미</h3>
       {% for r in donut_legend %}
       <p class="muted" style="margin-top:{{ '0' if loop.first else '6px' }}"><b style="color:{{ r.color }}">{{ r.label }} ({{ r.pct }}%)</b> — {{ r.desc }}</p>
@@ -385,8 +387,10 @@ new Chart(monChart,{type:'bar',data:{labels:D.months,datasets:[
  {type:'line',label:'대박 영상 포함 평균',data:D.mon_avg,borderColor:'#fd7e2a',borderDash:[6,4],tension:.35,pointRadius:3,yAxisID:'y'},
  {type:'bar',label:'올린 영상 수',data:D.mon_cnt,backgroundColor:'rgba(169,159,192,.18)',yAxisID:'y1',borderRadius:4,maxBarThickness:44}]},
  options:{maintainAspectRatio:false,plugins:{tooltip:{callbacks:{label:i=>i.dataset.label+': '+(i.datasetIndex<2?man(i.parsed.y)+'회':i.parsed.y+'개')}}},scales:{y:{ticks:{callback:v=>man(v)},title:{display:true,text:'조회수(회)'}},y1:{position:'right',grid:{display:false},title:{display:true,text:'영상 수'}},x:{grid:{display:false}}}}});
-/* 내장 범례는 끈다 — 오른쪽 '각 분류의 의미' 카드가 같은 항목을 색·설명까지 이미 보여주고,
-   position:'right' 로 두면 분류가 11종으로 늘어난 뒤 라벨이 박스를 넘쳐 잘렸다(2026-08-04 실측). */
-new Chart(commentChart,{type:'doughnut',data:{labels:D.cmt_labels,datasets:[{data:D.cmt,backgroundColor:D.cmt_colors,borderWidth:0}]},options:{maintainAspectRatio:false,cutout:'62%',plugins:{legend:{display:false},tooltip:{callbacks:{label:i=>i.label+': '+i.parsed+'개'}}}}});
+/* 댓글 분류는 **가로 막대**다 (도넛 아님).
+   분류가 11종이라 도넛은 ①얇은 조각이 구분 안 되고 ②내장 범례를 오른쪽에 두면 라벨이 박스를
+   넘쳐 잘리고 ③범례를 끄면 어느 조각이 무엇인지 알 수 없는 장식 고리가 된다(2026-08-04 실측).
+   가로 막대는 라벨이 축에 바로 붙어 읽히고, 길이로 비중이 즉시 비교된다. */
+new Chart(commentChart,{type:'bar',data:{labels:D.cmt_labels,datasets:[{data:D.cmt,backgroundColor:D.cmt_colors,borderRadius:6,borderSkipped:false,maxBarThickness:20}]},options:{indexAxis:'y',maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:i=>i.parsed.x+'개'}}},scales:{x:{grid:{color:'rgba(255,255,255,.06)'},ticks:{precision:0}},y:{grid:{display:false},ticks:{autoSkip:false,font:{size:11}}}}}});
 </script>
 </body></html>
