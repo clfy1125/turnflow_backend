@@ -20,6 +20,15 @@
 
 > ⚠️ 이 세 장애의 뿌리가 모두 **하나의 301 리다이렉트**였다. 부록 A의 함정 목록을 먼저 읽을 것.
 
+### ✅ 2026-08-05 추가 완료 (`bd42da1`)
+
+| 항목 | 내용 |
+|---|---|
+| **Redis 인증 내구성** | 08-04 의 `CONFIG SET` 은 **런타임 전용**이어서 재시작하면 무인증으로 돌아가는 상태였다(옛 healthcheck 가 NOAUTH 에도 exit 0 이라 이를 가렸다). redis 재생성으로 커맨드라인에 `--requirepass` 를 박아 해결 — **키 손실 0**(db0 14,769 / db1 34 그대로) |
+| **prod compose 드리프트** | 실서버에만 있던 Redis 인증 설정을 git 에 반영(바이트 일치 확인 후). `git checkout .` 한 번에 날아갈 위험 해소 |
+| **`celery_reports` 배포 누락** | `deploy.sh`/`rollback.sh` 에 조건부 추가(리포트 1건 13~18분이라 큐 0 + 진행중 0 일 때만) + 두 스크립트에 **이미지 스큐 자동 점검** |
+| ~~`rollback.sh` 가 celery_beat 를 켠다~~ | **오정보였다** — 07-30 `f91f5b9` 에서 이미 해결. 교훈만 유효: compose 서비스명을 명시하면 `profiles:[fallback]` 를 무시하고 기동한다 |
+
 ---
 
 ## P0 — 지금/오늘 (나만 할 수 있는 것)
@@ -246,6 +255,13 @@ tick 자체의 성공/실패를 직접 감시하는 장치를 권한다:
 8. `sshd` 드롭인은 **`00-`** 이어야 한다(`99-` 는 `50-cloud-init.conf` 에 져서 조용히 무효).
 9. `pgbackrest.conf` 는 **644 필수** — 600 이면 컨테이너의 `postgres` 유저가 못 읽어 WAL 아카이빙이 멈춘다.
 10. 아카이버 점검은 `failed_count == 0` 같은 **절대 조건 금지** — 누적값이므로 **증가분**으로 판정.
+11. **런타임 전용 설정은 재시작 후에도 유지되는지로 검증할 것.** `CONFIG SET` / `iptables -I` /
+    `sysctl -w` 류는 프로세스·컨테이너가 살아 있는 동안만 유효하다. Redis 인증이 실제로 이 함정에
+    빠져 있었다(재시작 시 무인증 복귀). 판정:
+    `docker inspect <ctr> --format '{{join .Config.Cmd " "}}' | grep -c requirepass`
+12. **healthcheck 가 "통과"한다고 건강한 게 아니다.** `redis-cli ping` 은 NOAUTH 를 받아도 **exit 0**
+    이라 requirepass 가 걸린 서버를 healthy 로 보고한다 — 잘못된 상태를 적극적으로 가려준다.
+    상태 판정 커맨드는 실패 시 **비0으로 끝나는지** 확인할 것(`| grep -q PONG` 등).
 
 ## 부록 B. 상태 점검 원커맨드
 

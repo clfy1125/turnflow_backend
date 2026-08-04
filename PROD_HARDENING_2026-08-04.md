@@ -103,6 +103,28 @@
 4) CONFIG SET requirepass  ← Redis 재시작 없음 → 큐 보존
 ```
 
+> ### ⚠️ 후속 정정 (2026-08-05) — 이 조치는 **재시작에 살아남지 않는 상태**였습니다
+>
+> 위 4단계(`CONFIG SET requirepass`)는 **런타임 전용**입니다. 컨테이너 커맨드라인에는
+> `--requirepass` 가 없었고(2단계의 compose 수정은 *재생성* 시에만 적용됨, 그런데 큐 보존을 위해
+> redis 는 일부러 재생성하지 않았습니다), `CONFIG REWRITE` 는
+> `ERR The server is running without a config file` 로 불가했습니다.
+> → **redis 컨테이너가 한 번 재시작되면(호스트 재부팅·OOM·docker 재시작) 무인증으로 복귀**합니다.
+>
+> 게다가 옛 healthcheck `["CMD","redis-cli","ping"]` 는 NOAUTH 응답을 받아도 **exit 0** 이라
+> `healthy` 로 통과합니다 — 이 상태를 가려주고 있었습니다.
+>
+> **해결**: 큐 전부 0 + `aof_enabled:1` 확인 후 redis 를 재생성했습니다(`bd42da1`).
+> 결과 — 커맨드라인에 `--requirepass` 박힘 · 컨테이너 env 에 `REDIS_PASSWORD` · 인증형 healthcheck
+> (`healthy`) · **키 손실 0**(db0 14,769→14,769 / db1 34→34, AOF 복원) · 워커 6노드 즉시 재연결 ·
+> DM 무중단.
+>
+> **교훈: 런타임 전용 보안 설정은 "적용됐다"가 아니라 "재시작 후에도 유지되는가"로 검증할 것.**
+> 판정 한 줄:
+> ```bash
+> docker inspect turnflow_instagram_redis --format '{{join .Config.Cmd " "}}' | grep -c requirepass
+> ```
+
 - 재생성 순서: celery_ai·celery_reports → 나머지 워커 4개 → web_external → web_dashboard → web_webhook (각 단계 healthz 게이트)
 - 검증: 무인증 `ping` → **NOAUTH** · 인증 `ping` → PONG · **litellm-proxy(2026-07-07 침해 당사자)에서 NOAUTH 로 차단** · broker/result/cache 3경로 ping OK · celery 6노드 · 큐 보존(db0 15,125키) · 큐 적체 0
 - `${REDIS_PASSWORD:?...}` 형태를 쓴 이유: `--env-file` 없이 compose 를 돌리면 **즉시 실패**합니다. 무인증 Redis 가 조용히 다시 뜨는 사고를 구조적으로 막습니다.
