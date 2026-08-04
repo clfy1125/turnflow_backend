@@ -273,7 +273,7 @@ footer{text-align:center;color:#6d6485;font-size:12px;margin-top:44px;padding-to
   아래 비율은 <b>분류에 성공한 댓글 기준</b>으로만 읽어 주세요.</div>
   {% endif %}
   <div class="grid g2">
-    <div class="card"><div class="chartbox xs"><canvas id="commentChart"></canvas></div></div>
+    <div class="card"><div class="chartbox sm"><canvas id="commentChart"></canvas></div></div>
     <div class="card"><h3>각 분류의 의미</h3>
       {% for r in donut_legend %}
       <p class="muted" style="margin-top:{{ '0' if loop.first else '6px' }}"><b style="color:{{ r.color }}">{{ r.label }} ({{ r.pct }}%)</b> — {{ r.desc }}</p>
@@ -385,6 +385,8 @@ new Chart(monChart,{type:'bar',data:{labels:D.months,datasets:[
  {type:'line',label:'대박 영상 포함 평균',data:D.mon_avg,borderColor:'#fd7e2a',borderDash:[6,4],tension:.35,pointRadius:3,yAxisID:'y'},
  {type:'bar',label:'올린 영상 수',data:D.mon_cnt,backgroundColor:'rgba(169,159,192,.18)',yAxisID:'y1',borderRadius:4,maxBarThickness:44}]},
  options:{maintainAspectRatio:false,plugins:{tooltip:{callbacks:{label:i=>i.dataset.label+': '+(i.datasetIndex<2?man(i.parsed.y)+'회':i.parsed.y+'개')}}},scales:{y:{ticks:{callback:v=>man(v)},title:{display:true,text:'조회수(회)'}},y1:{position:'right',grid:{display:false},title:{display:true,text:'영상 수'}},x:{grid:{display:false}}}}});
-new Chart(commentChart,{type:'doughnut',data:{labels:D.cmt_labels,datasets:[{data:D.cmt,backgroundColor:D.cmt_colors,borderWidth:0}]},options:{maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'right',labels:{boxWidth:12,padding:10}},tooltip:{callbacks:{label:i=>i.label+': '+i.parsed+'개'}}}}});
+/* 내장 범례는 끈다 — 오른쪽 '각 분류의 의미' 카드가 같은 항목을 색·설명까지 이미 보여주고,
+   position:'right' 로 두면 분류가 11종으로 늘어난 뒤 라벨이 박스를 넘쳐 잘렸다(2026-08-04 실측). */
+new Chart(commentChart,{type:'doughnut',data:{labels:D.cmt_labels,datasets:[{data:D.cmt,backgroundColor:D.cmt_colors,borderWidth:0}]},options:{maintainAspectRatio:false,cutout:'62%',plugins:{legend:{display:false},tooltip:{callbacks:{label:i=>i.label+': '+i.parsed+'개'}}}}});
 </script>
 </body></html>

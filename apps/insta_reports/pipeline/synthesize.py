@@ -286,10 +286,14 @@ def _audience_guidance(agg_input: dict) -> str:
     ]
     parts.append(_CONFLICT_RULE)
     body = "\n".join(p for p in parts if p)
+    # 금지 어휘는 게이트와 같은 소스에서 가져와 **미리** 알려준다(재작성 횟수 감소).
+    from .verify_v3 import jargon_prompt_block
+
     return (
         "\n\n## 이 계정에 맞는 조언 방향 (반드시 반영)\n"
         + body
         + "\n위 방향과 어긋나는 일반론은 쓰지 마세요. 숫자는 여전히 입력에 있는 것만 씁니다."
+        + jargon_prompt_block()
     )
 
 

@@ -1097,6 +1097,38 @@ class TestCommentClassificationRobustness:
         assert set(CATEGORIES) - grouped == {"other", "unclassified"}
 
 
+class TestJargonHintsMatchTheGate:
+    """프롬프트가 미리 알려주는 금지어가 **실제로 게이트에 걸리는 말**이어야 한다.
+
+    2026-08-04: 게이트 반려 사유의 다수가 어휘 치환(캡션·CTA·잠재력·편차…)이었고 4회 재작성
+    안에 못 끝나면 슬롯이 폴백됐다 → 규칙을 처음부터 프롬프트에 준다. 다만 프롬프트 문구와
+    게이트 사전이 갈라지면 **없는 규칙을 지키라고 시키는** 최악이 되므로 여기서 묶어 둔다.
+    """
+
+    def test_every_hint_word_is_actually_rejected(self):
+        from .pipeline.verify_v3 import JARGON_COMPILED, JARGON_PROMPT_WORDS
+
+        assert len(JARGON_PROMPT_WORDS) == len(JARGON_COMPILED), "규칙과 표기 개수가 다르다"
+        for i, word in enumerate(JARGON_PROMPT_WORDS):
+            rx, _hint = JARGON_COMPILED[i]
+            assert rx.search(word), f"[{i}] '{word}' 가 자기 규칙에 안 걸린다 ({rx.pattern})"
+
+    def test_prompt_block_lists_replacements(self):
+        from .pipeline.verify_v3 import jargon_prompt_block
+
+        block = jargon_prompt_block()
+        for w in ("CTA", "캡션", "잠재력", "편차", "전환율"):
+            assert w in block, w
+        assert "게시물 글" in block  # 대체 표현이 함께 나와야 쓸모가 있다
+        assert "한글 수량어" in block
+
+    def test_guidance_includes_jargon_block(self):
+        from .pipeline.synthesize import _audience_guidance
+
+        g = _audience_guidance({"audience": {"scale": "large", "reach_mode": "explore_driven"}})
+        assert "쓰면 반려되는 말" in g
+
+
 class TestDonutShowsEveryComment:
     """도넛은 **분류 전량**을 담아야 한다 (합계 = 분석한 댓글 수).
 
