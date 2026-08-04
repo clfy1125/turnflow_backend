@@ -1156,6 +1156,76 @@ class TestJargonHintsMatchTheGate:
             assert not check_jargon(body), (name, check_jargon(body))
 
 
+class TestApifyGetsExplicitPermalinks:
+    """Apify 에는 **Graph 에서 받은 릴스 permalink** 를 직접 넘겨야 한다.
+
+    2026-08-04 실측(@yeonhada__): 프로필 URL 만 주면 액터가 공개 프로필 그리드만 훑어
+    Graph 가 주는 릴스 39개 중 **9개(영상 3개)** 만 돌아왔고 `NOT_ENOUGH_REELS`(3 < 5)로
+    리포트가 통째로 실패했다. 같은 계정에 permalink 12개를 직접 주니 12/12 조회수가 왔다.
+    """
+
+    def test_permalinks_become_direct_urls(self, monkeypatch, tmp_path):
+        from .pipeline import collect_apify as ca
+
+        captured = {}
+        monkeypatch.setattr(ca, "start_run", lambda s, ri: (captured.update(ri) or ("r", "d")))
+        monkeypatch.setattr(ca, "wait_run", lambda *a, **k: None)
+        monkeypatch.setattr(
+            ca,
+            "get_items",
+            lambda *a, **k: [{"type": "Video", "videoPlayCount": 100, "ownerUsername": "someone"}],
+        )
+        ca.config.bind_run(tmp_path)  # APIFY_DIR 은 PEP 562 __getattr__ 이라 patch 불가
+        urls = ["https://www.instagram.com/reel/AAA/", "https://www.instagram.com/reel/BBB/"]
+        ca.collect("someone", permalinks=urls)
+        assert captured["directUrls"] == urls
+        assert captured["resultsLimit"] == 2
+
+    def test_falls_back_to_profile_when_no_permalinks(self, monkeypatch, tmp_path):
+        from .pipeline import collect_apify as ca
+
+        captured = {}
+        monkeypatch.setattr(ca, "start_run", lambda s, ri: (captured.update(ri) or ("r", "d")))
+        monkeypatch.setattr(ca, "wait_run", lambda *a, **k: None)
+        monkeypatch.setattr(
+            ca,
+            "get_items",
+            lambda *a, **k: [{"type": "Video", "videoPlayCount": 100, "ownerUsername": "someone"}],
+        )
+        ca.config.bind_run(tmp_path)  # APIFY_DIR 은 PEP 562 __getattr__ 이라 patch 불가
+        ca.collect("someone", permalinks=[])
+        assert captured["directUrls"] == ["https://www.instagram.com/someone/"]
+
+    def test_service_extracts_reels_only(self, tmp_path):
+        import json
+
+        from . import service
+        from .pipeline import config
+
+        config.bind_run(tmp_path)
+        (config.RAW_DIR / "acct.json").write_text(
+            json.dumps(
+                {
+                    "posts": [
+                        {"permalink": "u/reel/A/", "media_product_type": "REELS"},
+                        {"permalink": "u/p/B/", "media_product_type": "FEED"},
+                        {"media_product_type": "REELS"},  # permalink 없음
+                        {"permalink": "u/reel/C/", "media_product_type": "REELS"},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert service._reel_permalinks("acct") == ["u/reel/A/", "u/reel/C/"]
+
+    def test_missing_raw_file_returns_empty(self, tmp_path):
+        from . import service
+        from .pipeline import config
+
+        config.bind_run(tmp_path)
+        assert service._reel_permalinks("nope") == []
+
+
 class TestEngagementRateIsReadable:
     """반응률이 **0.0 으로 반올림돼 '댓글 없음'처럼 보이면 안 된다.**
 

@@ -377,9 +377,15 @@ def _collect(report, connection, username: str, *, fake: bool) -> dict:
         update_fields=["followers_snapshot", "media_count_snapshot", "ig_name", "updated_at"]
     )
 
+    # ⚠️ Apify 에 **Graph 에서 받은 릴스 permalink 를 직접** 넘긴다. 프로필 URL 만 주면
+    #    액터가 공개 프로필 그리드만 훑어 그리드에 없는 릴스가 빠지고, 조회수 있는 릴스가
+    #    5개 미만이면 리포트가 통째로 실패한다(@yeonhada__ 실측: Graph 39개 vs Apify 3개).
+    #    조회수는 Graph 인사이트로 대체 불가(지표 29종 전부 403 — 앱 권한 미승인, 재확인 완료).
+    reel_urls = _reel_permalinks(username)
     try:
         apify_summary = collect_apify.collect(
             username,
+            permalinks=reel_urls,
             on_tick=lambda st, secs: _tick_message(
                 report, ReportStage.COLLECTING, f"조회수를 모으고 있어요 ({secs}초)"
             ),
@@ -390,6 +396,23 @@ def _collect(report, connection, username: str, *, fake: bool) -> dict:
         raise ReportFailure(ReportErrorCode.VIEWS_UNAVAILABLE, f"{type(e).__name__}: {e}") from e
 
     return {**summary, "apify": apify_summary}
+
+
+def _reel_permalinks(username: str) -> list[str]:
+    """공식 수집 결과에서 릴스 permalink 만 뽑는다 (Apify 에 직접 넘길 대상).
+
+    릴스만 넘기는 이유: 조회수가 필요한 건 릴스뿐이고(지표·분포·벤치마크 전부 릴스 기준),
+    좋아요·댓글 수는 Graph 가 이미 정확히 준다. 항목 수가 줄어 Apify 비용도 낮아진다.
+    """
+    try:
+        doc = json.loads((config.RAW_DIR / f"{username}.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return [
+        p["permalink"]
+        for p in (doc.get("posts") or [])
+        if p.get("permalink") and p.get("media_product_type") == "REELS"
+    ]
 
 
 def _extract(

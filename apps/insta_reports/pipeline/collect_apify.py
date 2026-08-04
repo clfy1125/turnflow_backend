@@ -96,15 +96,36 @@ def get_items(session: requests.Session, dataset_id: str) -> list:
     return items if isinstance(items, list) else []
 
 
-def collect(username: str, *, limit: int = RESULTS_LIMIT, on_tick=None) -> dict:
-    """조회수·댓글 수집 → APIFY_DIR/{username}.json 기록 후 요약 반환."""
+def collect(
+    username: str, *, limit: int = RESULTS_LIMIT, on_tick=None, permalinks: list | None = None
+) -> dict:
+    """조회수 수집 → APIFY_DIR/{username}.json 기록 후 요약 반환.
+
+    ``permalinks`` — Graph 에서 받은 **게시물 URL 목록**. 주면 프로필 대신 이 URL 들을 직접
+    긁는다. ⚠️ **가능하면 항상 넘길 것.**
+
+    왜: 프로필 URL 만 주면 액터가 **공개 프로필 그리드만** 훑어서, 그리드에 없는 릴스가
+    통째로 빠진다. 실측(@yeonhada__, 2026-08-04): Graph 는 릴스 39개를 주는데 Apify 는
+    9개(영상 3개)만 반환해 `NOT_ENOUGH_REELS`(3개 < 5)로 리포트가 아예 실패했다.
+    같은 계정에 릴스 permalink 12개를 직접 주니 **12/12 전부 조회수**가 왔다.
+    (조회수는 Graph 인사이트로는 못 받는다 — 지표 29종 전부 403, 앱 권한 미승인.)
+    """
     session = requests.Session()
-    run_input = {
-        "directUrls": [f"https://www.instagram.com/{username.lstrip('@')}/"],
-        "resultsType": "posts",
-        "resultsLimit": limit,
-        "addParentData": False,
-    }
+    targets = [u for u in (permalinks or []) if u][:limit]
+    if targets:
+        run_input = {
+            "directUrls": targets,
+            "resultsType": "posts",
+            "resultsLimit": len(targets),
+            "addParentData": False,
+        }
+    else:  # 폴백 — permalink 를 못 구한 경우에만(그리드 누락 위험을 안고 간다)
+        run_input = {
+            "directUrls": [f"https://www.instagram.com/{username.lstrip('@')}/"],
+            "resultsType": "posts",
+            "resultsLimit": limit,
+            "addParentData": False,
+        }
     run_id, dataset_id = start_run(session, run_input)
     logger.info("insta_report: apify run started run=%s dataset=%s", run_id, dataset_id)
     wait_run(session, run_id, on_tick=on_tick)
