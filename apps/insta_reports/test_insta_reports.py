@@ -1067,9 +1067,19 @@ class TestCommentClassificationRobustness:
 
         from .pipeline import comments as C
 
-        src = inspect.getsource(C.classify_comments)
+        src = inspect.getsource(C._classify_chunk)
         assert '"thinkingConfig": {"thinkingBudget": 0}' in src
         assert C.CLASSIFY_MAX_OUTPUT_TOKENS >= 8192
+
+    def test_chunks_run_in_parallel(self):
+        """댓글이 900여 개로 늘어 순차 호출은 2분이 걸린다 → 병렬이어야 한다."""
+        import inspect
+
+        from .pipeline import comments as C
+
+        src = inspect.getsource(C.classify_comments)
+        assert "ThreadPoolExecutor" in src
+        assert C.CLASSIFY_CONCURRENCY >= 4
 
     def test_failures_are_marked_unclassified_not_other(self):
         """분류 실패는 '기타' 와 구분돼야 리포트가 거짓말하지 않는다."""
@@ -1143,6 +1153,55 @@ class TestJargonHintsMatchTheGate:
             # 가이드는 '쓰지 마세요' 안내에서 금칙어를 일부러 언급한다 → 그 줄은 제외하고 본다.
             body = "\n".join(ln for ln in block.splitlines() if "반려" not in ln)
             assert not check_jargon(body), (name, check_jargon(body))
+
+
+class TestRatioArithmeticIsAccepted:
+    """허용된 두 지표를 나눈 값은 **환각이 아니라 맞는 산수**다 → 게이트가 통과시켜야 한다.
+
+    2026-08-04 실측: 모델이 "A가 B의 6.4배" 처럼 스스로 계산하는데 화이트리스트는
+    `agg.derived.ratios` 에 미리 계산해 둔 배수만 담아서, 두 수가 다 지표인데도
+    "지표에 없는 숫자" 로 반려됐다 — 재작성 4회의 주 사유이자 폴백의 마지막 원인.
+    """
+
+    def _wl(self):
+        from .pipeline.verify import build_whitelist
+
+        # 진용진 실측: 평소 41.3만 / 팔로워 2.6만 / 최고 238.2만
+        return build_whitelist(
+            {
+                "views_stats": {"median": 413_000, "max": 2_382_000},
+                "audience": {"followers": 25_933},
+            },
+            {},
+        )
+
+    @pytest.mark.parametrize("val", [5.8, 15.9, 91.7])
+    def test_derived_ratio_passes(self, val):
+        from .pipeline.verify import _match
+
+        # 238.2만÷41.3만=5.8 · 41.3만÷2.6만=15.9 · 238.2만÷2.6만=91.7
+        assert _match({"value": val, "unit": "배"}, self._wl()), val
+
+    def test_unrelated_ratio_is_still_rejected(self):
+        from .pipeline.verify import _match
+
+        # 어떤 두 지표를 나눠도 나오지 않는 값 — 여전히 반려돼야 한다
+        assert not _match({"value": 3.7, "unit": "배"}, self._wl())
+
+    def test_percentage_arithmetic_passes(self):
+        from .pipeline.verify import _match
+
+        wl = self._wl()
+        # 2.6만 ÷ 41.3만 = 6.3%
+        assert _match({"value": 6.3, "unit": "%"}, wl)
+        assert not _match({"value": 44.0, "unit": "%"}, wl)
+
+    def test_zero_and_negative_are_not_derivable(self):
+        from .pipeline.verify import _derivable
+
+        wl = self._wl()
+        assert not _derivable(0, wl, as_pct=False)
+        assert not _derivable(-2, wl, as_pct=False)
 
 
 class TestDonutShowsEveryComment:

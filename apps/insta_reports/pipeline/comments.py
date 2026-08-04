@@ -11,6 +11,7 @@
 텍스트는 id 매핑이라 배치 안전). 인용은 이후 단계에서 quote_id 로만 참조.
 """
 
+import concurrent.futures as cf
 import json
 import logging
 import re
@@ -233,6 +234,9 @@ CLASSIFY_PROMPT = """인스타그램 게시물에 달린 팔로워 댓글들을 
 
 
 CHUNK_SIZE = 40
+# 청크는 서로 독립 → 병렬. 댓글이 Graph 전환으로 99→900여 개가 되면서 순차 호출이 2분 넘게
+# 걸렸다(22청크 × ~6초). 6 병렬이면 20초대로 줄고 Gemini 레이트리밋도 여유가 있다.
+CLASSIFY_CONCURRENCY = 6
 # 이 모델은 thinking 토큰을 쓰고 **그게 maxOutputTokens 예산을 공유한다**.
 # 4096 이던 시절 실측: thoughts 3,933 + 출력 148 → finishReason=MAX_TOKENS 로 JSON 이 10번째
 # 항목에서 잘렸고, 파싱 실패를 조용히 삼켜 **청크 40~50개가 통째로 '기타'** 가 됐다
@@ -263,29 +267,51 @@ def _parse_classifications(text: str, n: int) -> dict[int, str]:
 
 
 def classify_comments(pool: list, ledger: CostLedger, username: str) -> dict:
-    """{comment_id: category}. 계정 단위 캐시. 실패분은 ``unclassified`` 로 **명시**한다."""
+    """{comment_id: category}. 계정 단위 캐시. 실패분은 ``unclassified`` 로 **명시**한다.
+
+    청크는 서로 독립이라 **병렬**로 돈다(댓글이 Graph 전환으로 99→900여 개가 되면서 순차
+    호출이 2분 넘게 걸렸다). 캐시 갱신은 메인 스레드에서만 한다.
+    """
     cache_p = config.FEATURE_DIR / f"comments_{username}@v{CLASSIFY_CACHE_VERSION}.json"
     cache = json.loads(cache_p.read_text(encoding="utf-8")) if cache_p.exists() else {}
     todo = [c for c in pool if c["id"] not in cache]
 
+    chunks = [todo[i : i + CHUNK_SIZE] for i in range(0, len(todo), CHUNK_SIZE)]
     chunks_failed = 0
-    for chunk_start in range(0, len(todo), CHUNK_SIZE):
-        chunk = todo[chunk_start : chunk_start + CHUNK_SIZE]
-        listing = "\n".join(f"{i}. {c['text'][:150]}" for i, c in enumerate(chunk))
-        body = {
-            "contents": [{"role": "user", "parts": [{"text": CLASSIFY_PROMPT + listing}]}],
-            "generationConfig": {
-                "temperature": 0,
-                "responseMimeType": "application/json",
-                "responseSchema": CLASSIFY_SCHEMA,
-                "maxOutputTokens": CLASSIFY_MAX_OUTPUT_TOKENS,
-                # ⚠️ 되돌리지 말 것 — thinking 이 출력 예산을 먹어 응답이 잘린다(위 주석).
-                "thinkingConfig": {"thinkingBudget": 0},
-            },
-        }
-        backoff = 2
-        got: dict[int, str] = {}
-        for _ in range(5):
+    if chunks:
+        with cf.ThreadPoolExecutor(max_workers=CLASSIFY_CONCURRENCY) as ex:
+            for chunk, got, failed in ex.map(
+                lambda idx_chunk: _classify_chunk(*idx_chunk, ledger), enumerate(chunks)
+            ):
+                chunks_failed += failed
+                for i, c in enumerate(chunk):
+                    cache[c["id"]] = got.get(i, "unclassified")
+
+    config.FEATURE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_p.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+    if chunks_failed:
+        logger.warning("insta_report: 댓글 분류 청크 %s개에서 누락 발생", chunks_failed)
+    return {c["id"]: cache.get(c["id"], "unclassified") for c in pool}
+
+
+def _classify_chunk(chunk_no: int, chunk: list, ledger: CostLedger) -> tuple[list, dict, int]:
+    """청크 1개 분류 → (chunk, {index: category}, 부분실패 0/1). 스레드에서 호출된다."""
+    listing = "\n".join(f"{i}. {c['text'][:150]}" for i, c in enumerate(chunk))
+    body = {
+        "contents": [{"role": "user", "parts": [{"text": CLASSIFY_PROMPT + listing}]}],
+        "generationConfig": {
+            "temperature": 0,
+            "responseMimeType": "application/json",
+            "responseSchema": CLASSIFY_SCHEMA,
+            "maxOutputTokens": CLASSIFY_MAX_OUTPUT_TOKENS,
+            # ⚠️ 되돌리지 말 것 — thinking 이 출력 예산을 먹어 응답이 잘린다(위 주석).
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
+    }
+    backoff = 2
+    got: dict[int, str] = {}
+    for _ in range(5):
+        try:
             r = requests.post(
                 f"{config.GEMINI_BASE}/models/{config.EXTRACT_MODEL}:generateContent",
                 headers={
@@ -295,44 +321,40 @@ def classify_comments(pool: list, ledger: CostLedger, username: str) -> dict:
                 json=body,
                 timeout=120,
             )
-            if r.status_code in (429, 500, 503):
-                time.sleep(backoff)
-                backoff *= 2
-                continue
-            r.raise_for_status()
-            d = r.json()
-            u = d.get("usageMetadata", {})
-            ledger.record_llm(
-                "S4b_comments",
-                config.EXTRACT_MODEL,
-                u.get("promptTokenCount", 0),
-                u.get("candidatesTokenCount", 0) + u.get("thoughtsTokenCount", 0),
-                note=f"chunk {chunk_start // CHUNK_SIZE}",
+        except requests.RequestException as e:
+            logger.warning(
+                "insta_report: 댓글 분류 호출 실패 chunk=%s %s", chunk_no, type(e).__name__
             )
-            cand = (d.get("candidates") or [{}])[0]
-            parts = (cand.get("content") or {}).get("parts") or []
-            text = parts[0].get("text", "") if parts else ""
-            got = _parse_classifications(text, len(chunk))
-            if len(got) < len(chunk):
-                # 조용히 넘기지 않는다 — 이 결함이 91% 기타로 몇 달을 갔다.
-                chunks_failed += 1
-                logger.warning(
-                    "insta_report: 댓글 분류 부분 실패 %s/%s (finish=%s, thoughts=%s, out=%s)",
-                    len(got),
-                    len(chunk),
-                    cand.get("finishReason"),
-                    u.get("thoughtsTokenCount"),
-                    u.get("candidatesTokenCount"),
-                )
             break
-        for i, c in enumerate(chunk):
-            cache[c["id"]] = got.get(i, "unclassified")
-
-    config.FEATURE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_p.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
-    if chunks_failed:
-        logger.warning("insta_report: 댓글 분류 청크 %s개에서 누락 발생", chunks_failed)
-    return {c["id"]: cache.get(c["id"], "unclassified") for c in pool}
+        if r.status_code in (429, 500, 503):
+            time.sleep(backoff)
+            backoff *= 2
+            continue
+        r.raise_for_status()
+        d = r.json()
+        u = d.get("usageMetadata", {})
+        ledger.record_llm(
+            "S4b_comments",
+            config.EXTRACT_MODEL,
+            u.get("promptTokenCount", 0),
+            u.get("candidatesTokenCount", 0) + u.get("thoughtsTokenCount", 0),
+            note=f"chunk {chunk_no}",
+        )
+        cand = (d.get("candidates") or [{}])[0]
+        parts = (cand.get("content") or {}).get("parts") or []
+        got = _parse_classifications(parts[0].get("text", "") if parts else "", len(chunk))
+        if len(got) < len(chunk):
+            # 조용히 넘기지 않는다 — 이 결함이 91% 기타로 몇 달을 갔다.
+            logger.warning(
+                "insta_report: 댓글 분류 부분 실패 %s/%s (finish=%s, thoughts=%s, out=%s)",
+                len(got),
+                len(chunk),
+                cand.get("finishReason"),
+                u.get("thoughtsTokenCount"),
+                u.get("candidatesTokenCount"),
+            )
+        break
+    return chunk, got, int(len(got) < len(chunk))
 
 
 def comment_stats(pool: list, classes: dict, canon: dict) -> dict:

@@ -128,6 +128,33 @@ def build_whitelist(metrics: dict, agg: dict) -> dict:
     return {"raw": raws, "man": mans, "bae": baes, "pct": pcts, "count": counts}
 
 
+# 배수·백분율 산수 검증에 쓸 지표 값의 상한 — 조합 수를 O(n²) 로 보되 n 을 제한한다.
+_DERIVABLE_MAX_OPERANDS = 400
+
+
+def _derivable(value: float, wl: dict, *, as_pct: bool) -> bool:
+    """허용된 두 지표의 **나눗셈으로 실제 나오는 값**인지.
+
+    왜 필요한가: 모델은 "A가 B의 6.4배" 처럼 스스로 나눗셈을 한다. 화이트리스트는
+    `agg.derived.ratios` 에 **미리 계산해 둔** 배수만 담고 있어서, 두 수가 모두 허용된
+    지표인데도 "지표에 없는 숫자" 로 반려됐다(2026-08-04 실측: 재작성 4회의 주 사유).
+    둘 다 실제 지표에서 온 값이라면 그 비율은 **환각이 아니라 맞는 산수**다.
+    반올림 표기(41.3만 ÷ 2.6만)를 감안해 허용 오차를 넉넉히 둔다.
+    """
+    if value <= 0:
+        return False
+    nums = sorted({n for n in wl["raw"] | wl["man"] if n > 0})
+    if len(nums) > _DERIVABLE_MAX_OPERANDS:  # 큰 값 위주로 잘라낸다(비율의 분자·분모는 대개 큰 값)
+        nums = nums[-_DERIVABLE_MAX_OPERANDS:]
+    target = value / 100 if as_pct else value
+    tol = max(0.05, target * 0.03)  # 표기 반올림 누적분
+    for a in nums:
+        for b in nums:
+            if b and abs(a / b - target) <= tol:
+                return True
+    return False
+
+
 def _match(tok: dict, wl: dict) -> bool:
     v, u = tok["value"], tok["unit"]
 
@@ -139,9 +166,9 @@ def _match(tok: dict, wl: dict) -> bool:
     if u == "천":
         return close(wl["man"] | wl["raw"], max(100, v * 0.02))
     if u == "배":
-        return close(wl["bae"], 0.05) or close(wl["raw"], 0.05)
+        return close(wl["bae"], 0.05) or close(wl["raw"], 0.05) or _derivable(v, wl, as_pct=False)
     if u == "%":
-        return close(wl["pct"], 1.0) or close(wl["raw"], 1.0)
+        return close(wl["pct"], 1.0) or close(wl["raw"], 1.0) or _derivable(v, wl, as_pct=True)
     if u == "count":
         return close(wl["count"] | wl["raw"], 0.05)
     return close(wl["raw"] | wl["man"], max(0.5, v * 0.01))
