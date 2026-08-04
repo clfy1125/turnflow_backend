@@ -370,13 +370,28 @@ class TestCancelledDuringTrialRecording:
         assert sub.cancelled_during_trial_at == cancelled_at
         assert sub.trial_plan is not None and sub.trial_plan.name == "pro"
 
-    def test_retrial_keeps_previous_cancel_record(self, client, user):
+    def test_retrial_keeps_previous_cancel_record(self, user, monkeypatch):
         """T-3 — 재체험이 과거 취소를 지우면 **이미 지나간 기간의 집계가 나중에 줄어든다**.
 
-        쿠폰 재체험 엔드포인트를 실제로 태운다 — 필드 세팅을 흉내 내면 referral_views 에
-        초기화가 다시 들어와도 잡히지 않는다.
+        쿠폰 체험을 시작하는 **실제 경로**(confirm_billing, scenario="trial")를 그대로
+        태운다 — 필드 세팅을 흉내 내면 초기화가 다시 들어와도 잡히지 않는다.
+        (구 무카드 경로 /billing/referral/redeem/ 는 base 30일 누락으로 폐지됐다.)
         """
         from apps.billing.models import ReferralCode
+        from apps.billing.toss_flows import TRIAL_BASE_DAYS, confirm_billing
+
+        monkeypatch.setattr(
+            TossBillingClient,
+            "issue_billing_key",
+            lambda auth_key, customer_key: {
+                "billingKey": f"bk_{uuid.uuid4().hex[:8]}",
+                "customerKey": customer_key,
+                "card": {"company": "현대", "number": "1234****"},
+            },
+        )
+        monkeypatch.setattr(
+            TossBillingClient, "delete_billing_key", lambda billing_key, customer_key: {}
+        )
 
         # 과거에 체험하다 취소한 이력 (free 로 내려간 상태)
         sub = ensure_subscription(user)
@@ -389,12 +404,15 @@ class TestCancelledDuringTrialRecording:
         code = ReferralCode.objects.create(
             code=f"RT{uuid.uuid4().hex[:6].upper()}",
             target_plan=SubscriptionPlan.objects.get(name="pro"),
-            trial_days=30,
+            trial_days=14,
         )
-        res = client.post("/api/v1/billing/referral/redeem/", {"code": code.code}, format="json")
-        assert res.status_code == 200, res.data
+        result = confirm_billing(user, auth_key="ak1", plan_name="pro", referral_code=code.code)
+        assert result["scenario"] == "trial"
 
         sub.refresh_from_db()
         assert sub.status == SubscriptionStatus.TRIALING  # 재체험은 정상 동작
         assert sub.trial_plan is not None and sub.trial_plan.name == "pro"
         assert sub.cancelled_during_trial_at == first_cancel  # 과거 기간 숫자가 유지된다
+        # 쿠폰은 base 30일 위에 얹힌다 — 14일만 나가던 결함의 회귀 방어
+        granted = (sub.current_period_end - sub.current_period_start).days
+        assert granted == TRIAL_BASE_DAYS + 14

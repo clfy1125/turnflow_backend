@@ -4,9 +4,12 @@
 시나리오 (confirm_billing):
 - trial:       pro 첫 구독 + trial_used_at 없음 → 과금 없이 TRIALING 30일
                (+유효 제휴코드 시 code.trial_days 가산). 첫 과금은 갱신 태스크가.
+               **쿠폰으로 체험을 시작하는 유일한 경로다** — 카드 없이 부여하던
+               ``/billing/referral/redeem/`` 은 base 30일을 빼먹어 폐지됐다
+               (2026-08-04, apps/billing/referral_views.py 참조).
 - charge_now:  basic 구독 / 트라이얼 소진 후 pro 재구독 → 즉시 첫 과금.
-- attach_only: 트라이얼 중(무카드 레퍼럴 포함) 카드 등록 → 키만 부착,
-               기간 불변(트라이얼 적층 금지).
+- attach_only: 트라이얼 중 카드 등록 → 키만 부착, 기간 불변(트라이얼 적층 금지).
+               폐지 전 무카드 레퍼럴로 시작한 기존 사용자도 여기로 들어온다.
 - card_change: 유료 사용자 plan_name 생략 → 카드 교체. PAST_DUE면 즉시 재시도.
 
 원칙:

@@ -334,7 +334,13 @@ class TossConfirmRequestSerializer(serializers.Serializer):
         required=False,
         allow_blank=True,
         default="",
-        help_text="제휴 코드 — pro 최초 구독(무료 체험 시작) 시에만 유효. 체험 +30일",
+        help_text=(
+            "제휴/쿠폰 코드 — pro 최초 구독(무료 체험 시작) 시에만 유효. "
+            "기본 체험 30일 **위에** 코드의 보너스 일수가 가산된다(14일 코드 → 총 44일). "
+            "총 일수는 GET /billing/referral/validate/ 의 total_trial_days 로 미리 확인할 수 있다. "
+            "⚠️ 쿠폰으로 체험을 시작하는 경로는 이것 하나뿐 — 카드 없는 "
+            "POST /billing/referral/redeem/ 는 폐지됐다(base 30일 누락 결함)."
+        ),
     )
     extra_ig_accounts = serializers.IntegerField(
         required=False,
@@ -425,12 +431,36 @@ class ReferralCodeValidateResponseSerializer(serializers.Serializer):
     )
     total_trial_days = serializers.IntegerField(
         required=False,
-        help_text="카드 등록 시 이 코드로 받는 총 무료 일수 (= base_trial_days + trial_days). "
-        "프론트 '총 N개월 무료' 표기는 이 값 사용. "
-        "※ 카드 없이 /referral/redeem/ 로 쓰면 trial_days 만 적용됨",
+        help_text="이 코드로 받는 총 무료 일수 (= base_trial_days + trial_days). "
+        "프론트 '총 N개월 무료' 표기는 반드시 이 값 사용",
     )
     plan = SubscriptionPlanSerializer(
         required=False, help_text="트라이얼로 부여될 플랜 (valid=true일 때)"
+    )
+    # ── 결제 전 미리보기 (프론트 UX: "이 쿠폰 + 결제 시 무슨 일이 일어나는지") ──
+    requires_card = serializers.BooleanField(
+        required=False,
+        help_text="항상 true — 쿠폰은 카드 등록(POST /billing/toss/confirm/ 에 referral_code 동봉) "
+        "경로에서만 사용된다. 카드 없이 쓰는 경로는 폐지됐다.",
+    )
+    trial_ends_at = serializers.DateTimeField(
+        required=False,
+        help_text="지금 결제(카드 등록)하면 무료 체험이 끝나는 시각 (= now + total_trial_days). "
+        "미리보기용 추정치 — 실제 값은 confirm 응답의 subscription.current_period_end",
+    )
+    first_charge_at = serializers.DateTimeField(
+        required=False,
+        help_text="첫 결제가 일어나는 시각. 무료 체험 종료 시점과 동일(trial_ends_at). "
+        "체험 기간 중에는 단 한 번도 청구되지 않는다.",
+    )
+    first_charge_amount = serializers.IntegerField(
+        required=False,
+        help_text="첫 결제 예정 금액(원) — target_plan 현재 판매가. 추가 IG 계정을 함께 구매하면 "
+        "extra_ig_account_price × 개수가 더해진다.",
+    )
+    extra_ig_account_price = serializers.IntegerField(
+        required=False,
+        help_text="추가 IG 계정 1개당 월 단가(원). 프론트에서 추가 계정 선택 시 첫 결제 금액 계산에 사용",
     )
 
 
