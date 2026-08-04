@@ -33,8 +33,16 @@ APP_IMAGE="$APP_IMAGE" $COMPOSE up -d --no-deps celery_dm celery_followup celery
 # celery_reports 만 **새** 이미지로 남아 반대 방향 스큐가 생긴다.
 _rq="$(docker exec turnflow_instagram_redis sh -c \
         'redis-cli --no-auth-warning -a "$REDIS_PASSWORD" llen reports' 2>/dev/null | tr -d '\r' || echo '?')"
-_ract="$(docker exec "$($COMPOSE ps -q celery_reports 2>/dev/null | head -1)" \
-          celery -A config inspect active -t 10 2>/dev/null | grep -c 'insta_reports' || echo '?')"
+# grep -c 는 매칭 0건이면 exit 1 이다 → `|| echo '?'` 를 쓰면 "0건"과
+#   "확인불가"가 뒤섞인다(2026-08-05 실제로 그 버그로 항상 SKIP 됐다).
+#   출력 유무로 두 경우를 가른다.
+_ract_raw="$(docker exec "$($COMPOSE ps -q celery_reports 2>/dev/null | head -1)" \
+              celery -A config inspect active -t 10 2>/dev/null)"
+if [ -z "$_ract_raw" ]; then
+  _ract='?'
+else
+  _ract="$(printf '%s' "$_ract_raw" | grep -c 'insta_reports')"
+fi
 echo "    celery_reports: 큐=${_rq} 진행중=${_ract}"
 if [ "${_rq}" = "0" ] && [ "${_ract}" = "0" ]; then
   APP_IMAGE="$APP_IMAGE" $COMPOSE up -d --no-deps celery_reports
