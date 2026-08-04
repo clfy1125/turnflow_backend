@@ -322,7 +322,15 @@ def _sub_outside_quotes(text: str) -> str:
 
 
 # 받침 유무로 형태가 갈리는 조사 — {받침 있을 때: 받침 없을 때}
-_PARTICLE_PAIRS = {"이": "가", "은": "는", "을": "를", "과": "와", "이나": "나", "이라": "라"}
+_PARTICLE_PAIRS = {
+    "이": "가",
+    "은": "는",
+    "을": "를",
+    "과": "와",
+    "으로": "로",
+    "이나": "나",
+    "이라": "라",
+}
 _PARTICLE_ALT = {**_PARTICLE_PAIRS, **{v: k for k, v in _PARTICLE_PAIRS.items()}}
 _PARTICLE_RE = "|".join(sorted(_PARTICLE_ALT, key=len, reverse=True))
 
@@ -342,7 +350,11 @@ def _sub_all(seg: str) -> str:
     (2026-08-04 테스트에서 잡음). 단어를 바꾸면 받침이 바뀌므로 조사도 함께 봐야 한다.
     """
     for rx, better in JARGON_AUTOFIX:
-        pat = re.compile(f"(?:{rx.pattern})({_PARTICLE_RE})?(?![가-힣])")
+        # ⚠️ 뒤에 `(?![가-힣])` 가드를 두면 안 된다 — '말하는 얼굴**로**'·'캡션**에**' 처럼
+        #    목록에 없는 조사가 붙으면 매칭이 아예 안 돼 교정을 못 한다(2026-08-04 실측:
+        #    자동 교정이 1곳만 되고 '말하는 얼굴' 이 3번 반려됐다).
+        #    받침에 따라 형태가 갈리는 조사만 잡아 고치고, 나머지는 단어만 바꾼다.
+        pat = re.compile(f"(?:{rx.pattern})({_PARTICLE_RE})?")
 
         def rep(m, _better=better):
             p = m.group(1)
