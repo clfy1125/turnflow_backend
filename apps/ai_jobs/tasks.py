@@ -278,8 +278,12 @@ def _apply_reference_template(result_data: dict, reference_page_slug: str) -> bo
     retry_backoff=True,
     acks_late=True,
     reject_on_worker_lost=True,
-    time_limit=600,
-    soft_time_limit=540,
+    # 추론 모델 예산 상향(PAGE_GEN_MAX_TOKENS=64k)에 맞춘 상한. 실측 단일 호출은
+    # 182~273s 이고, 이 태스크는 최악의 경우 LLM 을 3회(본 호출 + JSON 파싱 재호출 +
+    # blocks 재호출) 부르므로 ~900s 가 필요하다. 600/540 이면 그 중간에 잘려
+    # SoftTimeLimitExceeded → 재시도로 또 10분을 태운다.
+    time_limit=1260,
+    soft_time_limit=1200,
 )
 def run_ai_job(self, job_id: str):
     """
@@ -475,7 +479,11 @@ def run_ai_job(self, job_id: str):
 
             # deepseek 가 가끔 page 메타만 내고 blocks 배열을 통째로 생략한다(짧은 게으른
             # 응답 — 잘림 아님). 그대로 머지하면 "디자인만 바뀐 척"이 되므로 1회 재호출.
-            if job.mode and not isinstance(result_data.get("blocks"), list):
+            # full_restyle 만 blocks 배열을 낸다 — style_only 는 block_styles 를 내므로
+            # 여기 걸리면 매번 쓸데없는 재호출이 돈다(예전엔 `job.mode` 로 둘 다 걸렸다).
+            if job.mode == AiJob.Mode.FULL_RESTYLE and not isinstance(
+                result_data.get("blocks"), list
+            ):
                 logger.warning("AiJob %s: 응답에 blocks 배열 없음 — 1회 재호출", job_id)
                 raw_response = call_llm(
                     model=model_name,
@@ -485,6 +493,23 @@ def run_ai_job(self, job_id: str):
                     "`page` 와 `blocks` 를 모두 포함한 완전한 JSON 을 출력하라.)",
                 )
                 result_data = extract_json(raw_response)
+
+        # ── 3.4 리뉴얼(full_restyle) 응답 검증 ────────────────
+        # 위 재호출 뒤 **재검증이 없어서** blocks 없는 응답이 그대로 머지까지 흘러갔고,
+        # 결과적으로 블록 0개인 result_json 이 succeeded 로 나갔다(2026-08-04 사고 —
+        # 프론트가 빈 페이지를 그린 직접 원인). 여기서 예외를 던지면 celery 자동 재시도가
+        # 한 번 돌고, 그래도 안 되면 job 이 FAILED 로 확정된다. 사용자는 10분 기다린 뒤
+        # "빈 페이지"가 아니라 정직한 실패를 보게 된다.
+        # (chunked 분기도 blocks=[] 로 여기 걸린다 — 두 경로를 한곳에서 검증한다.)
+        # merge_full_restyle 쪽 baseline 폴백은 이 검증을 통과하지 못한 응답이 도달할 수
+        # 없으므로 중복이 아니라 **다른 호출자/미래 경로를 위한 2차 방어선**이다.
+        if job.mode == AiJob.Mode.FULL_RESTYLE:
+            restyle_blocks = result_data.get("blocks") if isinstance(result_data, dict) else None
+            if not (isinstance(restyle_blocks, list) and restyle_blocks):
+                raise ValueError(
+                    "LLM 응답에 blocks 배열이 없습니다(재호출 후에도). "
+                    "리뉴얼 결과를 만들 수 없어 실패 처리합니다."
+                )
 
         # ── 3.5 placeholder 복원 + style patch 머지 ──
         # mode 가 있는 리뉴얼 작업은 기존 콘텐츠를 보존한 채 LLM 스타일 패치만 적용.

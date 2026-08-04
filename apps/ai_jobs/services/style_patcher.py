@@ -381,8 +381,19 @@ def merge_full_restyle(
             existing_by_id[bid] = b
 
     if not isinstance(response_blocks, list):
-        # 블록 응답이 빠지면 메타만 적용.
-        return {**merged_meta}
+        # 블록 응답이 빠졌다. 예전엔 메타만 반환했는데(`return {**merged_meta}`) 그러면
+        # result_json 에 blocks 키 자체가 없어져서, 프론트가 그 결과를 렌더하면 **블록이
+        # 하나도 없는 빈 페이지**가 된다 (2026-08-04: 리뉴얼 10분 돌린 뒤 "페이지가 다
+        # 사라졌다" 사고의 마지막 단계). 그대로 적용됐다면 기존 블록이 전부 삭제됐다.
+        # 형제 함수 merge_style_only 는 항상 existing_blocks 를 순회해 블록을 내놓으므로
+        # 구조적으로 안전하다 — full_restyle 만 예외였다. 여기서도 기존 블록을 그대로
+        # 보존해(디자인/메타만 반영) **파괴적인 결과를 절대 만들지 않는다**.
+        logger.warning(
+            "merge_full_restyle: 응답에 blocks 배열 없음 — 기존 블록 %d개를 그대로 보존"
+            "(메타/디자인만 적용). 파괴적 적용 방지.",
+            len(existing_blocks or []),
+        )
+        return {**merged_meta, "blocks": [dict(b) for b in (existing_blocks or [])]}
 
     merged_blocks: list[dict] = []
     for i, raw in enumerate(response_blocks):
@@ -517,6 +528,31 @@ def merge_full_restyle(
                 "hide_at": None,
             }
         )
+
+    # ── 블록 대량 소실 감지 ────────────────────────────────────
+    # full_restyle 은 블록 삭제가 **정상 동작**이라(응답에 없는 id = 삭제) 개수 감소만으로
+    # 실패 처리할 수는 없다. 다만 응답이 잘려서 뒷부분 블록이 통째로 날아간 경우도 똑같이
+    # "삭제"로 보이기 때문에, 절반 이상 사라지면 로그로 남겨 조용한 소실을 관측 가능하게 한다.
+    # (실측 사례: 예산 부족으로 잘린 응답이 기존 8개 중 6개만 담아 2개가 말없이 삭제될 상태.)
+    if existing_by_id:
+        kept = sum(1 for b in merged_blocks if b.get("id") is not None)
+        if kept * 2 < len(existing_by_id):
+            logger.warning(
+                "merge_full_restyle: 기존 블록 %d개 중 %d개만 유지 — 의도적 삭제이거나 "
+                "응답 잘림으로 인한 소실일 수 있음(LLM 응답 blocks=%d개).",
+                len(existing_by_id),
+                kept,
+                len(response_blocks),
+            )
+
+    # 블록이 하나도 안 남으면 빈 페이지가 된다 — 기존 블록을 되살려 파괴를 막는다.
+    # (LLM 이 blocks:[] 를 내거나 모든 항목이 검증에서 탈락한 경우.)
+    if not merged_blocks and existing_blocks:
+        logger.warning(
+            "merge_full_restyle: 머지 결과 블록 0개 — 기존 블록 %d개로 되돌림(빈 페이지 방지).",
+            len(existing_blocks),
+        )
+        return {**merged_meta, "blocks": [dict(b) for b in existing_blocks]}
 
     # order 정규화 — 1 부터 순차 (충돌 방지).
     for idx, b in enumerate(merged_blocks):
