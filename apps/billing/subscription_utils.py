@@ -16,19 +16,30 @@ def ensure_subscription(user):
     """
     User에 subscription이 없으면 Free plan으로 자동 생성.
     Returns UserSubscription.
+
+    ⚠️ 경쟁 조건 주의 (2026-08-05 실장애):
+    예전 구현은 `get()` → `except DoesNotExist` → `create()` 였다. 동시 요청 두 개가 둘 다
+    `DoesNotExist` 를 받으면 둘 다 INSERT 를 시도해 한쪽이
+    `UniqueViolation: user_subscriptions_user_id_key` 로 **500** 을 낸다.
+    구독 행이 아직 없는 **신규 사용자의 첫 화면 로딩**에서 실제로 발생했다
+    (SPA 가 같은 엔드포인트를 두 번 호출 — iOS Instagram 인앱 브라우저 사례).
+
+    `get_or_create` 는 INSERT 를 `transaction.atomic` 으로 감싸고 `IntegrityError` 시
+    **다시 `get()`** 하므로 이 경쟁에서 안전하다. 직접 try/except 로 흉내내지 말 것
+    (atomic 없이 INSERT 가 실패하면 바깥 트랜잭션까지 오염된다).
     """
     from .models import UserSubscription
 
     sub = getattr(user, "subscription", None)
-    if sub is None:
-        try:
-            sub = UserSubscription.objects.get(user=user)
-        except UserSubscription.DoesNotExist:
-            sub = UserSubscription.objects.create(
-                user=user,
-                plan=get_free_plan(),
-                current_period_start=timezone.now(),
-            )
+    if sub is not None:
+        return sub
+    sub, _created = UserSubscription.objects.get_or_create(
+        user=user,
+        defaults={
+            "plan": get_free_plan(),
+            "current_period_start": timezone.now(),
+        },
+    )
     return sub
 
 
