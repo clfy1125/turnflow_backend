@@ -11,7 +11,7 @@
 | 항목 | 상태 |
 |---|---|
 | SSH 무차별 대입 (7일간 42,738회) | ✅ 키 전용 인증 + IP 허용목록, 실측 0회 |
-| Redis 무인증 브로커 | ✅ 무중단 인증 전환(오류 창 0) |
+| Redis 무인증 브로커 | ✅ 무중단 인증 전환(오류 창 0) + **08-05 재시작 내구성 확보**(아래 참조) |
 | Cloudflare 우회 경로(오리진 직타) | ✅ `@not_cf` 403 + `api.turnflow` API 미서빙 |
 | Django `/admin` 무제한 노출 | ✅ IP 허용목록 (단 `/api/v1/admin/*` 는 외주 사용 중이라 의도적 미차단) |
 | HSTS · netdata · vastai 특권 · gemma 네트워크 · LiteLLM 키 | ✅ |
@@ -67,18 +67,17 @@
 
 ## P1 — 마케팅 집행 전 (코드 배포 1회로 묶기)
 
-### 배포 블로커는 사실상 없다 (실측)
+### 배포 블로커 없음 — 2026-08-05 기준 prod 는 깨끗하다
 
-- `git log 086aea9..HEAD` = **4커밋**, 전부 `insta_reports`. HEAD = `4fa34f1`.
-- **`celery_reports` 는 이미 `4fa34f1` 로 운영 중** — 뒤처진 건 web 티어 3개뿐.
-- 그 4커밋이 건드린 건 `pipeline/*` · `service.py` · 템플릿 · 테스트뿐.
-  **views / serializers / urls / settings / models / migrations 변경 0건** → web 티어 무영향.
-- `deploy/scripts/deploy.sh:27` 은 **서버에서** `git pull` 후 빌드 → 로컬 워킹트리의 미커밋 변경
-  (현재 billing 리퍼럴 WIP 5파일)은 **배포에 안 들어간다**.
+- prod HEAD = `8073dbc`(= `origin/main`), **이미지 스큐 0**(앱 컨테이너 9개 전부 동일 태그),
+  워킹트리 드리프트 해소(`docker-compose.prod.yml` 커밋됨).
+- 미배포 커밋 없음. 아래 항목만 만들어 배포하면 된다.
 - ⚠️ **`.deploy.prev` 를 신뢰하지 말 것** — `deploy.sh` 가 무조건 덮어쓰고 `rollback.sh` 가 그 값을 쓴다.
   실제 실행 이미지 표는 `/root/rollback_pointer_20260804.txt`(600)에 대역외로 고정해 뒀다.
+- `deploy/scripts/deploy.sh` 는 **서버에서** `git pull` 후 빌드한다 → 로컬 워킹트리의 미커밋 변경은
+  배포에 들어가지 않는다(반대로, 배포하려면 **push 가 필수**).
 
-아래 5개를 **한 배포**로 묶는 것을 권한다. 이 배포로 이미지 스큐도 자연히 수렴된다.
+아래 5개를 **한 배포**로 묶는 것을 권한다.
 
 ### P1-1. `NUM_PROXIES = 2` — 다른 스로틀보다 **먼저**
 
