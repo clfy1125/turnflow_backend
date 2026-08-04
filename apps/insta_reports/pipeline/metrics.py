@@ -6,9 +6,11 @@
 
 import json
 import statistics as st
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 
 from . import config
+
+KST = timezone(timedelta(hours=9))
 
 NICE = [
     1_000,
@@ -122,6 +124,46 @@ def _audience_profile(canon: dict, m: dict) -> dict:
     }
 
 
+# 반응률 분모 후보 — 계정 규모에 맞는 것을 고른다.
+# ⚠️ **100 회당으로 고정하면 안 된다.** 대형 계정에서 소수 첫째자리로 반올림하면 0.0 이 된다:
+#    @jinyongjin92 실측 — 댓글 886개인데 평소 조회수 41.4만이라 100회당 0.016 → **"댓글 0.0개"**.
+#    사용자는 "댓글이 아예 없다" 로 읽고, 합성 AI 도 그 0.0 을 근거로 "댓글 소통이 거의 없어요"
+#    라는 **사실과 반대되는 조언**을 썼다(2026-08-04 리포트에서 실제 발생).
+ENGAGEMENT_BASES = (100, 1_000, 10_000, 100_000)
+_BASE_LABEL = {100: "100회", 1_000: "1,000회", 10_000: "1만회", 100_000: "10만회"}
+
+
+def _readable(value: float | None, base: int) -> float | None:
+    """분모 환산값. 소수 첫째자리로 0.0 이 되는데 실제로 0 이 아니면 둘째자리까지 보인다
+    (0 이 아닌 것을 0 으로 보여주는 게 애초의 문제였다)."""
+    if value is None:
+        return None
+    v = value * base
+    r = round(v, 1)
+    return r if r > 0 or v == 0 else round(v, 2)
+
+
+def _engagement_rate(like_ratio: float | None, comment_ratio: float | None) -> dict:
+    """조회수 대비 좋아요·댓글 비율 → **읽히는 분모**로 환산.
+
+    분모는 '댓글 수가 **1.0 이상**으로 보이는 가장 작은 값'을 고른다. 0.1 을 기준으로 하면
+    "1,000회당 0.2개" 처럼 여전히 감이 안 오는 수가 나온다(진용진 실측). 좋아요는 항상
+    댓글보다 많으므로 댓글 기준으로 잡으면 둘 다 읽힌다.
+    """
+    base = ENGAGEMENT_BASES[0]
+    if comment_ratio:
+        for b in ENGAGEMENT_BASES:
+            base = b
+            if comment_ratio * b >= 1.0:
+                break
+    return {
+        "per_base": base,
+        "base_label": _BASE_LABEL[base],
+        "like_per_base": _readable(like_ratio, base),
+        "comment_per_base": _readable(comment_ratio, base),
+    }
+
+
 def build_metrics(canon: dict) -> dict:
     posts = canon["posts"]
     now = datetime.now(UTC)
@@ -197,6 +239,18 @@ def build_metrics(canon: dict) -> dict:
         low_sample = len(by_month) > 1
     m["monthly_low_sample"] = low_sample
     months = sorted(by_month)
+    # 데이터 기준일(수집 시각, KST). 없으면 빈 문자열 — 렌더가 항목을 아예 생략한다.
+    # ⚠️ 이 값을 안 넣던 동안 리포트 부제가 "릴스 13개 기준 · **..** · 조회수는…" 으로
+    #    구분점만 남아 나왔다(2026-08-04 실측). 렌더에서 문자열을 잘라 조립했기 때문.
+    fetched = canon.get("fetched_at_official") or canon.get("fetched_at_apify") or ""
+    m["coverage"]["data_date"] = ""
+    if fetched:
+        try:
+            m["coverage"]["data_date"] = (
+                datetime.fromisoformat(fetched).astimezone(KST).strftime("%Y.%m.%d")
+            )
+        except ValueError:
+            pass
     m["coverage"]["months_span"] = len(months)
     all_dates = sorted(p["taken_at_kst"][:10] for p in rv)
     m["coverage"]["period_from"] = all_dates[0]
@@ -224,11 +278,10 @@ def build_metrics(canon: dict) -> dict:
     m["benchmark"] = {"tiers": tiers}
 
     # ── 반응률 ──
-    lr = [p["likes"] / p["views"] * 100 for p in rv if p["likes"] is not None]
-    cr = [p["comments"] / p["views"] * 100 for p in rv if p["comments"] is not None]
+    lr = [p["likes"] / p["views"] for p in rv if p["likes"] is not None]
+    cr = [p["comments"] / p["views"] for p in rv if p["comments"] is not None]
     m["engagement"] = {
-        "like_per_100": round(st.median(lr), 1) if lr else None,
-        "comment_per_100": round(st.median(cr), 1) if cr else None,
+        **_engagement_rate(st.median(lr) if lr else None, st.median(cr) if cr else None),
         "comment_gt_like": sum(1 for p in rv if (p["comments"] or 0) > (p["likes"] or 0)),
         "n": len(rv),
     }

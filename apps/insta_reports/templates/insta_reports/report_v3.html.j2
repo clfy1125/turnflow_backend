@@ -178,12 +178,12 @@ footer{text-align:center;color:#6d6485;font-size:12px;margin-top:44px;padding-to
 </div>
 <!-- TAB 1 · 개요 -->
 <section id="ov" class="active">
-  <div class="sub" style="margin-top:6px">최근 게시물 {{ cov.posts_analyzed }}개 중 조회수를 확인할 수 있는 릴스 {{ cov.reels_with_views }}개 기준 · {{ data_date }} · 조회수는 사람 수가 아니라 재생된 횟수예요</div>
+  <div class="sub" style="margin-top:6px">최근 게시물 {{ cov.posts_analyzed }}개 중 조회수를 확인할 수 있는 릴스 {{ cov.reels_with_views }}개 기준{% if data_date %} · {{ data_date }} 수집{% endif %} · 조회수는 사람 수가 아니라 재생된 횟수예요</div>
   <div class="grid kpis">
     <div class="kpi"><div class="v">{{ "{:,}".format(a.followers) }}</div><div class="l">팔로워</div><div class="s">게시물 {{ a.posts_total }}개를 운영 중이에요</div></div>
     <div class="kpi"><div class="v">{{ man(vs.median) }}</div><div class="l">평소 조회수 (가운데 값)</div><div class="s">영상들을 조회수 순으로 줄 세운 <b>가운데 값</b>이에요(평균 아님). 새 영상이 이걸 넘으면 평소보다 잘된 거예요</div></div>
     <div class="kpi"><div class="v">{{ man(vs.max) }}</div><div class="l">최고 조회수 (회)</div><div class="s">{{ top1_date }} 게시물이 기록했어요</div></div>
-    <div class="kpi"><div class="v">{{ eng.comment_per_100 }}개</div><div class="l">조회 100회당 댓글</div><div class="s">100번 재생될 때 댓글 {{ eng.comment_per_100 }}개 · 좋아요 {{ eng.like_per_100 }}개가 달려요</div></div>
+    <div class="kpi"><div class="v">{{ eng.comment_per_base }}개</div><div class="l">조회 {{ eng.base_label }}당 댓글</div><div class="s">{{ eng.base_label }} 재생될 때 댓글 {{ eng.comment_per_base }}개 · 좋아요 {{ eng.like_per_base }}개가 달려요</div></div>
   </div>
 
   <h2><span class="bar"></span>가장 중요한 3가지</h2>
@@ -362,7 +362,7 @@ footer{text-align:center;color:#6d6485;font-size:12px;margin-top:44px;padding-to
 
 <!-- (구) TAB 5 저장하기 — 제거. 이 파일 자체가 내려받은 산출물이라 화면 내 저장 버튼이 필요 없다. -->
 
-<footer>@{{ a.username }} 내 인스타 성장 리포트 · 최근 게시물 {{ cov.posts_analyzed }}개 중 릴스 {{ cov.reels_with_views }}개 · 댓글 {{ cstats.n_analyzed }}개 기준 · {{ data_date }} · AI 영상 분석 {{ agg.video_analyzed }}/{{ agg.video_total }}개<br>
+<footer>@{{ a.username }} 내 인스타 성장 리포트 · 최근 게시물 {{ cov.posts_analyzed }}개 중 릴스 {{ cov.reels_with_views }}개 · 댓글 {{ cstats.n_analyzed }}개 기준{% if data_date %} · {{ data_date }} 수집{% endif %} · AI 영상 분석 {{ agg.video_analyzed }}/{{ agg.video_total }}개<br>
 공개된 조회수·좋아요·댓글을 바탕으로 만들었어요. 도달·저장 수·시청 시간은 인스타그램이 공개하지 않아 포함되지 않아요.<br>TURNFLOW</footer>
 </div>
 <script>

@@ -422,11 +422,9 @@ def render_report_v3(
         video_on=video_on,
         cstats=cstats,
         cfilter=cfilter,
-        data_date=(m["coverage"].get("data_date") or "")[:4]
-        + "."
-        + (m["coverage"].get("data_date") or "    ")[4:6]
-        + "."
-        + (m["coverage"].get("data_date") or "      ")[6:8],
+        # metrics 가 이미 'YYYY.MM.DD' 로 만들어 준다. 예전에는 여기서 문자열을 잘라
+        # 조립하다 값이 비면 '..' 만 남아 리포트에 그대로 노출됐다(2026-08-04 실측).
+        data_date=m["coverage"].get("data_date") or "",
         top1_date=(m["top_posts"][0]["date_kst"][2:7].replace("-", ".") if m["top_posts"] else ""),
         # 프로필 사진: IG 서명 URL 이 만료됐으면 우리 스토리지 캐시본으로 대체한다.
         pfp_data_uri=(
@@ -609,11 +607,9 @@ def render_report(
         slots=slots,
         agg=agg or {},
         video_on=video_on,
-        data_date=(m["coverage"].get("data_date") or "")[:4]
-        + "."
-        + (m["coverage"].get("data_date") or "    ")[4:6]
-        + "."
-        + (m["coverage"].get("data_date") or "      ")[6:8],
+        # metrics 가 이미 'YYYY.MM.DD' 로 만들어 준다. 예전에는 여기서 문자열을 잘라
+        # 조립하다 값이 비면 '..' 만 남아 리포트에 그대로 노출됐다(2026-08-04 실측).
+        data_date=m["coverage"].get("data_date") or "",
         top1_date=(m["top_posts"][0]["date_kst"][2:7].replace("-", ".") if m["top_posts"] else ""),
         # 프로필 사진: IG 서명 URL 이 만료됐으면 우리 스토리지 캐시본으로 대체한다.
         pfp_data_uri=(

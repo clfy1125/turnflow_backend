@@ -114,17 +114,18 @@ def build_whitelist(metrics: dict, agg: dict) -> dict:
     baes = {r["value"] for r in agg.get("derived", {}).get("ratios", [])}
     pcts = {p["value"] for p in agg.get("derived", {}).get("pcts", [])}
     # engagement 비율(1.6개 등)은 카운트/원값으로도 등장
-    for k in ("like_per_100", "comment_per_100"):
-        v = (metrics.get("engagement") or {}).get(k)
+    eng = metrics.get("engagement") or {}
+    for k in ("like_per_base", "comment_per_base"):
+        v = eng.get(k)
         if v is not None:
             raws.add(float(v))
             counts.add(float(v))
-    # ⚠️ **우리 리포트가 직접 쓰는 고정 분모** — "조회 100회당 댓글 N개"(engagement.*_per_100).
-    # 100 은 지표 '값' 으로는 등장하지 않아 화이트리스트에 없었고, AI 가 이 표기를 쓰면
-    # 무조건 "지표에 없는 숫자" 로 반려됐다. 실측(@jinyongjin92, 2026-08-04): 재작성 4회 중
-    # 3·4회차의 반려 사유가 **'100회' 단 2건**이어서 추천 슬롯이 폴백으로 떨어졌다.
-    if metrics.get("engagement"):
-        counts.add(100.0)
+    # ⚠️ **우리 리포트가 직접 쓰는 반응률 분모** — "조회 1만회당 댓글 N개"(engagement.per_base).
+    # 분모는 지표 '값' 으로도 등장하지만(per_base) 명시적으로 넣어 둔다. 실측(2026-08-04):
+    # 이게 없어 재작성 4회 중 3·4회차의 반려 사유가 **'100회' 단 2건**이었고 추천이 폴백됐다.
+    if eng:
+        counts.add(float(eng.get("per_base") or 100))
+        counts.add(100.0)  # 분모가 커져도 사용자가 100 기준으로 되물을 수 있다
     return {"raw": raws, "man": mans, "bae": baes, "pct": pcts, "count": counts}
 
 

@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import timedelta
 
@@ -1153,6 +1154,88 @@ class TestJargonHintsMatchTheGate:
             # 가이드는 '쓰지 마세요' 안내에서 금칙어를 일부러 언급한다 → 그 줄은 제외하고 본다.
             body = "\n".join(ln for ln in block.splitlines() if "반려" not in ln)
             assert not check_jargon(body), (name, check_jargon(body))
+
+
+class TestEngagementRateIsReadable:
+    """반응률이 **0.0 으로 반올림돼 '댓글 없음'처럼 보이면 안 된다.**
+
+    2026-08-04 운영자 지적: @jinyongjin92 리포트가 "조회 100회당 댓글 0.0개" 로 나왔다.
+    댓글이 실제로 **886개** 인데 평소 조회수가 41.4만이라 100회당 0.016 → 0.0 으로 반올림된
+    것이다. 사용자는 "댓글이 아예 없다" 로 읽고, 합성 AI 도 그 0.0 을 근거로 "댓글 소통이
+    거의 없어요" 라는 **사실과 반대되는 조언**을 썼다.
+    """
+
+    @pytest.mark.parametrize(
+        ("comments", "views", "base"),
+        [
+            (2, 100, 100),  # 소형: 100회당 2.0개
+            (68, 414_000, 10_000),  # 진용진 실측: 1만회당 1.6개
+            (1, 3_000_000, 100_000),  # 초대형: 최대 분모까지 키운다
+        ],
+    )
+    def test_base_scales_so_the_number_is_visible(self, comments, views, base):
+        from .pipeline.metrics import _engagement_rate
+
+        r = _engagement_rate(comments / views, comments / views)
+        assert r["per_base"] == base, r
+        assert r["comment_per_base"] > 0, r  # 0 이 아닌 값이 0.0 으로 보이면 안 된다
+
+    def test_jinyongjin_case_no_longer_reads_as_zero(self):
+        from .pipeline.metrics import _engagement_rate
+
+        r = _engagement_rate(70 / 414_000, 68 / 414_000)
+        assert r["comment_per_base"] > 0, "886개 댓글이 0.0개로 보이면 안 된다"
+        assert r["base_label"] == "1만회"
+
+    def test_zero_comments_stays_zero(self):
+        """진짜로 댓글이 없으면 0.0 이 맞다 — 분모를 키워 숨기지 않는다."""
+        from .pipeline.metrics import _engagement_rate
+
+        r = _engagement_rate(0.01, 0.0)
+        assert r["comment_per_base"] == 0.0
+        assert r["per_base"] == 100
+
+    def test_missing_ratio_is_none_not_crash(self):
+        from .pipeline.metrics import _engagement_rate
+
+        r = _engagement_rate(None, None)
+        assert r["comment_per_base"] is None and r["like_per_base"] is None
+
+
+class TestDataDateNeverRendersAsDots:
+    """수집일이 없을 때 '..' 같은 찌꺼기가 리포트에 노출되면 안 된다.
+
+    2026-08-04 실측: 부제가 "릴스 13개 기준 · **..** · 조회수는…" 으로 나왔다.
+    `coverage.data_date` 를 아무도 채우지 않는데 렌더가 문자열을 잘라 조립했기 때문.
+    """
+
+    def test_metrics_fills_data_date_from_collection_time(self, tmp_path):
+        from .pipeline import config, fake_mode, normalize
+        from .pipeline import metrics as metrics_mod
+
+        config.bind_run(tmp_path)
+        fake_mode.write_sources("datedate")
+        m = metrics_mod.build_metrics(normalize.build_canonical("datedate"))
+        assert re.fullmatch(r"\d{4}\.\d{2}\.\d{2}", m["coverage"]["data_date"]), m["coverage"]
+
+    def test_missing_collection_time_yields_empty_not_dots(self, tmp_path):
+        import json
+
+        from .pipeline import config, fake_mode, normalize
+        from .pipeline import metrics as metrics_mod
+
+        config.bind_run(tmp_path)
+        fake_mode.write_sources("nodate")
+        for name in ("nodate.json",):
+            for d in (config.RAW_DIR, config.APIFY_DIR):
+                p = d / name
+                if p.exists():
+                    doc = json.loads(p.read_text(encoding="utf-8"))
+                    doc.pop("fetched_at", None)
+                    p.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+        m = metrics_mod.build_metrics(normalize.build_canonical("nodate"))
+        assert m["coverage"]["data_date"] == ""
+        assert "." not in m["coverage"]["data_date"]
 
 
 class TestJargonAutofixSavesARetry:
