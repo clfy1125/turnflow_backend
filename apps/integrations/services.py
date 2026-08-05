@@ -1792,6 +1792,105 @@ class InstagramMediaService:
 
         return body.get("permalink") or None
 
+    # 썸네일 소스 조회에 필요한 필드. media_type 별로 이미지가 실려 오는 필드가 다르다:
+    #   IMAGE          → media_url (원본 이미지)
+    #   VIDEO / REELS  → thumbnail_url (media_url 은 .mp4 라 <img> 에 못 쓴다)
+    #   CAROUSEL_ALBUM → 대표(첫) 자식의 media_url (부모엔 media_url 이 없다)
+    THUMBNAIL_SOURCE_FIELDS = (
+        "id,media_type,media_product_type,media_url,thumbnail_url,"
+        "children{id,media_type,media_url,thumbnail_url}"
+    )
+
+    @classmethod
+    def get_media_thumbnail_source(cls, media_id: str, access_token: str) -> "tuple[str, str]":
+        """게시물의 **표시용 이미지** CDN URL 1개를 고른다 (썸네일 재호스팅 소스).
+
+        ``media_url`` 만 보던 기존 보강 로직은 릴스/동영상에서 ``.mp4`` 를, 캐러셀에서는
+        (부모에 media_url 이 없어) 아무것도 얻지 못했다 — 그래서 media_type 별로 갈라 고른다.
+        캐러셀은 **첫** 슬라이드(=IG 그리드에 보이는 커버)를 쓴다. 마지막 슬라이드를 고르는
+        :meth:`AutoDMCampaignViewSet._pick_image_url` 은 AI 비전 입력용이라 목적이 다르다.
+
+        Returns:
+            ``(image_url, media_type)``. 실패/부재 시 ``("", "")`` — 절대 raise 하지 않는다
+            (표시용 보강이라 호출부의 캠페인 처리를 멈출 이유가 없다).
+        """
+        if not media_id:
+            return "", ""
+
+        # Mock 모드(dev): 가짜 media_id 라 Graph 조회가 무의미하다 → 소스 없음으로 스킵.
+        if MockInstagramProvider.is_mock_mode():
+            return "", ""
+
+        url = f"{cls.GRAPH_API_BASE}/{media_id}"
+        params = {"fields": cls.THUMBNAIL_SOURCE_FIELDS, "access_token": access_token}
+        try:
+            resp = requests.get(url, params=params, timeout=cls.DEFAULT_TIMEOUT)
+        except (requests.Timeout, requests.ConnectionError):
+            return "", ""
+        if not resp.ok:
+            return "", ""
+        try:
+            body = resp.json() or {}
+        except ValueError:
+            return "", ""
+
+        return cls.pick_thumbnail_source(body), (body.get("media_type") or "")
+
+    @staticmethod
+    def pick_thumbnail_source(media: dict) -> str:
+        """Graph 미디어 페이로드 → 표시용 이미지 URL (순수 함수, 테스트 진입점)."""
+        media_type = (media.get("media_type") or "").upper()
+
+        if media_type == "CAROUSEL_ALBUM":
+            children = ((media.get("children") or {}).get("data")) or []
+            for child in children:  # 첫 슬라이드 = 커버
+                child_type = (child.get("media_type") or "").upper()
+                if child_type == "VIDEO" and child.get("thumbnail_url"):
+                    return child["thumbnail_url"]
+                if child.get("media_url"):
+                    return child["media_url"]
+
+        if media_type == "VIDEO":
+            # 릴스/동영상: media_url 은 .mp4 → 반드시 thumbnail_url 을 쓴다.
+            return media.get("thumbnail_url") or ""
+
+        return media.get("media_url") or media.get("thumbnail_url") or ""
+
+    @classmethod
+    def get_media_batch(cls, media_ids: "list[str]", access_token: str, fields: str) -> dict:
+        """여러 게시물을 **한 번의** Graph 호출로 조회 (``GET /?ids=a,b,c``).
+
+        Graph 의 batch-by-ids 문법이라 media_id 개수와 무관하게 호출 1회다. 목록 화면이
+        게시물 N개를 찾으려고 /media 엣지를 커서로 넘겨가며 뒤지던 비용을 없앤다.
+
+        Returns:
+            ``{media_id: {…}}``. 접근 불가/삭제된 id 는 응답에서 빠진다(부분 성공 허용).
+            호출 자체가 실패하면 빈 dict.
+        """
+        ids = [m.strip() for m in (media_ids or []) if m and m.strip()]
+        if not ids:
+            return {}
+
+        if MockInstagramProvider.is_mock_mode():
+            return {}
+
+        try:
+            resp = requests.get(
+                f"{cls.GRAPH_API_BASE}/",
+                params={"ids": ",".join(ids), "fields": fields, "access_token": access_token},
+                timeout=cls.DEFAULT_TIMEOUT,
+            )
+        except (requests.Timeout, requests.ConnectionError):
+            return {}
+        if not resp.ok:
+            return {}
+        try:
+            body = resp.json() or {}
+        except ValueError:
+            return {}
+        # 응답은 {media_id: {...}} 형태. 방어적으로 dict 만 통과시킨다.
+        return {k: v for k, v in body.items() if isinstance(v, dict)}
+
     @classmethod
     def list_media_comments(
         cls,

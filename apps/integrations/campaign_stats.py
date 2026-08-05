@@ -627,8 +627,11 @@ def compute_campaign_enrichment(obj: AutoDMCampaign) -> dict:
         "delivery_rate": delivery_rate,
         "needs_attention_count": needs,
         "last_sent_at": last,
-        # 게시물 썸네일 = 캠페인 media_url (목록 응답에서 Graph API 로 best-effort 보강됨)
-        "thumbnail_url": obj.media_url or None,
+        # 게시물 썸네일 = 우리 스토리지에 재호스팅한 사본의 영구 URL (모델 컬럼, 추가 쿼리 0).
+        # ⚠️ 예전엔 media_url 미러였는데 media_url 은 2026-08-03 부터 **permalink** 가 채워진다
+        #    → HTML 페이지 URL 을 <img src> 에 넣어 프론트에서 전부 깨졌다(prod 77건 중 68건).
+        #    썸네일과 게시물 링크는 별개 필드로 완전히 분리했다.
+        "thumbnail_url": (obj.thumbnail_url or "") or None,
     }
 
 

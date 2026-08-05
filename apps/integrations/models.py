@@ -591,7 +591,50 @@ class AutoDMCampaign(models.Model):
         help_text="specific_media 트리거에서만 사용 (any/next 모드에선 빈 문자열)",
     )
     media_url = models.URLField(
-        blank=True, null=True, verbose_name="Media URL", help_text="게시물 URL (참고용)"
+        max_length=512,
+        blank=True,
+        null=True,
+        verbose_name="게시물 permalink",
+        help_text=(
+            "게시물 영구 링크(https://www.instagram.com/p/{shortcode}/). 생성/게시물 변경 직후 "
+            "backfill_campaign_media_permalink 가 Graph 에서 조회해 채운다(사용자 자유 입력도 허용). "
+            "⚠️ 이미지가 아니다 — 썸네일 표시에는 thumbnail_url 을 쓸 것."
+        ),
+    )
+
+    # ── 게시물 썸네일 (우리 스토리지에 재호스팅한 사본) ─────────────────────────
+    # IG CDN 의 media_url/thumbnail_url 은 **서명된 일시 URL** 이라 시간이 지나면 만료돼
+    # 깨진 이미지가 된다(게시물이 삭제되면 아예 조회도 안 된다). 그래서 CDN URL 을 그대로
+    # 저장하지 않고, 한 번 내려받아 R2/로컬 default_storage 에 사본을 두고 그 영구 URL 을 준다.
+    # IG 프로필 사진과 완전히 같은 규약 (apps/integrations/profile_image.py 3필드 패턴).
+    thumbnail_url = models.TextField(
+        blank=True,
+        default="",
+        verbose_name="게시물 썸네일 URL (우리 스토리지)",
+        help_text=(
+            "우리 스토리지(R2/로컬)에 재호스팅한 게시물 썸네일의 영구 URL. 만료되지 않고 "
+            "게시물이 삭제된 뒤에도 남는다. 비어 있으면 아직 미동기화(또는 동기화 실패)."
+        ),
+    )
+    thumbnail_source_url = models.TextField(
+        blank=True,
+        default="",
+        verbose_name="썸네일 원본 CDN URL",
+        help_text="다운로드에 사용한 IG CDN URL (dedup·디버그용). 만료되므로 표시에 쓰지 말 것.",
+    )
+    thumbnail_synced_at = models.DateTimeField(
+        null=True, blank=True, verbose_name="썸네일 마지막 동기화 시각"
+    )
+    thumbnail_sync_attempts = models.PositiveSmallIntegerField(
+        default=0,
+        verbose_name="썸네일 동기화 연속 실패 횟수",
+        help_text=(
+            "성공 시 0 으로 리셋. 삭제된 게시물처럼 영구 실패하는 건이 스위퍼 슬롯을 "
+            "독점하지 않도록 상한(THUMBNAIL_MAX_SYNC_ATTEMPTS)을 넘으면 스위퍼가 제외한다."
+        ),
+    )
+    thumbnail_sync_error = models.TextField(
+        blank=True, default="", verbose_name="썸네일 동기화 마지막 에러"
     )
 
     # 키워드 필터
@@ -896,6 +939,30 @@ class AutoDMCampaign(models.Model):
         """캠페인이 활성 상태인지 확인 (status 만 본다 — 예약 창은 is_runnable_now 참고)"""
         return self.status == self.Status.ACTIVE
 
+    # 썸네일 동기화 연속 실패 상한. 삭제된 게시물/회수된 토큰은 몇 번을 더 시도해도 낫지 않으므로
+    # 이 횟수를 넘으면 주기 스위퍼 후보에서 제외한다(게시물이 바뀌면 카운터가 0 으로 리셋됨).
+    THUMBNAIL_MAX_SYNC_ATTEMPTS = 5
+
+    def needs_thumbnail_sync(self) -> bool:
+        """썸네일 사본을 (다시) 받아와야 하는 상태인지.
+
+        media_id 가 있고 아직 우리 스토리지 사본이 없을 때만 True. 사본은 만료되지 않으므로
+        한 번 성공하면 재동기화가 필요 없다(게시물이 바뀌면 호출부가 필드를 비운다).
+        """
+        return bool((self.media_id or "").strip()) and not (self.thumbnail_url or "").strip()
+
+    def reset_thumbnail(self) -> None:
+        """게시물이 바뀌었을 때 썸네일 상태 초기화 (이전 게시물 사본을 계속 보여주지 않도록).
+
+        스토리지의 옛 파일은 지우지 않는다 — 콘텐츠 해시 키라 다른 캠페인이 같은 파일을
+        참조할 수 있고, 사본은 작아서 남겨두는 비용이 지우는 위험보다 싸다.
+        """
+        self.thumbnail_url = ""
+        self.thumbnail_source_url = ""
+        self.thumbnail_synced_at = None
+        self.thumbnail_sync_attempts = 0
+        self.thumbnail_sync_error = ""
+
     # 특정 게시물/스토리 한 개를 "점유"하는 트리거 (= 같은 media_id 에 활성 캠페인 1개 제한 대상).
     # any_media 는 계정 전체를 대상으로 하므로 특정 게시물을 점유하지 않고,
     # next_media 는 attach 전에는 media_id 가 비어 있어 점유하지 않는다(attach 되면
@@ -1034,9 +1101,9 @@ class AutoDMCampaign(models.Model):
             # next_media → specific_media 전환도 '게시물이 정해진' 순간이다 → 어드민 게시물
             # 링크용 permalink 백필. media_url 로 넘어온 값은 CDN 이미지 URL 일 수 있어
             # permalink 를 따로 확보해야 한다 (on_commit — 이 atomic 블록 커밋 후 발행).
-            from .tasks import enqueue_media_permalink_backfill
+            from .tasks import enqueue_campaign_media_backfill
 
-            enqueue_media_permalink_backfill(winner)
+            enqueue_campaign_media_backfill(winner)
 
             paused_ids = []
             for loser in losers:

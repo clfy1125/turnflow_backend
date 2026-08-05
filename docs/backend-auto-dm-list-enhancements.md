@@ -77,7 +77,13 @@ GET /api/v1/integrations/auto-dm-campaigns/?ig_connection_id=<uuid>
 | `delivery_rate` | float (0~1) | ACCEPTED 진입 건 중 도착확인 비율 |
 | `needs_attention_count` | int | 조치 필요 로그 수 (아래 정의) |
 | `last_sent_at` | datetime\|null | 가장 최근 발송 로그 시각 |
-| `thumbnail_url` | string\|null | 게시물 썸네일 (= `media_url` 미러, best-effort 보강) |
+| `thumbnail_url` | string\|null | 게시물 썸네일 이미지 (우리 스토리지 사본, **만료 없음**) |
+
+> ⚠️ **2026-08-05 정정**: `thumbnail_url` 은 예전에 `media_url` 미러였습니다. 그런데
+> `media_url` 에는 2026-08-03 부터 게시물 **permalink**(HTML 페이지 URL)가 채워지게 돼,
+> 미러 값을 `<img src>` 에 넣으면 깨졌습니다. 이제 `thumbnail_url` 은 **별도 컬럼**이며
+> 우리 스토리지에 재호스팅한 이미지 URL 입니다. 상세(retrieve) 응답에도 함께 나갑니다.
+> 자세한 계약은 `DM_CAMPAIGN_THUMBNAIL_FRONTEND.md` 참고.
 
 > 응답은 기존과 동일하게 **페이지네이션 없는 평면 배열**입니다. 기존 필드는 그대로,
 > 위 5개만 추가됐습니다(Breaking 아님).

@@ -1022,25 +1022,66 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
             )
 
     @extend_schema(
-        summary="[개발용] Instagram 게시물 목록 조회",
+        summary="Instagram 게시물 목록 조회",
         description="""
-        ## 목적 (개발 전용)
-        연동된 Instagram 계정의 게시물(미디어) 목록을 조회합니다.
+        ## 목적
+        연동된 Instagram 계정의 게시물(미디어) 목록을 조회합니다. 캠페인 생성 화면의
+        **게시물 피커**가 쓰는 정본 엔드포인트입니다.
+
+        > 경로 주의: 정본은 `/api/v1/integrations/instagram/workspaces/{workspace_id}/media/`
+        > 입니다. 일부 옛 문서에 적힌 `.../instagram/{workspace_id}/media/list/` 는
+        > **존재하지 않는 경로**입니다.
 
         ## 기능
         - 📸 게시물 목록 조회 (IMAGE, VIDEO, CAROUSEL_ALBUM)
         - 📊 각 게시물의 인게이지먼트 데이터 (좋아요, 댓글 수)
-        - 🔄 페이지네이션 지원 (limit, after)
+        - 🔄 커서 페이지네이션 (`limit`, `after`)
+        - 🎯 **id 다건 조회** (`media_ids`) — 아래 참고
 
         ## Query Parameters
-        - `limit`: 가져올 게시물 수 (기본값: 10, 최대: 50)
-        - `after`: 페이지네이션 커서 (다음 페이지 조회 시 사용)
+        | 파라미터 | 타입 | 설명 |
+        |---|---|---|
+        | `limit` | int | 가져올 게시물 수 (기본 10, 최대 50). `media_ids` 지정 시 무시 |
+        | `after` | string | 페이지네이션 커서 (`paging.cursors.after` 값). `media_ids` 지정 시 무시 |
+        | `ig_connection_id` | uuid | 조회할 IG 계정. 미지정 시 첫 번째 활성 connection |
+        | `media_ids` | string | **게시물 id 콤마 구분 목록**(최대 50). 지정하면 목록을 커서로 훑지 않고 그 id 들만 Graph 배치 조회(호출 1회)로 돌려줍니다 |
+
+        ### `media_ids` 사용 (권장)
+        특정 게시물 몇 개의 정보(썸네일 등)만 필요할 때 씁니다. 페이지를 순차로 넘겨가며
+        찾을 필요가 없고, **200개보다 오래된 게시물도 바로 찾힙니다.**
+
+        ```
+        GET .../workspaces/{ws}/media/?media_ids=17901234567890,17909876543210
+        ```
+
+        - 응답 `data` 는 **요청한 순서**를 따릅니다.
+        - 접근할 수 없거나 삭제된 id 는 `data` 에서 **조용히 빠집니다**(부분 성공).
+          어떤 id 가 빠졌는지는 `query.missing_media_ids` 로 알려줍니다.
+        - `paging` 은 빈 객체입니다(배치 조회라 커서가 없음).
+
+        > ⚠️ 응답의 `media_url` / `thumbnail_url` 은 **IG CDN 의 서명된 일시 URL** 이라
+        > 시간이 지나면 만료됩니다. **저장하지 마세요.** 캠페인 카드/상세의 썸네일은
+        > 만료되지 않는 캠페인 응답의 `thumbnail_url`(우리 스토리지 사본)을 쓰세요.
 
         ## 응답
-        게시물 목록과 페이지네이션 정보를 반환합니다.
+        ```json
+        {
+          "success": true,
+          "data": [
+            {"id": "1790…", "media_type": "IMAGE", "media_url": "https://scontent…",
+             "thumbnail_url": null, "permalink": "https://www.instagram.com/p/…",
+             "caption": "…", "timestamp": "2026-08-01T…", "like_count": 12, "comments_count": 3,
+             "media_product_type": "FEED"}
+          ],
+          "paging": {"cursors": {"before": "…", "after": "…"}, "next": "https://…"},
+          "count": 1,
+          "connection": {"id": "uuid", "username": "acct", "account_id": "1784…"},
+          "query": {"limit": 10, "after": null, "ig_connection_id": null, "media_ids": null}
+        }
+        ```
 
-        ## 주의
-        - 개발/테스트 용도로만 사용하세요.
+        ## 인증
+        Bearer JWT 필수 + 해당 workspace 멤버십 필요.
         """,
         responses={
             200: OpenApiResponse(
@@ -1114,8 +1155,19 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 ),
                 required=False,
             ),
+            OpenApiParameter(
+                name="media_ids",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description=(
+                    "게시물 id 콤마 구분 목록 (최대 50). 지정하면 커서 페이지네이션 대신 "
+                    "Graph 배치 조회(호출 1회)로 그 id 들만 반환한다. 응답 순서는 요청 순서, "
+                    "접근 불가/삭제된 id 는 data 에서 빠지고 query.missing_media_ids 로 보고된다."
+                ),
+            ),
         ],
-        tags=["개발 전용"],
+        tags=["Integrations"],
     )
     @action(
         detail=False,
@@ -1123,15 +1175,14 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         url_path="workspaces/(?P<workspace_id>[^/.]+)/media",
     )
     def get_media(self, request, workspace_id=None):
-        """
-        [DEV ONLY] Get Instagram media (posts) for connected account
-        """
+        """Instagram 게시물 목록 조회 (커서 페이지네이션 또는 media_ids 배치)."""
         workspace = self.get_workspace(workspace_id)
 
         # Query parameters
         limit = min(int(request.query_params.get("limit", 10)), 50)  # 최대 50개
         after = request.query_params.get("after", None)
         ig_connection_id = request.query_params.get("ig_connection_id")
+        media_ids_param = request.query_params.get("media_ids")
 
         # 연결된 Instagram 계정 찾기 (멀티 IG: 쿼리로 지정 가능, 미지정 시 첫 활성)
         connection = self.resolve_ig_connection(workspace, ig_connection_id)
@@ -1145,25 +1196,46 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
+        from .services import InstagramMediaService
+
+        media_fields = (
+            "id,caption,media_type,media_url,thumbnail_url,permalink,"
+            "timestamp,like_count,comments_count,media_product_type"
+        )
+
         try:
             graph_api_base = InstagramOAuthService.GRAPH_API_BASE
             access_token = connection.access_token
 
-            # Instagram Media API 호출
-            media_url = f"{graph_api_base}/{connection.external_account_id}/media"
-            params = {
-                "fields": "id,caption,media_type,media_url,thumbnail_url,permalink,timestamp,like_count,comments_count,media_product_type",
-                "limit": limit,
-                "access_token": access_token,
-            }
+            requested_ids = None
+            missing_ids: list = []
 
-            # 페이지네이션 커서 추가
-            if after:
-                params["after"] = after
+            if media_ids_param:
+                # id 다건 조회 — 목록을 커서로 훑지 않고 Graph 배치 문법으로 한 번에 가져온다.
+                # (게시물 1건을 찾으려고 50개씩 4페이지를 순차 호출하던 프론트 우회를 없앤다)
+                requested_ids = [m.strip() for m in media_ids_param.split(",") if m.strip()][:50]
+                by_id = InstagramMediaService.get_media_batch(
+                    media_ids=requested_ids, access_token=access_token, fields=media_fields
+                )
+                items = [by_id[mid] for mid in requested_ids if mid in by_id]
+                missing_ids = [mid for mid in requested_ids if mid not in by_id]
+                data = {"data": items, "paging": {}}
+            else:
+                # Instagram Media API 호출 (커서 페이지네이션)
+                media_url = f"{graph_api_base}/{connection.external_account_id}/media"
+                params = {
+                    "fields": media_fields,
+                    "limit": limit,
+                    "access_token": access_token,
+                }
 
-            response = requests.get(media_url, params=params)
-            response.raise_for_status()
-            data = response.json()
+                # 페이지네이션 커서 추가
+                if after:
+                    params["after"] = after
+
+                response = requests.get(media_url, params=params)
+                response.raise_for_status()
+                data = response.json()
 
             return Response(
                 {
@@ -1180,6 +1252,8 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                         "limit": limit,
                         "after": after,
                         "ig_connection_id": ig_connection_id,
+                        "media_ids": requested_ids,
+                        "missing_media_ids": missing_ids,
                     },
                 }
             )
@@ -2145,8 +2219,10 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
     DEFAULT_LIST_ORDERING = "-created_at"
 
     def get_serializer_class(self):
-        # 목록/토글 응답은 per-item 통계 enrichment 포함 serializer 사용.
-        if self.action in ("list", "pause", "resume"):
+        # 목록/상세/토글 응답은 per-item 통계 enrichment 포함 serializer 사용.
+        # 상세(retrieve)도 포함한다 — 프론트가 상세 화면에서 목록과 같은 통계 필드를 쓰는데
+        # 예전엔 기본 serializer 라 delivered_count 등이 빠져 있었다(2026-08-05 요청).
+        if self.action in ("list", "retrieve", "pause", "resume"):
             return AutoDMCampaignListSerializer
         return AutoDMCampaignSerializer
 
@@ -2957,8 +3033,6 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
 
         ## 응답 형태
         **페이지네이션 없이** 캠페인 객체 배열을 그대로 반환합니다(평면 리스트).
-        각 항목의 `media_url` 이 비어 있고 `media_id` 가 있으면 Instagram Graph API 로
-        best-effort 보강합니다(토큰 만료/실패 시 조용히 건너뜀).
 
         **항목별 통계 필드(read-only)** — 항목마다 통계를 따로 호출(N+1)할 필요 없이 함께 옵니다:
         | 필드 | 타입 | 의미 |
@@ -2967,7 +3041,16 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         | `delivery_rate` | float(0~1) | ACCEPTED 진입 건 중 도착확인 비율 |
         | `needs_attention_count` | int | 사용자 조치 필요 로그 수 (토큰만료/윈도우만료/파라미터오류/도착미확인) |
         | `last_sent_at` | datetime\\|null | 가장 최근 발송 로그 시각 |
-        | `thumbnail_url` | string\\|null | 게시물 썸네일(=media_url 미러) |
+
+        ## 게시물 이미지·링크 (2026-08-05 변경)
+        | 필드 | 타입 | 의미 |
+        |---|---|---|
+        | `thumbnail_url` | string\\|null | **게시물 썸네일 이미지**. IG CDN URL 이 아니라 우리 스토리지에 재호스팅한 사본이라 **만료되지 않습니다**(`<img src>` 에 그대로 사용, 게시물이 삭제된 뒤에도 유지). 미동기화/획득 불가면 `null`. |
+        | `media_url` | string\\|null | **게시물 permalink**(`https://www.instagram.com/p/…`). "게시물 보기" 링크용이며 **이미지가 아닙니다**. |
+
+        썸네일은 캠페인 생성·게시물 변경 시 워커가 IG 에서 받아 저장합니다. 아직 없는 항목은
+        이 목록 조회가 확보를 예약하므로, 잠시 뒤 다시 조회하면 채워집니다(응답을 막지 않습니다).
+        릴스/동영상은 커버 이미지, 캐러셀은 첫 슬라이드가 썸네일이 됩니다.
 
         ## 쿼리 파라미터
         | 파라미터 | 타입 | 설명 |
@@ -3134,48 +3217,49 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         # filter_queryset 으로 ?search= (이름/설명/IG username) 적용. get_queryset 에서
         # 이미 통계 annotate + status/facet/날짜 필터 + ordering 이 적용된 상태.
         queryset = self.filter_queryset(self.get_queryset())
-        serializer = self.get_serializer(queryset, many=True)
+        campaigns = list(queryset)
+        serializer = self.get_serializer(campaigns, many=True)
         data = serializer.data
 
-        # Enrich missing `media_url` by querying Instagram Graph API using the
-        # campaign's `media_id` and its `ig_connection` access token.
-        # We keep this best-effort: if the API call fails or the token is
-        # unavailable/expired, we silently leave `media_url` as-is.
-        campaigns = list(queryset)
-        campaign_map = {str(c.id): c for c in campaigns}
-
-        for item in data:
-            if not item.get("media_url") and item.get("media_id"):
-                campaign = campaign_map.get(item["id"])
-                if not campaign:
-                    continue
-                connection = getattr(campaign, "ig_connection", None)
-                if not connection or not connection.access_token:
-                    continue
-                try:
-                    # Skip if token appears expired
-                    if not connection.refresh_token_if_needed():
-                        continue
-
-                    media_id = item["media_id"]
-                    url = f"{InstagramOAuthService.GRAPH_API_BASE}/{media_id}"
-                    params = {
-                        "fields": "id,media_type,media_url,permalink",
-                        "access_token": connection.access_token,
-                    }
-                    resp = requests.get(url, params=params, timeout=5)
-                    resp.raise_for_status()
-                    media_data = resp.json()
-                    media_url = media_data.get("media_url") or media_data.get("permalink")
-                    if media_url:
-                        item["media_url"] = media_url
-                        # thumbnail_url 은 media_url 미러 — 보강된 값과 동기화.
-                        item["thumbnail_url"] = media_url
-                except Exception:
-                    # Best-effort fallback: ignore and continue
-                    continue
+        # 썸네일 사본이 아직 없는 캠페인은 **비동기로** 확보를 예약한다.
+        # 예전엔 이 자리에서 캠페인마다 Graph 를 동기 호출했다(항목당 최대 5초 × N, 순차) —
+        # 게다가 얻은 CDN URL 은 만료되고, 릴스/캐러셀에선 이미지도 아니었다.
+        # 이제 응답은 DB 컬럼만 읽고(추가 쿼리 0), 채우는 일은 워커가 한다.
+        self._enqueue_missing_thumbnails(campaigns)
 
         return Response(data)
+
+    # 목록 조회마다 같은 캠페인의 동기화를 재발행하지 않도록 하는 큐 억제 창(초).
+    _THUMBNAIL_ENQUEUE_THROTTLE_SEC = 300
+
+    def _enqueue_missing_thumbnails(self, campaigns) -> int:
+        """썸네일 사본이 없는 캠페인의 동기화를 예약 (throttle 적용, 절대 raise 안 함).
+
+        주기 스위퍼(6h)만으로도 결국 채워지지만, 방금 캠페인을 만든 사용자가 6시간을 기다리면
+        안 되므로 목록 조회를 기회로 삼는다. 새로고침을 연타해도 큐가 폭주하지 않게 캠페인별로
+        5분 캐시 키로 억제한다.
+        """
+        from django.core.cache import cache
+
+        from .tasks import sync_campaign_thumbnail
+
+        queued = 0
+        for campaign in campaigns:
+            try:
+                if not campaign.needs_thumbnail_sync():
+                    continue
+                if campaign.thumbnail_sync_attempts >= AutoDMCampaign.THUMBNAIL_MAX_SYNC_ATTEMPTS:
+                    continue  # 영구 실패(삭제된 게시물 등) — 스위퍼도 제외한 건
+                key = f"dm:thumb:enq:{campaign.id}"
+                if not cache.add(key, 1, timeout=self._THUMBNAIL_ENQUEUE_THROTTLE_SEC):
+                    continue
+                sync_campaign_thumbnail.delay(str(campaign.id))
+                queued += 1
+            except Exception:  # noqa: BLE001 - 표시용 보강이라 목록 응답을 막지 않는다
+                logger.warning(
+                    "썸네일 동기화 예약 실패 cid=%s", getattr(campaign, "id", None), exc_info=True
+                )
+        return queued
 
     @extend_schema(
         summary="캠페인 대시보드 요약",
@@ -3307,15 +3391,37 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
 
     @extend_schema(
         summary="캠페인 상세 조회",
-        description="특정 Auto DM 캠페인의 상세 정보를 조회합니다.",
-        responses={200: AutoDMCampaignSerializer},
+        description="""
+        특정 Auto DM 캠페인의 상세 정보를 조회합니다.
+
+        ## 게시물 이미지·링크 (2026-08-05 변경)
+        | 필드 | 타입 | 의미 |
+        |---|---|---|
+        | `thumbnail_url` | string\\|null | **게시물 썸네일 이미지**. 우리 스토리지에 재호스팅한 사본이라 **만료되지 않습니다**(`<img src>` 에 그대로 사용). 아직 동기화 전이거나 게시물이 삭제돼 받을 수 없으면 `null`. |
+        | `media_url` | string\\|null | **게시물 permalink**(`https://www.instagram.com/p/…`). 링크용이며 **이미지가 아닙니다** — `<img>` 에 쓰면 깨집니다. |
+
+        `thumbnail_url` 은 목록 응답과 **완전히 같은 규칙**입니다. 캠페인을 막 만든 직후
+        몇 초간은 `null` 일 수 있고(워커가 IG 에서 받아오는 중), 이 API 를 다시 호출하면 채워집니다.
+
+        ## 통계 필드
+        목록과 동일한 per-item 통계(`delivered_count`, `delivery_rate`,
+        `needs_attention_count`, `last_sent_at`)가 함께 옵니다 — 별도 stats 호출이 필요 없습니다.
+        """,
+        responses={
+            200: AutoDMCampaignListSerializer,
+            401: OpenApiResponse(description="인증 필요"),
+            404: OpenApiResponse(description="캠페인 없음 또는 권한 없음"),
+        },
         tags=["Auto DM"],
     )
     def retrieve(self, request, pk=None):
         """캠페인 상세 조회"""
         campaign = self.get_object()
         serializer = self.get_serializer(campaign)
-        return Response(serializer.data)
+        data = serializer.data
+        # 상세를 열었는데 썸네일이 아직 없으면 그 자리에서 확보를 예약한다(목록과 동일 정책).
+        self._enqueue_missing_thumbnails([campaign])
+        return Response(data)
 
     @extend_schema(
         summary="캠페인 생성",
@@ -3550,9 +3656,9 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
 
         # specific_media: media_url 이 참고용 자유입력이라 permalink 가 아닐 수 있음 →
         # 어드민/표시용 게시물 링크(IG permalink)를 비동기 백필 (best-effort, 요청 경로 비차단).
-        from .tasks import enqueue_media_permalink_backfill
+        from .tasks import enqueue_campaign_media_backfill
 
-        enqueue_media_permalink_backfill(campaign)
+        enqueue_campaign_media_backfill(campaign)
 
         response_serializer = AutoDMCampaignSerializer(campaign)
         return Response(response_serializer.data, status=status.HTTP_201_CREATED)
@@ -3636,22 +3742,35 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
     def _backfill_permalink_if_media_changed(self, campaign, before) -> None:
-        """수정으로 게시물이 바뀌었으면 permalink 를 다시 백필한다 (best-effort).
+        """수정으로 게시물이 바뀌었으면 permalink·썸네일을 다시 백필한다 (best-effort).
 
         (media_id, trigger_type) 이 그대로면 아무것도 하지 않는다 — 일시정지/문구 수정 같은
-        흔한 PATCH 마다 IG 조회를 태우지 않기 위함. 바뀌었으면 이전 게시물의 permalink 가
-        남아 잘못된 링크를 가리키므로 비운 뒤 다시 채운다.
+        흔한 PATCH 마다 IG 조회를 태우지 않기 위함. 바뀌었으면 이전 게시물의 permalink /
+        썸네일 사본이 남아 **다른 게시물을 가리키므로** 비운 뒤 다시 채운다.
         """
-        from .tasks import enqueue_media_permalink_backfill
+        from .tasks import enqueue_campaign_media_backfill
 
         campaign.refresh_from_db()
         if (campaign.media_id, campaign.trigger_type) == before:
             return
+        update_fields = []
         if campaign.media_id and is_instagram_permalink(campaign.media_url):
             # 옛 게시물 링크가 남아 있으면 백필 태스크가 'already permalink' 로 건너뛴다 → 비운다.
             campaign.media_url = ""
-            campaign.save(update_fields=["media_url", "updated_at"])
-        enqueue_media_permalink_backfill(campaign)
+            update_fields.append("media_url")
+        if campaign.thumbnail_url:
+            # 옛 게시물의 썸네일 사본 → 비워야 새 게시물 것으로 다시 받아온다.
+            campaign.reset_thumbnail()
+            update_fields += [
+                "thumbnail_url",
+                "thumbnail_source_url",
+                "thumbnail_synced_at",
+                "thumbnail_sync_attempts",
+                "thumbnail_sync_error",
+            ]
+        if update_fields:
+            campaign.save(update_fields=[*update_fields, "updated_at"])
+        enqueue_campaign_media_backfill(campaign)
 
     def _guard_update_active_conflict(self, campaign, validated_data):
         """수정(PUT/PATCH) 결과가 ACTIVE 일 때만 중복 검사.
@@ -4017,9 +4136,9 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         new_campaign = source.copy(new_name=in_ser.validated_data.get("name") or None)
         # 복사본은 media_id 를 그대로 물려받지만 media_url 은 원본이 비어 있으면 같이 빈다 →
         # 어드민 게시물 링크용 permalink 를 여기서도 백필한다.
-        from .tasks import enqueue_media_permalink_backfill
+        from .tasks import enqueue_campaign_media_backfill
 
-        enqueue_media_permalink_backfill(new_campaign)
+        enqueue_campaign_media_backfill(new_campaign)
         return Response(
             AutoDMCampaignSerializer(new_campaign).data,
             status=status.HTTP_201_CREATED,

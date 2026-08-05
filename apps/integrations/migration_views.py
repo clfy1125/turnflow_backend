@@ -542,9 +542,9 @@ class DMCampaignCandidateViewSet(_WorkspaceScopedViewSet):
                 ]
             )
             # 어드민 게시물 링크용 permalink 백필 (on_commit — 이 atomic 블록 커밋 후 발행).
-            from .tasks import enqueue_media_permalink_backfill
+            from .tasks import enqueue_campaign_media_backfill
 
-            enqueue_media_permalink_backfill(campaign)
+            enqueue_campaign_media_backfill(campaign)
 
         return Response(
             {

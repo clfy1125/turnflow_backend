@@ -53,12 +53,32 @@ WEBP_QUALITY = 85
 JPEG_QUALITY_ORIGINAL = 92  # 원본 재저장 시 품질 (EXIF만 떼고 거의 무손실)
 
 # SVG 화이트리스트
-_SVG_ALLOWED_TAGS = frozenset({
-    "svg", "g", "path", "rect", "circle", "ellipse", "line",
-    "polyline", "polygon", "text", "tspan", "defs", "use",
-    "linearGradient", "radialGradient", "stop", "clipPath", "mask",
-    "title", "desc", "symbol", "marker",
-})
+_SVG_ALLOWED_TAGS = frozenset(
+    {
+        "svg",
+        "g",
+        "path",
+        "rect",
+        "circle",
+        "ellipse",
+        "line",
+        "polyline",
+        "polygon",
+        "text",
+        "tspan",
+        "defs",
+        "use",
+        "linearGradient",
+        "radialGradient",
+        "stop",
+        "clipPath",
+        "mask",
+        "title",
+        "desc",
+        "symbol",
+        "marker",
+    }
+)
 # 금지 속성 prefix (on* 이벤트 핸들러)
 _SVG_FORBIDDEN_ATTR_PREFIXES = ("on",)
 
@@ -91,12 +111,20 @@ class ProcessedImage:
 # Public API
 # ─────────────────────────────────────────────────────────────
 
-def process_upload(django_file) -> ProcessedImage:
+
+def process_upload(django_file, max_edge: int | None = None) -> ProcessedImage:
     """Django `UploadedFile` 또는 file-like 객체를 받아 정제된 바이트 반환.
+
+    Args:
+        django_file: 업로드 파일 또는 file-like 객체.
+        max_edge: 최대 변 픽셀 상한. 생략하면 정책 기본값 `MAX_EDGE`(2048). 카드 썸네일처럼
+            원본 해상도가 필요 없는 용도는 더 작은 값을 넘겨 용량을 줄인다
+            (예: apps/integrations/media_thumbnail.py 는 640).
 
     Raises:
         ImageValidationError: 파싱 실패 / 손상 / 지원 불가 포맷.
     """
+    edge_limit = max_edge or MAX_EDGE
     name = (getattr(django_file, "name", "") or "").lower()
     django_file.seek(0)
     raw = django_file.read()
@@ -129,13 +157,10 @@ def process_upload(django_file) -> ProcessedImage:
     img = ImageOps.exif_transpose(img)
 
     # 해상도 상한
-    if max(img.size) > MAX_EDGE:
-        img.thumbnail((MAX_EDGE, MAX_EDGE), Image.LANCZOS)
+    if max(img.size) > edge_limit:
+        img.thumbnail((edge_limit, edge_limit), Image.LANCZOS)
 
-    has_alpha = (
-        img.mode in ("RGBA", "LA")
-        or (img.mode == "P" and "transparency" in img.info)
-    )
+    has_alpha = img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
 
     out = io.BytesIO()
     if has_alpha:
@@ -229,10 +254,7 @@ def sanitize_original(django_file) -> ProcessedImage:
     if max(img.size) > MAX_EDGE_ORIGINAL:
         img.thumbnail((MAX_EDGE_ORIGINAL, MAX_EDGE_ORIGINAL), Image.LANCZOS)
 
-    has_alpha = (
-        img.mode in ("RGBA", "LA")
-        or (img.mode == "P" and "transparency" in img.info)
-    )
+    has_alpha = img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
 
     out = io.BytesIO()
 
@@ -292,6 +314,7 @@ def sanitize_original(django_file) -> ProcessedImage:
 # ─────────────────────────────────────────────────────────────
 # Internals
 # ─────────────────────────────────────────────────────────────
+
 
 def _looks_like_svg(raw: bytes) -> bool:
     head = raw[:512].lstrip().lower()

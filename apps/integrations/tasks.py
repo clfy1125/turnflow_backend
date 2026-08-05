@@ -2426,6 +2426,20 @@ def backfill_campaign_media_permalink(campaign_id: str) -> dict:
     return {"status": "ok", "permalink": permalink}
 
 
+def enqueue_campaign_media_backfill(campaign) -> bool:
+    """캠페인 게시물의 **표시용 메타 2종**(permalink + 썸네일 사본) 백필을 커밋 후 예약.
+
+    캠페인이 만들어지는/게시물이 바뀌는 **모든** 경로가 이 함수 하나만 부르면 되도록 묶어 둔다
+    (경로마다 훅을 따로 걸다 누락되는 사고를 2026-08-03 에 이미 한 번 겪었다).
+
+    Returns:
+        permalink 백필이 예약됐는지 (하위호환 반환값 — 썸네일은 게이트가 달라 별도 판단).
+    """
+    permalink_queued = enqueue_media_permalink_backfill(campaign)
+    enqueue_campaign_thumbnail_sync(campaign)
+    return permalink_queued
+
+
 def enqueue_media_permalink_backfill(campaign) -> bool:
     """specific_media 캠페인의 permalink 백필을 커밋 후에 예약 (best-effort).
 
@@ -2486,6 +2500,146 @@ def sweep_missing_media_permalinks(limit: int = 100) -> dict:
         stats[key] = stats.get(key, 0) + 1
     if ids:
         logger.info("sweep_missing_media_permalinks: scanned=%s %s", len(ids), stats)
+    return {"scanned": len(ids), **stats}
+
+
+# ============================================================================
+# 캠페인 게시물 썸네일 (IG CDN → 우리 스토리지 재호스팅)
+# ============================================================================
+
+
+@shared_task(name="integrations.sync_campaign_thumbnail")
+def sync_campaign_thumbnail(campaign_id: str, force: bool = False) -> dict:
+    """캠페인 게시물의 썸네일을 우리 스토리지에 사본으로 확보한다 (best-effort).
+
+    IG CDN URL 은 서명 만료가 있어 저장해도 곧 깨진다 → 이미지를 한 번 내려받아
+    R2/로컬에 두고 그 영구 URL 을 ``campaign.thumbnail_url`` 에 기록한다
+    (근거·대안 비교는 :mod:`apps.integrations.media_thumbnail` 모듈 docstring).
+
+    Args:
+        campaign_id: AutoDMCampaign PK.
+        force: 이미 사본이 있어도 다시 받아온다 (게시물 이미지를 교체한 경우 등 수동 복구용).
+
+    Returns:
+        ``{"status": "ok"|"unchanged"|"skipped"|"failed", ...}``
+    """
+    from .media_thumbnail import ThumbnailFetchError, fetch_and_store_campaign_thumbnail
+
+    campaign = AutoDMCampaign.objects.select_related("ig_connection").filter(id=campaign_id).first()
+    if campaign is None:
+        return {"status": "skipped", "reason": "campaign_not_found"}
+    if not (campaign.media_id or "").strip():
+        return {"status": "skipped", "reason": "no_media_id"}
+    if not force and not campaign.needs_thumbnail_sync():
+        # 사본은 만료되지 않으므로 재조회할 이유가 없다.
+        return {"status": "unchanged", "thumbnail_url": campaign.thumbnail_url}
+
+    conn = campaign.ig_connection
+    if conn is None or conn.status != IGAccountConnection.Status.ACTIVE:
+        return {"status": "skipped", "reason": "ig_connection_not_active"}
+    if not conn.access_token:
+        return {"status": "skipped", "reason": "no_token"}
+
+    source_url, media_type = InstagramMediaService.get_media_thumbnail_source(
+        media_id=campaign.media_id, access_token=conn.access_token
+    )
+    if not source_url:
+        # 게시물 삭제/권한 상실/Mock 모드 — 실패 카운터만 올려 스위퍼가 결국 포기하게 한다.
+        return _record_thumbnail_failure(campaign, "no_source_url")
+
+    try:
+        hosted_url = fetch_and_store_campaign_thumbnail(source_url, conn.external_account_id)
+    except ThumbnailFetchError as e:
+        logger.warning("sync_campaign_thumbnail: fetch 실패 cid=%s err=%s", campaign_id, e)
+        return _record_thumbnail_failure(campaign, str(e)[:300])
+
+    campaign.thumbnail_url = hosted_url
+    campaign.thumbnail_source_url = source_url
+    campaign.thumbnail_synced_at = timezone.now()
+    campaign.thumbnail_sync_attempts = 0
+    campaign.thumbnail_sync_error = ""
+    campaign.save(
+        update_fields=[
+            "thumbnail_url",
+            "thumbnail_source_url",
+            "thumbnail_synced_at",
+            "thumbnail_sync_attempts",
+            "thumbnail_sync_error",
+            "updated_at",
+        ]
+    )
+    return {
+        "status": "ok",
+        "campaign_id": str(campaign.id),
+        "media_type": media_type,
+        "thumbnail_url": hosted_url,
+    }
+
+
+def _record_thumbnail_failure(campaign, reason: str) -> dict:
+    """썸네일 동기화 실패를 캠페인에 기록 (연속 실패 카운터 + 사유)."""
+    campaign.thumbnail_sync_attempts = (campaign.thumbnail_sync_attempts or 0) + 1
+    campaign.thumbnail_sync_error = reason
+    campaign.save(update_fields=["thumbnail_sync_attempts", "thumbnail_sync_error", "updated_at"])
+    return {
+        "status": "failed",
+        "campaign_id": str(campaign.id),
+        "reason": reason,
+        "attempts": campaign.thumbnail_sync_attempts,
+    }
+
+
+def enqueue_campaign_thumbnail_sync(campaign) -> bool:
+    """캠페인 썸네일 동기화를 커밋 후에 예약 (best-effort, 요청 경로 비차단).
+
+    ``on_commit`` 인 이유는 permalink 백필과 같다 — attach 는 ``transaction.atomic()`` 안에서
+    일어나므로 즉시 발행하면 워커가 커밋 전 행을 읽는다. 실패는 삼킨다(표시용 보강).
+
+    permalink 백필과 달리 ``trigger_type`` 을 보지 않는다 — media_id 가 있으면 스토리 답장
+    캠페인도 대상이다(오히려 스토리는 24h 뒤 원본이 사라지므로 사본의 가치가 가장 크다).
+    """
+    from django.db import transaction
+
+    if campaign is None:
+        return False
+    if not (getattr(campaign, "media_id", "") or "").strip():
+        return False
+    try:
+        cid = str(campaign.id)
+        transaction.on_commit(lambda: sync_campaign_thumbnail.delay(cid))
+        return True
+    except Exception:  # noqa: BLE001
+        logger.exception("enqueue_campaign_thumbnail_sync 실패 cid=%s", campaign.id)
+        return False
+
+
+@shared_task(name="integrations.sweep_missing_campaign_thumbnails")
+def sweep_missing_campaign_thumbnails(limit: int = 50) -> dict:
+    """썸네일 사본이 없는 캠페인을 주기적으로 채운다 (최종 안전망).
+
+    생성/게시물 변경 경로마다 훅이 걸려 있지만, 생성 시점에 IG API 가 일시 실패한 건이나
+    토큰이 만료됐다가 복구된 건은 스스로 낫지 않는다. 연속 실패가 상한
+    (:attr:`AutoDMCampaign.THUMBNAIL_MAX_SYNC_ATTEMPTS`)을 넘은 건은 제외한다 —
+    삭제된 게시물이 매 스위프의 슬롯을 영구 점유하는 것을 막는다.
+    """
+    ids = list(
+        AutoDMCampaign.objects.filter(thumbnail_url="")
+        .exclude(media_id="")
+        .filter(thumbnail_sync_attempts__lt=AutoDMCampaign.THUMBNAIL_MAX_SYNC_ATTEMPTS)
+        .order_by("-created_at")
+        .values_list("id", flat=True)[:limit]
+    )
+    stats: dict = {}
+    for cid in ids:
+        try:
+            res = sync_campaign_thumbnail(str(cid))
+        except Exception:  # noqa: BLE001 - 건별 실패가 스위프를 멈추지 않게
+            logger.exception("sweep_missing_campaign_thumbnails: 실패 cid=%s", cid)
+            res = {"status": "error"}
+        key = res.get("status", "unknown")
+        stats[key] = stats.get(key, 0) + 1
+    if ids:
+        logger.info("sweep_missing_campaign_thumbnails: scanned=%s %s", len(ids), stats)
     return {"scanned": len(ids), **stats}
 
 

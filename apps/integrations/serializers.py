@@ -351,6 +351,9 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
     link_buttons = LinkButtonItemSerializer(many=True, required=False)
     # 실제 발송 시 첨부될 버튼(link_buttons 우선, 없으면 legacy fallback) — 읽기 전용 편의값.
     effective_link_buttons = serializers.SerializerMethodField()
+    # 게시물 썸네일 — 우리 스토리지에 재호스팅한 **영구** 이미지 URL (만료 없음).
+    # 모델 필드지만 MethodField 로 감싸 빈 문자열 대신 null 을 준다(프론트 계약 string|null 유지).
+    thumbnail_url = serializers.SerializerMethodField()
 
     class Meta:
         model = AutoDMCampaign
@@ -361,7 +364,8 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
             # 트리거
             "trigger_type",
             "media_id",
-            "media_url",
+            "media_url",  # 게시물 permalink (링크용 — 이미지 아님)
+            "thumbnail_url",  # 게시물 썸네일 이미지 (표시용, 영구 URL)
             # 키워드
             "keyword_filter",
             "keyword_mode",
@@ -428,6 +432,7 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
             "public_reply_posted_count",
             "public_reply_limit_reached",
             "effective_link_buttons",
+            "thumbnail_url",
             "is_active",
             "can_send",
             "schedule_state",
@@ -487,6 +492,17 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
     def get_effective_link_buttons(self, obj) -> list:
         """실제 발송 시 첨부될 버튼 목록 (get_link_buttons 결과를 {url,label} 형태로)."""
         return [{"url": b["url"], "label": b["title"]} for b in (obj.get_link_buttons() or [])]
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_thumbnail_url(self, obj):
+        """게시물 썸네일 — 우리 스토리지 사본의 영구 URL (없으면 null).
+
+        IG CDN URL 을 그대로 주지 않는 이유는 만료 때문이다
+        (:mod:`apps.integrations.media_thumbnail` 모듈 docstring 참고).
+        아직 동기화 전(생성 직후 몇 초)이거나 게시물이 삭제됐으면 null.
+        추가 쿼리 0 — 모델 컬럼을 그대로 읽는다.
+        """
+        return (obj.thumbnail_url or "") or None
 
     def get_public_reply_limit_reached(self, obj) -> bool:
         return obj.public_reply_limit_reached()
@@ -551,19 +567,21 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
 
 
 class AutoDMCampaignListSerializer(AutoDMCampaignSerializer):
-    """목록/요약/토글 응답용 — 기본 캠페인 필드 + per-item 통계 enrichment (조회 고도화 v4.1).
+    """목록/상세/토글 응답용 — 기본 캠페인 필드 + per-item 통계 enrichment (조회 고도화 v4.1).
 
-    delivery_rate / needs_attention_count / delivered_count / last_sent_at / thumbnail_url 을
-    read-only 로 추가해, 프론트가 항목마다 stats 를 따로 호출하던 N+1 을 제거한다.
-    목록 쿼리는 annotate_campaign_stats 로 한 번에 집계되며, 단건(pause/resume 등) 은
-    compute_campaign_enrichment 가 즉석 집계한다.
+    delivery_rate / needs_attention_count / delivered_count / last_sent_at 을 read-only 로
+    추가해, 프론트가 항목마다 stats 를 따로 호출하던 N+1 을 제거한다.
+    목록 쿼리는 annotate_campaign_stats 로 한 번에 집계되며, 단건(상세·pause/resume 등) 은
+    compute_campaign_enrichment 가 즉석 집계한다(쿼리 1회).
+
+    ``thumbnail_url`` 은 base 로 옮겼다 — 상세 응답에도 나가야 하고, 이제 모델 컬럼이라
+    enrichment 집계와 무관하다.
     """
 
     delivered_count = serializers.SerializerMethodField()
     delivery_rate = serializers.SerializerMethodField()
     needs_attention_count = serializers.SerializerMethodField()
     last_sent_at = serializers.SerializerMethodField()
-    thumbnail_url = serializers.SerializerMethodField()
 
     class Meta(AutoDMCampaignSerializer.Meta):
         fields = AutoDMCampaignSerializer.Meta.fields + [
@@ -571,7 +589,6 @@ class AutoDMCampaignListSerializer(AutoDMCampaignSerializer):
             "delivery_rate",
             "needs_attention_count",
             "last_sent_at",
-            "thumbnail_url",
         ]
 
     def _enrich(self, obj):
@@ -595,10 +612,6 @@ class AutoDMCampaignListSerializer(AutoDMCampaignSerializer):
     @extend_schema_field(serializers.DateTimeField(allow_null=True))
     def get_last_sent_at(self, obj):
         return self._enrich(obj)["last_sent_at"]
-
-    @extend_schema_field(serializers.CharField(allow_null=True))
-    def get_thumbnail_url(self, obj):
-        return self._enrich(obj)["thumbnail_url"]
 
 
 class CampaignSummaryCountsSerializer(serializers.Serializer):

@@ -590,6 +590,15 @@ CELERY_BEAT_SCHEDULE = {
         "task": "integrations.sweep_missing_media_permalinks",
         "schedule": 60 * 60 * 6,  # 6시간
     },
+    # 6시간마다 — 썸네일 사본이 없는 캠페인의 게시물 이미지를 IG 에서 받아 R2 에 재호스팅.
+    # IG CDN URL 은 서명 만료가 있어 저장이 무의미하다 → 사본 보관이 유일한 영구 해법
+    # (근거는 apps/integrations/media_thumbnail.py docstring). 생성/게시물변경 훅 + 목록조회
+    # 기회 발행이 1차, 이 스위퍼가 최종 안전망.
+    # 실제 구동은 core.ScheduledJob(0013 시드). CELERY_BEAT_SCHEDULE 은 dev 패리티/문서용.
+    "dm-sweep-campaign-thumbnails": {
+        "task": "integrations.sweep_missing_campaign_thumbnails",
+        "schedule": 60 * 60 * 6,  # 6시간
+    },
     # ===== Instagram Insights 동기화 (임시 비활성) =====
     # insights 기능 출시 보류 — Meta IG insights API 호출이 발생하지 않도록 4개 beat 모두 주석 처리.
     # 활성화 시점에 아래 4개를 복원 + INSIGHTS_API_ENABLED=True 로 전환.
