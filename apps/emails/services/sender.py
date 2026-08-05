@@ -11,6 +11,7 @@ and the admin "test send" endpoint should use this.
 
 from __future__ import annotations
 
+import html as html_lib
 import logging
 import re
 from typing import Any
@@ -48,11 +49,50 @@ def _default_context() -> dict[str, Any]:
     }
 
 
+# `<a href="...">라벨</a>` → `라벨 (https://...)`. Without this the plain-text part
+# carries the CTA wording but no link at all — mailto: links are left alone since
+# the address is already spelled out in the label.
+_ANCHOR_RE = re.compile(
+    r'<a\b[^>]*\bhref=["\'](?P<href>[^"\']+)["\'][^>]*>(?P<label>.*?)</a>',
+    re.I | re.S,
+)
+_BLOCK_END_RE = re.compile(r"</\s*(p|div|tr|li|h[1-6]|table)\s*>", re.I)
+_CELL_END_RE = re.compile(r"</\s*(td|th)\s*>", re.I)
+# `<head>` holds the <title>/<style> text, and a naive tag strip would dump the
+# raw CSS (and its Korean comments) into the plain-text part.
+_DROP_RE = re.compile(r"<(head|style|script)\b[^>]*>.*?</\s*\1\s*>", re.I | re.S)
+# Preheader span: hidden in HTML, so it must not be repeated in the text part.
+_HIDDEN_RE = re.compile(r"<span\b[^>]*display:\s*none[^>]*>.*?</\s*span\s*>", re.I | re.S)
+
+
 def _strip_html(html: str) -> str:
-    """Cheap HTML → text fallback when template.text_body is empty."""
-    text = re.sub(r"<\s*br\s*/?>", "\n", html, flags=re.I)
-    text = re.sub(r"</\s*p\s*>", "\n\n", text, flags=re.I)
+    """Cheap HTML → text fallback when template.text_body is empty.
+
+    Keeps hrefs (a text-only client would otherwise get a dead CTA) and inserts
+    breaks at block boundaries so the table-based layout doesn't collapse into
+    one run-on line.
+    """
+
+    def _anchor(m: re.Match) -> str:
+        href = m.group("href").strip()
+        label = re.sub(r"<[^>]+>", "", m.group("label")).strip()
+        if href.lower().startswith("mailto:") or not label:
+            return label or href
+        return f"{label} ({href})" if label != href else href
+
+    text = _DROP_RE.sub("", html)
+    text = _HIDDEN_RE.sub("", text)
+    text = _ANCHOR_RE.sub(_anchor, text)
+    text = re.sub(r"<\s*br\s*/?>", "\n", text, flags=re.I)
+    text = _CELL_END_RE.sub(" ", text)
+    text = _BLOCK_END_RE.sub("\n\n", text)
     text = re.sub(r"<[^>]+>", "", text)
+    text = html_lib.unescape(text)
+    # Collapse whitespace runs. \xa0 is the unescaped &nbsp; from the spacer rows —
+    # note this must stay a single backslash inside the raw string, otherwise the
+    # class degenerates into the literal characters \, x, a and 0.
+    text = re.sub(r"[ \t\xa0]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 

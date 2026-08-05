@@ -34,6 +34,15 @@ from apps.emails.constants import (
 _GRADIENT = "linear-gradient(90deg,#152a64 0%,#7a3cff 45%,#b948b2 72%,#fd546b 100%)"
 _PRIMARY = "#7C3AED"
 
+# ── 한글 세로 쪼개짐(1글자/줄) 방어 ──────────────────────────────────────────
+# 한글은 기본 줄바꿈 규칙상 "아무 글자 사이에서나" 끊긴다. 그래서 모바일 Gmail 처럼
+# 컨테이너 폭을 강제로 좁히는 클라이언트에서 폭이 붕괴하면 텍스트가 한 글자씩 세로로
+# 쌓인다. `word-break:keep-all` 은 상속되는 속성이라 본문 셀에 한 번만 걸면 하위 전체가
+# "띄어쓰기에서만 줄바꿈" 으로 바뀌어 이 현상이 원천 차단된다.
+#   ⚠️ `overflow-wrap:break-word` / `word-break:break-all` 을 같이 주면 keep-all 이
+#      무력화되어 다시 한 글자씩 쪼개진다. 링크 URL 등 ASCII 전용 구간에만 국소 적용할 것.
+_KEEP_ALL = "word-break:keep-all;"
+
 # The shell uses __PREHEADER__ / __BODY__ sentinels (not str.format / f-string) so
 # that the literal `{{ var }}` placeholders survive untouched into the DB template.
 _SHELL = (
@@ -43,23 +52,39 @@ _SHELL = (
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="light only">
+  <meta name="format-detection" content="telephone=no,date=no,address=no,email=no">
   <title>{{ service_name }}</title>
+  <style>
+    /* 좁은 화면에서 카드 좌우 여백을 줄여 본문 폭이 붕괴하지 않게 한다.
+       (Gmail 비-구글 계정 등 <style> 미지원 클라이언트에서는 무시되지만,
+        keep-all 방어가 인라인으로 이미 걸려 있어 세로 쪼개짐은 발생하지 않는다.) */
+    @media only screen and (max-width:480px) {
+      .tf-gutter { padding-left:12px !important; padding-right:12px !important; }
+      .tf-pad    { padding-left:20px !important; padding-right:20px !important; }
+    }
+  </style>
 </head>
-<body style="margin:0;padding:0;background:#f3f4f6;font-family:'Pretendard','Noto Sans KR',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Apple SD Gothic Neo',sans-serif;color:#1f2937;-webkit-font-smoothing:antialiased;">
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:'Pretendard','Noto Sans KR',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Apple SD Gothic Neo',sans-serif;color:#1f2937;-webkit-font-smoothing:antialiased;"""
+    + _KEEP_ALL
+    + """">
   <span style="display:none!important;visibility:hidden;opacity:0;color:transparent;height:0;width:0;overflow:hidden;mso-hide:all;">__PREHEADER__</span>
-  <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#f3f4f6;padding:32px 16px;">
-    <tr><td align="center">
+  <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#f3f4f6;">
+    <tr><td align="center" class="tf-gutter" style="padding:32px 16px;">
       <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="560" style="max-width:560px;width:100%;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 1px 4px rgba(17,24,39,0.06);">
         <tr><td style="height:4px;line-height:4px;font-size:0;background:"""
     + _GRADIENT
     + """;">&nbsp;</td></tr>
-        <tr><td style="padding:30px 40px 6px;">
+        <tr><td class="tf-pad" style="padding:30px 40px 6px;">
           <img src="{{ logo_url }}" alt="TurnFlow" width="147" height="32" style="display:block;border:0;outline:none;text-decoration:none;height:32px;width:147px;max-width:147px;">
         </td></tr>
-        <tr><td style="padding:16px 40px 32px;font-size:15px;line-height:1.7;color:#1f2937;">
+        <tr><td class="tf-pad" style="padding:16px 40px 32px;font-size:15px;line-height:1.7;color:#1f2937;"""
+    + _KEEP_ALL
+    + """">
 __BODY__
         </td></tr>
-        <tr><td style="padding:22px 40px 26px;background:#f9fafb;border-top:1px solid #eef0f3;font-size:12px;line-height:1.75;color:#9ca3af;">
+        <tr><td class="tf-pad" style="padding:22px 40px 26px;background:#f9fafb;border-top:1px solid #eef0f3;font-size:12px;line-height:1.75;color:#9ca3af;"""
+    + _KEEP_ALL
+    + """">
           <div style="font-weight:700;color:#6b7280;margin-bottom:6px;">{{ company_name }}</div>
           대표 {{ company_ceo }} · 사업자등록번호 {{ company_reg_no }}<br>
           {{ company_address }}<br>
@@ -82,24 +107,46 @@ def _wrap(body_html: str, preheader: str = "") -> str:
 
 
 def _btn(href: str, label: str) -> str:
-    """Primary CTA button (bulletproof-ish, table-free inline)."""
+    """Primary CTA button — table-based ("bulletproof").
+
+    An `inline-block` anchor sizes itself shrink-to-fit; when the available width
+    is smaller than the label the used width collapses toward *min-content*, which
+    for Korean is a single character → the label renders one letter per line.
+    A table cell has no such shrink-to-fit rule, and `keep-all` caps min-content
+    at the longest space-delimited chunk instead of one glyph.
+    """
     return (
-        f'<p style="text-align:center;margin:28px 0;">'
-        f'<a href="{href}" style="display:inline-block;padding:13px 32px;background:{_PRIMARY};'
-        f'color:#ffffff;text-decoration:none;border-radius:10px;font-weight:700;font-size:15px;">'
-        f"{label}</a></p>"
+        '<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" '
+        'style="border-collapse:collapse;">'
+        '<tr><td align="center" style="padding:26px 0;">'
+        '<table role="presentation" cellpadding="0" cellspacing="0" border="0" '
+        'style="border-collapse:separate;margin:0 auto;">'
+        f'<tr><td align="center" bgcolor="{_PRIMARY}" style="border-radius:10px;">'
+        f'<a href="{href}" style="display:block;padding:13px 30px;background:{_PRIMARY};'
+        "color:#ffffff;text-decoration:none;border-radius:10px;font-weight:700;font-size:15px;"
+        f'line-height:1.4;text-align:center;{_KEEP_ALL}">'
+        f"{label}</a>"
+        "</td></tr></table>"
+        "</td></tr></table>"
     )
 
 
 def _detail_rows(rows: list[tuple[str, str]]) -> str:
-    """Render a light key/value detail card. `rows` = [(label, value_html), ...]."""
+    """Render a light key/value detail card. `rows` = [(label, value_html), ...].
+
+    The label column deliberately does NOT use `white-space:nowrap`: a nowrap
+    column claims its full max-content width and squeezes the value column, which
+    is how a Korean value ends up one character per line on narrow screens (and
+    how `신한카드 433012******123*` pushed the whole card past a 320px viewport).
+    """
     trs = ""
     for label, value in rows:
         trs += (
             "<tr>"
-            '<td style="padding:9px 0;color:#6b7280;font-size:13px;white-space:nowrap;">'
+            f'<td style="padding:9px 8px 9px 0;color:#6b7280;font-size:13px;{_KEEP_ALL}">'
             f"{label}</td>"
-            '<td style="padding:9px 0;color:#111827;font-size:14px;font-weight:600;text-align:right;">'
+            '<td style="padding:9px 0;color:#111827;font-size:14px;font-weight:600;'
+            f'text-align:right;{_KEEP_ALL}">'
             f"{value}</td></tr>"
         )
     return (
@@ -120,9 +167,13 @@ DEFAULTS: dict[str, dict[str, str]] = {
 <p style="font-size:18px;font-weight:700;color:#111827;margin:0 0 4px;">이메일을 인증해 주세요</p>
 <p style="margin:0 0 8px;color:#4b5563;">안녕하세요, <strong>{{ full_name }}</strong>님.</p>
 <p style="margin:0 0 4px;color:#4b5563;">아래 인증 코드를 <strong>{{ expires_minutes }}분 이내</strong>에 입력해 주세요.</p>
-<p style="text-align:center;margin:24px 0;">
-  <span style="display:inline-block;padding:14px 26px;background:#f5f1fe;color:#6D28D9;font-size:30px;font-weight:800;letter-spacing:8px;border-radius:12px;">{{ verification_code }}</span>
-</p>
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-collapse:collapse;">
+  <tr><td align="center" style="padding:22px 0;">
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 auto;">
+      <tr><td align="center" bgcolor="#f5f1fe" style="padding:14px 18px;border-radius:12px;color:#6D28D9;font-size:26px;font-weight:800;letter-spacing:6px;line-height:1.3;white-space:nowrap;">{{ verification_code }}</td></tr>
+    </table>
+  </td></tr>
+</table>
 <p style="margin:0;color:#4b5563;">또는 아래 버튼을 눌러 바로 인증할 수 있습니다.</p>
 """
             + _btn("{{ verification_url }}", "이메일 인증하기")

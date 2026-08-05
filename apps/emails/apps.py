@@ -8,4 +8,4 @@ class EmailsConfig(AppConfig):
 
     def ready(self):
         # Wire signup signals on app ready
-        from . import signals  # noqa: F401
+        from . import checks, signals  # noqa: F401
