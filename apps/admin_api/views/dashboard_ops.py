@@ -69,6 +69,7 @@ from apps.admin_api.dm_error_catalog import is_recoverable as _error_is_recovera
 from apps.admin_api.dm_error_catalog import policy_display as _policy_display
 from apps.admin_api.dm_error_catalog import policy_for as _policy_for
 from apps.admin_api.dm_error_catalog import reason_for as _reason_for
+from apps.admin_api.dm_policy_rollup import not_sent_people_rollup
 from apps.admin_api.serializers.dashboard_ops import AdminOpsDashboardSerializer
 
 # delivery_rate 표준 공식 재사용 (dm-verification/stats 와 동일 정의 — 복제 금지)
@@ -152,10 +153,11 @@ DM_ERROR_STATUSES = (
 # 있어야 하기 때문이다. 여기서는 화면 형태로만 접는다.
 
 
-def _skipped_breakdown(in_range) -> list[dict]:
+def _skipped_breakdown(in_range, people_by_reason: dict) -> list[dict]:
     """건너뜀 사유별 카운트 (count desc) — failure_breakdown 과 같은 형태 (DM-4).
 
     Σ count == dm_quality.skipped 를 항상 만족한다 (미매칭도 other 로 흡수).
+    ``people`` 은 DM-17 — 그 사유의 **사람 수**(``people_by_reason`` 에서 조회).
     """
     buckets: dict[str, dict] = {}
     rows = (
@@ -174,6 +176,7 @@ def _skipped_breakdown(in_range) -> list[dict]:
                 "reason": reason,
                 "label": label,
                 "count": 0,
+                "people": people_by_reason.get(reason, 0),
                 "actionable": actionable,
                 "policy": policy,
                 "policy_display": _policy_display(policy),
@@ -430,6 +433,18 @@ def _dm_quality(until, since, granularity: str) -> tuple[dict, dict]:
     # OPS-2: 원문 메시지(sample_error_message) + 원인·조치 사전(title/cause/action) 동봉.
     error_rows = in_range.filter(status__in=DM_ERROR_STATUSES)
     samples = _error_samples(error_rows)
+
+    # DM-17 — 같은 범위의 **사람 수** 롤업. 팝업이 건수만 갖고 있어 사유별 `보러가기` 로
+    #   착지한 수신자 목록(사람 단위)과 숫자가 달라 보였다("3건" ↔ 2행). 판정은 목록과
+    #   같은 대표 로그·같은 사전이라 `people == 같은 조건 recipients 의 count` 다.
+    # ⚠️ 아래에서 각 행에 붙는 people 은 **사유(reason) 단위**다. failure_breakdown 은
+    #   (code, subcode, status) 단위라 한 사유가 여러 행으로 쪼개질 수 있고, 그때 같은
+    #   값이 두 행에 붙는다 — 행별 people 을 더하면 중복 계산이다. 사유 1종 = 1행인
+    #   서로소 목록이 필요하면 `not_sent_people.by_reason` 을 쓸 것.
+    #   (행의 링크가 `?error_reason=` 인 이상, 행에 붙는 값은 사유 단위여야 클릭 결과와 맞는다.)
+    not_sent_people = not_sent_people_rollup(in_range)
+    people_by_reason = {b["reason"]: b["people"] for b in not_sent_people["by_reason"]}
+
     failure_breakdown = [
         {
             "code": (row["error_code"] or ""),
@@ -453,6 +468,10 @@ def _dm_quality(until, since, granularity: str) -> tuple[dict, dict]:
             #   `보러가기` 링크에 이 값을 그대로 실어 `?error_reason=` 로 드릴다운한다
             #   (code 로는 대체 불가 — 한 사유가 code 4조합, 한 code 가 두 사유).
             "reason": _reason_for(row["error_code"], row["error_subcode"], row["status"]),
+            # DM-17 — 사유 단위 사람 수 (행 단위가 아니다 — 위 ⚠️ 주석 참고).
+            "people": people_by_reason.get(
+                _reason_for(row["error_code"], row["error_subcode"], row["status"]), 0
+            ),
             "policy": _policy_for(row["error_code"], row["error_subcode"], row["status"]),
             "policy_display": _policy_display(
                 _policy_for(row["error_code"], row["error_subcode"], row["status"])
@@ -510,12 +529,14 @@ def _dm_quality(until, since, granularity: str) -> tuple[dict, dict]:
         ),
         "skipped": dm_agg["skipped"],
         # DM-4: 건너뜀 사유 분해 (Σ count == skipped). 조치 필요한 건 월 한도(actionable) 뿐.
-        "skipped_breakdown": _skipped_breakdown(in_range),
+        "skipped_breakdown": _skipped_breakdown(in_range, people_by_reason),
         "queued": dm_agg["queued"],
         "submitting": dm_agg["submitting"],
         "delivery_rate": _delivery_rate(dm_agg),
         # J-1: 오류 세분화(코드·상태별) + 복구 퍼널. series 는 변경 없음(KPI/드릴다운용 스칼라).
         "failure_breakdown": failure_breakdown,
+        # DM-17: '발송 안 됨'의 사람 수 (오류 + 건너뜀). 팝업 상단 `전체 보러가기` 줄용.
+        "not_sent_people": not_sent_people,
         "recovery": recovery,
         "series": {"granularity": granularity, "buckets": buckets},
     }
@@ -1060,6 +1081,24 @@ DM 발송 품질 / IG 연동 / 스팸 필터 / 빌링 4개 서브시스템의 �
   않으므로 프론트가 `status.ts` 의 `dmErrorCode`/`dmLogStatus` 로 렌더합니다. `recoverable` 은
   복구/재검증 경로가 있는 실패(`failed_no_trace`·`recovery_*`·`failed_param@2534025`)면 true.
   포함 상태 = `failed`(확인 필요) + `hidden_spam`(복구 대기/만료) 계열(성공·in-flight·skipped 제외).
+- **`dm_quality.not_sent_people`** (DM-17): 같은 범위의 '발송 안 됨'을 **사람 수**로 센 블록입니다.
+  두 breakdown 은 **발송 건수**라 링크 건너편(`GET /admin/auto-dm/recipients/` = 사람 단위)과
+  숫자가 다릅니다 — 한 사람이 두 번 실패하면 `2건`이 `1명`이라, 팝업에 3건이라 써 두고 목록이
+  2행이면 운영자는 목록이 잘렸다고 읽습니다. 팝업 표기는 이 블록을 쓰세요.
+  - `{total, investigate, normal, by_reason[]}` — `investigate + normal == total`,
+    `Σ by_reason[].people == total` (by_reason 은 **사유 1종 = 1행**이라 서로소).
+  - 성립하는 항등(같은 기간·같은 조건의 수신자 목록 `count` 와 일치):
+    `investigate` == `?error_policy=investigate`, `normal` == `?error_policy=normal`,
+    `by_reason[].people` == `?error_reason=<reason>`.
+    구조적으로 같아지는 이유는 **같은 대표 로그**(사람당 가장 최근 실패·정체 로그)를 **같은
+    사전**으로 접기 때문입니다. 목록 쪽 필터가 바로 그 대표 로그 id 를 서브쿼리로 겁니다.
+  - 편의를 위해 `failure_breakdown[].people` / `skipped_breakdown[].people` 에도 같은 값을
+    실었습니다. ⚠️ 이 값은 **사유 단위**입니다 — `failure_breakdown` 은 `(code,subcode,status)`
+    단위라 한 사유가 여러 행으로 쪼개지면 같은 값이 그 행들에 함께 붙습니다. **열을 세로로
+    더하지 마세요**(중복 계산). 행 링크가 `?error_reason=` 인 이상 행에 붙는 값도 사유
+    단위여야 클릭 결과와 맞습니다. 합계·서로소 목록은 `not_sent_people` 을 쓰세요.
+  - `total` 의 사람 정의는 수신자 목록의 행 정의(**캠페인 × 수신자**)와 같습니다 — 한 사람이
+    두 캠페인에서 실패하면 2명입니다.
 - **`dm_quality.recovery`**: 숨김채널 재댓글 복구 퍼널 — `recoverable_total`(=pending+recovered+
   expired), `pending`(recovery_pending), `recovered`(recovery_delivered), `expired`(recovery_expired),
   `recovery_rate`(=recovered/(recovered+expired), 표본 없으면 null). 시계열은 변경 없음.
@@ -1220,12 +1259,14 @@ curl -H "Authorization: Bearer <staff_token>" \\
                                 "reason": "monthly_dm_limit",
                                 "label": "월 DM 한도 도달",
                                 "count": 16,
+                                "people": 14,
                                 "actionable": True,
                             },
                             {
                                 "reason": "campaign_not_active",
                                 "label": "캠페인 일시정지 중",
                                 "count": 9,
+                                "people": 9,
                                 "actionable": False,
                             },
                         ],
@@ -1238,6 +1279,8 @@ curl -H "Authorization: Bearer <staff_token>" \\
                                 "subcode": "",
                                 "status": "failed_token",
                                 "count": 12,
+                                "people": 9,
+                                "reason": "token_invalid",
                                 "recoverable": False,
                             },
                             {
@@ -1245,6 +1288,8 @@ curl -H "Authorization: Bearer <staff_token>" \\
                                 "subcode": "",
                                 "status": "failed_no_trace",
                                 "count": 5,
+                                "people": 5,
+                                "reason": "no_trace",
                                 "recoverable": True,
                             },
                             {
@@ -1252,9 +1297,34 @@ curl -H "Authorization: Bearer <staff_token>" \\
                                 "subcode": "2534025",
                                 "status": "recovery_expired",
                                 "count": 3,
+                                "people": 3,
+                                "reason": "recovery_expired",
                                 "recoverable": True,
                             },
                         ],
+                        # DM-17 — 팝업 표기용 사람 수. Σ by_reason[].people == total 이고
+                        # investigate/normal 은 recipients 목록의 count 와 일치한다.
+                        "not_sent_people": {
+                            "total": 31,
+                            "investigate": 14,
+                            "normal": 17,
+                            "by_reason": [
+                                {
+                                    "reason": "no_trace",
+                                    "title": "발송 흔적 없음",
+                                    "policy": "investigate",
+                                    "policy_display": "조사 필요",
+                                    "people": 5,
+                                },
+                                {
+                                    "reason": "monthly_dm_limit",
+                                    "title": "월 DM 한도 도달",
+                                    "policy": "normal",
+                                    "policy_display": "자동 처리",
+                                    "people": 14,
+                                },
+                            ],
+                        },
                         "recovery": {
                             "recoverable_total": 20,
                             "pending": 5,

@@ -64,6 +64,12 @@ from apps.admin_api.serializers.autodm import (
     AdminIGConnectionListSerializer,
     _build_stats,
 )
+from apps.admin_api.views.dashboard_ops import (
+    ALLOWED_WINDOWS,
+    _custom_bounds,
+    _parse_custom_range,
+    _window_bounds,
+)
 from apps.integrations.campaign_stats import (
     QUEUE_WAITING_STATUSES,
     SENT_FOR_QUOTA_STATUSES,
@@ -146,6 +152,45 @@ def _classification_error(params) -> Response | None:
             allowed=sorted(reason_policy_map()),
         )
     return None
+
+
+def _time_range(params) -> tuple[object, object] | Response:
+    """`?window=` / `?start=`+`?end=` → `[since, until)` (DM-16). 미지정이면 `(None, None)`.
+
+    운영 대시보드(`GET /admin/dashboard/operations/`)·스팸 로그와 **같은 파라미터·같은
+    기준시**를 쓴다 — `dashboard_ops` 의 `_window_bounds`/`_custom_bounds` 를 그대로
+    부르므로 `today` 의 자정, `all` 의 시작 시각이 화면마다 갈라지지 않는다.
+
+    미지정 시 전체 기간(필터 미적용)인 것은 **기존 동작 유지**를 위해서다 — 이 목록의
+    기존 호출자(캠페인 상세 드릴다운 등)는 기간을 보내지 않는다.
+    """
+    start_raw, end_raw = params.get("start"), params.get("end")
+    now = timezone.now()
+    if start_raw or end_raw:
+        if not (start_raw and end_raw):
+            return _bad_request(
+                "커스텀 범위는 start 와 end 를 모두 지정해야 합니다",
+                field="start",
+            )
+        try:
+            start_d, end_d = _parse_custom_range(start_raw, end_raw, now)
+        except ValueError as exc:
+            return _bad_request(f"잘못된 커스텀 범위입니다: {exc}", field="start")
+        since, until, _granularity = _custom_bounds(start_d, end_d, now)
+        return since, until
+    window = params.get("window")
+    # 미지정 = 기존 동작(전체 기간). `all` 도 결과가 같다(서비스 최초 로그부터 now 까지)
+    # — MIN 스캔 두 번을 아끼려고 필터를 아예 걸지 않는다.
+    if not window or window == "all":
+        return None, None
+    if window not in ALLOWED_WINDOWS:
+        return _bad_request(
+            f"잘못된 window 값입니다: {window!r}",
+            field="window",
+            allowed=list(ALLOWED_WINDOWS),
+        )
+    since, _granularity = _window_bounds(window, now)
+    return since, now
 
 
 def _classification_q(params) -> Q | None:
@@ -1560,9 +1605,32 @@ class AdminDMRecipientListView(APIView):
 - **상한 없음** — 사유·분류를 SQL 로 컴파일하므로 전역 조회도 400 이 나지 않습니다
   (11차의 500쌍 상한은 폐기, DM-15).
 
+## 기간 (DM-16)
+운영 대시보드(`GET /admin/dashboard/operations/`)와 **같은 파라미터 이름·같은 의미**입니다 —
+프론트가 들고 있는 기간 상태를 변환 없이 그대로 실으면 됩니다.
+
+| 파라미터 | 값 | 의미 |
+|---|---|---|
+| `window` | `1h`/`24h`/`today`/`7d`/`30d`/`all` | 프리셋. **미지정 시 기존 동작(전체 기간) 유지** |
+| `start`,`end` | 로컬 날짜 `YYYY-MM-DD` | 커스텀 범위(최대 92일). `window` 와 동시 지정 시 커스텀 우선 |
+
+- 대상은 **`SentDMLog.created_at`**, 창은 `[since, until)` — 경계 계산은 운영 대시보드의
+  `_window_bounds`/`_custom_bounds` **같은 함수**라 `today` 의 자정과 `all` 의 시작 시각이
+  두 화면에서 갈라지지 않습니다. 그래서 ISO 시각이 아니라 프리셋 이름으로 받습니다.
+- **그룹핑 전에** 겁니다 — 창 안의 발송만 모아 `(campaign, recipient)` 로 접습니다.
+  접은 뒤 `last_activity_at` 으로 잘랐다면 "창 안에서 실패했다가 창 뒤에 재시도된 사람"이
+  통째로 빠졌을 텐데, 그런 일이 없습니다.
+- `error_title`/`error_reason`/`error_policy` 의 **대표 로그도 창 안에서** 고릅니다 — 창 밖의
+  더 최신 실패가 사유를 덮어 사유별 건수와 행의 사유가 어긋나는 일이 없습니다.
+- 기존 필터(`status_group`·`dm_axis`·`error_policy`·`error_reason`·`error_scope`·`campaign_id`·
+  `ig_connection_id`·`owner`·`recipient`)와 모두 조합됩니다.
+- `window` 를 안 보내면 예전과 100% 같습니다(전체 기간) — 기존 링크·저장된 필터가 안 깨집니다.
+- 잘못된 값은 조용히 무시하지 않고 **400**(`details.field` 로 어느 파라미터인지 지목).
+
 ## 주의사항
 - `campaign_id` 미지정 시 전역 `(campaign, recipient)` 그룹 집계라 대용량에서 무거울 수 있습니다.
   캠페인/계정 진입 동선에서는 `campaign_id` 또는 `ig_connection_id` 로 좁혀 호출하세요.
+  (`window` 로 좁히면 같은 효과가 나므로 전역 화면에서는 기간을 함께 거는 것을 권합니다.)
 - IG access_token 등 비밀값은 노출되지 않습니다.
 
 ### 요청 예시
@@ -1571,6 +1639,12 @@ class AdminDMRecipientListView(APIView):
 curl -H "Authorization: Bearer <staff_token>" \\
   "https://api.example.com/api/v1/admin/auto-dm/recipients/\\
 ?campaign_id=<uuid>&dm_axis=opening&error_policy=investigate"
+
+# 발송 로그 화면 "24시간 · 조사 필요 3명" 팝업 → 같은 화면 목록 (DM-16 + DM-17)
+#   이 count 는 dm_quality.not_sent_people.investigate 와 같다.
+curl -H "Authorization: Bearer <staff_token>" \\
+  "https://api.example.com/api/v1/admin/auto-dm/recipients/\\
+?window=24h&error_policy=investigate"
 ```
         """,
         parameters=[
@@ -1580,6 +1654,31 @@ curl -H "Authorization: Bearer <staff_token>" \\
                 OpenApiParameter.QUERY,
                 required=False,
                 description="특정 캠페인(UUID)만. 없으면 전역이되 여전히 (campaign, recipient) 그룹.",
+            ),
+            OpenApiParameter(
+                "window",
+                str,
+                OpenApiParameter.QUERY,
+                required=False,
+                enum=list(ALLOWED_WINDOWS),
+                description="DM-16 — 기간 프리셋. 운영 대시보드와 같은 값·같은 기준시 "
+                "(`SentDMLog.created_at`, `[since, until)`). **미지정 시 전체 기간**(기존 동작). "
+                "`today` 자정·`all` 시작 시각은 서버가 계산하므로 ISO 시각 대신 이 이름을 쓰세요.",
+            ),
+            OpenApiParameter(
+                "start",
+                str,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="DM-16 — 커스텀 범위 시작(로컬 날짜 `YYYY-MM-DD`). end 와 함께 필수, "
+                "최대 92일. 지정 시 window 보다 우선.",
+            ),
+            OpenApiParameter(
+                "end",
+                str,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="DM-16 — 커스텀 범위 끝(로컬 날짜, **포함**). start 와 함께 필수.",
             ),
             OpenApiParameter(
                 "status_group",
@@ -1661,7 +1760,8 @@ curl -H "Authorization: Bearer <staff_token>" \\
             200: AdminDMRecipientSerializer(many=True),
             400: OpenApiResponse(
                 description="status_group / dm_axis / error_policy / error_reason / error_scope "
-                "값 오류 (프로젝트 에러 포맷 · details.field 로 어느 파라미터인지 지목)"
+                "/ window / start·end 값 오류 (프로젝트 에러 포맷 · details.field 로 "
+                "어느 파라미터인지 지목)"
             ),
             401: OpenApiResponse(description="인증 누락/만료"),
             403: OpenApiResponse(description="관리자 권한 없음"),
@@ -1720,7 +1820,17 @@ curl -H "Authorization: Bearer <staff_token>" \\
         else:
             axis = None
 
+        # DM-16 — 기간. **그룹핑 전에** 건다: 창 안의 발송만 모아 (campaign, recipient) 로
+        #   접어야 한다. 접은 뒤 last_activity_at 으로 자르면 창 안에서 실패했다가 창 뒤에
+        #   재시도된 사람이 통째로 빠진다.
+        time_range = _time_range(params)
+        if isinstance(time_range, Response):
+            return time_range
+        since, until = time_range
+
         qs = SentDMLog.objects.all()
+        if since is not None:
+            qs = qs.filter(created_at__gte=since, created_at__lt=until)
 
         campaign_id = params.get("campaign_id")
         if campaign_id:
@@ -1829,6 +1939,10 @@ curl -H "Authorization: Bearer <staff_token>" \\
             page_scope = SentDMLog.objects.filter(
                 campaign_id__in=camp_ids, recipient_user_id__in=rcpt_ids
             )
+            # DM-16 — 대표 로그(error_title/reason/policy)도 **창 안에서** 골라야 한다.
+            #   창 밖의 더 최신 실패가 사유를 덮으면 사유별 건수와 행의 사유가 어긋난다.
+            if since is not None:
+                page_scope = page_scope.filter(created_at__gte=since, created_at__lt=until)
             for row in (
                 page_scope.order_by("campaign_id", "recipient_user_id", "-created_at")
                 .distinct("campaign_id", "recipient_user_id")

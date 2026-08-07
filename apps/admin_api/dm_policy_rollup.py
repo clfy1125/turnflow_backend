@@ -232,6 +232,42 @@ def followup_not_sent(log_qs) -> dict:
     return _block(reps)
 
 
+# ── 축 없는 사람 단위 롤업 (운영 대시보드) ────────────────────────────
+def not_sent_people_rollup(log_qs) -> dict:
+    """축을 가리지 않은 '발송 안 됨' **사람 수** 롤업 (DM-17).
+
+    운영 대시보드 팝업이 **건수**만 갖고 있어, 사유별 `보러가기` 로 착지한 수신자 목록
+    (사람 단위)과 숫자가 달라 보이던 문제를 없앤다("3건" ↔ 2행 = 목록이 잘린 것처럼 읽힘).
+
+    성립하는 항등 — 같은 기간·같은 조건으로 부른
+    ``GET /admin/auto-dm/recipients/`` 의 ``count`` 와 같다:
+
+    - ``investigate`` == ``?error_policy=investigate`` 의 count
+    - ``normal``      == ``?error_policy=normal`` 의 count
+    - ``by_reason[].people`` == ``?error_reason=<그 reason>`` 의 count
+
+    구조적으로 같아지는 이유는 **같은 대표 로그**(:func:`rep_log_qs`, axis=None,
+    (campaign, recipient) 그룹)를 보고 **같은 사전**(:func:`_classify_row`)으로 접기
+    때문이다 — 목록 쪽 필터는 이 대표 로그 id 를 서브쿼리로 걸어 HAVING 한다.
+
+    ``by_reason`` 은 사유 1종 = 1행이라 **서로소**이며 ``Σ people == total`` 이다.
+    (``failure_breakdown`` 은 ``(code, subcode, status)`` 단위라 한 사유가 여러 행으로
+     쪼개진다 — 그쪽 행의 ``people`` 을 더하면 중복 계산된다. 아래 뷰 주석 참고.)
+    """
+    rows = list(
+        rep_log_qs(log_qs, group_by_campaign=True).values(
+            "campaign_id", "recipient_user_id", *_REP_FIELDS
+        )
+    )
+    block = _block(rows)
+    return {
+        "total": block["total"],
+        "investigate": block["investigate"],
+        "normal": block["normal"],
+        "by_reason": block["breakdown"],
+    }
+
+
 # ── 목록 배지 ─────────────────────────────────────────────────────────
 def person_rep_map(log_qs, *, axis: str | None = None, group_by_campaign: bool = True) -> dict:
     """사람 → ``{policy, reason, title}`` (DM-8 배지 · DM-16 사유 열 공용).

@@ -55,6 +55,7 @@ from apps.admin_api.views.users import (
     AdminUserDetailView,
     AdminUserListView,
     AdminUserPasswordResetView,
+    AdminUserPaymentHistoryView,
     AdminUserSubscriptionUpdateView,
 )
 from apps.admin_api.views.workspaces import (
@@ -83,6 +84,12 @@ urlpatterns = [
     # C. 회원(계정) 관리
     path("users/", AdminUserListView.as_view(), name="user-list"),
     path("users/<int:pk>/", AdminUserDetailView.as_view(), name="user-detail"),
+    # USR-5 — 회원별 결제 이력 (목록이 길어질 수 있어 상세 응답과 분리)
+    path(
+        "users/<int:pk>/payments/",
+        AdminUserPaymentHistoryView.as_view(),
+        name="user-payments",
+    ),
     path(
         "users/<int:pk>/password-reset/",
         AdminUserPasswordResetView.as_view(),

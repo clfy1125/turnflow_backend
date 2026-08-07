@@ -6,6 +6,7 @@
 엔드포인트:
   - 회원 목록:        ``GET   /api/v1/admin/users/``
   - 회원 상세/수정:   ``GET/PATCH /api/v1/admin/users/<int:pk>/``
+  - 회원 결제 이력:   ``GET   /api/v1/admin/users/<int:pk>/payments/``  (USR-5)
   - 비밀번호 재설정:  ``POST  /api/v1/admin/users/<int:pk>/password-reset/``
 
 mutation(PATCH/POST) 성공 후에는 ``log_admin_action`` 으로 감사 로그를 남긴다.
@@ -29,6 +30,7 @@ from rest_framework.views import APIView
 
 from apps.admin_api.audit import log_admin_action
 from apps.admin_api.models import AdminActionLog
+from apps.admin_api.serializers.billing import AdminUserPaymentHistorySerializer
 from apps.admin_api.serializers.users import (
     AdminUserDetailSerializer,
     AdminUserListSerializer,
@@ -36,6 +38,7 @@ from apps.admin_api.serializers.users import (
     AdminUserSubscriptionUpdateSerializer,
     AdminUserUpdateSerializer,
 )
+from apps.billing.models import PaymentHistory
 from apps.emails.tasks import send_password_reset_email
 
 logger = logging.getLogger(__name__)
@@ -203,8 +206,11 @@ class AdminUserDetailView(generics.RetrieveUpdateAPIView):
     permission_classes = [IsAdminUser]
     queryset = (
         User.objects.all()
-        .select_related("subscription__plan")
-        .prefetch_related("owned_workspaces", "memberships__workspace", "pages")
+        # USR-1~4: 상세 구독 블록이 pending_plan/trial_plan 이름과 renewal_amount(예약 플랜
+        # 참조)를 쓰므로 함께 당겨 온다 — 안 하면 회원 1명당 쿼리가 3개 더 난다.
+        .select_related(
+            "subscription__plan", "subscription__pending_plan", "subscription__trial_plan"
+        ).prefetch_related("owned_workspaces", "memberships__workspace", "pages")
     )
     lookup_field = "pk"
 
@@ -238,8 +244,48 @@ class AdminUserDetailView(generics.RetrieveUpdateAPIView):
 - `ig_connections`: 소유 워크스페이스의 IG 연동 [{id,username,status,token_expires_at}].
 - `campaigns_count`: 소유 워크스페이스의 자동 DM 캠페인 총 수.
 
+## 구독 상세 블록 (USR-1 ~ USR-4)
+`subscription` 은 **목록보다 넓습니다** — 목록 4필드(plan_name/plan_display_name/status/
+current_period_end)에 아래가 더해집니다. 전부 `UserSubscription` 에 이미 있는 값이며
+새 집계·새 계산은 없습니다.
+
+| 묶음 | 필드 |
+|---|---|
+| 결제 수단·주기·청구액 | `has_billing_key` · `card_company` · `card_number_masked` · `billing_key_issued_at` · `current_period_start` · `renewal_amount` · `extra_ig_accounts` |
+| 무료 체험 | `trial_used_at` · `trial_plan_name` · `trial_plan_display_name` · `cancelled_during_trial_at` |
+| 결제 실패·재시도 | `renewal_attempts` · `next_billing_retry_at` · `last_billing_error`(+`_code`/`_message` 분리) |
+| 예약 변경·해지·정지 | `pending_plan_name` · `pending_plan_display_name` · `pending_extra_ig_accounts` · `cancelled_at` · `pause_ends_at` · `paused_months` |
+
+- **`renewal_amount` 는 서버 계산값을 그대로 표시하세요.** 예약 플랜 > 스냅샷 > 현재 플랜가
+  순으로 기준가를 잡고 추가 IG 계정·리텐션 할인(다음 1회 50%)까지 반영한 값입니다.
+  프론트에서 재계산하면 규칙이 바뀔 때 화면 금액과 실제 청구액이 갈라집니다.
+- **'카드 등록됨' 판정은 `has_billing_key`** 입니다. `card_company` 는 토스가 카드사를 안 준
+  경우 빈 문자열일 수 있어 미등록과 구분되지 않습니다. 어드민이 수기로 부여한 무카드 계정은
+  `has_billing_key=false` 입니다.
+- **체험 종료일은 `current_period_end` 가 맞습니다** — `UserSubscription` 에 체험 종료 전용
+  필드는 없습니다. 쿠폰 체험은 `acquisition.referral.trial_ends_at` 도 있지만 **과금을
+  결정하는 것은 `current_period_end`** 이니 결제 관련 표기는 그쪽을 쓰세요.
+- **`status=past_due` 인데 `next_billing_retry_at=null`** 은 정상 조합입니다 = 재시도 소진
+  (3회 실패). 실패가 계속되는 상태가 아니라, 유예 7일 경과 시 무료로 강등되는 **종결 대기**로
+  읽으세요.
+- `cancelled_at` 은 ①사용자 해지 ②만료 다운그레이드 ③카드 삭제 강제해지가 모두 덮어씁니다.
+  '해지 예약' 표기는 `status=cancelled` + `current_period_end` 미도래로 판정하세요
+  (만료 다운그레이드가 이미 돌았으면 `status` 가 active/free 이고 `current_period_end` 가 null).
+
+## 유입 경로와 잔액 (USR-6)
+`acquisition` 블록: `referral`(제휴 코드 사용 내역, 없으면 null) · `ai_token_balance` /
+`ai_token_total_used` · `marketing_opt_in` / `marketing_opt_in_at` · `signup_kind`.
+
+- **가입 경로는 판별할 값이 있습니다** — `SignupAttribution.signup_kind`(`email`/`google`)로,
+  가입 시점에 기록되는 내구 값입니다. `has_usable_password()` 근사는 쓰지 마세요:
+  비밀번호 재설정을 거친 구글 계정은 사용 가능한 비밀번호를 갖게 되어 오판합니다.
+  귀속 행이 없는 과거 가입자는 `null` 이니 그때는 표시하지 마세요.
+
 ## 주의사항
 - IG access_token 등 비밀 값은 절대 직렬화되지 않습니다 (status/만료시각만).
+- 원본 카드번호·빌링키·`toss_billing_key_hash`·`toss_customer_key` 도 직렬화되지 않습니다.
+- 결제 이력은 길어질 수 있어 이 응답에 넣지 않았습니다 →
+  `GET /admin/users/{id}/payments/` (페이지네이션).
         """,
         responses={
             200: AdminUserDetailSerializer,
@@ -345,6 +391,138 @@ class AdminUserDetailView(generics.RetrieveUpdateAPIView):
             )
 
         return Response(AdminUserDetailSerializer(user, context=self.get_serializer_context()).data)
+
+
+class AdminUserPaymentHistoryView(generics.ListAPIView):
+    """회원별 결제 이력 (USR-5, 전역 스코프 · 페이지네이션)."""
+
+    permission_classes = [IsAdminUser]
+    serializer_class = AdminUserPaymentHistorySerializer
+    # 스키마 생성기가 모델을 추론할 때 부르는 폴백 (get_queryset 은 kwargs 가 없어 실패한다).
+    queryset = PaymentHistory.objects.none()
+
+    def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):  # drf-spectacular 스키마 생성 경로
+            return PaymentHistory.objects.none()
+        # 회원 존재 검증 — 없는 pk 는 빈 목록이 아니라 404 여야 한다(오타를 조용히 삼키지 않음).
+        user = get_object_or_404(User, pk=self.kwargs["pk"])
+        return PaymentHistory.objects.filter(user=user).order_by("-created_at")
+
+    @extend_schema(
+        tags=["admin-users"],
+        summary="[관리자] 회원 결제 이력",
+        description="""
+## 개요
+한 회원의 **결제 이력**(`PaymentHistory`)을 최신순으로 페이지네이션해 반환합니다.
+회원 상세 응답에 넣으면 길어질 수 있어 별도 엔드포인트로 뺐습니다.
+
+## 사용 시나리오
+- "영수증 주세요" / "환불됐나요" / "언제 얼마 나갔나요" CS 대응
+- 결제 실패 건의 사유 확인 (`status=failed` 행의 `failure_message`)
+
+## 인증
+- `Authorization: Bearer <staff_access_token>` (is_staff=True)
+
+## 비즈니스 로직
+- 전역 조회 — request.user 의 워크스페이스로 필터링하지 않습니다.
+- 정렬은 **`-created_at` 고정**입니다(별도 필터·정렬 파라미터 없음).
+- 표준 `PageNumberPagination`(page_size=20) → `{count, next, previous, results}`.
+- 존재하지 않는 회원 pk 는 **404** 입니다 (빈 목록이 아님).
+- 필드 정의는 사용자용 `GET /billing/payments/history/` 와 **같은 시리얼라이저**를 상속하며
+  어드민에만 `refunded_at` 이 더해집니다.
+
+| 필드 | 의미 |
+|---|---|
+| `paid_at` / `created_at` | 결제 완료 시각 / 시도 시각. **실패 건은 `paid_at` 이 null** 이므로 `created_at` 으로 폴백하세요. |
+| `amount` | 금액(원) |
+| `description` | 항목 (예: "프로 · 추가 계정 1") |
+| `status` | `pending` / `paid` / `failed` / `refunded` |
+| `card_company` / `card_number_masked` | 어느 카드로 결제됐는지 (그 시점 스냅샷) |
+| `receipt_url` | 영수증 링크. 없으면 빈 문자열 |
+| `failure_code` / `failure_message` | 실패 사유 — **`failure_message` 는 토스가 준 한국어 문장**입니다(코드가 아님). 화면에는 이것만 쓰고 `failure_code` 는 CS 대조용으로 두세요. |
+| `refunded_at` | 환불 시각. 환불 아니면 null |
+| `toss_order_id` | 토스 콘솔 대조용 주문번호 |
+
+## 주의사항
+- `toss_payment_key` · `toss_idempotency_key` 는 응답에 없습니다 (결제 재실행에 쓰일 수 있는
+  값이라 어드민 화면에 내보내지 않습니다).
+- 읽기 전용입니다 — 이 엔드포인트로 환불·재결제를 하지 않으므로 감사 로그를 남기지 않습니다.
+
+### 요청 예시
+```bash
+curl -H "Authorization: Bearer <staff_token>" \\
+  "https://api.example.com/api/v1/admin/users/42/payments/?page=1"
+```
+        """,
+        parameters=[
+            OpenApiParameter(
+                name="pk",
+                type=int,
+                location=OpenApiParameter.PATH,
+                description="회원(User) PK.",
+            ),
+            OpenApiParameter(
+                name="page",
+                type=int,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="페이지 번호 (page_size=20).",
+            ),
+        ],
+        responses={
+            200: AdminUserPaymentHistorySerializer(many=True),
+            401: OpenApiResponse(description="인증 누락/만료"),
+            403: OpenApiResponse(description="관리자 권한 없음 (is_staff=False)"),
+            404: OpenApiResponse(description="해당 회원 없음"),
+        },
+        examples=[
+            OpenApiExample(
+                "응답 예시",
+                value={
+                    "count": 2,
+                    "next": None,
+                    "previous": None,
+                    "results": [
+                        {
+                            "id": "2f9a7c10-1111-4a2b-9c3d-aaaaaaaaaaaa",
+                            "amount": 14900,
+                            "status": "paid",
+                            "payment_method": "카드",
+                            "description": "프로 · 추가 계정 1",
+                            "toss_order_id": "tf_20260801_000042",
+                            "receipt_url": "https://dashboard.tosspayments.com/receipt/...",
+                            "card_company": "신한",
+                            "card_number_masked": "433012******1234",
+                            "failure_code": "",
+                            "failure_message": "",
+                            "paid_at": "2026-08-01T09:00:12+09:00",
+                            "created_at": "2026-08-01T09:00:10+09:00",
+                            "refunded_at": None,
+                        },
+                        {
+                            "id": "2f9a7c10-2222-4a2b-9c3d-bbbbbbbbbbbb",
+                            "amount": 14900,
+                            "status": "failed",
+                            "payment_method": None,
+                            "description": "프로",
+                            "toss_order_id": "tf_20260701_000031",
+                            "receipt_url": "",
+                            "card_company": "",
+                            "card_number_masked": "",
+                            "failure_code": "REJECT_CARD_LIMIT",
+                            "failure_message": "한도초과로 결제에 실패했습니다.",
+                            "paid_at": None,
+                            "created_at": "2026-07-01T09:00:10+09:00",
+                            "refunded_at": None,
+                        },
+                    ],
+                },
+                response_only=True,
+            )
+        ],
+    )
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
 
 
 class AdminUserPasswordResetView(APIView):

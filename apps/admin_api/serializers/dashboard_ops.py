@@ -168,6 +168,17 @@ class _DmFailureBreakdownSerializer(serializers.Serializer):
         "failed_no_trace/recovery_pending/recovery_expired/legacy). 프론트 dmLogStatus 라벨로 렌더."
     )
     count = serializers.IntegerField(help_text="윈도우 내 해당 (code,subcode,status) 건 수")
+    people = serializers.IntegerField(
+        help_text="**DM-17 — 이 행의 `reason` 으로 발송 안 된 사람 수**(건수 아님). "
+        "`count` 는 발송 이벤트라 한 사람이 두 번 실패하면 2 지만 이 값은 1 이다 — "
+        "팝업의 `보러가기` 가 착지하는 수신자 목록이 사람 단위라 표기도 이 값을 써야 "
+        "숫자가 맞는다. 항등: 같은 기간·같은 `?error_reason=` 으로 부른 "
+        "`GET /admin/auto-dm/recipients/` 의 `count` 와 같다. "
+        "⚠️ **사유 단위 값이라 행 단위가 아니다** — 한 사유가 여러 (code,subcode,status) "
+        "행으로 쪼개지면 같은 값이 그 행들에 함께 붙는다. 그래서 이 열을 세로로 더하면 "
+        "중복 계산이다. 합계는 `not_sent_people.investigate/normal`, 서로소 목록은 "
+        "`not_sent_people.by_reason` 을 쓸 것."
+    )
     recoverable = serializers.BooleanField(
         help_text="복구/재검증 경로가 있는 실패인가. failed_no_trace(재검증)·recovery_*·"
         "failed_param@2534025(숨김채널 복구)=true, 나머지 하드 실패=false."
@@ -229,6 +240,10 @@ class _DmSkippedBreakdownSerializer(serializers.Serializer):
     )
     label = serializers.CharField(help_text="한국어 표시명 (서버 제공 — 프론트 하드코딩 불필요)")
     count = serializers.IntegerField(help_text="윈도우 내 해당 사유 건수")
+    people = serializers.IntegerField(
+        help_text="DM-17 — 그 사유로 발송 안 된 **사람 수**. 정의·항등·주의사항은 "
+        "failure_breakdown[].people 과 동일(사유 단위, 세로 합산 금지)."
+    )
     actionable = serializers.BooleanField(
         help_text="운영 조치가 필요한 신호인가. 현재 true 는 monthly_dm_limit(업셀 기회) 하나뿐 — "
         "나머지는 일시정지·예약창 밖·자기 댓글 등 **정상 동작**이다."
@@ -239,6 +254,46 @@ class _DmSkippedBreakdownSerializer(serializers.Serializer):
         "failure_breakdown 의 policy 와 같은 어휘."
     )
     policy_display = serializers.CharField(help_text="분류 한국어 표시명 ('조사 필요'/'자동 처리')")
+
+
+class _DmNotSentReasonPeopleSerializer(serializers.Serializer):
+    """사유 1종 = 1행의 사람 수 (DM-17). breakdown 2종과 달리 **서로소**다."""
+
+    reason = serializers.CharField(
+        help_text="사유 머신 키 — failure_breakdown/skipped_breakdown 과 같은 네임스페이스. "
+        "`?error_reason=` 에 그대로 싣는다."
+    )
+    title = serializers.CharField(allow_blank=True, help_text="사유 한국어 문구 (서버 사전).")
+    policy = serializers.CharField(help_text="investigate(🔴) / normal(⚪).")
+    policy_display = serializers.CharField(help_text="분류 한국어 표시명.")
+    people = serializers.IntegerField(help_text="그 사유로 발송 안 된 사람 수.")
+
+
+class _DmNotSentPeopleSerializer(serializers.Serializer):
+    """**DM-17 — '발송 안 됨'의 사람 수** (오류 8종 + 건너뜀).
+
+    팝업 상단 `전체 보러가기` 줄과 링크 건너편(수신자 목록)의 숫자를 맞추기 위한 블록이다.
+    판정은 수신자 목록과 **같은 대표 로그·같은 사전**이라 다음이 항상 성립한다
+    (같은 기간 · 같은 필터):
+
+    - `investigate` == `GET /admin/auto-dm/recipients/?error_policy=investigate` 의 `count`
+    - `normal`      == `...?error_policy=normal` 의 `count`
+    - `by_reason[].people` == `...?error_reason=<reason>` 의 `count`
+
+    `investigate + normal == total`, `Σ by_reason[].people == total`.
+    """
+
+    total = serializers.IntegerField(
+        help_text="발송 안 된 사람 수 (오류 + 건너뜀). 한 사람이 여러 캠페인에서 실패하면 "
+        "캠페인당 1명으로 센다 — 수신자 목록의 행 정의(캠페인 × 수신자)와 같다."
+    )
+    investigate = serializers.IntegerField(help_text="🔴 조사 필요 사람 수.")
+    normal = serializers.IntegerField(help_text="⚪ 자동 처리 사람 수.")
+    by_reason = _DmNotSentReasonPeopleSerializer(
+        many=True,
+        help_text="사유별 사람 수 (🔴 먼저, 그 안에서 인원 많은 순). **서로소** — "
+        "Σ people == total. 팝업 행을 사유 단위로 그릴 때는 이 배열을 쓰세요.",
+    )
 
 
 class _DmRecoverySerializer(serializers.Serializer):
@@ -302,6 +357,10 @@ class _DmQualitySerializer(serializers.Serializer):
     failure_breakdown = _DmFailureBreakdownSerializer(
         many=True,
         help_text="오류 세분화 — (code,subcode,status) 묶음 카운트 (count desc). KPI 드릴다운용.",
+    )
+    not_sent_people = _DmNotSentPeopleSerializer(
+        help_text="DM-17 — '발송 안 됨'의 **사람 수** (오류 + 건너뜀). 위 두 breakdown 은 "
+        "건수라 링크 건너편(수신자 목록 = 사람 단위)과 숫자가 다르다."
     )
     recovery = _DmRecoverySerializer(help_text="복구 퍼널 (recovery_* 상태 집계).")
     series = _DmSeriesSerializer(help_text="시계열 (제로필)")

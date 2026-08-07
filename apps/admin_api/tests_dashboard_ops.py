@@ -1087,6 +1087,8 @@ class TestSkippedBreakdown:
                 "reason": "other",
                 "label": "기타",
                 "count": 2,
+                # DM-17 — 사람 수. 여기선 수신자가 서로 달라 건수와 같다.
+                "people": 2,
                 "actionable": False,
                 # 2026-07-31 — 미분류 건너뜀은 '사전에 없는 문구가 찍혔다'는 뜻이라
                 # 유일하게 사람이 봐야 하는 건너뜀 사유다(나머지는 전부 설정대로 동작).
@@ -1132,6 +1134,35 @@ class TestSkippedBreakdown:
             for r in staff_client.get(URL).data["dm_quality"]["skipped_breakdown"]
         }
         assert rows == {"duplicate_campaign_cleanup": 2, "ghost_opening_cleanup": 1}
+
+    def test_operational_cleanup_labels(self, staff_client, clean_slate):
+        """DM-18 — 라벨은 바뀌어도 **매칭 문자열은 그대로**여야 한다.
+
+        같이 고치면 기존 prod 행이 매칭에서 빠져 전부 '기타'로 떨어진다. 그래서 이 테스트는
+        **과거 로그 원문**(사고 대응 셸이 찍은 그 문자열)을 넣고 새 라벨이 붙는지 본다 —
+        라벨만 바꾸면 통과하고, 매칭 문자열까지 바꾸면 reason 이 other 가 되어 실패한다.
+        """
+        camp = _mk_campaign(_mk_conn())
+        _mk_dms(
+            camp,
+            SentDMLog.Status.SKIPPED,
+            1,
+            error_message="duplicate campaign on same media (sibling delivered) — auto-cleared",
+        )
+        _mk_dms(
+            camp,
+            SentDMLog.Status.SKIPPED,
+            1,
+            error_message="이미 답글 존재(subcode 2534023) + 리워드 전달완료 — 유령 오프닝 정리(수동)",
+        )
+        labels = {
+            r["reason"]: r["label"]
+            for r in staff_client.get(URL).data["dm_quality"]["skipped_breakdown"]
+        }
+        assert labels == {
+            "duplicate_campaign_cleanup": "같은 게시물 중복 캠페인 정리 (관리자 수동 조치)",
+            "ghost_opening_cleanup": "답장이 이미 있어 발송 취소 (관리자 수동 조치)",
+        }
 
     def test_empty_when_no_skipped(self, staff_client, clean_slate):
         camp = _mk_campaign(_mk_conn())
