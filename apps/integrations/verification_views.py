@@ -1432,7 +1432,11 @@ class DMVerificationViewSet(viewsets.ViewSet):
             {
                 "log_id": str(log.id),
                 "status": log.status,
-                "frontend_action": build_frontend_action(log.status),
+                # v4: 사유 판정에 code/subcode/message 가 모두 필요하다 (status 만 넘기면
+                # 같은 status 안의 갈래를 못 가른다).
+                "frontend_action": build_frontend_action(
+                    log.status, log.error_subcode, log.error_code, log.error_message
+                ),
             }
         )
 

@@ -129,13 +129,21 @@ class TestStatusGroupMapping:
 
 class TestFrontendAction2534025:
     def test_hidden_spam_branch(self):
+        # v4: code 없이 subcode 만 있어도 숨김함으로 판정돼야 한다.
+        # (탭·배지를 정하는 dm_status_groups 가 subcode 단독으로 보기 때문 —
+        #  쌍으로 보면 "탭은 숨겨진 요청인데 본문은 7일 초과"가 된다)
         act = build_frontend_action("failed_param", "2534025")
+        assert act["user_reason"] == "hidden_request"
         assert "숨겨진 요청" in act["title"]
         assert act["cta"]["action"] == "enable_recovery"
 
     def test_plain_param_error(self):
+        # v4: "파라미터 오류" 같은 내부 용어를 더 이상 쓰지 않는다
+        # (DM_USER_COPY_MAPPING.md §2-2 기준 8).
         act = build_frontend_action("failed_param", "")
-        assert "파라미터" in act["title"]
+        assert act["user_reason"] == "window_expired"
+        assert "파라미터" not in act["title"]
+        assert "7일" in act["title"]
 
     def test_default_signature_still_works(self):
         # 기존 호출부(subcode 미전달)와 하위호환

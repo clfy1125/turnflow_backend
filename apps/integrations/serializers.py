@@ -1394,10 +1394,17 @@ class SentDMLogSerializer(serializers.ModelSerializer):
         return obj.status == SentDMLog.Status.RECOVERY_PENDING
 
     def get_frontend_action(self, obj) -> dict:
-        """v3.2 — 상태별 프론트엔드 표시/체크리스트/CTA 가이드 (failed_param 은 subcode 분기)."""
+        """v4 — 사유(`user_reason`) 기준 표시/체크리스트/CTA 가이드.
+
+        ★ error_code 를 반드시 함께 넘긴다 — 이게 없으면 같은 status 안의 갈래를 가르지
+        못한다(예: 100/2534014 '수신자 없음' 과 100 일반 '대상 없음·만료'가 둘 다
+        failed_param 이라 한 문구로 뭉쳐졌다).
+        """
         from .dm_frontend_actions import build_frontend_action
 
-        return build_frontend_action(obj.status, obj.error_subcode)
+        return build_frontend_action(
+            obj.status, obj.error_subcode, obj.error_code, obj.error_message
+        )
 
     @extend_schema_field(serializers.BooleanField(allow_null=True))
     def get_follow_passed(self, obj):

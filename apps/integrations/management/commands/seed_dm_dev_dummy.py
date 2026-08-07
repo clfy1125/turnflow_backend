@@ -79,6 +79,7 @@ class Command(BaseCommand):
         with transaction.atomic():
             self._purge_dynamic()  # 재실행 안전: 기존 더미 캠페인/로그 제거 후 재구성
             self._seed_accounts()
+            self._seed_copy_catalog()
             self._seed_pro_campaigns()
             self._seed_cooldown_account()
             self._seed_free_campaigns()
@@ -97,8 +98,12 @@ class Command(BaseCommand):
         self.pro_user = self._ensure_user(PRO_EMAIL, "더미 프로계정")
 
         # --- 워크스페이스 + 멤버십 ---
-        self.free_ws = self._ensure_ws("dmdummy-free", "[DUMMY] 무료 워크스페이스", self.free_user, "starter")
-        self.pro_ws = self._ensure_ws("dmdummy-pro", "[DUMMY] 프로 워크스페이스", self.pro_user, "pro")
+        self.free_ws = self._ensure_ws(
+            "dmdummy-free", "[DUMMY] 무료 워크스페이스", self.free_user, "starter"
+        )
+        self.pro_ws = self._ensure_ws(
+            "dmdummy-pro", "[DUMMY] 프로 워크스페이스", self.pro_user, "pro"
+        )
 
         # --- 구독 (free 는 기본 free, pro 는 pro 플랜 강제) ---
         free_plan = SubscriptionPlan.objects.get(name="free")
@@ -163,8 +168,9 @@ class Command(BaseCommand):
         )
         return ws
 
-    def _ensure_conn(self, ws, ext_id, username, *, name="", status=None, is_active=True,
-                     token_days=60):
+    def _ensure_conn(
+        self, ws, ext_id, username, *, name="", status=None, is_active=True, token_days=60
+    ):
         status = status or IGAccountConnection.Status.ACTIVE
         conn, _ = IGAccountConnection.objects.get_or_create(
             workspace=ws,
@@ -189,13 +195,277 @@ class Command(BaseCommand):
     # ================================================================== #
     # 프로 계정 캠페인 세트
     # ================================================================== #
+    # ================================================================== #
+    # 문구 카탈로그 캠페인 (UC-1 · 프론트 문구 검증 전용)
+    # ================================================================== #
+    #
+    # `USER_CONSOLE_DM_COPY_REQUEST.md` 의 `user_reason` 을 **한 캠페인 안에서 하나씩**
+    # 눈으로 확인하기 위한 캠페인이다. 다른 더미 캠페인들은 "지표가 살아나는가"를 보려고
+    # 같은 상태를 여러 건 뿌리지만, 여기서는 **사유당 정확히 1건**만 만든다.
+    #
+    # ★ 수신자 username 을 `dmdummy_NN_<user_reason>` 으로 붙인다 — 목록에서 행 이름만
+    #   보고 어느 문구인지 바로 알 수 있어야 클릭해서 대조가 된다.
+    #
+    # (status, code, subcode, message) 조합은 `dm_user_reasons.user_reason_for` 의
+    # 4단 폴백을 실제로 타도록 골랐다. 조합이 틀리면 다른 사유로 떨어지므로,
+    # 시드 후 `_verify_catalog` 가 **기대 사유 == 실제 사유**를 검증하고 틀리면 실패한다.
+    COPY_CATALOG: tuple[tuple[str, str, str, str, str, str], ...] = (
+        # (기대 user_reason, status, error_code, error_subcode, error_message, 댓글 문구)
+        (
+            "connection_lost",
+            "failed_token",
+            "190",
+            "",
+            "Error validating access token: session expired.",
+            "자료 신청합니다",
+        ),
+        (
+            "recipient_unavailable",
+            "failed_param",
+            "100",
+            "2534014",
+            "(#100) Recipient not found | subcode=2534014",
+            "저도 받고 싶어요",
+        ),
+        (
+            "window_expired",
+            "failed_param",
+            "100",
+            "2534022",
+            "(#100) Outside allowed window | subcode=2534022",
+            "신청이요~",
+        ),
+        (
+            "hidden_request",
+            "failed_param",
+            "100",
+            "2534025",
+            "(#100) Param recipient[id] | subcode=2534025",
+            "정보 부탁드려요",
+        ),
+        (
+            "hidden_request",
+            "recovery_pending",
+            "100",
+            "2534025",
+            "(#100) Param recipient[id] | subcode=2534025",
+            "저도요!",
+        ),
+        (
+            "hidden_request",
+            "recovery_expired",
+            "100",
+            "2534025",
+            "(#100) Param recipient[id] | subcode=2534025",
+            "신청합니다",
+        ),
+        (
+            "post_restricted",
+            "failed_no_trace",
+            "200",
+            "2534066",
+            "(#200) Permission error | subcode=2534066",
+            "쿠폰 주세요",
+        ),
+        (
+            "already_replied",
+            "failed_no_trace",
+            "100",
+            "2534023",
+            "(#100) Comment already replied | subcode=2534023",
+            "링크 부탁해요",
+        ),
+        (
+            "delivery_unconfirmed",
+            "failed_no_trace",
+            "",
+            "",
+            "accepted but no delivery trace within 35m",
+            "신청할게요",
+        ),
+        (
+            "send_delayed",
+            "rate_limited",
+            "613",
+            "",
+            "(#613) Calls to this api have exceeded the rate limit",
+            "저도 신청!",
+        ),
+        (
+            "send_incomplete",
+            "failed_no_trace",
+            "-1",
+            "",
+            "(#-1) An unknown error occurred",
+            "자료 주세요",
+        ),
+        # ── 건너뜀 10종 (error_message 로 사유가 갈린다) ──
+        ("monthly_dm_limit", "skipped", "", "", "monthly_dm_limit_reached", "신청합니다"),
+        ("campaign_not_active", "skipped", "", "", "Campaign not active (status=paused)", "저도요"),
+        (
+            "outside_schedule_window",
+            "skipped",
+            "",
+            "",
+            "Campaign outside active schedule window",
+            "신청이요",
+        ),
+        ("ig_account_inactive", "skipped", "", "", "IG account deactivated", "자료 부탁해요"),
+        ("self_recipient", "skipped", "", "", "self recipient (account itself)", "감사합니다 :)"),
+        (
+            "connection_disconnected",
+            "skipped",
+            "",
+            "",
+            "IG connection disconnected (user_requested)",
+            "신청할게요",
+        ),
+        (
+            "duplicate_campaign_cleanup",
+            "skipped",
+            "",
+            "",
+            "duplicate campaign on same media (sibling delivered) — auto-cleared",
+            "저도 신청",
+        ),
+        (
+            "ghost_opening_cleanup",
+            "skipped",
+            "",
+            "",
+            "이미 답글 존재(subcode 2534023) + 리워드 전달완료 — 유령 오프닝 정리(수동)",
+            "신청이요!",
+        ),
+        (
+            "messaging_window_skip",
+            "skipped",
+            "",
+            "",
+            "24h 메시징 윈도우 밖 — 발송 스킵",
+            "자료 신청",
+        ),
+        ("other", "skipped", "", "", "알 수 없는 사유로 건너뜀(더미)", "신청합니다~"),
+        # ── 성공·진행 중 (user_reason 이 빈 문자열인 상태) ──
+        ("", "read", "", "", "", "신청합니다!"),
+        ("", "delivered", "", "", "", "저도 받고 싶어요"),
+        ("", "recovery_delivered", "", "", "", "다시 댓글 달았어요"),
+        ("", "accepted", "", "", "", "신청이요"),
+        ("", "submitting", "", "", "", "자료 부탁드려요"),
+        ("", "queued", "", "", "", "신청할게요"),
+    )
+
+    def _seed_copy_catalog(self):
+        """사유별 문구 카탈로그를 **프로·무료 양쪽에** 하나씩 (UC-1 검증용).
+
+        문구 자체(`build_frontend_action`)는 플랜을 모르므로 두 캠페인의 응답은 같다.
+        그래도 양쪽에 두는 이유는 **플랜에 따라 갈리는 화면**을 같은 데이터로 비교하기
+        위해서다 — 예: `hidden_request` 의 '실패 DM 복구 켜기'는 프로에서만 실제 기능이고
+        무료에서는 업그레이드 안내로 가야 한다.
+        """
+        self.camp_catalog = self._copy_catalog_for(self.conn_pro, "pro")
+        self.camp_catalog_free = self._copy_catalog_for(self.conn_free, "free")
+
+    def _copy_catalog_for(self, conn, plan_key):
+        plan_label = {"pro": "프로", "free": "무료"}[plan_key]
+        camp = self._campaign(
+            conn,
+            f"[DUMMY] 문구 카탈로그({plan_label}) — 사유별 1건씩",
+            trigger="specific_media",
+            media_id=f"dmdummy_media_COPY_{plan_key}",
+            opening_message="[더미] 신청 감사합니다! 자료 보내드릴게요 :)",
+        )
+
+        objs = []
+        for idx, (_expected, status, code, subcode, msg, comment) in enumerate(
+            self.COPY_CATALOG, start=1
+        ):
+            self._seq += 1
+            label = _expected or f"ok_{status}"
+            # 플랜별로 수신자를 분리한다 — 같은 rid 를 쓰면 두 카탈로그가 사람 단위
+            # 지표에서 한 사람으로 섞여 헷갈린다.
+            rid = f"{TAG}_copy_{plan_key}_{idx:02d}"
+            objs.append(
+                SentDMLog(
+                    campaign=camp,
+                    comment_id=f"{TAG}-copy-{plan_key}-c-{idx:02d}",
+                    comment_text=f"[더미] {comment}",
+                    recipient_user_id=rid,
+                    # ★ 행 이름만 보고 어느 사유인지 알 수 있게
+                    recipient_username=f"dmdummy_{idx:02d}_{label}",
+                    message_sent=camp.opening_message_template,
+                    idempotency_key=f"{TAG}:copy:{camp.id}:{idx}",
+                    status=getattr(SentDMLog.Status, status.upper()),
+                    dm_kind=SentDMLog.DMKind.OPENING,
+                    gate_status=SentDMLog.GateStatus.NONE,
+                    error_code=code,
+                    error_subcode=subcode,
+                    error_message=msg,
+                )
+            )
+        SentDMLog.objects.bulk_create(objs)
+
+        # created_at 을 1분 간격으로 흩어 목록 정렬이 카탈로그 순서와 같아지게 한다.
+        for idx, obj in enumerate(objs):
+            created = self.now - timedelta(minutes=len(objs) - idx)
+            obj.created_at = created
+            status = self.COPY_CATALOG[idx][1]
+            self._stamp(obj, status, created, waiting_slots=True, waiting_backdate_days=0, idx=idx)
+            # ★ SUBMITTING 은 beat(`reconcile_stuck_submitting`, 30초 주기)가 60초 정체 건을
+            #   **재큐 → 실제 발송 시도**한다. 그러면 mock 토큰이 Meta 에서 401 을 받아
+            #   status 가 failed_token 으로 뒤바뀌고 카탈로그가 망가진다(실측으로 확인).
+            #   그 태스크의 필터가 `submitted_at__lte=cutoff` 라, NULL 이면 절대 안 걸린다.
+            #   (다른 캠페인의 submitting 더미도 같은 이유로 뒤바뀌지만, 여기는 프론트가
+            #    문구를 대조하는 고정 카탈로그라 반드시 고정돼야 한다.)
+            if status == "submitting":
+                obj.submitted_at = None
+        SentDMLog.objects.bulk_update(
+            objs,
+            [
+                "created_at",
+                "submitted_at",
+                "accepted_at",
+                "delivered_at",
+                "read_at",
+                "sent_at",
+                "next_retry_at",
+                "verified_via",
+                "meta_message_id",
+                "recovery_pending_at",
+                "recovery_reply_id",
+            ],
+            batch_size=200,
+        )
+        self._verify_catalog(objs)
+        return camp
+
+    def _verify_catalog(self, objs):
+        """시드한 조합이 **기대한 사유로 판정되는지** 확인 (틀리면 시드 실패).
+
+        조합을 손으로 고른 것이라, 사전이 바뀌면 조용히 다른 문구가 뜨게 된다.
+        여기서 걸러야 프론트가 "이 행은 왜 다른 문구가 뜨죠?"로 시간을 쓰지 않는다.
+        """
+        from apps.integrations.dm_user_reasons import user_reason_for
+
+        bad = []
+        for obj, row in zip(objs, self.COPY_CATALOG, strict=False):
+            expected = row[0]
+            actual = user_reason_for(
+                obj.status, obj.error_code, obj.error_subcode, obj.error_message
+            )
+            if actual != expected:
+                bad.append(f"{obj.recipient_username}: 기대={expected!r} 실제={actual!r}")
+        if bad:
+            raise CommandError("문구 카탈로그 사유 불일치:\n  " + "\n  ".join(bad))
+
     def _seed_pro_campaigns(self):
         conn = self.conn_pro
 
         # ── C1 종합 (specific_media): §3 로그 전종류 · §7 5그룹 · §5 timeseries ·
         #    §2 하드실패+숨은스팸 · §4 발송중(+ETA/스피너) · §1-H overlap(specific active)
         c1 = self._campaign(
-            conn, "[DUMMY] C1 종합(발송/실패/복구/추이)", trigger="specific_media",
+            conn,
+            "[DUMMY] C1 종합(발송/실패/복구/추이)",
+            trigger="specific_media",
             media_id="dmdummy_media_C1",
             opening_message_templates=[
                 "안녕하세요! 신청 감사합니다 🙌 자료 보내드려요.",
@@ -206,7 +476,10 @@ class Command(BaseCommand):
 
         # ── C2 정상완료 (any_media): §2 healthy · §4 완료 · §1-A any_media · §1-H overlap
         c2 = self._campaign(
-            conn, "[DUMMY] C2 정상·완료(any_media)", trigger="any_media", status="active",
+            conn,
+            "[DUMMY] C2 정상·완료(any_media)",
+            trigger="any_media",
+            status="active",
         )
         # 전부 도착/읽음 → healthy, 대기 0 → 완료
         self._emit(c2, "read", 14, spread_days=6)
@@ -214,7 +487,9 @@ class Command(BaseCommand):
 
         # ── C4 발송중 (specific): §4 발송중 + ETA + 스피너 + ahead>0(C1 보다 최신 대기)
         c4 = self._campaign(
-            conn, "[DUMMY] C4 발송 중(큐 진행)", trigger="specific_media",
+            conn,
+            "[DUMMY] C4 발송 중(큐 진행)",
+            trigger="specific_media",
             media_id="dmdummy_media_C4",
         )
         self._emit(c4, "accepted", 18, spread_days=1)
@@ -224,33 +499,50 @@ class Command(BaseCommand):
 
         # ── C5 대기/멈춤 (paused): gauge.waiting/in_flight=0 인데 people 남음(rate_limited)
         c5 = self._campaign(
-            conn, "[DUMMY] C5 발송 대기(일시정지)", trigger="specific_media",
-            media_id="dmdummy_media_C5", status="paused",
+            conn,
+            "[DUMMY] C5 발송 대기(일시정지)",
+            trigger="specific_media",
+            media_id="dmdummy_media_C5",
+            status="paused",
         )
         self._emit(c5, "accepted", 8, spread_days=2)
         self._emit(c5, "rate_limited", 12)  # people.waiting>0, gauge.waiting=0/in_flight=0
 
         # ── C3 next_media (폴링/헬스 §8, §1-A next_media) — 미부착(media_id="")
         self._campaign(
-            conn, "[DUMMY] C3 다음 게시물(next_media)", trigger="next_media", status="active",
+            conn,
+            "[DUMMY] C3 다음 게시물(next_media)",
+            trigger="next_media",
+            status="active",
         )
 
         # ── 게이트 3분기 (§1-B) ──
         self._campaign(
-            conn, "[DUMMY] G1 단순 DM(게이트 없음)", trigger="specific_media",
-            media_id="dmdummy_media_G1", follow_gate_enabled=False,
+            conn,
+            "[DUMMY] G1 단순 DM(게이트 없음)",
+            trigger="specific_media",
+            media_id="dmdummy_media_G1",
+            follow_gate_enabled=False,
         )  # 로그 0 → §2 case5(0건)도 겸함
         self._campaign(
-            conn, "[DUMMY] G2 버튼 클릭 시 링크(button-only)", trigger="specific_media",
-            media_id="dmdummy_media_G2", follow_gate_enabled=True, gate_verify_follow=False,
+            conn,
+            "[DUMMY] G2 버튼 클릭 시 링크(button-only)",
+            trigger="specific_media",
+            media_id="dmdummy_media_G2",
+            follow_gate_enabled=True,
+            gate_verify_follow=False,
             follow_gate_prompt="자료가 필요하면 아래 버튼을 눌러주세요!",
             follow_gate_button_label="자료 받기",
             reward_message_template="여기 자료 링크예요 👉",
             link_buttons=[{"url": "https://turnflow.link/guide", "label": "가이드 보기"}],
         )
         g3 = self._campaign(
-            conn, "[DUMMY] G3 팔로우 확인 후 보상(follow-gate)", trigger="specific_media",
-            media_id="dmdummy_media_G3", follow_gate_enabled=True, gate_verify_follow=True,
+            conn,
+            "[DUMMY] G3 팔로우 확인 후 보상(follow-gate)",
+            trigger="specific_media",
+            media_id="dmdummy_media_G3",
+            follow_gate_enabled=True,
+            gate_verify_follow=True,
             follow_gate_prompt="팔로우도 해주셨나요? 버튼을 눌러주세요!",
             follow_gate_prompt_templates=[  # §1-C 게이트 안내 회전
                 "댓글 감사해요! 팔로우 확인 후 버튼을 눌러주세요 🙏",
@@ -268,26 +560,38 @@ class Command(BaseCommand):
 
         # ── 대댓글(공개답글) 상한 (§1-D) ──
         self._campaign(
-            conn, "[DUMMY] PR1 대댓글 상한 미도달", trigger="specific_media",
-            media_id="dmdummy_media_PR1", public_reply_enabled=True, public_reply_limit=200,
+            conn,
+            "[DUMMY] PR1 대댓글 상한 미도달",
+            trigger="specific_media",
+            media_id="dmdummy_media_PR1",
+            public_reply_enabled=True,
+            public_reply_limit=200,
             public_reply_posted_count=40,
             public_reply_templates=["DM 보내드렸어요! 확인해주세요 :)", "안내 드렸습니다 🎁"],
         )
         self._campaign(
-            conn, "[DUMMY] PR2 대댓글 상한 도달", trigger="specific_media",
-            media_id="dmdummy_media_PR2", public_reply_enabled=True, public_reply_limit=100,
+            conn,
+            "[DUMMY] PR2 대댓글 상한 도달",
+            trigger="specific_media",
+            media_id="dmdummy_media_PR2",
+            public_reply_enabled=True,
+            public_reply_limit=100,
             public_reply_posted_count=100,  # → public_reply_limit_reached=true
             public_reply_templates=["DM 보내드렸어요!", "확인 부탁드려요 :)"],
         )
 
         # ── 다중 링크 버튼 (§1-E) ──
         self._campaign(
-            conn, "[DUMMY] LB1 링크버튼 1개", trigger="specific_media",
+            conn,
+            "[DUMMY] LB1 링크버튼 1개",
+            trigger="specific_media",
             media_id="dmdummy_media_LB1",
             link_buttons=[{"url": "https://turnflow.link/a", "label": "구매하기"}],
         )
         self._campaign(
-            conn, "[DUMMY] LB2 링크버튼 2개", trigger="specific_media",
+            conn,
+            "[DUMMY] LB2 링크버튼 2개",
+            trigger="specific_media",
             media_id="dmdummy_media_LB2",
             link_buttons=[
                 {"url": "https://turnflow.link/a", "label": "구매하기"},
@@ -295,7 +599,9 @@ class Command(BaseCommand):
             ],
         )
         self._campaign(
-            conn, "[DUMMY] LB3 링크버튼 3개(Meta 한도)", trigger="specific_media",
+            conn,
+            "[DUMMY] LB3 링크버튼 3개(Meta 한도)",
+            trigger="specific_media",
             media_id="dmdummy_media_LB3",
             link_buttons=[
                 {"url": "https://turnflow.link/a", "label": "구매하기"},
@@ -304,15 +610,20 @@ class Command(BaseCommand):
             ],
         )
         self._campaign(
-            conn, "[DUMMY] LB4 레거시 단일 버튼(link_buttons 빈)", trigger="specific_media",
+            conn,
+            "[DUMMY] LB4 레거시 단일 버튼(link_buttons 빈)",
+            trigger="specific_media",
             media_id="dmdummy_media_LB4",
-            link_button_url="https://turnflow.link/legacy", link_button_label="자세히 보기",
+            link_button_url="https://turnflow.link/legacy",
+            link_button_label="자세히 보기",
         )
 
         # ── 스토리 답장 만료 (§1-A, 이번 신규 UI 핵심) ──
         # media_id 를 stories 엔드포인트가 반환하지 않는 값으로 + created_at 이틀 전 → 만료 추정
         s1 = self._campaign(
-            conn, "[DUMMY] S1 스토리 답장(만료)", trigger="story_reply",
+            conn,
+            "[DUMMY] S1 스토리 답장(만료)",
+            trigger="story_reply",
             media_id="dmdummy_story_expired_0001",
             opening_message="스토리 답장 감사해요! 자료 보내드릴게요 :)",
         )
@@ -322,29 +633,44 @@ class Command(BaseCommand):
 
         # ── 상태 4종 (§1-G) : active(위 다수) / paused(C5) / completed / inactive ──
         self._campaign(
-            conn, "[DUMMY] ST 완료 상태", trigger="specific_media",
-            media_id="dmdummy_media_STc", status="completed",
+            conn,
+            "[DUMMY] ST 완료 상태",
+            trigger="specific_media",
+            media_id="dmdummy_media_STc",
+            status="completed",
         )
         self._campaign(
-            conn, "[DUMMY] ST 비활성 상태", trigger="specific_media",
-            media_id="dmdummy_media_STi", status="inactive",
+            conn,
+            "[DUMMY] ST 비활성 상태",
+            trigger="specific_media",
+            media_id="dmdummy_media_STi",
+            status="inactive",
         )
 
         # ── 예약 상태 다양 (§1-G) : scheduled / running / ended ──
         self._campaign(
-            conn, "[DUMMY] SCH 예약 대기(scheduled)", trigger="specific_media",
-            media_id="dmdummy_media_SCHs", status="active",
+            conn,
+            "[DUMMY] SCH 예약 대기(scheduled)",
+            trigger="specific_media",
+            media_id="dmdummy_media_SCHs",
+            status="active",
             scheduled_start_at=self.now + timedelta(days=2),  # 미래 시작 → scheduled
         )
         self._campaign(
-            conn, "[DUMMY] SCH 진행 중(running)", trigger="specific_media",
-            media_id="dmdummy_media_SCHr", status="active",
+            conn,
+            "[DUMMY] SCH 진행 중(running)",
+            trigger="specific_media",
+            media_id="dmdummy_media_SCHr",
+            status="active",
             scheduled_start_at=self.now - timedelta(days=1),
             scheduled_end_at=self.now + timedelta(days=3),  # 창 안 → running
         )
         self._campaign(
-            conn, "[DUMMY] SCH 종료됨(ended)", trigger="specific_media",
-            media_id="dmdummy_media_SCHe", status="completed",
+            conn,
+            "[DUMMY] SCH 종료됨(ended)",
+            trigger="specific_media",
+            media_id="dmdummy_media_SCHe",
+            status="completed",
             scheduled_start_at=self.now - timedelta(days=5),
             scheduled_end_at=self.now - timedelta(days=1),  # 과거 종료 → ended
         )
@@ -364,26 +690,39 @@ class Command(BaseCommand):
         self._emit(c1, "recovery_pending", 3, spread_days=2)
         self._emit(c1, "recovery_expired", 2, spread_days=6)
         self._emit(c1, "recovery_delivered", 2, spread_days=4)  # 복구 성공(sent 버킷)
-        self._emit(c1, "failed_param", 1, error_code="100", error_subcode="2534025",
-                   spread_days=3)  # 복구 OFF 숨김함
+        self._emit(
+            c1, "failed_param", 1, error_code="100", error_subcode="2534025", spread_days=3
+        )  # 복구 OFF 숨김함
         # 확인 필요(attention 그룹) — 토큰/윈도우/파라미터/건너뜀
         self._emit(c1, "failed_token", 2, spread_days=4)
-        self._emit(c1, "failed_window", 2, error_code="100", error_subcode="2534022",
-                   spread_days=5)  # ★ 프론트 문구 덮어쓰기 케이스(7일 창/댓글 삭제)
-        self._emit(c1, "failed_param", 2, error_code="100", error_subcode="2534014",
-                   spread_days=4)  # 일반 파라미터 오류(비-2534025)
+        self._emit(
+            c1, "failed_window", 2, error_code="100", error_subcode="2534022", spread_days=5
+        )  # ★ 프론트 문구 덮어쓰기 케이스(7일 창/댓글 삭제)
+        self._emit(
+            c1, "failed_param", 2, error_code="100", error_subcode="2534014", spread_days=4
+        )  # 일반 파라미터 오류(비-2534025)
         self._emit(c1, "skipped", 1, spread_days=7)
 
     def _fill_gate(self, g3):
         """게이트 통과 흐름 — opening(PASSED) + reward child. verified_follower/ctr=click."""
         openings = self._emit(
-            g3, "delivered", 6, dm_kind="opening", gate_status="passed", spread_days=3,
+            g3,
+            "delivered",
+            6,
+            dm_kind="opening",
+            gate_status="passed",
+            spread_days=3,
         )
         # reward child (parent_log=opening, Send API 버킷)
         for parent in openings:
             self._emit(
-                g3, "delivered", 1, dm_kind="reward", parent=parent,
-                comment=False, spread_days=3,
+                g3,
+                "delivered",
+                1,
+                dm_kind="reward",
+                parent=parent,
+                comment=False,
+                spread_days=3,
             )
         # 아직 미통과(pending) opening 2 — not_followed
         self._emit(g3, "accepted", 2, dm_kind="opening", gate_status="pending", spread_days=2)
@@ -397,7 +736,9 @@ class Command(BaseCommand):
         )
         self.conn_cool = conn
         cd = self._campaign(
-            conn, "[DUMMY] CD Action Block 쿨다운", trigger="specific_media",
+            conn,
+            "[DUMMY] CD Action Block 쿨다운",
+            trigger="specific_media",
             media_id="dmdummy_media_CD",
         )
         self._emit(cd, "accepted", 6, spread_days=1)
@@ -416,7 +757,9 @@ class Command(BaseCommand):
         conn = self.conn_free
         # F1 — free 월 한도(200) 초과 + 대기 → §6 over-limit, §4 monthly_quota_reached
         f1 = self._campaign(
-            conn, "[DUMMY] F1 무료 한도 초과", trigger="specific_media",
+            conn,
+            "[DUMMY] F1 무료 한도 초과",
+            trigger="specific_media",
             media_id="dmdummy_media_F1",
         )
         self._emit(f1, "accepted", 210, spread_days=10)  # (캠페인×수신자) 고유 210 > 200
@@ -424,8 +767,11 @@ class Command(BaseCommand):
 
         # F2 — recovery 켜도 free 라 recovery_reply_available=false (no-op 안내)
         self._campaign(
-            conn, "[DUMMY] F2 복구 켰지만 무료(no-op)", trigger="specific_media",
-            media_id="dmdummy_media_F2", recovery_reply_enabled=True,
+            conn,
+            "[DUMMY] F2 복구 켰지만 무료(no-op)",
+            trigger="specific_media",
+            media_id="dmdummy_media_F2",
+            recovery_reply_enabled=True,
             recovery_reply_templates=["요청함 수락 후 다시 댓글 남겨주세요!"],
         )
 
@@ -435,24 +781,43 @@ class Command(BaseCommand):
     def _seed_aux_connections(self):
         # 토큰 만료 연동 (설정 헬스 배너 "재연결 필요" / health connection_status)
         self._ensure_conn(
-            self.pro_ws, "dmdummy_pro_expired", "dmdummy_expired", name="더미 토큰만료 계정",
-            status=IGAccountConnection.Status.EXPIRED, token_days=None,
+            self.pro_ws,
+            "dmdummy_pro_expired",
+            "dmdummy_expired",
+            name="더미 토큰만료 계정",
+            status=IGAccountConnection.Status.EXPIRED,
+            token_days=None,
         )
         # 소프트 비활성 연동 (설정 IG 카드 "사용 안 함" pill)
         self._ensure_conn(
-            self.pro_ws, "dmdummy_pro_inactive", "dmdummy_inactive", name="더미 비활성 계정",
+            self.pro_ws,
+            "dmdummy_pro_inactive",
+            "dmdummy_inactive",
+            name="더미 비활성 계정",
             is_active=False,
         )
 
     # ================================================================== #
     # 캠페인 / 로그 생성 헬퍼
     # ================================================================== #
-    def _campaign(self, conn, name, *, trigger="specific_media", status="active", media_id="",
-                  opening_message="", link_buttons=None, **fields) -> AutoDMCampaign:
+    def _campaign(
+        self,
+        conn,
+        name,
+        *,
+        trigger="specific_media",
+        status="active",
+        media_id="",
+        opening_message="",
+        link_buttons=None,
+        **fields,
+    ) -> AutoDMCampaign:
         trig = getattr(AutoDMCampaign.TriggerType, trigger.upper())
         st = getattr(AutoDMCampaign.Status, status.upper())
-        opening = opening_message or fields.pop("opening_message_template", "") or (
-            "안녕하세요! 신청 감사합니다. 자료 보내드릴게요 :)"
+        opening = (
+            opening_message
+            or fields.pop("opening_message_template", "")
+            or ("안녕하세요! 신청 감사합니다. 자료 보내드릴게요 :)")
         )
         camp = AutoDMCampaign.objects.create(
             ig_connection=conn,
@@ -467,9 +832,22 @@ class Command(BaseCommand):
         )
         return camp
 
-    def _emit(self, campaign, status, count, *, dm_kind="opening", gate_status="none",
-              error_code="", error_subcode="", parent=None, comment=True,
-              waiting_slots=False, waiting_backdate_days=0, spread_days=0):
+    def _emit(
+        self,
+        campaign,
+        status,
+        count,
+        *,
+        dm_kind="opening",
+        gate_status="none",
+        error_code="",
+        error_subcode="",
+        parent=None,
+        comment=True,
+        waiting_slots=False,
+        waiting_backdate_days=0,
+        spread_days=0,
+    ):
         """count 개의 SentDMLog 를 만든다 (distinct 수신자·idempotency). 실 발송 없음.
 
         bulk_create 는 auto_now_add 로 created_at 을 now 로 강제하므로, 원하는
@@ -512,15 +890,24 @@ class Command(BaseCommand):
         SentDMLog.objects.bulk_create(objs, batch_size=500)
 
         # 단계별 타임스탬프 채우기 (상태에 맞게) + created_at 덮어쓰기
-        for idx, (obj, (created_at,)) in enumerate(zip(objs, metas)):
+        for idx, (obj, (created_at,)) in enumerate(zip(objs, metas, strict=False)):
             obj.created_at = created_at
             self._stamp(obj, status, created_at, waiting_slots, waiting_backdate_days, idx)
         SentDMLog.objects.bulk_update(
             objs,
             [
-                "created_at", "submitted_at", "accepted_at", "delivered_at", "read_at",
-                "sent_at", "next_retry_at", "verified_via", "meta_message_id",
-                "recovery_pending_at", "recovery_reply_id", "public_reply_posted_at",
+                "created_at",
+                "submitted_at",
+                "accepted_at",
+                "delivered_at",
+                "read_at",
+                "sent_at",
+                "next_retry_at",
+                "verified_via",
+                "meta_message_id",
+                "recovery_pending_at",
+                "recovery_reply_id",
+                "public_reply_posted_at",
                 "public_reply_id",
             ],
             batch_size=500,
@@ -615,9 +1002,11 @@ class Command(BaseCommand):
             Workspace.objects.filter(owner=user).delete()  # CASCADE: membership 등
             UserSubscription.objects.filter(user=user).delete()
             user.delete()
-        self.stdout.write(self.style.SUCCESS(
-            f"cleanup OK: 더미 캠페인 {n_camp}개 + 연동/워크스페이스/계정 제거 완료"
-        ))
+        self.stdout.write(
+            self.style.SUCCESS(
+                f"cleanup OK: 더미 캠페인 {n_camp}개 + 연동/워크스페이스/계정 제거 완료"
+            )
+        )
 
     # ================================================================== #
     # 리포트
@@ -650,6 +1039,19 @@ class Command(BaseCommand):
             w(f"  · {label:6s} {conn.id}  (ws={conn.workspace_id})")
         w("")
 
+        w(s.MIGRATE_HEADING("★ 문구 카탈로그 (UC-1 검증 — 사유별 1건씩 · 플랜별 1개):"))
+        for plan_label, email, camp in [
+            ("프로", PRO_EMAIL, self.camp_catalog),
+            ("무료", FREE_EMAIL, self.camp_catalog_free),
+        ]:
+            w(f"  · {plan_label} ({email})")
+            w(f"      campaign_id = {camp.id}")
+            w(f"      {base}/dm-verification/?campaign_id={camp.id}")
+        w("  행 이름이 dmdummy_<번호>_<user_reason> 이라 목록에서 바로 구분됩니다.")
+        w(f"  각 {len(self.COPY_CATALOG)}건 = 오류 9종(+복구 3단계) · 건너뜀 10종 · 성공/진행 6종")
+        w("  ※ 문구 응답은 두 플랜이 같습니다(서버가 플랜을 모름) — 플랜별로 갈리는 화면")
+        w("    (복구 켜기: 프로=실기능 / 무료=업그레이드 안내)을 비교하는 용도입니다.\n")
+
         w(s.MIGRATE_HEADING("핵심 캠페인(campaign_id) → 검증 포인트:"))
         for camp in AutoDMCampaign.objects.filter(
             ig_connection__external_account_id__startswith=TAG
@@ -659,7 +1061,9 @@ class Command(BaseCommand):
 
         w(s.MIGRATE_HEADING("빠른 확인 예 (프로 로그인 토큰으로):"))
         w(f"  GET {base}/auto-dm-campaigns/                         (목록·임베드 통계)")
-        w(f"  GET {base}/auto-dm-campaigns/summary/?ig_connection_id={self.conn_free.id}  (무료 한도 초과)")
+        w(
+            f"  GET {base}/auto-dm-campaigns/summary/?ig_connection_id={self.conn_free.id}  (무료 한도 초과)"
+        )
         w(f"  GET {base}/dm-verification/queue-state/?campaign_id=<C4>   (발송중+ETA)")
         w(f"  GET {base}/dm-verification/queue-state/?campaign_id=<CD>   (action_block_cooldown)")
         w(f"  GET {base}/dm-verification/queue-state/?campaign_id=<F1>   (monthly_quota_reached)")
