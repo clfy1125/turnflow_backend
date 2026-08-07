@@ -20,6 +20,7 @@ from django.conf import settings
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 
 from .dm_exceptions import (
     ALREADY_REPLIED_SUBCODE,
@@ -200,6 +201,31 @@ logger = logging.getLogger(__name__)
 # 368 = "temporarily blocked for policies violations". 감지 시 계정 쿨다운(에스컬레이팅).
 _ACTION_BLOCK_CODES = {368}
 
+# ===== 게이트 리워드 '창 미개방' 복구 (2026-08-07) =====
+#
+# 증상: 팔로우 게이트 버튼을 누른 직후(초 단위) 나가는 reward DM 이 Meta 로부터
+#       code=10 / subcode=2534022 ("허용되는 창 외부") 를 받고 영구 실패한다.
+#
+# 원인(prod 실측 6건, Conversations API 대조):
+#   댓글은 24h 표준 메시징 창을 열지 않는다 — 창을 여는 것은 **버튼 탭이 대화방에
+#   '유저 발신 메시지'로 꽂히는 것** 뿐이다. 그런데 Meta 가 그 탭을 간헐적으로
+#   **비즈니스 발신으로 오귀속**하거나(6건 중 4건) 창 상태 전파가 늦어(2건),
+#   우리가 2~3초 뒤 Send API 를 부르면 창이 아직 닫혀 있다.
+#   ※ 우리 웹훅에는 sender.id=유저 로 오는데 Conversations API 는 from=비즈니스 로
+#     보고한다 — Meta 내부 불일치라 우리가 막을 수 없다.
+#
+# 자가치유: 유저가 버튼을 다시 누르면 그때는 정상 귀속돼 창이 열린다(실측 확인).
+#           따라서 ①짧은 자동 재시도 ②재탭 시 복구 두 갈래를 모두 연다.
+GATE_WINDOW_SUBCODES = frozenset({"2534022", "2018278"})
+# 자동 재시도 백오프(초). 전파 레이스는 수초 내 풀리고, 오귀속은 재탭을 기다려야 하므로 짧게.
+GATE_REWARD_WINDOW_BACKOFFS = (20, 60, 180)
+# 자동 재시도 + 재탭 복구를 합친 reward 1건당 Meta 호출 상한(연타 방어).
+GATE_REWARD_MAX_ATTEMPTS = 6
+# 재탭 복구 최소 간격(초) — 사용자가 버튼을 연타해도 이 간격 안에서는 1회만 재발송.
+GATE_REWARD_REPAIR_COOLDOWN = 30
+# verification_log 에 남기는 복구 흔적의 path (창 기준 시각 재계산에 쓰임).
+GATE_REPAIR_PATH = "gate_reward_repair"
+
 
 # ===== 발송 속도 제어 / defer 헬퍼 (item 1·2) =====
 
@@ -211,6 +237,46 @@ def _messaging_window(log) -> timedelta:
     rate-limit/transient 로 계속 defer 되더라도 이 윈도우가 지나면 graceful 종결한다.
     """
     return timedelta(days=7) if log.comment_id else timedelta(hours=24)
+
+
+def _window_anchor(log):
+    """이 로그의 메시징 창이 열린 기준 시각 (기본 = created_at).
+
+    게이트 reward 가 '창 미개방'으로 실패한 뒤 사용자가 버튼을 **다시 눌러** 복구된
+    건은, 그 재탭 시점에 창이 새로 열린다. created_at 을 그대로 쓰면 며칠 뒤의 재탭이
+    send_dm_task 진입부 age 가드에 걸려 영원히 못 나간다(실측: sayafiit 8일 뒤 재탭).
+    → 마지막 복구 시각이 있으면 그것을 기준으로 삼는다.
+
+    별도 컬럼 없이 verification_log(이미 판정 근거 보관용)의 마지막 복구 흔적을 읽는다.
+    """
+    anchor = log.created_at
+    for entry in reversed(log.verification_log or []):
+        if entry.get("path") != GATE_REPAIR_PATH:
+            continue
+        ts = parse_datetime(str(entry.get("ts") or ""))
+        return max(anchor, ts) if ts is not None else anchor
+    return anchor
+
+
+def _is_gate_reward_window_miss(log, cls, exc) -> bool:
+    """이 실패가 '게이트 reward 인데 Meta 가 창을 안 열어준' 건인가 (재시도 대상).
+
+    좁게 판정한다 — 여기서 넓히면 정당한 창 만료까지 재시도해 Meta 호출만 태운다:
+      - Meta 가 직접 준 창 오류여야 함(code=10 + 창 subcode). 우리 내부 age 가드가
+        찍는 failed_window(error_code="") 는 제외 — 그건 진짜 시간 경과다.
+      - user_id 경로(comment_id 없음)의 child 로그여야 함 = reward / 팔로우 재안내.
+        오프닝 사설답장(7일 창)은 해당 없음.
+      - 호출 상한 이내.
+    """
+    if cls.log_status != SentDMLog.Status.FAILED_WINDOW:
+        return False
+    if getattr(exc, "code", None) != 10:
+        return False
+    if str(getattr(exc, "subcode", "") or "") not in GATE_WINDOW_SUBCODES:
+        return False
+    if log.parent_log_id is None or log.comment_id:
+        return False
+    return (log.retry_count or 0) <= len(GATE_REWARD_WINDOW_BACKOFFS)
 
 
 def _resolve_plan_name(campaign) -> str:
@@ -371,6 +437,28 @@ def _defer_or_fail(log, campaign, ig_conn, exc) -> dict:
         log.status = SentDMLog.Status.QUEUED
         log.save(update_fields=["retry_count", "next_retry_at", "status"])
         return {"status": "deferred", "reason": cls.reason, "retry_count": log.retry_count}
+
+    # ★ 게이트 reward '창 미개방'(10/2534022) — 종결하지 말고 짧게 재시도 (2026-08-07).
+    # Meta 가 유저의 버튼 탭을 비즈니스 발신으로 오귀속하거나 창 상태 전파가 늦어 생기는
+    # 건이라, 수십 초 뒤엔 열려 있는 경우가 있다. 상한(GATE_REWARD_WINDOW_BACKOFFS)이
+    # 있고 진짜 시간 경과는 send_dm_task 진입부 age 가드가 잡으므로 무한 루프 불가.
+    if _is_gate_reward_window_miss(log, cls, exc):
+        idx = min(log.retry_count - 1, len(GATE_REWARD_WINDOW_BACKOFFS) - 1)
+        backoff = GATE_REWARD_WINDOW_BACKOFFS[idx]
+        log.next_retry_at = timezone.now() + timedelta(seconds=backoff)
+        log.status = SentDMLog.Status.QUEUED
+        log.save(update_fields=["retry_count", "next_retry_at", "status"])
+        logger.info(
+            "gate reward window not open → retry in %ss: log=%s attempt=%s",
+            backoff,
+            log.id,
+            log.retry_count,
+        )
+        return {
+            "status": "deferred",
+            "reason": "gate_window_not_open",
+            "retry_count": log.retry_count,
+        }
 
     # ★ 재시도 상한 소진(v3.4): 일시(transient)로 분류됐지만 상한을 넘도록 계속 실패 =
     # 사실상 영구(예: Meta code 1 로 오는 "댓글에 이미 답글 있음" 같은 조건)로 보고 종결한다.
@@ -1646,7 +1734,10 @@ def send_dm_task(self, log_id: str):
     # ★ 메시징 윈도우 만료 가드 (graceful 종결의 단일 지점):
     # rate-limit/한도 초과로 계속 defer 되더라도 comment 7일 / user_id 24h 가 지나면
     # Meta 가 무조건 거부하므로 FAILED_WINDOW 로 종결한다(= rate-limit 실패가 아닌 윈도우 만료).
-    age = timezone.now() - log.created_at
+    # 기준 시각은 created_at 이지만, 게이트 reward 가 재탭으로 복구된 건은 그 재탭 시각에
+    # 창이 새로 열리므로 _window_anchor 가 그것을 반영한다(그렇지 않으면 며칠 뒤 재탭이
+    # 여기서 즉시 죽는다).
+    age = timezone.now() - _window_anchor(log)
     window = _messaging_window(log)
     if age >= window:
         # 원인이 두 가지고 조치가 정반대라 종결 시점에 갈라 둔다(2026-07-31):
@@ -4015,6 +4106,70 @@ def _gate_chain(log: SentDMLog) -> list[SentDMLog]:
     return chain
 
 
+def _repair_failed_gate_reward(flow_ids: list, ig_conn) -> dict | None:
+    """플로우의 reward 가 '창 미개방'으로 실패해 있으면 같은 row 를 되살려 재발송.
+
+    사용자가 버튼을 다시 누른 시점에 호출된다 — 그 탭 자체가 24h 창을 열기 때문에
+    이번엔 성공할 가능성이 높다(실측: 오귀속된 1차 탭 뒤 2·3차 탭은 정상 귀속).
+
+    ★ 연타 방어 (이 함수가 재발송의 유일한 관문이므로 여기서 전부 막는다):
+      1) **조건부 UPDATE 한 방(CAS)** 으로 FAILED_WINDOW → QUEUED 전이. 동시에 도착한
+         탭 2개 중 1개만 rowcount=1 을 받는다 → 이중 dispatch 구조적으로 불가.
+      2) 되살릴 수 있는 상태는 FAILED_WINDOW **뿐**. QUEUED/SUBMITTING(발송 중·자동
+         재시도 대기)·ACCEPTED 이상(이미 나감)·다른 실패는 손대지 않는다.
+         특히 FAILED_NO_TRACE 는 '도착했을 수도 있음'이라 되살리면 중복 DM 이 된다.
+      3) 쿨다운(GATE_REWARD_REPAIR_COOLDOWN) + 호출 상한(GATE_REWARD_MAX_ATTEMPTS)
+         으로 버튼을 난타해도 Meta 호출이 선형 증가하지 않는다.
+
+    Returns: 복구했으면 결과 dict, 아니면 None(호출부가 기존 동작 유지).
+    """
+    # 연결이 죽어 있으면 되살리지 않는다 — send_dm_task 가 곧바로 FAILED_TOKEN 으로
+    # 종결시켜 원래 실패 사유(창 미개방)를 덮어써 진단만 흐려진다.
+    if ig_conn.status != IGAccountConnection.Status.ACTIVE:
+        return None
+
+    reward = (
+        SentDMLog.objects.filter(
+            dm_kind=SentDMLog.DMKind.REWARD,
+            parent_log_id__in=flow_ids,
+            status=SentDMLog.Status.FAILED_WINDOW,
+        )
+        .order_by("-created_at")
+        .first()
+    )
+    if reward is None:
+        return None
+
+    # 상한: 자동 재시도 + 재탭 복구를 합친 reward 1건당 Meta 호출 횟수.
+    if (reward.retry_count or 0) >= GATE_REWARD_MAX_ATTEMPTS:
+        return {"status": "repair_exhausted", "reward_log_id": str(reward.id)}
+
+    # 쿨다운: cache.add 는 SETNX 라 원자적 — 연타 중 첫 탭만 통과한다.
+    from django.core.cache import cache
+
+    if not cache.add(f"gate_reward_repair:{reward.id}", 1, timeout=GATE_REWARD_REPAIR_COOLDOWN):
+        return {"status": "repair_cooldown", "reward_log_id": str(reward.id)}
+
+    # ★ CAS: 아직 FAILED_WINDOW 인 경우에만 QUEUED 로. rowcount 0 이면 다른 탭이 이겼다.
+    updated = SentDMLog.objects.filter(pk=reward.pk, status=SentDMLog.Status.FAILED_WINDOW).update(
+        status=SentDMLog.Status.QUEUED,
+        next_retry_at=None,
+        error_code="",
+        error_subcode="",
+        error_message="",
+    )
+    if not updated:
+        return {"status": "repair_raced", "reward_log_id": str(reward.id)}
+
+    # 복구 시각을 남긴다 — _window_anchor 가 이걸 창 기준 시각으로 쓴다(며칠 뒤 재탭 대응).
+    reward.refresh_from_db()
+    reward.append_verification_log({"path": GATE_REPAIR_PATH, "result": "requeued"})
+
+    logger.info("gate reward repaired by re-tap → requeued: log=%s", reward.id)
+    send_dm_task.delay(str(reward.pk))
+    return {"status": "reward_repaired", "reward_log_id": str(reward.id)}
+
+
 def _gate_flow_ids(root: SentDMLog) -> list:
     """루트 opening 에서 시작하는 플로우 전체(루트 + 모든 자손 로그)의 pk 목록.
 
@@ -4076,8 +4231,14 @@ def process_follow_gate_postback(
             "recipient_account_id": recipient_account_id,
         }
 
-    # 이미 게이트 통과한 opening 이면 추가 처리 안 함
+    # 이미 게이트 통과한 opening 이면 추가 처리 안 함.
+    # ★ 단, '통과했는데 reward 가 창 미개방으로 실패해 있는' 경우는 예외 — 지금 이 탭이
+    #   창을 열어주므로 되살려 재발송한다(2026-08-07). 통과 여부만 보고 돌려보내던 탓에
+    #   유저가 버튼을 두 번 세 번 눌러도 영원히 리워드를 못 받았다(prod 실측 6명).
     if opening.gate_status == SentDMLog.GateStatus.PASSED:
+        repaired = _repair_failed_gate_reward(_gate_flow_ids(_gate_chain(opening)[-1]), ig_conn)
+        if repaired is not None:
+            return {**repaired, "opening_log_id": str(opening.id)}
         return {"status": "already_passed", "opening_log_id": str(opening.id)}
 
     # 게이트 미사용 캠페인의 log 가 잘못 라우팅된 경우
@@ -4088,6 +4249,9 @@ def process_follow_gate_postback(
     # (재안내로 통과한 뒤 원래 opening 버튼을 다시 누르는 경우의 reward 중복 방지).
     chain = _gate_chain(opening)
     if chain[-1].gate_status == SentDMLog.GateStatus.PASSED:
+        repaired = _repair_failed_gate_reward(_gate_flow_ids(chain[-1]), ig_conn)
+        if repaired is not None:
+            return {**repaired, "opening_log_id": str(opening.id)}
         return {"status": "already_passed", "opening_log_id": str(opening.id)}
 
     # 30초 쿨다운 — 사용자가 버튼을 연타해도 한 번만 IG API 호출
@@ -4175,6 +4339,12 @@ def _enqueue_reward_dm(
     ).first()
     if existing is not None:
         _mark_flow_passed()
+        # ★ '창 미개방'으로 실패해 있는 reward 는 '보낸 것'이 아니다 — 이 탭이 창을 열어
+        #   주므로 같은 row 를 되살려 재발송한다. 그 외 상태(발송 중·도착·다른 실패)는
+        #   기존대로 중복 방어 (2026-08-07).
+        repaired = _repair_failed_gate_reward(flow_ids, campaign.ig_connection)
+        if repaired is not None:
+            return {**repaired, "opening_log_id": str(opening.id)}
         return {
             "status": "duplicate_reward",
             "opening_log_id": str(opening.id),
