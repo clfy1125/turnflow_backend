@@ -90,6 +90,7 @@ from apps.admin_api.dashboard_constants import (
     POST_PAYMENT_WINDOW_DAYS,
     RECENT_CANCELLATIONS_LIMIT,
     RECENT_CHURN_WINDOW_DAYS,
+    SNAPSHOT_ROSTER_ID_CACHE_MAX,
     SOURCE_ROWS_MAX,
     TOP_PAGES_LIMIT,
     TRENDS_DAY_MAX_SPAN_DAYS,
@@ -107,6 +108,14 @@ from apps.admin_api.models import MarketingChannelLink
 from apps.admin_api.pii import apply_pii_policy
 from apps.admin_api.roles import resolve_admin_role
 from apps.admin_api.serializers.dashboard_marketing import AdminMarketingDashboardSerializer
+from apps.admin_api.snapshot_rosters import (
+    BUCKET_CANCELLED,
+    BUCKET_WILL_CHARGE,
+    paying_subscriptions_qs,
+    trial_cancelled_qs,
+    trial_no_card_qs,
+    trial_will_charge_qs,
+)
 from apps.ai_jobs.models import AiJob
 from apps.billing.dm_limits import DEFAULT_DM_MONTHLY_LIMIT
 from apps.billing.models import (
@@ -3537,21 +3546,17 @@ def _trial_now(now) -> dict:
     base = UserSubscription.objects.exclude(plan__name__in=_PAID_EXCLUDE).filter(
         current_period_end__gt=now
     )
-    trialing = base.filter(status=SubscriptionStatus.TRIALING)
-    # 체험 중 취소 — 이 기간 안에서 일어난 취소만. ⚠️ cancelled_during_trial_at 은 재체험
-    # 시에도 지우지 않으므로(T-3-②) 과거 체험의 취소 기록이 남아 있을 수 있다. 그 값으로
-    # '지금 유료 기간을 취소한 사람'을 체험 취소로 오인하지 않도록 **현재 기간 포함**을 본다.
-    cancelled_qs = base.filter(
-        status=SubscriptionStatus.CANCELLED,
-        cancelled_during_trial_at__isnull=False,
-        current_period_start__isnull=False,
-        cancelled_during_trial_at__gte=F("current_period_start"),
-    )
+    # SNAP-1/2: 모수 쿼리는 apps/admin_api/snapshot_rosters.py 가 정본이다 — 명단
+    # 엔드포인트(/admin/snapshot/trial/)가 **같은 쿼리**를 재사용해야 타일과 명단이
+    # 어긋나지 않는다(요청서 §공통 ①).
+    will_charge_qs = trial_will_charge_qs(now)
+    cancelled_qs = trial_cancelled_qs(now)
 
-    will_charge = trialing.filter(billing_key_issued_at__isnull=False).count()
-    no_card = trialing.filter(billing_key_issued_at__isnull=True).count()
+    will_charge = will_charge_qs.count()
+    no_card = trial_no_card_qs(now).count()
     cancelled = cancelled_qs.count()
     # by_plan 은 세 버킷을 합친 모집단 — Σ count == total 이 성립해야 한다
+    trialing = base.filter(status=SubscriptionStatus.TRIALING)
     rows, total = _plan_count_rows(base.filter(Q(pk__in=trialing) | Q(pk__in=cancelled_qs)))
     return {
         "total": total,
@@ -3612,12 +3617,8 @@ def _snapshot(now) -> dict:
       period=all 의 funnel.activation.count(코호트=전체)와 일치해야 하므로 판정 축을
       _cohort_qs(pg/cp)와 동일하게 맞춘다.
     """
-    paid_user_ids = PaymentHistory.objects.filter(status=PaymentStatus.PAID).values("user_id")
-    paying_rows, paying_total = _plan_count_rows(
-        UserSubscription.objects.filter(
-            user_id__in=paid_user_ids, status=SubscriptionStatus.ACTIVE
-        ).exclude(plan__name__in=_PAID_EXCLUDE)
-    )
+    # SNAP-1: 모수는 snapshot_rosters.paying_subscriptions_qs 정본 (명단 재사용).
+    paying_rows, paying_total = _plan_count_rows(paying_subscriptions_qs())
     trial_rows, trial_total = _plan_count_rows(
         UserSubscription.objects.filter(
             status=SubscriptionStatus.TRIALING, billing_key_issued_at__isnull=False
@@ -3653,6 +3654,45 @@ def _snapshot(now) -> dict:
         "visitors": visitors,
         "signups": User.objects.count(),
         "activated": len(page_owners | campaign_owners),
+        # SNAP-1/2: 타일을 만든 **그 행들**의 id 를 함께 캐시에 담는다. 명단 엔드포인트가
+        # 이 집합 위에서 페이지네이션하므로 `타일 숫자 == 명단 count` 가 캐시 지연과
+        # 무관하게 성립한다(요청서 §공통 ② 1번안). 값(plan_name/bucket)까지 함께 얼려
+        # `?plan=`·`?bucket=` 의 부분합도 by_plan/버킷 카운트와 정확히 일치시킨다.
+        # 응답에는 나가지 않는다 — _SnapshotSerializer 에 선언된 필드만 직렬화된다.
+        "_roster_ids": _roster_id_maps(now),
+    }
+
+
+def _roster_id_maps(now) -> dict:
+    """명단 엔드포인트용 id→축 매핑. 상한 초과 시 None (뷰가 라이브로 폴백).
+
+    Redis 를 다른 기능과 공유하므로 캐시 항목이 무한히 커지면 안 된다. 현재 규모(수십~수백)
+    에서는 수 KB 라 문제없고, 상한을 넘으면 명단은 라이브로 계산되고 응답의 ``as_of`` 가
+    지금 시각이 되어 화면이 "타일과 다를 수 있음"을 시각 차이로 드러낸다.
+    """
+    paying = {
+        str(pk): plan
+        for pk, plan in paying_subscriptions_qs().values_list("pk", "plan__name")[
+            : SNAPSHOT_ROSTER_ID_CACHE_MAX + 1
+        ]
+    }
+    trial = {
+        str(pk): BUCKET_WILL_CHARGE
+        for pk in trial_will_charge_qs(now).values_list("pk", flat=True)[
+            : SNAPSHOT_ROSTER_ID_CACHE_MAX + 1
+        ]
+    }
+    trial.update(
+        {
+            str(pk): BUCKET_CANCELLED
+            for pk in trial_cancelled_qs(now).values_list("pk", flat=True)[
+                : SNAPSHOT_ROSTER_ID_CACHE_MAX + 1
+            ]
+        }
+    )
+    return {
+        "paying": None if len(paying) > SNAPSHOT_ROSTER_ID_CACHE_MAX else paying,
+        "trial": None if len(trial) > SNAPSHOT_ROSTER_ID_CACHE_MAX else trial,
     }
 
 

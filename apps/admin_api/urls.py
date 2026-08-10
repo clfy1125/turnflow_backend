@@ -50,6 +50,7 @@ from apps.admin_api.views.referral import (
     AdminReferralCodeListCreateView,
     AdminReferralCodeRedemptionsView,
 )
+from apps.admin_api.views.snapshot import AdminPayingSnapshotView, AdminTrialSnapshotView
 from apps.admin_api.views.spam import AdminSpamLogListView
 from apps.admin_api.views.users import (
     AdminUserDetailView,
@@ -81,6 +82,10 @@ urlpatterns = [
         AdminMarketingDashboardView.as_view(),
         name="dashboard-marketing",
     ),
+    # B-2. 전체 현황 타일 → 회원 명단 (SNAP-1/2). 최고 관리자 전용 —
+    #      /admin/snapshot/** 는 RBAC 화이트리스트에 없어 marketing_viewer 는 403.
+    path("snapshot/paying/", AdminPayingSnapshotView.as_view(), name="snapshot-paying"),
+    path("snapshot/trial/", AdminTrialSnapshotView.as_view(), name="snapshot-trial"),
     # C. 회원(계정) 관리
     path("users/", AdminUserListView.as_view(), name="user-list"),
     path("users/<int:pk>/", AdminUserDetailView.as_view(), name="user-detail"),

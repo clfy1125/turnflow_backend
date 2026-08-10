@@ -130,3 +130,10 @@ MARKETING_DASHBOARD_ALL_CACHE_TTL = 900  # 초
 # ⚠️ refresh=1 은 이 키까지 함께 우회해야 한다 — 안 그러면 상단 고정 패널만 15분 스테일로
 # 남아 "새로고침했는데 일부 숫자만 안 바뀐다"가 된다.
 MARKETING_DASHBOARD_SNAPSHOT_CACHE_TTL = 900  # 초
+# SNAP-1/2: 명단(/admin/snapshot/paying|trial/)은 타일을 만든 **그 행들의 id 집합**을 같은
+# 캐시 항목에서 읽어 페이지네이션한다 → 타일 숫자와 명단 count 가 캐시 지연과 무관하게
+# 일치한다. Redis 를 다른 기능과 공유하므로 집합 크기에 상한을 둔다: 넘으면 id 를 담지 않고
+# 명단이 라이브로 계산되며, 응답 `as_of` 가 지금 시각이 되어 불일치가 시각 차이로 드러난다.
+SNAPSHOT_ROSTER_ID_CACHE_MAX = 5000
+# 명단 CSV 내보내기용 page_size 상한 (프론트 요청: 500).
+SNAPSHOT_ROSTER_MAX_PAGE_SIZE = 500

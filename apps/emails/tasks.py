@@ -13,6 +13,8 @@ from django.contrib.auth import get_user_model
 from django.utils import timezone
 
 from .constants import (
+    TEMPLATE_CONSENT_MISSING_DOWNGRADE,
+    TEMPLATE_CONVERSION_CONSENT,
     TEMPLATE_EMAIL_VERIFICATION,
     TEMPLATE_INSTA_REPORT_READY,
     TEMPLATE_ONBOARDING_DAY_3,
@@ -172,6 +174,44 @@ def send_pause_resume_reminder_email(user_id: int, ctx: dict | None = None) -> N
         )
     except EmailTemplateMissing:
         logger.error("pause_resume_reminder template missing — run seed_email_templates")
+
+
+@shared_task(name="emails.send_conversion_consent_email")
+def send_conversion_consent_email(user_id: int, ctx: dict | None = None) -> None:
+    """유료전환 2차 동의 요청 메일 (D-14 / D-3). billing.notify_conversion_consent 가 호출.
+
+    ⚠️ 이 메일은 **알림**이다 — 열람·링크 클릭을 동의로 처리하지 않는다. 동의는 앱 화면의
+    버튼(POST /billing/consents/)으로만 성립한다. 수신 동의(marketing_opt_in)와 무관하게
+    발송한다: 결제 예정 고지는 거래 정보성 메일이다.
+    """
+    try:
+        user = User.objects.get(pk=user_id, is_active=True)
+    except User.DoesNotExist:
+        return
+    try:
+        send_email(
+            TEMPLATE_CONVERSION_CONSENT, user.email, _payment_context(user, ctx or {}), user=user
+        )
+    except EmailTemplateMissing:
+        logger.error("conversion_consent template missing — run seed_email_templates")
+
+
+@shared_task(name="emails.send_consent_missing_downgrade_email")
+def send_consent_missing_downgrade_email(user_id: int, ctx: dict | None = None) -> None:
+    """미동의로 결제하지 않고 무료 전환했음을 알리는 사후 안내 메일."""
+    try:
+        user = User.objects.get(pk=user_id, is_active=True)
+    except User.DoesNotExist:
+        return
+    try:
+        send_email(
+            TEMPLATE_CONSENT_MISSING_DOWNGRADE,
+            user.email,
+            _payment_context(user, ctx or {}),
+            user=user,
+        )
+    except EmailTemplateMissing:
+        logger.error("consent_missing_downgrade template missing — run seed_email_templates")
 
 
 @shared_task(name="emails.send_winback_email")

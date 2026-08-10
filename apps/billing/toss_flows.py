@@ -485,6 +485,130 @@ def _consume_referral(user, code: ReferralCode, now, trial_ends) -> ReferralRede
 
 
 # ──────────────────────────────────────────────
+# preview — 결제 **전** 고지용 견적 (부작용 없음)
+# ──────────────────────────────────────────────
+
+
+def preview_subscription(
+    user,
+    *,
+    plan_name: str,
+    extra_ig_accounts: int = 0,
+    referral_code: str | None = None,
+    now=None,
+) -> dict:
+    """ "지금 이 플랜을 결제하면" 의 체험 종료일·첫 결제일·금액 — **읽기 전용**.
+
+    전자상거래법 §13② 는 계약 체결 **전에** 가격·결제 시기를 고지하라고 요구한다. 그런데
+    신규 구독은 이 값들이 ``confirm_billing`` 안에서 처음 확정되므로, 프론트가 고지 화면에
+    쓸 값이 없어 **자체 날짜 계산**을 하고 있었다(오늘+30일). 서버 계산과 하루라도 어긋나면
+    그 자체가 허위 고지이므로, ``confirm_billing`` 과 **같은 시나리오 판정·같은 상수**로
+    계산한 값을 내려준다.
+
+    부작용 금지: 구독 행 생성 없음(``ensure_subscription`` 을 부르지 않는다), 쿠폰 소진 없음,
+    토스 호출 없음. 제휴 코드는 유효성만 확인한다.
+
+    Returns: {scenario, is_trial, trial_days, trial_ends_at, trial_last_day,
+              first_charge_at, first_charge_amount, recurring_amount, next_renewal_at,
+              plan, extra_ig_accounts, extra_ig_account_price, referral_code}
+    Raises: BillingFlowError
+    """
+    now = now or timezone.now()
+
+    try:
+        plan = SubscriptionPlan.objects.get(name=plan_name, is_active=True)
+    except SubscriptionPlan.DoesNotExist:
+        raise BillingFlowError("플랜을 찾을 수 없습니다.", status_code=404) from None
+    if plan.name == "free":
+        raise BillingFlowError("무료 플랜은 결제가 필요하지 않습니다.")
+    if plan.name == "admin":
+        raise BillingFlowError("관리자 플랜은 결제 대상이 아닙니다.")
+    if extra_ig_accounts and plan.name != "pro":
+        raise BillingFlowError("추가 IG 계정은 프로 플랜에서만 구매할 수 있습니다.")
+
+    # 구독 행이 없는 신규 사용자도 견적을 볼 수 있어야 한다 → get_or_create 하지 않고 조회만.
+    sub = UserSubscription.objects.select_related("plan").filter(user=user).first()
+
+    # ── 시나리오 판정 (confirm_billing 과 동일한 순서·조건) ──
+    if sub is not None and sub.status == SubscriptionStatus.TRIALING:
+        if sub.plan_id != plan.id:
+            raise BillingFlowError(
+                "트라이얼 중에는 플랜을 변경할 수 없습니다. 트라이얼 종료 후 변경해주세요."
+            )
+        scenario = "attach_only"
+    elif sub is not None and sub.is_paid_plan and sub.plan.name != "admin":
+        raise BillingFlowError(
+            "이미 유료 구독 중입니다. 플랜 변경 견적은 POST /billing/change-plan/preview/, "
+            "추가 계정 견적은 POST /billing/extra-accounts/preview/ 를 사용해주세요."
+        )
+    elif plan.name == "pro" and (sub is None or sub.trial_used_at is None):
+        scenario = "trial"
+    else:
+        scenario = "charge_now"
+
+    referral = None
+    bonus_days = 0
+    if referral_code:
+        if scenario != "trial":
+            raise BillingFlowError(
+                "제휴 코드는 프로 플랜 최초 구독(무료 체험 시작) 시에만 사용할 수 있습니다."
+            )
+        referral = _validate_referral_for_trial(user, referral_code)
+        bonus_days = referral.trial_days
+
+    full_amount = get_current_selling_price(plan)
+    if plan.name == "pro":
+        full_amount += EXTRA_IG_ACCOUNT_PRICE * extra_ig_accounts
+
+    if scenario == "attach_only":
+        # 이미 체험 중 — 기간은 불변(트라이얼 적층 금지)이므로 서버가 가진 실제 값을 준다.
+        trial_ends = sub.current_period_end
+        trial_days = sub.trial_total_days
+        first_charge_at = trial_ends
+        first_charge_amount = sub.renewal_amount
+        recurring_amount = sub.renewal_amount
+        is_trial = True
+    elif scenario == "trial":
+        trial_days = TRIAL_BASE_DAYS + bonus_days
+        trial_ends = now + timedelta(days=trial_days)
+        first_charge_at = trial_ends
+        first_charge_amount = full_amount
+        recurring_amount = full_amount
+        is_trial = True
+    else:  # charge_now — 오늘 즉시 청구
+        trial_days = 0
+        trial_ends = None
+        first_charge_at = now
+        first_charge_amount = full_amount
+        recurring_amount = full_amount
+        is_trial = False
+
+    next_renewal_at = first_charge_at + timedelta(days=PERIOD_DAYS) if first_charge_at else None
+    # 체험 '마지막 이용일' = 첫 결제일의 전날 (표기용). trial_ends_at 은 결제가 일어나는
+    # 시각 그 자체라 날짜로 찍으면 하루 더 써도 되는 것처럼 보인다.
+    trial_last_day = None
+    if trial_ends is not None:
+        trial_last_day = timezone.localdate(trial_ends) - timedelta(days=1)
+
+    return {
+        "scenario": scenario,
+        "is_trial": is_trial,
+        "trial_days": trial_days,
+        "trial_ends_at": trial_ends,
+        "trial_last_day": trial_last_day,
+        "first_charge_at": first_charge_at,
+        "first_charge_amount": first_charge_amount,
+        "recurring_amount": recurring_amount,
+        "next_renewal_at": next_renewal_at,
+        "plan": plan,
+        "extra_ig_accounts": extra_ig_accounts,
+        "extra_ig_account_price": EXTRA_IG_ACCOUNT_PRICE,
+        "referral_code": referral.code if referral else None,
+        "referral_bonus_days": bonus_days,
+    }
+
+
+# ──────────────────────────────────────────────
 # confirm — 빌링키 등록 + 구독 시작/카드 변경
 # ──────────────────────────────────────────────
 
@@ -619,6 +743,11 @@ def confirm_billing(
             locked.renewal_attempts = 0
             locked.next_billing_retry_at = None
             locked.last_billing_error = ""
+            # 유료전환 2차 동의: **새 체험은 새 동의를 받는다**. 지난 체험의 동의를 남기면
+            # 44일 체험을 다시 시작한 사용자가 옛 동의로 게이트를 통과한다(consent.py).
+            locked.conversion_consent_at = None
+            locked.conversion_consent_notice_sent_at = None
+            locked.conversion_consent_reminder_sent_at = None
             locked.save(
                 update_fields=key_fields
                 + [
@@ -634,6 +763,9 @@ def confirm_billing(
                     "renewal_attempts",
                     "next_billing_retry_at",
                     "last_billing_error",
+                    "conversion_consent_at",
+                    "conversion_consent_notice_sent_at",
+                    "conversion_consent_reminder_sent_at",
                     "updated_at",
                 ]
             )

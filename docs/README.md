@@ -21,6 +21,7 @@
 - [TOSS_BILLING_FRONTEND.md](frontend/TOSS_BILLING_FRONTEND.md) — 토스 빌링 연동(카드등록 → prepare/confirm, 체험·해지·카드변경)
 - [CANCEL_RETENTION_FRONTEND.md](frontend/CANCEL_RETENTION_FRONTEND.md) — 해지 리텐션(일시정지·50% 할인·윈백)
 - [REFERRAL_COUPON_FRONTEND.md](frontend/REFERRAL_COUPON_FRONTEND.md) — 쿠폰/제휴코드(무카드 redeem 폐지 + 결제 전 미리보기)
+- [PAYMENT_CONSENT_FRONTEND.md](frontend/PAYMENT_CONSENT_FRONTEND.md) — **결제 전 고지·동의 + 유료전환 2차 동의**(견적 preview · 동의 원장 · 미동의 시 무과금 무료전환)
 - [MARKETING_OPT_IN_FRONTEND.md](frontend/MARKETING_OPT_IN_FRONTEND.md) — 마케팅 수신동의
 
 **IG 연동**
@@ -39,6 +40,9 @@
 - [DM_CAMPAIGN_THUMBNAIL_FRONTEND.md](frontend/DM_CAMPAIGN_THUMBNAIL_FRONTEND.md) — 썸네일 재호스팅
 - [DM_USER_COPY_MAPPING.md](frontend/DM_USER_COPY_MAPPING.md) · [USER_CONSOLE_DM_COPY_REQUEST.md](frontend/USER_CONSOLE_DM_COPY_REQUEST.md) — 유저 콘솔 DM 문구
 - [USER_NOTIFICATION_PLAN.md](frontend/USER_NOTIFICATION_PLAN.md) — 사용자 알림 계획(구현 전)
+
+**어드민 콘솔**
+- [ADMIN_SNAPSHOT_ROSTER_RESPONSE.md](frontend/ADMIN_SNAPSHOT_ROSTER_RESPONSE.md) — 18차 회신(SNAP-1/2) · 전체 현황 타일 → 회원 명단(`/admin/snapshot/paying|trial/`, 타일-명단 항등·id 집합 캐시)
 
 **기타**
 - [INSTA_REPORT_FRONTEND.md](frontend/INSTA_REPORT_FRONTEND.md) — 인스타 성장 리포트(프로 전용·월1회)

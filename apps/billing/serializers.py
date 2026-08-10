@@ -123,6 +123,20 @@ class UserSubscriptionSerializer(serializers.ModelSerializer):
         read_only=True,
         help_text="리텐션 할인(다음 1회 50%) 지금 받을 수 있는지(1인 1회·active 유료·카드 보유)",
     )
+    conversion_consent_required = serializers.BooleanField(
+        read_only=True,
+        help_text=(
+            "유료전환 2차 동의 대상인가 — true 면 프론트가 동의 모달을 띄운다. "
+            "판정은 서버 단일 소스(apps/billing/consent.py): 체험 30일 초과 + 미동의 + "
+            "첫 결제 30일 이내 + 카드 보유. **30일 체험자는 항상 false**(결제 화면 동의로 충족). "
+            "미동의 상태로 체험이 끝나면 결제하지 않고 무료 플랜으로 전환된다"
+        ),
+    )
+    trial_total_days = serializers.IntegerField(
+        read_only=True,
+        allow_null=True,
+        help_text="이번 체험의 총 일수(쿠폰 보너스 포함). 체험이 아니면 null 이거나 무의미",
+    )
 
     class Meta:
         model = None  # set below
@@ -144,6 +158,10 @@ class UserSubscriptionSerializer(serializers.ModelSerializer):
             "ig_activation_review_needed",
             "trial_used_at",
             "cancelled_at",
+            # 유료전환 2차 동의 (전자상거래법 §13⑥)
+            "conversion_consent_required",
+            "conversion_consent_at",
+            "trial_total_days",
             # 리텐션: 일시정지
             "pause_ends_at",
             "paused_months",
@@ -491,14 +509,153 @@ class ReferralRedemptionSerializer(serializers.ModelSerializer):
         return obj.trial_ends_at > timezone.now() and not obj.converted_to_paid
 
 
+# ──────────────────────────────────────────────
+# 결제 전 고지 — 견적(preview) + 동의 기록
+# ──────────────────────────────────────────────
+
+
+class SubscriptionPreviewSerializer(serializers.Serializer):
+    """신규 구독 견적 — 결제 화면(고지 시트)이 **그대로 표기**할 값."""
+
+    scenario = serializers.CharField(
+        help_text="trial(무료 체험 시작) / attach_only(이미 체험 중 카드 등록) / "
+        "charge_now(즉시 첫 결제). 프론트 분기용"
+    )
+    is_trial = serializers.BooleanField(
+        help_text="true 면 오늘 청구 없음(체험 시작). false 면 오늘 first_charge_amount 즉시 청구"
+    )
+    trial_days = serializers.IntegerField(
+        help_text="총 무료 일수 (기본 30 + 제휴코드 보너스). is_trial=false 면 0. "
+        "⚠️ 보너스분만 따로 노출하면 혜택이 축소돼 보인다 — 이 값이 표기용 정본"
+    )
+    trial_ends_at = serializers.DateTimeField(
+        allow_null=True,
+        help_text="체험이 종료되는 **시각** = 첫 결제 시각(first_charge_at 과 동일). "
+        "날짜로 찍어 '체험 마지막 날'로 쓰면 하루 늘어나 보인다 → 표기는 trial_last_day 사용",
+    )
+    trial_last_day = serializers.DateField(
+        allow_null=True,
+        help_text="체험 **마지막 이용일** (= 첫 결제일 − 1일, KST). "
+        "고지 문구의 '~까지 무료' 에 쓰는 값",
+    )
+    first_charge_at = serializers.DateTimeField(
+        allow_null=True, help_text="첫 결제 시각 (= 유료 전환 시점). charge_now 면 지금"
+    )
+    first_charge_amount = serializers.IntegerField(help_text="첫 결제 금액(원, 부가세 포함)")
+    recurring_amount = serializers.IntegerField(help_text="이후 매월 결제 금액(원, 부가세 포함)")
+    next_renewal_at = serializers.DateTimeField(
+        allow_null=True, help_text="첫 결제 다음 갱신 시각 (= first_charge_at + 30일)"
+    )
+    plan = SubscriptionPlanSerializer(help_text="견적 대상 플랜")
+    extra_ig_accounts = serializers.IntegerField(help_text="견적에 반영된 추가 IG 계정 수")
+    extra_ig_account_price = serializers.IntegerField(help_text="추가 IG 계정 1개당 월 단가(원)")
+    referral_code = serializers.CharField(
+        allow_null=True, help_text="적용된 제휴 코드 (없으면 null)"
+    )
+    referral_bonus_days = serializers.IntegerField(help_text="제휴 코드가 더한 보너스 일수")
+
+
+class _TolerantDateField(serializers.DateField):
+    """``YYYY-MM-DD`` 와 ISO datetime 을 모두 받아 **날짜**로 저장한다.
+
+    프론트가 화면에 표시한 첫 결제일을 그대로 실어 보내는 필드라, 어떤 포맷으로 오든
+    거부하지 않는 편이 낫다 — 여기서 400 을 내면 **동의 기록이 남지 않는다**(증거 소실).
+    """
+
+    def to_internal_value(self, value):
+        if isinstance(value, str) and "T" in value:
+            value = value.split("T", 1)[0]
+        return super().to_internal_value(value)
+
+
+class PaymentConsentCreateSerializer(serializers.Serializer):
+    """동의 기록 저장 요청. 세 동의가 **모두 true** 여야 유효한 동의로 받는다."""
+
+    kind = serializers.ChoiceField(
+        choices=["initial", "conversion"],
+        help_text="initial=결제 화면(카드 등록 직전) / conversion=유료전환 2차 동의(첫 결제 전)",
+    )
+    plan_name = serializers.CharField(
+        max_length=30, help_text="고지한 플랜 코드명 (basic/pro). 화면에 표시한 그 플랜"
+    )
+    disclosed_first_charge_at = _TolerantDateField(
+        required=False,
+        allow_null=True,
+        help_text="화면에 표시한 첫 결제일 (YYYY-MM-DD). 견적 응답의 first_charge_at 날짜부",
+    )
+    disclosed_amount = serializers.IntegerField(
+        min_value=0, help_text="화면에 표시한 금액(원, 부가세 포함)"
+    )
+    disclosed_recurring_cycle = serializers.CharField(
+        max_length=20, required=False, default="monthly", help_text="고지한 결제 주기"
+    )
+    payment_method_type = serializers.CharField(
+        max_length=20, required=False, default="card", help_text="결제수단 종류"
+    )
+    copy_version = serializers.CharField(
+        max_length=64, help_text="동의 문구 버전 (예: billingConsent@2026-08-10)"
+    )
+    agreed_terms = serializers.BooleanField(help_text="이용약관 동의 — false 면 400")
+    agreed_privacy = serializers.BooleanField(help_text="개인정보 수집·이용 동의 — false 면 400")
+    agreed_recurring = serializers.BooleanField(
+        help_text="정기결제(자동 유료전환) 동의 — false 면 400"
+    )
+
+    def validate(self, attrs):
+        missing = [
+            name
+            for name in ("agreed_terms", "agreed_privacy", "agreed_recurring")
+            if not attrs.get(name)
+        ]
+        if missing:
+            # 공정위: 명시적으로 동의하지 않으면 '동의 없음' 으로 처리해야 한다 —
+            # 일부만 체크된 상태를 동의로 기록하면 그 기록 자체가 무효 증거가 된다.
+            raise serializers.ValidationError(
+                {
+                    name: "이 항목에 동의하지 않으면 동의 기록을 저장할 수 없습니다."
+                    for name in missing
+                }
+            )
+        return attrs
+
+
+class PaymentConsentSerializer(serializers.ModelSerializer):
+    """저장된 동의 기록 (201 응답 / 조회)."""
+
+    class Meta:
+        model = None  # set below
+        fields = [
+            "id",
+            "kind",
+            "plan_name",
+            "disclosed_first_charge_at",
+            "disclosed_amount",
+            "disclosed_recurring_cycle",
+            "payment_method_type",
+            "copy_version",
+            "agreed_terms",
+            "agreed_privacy",
+            "agreed_recurring",
+            "consented_at",
+        ]
+        read_only_fields = fields
+
+
 # Avoid circular import: set model references after class definition
 def _patch_serializer_models():
-    from .models import PaymentHistory, ReferralRedemption, SubscriptionPlan, UserSubscription
+    from .models import (
+        PaymentConsent,
+        PaymentHistory,
+        ReferralRedemption,
+        SubscriptionPlan,
+        UserSubscription,
+    )
 
     SubscriptionPlanSerializer.Meta.model = SubscriptionPlan
     UserSubscriptionSerializer.Meta.model = UserSubscription
     PaymentHistorySerializer.Meta.model = PaymentHistory
     ReferralRedemptionSerializer.Meta.model = ReferralRedemption
+    PaymentConsentSerializer.Meta.model = PaymentConsent
 
 
 _patch_serializer_models()

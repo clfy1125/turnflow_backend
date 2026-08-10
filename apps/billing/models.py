@@ -448,6 +448,33 @@ class UserSubscription(models.Model):
         help_text="1인 1회 — 부여되면 기록, 재부여 차단(어뷰징 방어)",
     )
 
+    # ── 유료전환 2차 동의 (전자상거래법 §13⑥ / 시행령 §20-2) ──
+    # 판정 로직은 apps/billing/consent.py 가 단일 소스다 (프론트 플래그·안내 메일·과금
+    # 게이트 셋이 같은 답을 보게 하기 위함). 여기 있는 건 상태 필드뿐.
+    conversion_consent_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="유료전환 2차 동의 시각",
+        help_text=(
+            "30일 초과 체험(쿠폰 연장)의 첫 결제 전 재동의 시각. null 이면 미동의 — "
+            "체험 종료 과금이 차단되고 무료로 전환된다(consent.blocks_first_charge). "
+            "체험을 새로 시작하면 초기화된다(지난 체험의 동의가 다음 체험을 통과시키면 안 됨)."
+        ),
+    )
+    conversion_consent_notice_sent_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="2차 동의 요청 메일(D-14) 발송 시각",
+        help_text="중복 발송 방지. 체험 재시작 시 초기화",
+    )
+    conversion_consent_reminder_sent_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="2차 동의 리마인드 메일(D-3) 발송 시각",
+        help_text="중복 발송 방지. 체험 재시작 시 초기화",
+    )
+
     cancelled_at = models.DateTimeField(null=True, blank=True)
     page_activation_changed_at = models.DateTimeField(
         null=True,
@@ -538,6 +565,29 @@ class UserSubscription(models.Model):
         ):
             return False
         return True
+
+    @property
+    def trial_total_days(self) -> int | None:
+        """이번 체험의 총 일수 (반올림). 체험 경계를 모르면 None.
+
+        프론트 표기용 — 쿠폰 체험이면 44 처럼 보너스가 합산된 값이다.
+        """
+        from .consent import trial_length_days
+
+        length = trial_length_days(self)
+        return None if length is None else round(length)
+
+    @property
+    def conversion_consent_required(self) -> bool:
+        """지금 유료전환 2차 동의 모달을 띄워야 하는가 (apps/billing/consent.py 단일 소스).
+
+        ⚠️ 프론트가 체험 길이를 역산해 자체 판정하지 않도록 **서버가 내려주는 값**이다.
+        과금 차단 게이트(consent.blocks_first_charge)와 같은 모듈에서 파생되므로
+        "모달은 떴는데 그냥 결제된다"가 구조적으로 발생하지 않는다.
+        """
+        from .consent import conversion_consent_required
+
+        return conversion_consent_required(self)
 
     @property
     def retention_discount_available(self) -> bool:
@@ -662,6 +712,107 @@ class PaymentHistory(models.Model):
 
     def __str__(self):
         return f"{self.user.email} - {self.amount}원 ({self.status})"
+
+
+# ──────────────────────────────────────────────
+# 결제 전 고지·동의 기록 (전자상거래법 §13②⑥)
+# ──────────────────────────────────────────────
+
+
+class ConsentKind(models.TextChoices):
+    INITIAL = "initial", "결제 화면 동의 (카드 등록 직전)"
+    CONVERSION = "conversion", "유료전환 2차 동의 (첫 결제 전)"
+
+
+class PaymentConsent(models.Model):
+    """사용자가 **무엇을 보고 무엇에 동의했는지**의 증거 원장 (append-only).
+
+    분쟁(무동의 결제 주장 · 카드 차지백 · 소비자원)에서 재현해야 하는 것은 "동의했다"가
+    아니라 **그때 화면에 뜬 금액·첫 결제일·문구 버전**이다. 그래서 판정에 쓰이는 현재
+    상태(UserSubscription.conversion_consent_at)와 별개로, 고지 내용을 **그 시점 값으로
+    스냅샷**해 둔다 — 나중에 가격 정책이 바뀌어도 당시 고지가 남는다.
+
+    - 수정·삭제하지 않는다. 동의 철회는 새 행이 아니라 구독 해지로 표현된다.
+    - 세 동의를 각각 저장한다(약관/개인정보/정기결제) — 구분 동의 요건.
+    - ``kind=initial`` 은 결제 화면(카드 등록 직전), ``kind=conversion`` 은 30일 초과
+      체험의 첫 결제 전 재동의. 한 사용자에게 여러 행이 쌓일 수 있다(재구독 등).
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="payment_consents",
+    )
+    subscription = models.ForeignKey(
+        UserSubscription,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="payment_consents",
+        help_text="동의 시점의 구독 행. 구독이 지워져도 동의 기록은 남는다(SET_NULL).",
+    )
+    kind = models.CharField(max_length=20, choices=ConsentKind.choices, db_index=True)
+
+    # ── 그때 화면에 고지한 내용 (스냅샷 — 사후 정책 변경과 무관하게 보존) ──
+    plan_name = models.CharField(max_length=30, verbose_name="고지한 플랜 코드명")
+    disclosed_first_charge_at = models.DateField(
+        null=True,
+        blank=True,
+        verbose_name="고지한 첫 결제일",
+        help_text="화면에 표시한 날짜 그대로 (KST 기준 날짜). 서버 계산값과 다르면 그 자체가 증거",
+    )
+    disclosed_amount = models.IntegerField(verbose_name="고지한 금액(원, 부가세 포함)")
+    disclosed_recurring_cycle = models.CharField(
+        max_length=20,
+        default="monthly",
+        verbose_name="고지한 결제 주기",
+    )
+    payment_method_type = models.CharField(
+        max_length=20,
+        default="card",
+        verbose_name="결제수단 종류",
+    )
+    copy_version = models.CharField(
+        max_length=64,
+        verbose_name="동의 문구 버전",
+        help_text="예: billingConsent@2026-08-10. 문구를 바꾸면 어느 버전에 동의했는지 달라진다",
+    )
+
+    # ── 구분 동의 (각각 기록) ──
+    agreed_terms = models.BooleanField(verbose_name="이용약관 동의")
+    agreed_privacy = models.BooleanField(verbose_name="개인정보 수집·이용 동의")
+    agreed_recurring = models.BooleanField(verbose_name="정기결제(자동 유료전환) 동의")
+
+    # ── 요청 컨텍스트 ──
+    ip_address = models.GenericIPAddressField(null=True, blank=True, verbose_name="요청 IP")
+    user_agent = models.CharField(max_length=300, blank=True, default="")
+    session_key = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        verbose_name="세션/요청 식별자",
+        help_text="세션 키 또는 X-Request-ID — 동의 요청을 서버 로그와 이어붙이는 축",
+    )
+
+    consented_at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    class Meta:
+        db_table = "payment_consents"
+        verbose_name = "결제 동의 기록"
+        verbose_name_plural = "결제 동의 기록"
+        ordering = ["-consented_at"]
+        indexes = [
+            models.Index(fields=["user", "kind", "-consented_at"], name="pconsent_user_kind_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.user_id} {self.kind} {self.plan_name} ({self.consented_at:%Y-%m-%d})"
+
+    @property
+    def all_agreed(self) -> bool:
+        """세 동의를 모두 받았는가 — 하나라도 빠지면 유효한 동의가 아니다."""
+        return bool(self.agreed_terms and self.agreed_privacy and self.agreed_recurring)
 
 
 # ──────────────────────────────────────────────

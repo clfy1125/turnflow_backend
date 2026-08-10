@@ -182,6 +182,117 @@ def payment_failed_email(sub, payment, code: str, message: str) -> None:
         logger.exception("결제 실패 메일 enqueue 실패 user_id=%s", getattr(sub, "user_id", "?"))
 
 
+def conversion_consent_email(sub, *, days_left: int) -> None:
+    """유료전환 2차 동의 요청 메일 enqueue (D-14 / D-3 공용, best-effort).
+
+    **이메일은 알림·유입 경로일 뿐 동의가 아니다** — 열람·클릭을 동의로 처리하지 않는다
+    (그 클릭이 '동의' 인지 '내용 확인' 인지 구분할 수 없고, 열람 추적은 증거가 되지 않는다).
+    실제 동의는 앱의 동의 화면에서 ``POST /billing/consents/`` 로 받는다.
+    """
+    from django.conf import settings
+
+    try:
+        from apps.emails.tasks import send_conversion_consent_email
+
+        path = getattr(settings, "CONVERSION_CONSENT_PATH", "/billing/consent")
+        ctx = {
+            "plan_name": sub.plan.display_name,
+            "amount_str": f"{sub.renewal_amount:,}",
+            "first_charge_date": _fmt_local_date(sub.current_period_end),
+            "days_left": days_left,
+            "consent_url": f"{settings.FRONTEND_URL}{path}",
+        }
+        send_conversion_consent_email.delay(sub.user_id, ctx)
+    except Exception:  # noqa: BLE001 — 메일 실패가 동의 파이프라인을 막으면 안 됨
+        logger.exception("2차 동의 요청 메일 enqueue 실패 user_id=%s", getattr(sub, "user_id", "?"))
+
+
+def consent_missing_downgrade_email(sub, ctx: dict) -> None:
+    """미동의로 결제하지 않고 무료 전환했음을 **사후 안내** (best-effort).
+
+    "결제되지 않았다 + 무료 플랜이다 + 데이터는 그대로다 + 다시 시작할 수 있다" 네 가지를
+    알린다. 이 메일이 없으면 사용자는 유료 기능이 사라진 이유를 알 수 없다.
+    """
+    from django.conf import settings
+
+    try:
+        from apps.emails.tasks import send_consent_missing_downgrade_email
+
+        path = getattr(settings, "CONVERSION_CONSENT_PATH", "/billing/consent")
+        payload = dict(ctx)
+        payload["consent_url"] = f"{settings.FRONTEND_URL}{path}"
+        send_consent_missing_downgrade_email.delay(sub.user_id, payload)
+    except Exception:  # noqa: BLE001
+        logger.exception("무동의 무료전환 안내 메일 enqueue 실패 user_id=%s", sub.user_id)
+
+
+def _consent_blocks_charge(sub_id) -> bool:
+    """이 구독의 첫 과금을 2차 동의 미비로 막아야 하는가 (읽기 전용)."""
+    from .consent import blocks_first_charge
+    from .models import UserSubscription
+
+    sub = UserSubscription.objects.select_related("plan").filter(id=sub_id).first()
+    return sub is not None and blocks_first_charge(sub)
+
+
+def _skip_charge_missing_consent(sub_id) -> dict:
+    """2차 동의 없는 체험 종료 → **결제하지 않고** 무료 플랜으로 전환 + 사후 안내.
+
+    보존: 페이지·캠페인·설정·DM 로그·IG 연동 토큰 전부 (``_downgrade_to_free`` 규약).
+    재구독하면 그대로 복원된다. 빌링키는 **삭제한다** — 동의 없는 결제수단을 계속 보관할
+    근거가 없고, 남겨두면 다음 갱신 배치가 다시 이 구독을 집는다.
+    """
+    from .consent import blocks_first_charge
+    from .models import UserSubscription
+    from .subscription_utils import get_free_plan
+
+    free_plan = get_free_plan()
+    if not free_plan:
+        logger.error("skip_charge_missing_consent: free 플랜이 존재하지 않음 sub=%s", sub_id)
+        return {"result": "no_free_plan"}
+
+    sub = UserSubscription.objects.select_related("plan", "user").filter(id=sub_id).first()
+    if sub is None:
+        return {"result": "missing"}
+    ctx = {
+        "plan_name": sub.plan.display_name,
+        "amount_str": f"{sub.renewal_amount:,}",
+        "trial_end_date": _fmt_local_date(sub.current_period_end),
+    }
+
+    _safe_delete_billing_key(sub, "consent_missing")
+    with transaction.atomic():
+        locked = (
+            UserSubscription.objects.select_for_update(of=("self",))
+            .select_related("plan", "user")
+            .get(pk=sub_id)
+        )
+        # 락 안에서 재검증 — 이 사이에 사용자가 동의 버튼을 눌렀을 수 있다.
+        if not blocks_first_charge(locked):
+            logger.info("skip_charge_missing_consent: 재검증에서 해제됨 sub=%s", sub_id)
+            return {"result": "consent_arrived"}
+        # _downgrade_to_free 가 clear_billing_key() 까지 수행한다 (빌링키를 남기면 다음
+        # 갱신 배치가 이 구독을 다시 집는다).
+        _downgrade_to_free(locked, free_plan, reason="conversion_consent_missing")
+
+    logger.warning(
+        "유료전환 2차 동의 없음 → 무과금 무료 전환: user=%s plan=%s amount=%s",
+        sub.user.email,
+        ctx["plan_name"],
+        ctx["amount_str"],
+    )
+    # 매출이 발생하지 않은 사건이다 — 로그만 남기면 몇 주 뒤 "매출이 왜 적지?" 로 발견된다.
+    # 동의 화면이 사고로 내려가 전원이 무료로 떨어지는 경우를 당일에 알아야 한다.
+    _ops_alert(
+        f"⚠️ 유료전환 2차 동의 없음 → 무과금 무료 전환\n"
+        f"user={sub.user.email} plan={ctx['plan_name']} "
+        f"미청구={ctx['amount_str']}원 체험종료={ctx['trial_end_date']}\n"
+        f"동의 화면이 정상인지 확인 필요 (긴급 시 CONVERSION_CONSENT_ENFORCE=False)"
+    )
+    consent_missing_downgrade_email(sub, ctx)
+    return {"result": "skipped_missing_consent"}
+
+
 # ──────────────────────────────────────────────
 # 1) 갱신 디스패처
 # ──────────────────────────────────────────────
@@ -448,6 +559,19 @@ def charge_subscription_renewal(self, sub_id: str):
     from .toss_service import TossBillingClient, TossError, TossNetworkError
 
     now = timezone.now()
+
+    # ── TXN 0: 유료전환 2차 동의 게이트 (전자상거래법 §13⑥ / 시행령 §20-2) ──
+    # 30일 초과 체험(쿠폰 연장)은 결제 화면의 동의가 30일 창을 벗어난다 → 미동의면
+    # **긁지 않는다**. 이 분기가 없으면 프론트 동의 모달은 장식이고 무동의 계정도
+    # 그냥 결제된다. 판정은 apps/billing/consent.py 단일 소스.
+    #
+    # ⚠️ 주문 행(PaymentHistory PENDING) 생성 **전에** 빠져나가야 한다. 만들어두면 토스에
+    #    존재하지 않는 orderId 를 reconcile 이 조회해 FAILED 로 확정하고, 사용자에게는
+    #    '결제 실패' 로 보인다 — 실제로는 우리가 승인을 시도하지 않은 것이다.
+    # 여기서는 락을 잡지 않는다(읽기 전용 정책 판정). 실제 전환은
+    # _skip_charge_missing_consent 가 락을 다시 잡고 재검증하므로 경합에 안전하다.
+    if _consent_blocks_charge(sub_id):
+        return _skip_charge_missing_consent(sub_id)
 
     # ── TXN 1: 락 + due 재검증 + 주문 소유권 획득 (외부 호출 전, 짧게) ──
     with transaction.atomic():
@@ -1189,6 +1313,86 @@ def notify_pause_resume_reminder():
     if sent:
         logger.info("notify_pause_resume_reminder: %d건 고지", sent)
     return {"sent": sent}
+
+
+@shared_task(name="billing.notify_conversion_consent")
+def notify_conversion_consent():
+    """유료전환 2차 동의 요청 메일 — 첫 결제 D-14 / D-3 (매일 1회).
+
+    대상: ``consent.conversion_consent_required`` 가 참인 구독 (30일 초과 체험 + 미동의 +
+    카드 보유 + 30일 창 안). 30일 체험자는 결제 화면 동의로 요건이 충족되므로 대상이 아니다.
+
+    두 시점은 **각각의 발송 마커**로 멱등하다(D-14 를 놓쳤어도 D-3 은 나간다). 배치가 하루
+    한 번이라 D-14 창을 놓칠 수 있으므로 "N일 이하 남았고 아직 안 보냄"으로 판정한다 —
+    즉 늦게라도 한 번은 나간다. 이 메일은 **알림**이고 동의는 앱 화면에서 받는다.
+    """
+    from .consent import conversion_consent_required, notice_days, reminder_days
+    from .models import SubscriptionStatus, UserSubscription
+
+    now = timezone.now()
+    n_days, r_days = notice_days(), reminder_days()
+    # 창(30일) 안의 체험 중 구독만 후보로 좁힌다 — 판정 자체는 consent.py 가 한다.
+    candidates = list(
+        UserSubscription.objects.filter(
+            status=SubscriptionStatus.TRIALING,
+            conversion_consent_at__isnull=True,
+            current_period_end__isnull=False,
+            current_period_end__gt=now,
+            current_period_end__lte=now + timedelta(days=max(n_days, r_days)),
+        )
+        .exclude(_encrypted_toss_billing_key="")
+        .select_related("plan", "user")[:500]
+    )
+
+    notices, reminders = 0, 0
+    for sub in candidates:
+        if not conversion_consent_required(sub, now=now):
+            continue
+        days_left = max(0, (sub.current_period_end - now).days)
+        if days_left <= r_days and sub.conversion_consent_reminder_sent_at is None:
+            marked = UserSubscription.objects.filter(
+                pk=sub.pk, conversion_consent_reminder_sent_at__isnull=True
+            ).update(conversion_consent_reminder_sent_at=now)
+            if marked:
+                conversion_consent_email(sub, days_left=days_left)
+                reminders += 1
+            continue
+        if days_left <= n_days and sub.conversion_consent_notice_sent_at is None:
+            marked = UserSubscription.objects.filter(
+                pk=sub.pk, conversion_consent_notice_sent_at__isnull=True
+            ).update(conversion_consent_notice_sent_at=now)
+            if marked:
+                conversion_consent_email(sub, days_left=days_left)
+                notices += 1
+
+    if notices or reminders:
+        logger.info(
+            "notify_conversion_consent: 요청(D-%d) %d건 · 리마인드(D-%d) %d건",
+            n_days,
+            notices,
+            r_days,
+            reminders,
+        )
+
+    # 조기 경보 — 리마인드 창(D-3)에 들어왔는데도 미동의인 인원은 그대로 두면 며칠 뒤
+    # 무과금 무료 전환된다. 개별 다운그레이드 알림은 사후라서, 동의 화면 장애를 **사전에**
+    # 잡으려면 "곧 떨어질 사람이 몇 명인지"를 미리 알려야 한다.
+    at_risk = [
+        s
+        for s in candidates
+        if conversion_consent_required(s, now=now)
+        and (s.current_period_end - now) <= timedelta(days=r_days)
+    ]
+    if at_risk:
+        head = ", ".join(s.user.email for s in at_risk[:5])
+        amount = sum(s.renewal_amount for s in at_risk)
+        _ops_alert(
+            f"⚠️ 유료전환 2차 동의 미완료 {len(at_risk)}명이 D-{r_days} 이내\n"
+            f"이대로면 무과금 무료 전환됩니다 (미청구 예상 {amount:,}원)\n"
+            f"{head}{' 외' if len(at_risk) > 5 else ''}\n"
+            f"동의 화면(앱)이 정상 동작하는지 확인해주세요"
+        )
+    return {"notices": notices, "reminders": reminders, "at_risk": len(at_risk)}
 
 
 @shared_task(name="billing.send_winback_emails")

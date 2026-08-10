@@ -19,6 +19,9 @@ TEMPLATE_PAYMENT_FAILED = "payment_failed"
 TEMPLATE_PAUSE_RESUME_REMINDER = "pause_resume_reminder"
 TEMPLATE_WINBACK = "winback"
 TEMPLATE_INSTA_REPORT_READY = "insta_report_ready"
+# 유료전환 2차 동의 (전자상거래법 §13⑥) — 알림용. 동의는 앱 화면에서 받는다.
+TEMPLATE_CONVERSION_CONSENT = "conversion_consent"
+TEMPLATE_CONSENT_MISSING_DOWNGRADE = "consent_missing_downgrade"
 
 TEMPLATE_KEYS = [
     TEMPLATE_EMAIL_VERIFICATION,
@@ -32,6 +35,8 @@ TEMPLATE_KEYS = [
     TEMPLATE_PAUSE_RESUME_REMINDER,
     TEMPLATE_WINBACK,
     TEMPLATE_INSTA_REPORT_READY,
+    TEMPLATE_CONVERSION_CONSENT,
+    TEMPLATE_CONSENT_MISSING_DOWNGRADE,
 ]
 
 TEMPLATE_CHOICES = [(k, k) for k in TEMPLATE_KEYS]
@@ -132,6 +137,26 @@ AVAILABLE_VARIABLES: dict[str, dict[str, str]] = {
         "videos_analyzed": "AI 가 본 영상 수",
         "comments_analyzed": "분석한 댓글 수",
         "report_url": "콘솔에서 리포트를 열 수 있는 URL",
+        "service_name": "서비스명",
+        "support_email": "고객센터 이메일",
+    },
+    TEMPLATE_CONVERSION_CONSENT: {
+        "full_name": "수신자 이름",
+        "plan_name": "체험 중인 플랜 표시명 (예: 프로)",
+        "amount_str": "첫 결제 예정 금액 (천단위 콤마, 부가세 포함)",
+        "first_charge_date": "첫 결제 예정일 (YYYY-MM-DD)",
+        "days_left": "첫 결제까지 남은 일수",
+        "consent_url": "앱의 유료전환 동의 화면 URL (딥링크)",
+        "service_name": "서비스명",
+        "support_email": "고객센터 이메일",
+    },
+    TEMPLATE_CONSENT_MISSING_DOWNGRADE: {
+        "full_name": "수신자 이름",
+        "plan_name": "체험했던 플랜 표시명",
+        "amount_str": "청구되지 않은 금액 (천단위 콤마)",
+        "trial_end_date": "체험 종료일 (YYYY-MM-DD)",
+        "consent_url": "다시 구독(동의) 화면 URL",
+        "billing_url": "콘솔 결제/구독 설정 URL",
         "service_name": "서비스명",
         "support_email": "고객센터 이메일",
     },

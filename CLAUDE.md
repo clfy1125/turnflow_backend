@@ -53,6 +53,8 @@ turnflow_backend/
 │   ├── authentication/         # User(email 로그인) + JWT + Google OAuth
 │   ├── workspace/              # Workspace(테넌트) + Membership + permissions
 │   ├── billing/                # 요금제/구독/토스 빌링 (toss_service, toss_flows, toss_views, dm_limits) + Celery 갱신 배치
+│   │                           #   consent.py = 결제 전 고지·유료전환 2차 동의 **판정 단일 소스**
+│   │                           #   (프론트 플래그·D-14/D-3 메일·과금 차단 게이트가 공유) + consent_views.py
 │   ├── integrations/           # Instagram OAuth/토큰 암호화(encryption.py)/Webhook
 │   ├── pages/                  # 페이지/게시물/DM 관련 뷰 (multi_views, image_views, stats, aiviews)
 │   ├── ai_jobs/                # LLM 작업 큐 + services(llm_client, model_router, prompt_builder)
@@ -61,6 +63,9 @@ turnflow_backend/
 │   │                           #   pipeline/(랩 이식: 수집→지표→샘플→Gemini 피처→집계→DeepSeek 합성→검증→렌더) +
 │   │                           #   quota.py + progress.py. 산출물=자기완결 HTML. 마운트: /api/v1/insta-reports/
 │   └── admin_api/              # 백오피스(어드민) 전용 API — 신원/대시보드(overview + 운영/마케팅: dashboard_ops·dashboard_marketing, 임계값=dashboard_constants.py)/회원/워크스페이스/페이지/자동DM 모니터링/레퍼럴 코드/마케팅 채널링크(marketing/channel-links — UTM 링크 서버 저장 CRUD, MarketingChannelLink·url/channel 서버 계산) (serializers/, views/ 패키지 + AdminActionLog 감사로그). 마운트: /api/v1/admin/
+│                               #   snapshot_rosters.py = 전체 현황 타일의 **모수 쿼리 단일 소스** —
+│                               #   대시보드 타일(_snapshot/_trial_now)과 명단(views/snapshot.py)이 공유해야
+│                               #   "타일 숫자 == 명단 count" 가 성립한다. 조건 복제 금지
 ├── config/                     # Django 프로젝트 설정
 │   ├── settings/               # base.py / local.py / prod.py
 │   ├── urls.py                 # 루트 URL (admin, api/v1, swagger, redoc)
@@ -266,6 +271,7 @@ make test-cov                             # HTML 커버리지 리포트
   - `billing.handle_grace_period_expiry` / `handle_cancelled_expiry` / `handle_trial_expiry` — 매시간
   - `billing.handle_pause_expiry` — 매시간 (리텐션 정지 만료 → 자동 유료 재개 + 갱신 과금)
   - `billing.notify_pause_resume_reminder` — 매일 09:30 KST (정지 재개 3일 전 사전 고지 메일)
+  - `billing.notify_conversion_consent` — 매일 10:30 KST (30일 초과 체험의 **유료전환 2차 동의** 요청 D-14/D-3 메일. 과금 차단은 배치가 아니라 `charge_subscription_renewal` 게이트가 하므로 이 잡이 죽어도 무동의 결제는 없다, core 0014 시드)
   - `billing.send_winback_emails` — 매일 10:00 KST (해지 후 복귀 유도, `WINBACK_ENABLED` 게이트·기본 dormant)
   - `insta_reports.sweep_stale` — 30분 (running 에 박힌 리포트 잡 실패 확정 — 동시생성 1건 제한 해제)
   - `insta_reports.purge_caches` — 매일 04:40 KST (90일 경과 AI 캐시 정리, 리포트 파일·집계는 보관)
@@ -349,6 +355,8 @@ make test-cov                             # HTML 커버리지 리포트
 - `docs/ops/CLOUDFLARE_TUNNEL_SETUP.md` — 개발 서버 공개(고정 URL `dev-api.turnflow.link`) Cloudflare Tunnel 셋업 (ngrok 대체)
 - `docs/system/AUTODM_DELIVERY_LIFECYCLE.md` (+ `.html`) — 자동 DM 발송 라이프사이클: 웹훅 수신→발송 확정→실패 처리·무손실 하드닝(v3.10.1)
 - `docs/frontend/TOSS_BILLING_FRONTEND.md` — 토스 빌링 프론트 연동 가이드 (SDK v2 카드등록 → prepare/confirm, 플랜 표시, 체험/해지/카드변경/추가계정 UX; 추가계정 축소=지연 반영 §3-2)
+- `docs/frontend/PAYMENT_CONSENT_FRONTEND.md` — **결제 전 고지·동의 + 유료전환 2차 동의**(2026-08-10, 마이그 billing0025·emails0008·core0014). 전자상거래법 §13②⑥·시행령 §20-2. ①체험은 **`+30일` 고정**(달력월 아님) 확인 + 신규 구독 견적 `GET /billing/subscription/preview/`(부작용 없음 — 구독행·쿠폰 소진 없음, `trial_last_day`=마지막 이용일 ≠ `trial_ends_at`=결제 시각) ②`conversion_consent_required`/`conversion_consent_at`/`trial_total_days` 3필드 ③동의 원장 `POST /billing/consents/`(**confirm 동봉 아님** — 체결 전 성립 + 실패 시 증거 보존, 세 동의 전부 true 아니면 400) ④**미동의 첫 결제 = 승인 호출·PENDING 행 자체를 만들지 않고** 무료 전환(데이터 보존·빌링키 삭제·사후 메일) ⑤D-14/D-3 메일(클릭을 동의로 처리 금지). 소급(동의기록 없는 30일 체험자) 게이트는 `CONVERSION_CONSENT_REQUIRE_ALL_TRIALS` 기본 False, 규모는 `manage.py report_consent_backlog`
+- `docs/frontend/ADMIN_SNAPSHOT_ROSTER_RESPONSE.md` — 어드민 18차 회신(SNAP-1/2). 전체 현황 타일 → 회원 명단 `GET /admin/snapshot/paying|trial/`. **타일-명단 항등**을 위해 모수 쿼리를 `snapshot_rosters.py` 로 단일화 + 타일이 만든 **id→축 매핑을 스냅샷 캐시에 함께 얼려** 부분합(`?plan=`/`?bucket=`)까지 일치. `no_card` 는 SNAP-2 제외(≠`trial_now.total`), ordering 화이트리스트 밖은 400, page_size 상한 500, `/admin/snapshot/**` 는 RBAC 미화이트리스트라 marketing_viewer 자동 403(PII 마스킹 미적용)
 - `docs/frontend/REFERRAL_COUPON_FRONTEND.md` — 쿠폰(제휴/레퍼럴 코드) 프론트 변경 요청(2026-08-04, **breaking**). 무카드 `POST /billing/referral/redeem/` **폐지**(항상 400 + `REFERRAL_REQUIRES_CARD`) — 이 경로가 기본 체험 30일을 가산하지 않아 14일 쿠폰이 44일 아닌 **14일**로 나갔다(HLEVEL26 17건 중 3건 피해). 쿠폰은 `toss/confirm` 의 `referral_code` 동봉이 **유일 경로**. `validate` 에 결제 전 미리보기 5필드 추가(`requires_card`/`trial_ends_at`/`first_charge_at`/`first_charge_amount`/`extra_ig_account_price`). ⚠️ 표기는 `total_trial_days`, **`trial_days`(보너스분)를 노출하면 혜택이 1/3로 축소돼 보인다**
 - `docs/frontend/IG_ACCOUNT_ACTIVATION_FRONTEND.md` — 추가 IG 계정 축소 지연 + 활성 계정 선택(소프트 비활성) 계약. `GET/POST /billing/ig-account-activation/` (page-activation IG 판), 비활성=기능 제외·토큰 보존, 허용량=활성 계정 수 기준. **needs_activation_adjustment 트리거에 "연동≥1 & 활성0" 케이스 추가**(전부 비활성 구제)
 - `docs/frontend/WEBHOOK_HEALTH_FRONTEND.md` — IG 연결 종합 헬스 진단 + 웹훅 수동 재구독 프론트 가이드. `GET/POST /integrations/instagram/connections/{id}/health|resubscribe-webhooks/` (토큰 라이브 /me·웹훅 subscribed_apps·만료·status, report-only·항상 200, issues→CTA 매핑, 스로틀 20/min·6/hour). **하나의 IG 계정=하나의 워크스페이스**(콜백 `ALREADY_CONNECTED_ELSEWHERE` 차단, audit_ig_duplicates 로 기존 중복 조사) + 재연결 `reconnect_connection_id`(한도 우회·콜백 재판정) + 콜백 is_active 자동 복구

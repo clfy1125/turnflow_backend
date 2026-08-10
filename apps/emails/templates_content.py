@@ -18,6 +18,8 @@ Brand palette (from turnflow.link):
 from __future__ import annotations
 
 from apps.emails.constants import (
+    TEMPLATE_CONSENT_MISSING_DOWNGRADE,
+    TEMPLATE_CONVERSION_CONSENT,
     TEMPLATE_EMAIL_VERIFICATION,
     TEMPLATE_INSTA_REPORT_READY,
     TEMPLATE_ONBOARDING_DAY_3,
@@ -371,6 +373,66 @@ DEFAULTS: dict[str, dict[str, str]] = {
             preheader="@{{ ig_username }} 성장 리포트 · {{ period_text }}",
         ),
     },
+    # ── 유료전환 2차 동의 (전자상거래법 §13⑥ / 시행령 §20-2) ──
+    # 이 메일은 **알림·유입 경로**다. 열람이나 링크 클릭을 동의로 처리하지 않는다 —
+    # 동의는 앱의 동의 화면에서 버튼을 눌러야 성립한다(apps/billing/consent.py).
+    # 그래서 CTA 라벨도 "동의하기" 가 아니라 화면으로 이동한다는 표현을 쓴다.
+    TEMPLATE_CONVERSION_CONSENT: {
+        "subject": "[{{ service_name }}] {{ first_charge_date }} 유료 전환 예정 — 계속 이용하려면 동의가 필요해요",
+        "html_body": _wrap(
+            """
+<p style="font-size:18px;font-weight:700;color:#111827;margin:0 0 4px;">유료 전환 동의가 필요해요</p>
+<p style="margin:0 0 6px;color:#4b5563;"><strong>{{ full_name }}</strong>님, 무료 체험이 <strong>{{ days_left }}일</strong> 뒤에 끝납니다. 계속 이용하시려면 아래 내용에 한 번 더 동의해 주세요.</p>
+"""
+            + _detail_rows(
+                [
+                    ("이용 중인 플랜", "{{ plan_name }} 플랜"),
+                    ("유료 전환(첫 결제)일", "{{ first_charge_date }}"),
+                    ("첫 결제 금액", "{{ amount_str }}원 (부가세 포함)"),
+                    ("이후 결제 주기", "매월 자동 결제"),
+                ]
+            )
+            + """
+<div style="margin:16px 0;padding:14px 18px;background:#f5f3ff;border:1px solid #ede9fe;border-radius:12px;color:#5b21b6;font-size:13px;line-height:1.7;">
+  <strong>동의가 없으면 결제되지 않고 무료 플랜으로 전환됩니다.</strong><br>
+  그동안 만든 페이지·캠페인·설정은 그대로 보관되며, 나중에 다시 시작하실 수 있어요.
+</div>
+"""
+            + _btn("{{ consent_url }}", "동의 화면 열기")
+            + """
+<p style="font-size:13px;color:#9ca3af;margin:0;">이 메일은 안내용이며, 동의는 위 화면에서 직접 확인·선택하셔야 완료됩니다. 문의는 <a href="mailto:{{ support_email }}" style="color:#7C3AED;">{{ support_email }}</a>로 알려 주세요.</p>
+""",
+            preheader="{{ first_charge_date }} {{ amount_str }}원 유료 전환 예정 — 동의 필요",
+        ),
+    },
+    TEMPLATE_CONSENT_MISSING_DOWNGRADE: {
+        "subject": "[{{ service_name }}] 결제되지 않았습니다 — 무료 플랜으로 전환됐어요",
+        "html_body": _wrap(
+            """
+<p style="font-size:18px;font-weight:700;color:#111827;margin:0 0 4px;">결제하지 않고 무료 플랜으로 전환했어요</p>
+<p style="margin:0 0 6px;color:#4b5563;"><strong>{{ full_name }}</strong>님, 유료 전환에 대한 동의가 확인되지 않아 <strong>결제를 진행하지 않았습니다</strong>. {{ trial_end_date }}자로 무료 플랜으로 전환됐어요.</p>
+"""
+            + _detail_rows(
+                [
+                    ("체험했던 플랜", "{{ plan_name }} 플랜"),
+                    ("체험 종료일", "{{ trial_end_date }}"),
+                    ("청구된 금액", "0원 (결제 없음)"),
+                    ("현재 플랜", "무료"),
+                ]
+            )
+            + """
+<div style="margin:16px 0;padding:14px 18px;background:#f0fdf4;border:1px solid #dcfce7;border-radius:12px;color:#166534;font-size:13px;line-height:1.7;">
+  <strong>데이터는 그대로 보관돼 있습니다.</strong><br>
+  페이지·DM 캠페인·설정·분석 기록 모두 남아 있어, 다시 구독하시면 이전 상태로 이어서 쓰실 수 있어요.
+</div>
+"""
+            + _btn("{{ consent_url }}", "다시 시작하기")
+            + """
+<p style="font-size:13px;color:#9ca3af;margin:0;">등록하셨던 결제 카드 정보는 삭제했습니다. 문의는 <a href="mailto:{{ support_email }}" style="color:#7C3AED;">{{ support_email }}</a>로 알려 주세요.</p>
+""",
+            preheader="결제 없이 무료 플랜으로 전환됐습니다 (데이터는 보관)",
+        ),
+    },
 }
 
 
@@ -407,6 +469,11 @@ SAMPLE_CONTEXT: dict[str, str] = {
     # pause resume / winback
     "resume_date": "2026-12-03",
     "resubscribe_url": "https://app.turnflow.link/billing/plans",
+    # 유료전환 2차 동의
+    "first_charge_date": "2026-09-23",
+    "days_left": "14",
+    "trial_end_date": "2026-09-23",
+    "consent_url": "https://app.turnflow.link/billing/consent",
     # insta report ready
     "ig_username": "reels_drgn",
     "ig_name": "이지용 | 릴스 드래곤",

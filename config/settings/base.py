@@ -459,6 +459,15 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": crontab(hour=10, minute=0),  # 매일 KST 10:00
         "options": {"queue": "billing"},
     },
+    # ===== 유료전환 2차 동의 (전자상거래법 §13⑥ / 시행령 §20-2) =====
+    # 30일 초과 체험(쿠폰 연장)의 첫 결제 D-14 / D-3 동의 요청 메일.
+    # 미동의면 charge_subscription_renewal 이 과금을 차단하고 무료로 전환한다.
+    # 실제 구동은 core.ScheduledJob(0014 시드). CELERY_BEAT_SCHEDULE 은 fallback/문서용.
+    "billing-notify-conversion-consent": {
+        "task": "billing.notify_conversion_consent",
+        "schedule": crontab(hour=10, minute=30),  # 매일 KST 10:30
+        "options": {"queue": "billing"},
+    },
     # ===== 일별 구독 스냅샷 (어드민 마케팅 P-4) =====
     # 매일 00:20 KST — 구독 상태/MRR/결제 코호트 스냅샷 적재 (멱등 upsert).
     # 실제 구동은 core.ScheduledJob(0010 시드). CELERY_BEAT_SCHEDULE 은 fallback/문서용.
@@ -643,6 +652,25 @@ CELERY_BEAT_SCHEDULE = {
 # 동의 수집 경로(가입/설정)와 문구가 준비되기 전까지 기본 False(dormant).
 WINBACK_ENABLED = config("WINBACK_ENABLED", default=False, cast=bool)
 WINBACK_AFTER_DAYS = config("WINBACK_AFTER_DAYS", default=30, cast=int)
+
+# ── 유료전환 2차 동의 (전자상거래법 §13⑥ / 시행령 §20-2) ─────────────
+# 판정은 apps/billing/consent.py 단일 소스. 여기 있는 건 운영 파라미터뿐.
+# 안내 메일 발송 시점 (첫 결제 D-N). 30일 창 안이면 자유롭게 조정 가능.
+CONVERSION_CONSENT_NOTICE_DAYS = config("CONVERSION_CONSENT_NOTICE_DAYS", default=14, cast=int)
+CONVERSION_CONSENT_REMINDER_DAYS = config("CONVERSION_CONSENT_REMINDER_DAYS", default=3, cast=int)
+# 프론트 2차 동의 화면 딥링크 경로 (FRONTEND_URL 뒤에 붙는다). 프론트가 경로를 확정하면 교체.
+CONVERSION_CONSENT_PATH = config("CONVERSION_CONSENT_PATH", default="/billing/consent")
+# 긴급 킬스위치: 미동의 첫 과금을 **실제로 막을지** (기본 True = 법 요건 준수).
+# 프론트의 2차 동의 화면이 내려가면 사용자는 동의할 방법이 없는데 게이트는 계속 막아
+# 유료 전환이 조용히 무료로 떨어진다 → 그때 코드 배포 없이 끌 수 있게 env 로 뺀다.
+# 끄더라도 동의 수집(플래그·기록 API·안내 메일)은 계속 동작한다(차단만 끈다).
+CONVERSION_CONSENT_ENFORCE = config("CONVERSION_CONSENT_ENFORCE", default=True, cast=bool)
+# 소급(legacy) 게이트: 동의 기록이 아예 없는 **30일 체험자**까지 과금을 막을지.
+# 켜면 무동의 판정만으로 유료전환이 멈춘다 → 대상 규모를 먼저 확인할 것
+# (`manage.py report_consent_backlog`). 기본 False(dormant).
+CONVERSION_CONSENT_REQUIRE_ALL_TRIALS = config(
+    "CONVERSION_CONSENT_REQUIRE_ALL_TRIALS", default=False, cast=bool
+)
 
 # TossPayments 빌링(정기결제) 연동
 # 라이브 전환 = 키만 test_* → live_* 로 교체 (+ 개발자센터 웹훅 URL 등록)
