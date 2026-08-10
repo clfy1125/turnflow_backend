@@ -653,18 +653,25 @@ CELERY_BEAT_SCHEDULE = {
 WINBACK_ENABLED = config("WINBACK_ENABLED", default=False, cast=bool)
 WINBACK_AFTER_DAYS = config("WINBACK_AFTER_DAYS", default=30, cast=int)
 
-# ── 유료전환 2차 동의 (전자상거래법 §13⑥ / 시행령 §20-2) ─────────────
+# ── 결제 전 고지·동의 (전자상거래법 §13②⑥ / 시행령 §20-2) ─────────────
 # 판정은 apps/billing/consent.py 단일 소스. 여기 있는 건 운영 파라미터뿐.
+#
+# 2026-08-10 제품 결정: **동의는 결제 화면 1회로 통일.** 첫 결제 45일 전에 다시 동의를
+# 받게 하면 리텐션이 떨어지고, 당시 44일 쿠폰 체험 대상이 지인 범위였다.
+# False 면 2차 동의 파이프라인 3개가 전부 정지한다:
+#   프론트 모달 플래그(conversion_consent_required) · 과금 차단 게이트 · D-14/D-3 메일.
+# ⚠️ 44일 쿠폰을 **일반 마케팅에 여는 시점**에 다시 검토할 것 — 대상이 지인이 아니게 되면
+#    시행령 §20-2(전환 전 30일 이내 동의)가 실질 리스크가 된다. 그때 이 값만 True 로.
+#    구조적으로 깨끗한 대안은 총 체험을 30일 이내로 맞추는 것(2차 동의 개념 자체가 불필요).
+CONVERSION_SECOND_CONSENT_ENABLED = config(
+    "CONVERSION_SECOND_CONSENT_ENABLED", default=False, cast=bool
+)
 # 안내 메일 발송 시점 (첫 결제 D-N). 30일 창 안이면 자유롭게 조정 가능.
 CONVERSION_CONSENT_NOTICE_DAYS = config("CONVERSION_CONSENT_NOTICE_DAYS", default=14, cast=int)
 CONVERSION_CONSENT_REMINDER_DAYS = config("CONVERSION_CONSENT_REMINDER_DAYS", default=3, cast=int)
 # 프론트 2차 동의 화면 딥링크 경로 (FRONTEND_URL 뒤에 붙는다). 프론트가 경로를 확정하면 교체.
 CONVERSION_CONSENT_PATH = config("CONVERSION_CONSENT_PATH", default="/billing/consent")
-# 긴급 킬스위치: 미동의 첫 과금을 **실제로 막을지** (기본 True = 법 요건 준수).
-# 프론트의 2차 동의 화면이 내려가면 사용자는 동의할 방법이 없는데 게이트는 계속 막아
-# 유료 전환이 조용히 무료로 떨어진다 → 그때 코드 배포 없이 끌 수 있게 env 로 뺀다.
-# 끄더라도 동의 수집(플래그·기록 API·안내 메일)은 계속 동작한다(차단만 끈다).
-CONVERSION_CONSENT_ENFORCE = config("CONVERSION_CONSENT_ENFORCE", default=True, cast=bool)
+# 아래 3개는 CONVERSION_SECOND_CONSENT_ENABLED=True 일 때만 의미가 있다.
 # 소급(legacy) 게이트: 동의 기록이 아예 없는 **30일 체험자**까지 과금을 막을지.
 # 켜면 무동의 판정만으로 유료전환이 멈춘다 → 대상 규모를 먼저 확인할 것
 # (`manage.py report_consent_backlog`). 기본 False(dormant).

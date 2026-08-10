@@ -318,11 +318,22 @@ class TestTrialRoster:
         assert row["card_number_masked"] == "433012******123*"
         assert row["trial_total_days"] == 30
 
-    def test_coupon_trial_flags_consent_required(self, staff_client, clean_slate, pro_plan):
-        """44일 쿠폰 체험 + 30일 창 안 → 2차 동의 대기로 표시된다."""
+    def test_consent_required_follows_policy_flag(
+        self, staff_client, clean_slate, pro_plan, settings
+    ):
+        """`conversion_consent_required` 는 정책 플래그를 그대로 반영한다.
+
+        2026-08-10 제품 결정으로 동의는 결제 화면 1회 → 기본값에서는 44일 쿠폰 체험자도
+        **false**(운영이 따로 안내할 대상이 없다). 플래그를 켜면 다시 true 가 된다.
+        """
         _mk_trial(pro_plan, days=44, elapsed=20)
+
         row = staff_client.get(TRIAL_URL).data["results"][0]
         assert row["trial_total_days"] == 44
+        assert row["conversion_consent_required"] is False  # 기본 정책
+
+        settings.CONVERSION_SECOND_CONSENT_ENABLED = True
+        row = staff_client.get(TRIAL_URL).data["results"][0]
         assert row["conversion_consent_required"] is True
 
     def test_30day_trial_not_flagged(self, staff_client, clean_slate, pro_plan):

@@ -1,4 +1,11 @@
-"""apps/billing/consent.py — 결제 전 고지·동의 / 유료전환 2차 동의 정책 **단일 소스**.
+"""apps/billing/consent.py — 결제 전 고지·동의 정책 **단일 소스**.
+
+⚠️ **현재 정책(2026-08-10 제품 결정): 동의는 결제 화면 1회.**
+유료전환 2차 동의는 ``CONVERSION_SECOND_CONSENT_ENABLED`` 로 게이팅되며 **기본 False** 다
+— 첫 결제 45일 전에 다시 동의를 받게 하면 리텐션이 떨어지고, 당시 44일 쿠폰 대상이 지인
+범위였기 때문. 그래서 아래 "44일 체험은 2차 동의가 필요하다" 는 설명은 **플래그를 켰을 때의
+동작**을 서술한 것이다. 켜는 조건과 그때 되살아나는 것은
+:func:`second_consent_enabled` 참고.
 
 배경 (프론트 요청서 `backend-payment-consent.md`, 2026-08-10):
 전자상거래법 제13조 제6항 + 시행령 제20조의2 — 무료→유료 정기결제 전환에는 **유료전환 전
@@ -56,18 +63,25 @@ def require_all_trials() -> bool:
     return bool(getattr(settings, "CONVERSION_CONSENT_REQUIRE_ALL_TRIALS", False))
 
 
-def enforce_gate() -> bool:
-    """미동의 첫 과금을 **실제로 막을지** — 기본 True (법 요건이므로 준수가 기본값).
+def second_consent_enabled() -> bool:
+    """유료전환 2차 동의를 **요구할지** — 기본 **False** (동의는 결제 화면 1회로 통일).
 
-    긴급 킬스위치다. 프론트의 2차 동의 화면이 사고로 내려가면 사용자는 동의할 방법이
-    없는데 게이트는 계속 과금을 막아 **유료 전환이 조용히 무료로 떨어진다**(2026-08-10
-    prod 실측 대상 27명 × 14,900원). 그 상황에서 코드 배포를 기다리지 않고 끌 수 있어야 한다.
+    2026-08-10 제품 결정: 첫 결제 45일 전에 다시 동의를 받게 하면 리텐션이 떨어지고,
+    당시 44일 쿠폰 체험 대상은 지인 범위였다. 그래서 동의는 **결제 화면(카드 등록 직전)
+    1회**로 통일한다. 이 플래그가 False 면 아래 3개가 전부 동작하지 않는다:
+      · ``conversion_consent_required`` → 항상 False (프론트 모달 안 뜸)
+      · ``blocks_first_charge``         → 항상 False (과금 차단 없음)
+      · ``billing.notify_conversion_consent`` → no-op (D-14/D-3 메일 안 나감)
 
-    ⚠️ 이 스위치는 **차단만** 끈다 — 동의 수집(플래그·모달·기록 API·안내 메일)은 계속
-    동작한다. 껐다고 동의를 안 받으면 법 요건이 무너지고, 나중에 다시 켤 때 무동의 인원이
-    한꺼번에 무료로 떨어진다.
+    코드를 지우지 않고 플래그로 남긴 이유: 44일 쿠폰을 **일반 마케팅에 열는 순간** 대상이
+    지인이 아니게 되고, 그때는 시행령 제20조의2(전환 전 30일 이내 동의)가 실질 리스크가
+    된다. 그 시점에 이 플래그 하나만 켜면 파이프라인 전체가 되살아난다.
+
+    ⚠️ 이 정책의 전제: 체험이 30일을 넘으면 결제 화면 동의가 30일 창을 벗어난다.
+    구조적으로 깨끗하게 푸는 방법은 **총 체험을 30일 이내로 맞추는 것**이다
+    (쿠폰 보너스를 줄이거나 base 를 조정) — 그러면 2차 동의 개념 자체가 필요 없다.
     """
-    return bool(getattr(settings, "CONVERSION_CONSENT_ENFORCE", True))
+    return bool(getattr(settings, "CONVERSION_SECOND_CONSENT_ENABLED", False))
 
 
 def trial_length_days(sub) -> float | None:
@@ -128,7 +142,12 @@ def conversion_consent_required(sub, *, now=None) -> bool:
     ``needs_second_consent_by_length`` 에 "아직 동의 없음" + "30일 창 안" + "과금이 실제로
     예정돼 있음"(카드 보유)을 더한 값이다. 창 밖(예: 44일 체험의 D-0~D-13)에 미리 띄우면
     **그 동의가 다시 30일 창을 벗어날 수** 있어 의미가 없다.
+
+    기본 정책(2026-08-10)은 동의 1회이므로 ``second_consent_enabled()`` 가 False →
+    **항상 False** 다. 프론트는 이 필드만 보므로 모달을 렌더할 일이 없다.
     """
+    if not second_consent_enabled():
+        return False
     if not _is_trialing(sub):
         return False
     if sub.conversion_consent_at is not None:
@@ -160,8 +179,8 @@ def blocks_first_charge(sub, *, now=None) -> bool:
     남은 체험에 과금 태스크가 한 번 잘못 디스패치되는 것만으로 그 사용자가 **즉시 무료로
     떨어진다**(2026-08-10 prod 기준 27명이 이 조건에 걸려 있었다).
     """
-    if not enforce_gate():
-        return False  # 긴급 킬스위치 — 동의 수집은 계속하되 차단만 끈다
+    if not second_consent_enabled():
+        return False  # 기본 정책 = 동의 1회. 2차 동의로 과금을 막지 않는다.
     if not _is_trialing(sub):
         return False
     end = sub.current_period_end

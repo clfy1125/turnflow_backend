@@ -20,14 +20,11 @@
     docker exec -i -e DRY=0 turnflow_instagram_web_dashboard \
         python manage.py shell < scripts/backfill_payment_consent.py
 
-⚠️ 이 백필만으로는 27명의 첫 결제가 되지 않는다. 과금 게이트가 보는 필드는
-   `UserSubscription.conversion_consent_at`(유료전환 2차 동의)이고 `kind=initial` 이 아니다.
-   27명을 정상 결제시키려면 아래 둘 중 하나가 **추가로** 필요하다:
-     (A) .env.production 에 CONVERSION_CONSENT_ENFORCE=False  ← 권장. 차단만 끄고 수집은 유지
-     (B) 이 스크립트를 SET_CONVERSION=1 로 실행 → conversion_consent_at 도 카드 등록 시각으로 채움
-   (B)는 게이트를 통과시키지만, 감사 기록상 '2차 동의'가 첫 결제보다 43~64일 앞선 것으로
-   남는다 → 시행령 30일 창을 충족하지 못하며, 그 사실이 기록에 그대로 보인다.
-   즉 (B)는 컴플라이언스를 만들어주지 않고 게이트만 연다. 같은 결과를 (A)가 더 정직하게 낸다.
+이력(2026-08-10): 실행 당시에는 2차 동의 게이트가 켜져 있어 이 백필과 함께
+``SET_CONVERSION=1`` 로 27명의 ``conversion_consent_at`` 까지 채워 유료전환을 확보했다.
+같은 날 제품 결정으로 **2차 동의가 폐기**(``CONVERSION_SECOND_CONSENT_ENABLED=False`` 기본)되어
+지금은 게이트 자체가 동작하지 않는다 → ``SET_CONVERSION`` 은 더 필요 없다(무해하게 남겨둔다).
+이 스크립트의 남은 용도는 **결제 화면 동의(kind=initial) 기록 복원** 하나다.
 
 멱등: 같은 user+kind 기록이 이미 있으면 건너뛴다. 여러 번 실행해도 중복이 생기지 않는다.
 """

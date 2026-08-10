@@ -287,7 +287,7 @@ def _skip_charge_missing_consent(sub_id) -> dict:
         f"⚠️ 유료전환 2차 동의 없음 → 무과금 무료 전환\n"
         f"user={sub.user.email} plan={ctx['plan_name']} "
         f"미청구={ctx['amount_str']}원 체험종료={ctx['trial_end_date']}\n"
-        f"동의 화면이 정상인지 확인 필요 (긴급 시 CONVERSION_CONSENT_ENFORCE=False)"
+        f"동의 화면이 정상인지 확인 필요 (긴급 시 CONVERSION_SECOND_CONSENT_ENABLED=False)"
     )
     consent_missing_downgrade_email(sub, ctx)
     return {"result": "skipped_missing_consent"}
@@ -1319,6 +1319,9 @@ def notify_pause_resume_reminder():
 def notify_conversion_consent():
     """유료전환 2차 동의 요청 메일 — 첫 결제 D-14 / D-3 (매일 1회).
 
+    ⚠️ ``CONVERSION_SECOND_CONSENT_ENABLED`` 가 False(기본)면 즉시 no-op 이다 —
+    현재 정책은 동의 1회(결제 화면)이므로 이 메일이 나가지 않는다.
+
     대상: ``consent.conversion_consent_required`` 가 참인 구독 (30일 초과 체험 + 미동의 +
     카드 보유 + 30일 창 안). 30일 체험자는 결제 화면 동의로 요건이 충족되므로 대상이 아니다.
 
@@ -1326,8 +1329,17 @@ def notify_conversion_consent():
     한 번이라 D-14 창을 놓칠 수 있으므로 "N일 이하 남았고 아직 안 보냄"으로 판정한다 —
     즉 늦게라도 한 번은 나간다. 이 메일은 **알림**이고 동의는 앱 화면에서 받는다.
     """
-    from .consent import conversion_consent_required, notice_days, reminder_days
+    from .consent import (
+        conversion_consent_required,
+        notice_days,
+        reminder_days,
+        second_consent_enabled,
+    )
     from .models import SubscriptionStatus, UserSubscription
+
+    if not second_consent_enabled():
+        # 기본 정책 = 동의 1회 (2026-08-10). 2차 동의를 요구하지 않으므로 안내할 것도 없다.
+        return {"skipped": "second_consent_disabled"}
 
     now = timezone.now()
     n_days, r_days = notice_days(), reminder_days()

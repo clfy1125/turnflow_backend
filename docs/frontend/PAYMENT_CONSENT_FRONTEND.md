@@ -1,16 +1,51 @@
-# 결제 전 고지·동의 + 유료전환 2차 동의 — 백엔드 구현 회신
+# 결제 전 고지·동의 — 백엔드 구현 회신
 
-작성 2026-08-10 · 백엔드 → 프론트(TurnflowLink)
+작성 2026-08-10 · 갱신 2026-08-10(2차 동의 폐기) · 백엔드 → 프론트(TurnflowLink)
 요청서: `backend-payment-consent.md`
 
-**요청 전부 구현했습니다.** 1번은 확인만 필요한 항목이었고(답: **A**), preview 엔드포인트는
-요청 안 하셔도 만들어 드렸습니다 — 프론트에서 날짜를 계산하는 코드가 남아 있는 것 자체가
-재발 경로라서요. 2번은 5개 항목(플래그·저장 API·과금 분기·메일·소급 규모) 모두 배포 준비
-완료입니다.
+**요청 전부 구현해 배포까지 완료했습니다.** 1번은 확인만 필요한 항목이었고(답: **A**),
+preview 엔드포인트는 요청 안 하셔도 만들어 드렸습니다 — 프론트에서 날짜를 계산하는 코드가
+남아 있는 것 자체가 재발 경로라서요.
+
+**단, 2번(유료전환 2차 동의)은 같은 날 제품 결정으로 폐기됐습니다 — 아래 빨간 절부터
+읽어주세요.** 프론트 작업이 크게 줄었습니다.
 
 ---
 
-## ⚠️ 먼저 — 2차 동의 화면(모달)이 **언제 나오는지** 알려주세요
+## 🔴 2026-08-10 갱신 — **2차 동의는 폐기됐습니다. 모달 만들지 마세요**
+
+제품 회의 결정: 첫 결제 45일 전에 다시 동의를 받게 하면 **리텐션이 떨어지고**, 현재 44일
+쿠폰 대상은 지인 범위라 **동의는 결제 화면 1회로 통일**합니다.
+
+프론트가 해야 할 일이 줄었습니다:
+
+| 항목 | 상태 |
+|---|---|
+| `POST /billing/consents/` (`kind:"initial"`) | ✅ **그대로 사용** — 결제 화면 동의 기록. 이게 유일한 동의입니다 |
+| `GET /billing/subscription/preview/` | ✅ **그대로 사용** — 결제 전 고지(§13②)는 유효합니다 |
+| **2차 동의 모달** | ❌ **만들지 마세요.** 폐기 |
+| `conversion_consent_required` | ⚠️ 필드는 남아 있지만 **항상 `false`** — 분기 코드를 넣지 마세요 |
+| `kind:"conversion"` | 사용하지 마세요 (API 는 살아 있지만 호출 대상 없음) |
+| D-14/D-3 안내 메일 | ❌ 발송 중지 |
+| 동의 화면 딥링크 | ❌ 불필요 (경로 회신 안 주셔도 됩니다) |
+
+서버 동작: 44일 쿠폰 체험자도 **추가 절차 없이 첫 결제일에 정상 유료전환**됩니다. 무동의
+무료 전환은 이제 아무에게도 일어나지 않습니다.
+
+재활성화는 `CONVERSION_SECOND_CONSENT_ENABLED=True` 한 줄이며, 코드·API·메일 템플릿은
+전부 남겨뒀습니다. **44일 쿠폰을 일반 마케팅에 여는 시점**에는 대상이 지인이 아니게 되므로
+그때 다시 논의가 필요합니다(시행령 §20-2). 구조적으로 깨끗한 대안은 **총 체험을 30일 이내로
+맞추는 것** — 그러면 결제 화면 동의 1회로 요건이 자동 충족되고 2차 동의 개념 자체가 사라집니다.
+
+아래 §2·§4·§5 와 그 다음 절의 "2차 동의" 관련 내용은 **플래그를 켰을 때의 동작 설명**으로
+읽어주세요. 지금은 동작하지 않습니다.
+
+---
+
+<details>
+<summary>이하 원래 회신 (2차 동의 기능 상세 — 재활성화 시 참고)</summary>
+
+## ⚠️ (지난 내용) 2차 동의 화면(모달)이 **언제 나오는지** 알려주세요
 
 배포 시점(2026-08-10) prod 실측입니다:
 
@@ -36,11 +71,7 @@
 모달이 없어도 **화면이 깨지지는 않습니다**(플래그를 무시하면 기존 동작 그대로). 손실은
 9/06 부터 발생하기 시작합니다.
 
-일정이 9월 초를 넘길 것 같으면 **미리 알려주세요** — 그때는 백엔드에서 차단을 끄고
-(`CONVERSION_CONSENT_ENFORCE=False`) 동의 수집만 계속하다가, 모달이 나온 뒤 다시 켜는
-순서로 가면 매출 손실 없이 넘길 수 있습니다.
-
-일정이 밀릴 것 같으면 알려주세요 — 백엔드에 **긴급 킬스위치**(`CONVERSION_CONSENT_ENFORCE=False`)가
+일정이 밀릴 것 같으면 알려주세요 — 백엔드에 **정책 스위치**(`CONVERSION_SECOND_CONSENT_ENABLED=False`)가
 있어 차단만 끄고 동의 수집은 유지할 수 있습니다. 또 D-3 이내 미동의자가 생기면 운영
 텔레그램으로 사전 경보가 오고, 실제로 무료 전환이 일어나면 건별 알림이 옵니다 —
 조용히 매출이 사라지는 경로는 막아 뒀습니다.
@@ -493,7 +524,7 @@ python manage.py report_consent_backlog --since 2026-08-10 --list
 | 마이그레이션 | `billing 0025`(구독 필드 3개 + `payment_consents` 테이블) · `emails 0008`(템플릿 키 2개) · `core 0014`(`ScheduledJob` 시드) |
 | 이메일 템플릿 | `python manage.py seed_email_templates` 필요 (신규 2건 생성) |
 | 신규 주기잡 | `billing-notify-conversion-consent` (매일 10:30 KST, `billing` 큐) |
-| 새 환경변수 | `CONVERSION_CONSENT_NOTICE_DAYS=14` · `CONVERSION_CONSENT_REMINDER_DAYS=3` · `CONVERSION_CONSENT_PATH=/billing/consent` · `CONVERSION_CONSENT_REQUIRE_ALL_TRIALS=False` · **`CONVERSION_CONSENT_ENFORCE=True`**(긴급 킬스위치 — 차단만 끔) (전부 기본값 있음 — 설정 없이도 동작) |
+| 새 환경변수 | `CONVERSION_CONSENT_NOTICE_DAYS=14` · `CONVERSION_CONSENT_REMINDER_DAYS=3` · `CONVERSION_CONSENT_PATH=/billing/consent` · `CONVERSION_CONSENT_REQUIRE_ALL_TRIALS=False` · **`CONVERSION_SECOND_CONSENT_ENABLED=False`**(2차 동의 전체 on/off — 현재 정책상 off) (전부 기본값 있음 — 설정 없이도 동작) |
 | 운영 알림 | ①D-3 이내 미동의자 발생 시 사전 경보 ②실제 무과금 무료 전환 시 건별 알림 (둘 다 텔레그램) |
 | 테스트 | `apps/billing/test_payment_consent.py` 36건 (게이트 제거 시 실패하는지 역검증 완료) |
 | 판정 단일 소스 | `apps/billing/consent.py` |
@@ -502,3 +533,16 @@ python manage.py report_consent_backlog --since 2026-08-10 --list
 
 궁금한 점이나 필드명·응답 형태 조정이 필요하면 알려 주세요. `trial_last_day` 처럼 의미가
 갈릴 수 있는 부분은 특히 먼저 맞춰두는 게 좋겠습니다.
+
+</details>
+
+---
+
+## 지금 프론트가 붙일 것 (요약)
+
+1. **결제 전 고지 시트** — `GET /billing/subscription/preview/` 값을 그대로 표기.
+   자체 날짜 계산(`TRIALS_DAYS` · `addDays`)은 버리세요. `trial_last_day`(마지막 이용일)와
+   `first_charge_at`(첫 결제일)을 구분해서 쓰는 것만 주의.
+2. **동의 3개 체크 → `POST /billing/consents/` (`kind:"initial"`)** → 토스 SDK → `toss/confirm`.
+   세 동의가 전부 `true` 여야 201 입니다.
+3. 그 외 없음. 모달·딥링크·2차 동의 관련 작업은 전부 취소입니다.

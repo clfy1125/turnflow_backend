@@ -1,10 +1,16 @@
-"""결제 전 고지·동의 + 유료전환 2차 동의 테스트.
+"""결제 전 고지·동의 테스트.
 
 핵심 계약 (프론트 요청서 `backend-payment-consent.md`):
 1. 체험은 **+30일 고정** — 프론트의 `오늘+30일` 계산과 서버 확정값이 일치해야 한다.
-2. `conversion_consent_required` 는 **30일 초과 체험에만** true. 30일 체험자는 false.
-3. 미동의 상태로 체험이 끝나면 **결제하지 않고** 무료로 전환된다 ← 실질적으로 가장 중요.
-4. 동의 후에는 정상 결제된다.
+2. 동의 기록(`POST /billing/consents/`)은 세 동의가 전부 true 일 때만 저장된다.
+3. 견적(`preview`)은 부작용이 없어야 한다.
+
+**2026-08-10 정책 변경**: 동의는 결제 화면 **1회**로 통일됐다
+(`CONVERSION_SECOND_CONSENT_ENABLED=False` 기본). 그래서 2차 동의 파이프라인
+(모달 플래그·과금 차단·D-14/D-3 메일)을 검증하는 클래스는 `_second_consent_on`
+픽스처로 **명시적으로 켜고** 테스트한다 — 플래그를 켰을 때 그 기능이 여전히
+정상 동작하는지가 재활성화 시점의 안전망이다.
+기본값(꺼진 상태) 동작은 :class:`TestSecondConsentDisabledByDefault` 가 지킨다.
 
 ⚠️ pytest DB 는 dev DB 를 쓴다(test-db-not-clean) → 이메일은 uuid, 집계는 델타로 단언.
 """
@@ -56,6 +62,13 @@ def client(user):
     c = APIClient()
     c.force_authenticate(user=user)
     return c
+
+
+@pytest.fixture
+def _second_consent_on(settings):
+    """2차 동의 파이프라인을 켠다 (기본은 꺼져 있다 — 2026-08-10 정책)."""
+    settings.CONVERSION_SECOND_CONSENT_ENABLED = True
+    return settings
 
 
 def _trial_sub(user, *, trial_days=TRIAL_BASE_DAYS, elapsed_days=0, billing_key="bk_consent"):
@@ -187,6 +200,11 @@ class TestSubscriptionPreview:
 
 @pytest.mark.django_db
 class TestConsentRequiredFlag:
+    # 2026-08-10 정책상 2차 동의는 기본 OFF — 이 클래스는 켠 상태의 동작을 지킨다
+    @pytest.fixture(autouse=True)
+    def _on(self, _second_consent_on):
+        pass
+
     def test_30day_trial_is_never_required(self, user):
         """30일 체험자는 결제 화면 동의로 요건 충족 → 모달 띄우지 않는다."""
         sub = _trial_sub(user, trial_days=30, elapsed_days=29)
@@ -349,6 +367,11 @@ class TestConsentRecord:
 
 @pytest.mark.django_db
 class TestFirstChargeGate:
+    # 2026-08-10 정책상 2차 동의는 기본 OFF — 이 클래스는 켠 상태의 동작을 지킨다
+    @pytest.fixture(autouse=True)
+    def _on(self, _second_consent_on):
+        pass
+
     def test_missing_consent_skips_charge_and_downgrades(self, user, monkeypatch):
         spy = ChargeSpy(monkeypatch)
         sub = _trial_sub(user, trial_days=44, elapsed_days=44)
@@ -437,29 +460,24 @@ class TestFirstChargeGate:
         assert result["result"] == "skipped_missing_consent"
         assert spy.calls == []
 
-    def test_kill_switch_stops_blocking_but_keeps_collecting(self, user, monkeypatch, settings):
-        """긴급 킬스위치 — 차단만 끄고 동의 수집(플래그)은 유지한다.
-
-        동의 화면 장애로 27명이 조용히 무료로 떨어지는 상황을 코드 배포 없이 멈추는 레버.
-        """
+    def test_enable_flag_is_the_single_control(self, user, monkeypatch, settings):
+        """플래그 하나가 모달·차단·메일을 함께 켜고 끈다 (스위치가 갈라지지 않는지)."""
         spy = ChargeSpy(monkeypatch)
         sub = _trial_sub(user, trial_days=44, elapsed_days=44)
-        assert blocks_first_charge(sub) is True  # 기본값(True)에서는 막는다
+        assert blocks_first_charge(sub) is True  # 이 클래스는 켠 상태(_second_consent_on)
 
-        settings.CONVERSION_CONSENT_ENFORCE = False
+        settings.CONVERSION_SECOND_CONSENT_ENABLED = False
         assert blocks_first_charge(sub) is False
-        assert charge_subscription_renewal(str(sub.id))["result"] == "paid"
-        assert len(spy.calls) == 1
-
-        # 차단만 껐고 수집은 계속 — 창 안이면 여전히 모달 대상이다
-        sub2 = _trial_sub(
+        in_window = _trial_sub(
             User.objects.create_user(
-                email=f"kill-{uuid.uuid4().hex[:8]}@example.com", password="Pass1234!"
+                email=f"off-{uuid.uuid4().hex[:8]}@example.com", password="Pass1234!"
             ),
             trial_days=44,
             elapsed_days=20,
         )
-        assert conversion_consent_required(sub2) is True
+        assert conversion_consent_required(in_window) is False
+        assert charge_subscription_renewal(str(sub.id))["result"] == "paid"
+        assert len(spy.calls) == 1
 
     def test_legacy_gate_passes_when_initial_consent_exists(self, user, monkeypatch, settings):
         ChargeSpy(monkeypatch)
@@ -489,6 +507,11 @@ class TestFirstChargeGate:
 
 @pytest.mark.django_db
 class TestConsentNotices:
+    # 2026-08-10 정책상 2차 동의는 기본 OFF — 이 클래스는 켠 상태의 동작을 지킨다
+    @pytest.fixture(autouse=True)
+    def _on(self, _second_consent_on):
+        pass
+
     def test_d14_notice_sent_once(self, user, monkeypatch):
         sent = []
         monkeypatch.setattr(
@@ -567,3 +590,68 @@ class TestConsentNotices:
         charge_subscription_renewal(str(sub.id))
         assert len(alerts) == 1
         assert user.email in alerts[0]
+
+
+# ──────────────────────────────────────────────
+# ⑥ 기본 정책 = 동의 1회 (2026-08-10 제품 결정)
+# ──────────────────────────────────────────────
+
+
+@pytest.mark.django_db
+class TestSecondConsentDisabledByDefault:
+    """플래그를 켜지 않은 **기본 상태**의 계약.
+
+    회의 결정: 첫 결제 45일 전에 다시 동의를 받게 하면 리텐션이 떨어지고, 당시 44일 쿠폰
+    대상이 지인 범위였다 → 동의는 결제 화면 1회. 여기서 지키는 것은
+    "44일 쿠폰 체험자도 아무 추가 절차 없이 정상 유료전환된다" 하나다.
+    """
+
+    def test_flag_is_off_by_default(self):
+        from apps.billing.consent import second_consent_enabled
+
+        assert second_consent_enabled() is False
+
+    def test_44day_trial_charges_normally(self, user, monkeypatch):
+        """가장 중요 — 쿠폰 44일 체험자가 2차 동의 없이 정상 결제된다."""
+        spy = ChargeSpy(monkeypatch)
+        sub = _trial_sub(user, trial_days=44, elapsed_days=44)
+        assert sub.conversion_consent_at is None
+
+        result = charge_subscription_renewal(str(sub.id))
+
+        assert result["result"] == "paid"
+        assert len(spy.calls) == 1
+        sub.refresh_from_db()
+        assert sub.status == SubscriptionStatus.ACTIVE
+        assert sub.plan.name == "pro"  # 무료로 떨어지지 않았다
+
+    def test_no_modal_flag(self, client, user):
+        _trial_sub(user, trial_days=44, elapsed_days=20)
+        res = client.get("/api/v1/billing/my-subscription/")
+        assert res.status_code == 200, res.data
+        # 필드는 계약 유지를 위해 남기고 값만 항상 false (프론트 모달이 뜨지 않는다)
+        assert res.data["conversion_consent_required"] is False
+        assert res.data["trial_total_days"] == 44
+
+    def test_no_reminder_emails(self, user, monkeypatch):
+        sent = []
+        monkeypatch.setattr(
+            "apps.emails.tasks.send_conversion_consent_email.delay",
+            lambda uid, ctx: sent.append(ctx),
+        )
+        _trial_sub(user, trial_days=44, elapsed_days=44 - 2)  # D-2 (창 한복판)
+        result = notify_conversion_consent()
+        assert result == {"skipped": "second_consent_disabled"}
+        assert sent == []
+
+    def test_initial_consent_still_recorded(self, client, user):
+        """동의 1회(결제 화면)는 그대로 기록된다 — 이건 폐지 대상이 아니다."""
+        res = client.post("/api/v1/billing/consents/", _consent_body(kind="initial"), format="json")
+        assert res.status_code == 201, res.data
+        assert PaymentConsent.objects.filter(user=user, kind=ConsentKind.INITIAL).exists()
+
+    def test_preview_still_works(self, client, user):
+        """결제 전 고지(견적)도 폐지 대상이 아니다 — §13② 는 그대로 유효하다."""
+        res = client.get("/api/v1/billing/subscription/preview/?plan_name=pro")
+        assert res.status_code == 200
+        assert res.data["trial_days"] == 30
