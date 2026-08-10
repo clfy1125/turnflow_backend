@@ -4741,7 +4741,7 @@ def _capture_comment_webhook_raw(payload: dict, logger) -> None:
     ⚠️ 범위 축소 (2026-07-30, 판정 완료 후):
         최초 목적("광고 유입 댓글이 웹훅으로 오는가 / 어떤 형태로 오는가")은
         **실측으로 판정이 끝났다** — 광고 댓글은 온다. `media.id` 가 광고 카피이고
-        원본은 `media.original_media_id` 로 온다(증거: AD_COMMENT_WEBHOOK_EVIDENCE.md).
+        원본은 `media.original_media_id` 로 온다(증거: docs/system/AD_COMMENT_WEBHOOK_EVIDENCE.md).
         그래서 **일반 댓글은 더 이상 적재하지 않고**, 아래 두 부류만 남긴다:
           (a) 광고 관련(`ad_id`/`ad_title`/`original_media_id`/`media_product_type=AD`)
               → 광고 대응 로직의 회귀 감시 + 새 필드 조합 발견

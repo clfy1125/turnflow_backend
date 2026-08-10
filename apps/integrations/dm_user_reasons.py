@@ -1,6 +1,6 @@
 """유저 콘솔용 사유(`user_reason`) — 운영 사유 24종을 사용자 관점 9종으로 접는 층.
 
-설계 근거는 `DM_USER_COPY_MAPPING.md` §4·§5. 요약하면:
+설계 근거는 `../../docs/frontend/DM_USER_COPY_MAPPING.md` §4·§5. 요약하면:
 
 - 운영자 사전(:mod:`apps.admin_api.dm_error_catalog`)은 **원인을 파고들기 위한** 축이라
   세분화가 미덕이다("우리가 제때 못 보냄" 같은 내부 사정도 적혀 있다).

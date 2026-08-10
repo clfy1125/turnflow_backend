@@ -169,11 +169,11 @@ prod 쿼리는 제 환경에서 못 돌리지만 **코드로 확정**됩니다.
 자체가 실측입니다. 제안하신 판정(`policy=normal` + `RECIPIENT_NOTICE`)과 문구를 그대로
 등록했습니다. 사전 주석에 이 원문과 출처(어드민팀 제보)를 남겨 뒀습니다.
 
-→ `DM_ERROR_POLICY_MATRIX.html` 의 `gap:2534001`("추정·실측 확인 필요")은 이제 해소입니다.
+→ `../system/DM_ERROR_POLICY_MATRIX.html` 의 `gap:2534001`("추정·실측 확인 필요")은 이제 해소입니다.
 
 ### 확인 요청 답변 — "7일 초과" 원문 파싱은 **아직 미정입니다**
 
-`DM_ERROR_POLICY_PLAN.md` §Phase 0 ③ 그대로 미확인입니다(prod census 미실행).
+`../system/DM_ERROR_POLICY_PLAN.md` §Phase 0 ③ 그대로 미확인입니다(prod census 미실행).
 **그 전까지 7일 초과 건은 🔴로 뜹니다** — 말씀하신 전제가 맞습니다.
 
 다만 DM-9 문구 교체로 **화면 문구는 그 전제 위에 있지 않게** 됐습니다.

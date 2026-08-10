@@ -2,7 +2,7 @@
 
 작성 2026-08-06 · 갱신 2026-08-07 · **백엔드 구현 완료 / 프론트 이행 대기**
 대상: 유저 콘솔 `자동 DM > 발송 로그`
-관련: [`DM_ERROR_POLICY_PLAN.md`](DM_ERROR_POLICY_PLAN.md)(운영자용 정책) ·
+관련: [`../system/DM_ERROR_POLICY_PLAN.md`](../system/DM_ERROR_POLICY_PLAN.md)(운영자용 정책) ·
 [`USER_NOTIFICATION_PLAN.md`](USER_NOTIFICATION_PLAN.md)(알림) ·
 [`DM_RECOVERY_FRONTEND.md`](DM_RECOVERY_FRONTEND.md)
 

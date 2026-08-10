@@ -1,4 +1,4 @@
-"""유저 콘솔 DM 문구(v4) 회귀 테스트 — `DM_USER_COPY_MAPPING.md` 구현분.
+"""유저 콘솔 DM 문구(v4) 회귀 테스트 — `../../docs/frontend/DM_USER_COPY_MAPPING.md` 구현분.
 
 이 파일이 지키는 것은 세 가지다.
 
@@ -128,7 +128,7 @@ class TestAdminCatalogParity:
         missing = sorted(seen - set(ADMIN_REASON_TO_USER))
         assert not missing, (
             f"운영 사유에 유저 매핑이 없습니다: {missing}\n"
-            "→ DM_USER_COPY_MAPPING.md §4 에 어느 U 버킷인지 정하고 "
+            "→ docs/frontend/DM_USER_COPY_MAPPING.md §4 에 어느 U 버킷인지 정하고 "
             "ADMIN_REASON_TO_USER 에 추가하세요."
         )
 

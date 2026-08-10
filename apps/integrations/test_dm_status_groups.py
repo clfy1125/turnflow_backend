@@ -139,7 +139,7 @@ class TestFrontendAction2534025:
 
     def test_plain_param_error(self):
         # v4: "파라미터 오류" 같은 내부 용어를 더 이상 쓰지 않는다
-        # (DM_USER_COPY_MAPPING.md §2-2 기준 8).
+        # (docs/frontend/DM_USER_COPY_MAPPING.md §2-2 기준 8).
         act = build_frontend_action("failed_param", "")
         assert act["user_reason"] == "window_expired"
         assert "파라미터" not in act["title"]

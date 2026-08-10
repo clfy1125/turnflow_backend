@@ -1,6 +1,6 @@
 """DM 오류 분류(policy) 회귀 테스트 — 2분류 체계 (2026-07-31).
 
-방침 원본: ``DM_ERROR_POLICY_PLAN.md`` (분류 근거는 ``DM_ERROR_POLICY_MATRIX.html``).
+방침 원본: ``../../docs/system/DM_ERROR_POLICY_PLAN.md`` (분류 근거는 ``../../docs/system/DM_ERROR_POLICY_MATRIX.html``).
 
 여기서 지키는 계약:
   1. 사전의 **모든** 항목이 유효한 policy 를 갖는다 (빠뜨린 항목 = 배포 후 화면에서 무색).

@@ -8,7 +8,7 @@
 를 단일 source of truth 로 제공한다.
 
 ──────────────────────────────────────────────────────────────────────────
-v4 에서 바뀐 것 (2026-08-06, `DM_USER_COPY_MAPPING.md`)
+v4 에서 바뀐 것 (2026-08-06, `../../docs/frontend/DM_USER_COPY_MAPPING.md`)
 ──────────────────────────────────────────────────────────────────────────
 v3.2 문구는 어드민 오류 사전 정비 **이전**에 쓰여, 내부 용어("Private Reply", "파라미터
 오류", "토큰")와 내부 처리 사정(검증 대기 35분)이 그대로 사용자에게 나가고 있었다.
@@ -66,7 +66,7 @@ HIDDEN_SPAM_SUBCODE = "2534025"
 #
 # ⚠️ v3.2 의 ``default_routing_app`` 항목을 **삭제**했다 — "Facebook 페이지 설정 > 고급
 #    메시지 설정 > 기본 라우팅 앱"을 안내했는데, 우리는 **Instagram Login** 방식이라
-#    그 설정 화면 자체가 존재하지 않는다. `DISCONNECT_OTHER_DM_TOOLS_GUIDE.md` 는
+#    그 설정 화면 자체가 존재하지 않는다. `../../docs/frontend/DISCONNECT_OTHER_DM_TOOLS_GUIDE.md` 는
 #    정반대로 "그 절차는 TurnFlow 에 해당하지 않는다"고 안내 중이었다(두 문서가 상충).
 # ⚠️ ``message_access_allowed`` 항목도 뺐다(제품 결정) — 확인 경로가 길고 실제 원인인
 #    경우가 드물어 첫 항목으로 두기에 부적절했다.
@@ -94,7 +94,7 @@ SELF_CHECK_CHECKLIST: list[dict] = [
 
 
 # ── 사유별 문구 (제목 · 이유 · 다음 행동) ─────────────────────────────
-# 구조·표현 규칙은 `DM_USER_COPY_MAPPING.md` §2. 이 파일을 고칠 때는 그 문서도 함께 고칠 것.
+# 구조·표현 규칙은 `../../docs/frontend/DM_USER_COPY_MAPPING.md` §2. 이 파일을 고칠 때는 그 문서도 함께 고칠 것.
 def _copy(title: str, cause: str, next_step: str) -> dict:
     return {"title": title, "cause": cause, "next_step": next_step}
 

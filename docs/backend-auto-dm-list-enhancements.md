@@ -83,7 +83,7 @@ GET /api/v1/integrations/auto-dm-campaigns/?ig_connection_id=<uuid>
 > `media_url` 에는 2026-08-03 부터 게시물 **permalink**(HTML 페이지 URL)가 채워지게 돼,
 > 미러 값을 `<img src>` 에 넣으면 깨졌습니다. 이제 `thumbnail_url` 은 **별도 컬럼**이며
 > 우리 스토리지에 재호스팅한 이미지 URL 입니다. 상세(retrieve) 응답에도 함께 나갑니다.
-> 자세한 계약은 `DM_CAMPAIGN_THUMBNAIL_FRONTEND.md` 참고.
+> 자세한 계약은 `frontend/DM_CAMPAIGN_THUMBNAIL_FRONTEND.md` 참고.
 
 > 응답은 기존과 동일하게 **페이지네이션 없는 평면 배열**입니다. 기존 필드는 그대로,
 > 위 5개만 추가됐습니다(Breaking 아님).

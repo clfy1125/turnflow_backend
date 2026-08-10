@@ -2191,7 +2191,7 @@ class DMAccountBlock(models.Model):
     - ``rate_governor.rehydrate_from_db`` 가 Redis 손실 후 이 행들로 캐시 재시드
 
     키는 IG 계정 단위(``external_account_id``) — Meta 한도가 계정당이므로(거버너 키와 동일).
-    설계: DR_IMPLEMENTATION_PLAN.md §7.2.
+    설계: docs/ops/DR_IMPLEMENTATION_PLAN.md §7.2.
     """
 
     external_account_id = models.CharField(

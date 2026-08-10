@@ -3,7 +3,7 @@
 > **목적**: 콜로(colo) → GCP cold-VM 복구 체인 전체를 **프로덕션 트래픽·공유 백업을 건드리지 않고** 리허설한다.
 > 이 문서는 **미래의 운영자(사람/에이전트)가 그대로 재현**할 수 있도록 2026-06-30 격리 드릴 + 2026-07-01 실(live) 컷오버 훈련에서 실제로 실행·검증된 절차를 기록한 것이다.
 >
-> - **설계 배경/결정 로그**: [`../../../DR_IMPLEMENTATION_PLAN.md`](../../../DR_IMPLEMENTATION_PLAN.md)
+> - **설계 배경/결정 로그**: [`../../../docs/ops/DR_IMPLEMENTATION_PLAN.md`](../../../docs/ops/DR_IMPLEMENTATION_PLAN.md)
 > - **운영자 개요 런북**: [`README.md`](README.md) (파일 표·1회성 셋업·비용·안전규칙)
 > - **레거시(office 웜스탠바이 + CF LB)**: [`../DR_STEP3_4_RUNBOOK.md`](../DR_STEP3_4_RUNBOOK.md) — 폐기됨(2026-06-30), LB/failback 설계 배경용으로만 보존
 > - **감지/알림(Phase A)**: [`../cloudflare/README.md`](../cloudflare/README.md) — `turnflow-scheduler-tick` 워커. 이 드릴의 범위 밖.

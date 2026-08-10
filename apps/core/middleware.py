@@ -69,7 +69,7 @@ class ActiveSiteGateMiddleware:
       가 True 일 때만 통과(기본 False = fully-dark).
     - ``/api/v1/healthz*``, ``/api/v1/internal/scheduler/*`` 는 하드 예외(이게 막히면 failover 불가).
 
-    상세: DR_IMPLEMENTATION_PLAN.md §5.3.
+    상세: docs/ops/DR_IMPLEMENTATION_PLAN.md §5.3.
     """
 
     def __init__(self, get_response):

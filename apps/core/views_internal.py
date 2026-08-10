@@ -10,7 +10,7 @@ POST /api/v1/internal/scheduler/tick
 
   active_site 게이트: SITE_ID != active_site 면 409(아무것도 fire 안 함). active_site 불명 → 503.
 
-상세: DR_IMPLEMENTATION_PLAN.md §6.2.
+상세: docs/ops/DR_IMPLEMENTATION_PLAN.md §6.2.
 """
 
 from __future__ import annotations

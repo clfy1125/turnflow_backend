@@ -6,7 +6,7 @@
   - DB 조회 실패 → last-known-good 으로 폴백(active 사이트가 DB blip 에 503 나는 것 방지)
   - 둘 다 없으면 보수적으로 passive 취급(split-brain 방지 우선)
 
-상세: DR_IMPLEMENTATION_PLAN.md §5.
+상세: docs/ops/DR_IMPLEMENTATION_PLAN.md §5.
 """
 
 from __future__ import annotations

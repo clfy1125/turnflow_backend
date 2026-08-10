@@ -5,7 +5,7 @@
   - 인증되면 **항상 200** + 점수판 필드. 서브프로브가 터져도 503 아님(필드로 인코딩).
   - ready/tick 과 달리 **active_site 게이트 없음** — passive 박스에서도 진실 반환.
 
-설계: 계획서 Phase A1, DR_IMPLEMENTATION_PLAN.md §5.
+설계: 계획서 Phase A1, docs/ops/DR_IMPLEMENTATION_PLAN.md §5.
 """
 
 import pytest

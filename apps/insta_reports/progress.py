@@ -3,7 +3,7 @@
 프론트는 `GET /reports/{id}/` 의 `steps[]` 를 그대로 체크리스트로 그리면 된다.
 `stage_started_at + stage_expected_seconds` 로 폴링(3초) 사이를 부드럽게 채울 수 있다.
 
-⚠️ 단계 키를 바꾸면 `models.ReportStage` 와 프론트 문서(INSTA_REPORT_FRONTEND.md)를
+⚠️ 단계 키를 바꾸면 `models.ReportStage` 와 프론트 문서(docs/frontend/INSTA_REPORT_FRONTEND.md)를
    함께 고쳐야 한다. 진행률 구간은 겹치지 않고 0→100 을 정확히 덮는다.
 """
 

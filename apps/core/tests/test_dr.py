@@ -1,6 +1,6 @@
 """DR 컨트롤플레인 회귀 테스트 — active_site 게이트 / 헬스 / 스케줄러 tick / 거버너 재수화.
 
-설계: DR_IMPLEMENTATION_PLAN.md §5, §6, §7.
+설계: docs/ops/DR_IMPLEMENTATION_PLAN.md §5, §6, §7.
 """
 
 import pytest

@@ -79,4 +79,4 @@ bash teardown.sh                    # 끝나면 정리 → $0
 - **false-failover 주의**: 콜로가 실제 살아있는데 전환하면 콜로·GCP 가 같은 R2 stanza 에 분기 타임라인을 동시 push → 백업 오염. 그래서 `cf_origin.sh` 는 GCP 전환 시 '콜로 펜스 완료?'를 **강제 확인**하고 스왑 후 콜로 443 을 능동 프로브한다. 진짜 장애(콜로 다운)면 경합 없음. live promote 는 새 타임라인 생성 → startup 이 full backup+check 로 정착(알림에 `archive=OK` 표기, 실패 시 🟠).
 - 자동 failback 금지. 콜로 복귀는 항상 수동 + R2(새 타임라인)에서 재시드 후(`failback_from_gcp.sh`).
 - 시크릿(`secrets/`·`gcp.env`·`certs/`)은 `deploy/dr/gcp/.gitignore`(deny-all+allowlist)로 커밋 차단. setup_secrets.sh 후 `secrets/` 삭제 권장. 암호화 cipher/CF Origin key 분실 = 복구 불가 → Secret Manager + 오프사이트 이중 보관.
-- 상세 설계: `DR_IMPLEMENTATION_PLAN.md`, 계획서 `purrfect-knitting-ember.md`. 콜로 배포 함정: 메모리 `colo-prod-deploy-gotchas`.
+- 상세 설계: `../../../docs/ops/DR_IMPLEMENTATION_PLAN.md`, 계획서 `purrfect-knitting-ember.md`. 콜로 배포 함정: 메모리 `colo-prod-deploy-gotchas`.

@@ -52,7 +52,7 @@ class TrackVisitView(APIView):
 
 ## 사용 시나리오
 - 랜딩 페이지가 로드될 때 트래킹 스니펫이 `fetch(..., { keepalive: true })` 로 1회 전송
-- 상세 통합 코드는 `SIGNUP_ATTRIBUTION_FRONTEND.md` 참고 (스니펫 전문 포함)
+- 상세 통합 코드는 `../../docs/frontend/SIGNUP_ATTRIBUTION_FRONTEND.md` 참고 (스니펫 전문 포함)
 - 서비스 앱(로그인 후 화면)에서는 호출하지 않습니다 — 랜딩 전용
 
 ## 인증

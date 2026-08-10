@@ -32,7 +32,7 @@ def _dr_active_site_gate(task_id=None, task=None, **kwargs):
 
     active 사이트(콜로)에서는 no-op. failover 후 office 가 active 면 office 워커가 정상 실행.
     게이트 평가 자체가 실패하면 통과(가용성 우선; 미들웨어/거버너가 2차 방어). 멱등 태스크라
-    전환 경계의 짧은 중복/드랍은 무손실.  (DR_IMPLEMENTATION_PLAN.md §5.4)
+    전환 경계의 짧은 중복/드랍은 무손실.  (docs/ops/DR_IMPLEMENTATION_PLAN.md §5.4)
     """
     try:
         from apps.core.site_control import is_active_site
@@ -50,7 +50,7 @@ def _dr_rehydrate_governor(**kwargs):
     """워커 부팅 시(예: Redis 재시작/failover 후) 거버너 카운터를 DB 에서 재수화.
 
     active 사이트에서만 수행. 이로써 'Redis 손실 → 최대 1h DM 동결' 함정 없이 즉시 정확 재개.
-    (DR_IMPLEMENTATION_PLAN.md §7.1)
+    (docs/ops/DR_IMPLEMENTATION_PLAN.md §7.1)
     """
     try:
         from apps.core.site_control import is_active_site
@@ -68,7 +68,7 @@ def _dr_worker_heartbeat(**kwargs):
 
     active 사이트에서 큐가 흐르는지(워커 stall 감지) 신호. best-effort — 무트래픽이면 stale
     로 보이나, 감지기가 queue_depth 와 상관(빈 큐 + stale = 무해)으로 처리하므로 오탐 아님.
-    (DR_IMPLEMENTATION_PLAN.md §5, 계획서 Phase A1)
+    (docs/ops/DR_IMPLEMENTATION_PLAN.md §5, 계획서 Phase A1)
     """
     try:
         from apps.core.site_control import touch_worker_heartbeat

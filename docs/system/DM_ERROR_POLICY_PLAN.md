@@ -326,7 +326,7 @@ log.mark_failed(
 ### Phase 6 — 어드민팀 요청서 반영 ✅ **구현 완료 (2026-07-31)**
 
 어드민팀이 이 계획으로 화면을 설계하면서 두 라운드의 요청서를 보냈다. 회신은
-`ADMIN_DM_ERROR_PROPOSAL_R11.md` / `ADMIN_DM_ERROR_PROPOSAL_R12.md`.
+`../archive/ADMIN_DM_ERROR_PROPOSAL_R11.md` / `../archive/ADMIN_DM_ERROR_PROPOSAL_R12.md`.
 
 11차 (DM-6~12) — 화면이 쓸 **숫자**를 만드는 단계:
 - `stats.follow_up` 후속 DM 사람 단위 축 (`basis=latest_per_person`)

@@ -244,7 +244,7 @@ def moderation_action_check(ig_account_id: str, comment_id: str, action: str) ->
 
 # ───────────────────────────────────────────────────────────────
 # DR — Action Block DB 영속화 + Redis 손실 후 DB 재수화 (#2 Option C)
-# 설계: DR_IMPLEMENTATION_PLAN.md §7.1, §7.2.
+# 설계: docs/ops/DR_IMPLEMENTATION_PLAN.md §7.1, §7.2.
 # ───────────────────────────────────────────────────────────────
 def _db_action_block_level(ig_account_id: str) -> int:
     """DMAccountBlock.level (없으면 0). trip 시 에스컬레이션 보존용."""

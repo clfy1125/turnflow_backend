@@ -1,7 +1,7 @@
 # [어드민팀 전달] DM 오류 분류 개편 — API 변경 안내 + 반영 요청
 
 2026-07-31 · 백엔드 → 어드민 콘솔팀
-관련 백엔드 문서: `DM_ERROR_POLICY_PLAN.md` (분류 원본 `DM_ERROR_POLICY_MATRIX.html`)
+관련 백엔드 문서: `../system/DM_ERROR_POLICY_PLAN.md` (분류 원본 `../system/DM_ERROR_POLICY_MATRIX.html`)
 
 ---
 
@@ -211,7 +211,7 @@ const SEND_STATUS_TO_CODE = { failed_token: "190", failed_window: "10", failed_p
 
 ## 6. 질문 주실 곳
 
-- 분류 근거 전수 목록: `DM_ERROR_POLICY_MATRIX.html` (52항목, 사유·원인·조치까지)
-- 방침·판정 근거: `DM_ERROR_POLICY_PLAN.md`
+- 분류 근거 전수 목록: `../system/DM_ERROR_POLICY_MATRIX.html` (52항목, 사유·원인·조치까지)
+- 방침·판정 근거: `../system/DM_ERROR_POLICY_PLAN.md`
 - 서버 사전 원본: `apps/admin_api/dm_error_catalog.py`
 - 분류 회귀 테스트: `apps/admin_api/tests_dm_error_policy.py` (방침이 바뀌면 여기가 먼저 깨집니다)

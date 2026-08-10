@@ -6,7 +6,7 @@ Core views — health check / monitoring.
 - healthz/ready : DR 트래픽 수용 자격(DB·Redis·migration·active_site·restore[·scheduler·siblings]).
                   Cloudflare Load Balancer 의 colo-production 풀 모니터가 이 경로를 본다.
 
-상세: DR_IMPLEMENTATION_PLAN.md §5.
+상세: docs/ops/DR_IMPLEMENTATION_PLAN.md §5.
 """
 
 from __future__ import annotations

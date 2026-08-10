@@ -1,6 +1,6 @@
 # DR 활성화 — Step 3 & 4 실행 런북 (나중에 진행)
 
-> 사내(office) 박스가 준비되면 이 문서대로 진행한다. 설계 배경은 `DR_IMPLEMENTATION_PLAN.md` §4(Caddy↔DR), §8(LB/failover), §7.4(office 복구) 참조. 이 문서는 **실행 순서/명령**에 집중.
+> 사내(office) 박스가 준비되면 이 문서대로 진행한다. 설계 배경은 `../../docs/ops/DR_IMPLEMENTATION_PLAN.md` §4(Caddy↔DR), §8(LB/failover), §7.4(office 복구) 참조. 이 문서는 **실행 순서/명령**에 집중.
 
 ## 0. 전제 — 이미 완료된 것 (✅)
 - **Step 1 (PITR)**: 콜로 db 에 pgBackRest 내장, WAL → R2 연속 아카이빙(RPO=분), 주1 full/일 diff cron. (`deploy/backups/pgbackrest.conf`, `pgbackrest_backup.sh`)

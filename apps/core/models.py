@@ -4,7 +4,7 @@
 - ``ScheduledJob`` : 외부 Cron(``/api/v1/internal/scheduler/tick``)이 참조하는 due-job 테이블.
                      기존 ``CELERY_BEAT_SCHEDULE`` 의 단일 장애점(celery_beat)을 대체한다.
 
-설계 상세: ``DR_IMPLEMENTATION_PLAN.md`` §5(SiteControl/health), §6(ScheduledJob/tick).
+설계 상세: ``../../docs/ops/DR_IMPLEMENTATION_PLAN.md`` §5(SiteControl/health), §6(ScheduledJob/tick).
 """
 
 from __future__ import annotations

@@ -9,5 +9,5 @@
     llm       — deepseek LLM 4단계(분류/검증/적합도/초안) + FAKE_LLM 휴리스틱
     pipeline  — 오케스트레이터(단계 실행·체크포인트 재개·취소·rate-pause·후보 생성)
 
-설계: 저장소 루트 DM_CAMPAIGN_MIGRATION_FRONTEND.md, CLAUDE.md 문서 인덱스.
+설계: 저장소 루트 docs/frontend/DM_CAMPAIGN_MIGRATION_FRONTEND.md, CLAUDE.md 문서 인덱스.
 """

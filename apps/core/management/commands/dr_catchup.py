@@ -3,7 +3,7 @@
 Redis 는 휘발성으로 간주하고, 복구된 DB 를 진실로 하여 기존 **멱등** 태스크들을 순서대로
 동기 실행한다(신규 dedupe 로직 없음). failover.sh 가 마이그레이션 직후, promote 전에 호출.
 
-순서(설계: DR_IMPLEMENTATION_PLAN.md §7.5):
+순서(설계: docs/ops/DR_IMPLEMENTATION_PLAN.md §7.5):
   STEP 0  거버너 재수화(rate_governor.rehydrate_from_db) — 카운터/Action Block 복원 + 동결 해제
   STEP 1  reconcile_stuck_submitting   (in-flight SUBMITTING 먼저)
   STEP 2  reconcile_accepted_dms

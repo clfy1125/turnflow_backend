@@ -2,7 +2,7 @@
 
 > **대상:** colo prod `121.126.99.70` (Ubuntu 24.04, Dell PowerEdge R760)
 > **전제:** 실서비스 운영 중 — 유료·체험 구독 **117건**(active 89 / trialing 28), 자동 DM 상시 발송, 토스 정기결제 10분 beat
-> **원본 진단:** [SECURITY_AUDIT_2026-08-03_PROD_INFRA.md](SECURITY_AUDIT_2026-08-03_PROD_INFRA.md)
+> **원본 진단:** [SECURITY_AUDIT_2026-08-03_PROD_INFRA.md](../archive/SECURITY_AUDIT_2026-08-03_PROD_INFRA.md)
 > **방법:** 변경 전 10개 영역을 read-only 로 사전검증(적대적 반증 포함) → 단계별 게이트를 두고 직렬 적용 → 매 단계 양방향 검증
 > **결과:** P0 5건 전부 완료 · P1 6건 중 5건 완료 · P2 5건 중 2건 완료 · **서비스 중단 0**
 

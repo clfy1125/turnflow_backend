@@ -3,7 +3,7 @@
 `/healthz/diag` 가 호출한다. 모두 best-effort(예외 → 빈값/None), 핫패스 아님(감지기가 60s 폴).
 "앱이 200 을 주는데 일이 안 흐르는" 정체(stall)를 감지기에 노출하는 게 목적이다.
 
-상세: DR 계획서 Phase A1, DR_IMPLEMENTATION_PLAN.md §5.
+상세: DR 계획서 Phase A1, docs/ops/DR_IMPLEMENTATION_PLAN.md §5.
 """
 
 from __future__ import annotations

@@ -1021,7 +1021,7 @@ CSRF_TRUSTED_ORIGINS = [o.strip() for o in _csrf_env.split(",") if o.strip()]
 
 # ─────────────────────────────────────────────────────────────
 # DR (Disaster Recovery) — active_site 락 / 헬스 / 외부 스케줄러
-# 상세: DR_IMPLEMENTATION_PLAN.md
+# 상세: docs/ops/DR_IMPLEMENTATION_PLAN.md
 # ─────────────────────────────────────────────────────────────
 # 이 서버의 정체성. 콜로=colo / 사내=office / Azure=azure. .env 로 서버별 지정.
 SITE_ID = config("SITE_ID", default="colo")

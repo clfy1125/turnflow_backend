@@ -67,6 +67,12 @@ turnflow_backend/
 │   ├── api_urls.py             # /api/v1/ 아래 라우팅
 │   ├── celery.py               # Celery 앱
 │   └── wsgi.py / asgi.py
+├── docs/                       # 📄 모든 문서 (2026-08-10 루트에서 이관) — 색인: docs/README.md
+│   ├── frontend/               #   API 계약·연동 가이드 (프론트/어드민 콘솔팀 전달분)
+│   ├── ops/                    #   운영·인프라·보안·배포 (배포는 docs/ops/배포방법.md 부터)
+│   ├── system/                 #   백엔드 내부 동작 설명 (DM 라이프사이클·스팸필터·오류정책)
+│   ├── archive/                #   완료·대체된 일회성 문서 (최신 아님, 이력 참고용)
+│   └── legal/                  #   법무 자료 (수정 금지)
 ├── api-mcp/                    # 사내 API 문서 검색용 MCP 서버 (별도 파이썬 패키지)
 ├── geoip/                      # GeoLite2 DB (런타임 다운로드)
 ├── media/                      # 사용자 업로드 파일
@@ -319,37 +325,52 @@ make test-cov                             # HTML 커버리지 리포트
 
 ## 13. 참고 문서
 
+**📄 문서는 전부 `docs/` 아래에 있습니다 — 색인은 `docs/README.md`.**
+(2026-08-10 정리: 루트에 흩어져 있던 47개를 `git mv` 로 용도별 이관. 루트에 남긴 건
+`README.md` · `CLAUDE.md` · `프로젝트 지침서.md` 셋뿐. 새 문서도 해당 폴더에 만들 것.)
+
+| 폴더 | 용도 |
+|---|---|
+| `docs/frontend/` | API 계약·연동 가이드 (프론트/어드민 콘솔팀 전달분) |
+| `docs/ops/` | 운영·인프라·보안·배포 — **배포는 `docs/ops/배포방법.md` 부터** |
+| `docs/system/` | 백엔드 내부 동작 설명 |
+| `docs/archive/` | 완료·대체됨 (최신 아님, 이력 참고용) |
+| `docs/legal/` | 법무 자료 (수정 금지) |
+
 저장소 내 문서:
 - `프로젝트 지침서.md` — 제품 요구사항 원본 (이 파일의 상위)
 - `README.md` — 일반 개발자용 셋업 가이드
-- `AI_PAGE_GENERATION_GUIDE.md` — AI 페이지 생성 API 프론트엔드 연동 가이드 (4단계 흐름 + category 파라미터)
-- `INSTAGRAM_OAUTH_FLOW.md` — IG OAuth 플로우
-- `INSTAGRAM_TEST_GUIDE.md` — IG 테스트 가이드
-- `CLOUDFLARE_TUNNEL_SETUP.md` — 개발 서버 공개(고정 URL `dev-api.turnflow.link`) Cloudflare Tunnel 셋업 (ngrok 대체)
-- `AUTODM_DELIVERY_LIFECYCLE.md` (+ `.html`) — 자동 DM 발송 라이프사이클: 웹훅 수신→발송 확정→실패 처리·무손실 하드닝(v3.10.1)
-- `TOSS_BILLING_FRONTEND.md` — 토스 빌링 프론트 연동 가이드 (SDK v2 카드등록 → prepare/confirm, 플랜 표시, 체험/해지/카드변경/추가계정 UX; 추가계정 축소=지연 반영 §3-2)
-- `REFERRAL_COUPON_FRONTEND.md` — 쿠폰(제휴/레퍼럴 코드) 프론트 변경 요청(2026-08-04, **breaking**). 무카드 `POST /billing/referral/redeem/` **폐지**(항상 400 + `REFERRAL_REQUIRES_CARD`) — 이 경로가 기본 체험 30일을 가산하지 않아 14일 쿠폰이 44일 아닌 **14일**로 나갔다(HLEVEL26 17건 중 3건 피해). 쿠폰은 `toss/confirm` 의 `referral_code` 동봉이 **유일 경로**. `validate` 에 결제 전 미리보기 5필드 추가(`requires_card`/`trial_ends_at`/`first_charge_at`/`first_charge_amount`/`extra_ig_account_price`). ⚠️ 표기는 `total_trial_days`, **`trial_days`(보너스분)를 노출하면 혜택이 1/3로 축소돼 보인다**
-- `IG_ACCOUNT_ACTIVATION_FRONTEND.md` — 추가 IG 계정 축소 지연 + 활성 계정 선택(소프트 비활성) 계약. `GET/POST /billing/ig-account-activation/` (page-activation IG 판), 비활성=기능 제외·토큰 보존, 허용량=활성 계정 수 기준. **needs_activation_adjustment 트리거에 "연동≥1 & 활성0" 케이스 추가**(전부 비활성 구제)
-- `WEBHOOK_HEALTH_FRONTEND.md` — IG 연결 종합 헬스 진단 + 웹훅 수동 재구독 프론트 가이드. `GET/POST /integrations/instagram/connections/{id}/health|resubscribe-webhooks/` (토큰 라이브 /me·웹훅 subscribed_apps·만료·status, report-only·항상 200, issues→CTA 매핑, 스로틀 20/min·6/hour). **하나의 IG 계정=하나의 워크스페이스**(콜백 `ALREADY_CONNECTED_ELSEWHERE` 차단, audit_ig_duplicates 로 기존 중복 조사) + 재연결 `reconnect_connection_id`(한도 우회·콜백 재판정) + 콜백 is_active 자동 복구
-- `SIGNUP_ATTRIBUTION_FRONTEND.md` — 방문→가입 채널 귀속 연동 가이드 (랜딩 스니펫 `tf_vid`/세션 1회 전송, CTA 쿼리스트링 핸드오프, register/google `attribution` 필드, 채널 매핑 표 = 마케팅팀 UTM 규칙). 어드민 마케팅 대시보드(`/api/v1/admin/dashboard/marketing/`)의 채널·퍼널 데이터 소스
-- `DR_IMPLEMENTATION_PLAN.md` — 재해복구(DR) 설계·결정 로그·코드 자산 맵
+- `docs/README.md` — **문서 색인** (아래 목록의 요약판)
+- `docs/ops/배포방법.md` — prod 배포 절차. ⚠️ 수동 `compose build`/`up -d` 금지 이유(48초 DB 블립,
+  은퇴한 `celery_beat` 기동 시 주기잡 이중 발사) 포함
+- `docs/frontend/AI_PAGE_GENERATION_GUIDE.md` — AI 페이지 생성 API 프론트엔드 연동 가이드 (4단계 흐름 + category 파라미터)
+- `docs/ops/INSTAGRAM_OAUTH_FLOW.md` — IG OAuth 플로우
+- `docs/ops/INSTAGRAM_TEST_GUIDE.md` — IG 테스트 가이드
+- `docs/ops/CLOUDFLARE_TUNNEL_SETUP.md` — 개발 서버 공개(고정 URL `dev-api.turnflow.link`) Cloudflare Tunnel 셋업 (ngrok 대체)
+- `docs/system/AUTODM_DELIVERY_LIFECYCLE.md` (+ `.html`) — 자동 DM 발송 라이프사이클: 웹훅 수신→발송 확정→실패 처리·무손실 하드닝(v3.10.1)
+- `docs/frontend/TOSS_BILLING_FRONTEND.md` — 토스 빌링 프론트 연동 가이드 (SDK v2 카드등록 → prepare/confirm, 플랜 표시, 체험/해지/카드변경/추가계정 UX; 추가계정 축소=지연 반영 §3-2)
+- `docs/frontend/REFERRAL_COUPON_FRONTEND.md` — 쿠폰(제휴/레퍼럴 코드) 프론트 변경 요청(2026-08-04, **breaking**). 무카드 `POST /billing/referral/redeem/` **폐지**(항상 400 + `REFERRAL_REQUIRES_CARD`) — 이 경로가 기본 체험 30일을 가산하지 않아 14일 쿠폰이 44일 아닌 **14일**로 나갔다(HLEVEL26 17건 중 3건 피해). 쿠폰은 `toss/confirm` 의 `referral_code` 동봉이 **유일 경로**. `validate` 에 결제 전 미리보기 5필드 추가(`requires_card`/`trial_ends_at`/`first_charge_at`/`first_charge_amount`/`extra_ig_account_price`). ⚠️ 표기는 `total_trial_days`, **`trial_days`(보너스분)를 노출하면 혜택이 1/3로 축소돼 보인다**
+- `docs/frontend/IG_ACCOUNT_ACTIVATION_FRONTEND.md` — 추가 IG 계정 축소 지연 + 활성 계정 선택(소프트 비활성) 계약. `GET/POST /billing/ig-account-activation/` (page-activation IG 판), 비활성=기능 제외·토큰 보존, 허용량=활성 계정 수 기준. **needs_activation_adjustment 트리거에 "연동≥1 & 활성0" 케이스 추가**(전부 비활성 구제)
+- `docs/frontend/WEBHOOK_HEALTH_FRONTEND.md` — IG 연결 종합 헬스 진단 + 웹훅 수동 재구독 프론트 가이드. `GET/POST /integrations/instagram/connections/{id}/health|resubscribe-webhooks/` (토큰 라이브 /me·웹훅 subscribed_apps·만료·status, report-only·항상 200, issues→CTA 매핑, 스로틀 20/min·6/hour). **하나의 IG 계정=하나의 워크스페이스**(콜백 `ALREADY_CONNECTED_ELSEWHERE` 차단, audit_ig_duplicates 로 기존 중복 조사) + 재연결 `reconnect_connection_id`(한도 우회·콜백 재판정) + 콜백 is_active 자동 복구
+- `docs/frontend/SIGNUP_ATTRIBUTION_FRONTEND.md` — 방문→가입 채널 귀속 연동 가이드 (랜딩 스니펫 `tf_vid`/세션 1회 전송, CTA 쿼리스트링 핸드오프, register/google `attribution` 필드, 채널 매핑 표 = 마케팅팀 UTM 규칙). 어드민 마케팅 대시보드(`/api/v1/admin/dashboard/marketing/`)의 채널·퍼널 데이터 소스
+- `docs/ops/DR_IMPLEMENTATION_PLAN.md` — 재해복구(DR) 설계·결정 로그·코드 자산 맵
 - `deploy/dr/gcp/DRILL_RUNBOOK.md` — GCP cold-VM DR 드릴/컷오버 재현 런북 (+ `deploy/dr/gcp/README.md` 운영자 개요)
-- `SECURITY_AUDIT_2026-06.md` — 론칭 전 보안 취약점 감사(미해결 P0 포함)
-- `DM_CAMPAIGN_DUPLICATE_PREVENTION_FRONTEND.md` — 게시물당 활성 캠페인 1개(409) 프론트 가이드
-- `DM_QUEUE_STATE_FRONTEND.md` — DM 순차 발송 큐 현황(게이지+ETA) 프론트 가이드 + v4.3 페이서 메커니즘 요약 (`max_sends_per_hour` 필드·DB 컬럼 완전 제거 — 마이그 0042) + v4.4 사람 단위 `people` 블록("N명" 표기는 이벤트 단위 `gauge` 말고 이걸로; stats 의 `unique_targets/failed/unconfirmed/reach_rate` 와 동일 정의 = `campaign_stats.people_rollup`) + **v4.5(2026-07-14)**: 통계 헤드라인=`unique_sent_rate`(구 100% 오표기 정정), '확인 필요'→'숨겨진 요청·스팸'(`unique_hidden_spam`) 분리 + `unique_needs_attention[_excl_hidden]`, 로그 상태 그룹 `status_group`(대기중/전송됨/읽음/숨겨진 요청·스팸/확인 필요 — 단일 소스 `dm_status_groups.py`)·`is_recovering`·서버 필터, needs_attention success-aware(복구 반영)
-- `DM_RECOVERY_FRONTEND.md` — 실패 DM 복구(recovery) 프론트 연동 **v2(재댓글 방식, 2026-07-14)**: 확정실패→"숨김함 수락 후 재댓글" 안내 대댓글→재댓글이 일반 경로로 재발송(성공 시 recovery_delivered 자동 승격). 추천문구 30개(`GET .../recovery-reply-suggestions/`) + 프로 전용 게이트(fail-closed) + 로그 상태 3종. `recovery_keyword`=deprecated(값 무시). 기본 활성
-- `CAMPAIGN_TIMESERIES_FRONTEND.md` — 캠페인 신규 요청자 시계열(진행/모멘텀 차트) 프론트 가이드. `GET .../auto-dm-campaigns/{id}/timeseries/?range=all|24h|7d`, 사람 단위(최초 트리거 시점 1회, `stats` people.total 과 동일), KST 버킷(all·7d=day/24h=hour)·제로필·마지막 버킷 partial, `history_complete`(로그 보존정책 가드). 집계=`campaign_stats.new_requester_timeseries`
-- `DM_CAMPAIGN_THUMBNAIL_FRONTEND.md` — 캠페인 게시물 썸네일 계약(2026-08-05, 마이그 integrations0048·core0013). **`media_url` 은 permalink(링크용, 이미지 아님) / `thumbnail_url` 은 우리 스토리지 재호스팅 사본(영구, 만료 없음)** 으로 의미 분리 — 예전 미러 구조가 permalink 를 `<img src>` 로 내보내 prod 77건 중 68건이 깨져 있었다. IG CDN URL 은 서명 만료라 저장·전달 모두 부적합 → `apps/integrations/media_thumbnail.py`(프로필 사진 규약 확장, 640px). 릴스=커버·캐러셀=첫 슬라이드(`InstagramMediaService.pick_thumbnail_source`), 목록 동기 Graph 호출 제거·비동기 예약+6h 스위퍼, 상세 응답에 통계 4필드 추가, 미디어 목록 `?media_ids=` 배치조회(호출 1회)
-- `CANCEL_RETENTION_FRONTEND.md` — 구독 해지 리텐션 플로우 백엔드 구현 응답. ①일시정지 `POST /billing/pause/`(months 1/2/3, 잔여기간 후 무과금 정지·자동재개+3일전 고지, 재개=기존 resume 재사용, status "paused"·pause_ends_at·paused_months·can_pause) ②리텐션할인 `POST /billing/retention-offer/apply/`(다음1회 50%, 1인1회·active유료, next_charge_amount 응답) ③트래킹 offer_shown/accepted/declined + offer 필드 ④윈백메일(WINBACK_ENABLED 게이트·dormant, marketing_opt_in 동의). 정책: 데이터 무기한 보존·정지 연1회·할인 1인1회. 마이그 billing0019/analytics0004/auth0004/core0009. **윈백은 2026-07-23 제품결정으로 계속 dormant 유지**(인앱 즉시 50% 할인으로 대체)
-- `MARKETING_OPT_IN_FRONTEND.md` — 마케팅 수신동의(`marketing_opt_in`) 연결 응답(2026-07-23, 마이그 없음·필드는 auth0004 기존). register/GET·PATCH me/google 3경로 연결, 수신거부=`PATCH /auth/me/ {marketing_opt_in:false}` 단일 소스(별도 토큰 엔드포인트 없음), PATCH me 응답이 프로필 전체로 확장. 리텐션 확인 4건 답변(next_billing.amount=renewal_amount 할인반영·paused change-plan/extra-accounts 400·오퍼코드 신규발급·정지 게이팅 get_effective_plan 일치). "취소 시 쿠폰 메일"은 원래 없음
-- `PASSWORD_RESET_GUIDE.md` — 비밀번호 재설정 플로우 프론트 가이드
-- `DISCONNECT_OTHER_DM_TOOLS_GUIDE.md` — 다른 DM 자동화 툴(매니챗 등) 연결 해제 안내 (댓글 fan-out·Private Reply 1회 충돌 / IG Login이라 Facebook 라우팅 불필요)
-- `CONNECT_CONFLICT_WARNING_FRONTEND.md` — 다른 DM 툴 충돌 경고 배너 프론트 스펙 (연결 직후 + 대시보드 상단, 닫기 규칙)
-- `DM_CAMPAIGN_MIGRATION_FRONTEND.md` — DM 캠페인 이전(매니챗 등→TurnFlow) 프론트 가이드. 연동 IG 계정의 최근 게시물·댓글·발신 DM(Conversations API) 분석→기존 DM 캠페인 추론→**비활성(INACTIVE) 초안 후보** 생성→검수·apply→활성화. `POST/GET /integrations/dm-migration/jobs/`(시작·폴링 3s·취소, 비종결1개+24h재사용+force쿨다운1h·429), `.../jobs/{id}/candidates/`(band=auto_draft/needs_review/template_only/excluded), `.../candidates/{id}/apply|dismiss/`(apply=AutoDMCampaignCreateSerializer 재사용·status=INACTIVE·활성 중복은 활성화 시점 발동). 전 플랜·v1 토큰차감 없음. 파이프라인=`apps/integrations/dm_migration/`(collect·analyze·llm·pipeline), 태스크 `integrations.run_dm_migration_job`(ai_jobs 큐, 체크포인트 재개·rate-pause)·`integrations.purge_dm_migration_raw`(원본 7일 파기+스테일 스위퍼, core 0008 시드). 자기발송 제외(SentDMLog mid/지문), Mock 픽스처+`DM_MIGRATION_FAKE_LLM`로 오프라인 e2e
-- `INSTA_REPORT_FRONTEND.md` — 인스타 성장 리포트 프론트 연동 가이드(프로 전용·계정당 월1회·평균 15분·3초 폴링·10단계
+- `docs/ops/SECURITY_AUDIT_2026-06.md` — 론칭 전 보안 취약점 감사(미해결 P0 포함)
+- `docs/frontend/DM_CAMPAIGN_DUPLICATE_PREVENTION_FRONTEND.md` — 게시물당 활성 캠페인 1개(409) 프론트 가이드
+- `docs/frontend/DM_QUEUE_STATE_FRONTEND.md` — DM 순차 발송 큐 현황(게이지+ETA) 프론트 가이드 + v4.3 페이서 메커니즘 요약 (`max_sends_per_hour` 필드·DB 컬럼 완전 제거 — 마이그 0042) + v4.4 사람 단위 `people` 블록("N명" 표기는 이벤트 단위 `gauge` 말고 이걸로; stats 의 `unique_targets/failed/unconfirmed/reach_rate` 와 동일 정의 = `campaign_stats.people_rollup`) + **v4.5(2026-07-14)**: 통계 헤드라인=`unique_sent_rate`(구 100% 오표기 정정), '확인 필요'→'숨겨진 요청·스팸'(`unique_hidden_spam`) 분리 + `unique_needs_attention[_excl_hidden]`, 로그 상태 그룹 `status_group`(대기중/전송됨/읽음/숨겨진 요청·스팸/확인 필요 — 단일 소스 `dm_status_groups.py`)·`is_recovering`·서버 필터, needs_attention success-aware(복구 반영)
+- `docs/frontend/DM_RECOVERY_FRONTEND.md` — 실패 DM 복구(recovery) 프론트 연동 **v2(재댓글 방식, 2026-07-14)**: 확정실패→"숨김함 수락 후 재댓글" 안내 대댓글→재댓글이 일반 경로로 재발송(성공 시 recovery_delivered 자동 승격). 추천문구 30개(`GET .../recovery-reply-suggestions/`) + 프로 전용 게이트(fail-closed) + 로그 상태 3종. `recovery_keyword`=deprecated(값 무시). 기본 활성
+- `docs/frontend/CAMPAIGN_TIMESERIES_FRONTEND.md` — 캠페인 신규 요청자 시계열(진행/모멘텀 차트) 프론트 가이드. `GET .../auto-dm-campaigns/{id}/timeseries/?range=all|24h|7d`, 사람 단위(최초 트리거 시점 1회, `stats` people.total 과 동일), KST 버킷(all·7d=day/24h=hour)·제로필·마지막 버킷 partial, `history_complete`(로그 보존정책 가드). 집계=`campaign_stats.new_requester_timeseries`
+- `docs/frontend/DM_CAMPAIGN_THUMBNAIL_FRONTEND.md` — 캠페인 게시물 썸네일 계약(2026-08-05, 마이그 integrations0048·core0013). **`media_url` 은 permalink(링크용, 이미지 아님) / `thumbnail_url` 은 우리 스토리지 재호스팅 사본(영구, 만료 없음)** 으로 의미 분리 — 예전 미러 구조가 permalink 를 `<img src>` 로 내보내 prod 77건 중 68건이 깨져 있었다. IG CDN URL 은 서명 만료라 저장·전달 모두 부적합 → `apps/integrations/media_thumbnail.py`(프로필 사진 규약 확장, 640px). 릴스=커버·캐러셀=첫 슬라이드(`InstagramMediaService.pick_thumbnail_source`), 목록 동기 Graph 호출 제거·비동기 예약+6h 스위퍼, 상세 응답에 통계 4필드 추가, 미디어 목록 `?media_ids=` 배치조회(호출 1회)
+- `docs/frontend/CANCEL_RETENTION_FRONTEND.md` — 구독 해지 리텐션 플로우 백엔드 구현 응답. ①일시정지 `POST /billing/pause/`(months 1/2/3, 잔여기간 후 무과금 정지·자동재개+3일전 고지, 재개=기존 resume 재사용, status "paused"·pause_ends_at·paused_months·can_pause) ②리텐션할인 `POST /billing/retention-offer/apply/`(다음1회 50%, 1인1회·active유료, next_charge_amount 응답) ③트래킹 offer_shown/accepted/declined + offer 필드 ④윈백메일(WINBACK_ENABLED 게이트·dormant, marketing_opt_in 동의). 정책: 데이터 무기한 보존·정지 연1회·할인 1인1회. 마이그 billing0019/analytics0004/auth0004/core0009. **윈백은 2026-07-23 제품결정으로 계속 dormant 유지**(인앱 즉시 50% 할인으로 대체)
+- `docs/frontend/MARKETING_OPT_IN_FRONTEND.md` — 마케팅 수신동의(`marketing_opt_in`) 연결 응답(2026-07-23, 마이그 없음·필드는 auth0004 기존). register/GET·PATCH me/google 3경로 연결, 수신거부=`PATCH /auth/me/ {marketing_opt_in:false}` 단일 소스(별도 토큰 엔드포인트 없음), PATCH me 응답이 프로필 전체로 확장. 리텐션 확인 4건 답변(next_billing.amount=renewal_amount 할인반영·paused change-plan/extra-accounts 400·오퍼코드 신규발급·정지 게이팅 get_effective_plan 일치). "취소 시 쿠폰 메일"은 원래 없음
+- `docs/frontend/PASSWORD_RESET_GUIDE.md` — 비밀번호 재설정 플로우 프론트 가이드
+- `docs/frontend/DISCONNECT_OTHER_DM_TOOLS_GUIDE.md` — 다른 DM 자동화 툴(매니챗 등) 연결 해제 안내 (댓글 fan-out·Private Reply 1회 충돌 / IG Login이라 Facebook 라우팅 불필요)
+- `docs/frontend/CONNECT_CONFLICT_WARNING_FRONTEND.md` — 다른 DM 툴 충돌 경고 배너 프론트 스펙 (연결 직후 + 대시보드 상단, 닫기 규칙)
+- `docs/frontend/DM_CAMPAIGN_MIGRATION_FRONTEND.md` — DM 캠페인 이전(매니챗 등→TurnFlow) 프론트 가이드. 연동 IG 계정의 최근 게시물·댓글·발신 DM(Conversations API) 분석→기존 DM 캠페인 추론→**비활성(INACTIVE) 초안 후보** 생성→검수·apply→활성화. `POST/GET /integrations/dm-migration/jobs/`(시작·폴링 3s·취소, 비종결1개+24h재사용+force쿨다운1h·429), `.../jobs/{id}/candidates/`(band=auto_draft/needs_review/template_only/excluded), `.../candidates/{id}/apply|dismiss/`(apply=AutoDMCampaignCreateSerializer 재사용·status=INACTIVE·활성 중복은 활성화 시점 발동). 전 플랜·v1 토큰차감 없음. 파이프라인=`apps/integrations/dm_migration/`(collect·analyze·llm·pipeline), 태스크 `integrations.run_dm_migration_job`(ai_jobs 큐, 체크포인트 재개·rate-pause)·`integrations.purge_dm_migration_raw`(원본 7일 파기+스테일 스위퍼, core 0008 시드). 자기발송 제외(SentDMLog mid/지문), Mock 픽스처+`DM_MIGRATION_FAKE_LLM`로 오프라인 e2e
+- `docs/frontend/INSTA_REPORT_FRONTEND.md` — 인스타 성장 리포트 프론트 연동 가이드(프로 전용·계정당 월1회·평균 15분·3초 폴링·10단계
   진행률 보간·HTML 인증 다운로드·완료 메일). 파이프라인 원본 실험은 `../insta_report_lab/PLAN.md`
-- `SERVICE_DIFFERENTIATION.md` — 서비스 차별점/경쟁 비교 (세일즈·마케팅)
-- `개인정보처리방침_변호사_전달자료.md`, `이용약관_변호사_전달자료.md` — 법무 자료 (수정 금지, 요청 시에만)
+- `docs/system/SERVICE_DIFFERENTIATION.md` — 서비스 차별점/경쟁 비교 (세일즈·마케팅)
+- `docs/legal/개인정보처리방침_변호사_전달자료.md`, `docs/legal/이용약관_변호사_전달자료.md` — 법무 자료 (수정 금지, 요청 시에만)
 - `api-mcp/README.md` — 사내 API 문서 검색 MCP 서버
 
 외부 참조:

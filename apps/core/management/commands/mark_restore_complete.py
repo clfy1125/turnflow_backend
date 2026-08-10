@@ -5,7 +5,7 @@
   --demote  : 이 서버를 maintenance(passive)로 강등 (mode=maintenance, restore_complete=False), epoch++.
 
 epoch 는 항상 +1 (펜싱). 전환 후 site_state 캐시를 즉시 무효화한다.
-상세: DR_IMPLEMENTATION_PLAN.md §5.5, §8.2.
+상세: docs/ops/DR_IMPLEMENTATION_PLAN.md §5.5, §8.2.
 """
 
 from __future__ import annotations
