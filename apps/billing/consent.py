@@ -146,18 +146,27 @@ def conversion_consent_required(sub, *, now=None) -> bool:
     return (end - now) <= timedelta(days=CONSENT_WINDOW_DAYS)
 
 
-def blocks_first_charge(sub) -> bool:
+def blocks_first_charge(sub, *, now=None) -> bool:
     """**첫 과금을 막아야 하는가** (갱신 태스크 게이트).
 
     ``conversion_consent_required`` 와 조건이 다르다 — 과금 시점에는 이미 창 안이고
     (남은 기간 0) 모달 노출 여부와 무관하게 "동의 없이 긁지 않는다"만 판정한다.
     체험 종료 과금(status=TRIALING)에만 적용되며, 그 이후의 정기 갱신은 최초 동의가
     유효하므로 절대 막지 않는다.
+
+    ⚠️ **체험 종료가 실제로 도래했는지 여기서 직접 확인한다.** 이 게이트는
+    ``charge_subscription_renewal`` 의 due 재검증보다 **앞**에 있다(주문 행을 만들기 전에
+    빠져나가야 하므로). 그래서 due 조건을 게이트가 스스로 갖지 않으면, 아직 한 달 넘게
+    남은 체험에 과금 태스크가 한 번 잘못 디스패치되는 것만으로 그 사용자가 **즉시 무료로
+    떨어진다**(2026-08-10 prod 기준 27명이 이 조건에 걸려 있었다).
     """
     if not enforce_gate():
         return False  # 긴급 킬스위치 — 동의 수집은 계속하되 차단만 끈다
     if not _is_trialing(sub):
         return False
+    end = sub.current_period_end
+    if end is None or end > (now or timezone.now()):
+        return False  # 아직 체험 기간 중 — 막을 과금이 없다
     if not sub.has_billing_key:
         # 막을 과금이 없다. 카드 없는 체험의 만료 정리는 handle_trial_expiry 소관이며,
         # 여기서 True 를 주면 같은 사용자를 두 경로가 각각 무료로 내리려 든다.

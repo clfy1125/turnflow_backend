@@ -221,6 +221,25 @@ class TestConsentRequiredFlag:
         sub = _trial_sub(user, trial_days=44, elapsed_days=44)
         assert blocks_first_charge(sub) is True
 
+    def test_gate_never_fires_before_trial_ends(self, user, monkeypatch):
+        """⚠️ 회귀 방어 — 게이트는 due 재검증보다 **앞**에 있다.
+
+        게이트가 '체험 종료 도래' 를 스스로 확인하지 않으면, 아직 한 달 넘게 남은 체험에
+        과금 태스크가 한 번 잘못 디스패치되는 것만으로 그 사용자가 즉시 무료로 떨어진다.
+        """
+        spy = ChargeSpy(monkeypatch)
+        sub = _trial_sub(user, trial_days=44, elapsed_days=1)  # 43일 남음
+        assert blocks_first_charge(sub) is False
+
+        # 오배치 시뮬레이션 — 아직 due 가 아니므로 '아무 일도 없음' 이어야 한다
+        result = charge_subscription_renewal(str(sub.id))
+        assert result["result"] == "not_due"
+        assert spy.calls == []
+        sub.refresh_from_db()
+        assert sub.status == SubscriptionStatus.TRIALING
+        assert sub.plan.name == "pro"  # 무료로 떨어지지 않았다
+        assert sub.has_billing_key is True  # 빌링키도 살아 있다
+
     def test_my_subscription_exposes_flag(self, client, user):
         _trial_sub(user, trial_days=44, elapsed_days=20)
         res = client.get("/api/v1/billing/my-subscription/")
