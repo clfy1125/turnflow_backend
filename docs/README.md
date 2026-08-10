@@ -45,6 +45,7 @@
 - [SIGNUP_ATTRIBUTION_FRONTEND.md](frontend/SIGNUP_ATTRIBUTION_FRONTEND.md) — 방문→가입 채널 귀속
 - [AI_PAGE_GENERATION_GUIDE.md](frontend/AI_PAGE_GENERATION_GUIDE.md) — AI 페이지 생성 4단계
 - [PASSWORD_RESET_GUIDE.md](frontend/PASSWORD_RESET_GUIDE.md) — 비밀번호 재설정
+- [RETIRE_OLD_API_HOST_REQUEST.md](frontend/RETIRE_OLD_API_HOST_REQUEST.md) — ⏳ **회신 대기** · 서버측(Pages Function)이 은퇴한 API 호스트를 호출 중 → 교체 요청
 
 ## ops/ — 운영·인프라·보안
 
