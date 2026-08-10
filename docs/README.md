@@ -21,7 +21,8 @@
 - [TOSS_BILLING_FRONTEND.md](frontend/TOSS_BILLING_FRONTEND.md) — 토스 빌링 연동(카드등록 → prepare/confirm, 체험·해지·카드변경)
 - [CANCEL_RETENTION_FRONTEND.md](frontend/CANCEL_RETENTION_FRONTEND.md) — 해지 리텐션(일시정지·50% 할인·윈백)
 - [REFERRAL_COUPON_FRONTEND.md](frontend/REFERRAL_COUPON_FRONTEND.md) — 쿠폰/제휴코드(무카드 redeem 폐지 + 결제 전 미리보기)
-- [PAYMENT_CONSENT_FRONTEND.md](frontend/PAYMENT_CONSENT_FRONTEND.md) — **결제 전 고지·동의 + 유료전환 2차 동의**(견적 preview · 동의 원장 · 미동의 시 무과금 무료전환)
+- [PAYMENT_CONSENT_HANDOVER.md](frontend/PAYMENT_CONSENT_HANDOVER.md) — ⭐ **프론트 전달본** — 2차 동의 폐기 결정 + 붙일 API 2개 + dev 테스트 계정 5개
+- [PAYMENT_CONSENT_FRONTEND.md](frontend/PAYMENT_CONSENT_FRONTEND.md) — 결제 전 고지·동의 상세 계약(견적 preview · 동의 원장 · 2차 동의는 dormant)
 - [MARKETING_OPT_IN_FRONTEND.md](frontend/MARKETING_OPT_IN_FRONTEND.md) — 마케팅 수신동의
 
 **IG 연동**
