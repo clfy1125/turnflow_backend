@@ -51,13 +51,14 @@
 - [AI_PAGE_GENERATION_GUIDE.md](frontend/AI_PAGE_GENERATION_GUIDE.md) — AI 페이지 생성 4단계
 - [PASSWORD_RESET_GUIDE.md](frontend/PASSWORD_RESET_GUIDE.md) — 비밀번호 재설정
 - [RETIRE_OLD_API_HOST_REQUEST.md](frontend/RETIRE_OLD_API_HOST_REQUEST.md) — ✅ 회신 받음(1차) · 서버측(Pages Function)이 은퇴한 API 호스트를 호출 중 → 교체 요청
-- [RETIRE_OLD_API_HOST_ROUND2.md](frontend/RETIRE_OLD_API_HOST_ROUND2.md) — ⏳ **프론트 배포 대기** · `/media/` 저장 URL 을 R2 로 이관 완료(61행/101 URL) + 수정본 `387b7ce` 가 dev 프리뷰에만 있고 main 미반영 → DNS 삭제는 그 이후
+- [RETIRE_OLD_API_HOST_ROUND2.md](frontend/RETIRE_OLD_API_HOST_ROUND2.md) — ✅ **완결(2026-08-12)** · `/media/` 저장 URL R2 이관(61행/101 URL) + 프론트 배포 반영 → 소비자 0건 확인 → DNS 삭제. 결과는 [ops/DNS_RETIRE_API_TURNFLOW.md](ops/DNS_RETIRE_API_TURNFLOW.md)
 
 ## ops/ — 운영·인프라·보안
 
 - [배포방법.md](ops/배포방법.md) — **prod 배포는 여기부터**(수동 compose 금지 이유 포함)
 - [NEXT_ACTIONS_2026-08-04.md](ops/NEXT_ACTIONS_2026-08-04.md) — **현재 우선순위 로드맵**
 - [PROD_HARDENING_2026-08-04.md](ops/PROD_HARDENING_2026-08-04.md) — 08-03~04 하드닝 실행 기록 + 사고 3건
+- [DNS_RETIRE_API_TURNFLOW.md](ops/DNS_RETIRE_API_TURNFLOW.md) — 옛 API 호스트 DNS 삭제(2026-08-12) + **복구 레시피** · 오리진 IP 직노출 제거
 - [SECURITY_AUDIT_2026-06.md](ops/SECURITY_AUDIT_2026-06.md) — 애플리케이션 취약점 감사(미해결 포함)
 - [DR_IMPLEMENTATION_PLAN.md](ops/DR_IMPLEMENTATION_PLAN.md) — 재해복구 설계·결정 로그
 - [INSTAGRAM_OAUTH_FLOW.md](ops/INSTAGRAM_OAUTH_FLOW.md) · [INSTAGRAM_TEST_GUIDE.md](ops/INSTAGRAM_TEST_GUIDE.md)
