@@ -3,6 +3,7 @@ from rest_framework import serializers
 
 from .block_visibility import public_blocks
 from .models import Block, ContactInquiry, Page, PageMedia, PageSubscription
+from .sanitizers import CssSanitizeError, clean_custom_css_field
 from .validators import validate_block_data
 
 
@@ -10,17 +11,39 @@ from .validators import validate_block_data
     field={
         "type": "object",
         "properties": {
-            "url":           {"type": "string", "format": "uri",    "description": "[single_link 필수] 이동할 URL"},
-            "label":         {"type": "string",                      "description": "[single_link 필수] 버튼 표시 텍스트"},
-            "description":   {"type": "string",                      "description": "[single_link 선택] 버튼 하단 설명"},
-            "layout":        {"type": "string", "enum": ["small", "large"], "description": "[single_link 선택] 버튼 크기 (기본: small)"},
-            "thumbnail_url": {"type": "string", "format": "uri",    "description": "[single_link 선택] 썸네일 이미지 URL"},
-            "headline":      {"type": "string",                      "description": "[profile 필수] 한 줄 소개"},
-            "subline":       {"type": "string",                      "description": "[profile 선택] 부제목"},
-            "avatar_url":    {"type": "string", "format": "uri",    "description": "[profile 선택] 프로필 이미지 URL"},
-            "country_code":  {"type": "string",                      "description": "[contact 필수] 국가 코드 (+82 형식)"},
-            "phone":         {"type": "string",                      "description": "[contact 필수] 전화번호 (하이픈 없이)"},
-            "whatsapp":      {"type": "boolean",                     "description": "[contact 선택] WhatsApp 링크 사용 여부"},
+            "url": {
+                "type": "string",
+                "format": "uri",
+                "description": "[single_link 필수] 이동할 URL",
+            },
+            "label": {"type": "string", "description": "[single_link 필수] 버튼 표시 텍스트"},
+            "description": {"type": "string", "description": "[single_link 선택] 버튼 하단 설명"},
+            "layout": {
+                "type": "string",
+                "enum": ["small", "large"],
+                "description": "[single_link 선택] 버튼 크기 (기본: small)",
+            },
+            "thumbnail_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "[single_link 선택] 썸네일 이미지 URL",
+            },
+            "headline": {"type": "string", "description": "[profile 필수] 한 줄 소개"},
+            "subline": {"type": "string", "description": "[profile 선택] 부제목"},
+            "avatar_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "[profile 선택] 프로필 이미지 URL",
+            },
+            "country_code": {
+                "type": "string",
+                "description": "[contact 필수] 국가 코드 (+82 형식)",
+            },
+            "phone": {"type": "string", "description": "[contact 필수] 전화번호 (하이픈 없이)"},
+            "whatsapp": {
+                "type": "boolean",
+                "description": "[contact 선택] WhatsApp 링크 사용 여부",
+            },
         },
         "example": {
             "url": "https://naver.me/abc",
@@ -94,15 +117,44 @@ class BlockDataField(serializers.JSONField):
         ),
     ]
 )
-class BlockSerializer(serializers.ModelSerializer):
+class CustomCssValidationMixin:
+    """``custom_css`` 저장 전 검사 (감사 M-9).
+
+    이 값은 공개 페이지 응답에 그대로 실려 나가 프론트가 ``<style>`` 로 주입한다.
+    ``</style>`` 브레이크아웃이 들어가면 공개 페이지에서 **스크립트가 실행**되고,
+    그 페이지는 로그인 앱과 같은 오리진이라 방문자 세션까지 노린다.
+
+    허용목록 방식이라 실서비스가 쓰는 구글 폰트 ``@import`` 는 그대로 통과한다
+    (2026-08-12 전수 대조: 기존 390건 전부 무변경). 자세한 규칙은
+    ``apps/pages/sanitizers.py`` 참고.
+    """
+
+    def validate_custom_css(self, value):
+        try:
+            return clean_custom_css_field(value, context=f"{self.__class__.__name__}")
+        except CssSanitizeError as exc:
+            raise serializers.ValidationError(
+                f"CSS 에 허용되지 않는 구문이 있습니다: {exc.reason}"
+            ) from exc
+
+
+class BlockSerializer(CustomCssValidationMixin, serializers.ModelSerializer):
     data = BlockDataField(default=dict)
 
     class Meta:
         model = Block
         fields = [
-            "id", "type", "order", "is_enabled", "data", "custom_css",
-            "schedule_enabled", "publish_at", "hide_at",
-            "created_at", "updated_at",
+            "id",
+            "type",
+            "order",
+            "is_enabled",
+            "data",
+            "custom_css",
+            "schedule_enabled",
+            "publish_at",
+            "hide_at",
+            "created_at",
+            "updated_at",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
 
@@ -110,9 +162,7 @@ class BlockSerializer(serializers.ModelSerializer):
         # type 변경 금지 (PATCH 시 instance 존재)
         if self.instance is not None:
             if "type" in attrs and attrs["type"] != self.instance.type:
-                raise serializers.ValidationError(
-                    {"type": "블록 타입은 변경할 수 없습니다."}
-                )
+                raise serializers.ValidationError({"type": "블록 타입은 변경할 수 없습니다."})
             block_type = self.instance.type
         else:
             block_type = attrs.get("type")
@@ -133,7 +183,9 @@ class BlockSerializer(serializers.ModelSerializer):
         if schedule_enabled:
             if publish_at is None and hide_at is None:
                 raise serializers.ValidationError(
-                    {"schedule": "schedule_enabled=true일 때 publish_at 또는 hide_at 중 하나는 필수입니다."}
+                    {
+                        "schedule": "schedule_enabled=true일 때 publish_at 또는 hide_at 중 하나는 필수입니다."
+                    }
                 )
             if publish_at and hide_at and publish_at >= hide_at:
                 raise serializers.ValidationError(
@@ -162,10 +214,19 @@ class BlockPublicSerializer(serializers.ModelSerializer):
         fields = ["id", "type", "order", "data", "custom_css"]
 
 
-class PageSerializer(serializers.ModelSerializer):
+class PageSerializer(CustomCssValidationMixin, serializers.ModelSerializer):
     class Meta:
         model = Page
-        fields = ["id", "slug", "title", "is_public", "data", "custom_css", "created_at", "updated_at"]
+        fields = [
+            "id",
+            "slug",
+            "title",
+            "is_public",
+            "data",
+            "custom_css",
+            "created_at",
+            "updated_at",
+        ]
         read_only_fields = ["id", "slug", "created_at", "updated_at"]
 
 
@@ -174,6 +235,7 @@ class SlugChangeSerializer(serializers.Serializer):
     PATCH /api/pages/me/slug/ 전용.
     slug 형식 검증 + 중복 검증.
     """
+
     slug = serializers.SlugField(
         max_length=120,
         help_text="영문 소문자, 숫자, 하이픈(헤더/톨미 불가)만 허용. 2~120자.",
@@ -195,6 +257,7 @@ class SlugChangeSerializer(serializers.Serializer):
 
 class SlugCheckSerializer(serializers.Serializer):
     """GET /api/pages/check-slug/?slug=xxx 전용 응답 스키마."""
+
     slug = serializers.SlugField()
     available = serializers.BooleanField()
     message = serializers.CharField()
@@ -240,6 +303,7 @@ class ReorderSerializer(serializers.Serializer):
 
 
 # ─── 통계 시리얼라이저 ────────────────────────────────────────
+
 
 class RefererStatSerializer(serializers.Serializer):
     source = serializers.CharField(help_text="유입 채널명 (Instagram, 직접 방문 등)")
@@ -297,9 +361,13 @@ class LinkStatSerializer(serializers.Serializer):
     """서브링크 단위 클릭 통계 항목."""
 
     block_id = serializers.IntegerField(help_text="블록 ID")
-    link_id = serializers.CharField(help_text="서브링크 ID (social: 플랫폼 키, group_link: 개별 링크 ID, 빈 문자열이면 블록 단위)")
+    link_id = serializers.CharField(
+        help_text="서브링크 ID (social: 플랫폼 키, group_link: 개별 링크 ID, 빈 문자열이면 블록 단위)"
+    )
     type = serializers.CharField(help_text="블록 타입 (social / group_link / single_link 등)")
-    label = serializers.CharField(help_text="서브링크 표시명 (link_id가 있으면 해당 서브링크명, 없으면 블록 레이블)")
+    label = serializers.CharField(
+        help_text="서브링크 표시명 (link_id가 있으면 해당 서브링크명, 없으면 블록 레이블)"
+    )
     is_enabled = serializers.BooleanField(help_text="현재 노출 여부")
     clicks = serializers.IntegerField(help_text="기간 내 클릭수")
     click_rate = serializers.FloatField(help_text="클릭율 = 클릭수 / 페이지 조회수 x 100 (%)")
@@ -313,7 +381,7 @@ class LinkClicksStatsSerializer(serializers.Serializer):
     link_clicks = LinkStatSerializer(many=True, help_text="서브링크별 클릭수 배열")
 
 
-class CustomCssSerializer(serializers.Serializer):
+class CustomCssSerializer(CustomCssValidationMixin, serializers.Serializer):
     """커스텀 CSS 수정 전용 (페이지/블록 공용)."""
 
     custom_css = serializers.CharField(
@@ -325,25 +393,34 @@ class CustomCssSerializer(serializers.Serializer):
 
 class RecordViewSerializer(serializers.Serializer):
     """POST /api/pages/@{slug}/view/ 요청 바디 (모두 선택)."""
+
     referer = serializers.CharField(
-        required=False, allow_blank=True, default="",
+        required=False,
+        allow_blank=True,
+        default="",
         help_text="방문자 브라우저의 document.referrer 값. 없으면 빈 문자열.",
     )
 
 
 class RecordClickSerializer(serializers.Serializer):
     """POST /api/pages/@{slug}/blocks/{block_id}/click/ 요청 바디 (모두 선택)."""
+
     referer = serializers.CharField(
-        required=False, allow_blank=True, default="",
+        required=False,
+        allow_blank=True,
+        default="",
         help_text="방문자 브라우저의 document.referrer 값.",
     )
     link_id = serializers.CharField(
-        required=False, allow_blank=True, default="",
+        required=False,
+        allow_blank=True,
+        default="",
         help_text="서브링크 식별자. social 블록: 플랫폼 키(instagram 등), group_link: 개별 링크 ID. 없으면 빈 문자열.",
     )
 
 
 # ─── 문의 시리얼라이저 ────────────────────────────────────────
+
 
 class ContactInquirySubmitSerializer(serializers.ModelSerializer):
     """
@@ -362,7 +439,9 @@ class ContactInquirySubmitSerializer(serializers.ModelSerializer):
 
     def validate_agreed_to_terms(self, value: bool) -> bool:
         if not value:
-            raise serializers.ValidationError("이용약관 및 개인정보 처리방침에 동의해야 문의를 보낼 수 있습니다.")
+            raise serializers.ValidationError(
+                "이용약관 및 개인정보 처리방침에 동의해야 문의를 보낼 수 있습니다."
+            )
         return value
 
 
@@ -374,14 +453,31 @@ class ContactInquirySerializer(serializers.ModelSerializer):
     class Meta:
         model = ContactInquiry
         fields = [
-            "id", "name", "category", "category_display",
-            "email", "phone", "subject", "content",
-            "agreed_to_terms", "memo", "created_at", "updated_at",
+            "id",
+            "name",
+            "category",
+            "category_display",
+            "email",
+            "phone",
+            "subject",
+            "content",
+            "agreed_to_terms",
+            "memo",
+            "created_at",
+            "updated_at",
         ]
         read_only_fields = [
-            "id", "name", "category", "category_display",
-            "email", "phone", "subject", "content",
-            "agreed_to_terms", "created_at", "updated_at",
+            "id",
+            "name",
+            "category",
+            "category_display",
+            "email",
+            "phone",
+            "subject",
+            "content",
+            "agreed_to_terms",
+            "created_at",
+            "updated_at",
         ]
 
 
@@ -396,6 +492,7 @@ class ContactInquiryMemoSerializer(serializers.ModelSerializer):
 
 # ─── 구독 시리얼라이저 ────────────────────────────────────────
 
+
 class PageSubscriptionSubmitSerializer(serializers.ModelSerializer):
     """
     POST /api/pages/@{slug}/subscriptions/ — 방문자가 구독 등록할 때 사용.
@@ -408,7 +505,9 @@ class PageSubscriptionSubmitSerializer(serializers.ModelSerializer):
 
     def validate_agreed_to_terms(self, value: bool) -> bool:
         if not value:
-            raise serializers.ValidationError("개인정보 수집 및 이용에 동의해야 구독할 수 있습니다.")
+            raise serializers.ValidationError(
+                "개인정보 수집 및 이용에 동의해야 구독할 수 있습니다."
+            )
         return value
 
     def validate_email(self, value: str) -> str:
@@ -425,12 +524,27 @@ class PageSubscriptionSerializer(serializers.ModelSerializer):
     class Meta:
         model = PageSubscription
         fields = [
-            "id", "name", "category", "category_display",
-            "email", "phone", "agreed_to_terms", "memo", "created_at", "updated_at",
+            "id",
+            "name",
+            "category",
+            "category_display",
+            "email",
+            "phone",
+            "agreed_to_terms",
+            "memo",
+            "created_at",
+            "updated_at",
         ]
         read_only_fields = [
-            "id", "name", "category", "category_display",
-            "email", "phone", "agreed_to_terms", "created_at", "updated_at",
+            "id",
+            "name",
+            "category",
+            "category_display",
+            "email",
+            "phone",
+            "agreed_to_terms",
+            "created_at",
+            "updated_at",
         ]
 
 
@@ -444,6 +558,7 @@ class PageSubscriptionMemoSerializer(serializers.ModelSerializer):
 
 
 # ─── 미디어 시리얼라이저 ──────────────────────────────────────
+
 
 class PageMediaSerializer(serializers.ModelSerializer):
     """GET·POST /api/pages/me/media/ — 업로드된 미디어 파일 정보."""
@@ -468,12 +583,26 @@ class PageMediaSerializer(serializers.ModelSerializer):
     class Meta:
         model = PageMedia
         fields = [
-            "id", "original_name", "mime_type", "size", "size_display",
-            "url", "original_url", "crop_data", "created_at",
+            "id",
+            "original_name",
+            "mime_type",
+            "size",
+            "size_display",
+            "url",
+            "original_url",
+            "crop_data",
+            "created_at",
         ]
         read_only_fields = [
-            "id", "original_name", "mime_type", "size", "size_display",
-            "url", "original_url", "crop_data", "created_at",
+            "id",
+            "original_name",
+            "mime_type",
+            "size",
+            "size_display",
+            "url",
+            "original_url",
+            "crop_data",
+            "created_at",
         ]
 
     def get_url(self, obj) -> str:

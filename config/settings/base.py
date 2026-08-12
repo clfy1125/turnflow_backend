@@ -16,6 +16,18 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = config("SECRET_KEY", default="django-insecure-local-dev-key-change-in-production")
 
+# ── 저장 필드 암호화 전용 키 (감사 M-3/M-4) ──────────────────────────────────────
+# IG 액세스 토큰·토스 빌링키를 잠그는 키. 예전엔 sha256(SECRET_KEY) 파생이라 **키를 바꿀 수가
+# 없었다** — 바꾸면 기존 암호문이 전부 안 열려 모든 고객의 IG 연동·빌링키가 죽는다.
+#
+# 이 값을 넣으면 MultiFernet 이 **새 키로 암호화 · 새 키와 옛 파생 키 둘 다로 복호화** 한다.
+# 그래서 대량 재암호화 없이(서비스 중단 0) 점진적으로 옮겨간다.
+#   · 미설정이면 종전과 100% 동일 — 코드 배포와 키 투입을 분리할 수 있다.
+#   · 회전 시에는 "새키,옛키" 순서로 넣는다(첫 번째가 암호화용).
+#   · 키 생성: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# ⚠️ 한번 새 키로 저장된 값은 그 키를 목록에서 빼면 못 읽는다 — 키는 **빼지 말고 뒤로 미룰 것**.
+FIELD_ENCRYPTION_KEYS = config("FIELD_ENCRYPTION_KEYS", default="")
+
 # Application definition
 INSTALLED_APPS = [
     "django.contrib.admin",

@@ -16,10 +16,34 @@ from typing import Any
 from django.utils import timezone
 
 from apps.pages.models import Block, Page, _generate_unique_slug
+from apps.pages.sanitizers import CssSanitizeError, sanitize_custom_css
 from apps.pages.services.css_remap import remap_block_ids_in_css
 from apps.pages.validators import validate_block_data
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_css(raw: str, *, where: str) -> str:
+    """외부에서 가져온 CSS 를 안전하게 만든다 (감사 M-9).
+
+    여기 들어오는 CSS 는 **남의 사이트에서 긁어온 것**이라 우리 서비스에서 가장 신뢰도가
+    낮은 입력이다. 그대로 저장하면 공개 페이지 ``<style>`` 로 주입되어, ``</style>``
+    브레이크아웃이 섞여 있으면 방문자 브라우저에서 스크립트가 실행된다.
+
+    사용자 직접 입력(시리얼라이저)과 달리 **여기서는 예외를 던지지 않는다** — 임포트 전체를
+    실패시키는 대신 CSS 만 버리고 나머지 페이지는 살린다. 위험한 CSS 한 줄 때문에
+    복사 기능이 통째로 죽는 편이 더 나쁘다.
+    """
+    if not raw:
+        return ""
+    try:
+        cleaned, removed = sanitize_custom_css(raw)
+    except CssSanitizeError as exc:
+        logger.warning("import: 위험한 CSS 를 버렸다 (%s) — %s", where, exc.reason)
+        return ""
+    if removed:
+        logger.warning("import: 허용되지 않은 URL %d건 제거 (%s)", len(removed), where)
+    return cleaned
 
 
 def build_page_from_body(
@@ -58,7 +82,7 @@ def build_page_from_body(
         title=page_title,
         is_public=is_public,
         data=page_data,
-        custom_css=body.get("custom_css") or "",
+        custom_css=_safe_css(body.get("custom_css") or "", where=f"page/{source}"),
         import_source=source,
         import_source_slug=source_slug,
         import_source_url=source_url,
@@ -93,7 +117,7 @@ def build_page_from_body(
                 order=b.get("order") if b.get("order") else (i + 1),
                 is_enabled=b.get("is_enabled", True),
                 data=bdata,
-                custom_css=b.get("custom_css", ""),
+                custom_css=_safe_css(b.get("custom_css", ""), where=f"block/{source}"),
             )
         )
         source_ids.append(b.get("id"))
