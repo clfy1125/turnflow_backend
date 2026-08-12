@@ -50,6 +50,7 @@
 - [SIGNUP_ATTRIBUTION_FRONTEND.md](frontend/SIGNUP_ATTRIBUTION_FRONTEND.md) — 방문→가입 채널 귀속
 - [AI_PAGE_GENERATION_GUIDE.md](frontend/AI_PAGE_GENERATION_GUIDE.md) — AI 페이지 생성 4단계
 - [PASSWORD_RESET_GUIDE.md](frontend/PASSWORD_RESET_GUIDE.md) — 비밀번호 재설정
+- [RATE_LIMIT_AND_GOOGLE_LOGIN_FRONTEND.md](frontend/RATE_LIMIT_AND_GOOGLE_LOGIN_FRONTEND.md) — 🔴 **429 두 종류 분기 필수**(`RATE_LIMITED` vs `PLAN_LIMIT_EXCEEDED` — 안 하면 paywall 분석 오염) + 구글 로그인 `GOOGLE_EMAIL_UNVERIFIED` 403
 - [RETIRE_OLD_API_HOST_REQUEST.md](frontend/RETIRE_OLD_API_HOST_REQUEST.md) — ✅ 회신 받음(1차) · 서버측(Pages Function)이 은퇴한 API 호스트를 호출 중 → 교체 요청
 - [RETIRE_OLD_API_HOST_ROUND2.md](frontend/RETIRE_OLD_API_HOST_ROUND2.md) — ✅ **완결(2026-08-12)** · `/media/` 저장 URL R2 이관(61행/101 URL) + 프론트 배포 반영 → 소비자 0건 확인 → DNS 삭제. 결과는 [ops/DNS_RETIRE_API_TURNFLOW.md](ops/DNS_RETIRE_API_TURNFLOW.md)
 

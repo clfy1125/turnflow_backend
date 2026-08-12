@@ -4,7 +4,7 @@ Custom exception handlers for standardized API responses
 
 from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import status
-from rest_framework.exceptions import APIException
+from rest_framework.exceptions import APIException, Throttled
 from rest_framework.response import Response
 from rest_framework.views import exception_handler
 
@@ -85,6 +85,31 @@ def custom_exception_handler(exc, context):
             },
         }
         return Response(error_data, status=status.HTTP_429_TOO_MANY_REQUESTS)
+
+    # ── 속도 제한(Throttled) — 같은 429 지만 의미가 완전히 다르다 ──────────────────────
+    # 429 는 이미 위 PlanLimitExceededError 가 "요금제 한도 초과" 로 쓰고 있고, 프론트 계약이
+    # 429 → 유료 제한 모달 + paywall_viewed 분석 이벤트로 분기하도록 문서화돼 있다.
+    # 스로틀 429 를 구분 없이 내보내면 프론트가 "너무 빨라요" 를 "돈 내세요" 로 착각해
+    # **결제 전환 분석 데이터가 되돌릴 수 없게 오염된다**. 그래서 code 를 갈라 놓는다.
+    #   · PLAN_LIMIT_EXCEEDED → 유료 전환 유도 + paywall_viewed 발사
+    #   · RATE_LIMITED        → "잠시 후 다시" 안내, 분석 이벤트 발사 금지
+    # 계약: docs/frontend/RATE_LIMIT_ERROR_CODE_FRONTEND.md
+    if isinstance(exc, Throttled):
+        details = {"code": "RATE_LIMITED"}
+        if exc.wait is not None:
+            # 올림 — 딱 그 초에 다시 쏘면 경계에서 또 막힌다
+            details["retry_after"] = int(exc.wait) + 1
+        return Response(
+            {
+                "success": False,
+                "error": {
+                    "code": "RATE_LIMITED",
+                    "message": "요청이 너무 잦습니다. 잠시 후 다시 시도해 주세요.",
+                    "details": details,
+                },
+            },
+            status=status.HTTP_429_TOO_MANY_REQUESTS,
+        )
 
     # Call REST framework's default exception handler first
     response = exception_handler(exc, context)

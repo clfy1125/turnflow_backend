@@ -31,6 +31,7 @@ from apps.ai_jobs.serializers import (
     DmOpeningDiversifyRequestSerializer,
 )
 from apps.core.exceptions import DuplicateActiveCampaignError
+from apps.core.throttling import AI_GENERATE_THROTTLES
 from apps.workspace.models import Workspace
 
 from . import oauth_callback_pages, oauth_return
@@ -2741,7 +2742,14 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         ],
         tags=["Auto DM"],
     )
-    @action(detail=False, methods=["post"], url_path="ai-suggest")
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="ai-suggest",
+        # 호출마다 LLM 비용(gemma-4 비전 + 이미지 다운로드)이 나가는데 토큰 차감이 없다
+        # → 속도 제한이 유일한 비용 방어선이다(감사 H-8). apps/core/throttling.py 참고.
+        throttle_classes=AI_GENERATE_THROTTLES,
+    )
     def ai_suggest(self, request):
         """게시물 기반 캠페인 폼 초안 생성 작업을 큐에 등록 (비동기, gemma-4 비전).
 

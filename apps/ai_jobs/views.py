@@ -35,6 +35,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.billing.models import AiTokenBalance
+from apps.core.throttling import AI_GENERATE_THROTTLES
 from apps.pages.image_pipeline import ImageValidationError, process_upload
 from apps.pages.image_views import ALLOWED_MIME_TYPES, MAX_FILE_SIZE_BYTES
 from apps.pages.models import Block, Page, ReferenceCategory
@@ -1421,7 +1422,12 @@ class AiClassifyPostsView(APIView):
     이후 호출에서 누적된 카테고리를 ``existing_categories`` 로 넘기면 LLM 이 우선 재사용한다.
 
     동기 호출이며 토큰 차감 없음 (자체 호스팅 Gemma 기본 사용).
+
+    토큰 차감이 없으므로 **속도 제한이 유일한 비용 방어선**이다(감사 H-8).
+    플랜별 시간당/하루 상한은 ``apps/core/throttling.py`` 참고.
     """
+
+    throttle_classes = AI_GENERATE_THROTTLES
 
     permission_classes = [IsAuthenticated]
 

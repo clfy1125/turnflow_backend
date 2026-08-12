@@ -950,13 +950,48 @@ curl -X POST http://localhost:8000/api/v1/auth/google/ \\
 
         from django.utils import timezone
 
+        # ── 구글이 "이 이메일은 본인 확인이 안 됐다"고 알려준 경우 (감사 M-1) ────────────
+        # 구글 ID 토큰에는 email_verified 클레임이 들어온다. 일반 지메일 계정은 항상 true 라
+        # 정상 사용자는 아무 영향이 없다. false 가 나오는 건 공격자가 **자기가 소유한 도메인**
+        # 으로 워크스페이스를 만들어 남의 이메일 주소를 적어 넣은 경우다 — 구글은 도메인
+        # 소유가 확인 안 됐으니 false 를 실어 보내며 "믿지 마라"고 알려주는 것이다.
+        #
+        # 예전에는 이 값을 안 보고 email 만으로 기존 계정을 찾아 로그인시켰다 → **계정 탈취**.
+        # 로그인 자체를 막으면 OAuth 의 이점이 사라지므로, 막는 건 '기존 계정과의 연결'뿐이다:
+        #   · verified   → 종전과 100% 동일 (기존 계정 연결 O)
+        #   · unverified → 그 이메일의 기존 계정이 있으면 거절, 없으면 신규 가입만 허용
+        #                  (단 우리 쪽 '이메일 인증됨' 표시는 켜지 않는다)
+        email_verified = bool(idinfo.get("email_verified"))
+        if not email_verified:
+            existing = User.objects.filter(email=email).first()
+            # 계측: 실제로 이 경로를 타는 요청이 있는지 배포 후 확인하기 위한 로그.
+            # (DB 에 저장하지 않는 값이라 사후 집계가 불가능해 로그로만 남긴다)
+            logger.warning(
+                "google_login: email_verified=false email_domain=%s existing_account=%s",
+                (email.rsplit("@", 1)[-1] if "@" in email else "?"),
+                bool(existing),
+            )
+            if existing is not None:
+                return Response(
+                    {
+                        "detail": (
+                            "이 이메일로 가입된 계정이 이미 있습니다. "
+                            "구글에서 이메일 소유 확인이 완료되지 않아 자동 연결할 수 없습니다. "
+                            "비밀번호로 로그인하거나 이메일 인증을 완료해 주세요."
+                        ),
+                        "code": "GOOGLE_EMAIL_UNVERIFIED",
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
         marketing_opt_in = bool(serializer.validated_data.get("marketing_opt_in"))
         user, created = User.objects.get_or_create(
             email=email,
             defaults={
                 "full_name": name,
-                "is_email_verified": True,
-                "email_verified_at": timezone.now(),
+                # 구글이 확인해 준 경우에만 '인증됨'으로 승격한다.
+                "is_email_verified": email_verified,
+                "email_verified_at": timezone.now() if email_verified else None,
                 # 신규 가입 시에만 마케팅 동의 반영 (동의 시 시각도 기록).
                 "marketing_opt_in": marketing_opt_in,
                 "marketing_opt_in_at": timezone.now() if marketing_opt_in else None,
@@ -977,7 +1012,9 @@ curl -X POST http://localhost:8000/api/v1/auth/google/ \\
             if name and not user.full_name:
                 user.full_name = name
                 updates.append("full_name")
-            if not user.is_email_verified:
+            # 구글이 확인해 준 경우에만 승격한다. 미확인 토큰으로 우리 쪽 인증 표시를
+            # 켜 주면, 그 표시를 신뢰하는 다른 경로(비밀번호 재설정 등)까지 오염된다.
+            if email_verified and not user.is_email_verified:
                 user.is_email_verified = True
                 user.email_verified_at = timezone.now()
                 updates += ["is_email_verified", "email_verified_at"]

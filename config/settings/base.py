@@ -259,7 +259,27 @@ REST_FRAMEWORK = {
         # IG 웹훅 수동 재구독 (POST .../resubscribe-webhooks) — beat 자동 재구독이 있어
         # 수동은 드물어야 정상. 어뷰즈 방어 + 정상 복구 모두 OK.
         "ig_resubscribe": config("THROTTLE_IG_RESUBSCRIBE", default="6/hour"),
+        # ── AI 생성 엔드포인트 (감사 H-8) ──────────────────────────────────────────
+        # 호출마다 LLM 비용이 나가는데 지금까지 제한도 토큰 차감도 없었다 → 로그인만 하면
+        # 비용을 무제한으로 태울 수 있었다. 어뷰즈는 무료 가입으로 오므로 무료만 조이고
+        # 유료는 사실상 만날 일 없는 상한을 준다.
+        #
+        # 실측 근거(2026-08-12, 최근 7일): 전체 104건, 최다 사용자 16건/7일 = 2.3건/일.
+        #   → 유료 400/일 ≈ 170배 여유 · 무료 40/일 ≈ 17배 여유
+        # scope 이름은 apps/core/throttling.py 의 <scope_base>_<tier>_<window> 규칙과
+        # 반드시 맞아야 한다 — 안 맞으면 fail-open 이라 조용히 꺼진다.
+        "ai_generate_paid_hour": config("THROTTLE_AI_PAID_HOUR", default="100/hour"),
+        "ai_generate_paid_day": config("THROTTLE_AI_PAID_DAY", default="400/day"),
+        "ai_generate_free_hour": config("THROTTLE_AI_FREE_HOUR", default="15/hour"),
+        "ai_generate_free_day": config("THROTTLE_AI_FREE_DAY", default="40/day"),
     },
+    # ⚠️ NUM_PROXIES 는 의도적으로 미설정이다.
+    #    설정하면 **익명 요청의 스로틀 키 기준이 전 API 에서 한꺼번에 바뀐다**
+    #    (auth_login · auth_register · track_visit · password_reset …). 값을 잘못 잡으면
+    #    여러 사용자가 한 버킷을 공유해 로그인이 실서비스에서 막힐 수 있다.
+    #    현재 미설정이라 익명 스로틀 키가 XFF 문자열 전체 → 브루트포스 방어가 의도보다
+    #    약하다(알려진 부채). 고칠 때는 Caddy 가 실제로 넘기는 XFF 모양을 먼저 계측하고
+    #    단독 배포할 것. AI 스로틀은 user.pk 로 키잉되므로 이 값과 무관하다.
 }
 
 # DRF Spectacular (OpenAPI/Swagger)
