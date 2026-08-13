@@ -1042,6 +1042,24 @@ class AdminDMLogDetailView(generics.RetrieveAPIView):
   `100/2534022`(윈도우 만료, 정상 실패)는 조치가 정반대라 subcode 없이는 구분할 수 없습니다.
 - `recoverable=true` → 재발송/재검증 버튼 노출 (failed_no_trace·recovery_*·failed_param@2534025).
 
+### 고객이 보고 있는 화면 (DM-19, 2026-08-13)
+`user_view` 가 **이 로그를 고객이 유저 콘솔에서 어떤 문장으로 보고 있는지** 그대로 담습니다.
+CS 가 고객과 같은 문장을 보고 응대하라고 넣은 필드입니다 — 어휘가 갈려 있어서, 예를 들어
+같은 `skipped` 로그를 운영자는 "답장이 이미 있어 발송 취소 (관리자 수동 조치)"로,
+고객은 "중복 발송을 방지했어요"로 보고 있습니다.
+
+- 유저용 `frontend_action` 과 **같은 함수·같은 값**입니다(`build_frontend_action`).
+  사본이 아니라 호출이므로 서버 문구를 고치면 양쪽이 함께 바뀝니다.
+- **어드민 자신의 표시 가이드가 아닙니다.** 어드민 화면은 위의 `error_*`(운영자 어휘)로
+  그리세요. 필드명을 `frontend_action` 이 아니라 `user_view` 로 둔 이유입니다.
+- `description`(cause+next_step 합본)은 **없습니다.** 어드민은 두 줄을 나눠 그립니다.
+- 오류가 아닌 상태(delivered/read/queued 등)에도 채워집니다 — 고객은 그 로그에도 같은
+  모달을 봅니다.
+- ⚠️ 유저 콘솔이 `subcode 2534022`·`2534015` 두 건에서만 제목·설명을 자기 i18n 으로
+  덮어씁니다(v3.2 시절 서버가 "파라미터 오류" 같은 내부 용어를 내려주던 것의 임시 방어).
+  v4 문구가 배포되어 **덮어쓸 이유가 사라졌고**, 유저 콘솔에서 제거 예정입니다.
+  제거 전까지 그 두 subcode 는 문장 표현이 다를 수 있습니다(뜻은 같습니다).
+
 ## 주의사항
 - comment_text/message_sent 는 개인정보를 포함할 수 있으므로 취급에 유의하세요.
         """,
@@ -1081,8 +1099,45 @@ class AdminDMLogDetailView(generics.RetrieveAPIView):
                     "recoverable": True,
                     "error_message": "(#100) Param recipient[id] ...",
                     "retry_count": 0,
+                    "user_view": {
+                        "user_reason": "hidden_request",
+                        "severity": "warning",
+                        "type": "info",
+                        "title": "수신자의 '숨겨진 요청 · 스팸함'으로 이동했을 수 있어요",
+                        "cause": "아직 팔로우하지 않은 분에게 보내는 첫 DM은 받은편지함 대신 "
+                        "'숨겨진 요청'이나 스팸함으로 분류될 수 있어요. …",
+                        "next_step": "안내 댓글을 남겨두었어요. 수신자가 다시 댓글을 남기면 "
+                        "자동으로 재발송돼요.",
+                        "checklist": None,
+                        "cta": {"label": "실패 DM 복구 켜기", "action": "enable_recovery"},
+                    },
                 },
-            )
+            ),
+            OpenApiExample(
+                "건너뜀 로그 — 운영자 어휘와 고객 어휘가 갈리는 예",
+                response_only=True,
+                value={
+                    "id": "5b1f0c2e-0000-4a00-9c00-000000000002",
+                    "status": "skipped",
+                    "error_code": "",
+                    "error_subcode": "",
+                    "error_message": "유령 오프닝 정리",
+                    "error_title": "답장이 이미 있어 발송 취소 (관리자 수동 조치)",
+                    "error_policy": "normal",
+                    "recoverable": False,
+                    "user_view": {
+                        "user_reason": "ghost_opening_cleanup",
+                        "severity": "info",
+                        "type": "info",
+                        "title": "중복 발송을 방지했어요",
+                        "cause": "이미 답장이 발송된 건이라, 같은 분께 두 번 발송되지 "
+                        "않도록 처리했어요.",
+                        "next_step": "",
+                        "checklist": None,
+                        "cta": None,
+                    },
+                },
+            ),
         ],
     )
     def get(self, request, *args, **kwargs):

@@ -18,7 +18,7 @@ from datetime import timedelta
 
 from django.db.models import Count, Q
 from django.utils import timezone
-from drf_spectacular.utils import extend_schema_field
+from drf_spectacular.utils import extend_schema_field, inline_serializer
 from rest_framework import serializers
 
 from apps.admin_api.dm_error_catalog import describe_for_log
@@ -454,6 +454,17 @@ class AdminDMLogDetailSerializer(serializers.ModelSerializer):
             "'같은 사유 전체 보기'를 만들 때 쓴다. 오류·건너뜀이 아니면 빈 문자열."
         )
     )
+    user_view = serializers.SerializerMethodField(
+        help_text=(
+            "**DM-19 — 이 로그를 고객이 유저 콘솔에서 어떻게 보고 있는가.** "
+            "유저용 `frontend_action` 과 **같은 함수·같은 값**이다(`build_frontend_action`). "
+            "CS 가 고객과 같은 문장을 보고 응대하라고 만든 것이라 **어드민 자신의 표시 "
+            "가이드가 아니다** — 어드민 화면은 위의 `error_*`(운영자 어휘)로 그린다. "
+            "`description`(cause+next_step 합본)은 어드민이 두 줄을 나눠 그리므로 제외했다. "
+            "오류가 아닌 상태(delivered/read/queued 등)도 채워진다 — 유저는 그 로그에도 "
+            "같은 모달을 본다."
+        )
+    )
 
     class Meta:
         model = SentDMLog
@@ -475,6 +486,7 @@ class AdminDMLogDetailSerializer(serializers.ModelSerializer):
             "error_policy",
             "error_policy_display",
             "recoverable",
+            "user_view",
             "created_at",
             "delivered_at",
             # 상세 전용
@@ -519,6 +531,53 @@ class AdminDMLogDetailSerializer(serializers.ModelSerializer):
 
     def get_recoverable(self, obj: SentDMLog) -> bool:
         return self._described(obj)["recoverable"]
+
+    @extend_schema_field(
+        inline_serializer(
+            name="AdminDMLogUserView",
+            fields={
+                "user_reason": serializers.CharField(
+                    help_text="사용자 사유 머신 키(예: `ghost_opening_cleanup`). 오류·건너뜀이 아니면 빈 문자열."
+                ),
+                "severity": serializers.ChoiceField(
+                    choices=["success", "info", "warning", "error"],
+                    help_text="유저 콘솔 모달 헤더 색.",
+                ),
+                "type": serializers.ChoiceField(
+                    choices=["success", "wait", "reconnect", "info", "checklist"],
+                    help_text="유저 콘솔 모달 레이아웃 종류.",
+                ),
+                "title": serializers.CharField(help_text="고객이 보는 제목."),
+                "cause": serializers.CharField(help_text="고객이 보는 '발생 이유'."),
+                "next_step": serializers.CharField(
+                    help_text="고객이 보는 '다음 행동'. 조치가 없는 사유는 빈 문자열."
+                ),
+                "checklist": serializers.ListField(
+                    allow_null=True,
+                    help_text="자가 점검 항목 `[{id,title,description}]` 또는 null.",
+                ),
+                "cta": serializers.DictField(
+                    allow_null=True, help_text="`{label, action}` 또는 null."
+                ),
+            },
+        )
+    )
+    def get_user_view(self, obj: SentDMLog) -> dict:
+        """DM-19 — 유저 콘솔이 이 로그에 대해 그리는 값.
+
+        ★ **사본을 만들지 않는다.** `build_frontend_action` 을 그대로 부른다 — 문구가 두
+        벌이 되면 서버 문구를 고쳤을 때 어드민 미리보기만 옛 문구로 남아, '고객이 보는
+        화면'이라는 이름을 달고 거짓을 말하게 된다(요청서가 지적한 그대로).
+
+        `description` 은 뺀다 — cause+next_step 합본이라 어드민이 두 줄로 나눠 그리는
+        구조에서 중복이고, 지우는 쪽이 "어느 필드가 정본인가"를 헷갈리지 않게 한다.
+        """
+        from apps.integrations.dm_frontend_actions import build_frontend_action
+
+        action = build_frontend_action(
+            obj.status, obj.error_subcode, obj.error_code, obj.error_message
+        )
+        return {k: v for k, v in action.items() if k != "description"}
 
 
 # ===== DM 수신자(사람) 단위 롤업 =====
