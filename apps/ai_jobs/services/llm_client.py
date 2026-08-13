@@ -24,6 +24,21 @@ _LLM_API_KEY = config("LLM_API_KEY", default="")
 # `http://litellm-proxy:4000`(TLS 없음)으로 호출하므로 기본 True 여도 이 분기를 타지 않는다.
 _LLM_TLS_VERIFY = config("LLM_TLS_VERIFY", default=True, cast=bool)
 
+# ── 스트리밍 (프록시 유휴 타임아웃 방어) ──────────────────────
+# 개발 스택은 LLM 을 `https://llm.clfy.ai.kr`(Cloudflare 프록시) 로 부르는데, CF 는 오리진이
+# 120초 안에 응답을 **시작**하지 않으면 524(origin_response_timeout) 로 끊는다. 그런데 추론
+# 모델의 리뉴얼 호출은 추론에만 오래 걸린다 — 2026-08-13 실측(실제 실패 프롬프트 재현):
+#   첫 이벤트 2.4s · 첫 content 토큰 187.8s(추론 28,113 토큰) · 총 204.1s 완결
+# 즉 비스트리밍은 204초 동안 한 바이트도 안 나가 **구조적으로 CF 를 통과할 수 없다**.
+# 스트리밍이면 추론 델타가 2.4초부터 계속 흘러 유휴 구간이 사라져 같은 프롬프트가 정상 완결된다.
+#
+# 운영 경로(내부 `http://litellm-proxy:4000`)는 CF 를 타지 않아 원래 이 문제가 없지만,
+# 스트리밍은 프록시/LB 유휴 타임아웃 전반에 대한 방어라 양쪽 공통으로 켠다.
+#
+# 끄는 스위치를 둔 이유: 공급자가 `stream_options.include_usage` 를 무시하면 usage 가 비어
+# 비용·토큰 집계가 0 으로 떨어진다. 그 경우 배포 없이 `LLM_STREAMING=False` 로 되돌린다.
+_LLM_STREAMING = config("LLM_STREAMING", default=True, cast=bool)
+
 
 # ── DeepSeek 가격표 (USD / 1M tokens) ─────────────────────────
 # v4-flash 기준. 모델별 단가가 다르면 PRICE_TABLE 에 추가하면 된다.
@@ -101,12 +116,79 @@ def _merge_usage(acc: dict, part: dict) -> None:
         acc["raw_usage"] = part["raw_usage"]
 
 
+def _complete_once(
+    client: OpenAI,
+    model: str,
+    messages: list[dict],
+    max_tokens: int,
+    temperature: float,
+    extra_body: dict | None,
+    stream: bool,
+) -> tuple[str, str | None, dict]:
+    """LLM 을 한 번 호출하고 ``(content, finish_reason, usage_dict)`` 를 돌려준다.
+
+    스트리밍/비스트리밍의 반환 형태를 여기서 통일해, 호출자는 어느 쪽인지 몰라도 된다.
+    스트리밍은 델타를 이어붙이고 finish_reason·usage 는 각각 마지막으로 실린 값을 쓴다
+    (``include_usage`` 를 켜면 usage 는 choices 가 빈 마지막 이벤트로 온다).
+    """
+    if not stream:
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            extra_body=extra_body,
+        )
+        choice = response.choices[0]
+        return (
+            choice.message.content or "",
+            getattr(choice, "finish_reason", None),
+            _extract_usage(response, model),
+        )
+
+    parts: list[str] = []
+    finish_reason: str | None = None
+    usage = None
+
+    events = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        extra_body=extra_body,
+        stream=True,
+        stream_options={"include_usage": True},
+    )
+    for event in events:
+        if getattr(event, "usage", None):
+            usage = event.usage
+        for choice in event.choices or []:
+            delta = getattr(choice, "delta", None)
+            # 추론 델타(reasoning_content)는 본문이 아니므로 버린다 — 다만 이 델타가
+            # 흐르는 덕분에 프록시가 유휴로 보지 않는다(이 함수의 존재 이유).
+            if delta is not None and getattr(delta, "content", None):
+                parts.append(delta.content)
+            if getattr(choice, "finish_reason", None):
+                finish_reason = choice.finish_reason
+
+    usage_dict = _usage_to_dict(usage, model)
+    if not usage_dict:
+        # include_usage 를 무시하는 공급자 — 비용·토큰 집계가 조용히 0 이 된다.
+        logger.warning(
+            "스트리밍 응답에 usage 가 없음(model=%s) — 토큰/비용 집계가 0 으로 기록된다. "
+            "집계가 중요하면 LLM_STREAMING=False 로 되돌릴 것.",
+            model,
+        )
+    return "".join(parts), finish_reason, usage_dict
+
+
 def _complete_with_continuation(
     client: OpenAI,
     model: str,
     base_messages: list[dict],
     max_tokens: int,
     temperature: float,
+    stream: bool = False,
 ) -> tuple[str, dict, float, int]:
     """LLM 을 호출하되 출력이 max_tokens 로 잘리면 자동으로 이어받아 조립한다.
 
@@ -126,18 +208,11 @@ def _complete_with_continuation(
     started = time.time()
 
     while True:
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            extra_body=extra_body,
+        content_piece, finish_reason, usage_part = _complete_once(
+            client, model, messages, max_tokens, temperature, extra_body, stream
         )
-        choice = response.choices[0]
-        parts.append(choice.message.content or "")
-        _merge_usage(merged, _extract_usage(response, model))
-
-        finish_reason = getattr(choice, "finish_reason", None)
+        parts.append(content_piece)
+        _merge_usage(merged, usage_part)
 
         # ── 추론 초과(빈 응답)와 진짜 잘림을 구분한다 ──────────────
         # 추론 모델은 max_tokens 를 추론으로 다 쓰면 content="" + finish_reason="length"
@@ -226,7 +301,15 @@ def _get_client() -> OpenAI:
 
 def _extract_usage(response, model: str) -> dict:
     """OpenAI / DeepSeek usage 구조에서 캐시 통계까지 뽑아낸다."""
-    usage = getattr(response, "usage", None)
+    return _usage_to_dict(getattr(response, "usage", None), model)
+
+
+def _usage_to_dict(usage, model: str) -> dict:
+    """usage 객체 → 집계용 dict.
+
+    비스트리밍은 ``response.usage``, 스트리밍은 마지막 이벤트의 ``event.usage`` 로
+    같은 구조가 오므로 양쪽이 이 함수를 공유한다.
+    """
     if usage is None:
         return {}
 
@@ -347,7 +430,9 @@ def call_llm_with_usage(
     """
     client = _get_client()
 
-    logger.info("LLM 호출 시작: model=%s, max_tokens=%d", model, max_tokens)
+    logger.info(
+        "LLM 호출 시작: model=%s, max_tokens=%d, stream=%s", model, max_tokens, _LLM_STREAMING
+    )
 
     content, usage, elapsed, rounds = _complete_with_continuation(
         client,
@@ -358,6 +443,10 @@ def call_llm_with_usage(
         ],
         max_tokens,
         temperature,
+        # 페이지 생성/리뉴얼은 출력·추론이 길어 프록시 유휴 타임아웃에 걸리는 유일한 경로다.
+        # 멀티모달/짧은 호출(call_llm_messages_with_usage)은 비스트리밍 그대로 둔다 —
+        # 이득이 없고 공급자별 스트리밍 거동 차이만 새로 떠안게 된다.
+        stream=_LLM_STREAMING,
     )
     logger.info(
         "LLM 응답 수신: model=%s, %d chars, in=%d (hit=%d,miss=%d), out=%d(reasoning=%d), "

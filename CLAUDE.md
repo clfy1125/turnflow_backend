@@ -140,7 +140,8 @@ make init           # 빌드 + 실행 + 마이그레이션 한 번에
 - DB/Redis 접속 (`DB_*`, `REDIS_*`)
 - `SECRET_KEY`, `DEBUG`, `ALLOWED_HOSTS`, `CORS_ALLOWED_ORIGINS`, `CSRF_TRUSTED_ORIGINS`
 - Meta/Instagram: `META_APP_ID`, `META_APP_SECRET`, `INSTAGRAM_APP_ID`, `INSTAGRAM_APP_SECRET`, `INSTAGRAM_REDIRECT_URI`, `INSTAGRAM_WEBHOOK_VERIFY_TOKEN`, `INSTAGRAM_MOCK_MODE`
-- LLM: `LLM_URL`, `LLM_API_KEY`
+- LLM: `LLM_URL`(dev=`https://llm.clfy.ai.kr` CF 경유 / **prod=`http://litellm-proxy:4000` 내부**), `LLM_API_KEY`,
+  `LLM_TLS_VERIFY`(dev만 False — CF Origin 인증서 수용), `LLM_STREAMING`(기본 True — 끄면 dev 리뉴얼이 CF 524 로 죽는다)
 - 토스페이먼츠: `TOSS_SECRET_KEY`, `TOSS_CLIENT_KEY`, `TOSS_API_BASE`, `TOSS_DEV_CARD_AUTH_ENABLED`(dev 전용 카드입력 헬퍼 — 운영 반드시 False)
 - 인스타 리포트: `APIFY_API_KEY`(공개 조회수 수집 — 인사이트 권한 미승인 대체), `GEMINI_API_KEY`(영상 피처),
   `DEEPSEEK_API_KEY`(문장 합성), `INSTA_REPORT_FAKE_MODE`(dev 전용 오프라인 모드 — 운영 반드시 False)
