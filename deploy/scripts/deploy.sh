@@ -82,17 +82,37 @@ APP_IMAGE="$IMAGE" $COMPOSE up -d --no-deps celery_dm celery_followup celery_def
 # 이걸 아예 빼두면(2026-08-04 까지 그랬다) 배포마다 celery_reports 만 옛 이미지로 남아
 # 코드 스큐가 쌓인다 — 실제로 web 이 15커밋 앞선 상태가 발생했다.
 echo "==> 6b/6 recreate celery_reports (진행 중 리포트가 없을 때만)"
+# ⚠️ 이 블록은 **전부 non-fatal 이어야 한다** (`set -euo pipefail` 아래라는 걸 잊지 말 것).
+# 여기서 죽으면 celery_reports 가 옛 이미지로 남는 데서 끝나지 않고, 뒤따르는 **최종 검증
+# (running images / 이미지 스큐 점검)까지 통째로 실행되지 않아** 스큐를 눈치채지 못한다.
+# 2026-08-10(c62151f)·08-14(fa1aeaf) 배포가 연달아 이 지점에서 조용히 끊겼다.
+#
+# 죽는 지점이 세 군데였다 — 셋 다 "정상인데 실패로 보이는" 케이스라 더 나빴다:
+#   1) `grep -c` 는 매칭 0건이면 "0" 을 출력하면서 **exit 1** 이다. 대입문의 종료 상태가
+#      명령 치환의 종료 상태라 `set -e` 가 즉사시킨다. 하필 "진행 중 리포트 없음"
+#      = 재생성해도 되는 정상 상황에서만 터져서, 사실상 **항상** 6b 에서 멈췄다.
+#   2) `$COMPOSE ps -q celery_reports` 가 비면 `docker exec ""` 가 실패한다.
+#   3) `celery inspect` 는 6/6 에서 방금 재생성된 워커들이 아직 부팅 중이면 타임아웃 → 비0.
+# 판정 규칙은 유지한다: 확인 불가는 '?' 로 두고 **재생성하지 않는다**(진행 중 리포트 보호).
 _rq="$(docker exec turnflow_instagram_redis sh -c \
-        'redis-cli --no-auth-warning -a "$REDIS_PASSWORD" llen reports' 2>/dev/null | tr -d '\r' || echo '?')"
-# grep -c 는 매칭 0건이면 exit 1 이다 → `|| echo '?'` 를 쓰면 "0건"과
-#   "확인불가"가 뒤섞인다(2026-08-05 실제로 그 버그로 항상 SKIP 됐다).
-#   출력 유무로 두 경우를 가른다.
-_ract_raw="$(docker exec "$($COMPOSE ps -q celery_reports 2>/dev/null | head -1)" \
-              celery -A config inspect active -t 10 2>/dev/null)"
-if [ -z "$_ract_raw" ]; then
-  _ract='?'
+        'redis-cli --no-auth-warning -a "$REDIS_PASSWORD" llen reports' 2>/dev/null \
+        | tr -d '\r' || true)"
+[ -n "${_rq}" ] || _rq='?'
+
+_reports_cid="$($COMPOSE ps -q celery_reports 2>/dev/null | head -1 || true)"
+if [ -z "${_reports_cid}" ]; then
+  _ract='?'   # 컨테이너를 못 찾음 = 확인 불가
 else
-  _ract="$(printf '%s' "$_ract_raw" | grep -c 'insta_reports')"
+  # `|| true` 로 inspect 실패(부팅 중 타임아웃 등)를 흡수한다.
+  _ract_raw="$(docker exec "${_reports_cid}" \
+                celery -A config inspect active -t 10 2>/dev/null || true)"
+  if [ -z "${_ract_raw}" ]; then
+    _ract='?'
+  else
+    # grep -c 의 exit 1(=0건)을 흡수하되 stdout("0")은 그대로 쓴다.
+    _ract="$(printf '%s' "${_ract_raw}" | grep -c 'insta_reports' || true)"
+    [ -n "${_ract}" ] || _ract='?'
+  fi
 fi
 echo "    reports 큐=${_rq} 진행중=${_ract}"
 if [ "${_rq}" = "0" ] && [ "${_ract}" = "0" ]; then
