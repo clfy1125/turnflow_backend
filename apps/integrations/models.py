@@ -925,6 +925,38 @@ class AutoDMCampaign(models.Model):
         ),
     )
 
+    # ===== 기존 댓글 소급 발송 (backfill) =====
+    # 실사용 순서가 "게시물 업로드 → 댓글 축적 → 자동화 켜기" 라서, 캠페인 시작 이전 댓글이
+    # 통째로 누락된다(2026-08-14 @highestlevel33 실측: 게시물 댓글 60건 중 32건이 캠페인
+    # 생성 전이라 DM 0건). 폴링 보정은 이걸 못 줍는다 — 앵커 종료(_poll_one_media)와
+    # per-campaign baseline 두 겹으로 막혀 있고, 둘 다 "대량 오발송 방지" 목적이라 정상이다.
+    # 그래서 우회는 폴링을 고치는 게 아니라 **명시적 1회성 소급 태스크**로 분리한다.
+    backfill_existing_comments = models.BooleanField(
+        default=True,
+        verbose_name="기존 댓글 소급 발송",
+        help_text=(
+            "캠페인이 실제로 시작되는 시점에 이미 달려 있던 댓글에도 DM 을 발송한다. "
+            "범위는 게시물 업로드 시각부터이되 Private Reply 7일 창으로 잘린다. "
+            "1회만 실행되며(backfill_started_at 락), 일시중지 후 재개해도 반복되지 않는다."
+        ),
+    )
+    backfill_started_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="소급 발송 실행 시각",
+        help_text=(
+            "소급 발송을 시작한 시각. **NULL 인 행이 곧 대기열**이라 스캐너가 이걸로 "
+            "미처리분을 고른다 → 값이 차는 순간 1회성 락이 된다. 예약 캠페인은 예약 시작 "
+            "시각이 도래한 tick 에서 채워진다."
+        ),
+    )
+    backfill_stats = models.JSONField(
+        default=dict,
+        blank=True,
+        verbose_name="소급 발송 결과",
+        help_text="{scanned, enqueued, skipped, capped, floor, finished_at} — 프론트 표시용.",
+    )
+
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="생성일시")
     updated_at = models.DateTimeField(auto_now=True, verbose_name="수정일시")
@@ -1134,6 +1166,11 @@ class AutoDMCampaign(models.Model):
             "updated_at",
             "started_at",
             "ended_at",
+            # 소급 발송의 "실행 기록"은 복사하면 안 된다 — 복사본은 아직 한 번도 소급하지
+            # 않았으므로 락(backfill_started_at)이 따라오면 영영 소급이 안 돈다.
+            # 설정값 backfill_existing_comments 는 (EXCLUDE 밖이라) 정상 복사된다.
+            "backfill_started_at",
+            "backfill_stats",
         }
         data = {}
         for f in self._meta.fields:

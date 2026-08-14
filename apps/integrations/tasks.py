@@ -13,7 +13,7 @@ Instagram 통합 Celery 태스크.
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from celery import shared_task
 from django.conf import settings
@@ -3236,6 +3236,268 @@ def poll_missed_comments():
         "misses": total_misses,
         "stops": stop_reasons,
     }
+
+
+# ===== 기존 댓글 소급 발송 (backfill) =====
+
+
+def _campaign_backfill_floor(camp: AutoDMCampaign, now) -> datetime:
+    """소급 스캔 하한 = max(게시물 업로드 시각, Private Reply 7일 창).
+
+    사용자의 멘탈 모델은 "이 게시물에 달린 댓글 전부" 라 게시물 업로드 시각이 자연스러운
+    기준이다. 다만 7일을 넘어가면 Meta 가 code=100 으로 확정 거부하므로(발송 자체가 불가)
+    창 하한으로 한 번 더 자른다 — 오래된 게시물에 캠페인을 새로 켜도 여기서 자동으로 좁혀진다.
+
+    게시물 시각 조회에 실패하면 창 하한만 쓴다(fail-safe: 더 넓은 범위가 아니라 7일 고정).
+    """
+    window_floor = now - timedelta(days=getattr(settings, "PRIVATE_REPLY_WINDOW_DAYS", 7))
+    try:
+        media_ts = InstagramMediaService.get_media_timestamp(
+            camp.media_id, camp.ig_connection.access_token
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("backfill: get_media_timestamp 실패 camp=%s", camp.id, exc_info=True)
+        media_ts = None
+    if media_ts is not None and media_ts > window_floor:
+        return media_ts
+    return window_floor
+
+
+@shared_task(name="integrations.backfill_campaign_comments", bind=True, max_retries=2)
+def backfill_campaign_comments(self, campaign_id: str):
+    """캠페인 시작 이전에 달려 있던 댓글에 DM 을 소급 발송한다 (캠페인당 1회).
+
+    ``poll_missed_comments`` 와의 차이는 딱 두 가지다:
+      - **앵커를 종료 조건으로 쓰지 않는다** — 장부에 이미 있는 댓글이 곧 소급 대상이므로.
+      - **per-campaign baseline 을 적용하지 않는다** — 시작 이전 댓글이 목적이므로.
+    나머지 가드(self / 대댓글 / 키워드 / 슬롯 점유 / 멱등키 / 페이서 / 쿼터)는 전부
+    ``_enqueue_send_dm`` 을 그대로 재사용해 웹훅 경로와 동일하게 동작한다.
+
+    호출 시점은 ``scan_campaigns_for_backfill`` 이 결정한다(예약 캠페인 포함 단일 경로).
+    """
+    now = timezone.now()
+    max_comments = getattr(settings, "DM_BACKFILL_MAX_COMMENTS", 500)
+    max_pages = getattr(settings, "DM_BACKFILL_MAX_PAGES", 20)
+    page_size = getattr(settings, "MISSED_COMMENT_POLL_PAGE_SIZE", 50)
+
+    # ★ 1회성 락을 트랜잭션 안에서 선점 — 스캐너 중복 발사/워커 재시도로도 두 번 돌지 않는다.
+    with transaction.atomic():
+        camp = (
+            AutoDMCampaign.objects.select_for_update()
+            .select_related("ig_connection")
+            .filter(id=campaign_id)
+            .first()
+        )
+        if camp is None:
+            return {"status": "not_found"}
+        if camp.backfill_started_at is not None:
+            return {"status": "skipped", "reason": "already_backfilled"}
+        if not camp.backfill_existing_comments:
+            return {"status": "skipped", "reason": "disabled"}
+        if not camp.is_runnable_now(now):
+            # 예약 시작 전 / 종료 후 / 비활성 — 락을 잡지 않고 다음 tick 에 재평가한다.
+            return {"status": "skipped", "reason": "not_runnable"}
+        if not (camp.media_id or "").strip():
+            return {"status": "skipped", "reason": "no_media"}
+        camp.backfill_started_at = now
+        camp.save(update_fields=["backfill_started_at", "updated_at"])
+
+    conn = camp.ig_connection
+    floor = _campaign_backfill_floor(camp, now)
+    own_username = (conn.username or "").strip().lower()
+    logger.info("backfill 시작: camp=%s media=%s floor=%s", camp.id, camp.media_id, floor)
+
+    scanned = enqueued = 0
+    skipped: dict[str, int] = {}
+    capped = False
+    after = None
+    pages = 0
+
+    def _skip(reason: str) -> None:
+        skipped[reason] = skipped.get(reason, 0) + 1
+
+    try:
+        while pages < max_pages:
+            resp = InstagramMediaService.list_media_comments(
+                camp.media_id, conn.access_token, limit=page_size, after=after
+            )
+            comments = resp.get("data") or []
+            if not comments:
+                break
+
+            for c in comments:
+                cid = c.get("id")
+                if not cid:
+                    continue
+                ts = _parse_iso_timestamp(c.get("timestamp"))
+                # newest-first 라 하한을 만나면 이후는 전부 범위 밖 → 종료
+                if ts is not None and ts < floor:
+                    pages = max_pages  # 바깥 while 종료
+                    break
+                scanned += 1
+
+                # 장부에는 기록해 둔다(폴러 앵커 일관성) — 단 종료 조건으로 쓰지 않는다.
+                try:
+                    _record_seen_comment(
+                        ig_connection_id=conn.id,
+                        comment_id=cid,
+                        media_id=camp.media_id,
+                        source=SeenComment.Source.POLL,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug("backfill: SeenComment 기록 실패 cid=%s", cid, exc_info=True)
+
+                c_from_id = str((c.get("from") or {}).get("id") or "")
+                c_username = str(c.get("username") or "").strip().lower()
+                if (c_from_id and c_from_id == str(conn.external_account_id)) or (
+                    own_username and c_username == own_username
+                ):
+                    _skip("self_comment")
+                    continue
+                if c.get("parent_id"):
+                    _skip("is_reply")
+                    continue
+                text = c.get("text") or ""
+                if not camp.matches_keyword(text):
+                    _skip("keyword_mismatch")
+                    continue
+
+                if enqueued >= max_comments:
+                    capped = True
+                    pages = max_pages
+                    break
+
+                # comments edge 는 username 을 자주 생략하고 from.id 만 준다(그 반대도 있다).
+                # 웹훅/폴링 경로와 동일한 폴백 순서를 써야 같은 사람의 로그가 한 키공간에
+                # 모여 수신자 쿨다운(중복 DM 방지)이 실제로 작동한다.
+                recipient_key = (c.get("from") or {}).get("id") or c.get("username") or cid
+                res = _enqueue_send_dm(
+                    campaign=camp,
+                    comment_id=cid,
+                    comment_text=text,
+                    from_user_id=recipient_key,
+                    from_username=c.get("username") or "",
+                    webhook_payload={
+                        "source": "backfill_campaign_comments",
+                        "media_id": camp.media_id,
+                        "comment_id": cid,
+                        "comment_ts": c.get("timestamp"),
+                    },
+                )
+                status = res.get("status")
+                if status == "enqueued":
+                    enqueued += 1
+                    try:
+                        SeenComment.objects.filter(ig_connection_id=conn.id, comment_id=cid).update(
+                            triggered=True
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                else:
+                    _skip(res.get("reason") or status or "unknown")
+
+            if pages >= max_pages:
+                break
+            after = resp.get("paging_after")
+            pages += 1
+            if not after:
+                break
+    except Exception:
+        # 실패해도 락은 유지한다 — 부분 발송된 상태에서 재실행하면 멱등키가 중복은 막지만
+        # 페이서/쿼터를 두 번 태우고, 무엇보다 "왜 두 번 돌았나" 를 추적하기 어려워진다.
+        # 남은 누락분은 기존 poll_missed_comments 가 앵커 위쪽 갭으로 계속 보정한다.
+        logger.exception("backfill 실패: camp=%s (락 유지)", camp.id)
+        camp.backfill_stats = {
+            "error": True,
+            "scanned": scanned,
+            "enqueued": enqueued,
+            "skipped": skipped,
+            "finished_at": timezone.now().isoformat(),
+        }
+        camp.save(update_fields=["backfill_stats", "updated_at"])
+        raise
+
+    camp.backfill_stats = {
+        "scanned": scanned,
+        "enqueued": enqueued,
+        "skipped": skipped,
+        "capped": capped,
+        "floor": floor.isoformat(),
+        "finished_at": timezone.now().isoformat(),
+    }
+    camp.save(update_fields=["backfill_stats", "updated_at"])
+    logger.info(
+        "backfill 완료: camp=%s scanned=%s enqueued=%s capped=%s skipped=%s",
+        camp.id,
+        scanned,
+        enqueued,
+        capped,
+        skipped,
+    )
+
+    if capped:
+        # 잘라낸 사실을 침묵시키지 않는다 — 상한이 실제로 물린 계정은 운영이 알아야 한다.
+        logger.warning(
+            "backfill 상한 도달: camp=%s enqueued=%s (max=%s) — 더 오래된 댓글은 발송하지 않음",
+            camp.id,
+            enqueued,
+            max_comments,
+        )
+        try:
+            from apps.core.telegram import send_telegram_notification
+
+            send_telegram_notification(
+                f"⚠️ 소급 발송 상한 도달: @{conn.username} '{camp.name}' "
+                f"{enqueued}건 발송 후 중단 (상한 {max_comments})"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    return {
+        "status": "done",
+        "scanned": scanned,
+        "enqueued": enqueued,
+        "capped": capped,
+        "skipped": skipped,
+    }
+
+
+@shared_task(name="integrations.scan_campaigns_for_backfill")
+def scan_campaigns_for_backfill():
+    """소급 발송 대기 캠페인을 찾아 태스크를 발사한다 (Beat: 1분 주기).
+
+    ★ 왜 생성 훅이 아니라 스캐너인가 —
+    이 시스템에는 "예약 시작" 이벤트가 없다. ``enforce_campaign_schedules`` 는 종료만
+    처리하고 시작 게이팅은 발송 경로의 ``schedule_window_q`` 가 맡는다(그 분리 덕에 Beat 가
+    죽어도 시작 전 오발송이 없다). 그래서 생성 시점에 태스크를 쏘면 예약 캠페인에서는
+    ``is_runnable_now()`` 에 막혀 전량 skip 되고, 정작 예약 시각이 와도 다시 돌지 않는다.
+
+    ``backfill_started_at IS NULL`` 을 대기열로 쓰면 즉시형·예약형이 한 경로로 처리된다:
+    예약 시각이 도래하는 tick 에서 자연히 집히고, 예약 시각을 나중에 바꿔도 따라오고,
+    tick 이 몇 번 유실돼도 다음 tick 에 회복된다.
+    """
+    if not getattr(settings, "DM_BACKFILL_ENABLED", True):
+        return {"enabled": False}
+
+    now = timezone.now()
+    limit = getattr(settings, "DM_BACKFILL_SCAN_MAX", 20)
+    candidates = list(
+        AutoDMCampaign.objects.filter(
+            status=AutoDMCampaign.Status.ACTIVE,
+            backfill_existing_comments=True,
+            backfill_started_at__isnull=True,
+            ig_connection__is_active=True,
+            ig_connection__status=IGAccountConnection.Status.ACTIVE,
+        )
+        .filter(AutoDMCampaign.schedule_window_q(now))
+        .exclude(media_id="")
+        .values_list("id", flat=True)[:limit]
+    )
+    for cid in candidates:
+        backfill_campaign_comments.delay(str(cid))
+    if candidates:
+        logger.info("scan_campaigns_for_backfill: dispatched=%s", len(candidates))
+    return {"dispatched": len(candidates)}
 
 
 @shared_task(name="integrations.cleanup_comment_ledger")

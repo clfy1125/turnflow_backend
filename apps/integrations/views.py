@@ -2551,6 +2551,192 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         },
         tags=["Auto DM"],
     )
+    @extend_schema(
+        summary="소급 발송 대상 미리보기",
+        description=(
+            "캠페인을 켰을 때 **기존 댓글 중 몇 건에 DM 이 나갈지**를 미리 계산한다.\n\n"
+            "**사용 시나리오**: 캠페인 생성/수정 화면에서 `backfill_existing_comments` 토글 옆에 "
+            "'기존 댓글 N건에도 발송됩니다' 를 표시할 때. 캠페인이 아직 없어도 호출할 수 있도록 "
+            "media_id + 키워드 조건을 쿼리 파라미터로 받는다.\n\n"
+            "**부작용 없음** — 조회만 하며 DM 을 보내거나 장부(SeenComment)를 쓰지 않는다.\n\n"
+            "**집계 규칙** (실제 소급 발송과 동일):\n"
+            "- 범위: 게시물 업로드 시각 ~ 현재. 단 Private Reply 7일 창 밖은 제외(Meta 가 거부)\n"
+            "- 제외: 계정 본인 댓글, 대댓글(답글), 키워드 불일치, 이미 DM 이 나간 댓글\n"
+            "- `capped=true` 면 상한(기본 500건)에 걸려 실제로는 최신분만 발송된다\n\n"
+            "**인증**: JWT 필수. 본인 워크스페이스의 IG 연동만 조회 가능.\n\n"
+            "```bash\n"
+            "curl -H 'Authorization: Bearer <token>' \\\n"
+            "  '/api/v1/integrations/auto-dm-campaigns/backfill-preview/"
+            "?ig_connection_id=<uuid>&media_id=18117101836922278&keyword_filter=최고수준'\n"
+            "```"
+        ),
+        parameters=[
+            OpenApiParameter(
+                "ig_connection_id",
+                str,
+                required=True,
+                description="IG 연동 ID (UUID). 본인 워크스페이스 소속이어야 한다.",
+            ),
+            OpenApiParameter(
+                "media_id", str, required=True, description="대상 게시물의 Instagram media id."
+            ),
+            OpenApiParameter(
+                "keyword_filter",
+                str,
+                required=False,
+                description="키워드 콤마 구분 (예: `최고수준,신청`). 비우면 모든 댓글이 대상.",
+            ),
+            OpenApiParameter(
+                "keyword_mode",
+                str,
+                required=False,
+                description="`any`(기본) / `all` / `exact`. 캠페인의 keyword_mode 와 동일 의미.",
+            ),
+        ],
+        responses={
+            200: OpenApiResponse(
+                description=(
+                    "집계 결과. `eligible_count`=소급 발송될 건수, `capped`=상한 초과 여부, "
+                    "`window_floor`=실제 스캔 하한(ISO8601), `oldest_eligible_at`=가장 오래된 대상 "
+                    "댓글 시각, `scanned`=훑은 댓글 수, `excluded`=제외 사유별 건수."
+                ),
+                examples=[
+                    OpenApiExample(
+                        "대상 있음",
+                        value={
+                            "eligible_count": 32,
+                            "capped": False,
+                            "max_comments": 500,
+                            "window_floor": "2026-08-07T04:34:00Z",
+                            "oldest_eligible_at": "2026-08-13T14:34:11Z",
+                            "scanned": 60,
+                            "excluded": {
+                                "self_comment": 14,
+                                "is_reply": 14,
+                                "already_sent": 0,
+                            },
+                        },
+                    ),
+                    OpenApiExample(
+                        "대상 없음 (새 게시물)",
+                        value={
+                            "eligible_count": 0,
+                            "capped": False,
+                            "max_comments": 500,
+                            "window_floor": "2026-08-07T04:34:00Z",
+                            "oldest_eligible_at": None,
+                            "scanned": 0,
+                            "excluded": {},
+                        },
+                    ),
+                ],
+            ),
+            400: OpenApiResponse(description="ig_connection_id / media_id 누락 또는 형식 오류"),
+            401: OpenApiResponse(description="인증 필요 (JWT 누락/만료)"),
+            403: OpenApiResponse(description="본인 워크스페이스의 IG 연동이 아님"),
+            404: OpenApiResponse(description="IG 연동을 찾을 수 없음"),
+            500: OpenApiResponse(description="서버 내부 오류"),
+        },
+        tags=["Auto DM"],
+    )
+    @action(detail=False, methods=["get"], url_path="backfill-preview")
+    def backfill_preview(self, request):
+        """소급 발송 대상 건수 미리보기 (부작용 없음)."""
+        from rest_framework.exceptions import NotFound
+
+        from .services import InstagramMediaService
+        from .tasks import _campaign_backfill_floor, _parse_iso_timestamp
+
+        conn_id = (request.query_params.get("ig_connection_id") or "").strip()
+        media_id = (request.query_params.get("media_id") or "").strip()
+        if not conn_id or not media_id:
+            raise DRFValidationError({"detail": "ig_connection_id 와 media_id 는 필수입니다."})
+
+        user_workspaces = Workspace.objects.filter(memberships__user=request.user)
+        try:
+            conn = IGAccountConnection.objects.get(id=conn_id, workspace__in=user_workspaces)
+        except (IGAccountConnection.DoesNotExist, DjangoValidationError, ValueError, TypeError):
+            raise NotFound("IG 연동을 찾을 수 없습니다.") from None
+
+        # 실제 소급 발송과 같은 매칭 규칙을 쓰기 위해 저장하지 않는 임시 캠페인으로 평가한다
+        # (matches_keyword 를 재구현하면 미리보기와 실발송이 갈라진다).
+        raw_kw = request.query_params.get("keyword_filter") or ""
+        probe = AutoDMCampaign(
+            ig_connection=conn,
+            media_id=media_id,
+            keyword_filter=[k.strip() for k in raw_kw.split(",") if k.strip()],
+            keyword_mode=(request.query_params.get("keyword_mode") or "any").strip().lower(),
+        )
+
+        now = timezone.now()
+        floor = _campaign_backfill_floor(probe, now)
+        max_comments = getattr(settings, "DM_BACKFILL_MAX_COMMENTS", 500)
+        page_size = getattr(settings, "MISSED_COMMENT_POLL_PAGE_SIZE", 50)
+        max_pages = getattr(settings, "DM_BACKFILL_MAX_PAGES", 20)
+        own_username = (conn.username or "").strip().lower()
+
+        eligible = 0
+        scanned = 0
+        oldest = None
+        excluded: dict[str, int] = {}
+        after = None
+        pages = 0
+        done = False
+
+        while pages < max_pages and not done:
+            resp = InstagramMediaService.list_media_comments(
+                media_id, conn.access_token, limit=page_size, after=after
+            )
+            comments = resp.get("data") or []
+            if not comments:
+                break
+            for c in comments:
+                cid = c.get("id")
+                if not cid:
+                    continue
+                ts = _parse_iso_timestamp(c.get("timestamp"))
+                if ts is not None and ts < floor:
+                    done = True
+                    break
+                scanned += 1
+                c_from_id = str((c.get("from") or {}).get("id") or "")
+                c_username = str(c.get("username") or "").strip().lower()
+                if (c_from_id and c_from_id == str(conn.external_account_id)) or (
+                    own_username and c_username == own_username
+                ):
+                    excluded["self_comment"] = excluded.get("self_comment", 0) + 1
+                    continue
+                if c.get("parent_id"):
+                    excluded["is_reply"] = excluded.get("is_reply", 0) + 1
+                    continue
+                if not probe.matches_keyword(c.get("text") or ""):
+                    excluded["keyword_mismatch"] = excluded.get("keyword_mismatch", 0) + 1
+                    continue
+                if SentDMLog.objects.filter(comment_id=cid).exists():
+                    excluded["already_sent"] = excluded.get("already_sent", 0) + 1
+                    continue
+                eligible += 1
+                if ts is not None and (oldest is None or ts < oldest):
+                    oldest = ts
+            if done:
+                break
+            after = resp.get("paging_after")
+            pages += 1
+            if not after:
+                break
+
+        return Response(
+            {
+                "eligible_count": min(eligible, max_comments),
+                "capped": eligible > max_comments,
+                "max_comments": max_comments,
+                "window_floor": floor.isoformat(),
+                "oldest_eligible_at": oldest.isoformat() if oldest else None,
+                "scanned": scanned,
+                "excluded": excluded,
+            }
+        )
+
     @action(detail=False, methods=["get"], url_path="recovery-reply-suggestions")
     def recovery_reply_suggestions(self, request):
         from apps.billing.subscription_utils import owner_has_feature

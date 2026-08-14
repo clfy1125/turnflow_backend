@@ -547,6 +547,14 @@ CELERY_BEAT_SCHEDULE = {
         "task": "integrations.poll_missed_comments",
         "schedule": 60 * 60,  # 1시간
     },
+    # ===== 기존 댓글 소급 발송 대기열 스캔 =====
+    # backfill_started_at IS NULL 인 활성·예약창 내 캠페인을 찾아 소급 태스크를 발사한다.
+    # 1분 주기인 이유: 예약 캠페인의 "시작 시각 도래"를 감지하는 유일한 경로라서
+    # (이 시스템에는 예약 시작 이벤트가 없다 — enforce_campaign_schedules 는 종료 전담).
+    "dm-scan-campaigns-for-backfill": {
+        "task": "integrations.scan_campaigns_for_backfill",
+        "schedule": 60,  # 1분
+    },
     # ===== 실패 DM 복구: RECOVERY_PENDING 만료 스윕 =====
     # 안내 대댓글 게시 후 recovery_ttl_seconds(기본 7일) 내 사용자 DM 이 없으면
     # RECOVERY_EXPIRED 로 만료(좀비 로우 방지 + total_failed 정산).
@@ -1045,6 +1053,18 @@ MISSED_COMMENT_POLL_PAGE_SIZE = config("MISSED_COMMENT_POLL_PAGE_SIZE", default=
 # 폭주 방지 상한 — 정상 종료는 앵커 또는 7일 baseline. 소진 시 Telegram 경고.
 MISSED_COMMENT_POLL_MAX_PAGES = config("MISSED_COMMENT_POLL_MAX_PAGES", default=20, cast=int)
 MISSED_COMMENT_POLL_MAX_TARGETS = config("MISSED_COMMENT_POLL_MAX_TARGETS", default=1000, cast=int)
+
+# ===== 기존 댓글 소급 발송 (integrations.backfill_campaign_comments) =====
+# 캠페인이 실제 시작되는 시점에 이미 달려 있던 댓글에도 DM 을 보낸다. 폴링 보정(위)은
+# 앵커 종료 + per-campaign baseline 두 겹으로 이걸 의도적으로 막고 있어서 별도 경로가 필요하다.
+# 범위는 게시물 업로드 시각부터이되 PRIVATE_REPLY_WINDOW_DAYS 로 잘린다(그 밖은 Meta 가 거부).
+DM_BACKFILL_ENABLED = config("DM_BACKFILL_ENABLED", default=True, cast=bool)
+# 캠페인 1개당 소급 발송 상한. 넘으면 최신분만 보내고 중단 + Telegram 경고(침묵 절단 금지).
+# 오래된 바이럴 게시물에 캠페인을 새로 켰을 때 수천 건이 한 번에 큐에 쌓이는 것을 막는다.
+DM_BACKFILL_MAX_COMMENTS = config("DM_BACKFILL_MAX_COMMENTS", default=500, cast=int)
+DM_BACKFILL_MAX_PAGES = config("DM_BACKFILL_MAX_PAGES", default=20, cast=int)
+# 1 tick 당 발사할 캠페인 수 — 동시에 수십 개가 켜져도 Graph API 를 몰아치지 않게.
+DM_BACKFILL_SCAN_MAX = config("DM_BACKFILL_SCAN_MAX", default=20, cast=int)
 
 # ===== 실패 DM 복구 재댓글 폴링 (integrations.poll_recovery_recomments) =====
 # 스레드 답글 재댓글의 comments 웹훅이 유실되면 복구가 TTL 만료까지 멈추므로,

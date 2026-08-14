@@ -417,6 +417,10 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
             "schedule_state",
             "is_runnable_now",
             "miss_recovery",
+            # 기존 댓글 소급 발송 (캠페인 시작 이전 댓글 회수)
+            "backfill_existing_comments",
+            "backfill_started_at",
+            "backfill_stats",
             # timestamps
             "created_at",
             "updated_at",
@@ -439,6 +443,9 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
             "is_runnable_now",
             "miss_recovery",
             "recovery_reply_available",
+            # 소급 발송의 실행 기록은 서버 소유 (설정값 backfill_existing_comments 만 쓰기 가능)
+            "backfill_started_at",
+            "backfill_stats",
             "created_at",
             "updated_at",
             "started_at",
@@ -972,6 +979,20 @@ class AutoDMCampaignCreateSerializer(serializers.Serializer):
         ),
     )
 
+    # 기존 댓글 소급 발송 — 기본 켜짐.
+    # 실사용 순서가 "게시물 업로드 → 댓글 축적 → 자동화 켜기" 라서, 끄면 캠페인 생성 직전까지
+    # 달린 댓글이 통째로 누락된다(그게 이 기능이 생긴 이유다). 발송량이 걱정되면 생성 전에
+    # GET .../media/{media_id}/backfill-preview/ 로 예상 건수를 먼저 확인할 것.
+    backfill_existing_comments = serializers.BooleanField(
+        required=False,
+        default=True,
+        help_text=(
+            "캠페인 시작 시점에 이미 달려 있던 댓글에도 DM 을 발송할지. 기본 true. "
+            "범위는 게시물 업로드 시각부터이되 Private Reply 7일 창으로 잘리고, "
+            "상한(기본 500건)을 넘으면 최신분만 발송한다. 1회만 실행된다."
+        ),
+    )
+
     def validate_link_buttons(self, value):
         return _validate_link_buttons_len(value)
 
@@ -1109,6 +1130,9 @@ class AutoDMCampaignUpdateSerializer(serializers.ModelSerializer):
             # 예약 발송
             "scheduled_start_at",
             "scheduled_end_at",
+            # 기존 댓글 소급 발송 — 아직 실행되지 않은(backfill_started_at IS NULL) 동안만
+            # 의미가 있다. 이미 돌았으면 값을 바꿔도 재실행되지 않는다(1회성 락).
+            "backfill_existing_comments",
         ]
         extra_kwargs = {
             "link_button_url": {"required": False, "allow_blank": True},
