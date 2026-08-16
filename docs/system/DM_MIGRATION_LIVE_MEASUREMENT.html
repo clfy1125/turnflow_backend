@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>다른 DM 서비스 쓰던 고객의 옛 캠페인, 얼마나 되살릴 수 있나 — 실측 보고서</title>
+<style>
+  :root{
+    --bg:#fbfbfa; --fg:#1c1b19; --muted:#6b6862; --line:#e4e1da; --card:#fff; --code:#f4f2ee;
+    --ok:#0f7b4f; --ok-bg:#e8f6ee; --no:#c0392b; --no-bg:#fdecec;
+    --hi:#b06d00; --hi-bg:#fdf3e0; --info:#1d6fb8; --info-bg:#e9f2fb;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#16161a; --fg:#e8e6e1; --muted:#9a968e; --line:#2e2e34; --card:#1d1d22; --code:#232329;
+      --ok:#4cc38a; --ok-bg:#12291f; --no:#f07070; --no-bg:#2b1616;
+      --hi:#e0a33a; --hi-bg:#2b2113; --info:#6cb2ee; --info-bg:#13212e;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"Segoe UI","Malgun Gothic","Apple SD Gothic Neo",sans-serif;
+    line-height:1.85;word-break:keep-all;-webkit-font-smoothing:antialiased;font-size:16px}
+  .wrap{max-width:930px;margin:0 auto;padding:44px 22px 90px}
+  h1{font-size:1.6rem;line-height:1.4;margin:0 0 10px;letter-spacing:-.02em}
+  .sub{color:var(--muted);font-size:.95rem;margin:0 0 6px}
+  .meta{color:var(--muted);font-size:.83rem;margin:0 0 30px}
+  h2{font-size:1.24rem;margin:56px 0 16px;padding-bottom:10px;border-bottom:2px solid var(--line);letter-spacing:-.01em}
+  h3{font-size:1.04rem;margin:30px 0 10px}
+  p{margin:13px 0}
+  ul,ol{margin:13px 0;padding-left:24px} li{margin:7px 0}
+  code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.85em;
+    background:var(--code);padding:1px 5px;border-radius:4px}
+  .scroll{overflow-x:auto}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:.9rem}
+  th,td{border:1px solid var(--line);padding:10px 12px;text-align:left;vertical-align:top}
+  th{background:var(--code);font-weight:600}
+  td.nw,th.nw{white-space:nowrap} .num{font-family:ui-monospace,monospace}
+  .r{text-align:right}
+  .headline{background:var(--ok-bg);border:2px solid var(--ok);border-radius:14px;padding:24px 26px;margin:26px 0}
+  .headline .q{color:var(--muted);font-size:.92rem;margin:0 0 6px}
+  .headline .a{font-size:1.5rem;font-weight:800;letter-spacing:-.02em;line-height:1.45;color:var(--ok);margin:0}
+  .headline p{margin:12px 0 0;font-size:.97rem}
+  .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:13px;margin:20px 0}
+  @media(max-width:760px){.cards{grid-template-columns:1fr}}
+  .c{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px}
+  .c.good{border-top:5px solid var(--ok)} .c.mid{border-top:5px solid var(--hi)}
+  .c .who{font-weight:700;font-size:1rem;margin-bottom:2px}
+  .c .rate{font-size:2.1rem;font-weight:800;letter-spacing:-.03em;line-height:1.25}
+  .c.good .rate{color:var(--ok)} .c.mid .rate{color:var(--hi)}
+  .c .cap{color:var(--muted);font-size:.84rem;line-height:1.55;margin-top:6px}
+  .box{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 20px;margin:18px 0}
+  .box.hi{border-left:5px solid var(--hi);background:var(--hi-bg)}
+  .box.bad{border-left:5px solid var(--no);background:var(--no-bg)}
+  .box.info{border-left:5px solid var(--info);background:var(--info-bg)}
+  .box.ok{border-left:5px solid var(--ok);background:var(--ok-bg)}
+  .box p:first-child{margin-top:0} .box p:last-child{margin-bottom:0}
+  .box .h{font-weight:700;display:block;margin-bottom:6px}
+  .ev{background:var(--code);border-left:3px solid var(--muted);border-radius:0 7px 7px 0;
+    padding:11px 16px;margin:12px 0;font-size:.88rem}
+  .ev b.t{color:var(--fg);display:block;margin-bottom:3px;font-size:.83rem;letter-spacing:.02em}
+  .ev ul{margin:5px 0;padding-left:20px} .ev li{margin:3px 0}
+  .tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:.72rem;font-weight:700;
+    white-space:nowrap;vertical-align:middle}
+  .t-m{background:var(--ok-bg);color:var(--ok)}
+  .t-c{background:var(--info-bg);color:var(--info)}
+  .t-e{background:var(--hi-bg);color:var(--hi)}
+  .steps{counter-reset:st;display:grid;gap:11px;margin:18px 0}
+  .step{background:var(--card);border:1px solid var(--line);border-radius:10px;
+    padding:14px 18px 14px 54px;position:relative;font-size:.93rem}
+  .step::before{counter-increment:st;content:counter(st);position:absolute;left:15px;top:14px;
+    width:26px;height:26px;border-radius:50%;background:var(--info-bg);color:var(--info);
+    display:grid;place-items:center;font-size:.8rem;font-weight:800}
+  .step b{display:block;margin-bottom:2px}
+  .step .m{color:var(--muted);font-size:.87rem}
+  .ba{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:20px 0}
+  @media(max-width:700px){.ba{grid-template-columns:1fr}}
+  .side{background:var(--card);border:1px solid var(--line);border-radius:11px;padding:17px 19px}
+  .side.x{border-top:4px solid var(--no)} .side.o{border-top:4px solid var(--ok)}
+  .side h4{margin:0 0 9px;font-size:.98rem}
+  .side ul{margin:0;padding-left:20px} .side li{font-size:.9rem;margin:5px 0}
+  .tl{margin:18px 0}
+  .tl .row{display:grid;grid-template-columns:120px 1fr;gap:12px;align-items:center;margin:8px 0;font-size:.85rem}
+  .tl .nm{color:var(--muted);white-space:nowrap;font-weight:600}
+  .tl .track{position:relative;height:28px;background:var(--code);border-radius:7px;border:1px solid var(--line);overflow:hidden}
+  .tl .seg{position:absolute;top:0;height:100%;display:grid;place-items:center;font-size:.74rem;font-weight:700;color:#fff;padding:0 4px;text-align:center}
+  .tl .other{background:var(--hi)} .tl .gap{background:repeating-linear-gradient(45deg,var(--line),var(--line) 6px,transparent 6px,transparent 12px);color:var(--fg)}
+  .tl .ours{background:var(--info)}
+  .glo{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:6px 20px;margin:18px 0}
+  .glo dl{display:grid;grid-template-columns:max-content 1fr;gap:6px 18px;margin:14px 0;font-size:.9rem}
+  .glo dt{font-weight:700;white-space:nowrap} .glo dd{margin:0;color:var(--muted)}
+  details{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 20px;margin:18px 0}
+  summary{cursor:pointer;font-weight:700;font-size:.96rem}
+  hr{border:0;border-top:1px solid var(--line);margin:44px 0}
+  .foot{color:var(--muted);font-size:.83rem;margin-top:46px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>다른 DM 서비스 쓰던 고객의 옛 캠페인,<br>얼마나 되살릴 수 있나</h1>
+<p class="sub">실제 고객 계정 3곳에 직접 해보고 세어본 결과입니다.</p>
+<p class="meta">2026-08-13 · 조회만 했고 아무것도 바꾸지 않았습니다 — DM 발송 없음, 데이터 저장 없음, 코드 배포 없음.
+인스타그램 조회는 계정 주인에게 알림이 가지 않으므로 <b>고객이 눈치챌 일도 없습니다.</b></p>
+
+<div class="headline">
+  <p class="q">질문: 매니챗 같은 다른 서비스를 쓰던 고객이 우리에게 넘어올 때, 그 사람이 예전에 만든 캠페인을 우리가 자동으로 복사해올 수 있나?</p>
+  <p class="a">할 수 있습니다. 게시물 120개 중 114개(95%)를 되살렸습니다.</p>
+  <p>고객 3명의 게시물을 조사해서, 예전에 보낸 DM <b>1,600통 이상</b>을 실제로 찾아냈습니다.
+  비슷한 걸 만들어낸 게 아니라 <b>그 사람이 진짜 보낸 원문</b>입니다.</p>
+  <p>못 되살린 6개 중 <b>4개는 댓글 단 사람을 한 명도 빠짐없이 전부 확인해서 "DM이 아예 없었다"를 확정</b>했습니다.
+  되살릴 원본이 없는 게시물을 빼면 <b>116개 중 114개 = 98%</b>입니다.</p>
+</div>
+
+<div class="box bad">
+<span class="h">⚠️ 이 문서는 2026-08-13 재실험으로 크게 수정됐습니다</span>
+<p style="margin-bottom:0">처음 실험에서 못 되살린 게시물들을 <b>더 깊이 파고들어 다시 해봤더니 5개가 추가로 복원</b>됐고,
+그 과정에서 <b>제가 앞서 내린 판단 3가지가 틀렸다는 게 드러났습니다.</b>
+무엇이 어떻게 틀렸는지는 <b>§5</b>에 정리했습니다. 이전 버전을 보셨다면 그 장부터 읽어 주세요.</p>
+</div>
+
+<div class="box info">
+<span class="h">이 문서의 숫자 표기 규칙</span>
+<p style="margin-bottom:0">모든 숫자에 출처를 붙였습니다. 세 종류로 구분해서 읽어 주세요.<br>
+<span class="tag t-m">측정</span> 실제로 조회해서 센 값 &nbsp;·&nbsp;
+<span class="tag t-c">계산</span> 측정값으로 산수한 값 &nbsp;·&nbsp;
+<span class="tag t-e">추정</span> 아직 확인 안 된 예상치</p>
+</div>
+
+<h2>1. "되살린다"는 게 정확히 뭔가요?</h2>
+<p>고객이 예전 서비스에서 만들어 둔 <b>캠페인 설정지</b>를 그대로 베껴온다는 뜻입니다. 캠페인 하나는 이런 항목으로 되어 있습니다.</p>
+<div class="scroll">
+<table>
+<thead><tr><th class="nw">설정 항목</th><th>무슨 뜻인가</th><th class="nw">되살렸나?</th><th>이 숫자의 근거</th></tr></thead>
+<tbody>
+<tr><td class="nw"><b>어느 게시물</b></td><td>이 캠페인이 어떤 게시물에 걸려 있었나</td>
+  <td class="nw">✅ 됨</td><td>게시물별로 조회했으므로 자동으로 확정</td></tr>
+<tr><td class="nw"><b>반응할 댓글 단어</b></td><td>누가 "자료"라고 댓글 달면 DM 보내라 — 그 "자료"에 해당하는 단어</td>
+  <td class="nw">✅ 91% <span class="tag t-m">측정</span></td>
+  <td><b>DM을 받은 사람들의 실제 댓글</b>을 모아 공통으로 나오는 단어를 뽑음.
+  1차 실험의 복원 성공 109개 중 99개에서 단어가 나왔다</td></tr>
+<tr><td class="nw"><b>첫 DM 문구</b></td><td>실제로 보냈던 인사말 전문</td>
+  <td class="nw">✅ 100% <span class="tag t-c">계산</span></td>
+  <td>"복원 성공"의 정의 자체가 <b>발신 DM 원문을 1건 이상 확보</b>한 것이므로 항상 100%</td></tr>
+<tr><td class="nw"><b>버튼과 링크</b></td><td>DM에 달린 버튼 이름 + 눌렀을 때 가는 주소</td>
+  <td class="nw">✅ 99% <span class="tag t-m">측정</span></td>
+  <td>1차 실험의 복원 성공 109개 중 108개에서 링크 주소를 확보</td></tr>
+<tr><td class="nw"><b>팔로우 확인 단계</b></td><td>"먼저 팔로우해주세요" 단계를 썼는지 안 썼는지</td>
+  <td class="nw">✅ 됨 <span class="tag t-m">측정</span></td>
+  <td>버튼에 링크가 없으면 팔로우 확인용. 인스타가 이 둘을 다른 값으로 표시해 줌
+  (<code>web_url</code> 354건 / <code>postback</code> 380건)</td></tr>
+<tr><td class="nw">뒤이어 보낸 DM들의 조건</td><td>"3일 뒤에 이런 DM을 또 보내라" 같은 시나리오 규칙</td>
+  <td class="nw">❌ 문구만</td>
+  <td>보낸 시각·순서는 기록에 남지만 <b>"왜 그때 보냈는지"는 어디에도 안 남는다</b></td></tr>
+</tbody>
+</table>
+</div>
+<div class="box ok">
+<span class="h">고객 입장에서 뭐가 좋아지나</span>
+<p>지금은 다른 서비스에서 넘어오려면 <b>캠페인을 하나하나 손으로 다시 만들어야</b> 합니다.
+게시물 20개에 캠페인을 돌리던 사람이면 20번을 반복해야 하고, 그러다 보통 포기합니다.</p>
+<p style="margin-bottom:0">이 기능이 있으면 <b>버튼 한 번 → 초안 20개가 자동으로 만들어지고</b>, 고객은 검토만 하면 됩니다.
+문구도 자기가 예전에 쓰던 그 문구라 낯설지도 않습니다.</p>
+</div>
+
+<h2>2. 어떻게 세었나 — 방법 4단계</h2>
+<p>숫자를 믿기 전에 방법을 먼저 보셔야 합니다. 이렇게 했습니다.</p>
+<div class="steps">
+  <div class="step"><b>고객의 게시물 목록을 전부 가져온다</b>
+    <span class="m">댓글이 8개 이상인 게시물만 대상. <b>우리 캠페인이 이미 걸려 있는 게시물은 제외</b>했다
+    (@mini_ai_ 12개 · @3dragon_pd 8개 제외됨). 우리 것을 "타사 캠페인"으로 착각하면 안 되니까.</span></div>
+  <div class="step"><b>각 게시물에 댓글 단 사람 5명을 고른다</b>
+    <span class="m">캠페인이 답글을 달아준 사람을 우선하고, 부족하면 <b>오래된 댓글러</b>로 채운다.
+    <br><b>⚠️ 이 단계에서 실수가 있었습니다</b> — 처음엔 댓글을 <b>한 페이지(50개)만</b> 받았습니다.
+    그러면 대형 게시물에서는 "오래된 댓글러"가 실제로는 게시 <b>3~4주 뒤</b> 사람이라 캠페인 기간 밖입니다.
+    재실험에서는 <b>6페이지(300개)</b>를 받았고, 그것만으로 대형 게시물이 전부 복원됐습니다 (§5).</span></div>
+  <div class="step"><b>그 사람들의 DM함을 하나씩 열어본다</b>
+    <span class="m">"이 사람이 계정으로부터 받은 DM이 있나?" 를 인스타에 물어본다.
+    <b>여기서 우리 것은 걸러낸다</b> — 우리 발송 기록(메시지 번호 4만 2천여 건)과 대조해 제외.</span></div>
+  <div class="step"><b>댓글 시각 기준 7일 안에 온 DM만 인정한다</b>
+    <span class="m">인스타 규칙상 댓글에 대한 자동 DM은 <b>7일 안에만</b> 보낼 수 있다.
+    그래서 그 사람이 다른 때 받은 무관한 DM은 자동으로 배제된다. 이게 "이 게시물의 캠페인 DM"임을 보장한다.</span></div>
+</div>
+<div class="ev">
+<b class="t">이 방법이 "진짜 그 사람 원문"임을 보장하는 근거 3가지</b>
+<ul>
+<li><b>메시지 번호가 일치한다</b> — 인스타가 주는 메시지 ID가 우리 발송 기록의 ID와 정확히 맞아떨어지는지로 우리/타사를 가른다.
+  별도 검증에서 우리 DM 225건을 <b>225건 전부</b> 이 방식으로 걸러냈다.</li>
+<li><b>시기가 안 겹친다</b> — 1차 실험에서 복원한 1,647통 중 <b>1,289통(78%)이 우리가 첫 DM을 보내기 전</b>에 발송된 것이다.
+  우리 DM이 섞였다면 이 비율이 이렇게 높을 수 없다.</li>
+<li><b>7일 창</b> — 댓글 시각과 DM 시각을 대조해, 그 게시물 때문에 간 DM만 남긴다.</li>
+</ul>
+</div>
+
+<h2>3. 결과 — 고객 3명</h2>
+<div class="cards">
+  <div class="c good">
+    <div class="who">@mini_ai_</div>
+    <div class="rate">40 / 40</div>
+    <div class="cap">전부 되살렸습니다.<br>DM <b>840통</b> 복원 · 문구·링크·팔로우단계 모두 확보</div>
+  </div>
+  <div class="c good">
+    <div class="who">@3dragon_pd</div>
+    <div class="rate">40 / 40</div>
+    <div class="cap">전부 되살렸습니다.<br>DM <b>631통</b> 복원 · 캠페인 문구가 87가지나 되는 복잡한 운영</div>
+  </div>
+  <div class="c mid">
+    <div class="who">@highestlevel33</div>
+    <div class="rate">34 / 40</div>
+    <div class="cap">처음엔 29개였는데, 깊이 파서 <b>5개 추가 복원</b>.<br>
+    남은 6개 중 4개는 <b>"DM 없음" 확정</b></div>
+  </div>
+</div>
+<div class="ev">
+<b class="t">두 숫자의 뜻 <span class="tag t-c">계산</span></b>
+<ul>
+<li><b>95%</b> = 복원 114개 ÷ 검사 120개. 아무 보정 없이 그냥 센 값 <span class="tag t-m">측정</span></li>
+<li><b>98%</b> = 복원 114개 ÷ 116개. <b>"DM이 애초에 한 통도 없었다"고 확정된 4개를 뺀</b> 값.
+  없는 걸 못 찾았다고 실패로 세는 건 맞지 않으므로</li>
+<li>이 4개는 <b>댓글 단 사람 전원(6명·28명·41명·43명)을 빠짐없이 확인</b>했습니다.
+  표본이 부족해서가 아니라 <b>전수조사로 0을 확정</b>한 것이라 반박의 여지가 없습니다 <span class="tag t-m">측정</span></li>
+</ul>
+</div>
+
+<h2>4. 왜 한 계정만 낮게 나왔나 — 공백기, 그리고 놓쳤던 DM들</h2>
+<p>세 고객이 <b>언제 어떤 서비스를 썼는지</b> 시간순으로 그려보면 답이 나옵니다.</p>
+<div class="tl">
+  <div class="row"><span class="nm">@mini_ai_</span><span class="track">
+    <span class="seg other" style="left:0%;width:68%">다른 서비스 사용 (4월 ~ 7월 10일)</span>
+    <span class="seg ours" style="left:68%;width:32%">우리 서비스 (7월 11일~)</span></span></div>
+  <div class="row"><span class="nm">@3dragon_pd</span><span class="track">
+    <span class="seg other" style="left:0%;width:70%">다른 서비스 사용 (5월 ~ 7월 12일)</span>
+    <span class="seg ours" style="left:70%;width:30%">우리 서비스 (7월 13일~)</span></span></div>
+  <div class="row"><span class="nm">@highestlevel33</span><span class="track">
+    <span class="seg other" style="left:0%;width:63%">다른 서비스 (4월 ~ 7월 2일)</span>
+    <span class="seg gap" style="left:63%;width:25%">5주 공백</span>
+    <span class="seg ours" style="left:88%;width:12%">우리 (8월 6일~)</span></span></div>
+</div>
+<div class="ev">
+<b class="t">이 시간표의 근거 — 날짜는 추측이 아니라 두 개의 실제 기록에서 나왔습니다</b>
+<ul>
+<li><b>우리 서비스 시작일</b> = 우리 발송 기록의 <b>가장 오래된 DM 날짜</b> (DB 조회) <span class="tag t-m">측정</span><br>
+  @mini_ai_ <b>7월 11일</b> · @3dragon_pd <b>7월 13일</b> · @highestlevel33 <b>8월 6일</b></li>
+<li><b>다른 서비스 종료일</b> = 복원된 DM 중 <b>가장 최근 날짜</b> <span class="tag t-m">측정</span><br>
+  @highestlevel33 은 <b>7월 2일</b>이 마지막으로 확인된 캠페인 DM</li>
+</ul>
+<p style="margin:8px 0 0"><b>⚠️ 처음엔 이 종료일을 "6월 14일"로 적었는데 틀렸습니다.</b>
+얕게 훑어서 6월 16일·26일·27일·7월 2일에 나간 DM들을 못 봤던 것이고,
+깊이 파니 나왔습니다. <b>공백기는 7주가 아니라 5주</b>입니다.</p>
+</div>
+<h3>@highestlevel33 의 실패 11개를 다시 파본 결과</h3>
+<p>게시물당 <b>최대 100명까지</b>(찾으면 즉시 중단) 다시 확인했습니다. 결과가 셋으로 갈립니다.</p>
+<div class="scroll">
+<table>
+<thead><tr><th class="nw">게시물</th><th class="r nw">댓글</th><th class="r nw">몇 명 만에</th><th>결과</th></tr></thead>
+<tbody>
+<tr><td class="nw">6월 8일</td><td class="r num">1,366</td><td class="r"><b>1명</b></td>
+  <td rowspan="4"><span class="tag t-m">측정</span> <b>복원 성공 — 그것도 첫 번째 사람에서.</b>
+  이전 실험에서 20명을 봐도 못 찾았는데, <b>사람을 더 본 게 아니라 "다른 사람"을 봤더니</b> 바로 나왔다 (§5)</td></tr>
+<tr><td class="nw">6월 10일</td><td class="r num">1,873</td><td class="r"><b>1명</b></td></tr>
+<tr><td class="nw">6월 23일</td><td class="r num">1,405</td><td class="r"><b>1명</b></td></tr>
+<tr><td class="nw">6월 27일</td><td class="r num">227</td><td class="r"><b>1명</b></td></tr>
+<tr><td class="nw">8월 3일</td><td class="r num">137</td><td class="r">6명</td>
+  <td>DM 2통 나왔지만 <b>링크가 없다</b> → 캠페인이 아니라 직접 손으로 보낸 DM일 가능성이 높다</td></tr>
+<tr><td class="nw">7월 17·24·27·30일<br><span style="color:var(--muted);font-size:.85rem">게시물 4개</span></td>
+  <td class="r num">6~43</td><td class="r">전원</td>
+  <td><span class="tag t-m">측정</span> <b>"DM 없음" 확정.</b> 댓글 단 사람을 한 명도 빠짐없이 다 확인했다.
+  표본 부족이 아니라 <b>전수조사로 0</b></td></tr>
+<tr><td class="nw">7월 6·13일<br><span style="color:var(--muted);font-size:.85rem">게시물 2개</span></td>
+  <td class="r num">102·153</td><td class="r">100명</td>
+  <td>100명까지 확인했으나 못 찾음. 가용 인원의 <b>65~98%</b>를 봤으므로 사실상 없다고 봐도 된다</td></tr>
+</tbody>
+</table>
+</div>
+<div class="box ok">
+<p style="margin-top:0"><b>@highestlevel33 최종: 29개 → 34개 / 40개 (85%)</b></p>
+<p style="margin-bottom:0">남은 6개는 <b>7월 6일~30일에 몰려 있고</b>, 그중 4개는 전수조사로 "DM 없음"이 확정됐습니다.
+이 시기에 <b>다른 서비스를 이미 끊었다</b>는 뜻이고, 우리 서비스는 8월 6일에 시작했습니다.
+즉 <b>되살릴 것이 없는 게 정상</b>인 구간이 맞습니다 — 다만 그 구간이 처음 생각보다 <b>2주 짧습니다.</b></p>
+</div>
+
+<h2>5. 제가 틀렸던 것 3가지 <span style="font-size:.8em;color:var(--muted)">— 재실험으로 드러난 것</span></h2>
+<p>이번 심층 재시도에서 <b>앞선 판단 세 개가 뒤집혔습니다.</b> 무엇이 왜 틀렸는지 그대로 적습니다.</p>
+
+<h3>틀린 것 ① "대형 게시물은 90명까지 물어봐야 한다"</h3>
+<div class="box bad">
+<p style="margin-top:0">앞 버전에서 저는 확률 계산을 근거로 "대형 게시물은 21~90명을 확인해야 한다"고 썼습니다.
+<b>실제로는 1명이면 됐습니다.</b> 대형 게시물 4개 모두 <b>첫 번째 사람에서 바로</b> 복원됐습니다.</p>
+<p style="margin-bottom:0">확률 계산 자체가 틀린 게 아니라, <b>제가 넣은 확률값이 틀렸습니다.</b>
+"대형 게시물은 성공 확률이 5~20%"라고 가정했는데, <b>올바른 사람에게 물어보면 확률이 거의 100%</b>였습니다.</p>
+</div>
+
+<h3>틀린 것 ② "누구에게 묻느냐"가 진짜 레버였다 <span class="tag t-m">측정으로 확정</span></h3>
+<p>그럼 왜 이전 실험에서는 20명을 봐도 안 나왔을까요? <b>엉뚱한 사람들에게 물어봤기 때문</b>입니다.</p>
+<div class="ev">
+<b class="t">핵심 — 인스타그램은 댓글을 "최신순"으로만 줍니다</b>
+<p style="margin:5px 0">댓글 목록을 한 페이지(50개)만 받으면 <b>가장 최근에 달린 댓글 50개</b>만 옵니다.
+그런데 캠페인은 <b>게시물을 올린 직후</b>에 돌았습니다. 그때 댓글 단 사람들이 DM을 받았고,
+그 사람들은 목록 <b>맨 뒤</b>에 있습니다.</p>
+<p style="margin:5px 0"><b>실측 — 1페이지만 받았을 때 "가장 오래된 댓글"이 언제 것이었나:</b></p>
+<ul>
+<li>6월 8일 게시물 → 1페이지의 가장 오래된 댓글이 <b>7월 4일</b> (게시 <b>26일</b> 뒤!)</li>
+<li>6월 10일 게시물 → <b>7월 9일</b> (29일 뒤)</li>
+<li>6월 23일 게시물 → <b>7월 15일</b> (22일 뒤)</li>
+</ul>
+<p style="margin:5px 0">캠페인이 끝난 지 한참 뒤에 댓글 단 사람들만 보고 있었던 겁니다. 당연히 DM이 없습니다.</p>
+<p style="margin:5px 0 0"><b>6페이지(300개)까지 받으면</b> 가장 오래된 댓글이 6월 16일·6월 26일·7월 2일로 <b>게시일 근처까지</b> 내려갑니다.
+그 사람에게 물어보니 <b>첫 번째에 바로 나왔습니다.</b></p>
+</div>
+<div class="scroll">
+<table>
+<thead><tr><th>어떤 사람에게 물었나</th><th class="r nw">4명 중 몇 명이 DM 보유</th><th>결론</th></tr></thead>
+<tbody>
+<tr><td>1페이지만 받고 그중 오래된 사람</td><td class="r"><b>0 / 4</b> · 0 / 4 · 0 / 4 · 0 / 4</td>
+  <td>전멸 — 이게 이전 실험의 상태</td></tr>
+<tr><td><b>6페이지 받고 그중 오래된 사람</b></td><td class="r"><b>4 / 4</b> · 4 / 4 · 4 / 4 · 4 / 4</td>
+  <td><b>전원 적중</b></td></tr>
+<tr><td>캠페인이 답글 달아준 사람</td><td class="r">0 / 4</td>
+  <td>이 계정은 공개답글을 거의 안 써서 해당 없음</td></tr>
+</tbody>
+</table>
+</div>
+<div class="box ok">
+<span class="h">이게 좋은 소식인 이유 — 비용이 15배 싸집니다</span>
+<p style="margin-bottom:0">"90명에게 물어보기"는 조회 <b>90번</b>입니다.
+"댓글을 6페이지 받기"는 조회 <b>6번</b>이고, 그다음 <b>1명만</b> 물어보면 됩니다 → 총 <b>7번</b>.
+<b>같은 결과를 1/13 비용으로</b> 얻습니다. 대형 게시물이 비싸다고 했던 것도 취소합니다.</p>
+</div>
+
+<h3>틀린 것 ③ "공백기는 7주"</h3>
+<div class="box bad">
+<p style="margin-bottom:0">다른 서비스가 6월 14일에 멈췄다고 적었는데, 실제로는 <b>7월 2일까지 돌고 있었습니다.</b>
+6월 16·26·27일, 7월 2일에 나간 DM을 얕은 조사로는 못 봤던 것입니다.
+공백기는 <b>7주가 아니라 5주</b>고, 그만큼 <b>@highestlevel33 의 성적은 29개에서 34개로 올라갔습니다.</b></p>
+</div>
+<div class="box info">
+<span class="h">왜 이렇게 됐나 — 문제가 두 개였고 서로 독립이었습니다</span>
+<div class="scroll">
+<table>
+<thead><tr><th>문제</th><th>영향 범위</th><th>증상</th></tr></thead>
+<tbody>
+<tr><td class="nw"><b>① DM 본문을 안 읽고 있었다</b></td><td class="nw">모든 게시물</td>
+  <td>버튼 달린 DM은 본문이 다른 칸에 들어 있는데 그 칸을 요청하지 않았다</td></tr>
+<tr><td class="nw"><b>② 엉뚱한 사람에게 물었다</b></td><td class="nw">대형 게시물만</td>
+  <td>댓글을 한 페이지만 받아서, 캠페인이 끝난 뒤 댓글 단 사람들만 조회했다</td></tr>
+</tbody>
+</table>
+</div>
+<p style="margin-bottom:0">①만 고쳤을 때 보통 게시물은 다 살아났지만(78%) 대형 게시물은 계속 0이었습니다.
+그래서 저는 "대형 게시물은 원래 어렵다"고 결론 냈는데, <b>사실은 두 번째 문제가 남아 있었던 것</b>입니다.
+②까지 고치니 대형 게시물도 <b>첫 번째 사람에서</b> 나왔습니다.</p>
+</div>
+
+<h2>6. 시간은 얼마나 걸리나</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>계정</th><th class="nw r">게시물 40개 검사</th><th class="nw r">게시물 1개당</th><th class="nw r">조회 횟수</th><th class="nw">그 계정 전체를 다 하면</th></tr></thead>
+<tbody>
+<tr><td class="nw">@mini_ai_</td><td class="r num">5분 30초</td><td class="r num">8.3초</td><td class="r num">242회</td>
+  <td class="nw">약 7분 <span style="color:var(--muted)">(게시물 54개)</span> <span class="tag t-c">계산</span></td></tr>
+<tr><td class="nw">@3dragon_pd</td><td class="r num">5분 36초</td><td class="r num">8.4초</td><td class="r num">242회</td>
+  <td class="nw">약 7분 <span style="color:var(--muted)">(게시물 50개)</span> <span class="tag t-c">계산</span></td></tr>
+<tr><td class="nw">@highestlevel33</td><td class="r num">7분 42초</td><td class="r num">11.6초</td><td class="r num">368회</td>
+  <td class="nw"><b>약 75분</b> <span style="color:var(--muted)">(게시물 391개)</span> <span class="tag t-c">계산</span></td></tr>
+</tbody>
+</table>
+</div>
+<div class="ev">
+<b class="t">시간의 근거</b>
+<ul>
+<li>스크립트가 <b>직접 초를 재서</b> 출력한 값이다 <span class="tag t-m">측정</span></li>
+<li>조회 1건당 실측: DM함 조회 <b>1.0~1.2초</b> · 댓글 <b>0.6초</b> · 게시물 목록 <b>0.5~0.8초</b></li>
+<li>조회 1건이 1초를 넘으므로 <b>총 시간 ≈ 조회 횟수</b>. 게시물 1개당 조회 6~9회 → 8~12초</li>
+<li>"전체를 다 하면"은 <b>게시물 1개당 시간 × 그 계정의 전체 게시물 수</b>로 계산한 값 <span class="tag t-c">계산</span></li>
+</ul>
+</div>
+<div class="box hi">
+<span class="h">게시물이 많은 고객은 1시간이 넘습니다</span>
+<p>@highestlevel33 은 댓글 8개 이상인 게시물이 <b>391개</b>라, 전부 하면 75분입니다.</p>
+<p style="margin-bottom:0"><b>대응 방법</b> — 최근 게시물부터 처리해서 <b>결과가 나오는 대로 보여주고</b>,
+"더 옛날 것도 찾을까요?" 버튼을 주면 됩니다. 고객은 3분 만에 첫 캠페인 10개를 보게 되고, 나머지는 계속 찾습니다.
+(참고: 우리 인스타 성장 리포트도 이미 13~18분짜리 작업으로 운영 중입니다.)</p>
+</div>
+
+<h2>7. 안 되는 것 — 정직하게</h2>
+<div class="ba">
+  <div class="side o">
+    <h4>✅ 잘 되는 것</h4>
+    <ul>
+      <li>DM 문구 전문 (버튼 달린 DM도 포함)</li>
+      <li>버튼 이름과 링크 주소</li>
+      <li>팔로우 확인 단계를 썼는지</li>
+      <li>반응할 댓글 단어 — <b>오타 변형까지</b><br>
+        <span style="color:var(--muted)">"프롬프트"와 "프롬포트"를 둘 다 받고 있었다는 것까지 알아냅니다</span></li>
+      <li><b>11개월 전 캠페인도</b> 됩니다</li>
+    </ul>
+  </div>
+  <div class="side x">
+    <h4>❌ 안 되는 것</h4>
+    <ul>
+      <li><b>이미지·스티커만 보낸 DM</b> — 글자가 없으니 읽을 게 없습니다</li>
+      <li><b>DM이 한 통도 안 간 게시물</b> — 원본 자체가 없습니다</li>
+      <li><b>시나리오 조건</b> — "며칠 뒤에", "이 버튼 누르면" 같은 규칙</li>
+      <li>대화를 지웠거나 우리를 차단한 상대</li>
+    </ul>
+  </div>
+</div>
+<div class="ev">
+<b class="t">두 가지 숫자의 근거</b>
+<ul>
+<li><b>"11개월 전도 된다"</b> <span class="tag t-m">측정</span> — @manjzangi 계정 실험에서
+  <b>2025년 9월 17일에 보낸 DM</b>이 문구·버튼·링크 그대로 나왔다. 인스타는 대화 기록을 지우지 않는다</li>
+<li><b>"이미지·스티커 DM 약 8%"</b> <span class="tag t-m">측정</span> — 별도 실험에서 타사가 보낸 DM 641건을 유형별로 분류:
+  글자+버튼 61% · 순수 글자 29% · <b>글자 없음 9%</b> · 기타 1%.
+  즉 <b>글자 복원의 상한은 약 92%</b></li>
+</ul>
+</div>
+<p><b>안 되는 부분의 해법은 단순합니다</b> — 고객에게 "이 게시물에서 보내던 DM 문구를 붙여넣어 주세요" 칸을 하나 주면 됩니다.
+30초면 채웁니다. <b>이 기능이 100% 자동일 필요는 없고, 결과가 100% 완성되면 됩니다.</b></p>
+
+<h2>8. 덤으로 확인된 것</h2>
+<div class="box ok">
+<span class="h">다른 회사 서비스도 다 통했습니다</span>
+<p>걱정했던 게 "우리 서비스 형식에만 맞춰 만들면, 다른 회사 서비스를 쓰던 고객은 안 되는 거 아닌가"였습니다.</p>
+<div class="ev" style="background:var(--card)">
+<b class="t">근거 — 세 고객이 서로 다른 서비스·설정을 쓰고 있었다 <span class="tag t-m">측정</span></b>
+<ul>
+<li><b>팔로우 확인 단계</b>: @mini_ai_ 100% · @3dragon_pd 100% · <b>@highestlevel33 14%</b>
+  → 이 고객이 쓰던 서비스는 팔로우 확인을 <b>거의 안 쓴다</b>. 명백히 다른 서비스거나 다른 설정</li>
+<li><b>DM 문구 종류</b>: 87가지 · 50가지 · 29가지 → 운영 복잡도가 3배 차이</li>
+<li>그런데 <b>같은 방식으로 셋 다 읽혔다</b> — 인스타가 정한 표준 형식을 모든 서비스가 따르기 때문</li>
+</ul>
+</div>
+<p style="margin-bottom:0">추가로, 별도 실험에서 타사 DM의 형식을 전수 조사해 보니
+우리에게 없는 변종이 <b>10건</b> 있었습니다(카드 이미지가 붙은 형태, 버튼이 없는 형태 등).
+전체의 <b>0.5%</b>라 지금 당장 문제는 아니지만, <b>미지의 서비스 형식을 만나면 그 고객은 0%가 되므로</b>
+형식을 가리지 않고 읽는 방식으로 만들어 두는 게 안전합니다.</p>
+</div>
+<div class="box info">
+<span class="h">설계 판단 하나가 실측으로 뒤집혔습니다</span>
+<p>원래 계획은 "AI가 캠페인인지 판단한 게시물만 조사"였습니다.</p>
+<div class="ev" style="background:var(--card)">
+<b class="t">근거 <span class="tag t-m">측정</span></b>
+<p style="margin:4px 0">@3dragon_pd 에서 <b>캠페인 흔적(답글·반복 댓글·캡션 문구)이 없다고 판정된 게시물이 3개</b>였는데,
+실제로 DM함을 열어보니 <b>3개 모두 캠페인이 돌고 있었습니다</b>. 물증 37개 vs 실제 복원 40개.</p>
+</div>
+<p style="margin-bottom:0">→ <b>판단하지 말고 그냥 5명씩 물어보는 방식</b>이 맞았습니다. 물어보는 게 판단보다 정확합니다.
+AI 판단을 관문으로 썼다면 이 3개는 영원히 못 찾았을 겁니다.</p>
+</div>
+
+<h2>9. 아직 확인하지 않은 것</h2>
+<div class="box bad">
+<p style="margin-top:0"><b>"찾았다"까지만 확인했습니다.</b> 찾은 문구가 <b>원본과 정말 똑같은지</b>는 아직 대조하지 않았습니다.</p>
+<p>지금 98%가 보증하는 것은 <b>"그 게시물의 캠페인 DM 원문을 손에 넣었다"</b>이고,
+보증하지 않는 것은 <b>"그걸로 만든 초안이 원본과 일치한다"</b>입니다.
+중간에 문구를 다듬는 단계(AI가 이름·설명을 붙이는 단계)가 있어서, 거기서 달라질 수 있습니다.</p>
+<p style="margin-bottom:0"><b>이건 정확히 확인할 방법이 있습니다.</b>
+우리가 보낸 DM은 우리가 답을 알고 있습니다 — 발송 기록 <b>5만 3천 건</b>.
+우리 발송 기간(7~8월)을 대상으로 복원기를 돌려 원본과 한 글자씩 비교하면 <b>정확도가 숫자로 나옵니다.</b>
+이게 다음에 할 일입니다.</p>
+</div>
+<div class="box hi">
+<span class="h">그 채점에는 함정이 하나 있습니다</span>
+<p style="margin-bottom:0">이번 실험에서는 <b>우리 캠페인이 걸린 게시물을 제외</b>했습니다(§2 1단계).
+그런데 정확도를 채점할 때는 <b>바로 그 게시물이 정답지</b>입니다.
+즉 <b>채점할 때는 제외 규칙을 반대로 켜야</b> 합니다. 안 그러면 채점기가 정답을 스스로 지워버립니다.</p>
+</div>
+
+<h2>용어 정리</h2>
+<div class="glo">
+<dl>
+  <dt>캠페인</dt><dd>"이 게시물에 이런 댓글이 달리면 이런 DM을 보내라"는 자동화 설정 한 세트</dd>
+  <dt>트리거 단어</dt><dd>DM 발송을 촉발하는 댓글 단어 (예: "자료", "코드", "꿀팁")</dd>
+  <dt>팔로우 확인 단계</dt><dd>자료를 주기 전에 "먼저 팔로우해주세요" 버튼을 보내는 방식. 팔로워를 늘리는 흔한 수법</dd>
+  <dt>초안</dt><dd>복원 결과로 만들어지는, <b>아직 꺼져 있는</b> 캠페인. 고객이 확인하고 켜야 발송됩니다</dd>
+  <dt>대형 게시물</dt><dd>댓글이 1,000개 넘는 게시물. 도달이 커서 팔로워 아닌 사람이 많고, 그래서 DM이 잘 안 도착합니다</dd>
+  <dt>공백기</dt><dd>다른 서비스를 끊은 뒤 우리를 시작하기 전까지, 아무 자동화도 안 돌던 기간</dd>
+</dl>
+</div>
+
+<details>
+<summary>부록 — 자세한 수치 (기술 담당자용)</summary>
+<div class="scroll">
+<table>
+<thead><tr>
+<th>계정</th><th class="r nw">검사</th><th class="r nw">복원</th><th class="r nw">원시</th><th class="r nw">시대보정</th>
+<th class="r nw">복원 DM</th><th class="r nw">URL</th><th class="r nw">게이트</th><th class="r nw">키워드</th>
+<th class="r nw">템플릿</th><th class="r nw">호출</th><th class="r nw">소요</th></tr></thead>
+<tbody>
+<tr><td class="nw">@mini_ai_</td><td class="r num">40</td><td class="r num">40</td><td class="r num">100%</td><td class="r num">100%</td>
+  <td class="r num">840</td><td class="r num">100%</td><td class="r num">100%</td><td class="r num">98%</td>
+  <td class="r num">50</td><td class="r num">242</td><td class="r num">5.5분</td></tr>
+<tr><td class="nw">@3dragon_pd</td><td class="r num">40</td><td class="r num">40</td><td class="r num">100%</td><td class="r num">100%</td>
+  <td class="r num">631</td><td class="r num">100%</td><td class="r num">100%</td><td class="r num">88%</td>
+  <td class="r num">87</td><td class="r num">242</td><td class="r num">5.6분</td></tr>
+<tr><td class="nw">@highestlevel33 <span style="color:var(--muted)">1차</span></td><td class="r num">40</td><td class="r num">29</td><td class="r num">74%</td><td class="r num">—</td>
+  <td class="r num">176</td><td class="r num">97%</td><td class="r num">14%</td><td class="r num">86%</td>
+  <td class="r num">29</td><td class="r num">368</td><td class="r num">7.7분</td></tr>
+<tr><td class="nw">@highestlevel33 <b>심층 재시도</b></td><td class="r num">11</td><td class="r num">+5</td><td class="r num"><b>85%</b></td><td class="r num">—</td>
+  <td class="r num">+6</td><td class="r num">80%</td><td class="r num">0%</td><td class="r num">—</td>
+  <td class="r num">—</td><td class="r num">366</td><td class="r num">7.5분</td></tr>
+<tr><th class="nw">합계</th><th class="r num">120</th><th class="r num">114</th><th class="r num">95%</th><th class="r num">98%</th>
+  <th class="r num">1,653</th><th class="r num">99%</th><th class="r num">71%</th><th class="r num">91%</th>
+  <th class="r num">166</th><th class="r num">1,218</th><th class="r num">26.3분</th></tr>
+</tbody>
+</table>
+</div>
+<p style="font-size:.88rem">· <b>원시</b> = 복원 성공 / 검사 게시물 (114÷120). <b>보정</b> = 전수조사로 "DM 0건" 확정된 4개 제외 (114÷116).
+· 심층 재시도는 <b>발견 즉시 중단</b>이라 복원 DM 수(+6)가 실제 총량이 아니다 — 복원 여부만 측정.
+· <b>URL/게이트/키워드</b>는 복원 성공 게시물 대비. <b>템플릿</b> = 서로 다른 정규화 DM 문구 종류.</p>
+<p style="font-size:.88rem">· <b>심층 재시도 상세</b>(11개 대상, 게시물당 최대 100명·발견 시 중단):
+복원 5개(대형 4개는 <b>1번째 사람</b>에서, 1개는 6번째) · 전수조사 0 확정 4개(가용 6·28·41·43명 전원 확인) ·
+100명 확인 후 0 이 2개(가용 102·153명).</p>
+<p style="font-size:.88rem">· <b>가설 분리 A/B</b>(대형 게시물 4개): 댓글 1페이지 수집 후 오래된 댓글러 4명 조회 → 적중 <b>0/4</b>(4개 전부).
+댓글 6페이지 수집 후 오래된 댓글러 4명 조회 → 적중 <b>4/4</b>(4개 전부). 공개답글 확정타겟 → 0/4(해당 계정은 공개답글 미사용).
+1페이지 수집 시 도달하는 최고령 댓글이 게시 후 <b>22~29일</b> 시점이라 캠페인 기간 밖이었다.</p>
+<p style="font-size:.88rem">· 1차 실험 복원 DM 1,647건 중 <b>1,289건(78%)이 우리 최초 발송 이전</b> — 자기발송 오염 없음의 교차 증거.
+계정별 우리 최초 발송: @mini_ai_ 2026-07-11 · @3dragon_pd 2026-07-13 · @highestlevel33 2026-08-06.</p>
+<p style="font-size:.88rem">· 적용한 개선안: ①<code>attachments</code> 스키마 무관 추출(텍스트키/URL키 재귀 순회)
+②7일 귀속창(<code>댓글시각 ≤ DM시각 ≤ +7일</code>) ③적응형 에스컬레이션(5명→15명, 계정당 8게시물 상한)
+④공개답글 <code>parent_id</code> 확정타겟 우선 ⑤우리 캠페인 게시물 제외(@mini_ai_ 12개·@3dragon_pd 8개)
+⑥자기발송 제외(<code>meta_message_id</code>/<code>echo_mid</code> + 첨부 제목 지문 + 퍼지 0.92).</p>
+<p style="font-size:.88rem">· API 응답 실측: 대화 조회 1.0~1.2초 · 댓글 0.6초 · 미디어 0.5~0.8초.
+레이트리밋 여유 <code>x-app-usage: call_volume 0</code>. 페이싱 초당 3건 이하.</p>
+<p style="font-size:.88rem">· <b>미검증</b>: 복원 문구의 원본 일치율(<code>SentDMLog</code> 대조 필요) ·
+대형 게시물의 실제 적중률 p · 확정타겟 vs tail 표본 분리 A/B · 에스컬레이션 상한 해제 시 상승폭.</p>
+</details>
+
+<hr>
+<p class="foot">
+방식: 실서버 읽기 전용 조회만(Graph API GET + DB 읽기). DM 발송·데이터 쓰기·코드 배포 없음.
+연구 스크립트는 세션 임시 폴더에 있으며 저장소에 커밋되지 않았습니다.<br>
+같은 시리즈: <code>DM_MIGRATION_RESEARCH_R2.html</code>(왜 예전엔 안 됐는지) ·
+<code>DM_MIGRATION_99_PLAN.html</code>(99%까지 올리는 방법) ·
+<code>DM_MIGRATION_GENERIC_EXCLUSION.html</code>(다른 서비스 대응·우리 캠페인 제외).<br>
+⚠️ 고객 계정 이름과 게시물 번호가 들어 있습니다. DM 본문·수신자 정보·링크 주소는 넣지 않았습니다. <b>사내 한정.</b>
+</p>
+
+</div>
+</body>
+</html>

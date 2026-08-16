@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 
 from celery import shared_task
 from django.conf import settings
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Q
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
@@ -5057,3 +5057,48 @@ def purge_dm_migration_raw():
     if purged or stalled:
         logger.info("purge_dm_migration_raw: purged=%s stalled=%s", purged, stalled)
     return {"purged": purged, "stalled": stalled}
+
+
+@shared_task(name="integrations.prewarm_dm_migration", queue="ai_jobs")
+def prewarm_dm_migration(connection_id: str):
+    """IG 연동 직후 **백그라운드 선작업** — 사용자가 열어보기 전에 미리 분석해 둔다.
+
+    분석 1회가 계정당 수 분~수십 분 걸리므로, 사용자가 "다른 서비스에서 불러오기" 를 누른
+    뒤에 시작하면 그만큼 기다려야 한다. 연동 완료 시점에 미리 돌려두면 **열자마자 결과**가
+    보인다. 결과는 `_REUSE_WINDOW`(7일) 동안 캐시로 재사용된다.
+
+    전 플랜(무료 포함) 대상 — 이전은 신규 유입 경로라 요금제로 막지 않는다.
+
+    안전장치
+      · 이미 비종결 잡이 있거나 최근 완료 결과가 있으면 아무것도 하지 않는다.
+      · 실패해도 조용히 끝낸다(사용자가 요청한 작업이 아니므로 알림/에러 노출 없음).
+    """
+    from django.utils import timezone as _tz
+
+    from .migration_views import _NON_TERMINAL, _REUSABLE, _REUSE_WINDOW
+
+    conn = IGAccountConnection.objects.filter(id=connection_id).first()
+    if not conn or not conn.is_active:
+        return "skipped:no_connection"
+    if conn.status != IGAccountConnection.Status.ACTIVE:
+        return "skipped:inactive"
+    if DMMigrationJob.objects.filter(ig_connection=conn, status__in=_NON_TERMINAL).exists():
+        return "skipped:running"
+    if DMMigrationJob.objects.filter(
+        ig_connection=conn,
+        status__in=_REUSABLE,
+        finished_at__gte=_tz.now() - _REUSE_WINDOW,
+    ).exists():
+        return "skipped:cached"
+
+    try:
+        job = DMMigrationJob.objects.create(
+            ig_connection=conn,
+            requested_by=None,
+            trigger_source="auto_connect",
+        )
+    except IntegrityError:
+        return "skipped:race"
+    run_dm_migration_job.delay(str(job.id))
+    logger.info("prewarm_dm_migration: 잡 %s 시작 (connection=%s)", job.id, connection_id)
+    return str(job.id)

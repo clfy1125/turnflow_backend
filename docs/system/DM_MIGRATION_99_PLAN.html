@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DM 캠페인 이전 — 99% 복원 설계 (3차 연구)</title>
+<style>
+  :root{
+    --bg:#fbfbfa; --fg:#1c1b19; --muted:#6b6862; --line:#e4e1da; --card:#fff; --code:#f4f2ee;
+    --ok:#0f7b4f; --ok-bg:#e8f6ee; --no:#c0392b; --no-bg:#fdecec;
+    --hi:#b06d00; --hi-bg:#fdf3e0; --info:#1d6fb8; --info-bg:#e9f2fb;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#16161a; --fg:#e8e6e1; --muted:#9a968e; --line:#2e2e34; --card:#1d1d22; --code:#232329;
+      --ok:#4cc38a; --ok-bg:#12291f; --no:#f07070; --no-bg:#2b1616;
+      --hi:#e0a33a; --hi-bg:#2b2113; --info:#6cb2ee; --info-bg:#13212e;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"Segoe UI","Malgun Gothic","Apple SD Gothic Neo",sans-serif;
+    line-height:1.75;word-break:keep-all;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1060px;margin:0 auto;padding:44px 22px 90px}
+  h1{font-size:1.72rem;line-height:1.34;margin:0 0 8px;letter-spacing:-.02em}
+  .sub{color:var(--muted);font-size:.94rem;margin:0 0 8px}
+  .meta{color:var(--muted);font-size:.83rem;margin:0 0 28px}
+  h2{font-size:1.22rem;margin:52px 0 14px;padding-bottom:9px;border-bottom:2px solid var(--line)}
+  h3{font-size:1.02rem;margin:28px 0 10px}
+  p{margin:11px 0}
+  code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.87em;
+    background:var(--code);padding:1px 5px;border-radius:4px}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:8px;padding:13px 16px;
+    overflow-x:auto;font-size:.83rem;line-height:1.62;margin:12px 0}
+  pre code{background:none;padding:0}
+  .scroll{overflow-x:auto}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:.88rem}
+  th,td{border:1px solid var(--line);padding:9px 11px;text-align:left;vertical-align:top}
+  th{background:var(--code);font-weight:600;white-space:nowrap}
+  td.nw{white-space:nowrap} .num{font-family:ui-monospace,monospace}
+  .verdict{background:var(--ok-bg);border:2px solid var(--ok);border-radius:12px;padding:20px 24px;margin:24px 0}
+  .verdict h2{border:0;margin:0 0 8px;padding:0;font-size:1.28rem;color:var(--ok)}
+  .verdict .big{font-size:1.35rem;font-weight:800;letter-spacing:-.02em;line-height:1.45}
+  .note{background:var(--card);border:1px solid var(--line);border-radius:9px;padding:15px 19px;margin:17px 0}
+  .note.hi{border-left:4px solid var(--hi);background:var(--hi-bg)}
+  .note.bad{border-left:4px solid var(--no);background:var(--no-bg)}
+  .note.info{border-left:4px solid var(--info);background:var(--info-bg)}
+  .note.ok{border-left:4px solid var(--ok);background:var(--ok-bg)}
+  .note p:first-child{margin-top:0} .note p:last-child{margin-bottom:0}
+  .badge{display:inline-block;padding:2px 9px;border-radius:11px;font-size:.76rem;font-weight:700;white-space:nowrap}
+  .b-ok{background:var(--ok-bg);color:var(--ok)} .b-no{background:var(--no-bg);color:var(--no)}
+  .b-hi{background:var(--hi-bg);color:var(--hi)} .b-info{background:var(--info-bg);color:var(--info)}
+  .stages{counter-reset:s;display:grid;gap:11px;margin:18px 0}
+  .stage{background:var(--card);border:1px solid var(--line);border-radius:9px;
+    padding:14px 18px 14px 56px;position:relative}
+  .stage::before{counter-increment:s;content:counter(s);position:absolute;left:15px;top:14px;
+    width:28px;height:28px;border-radius:50%;background:var(--info-bg);color:var(--info);
+    display:grid;place-items:center;font-size:.82rem;font-weight:800}
+  .stage b{display:block;font-size:1rem;margin-bottom:3px}
+  .stage .m{color:var(--muted);font-size:.87rem}
+  .stage .tag{float:right;margin-left:8px}
+  .bars{margin:16px 0}
+  .bar{display:grid;grid-template-columns:190px 1fr 62px;gap:11px;align-items:center;
+    font-size:.85rem;margin:5px 0}
+  .bar .t{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .bar .track{background:var(--code);border-radius:5px;height:17px;overflow:hidden;border:1px solid var(--line)}
+  .bar .fill{height:100%;border-radius:4px 0 0 4px}
+  .bar .v{text-align:right;font-family:ui-monospace,monospace;font-size:.8rem}
+  hr{border:0;border-top:1px solid var(--line);margin:42px 0}
+  .foot{color:var(--muted);font-size:.83rem;margin-top:46px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>DM 캠페인 이전 — 99% 복원 설계</h1>
+<p class="sub">3차 연구. "시간이 걸려도 거의 전부 복원" 요구에 대한 타당성 검증 + 설계.</p>
+<p class="meta">2026-08-13 · prod 읽기 전용(GET) 실측 · 대상 계정 3곳 · 게시물 <span class="num">32</span>개 스윕</p>
+
+<div class="verdict">
+  <h2>결론</h2>
+  <p class="big">99%는 도달 가능합니다. 단 <u>"표본 추출"을 버리고 "적응형 전수 조사 + 시간창 정확 조인"</u>으로 바꿔야 하고,<br>
+  가장 중요한 건 — <u>우리는 그걸 측정으로 증명할 수 있습니다.</u></p>
+  <p>정답지가 있습니다. 우리 <code>SentDMLog</code> <span class="num">53,228</span>건 · IG 연결 <span class="num">30</span>개.
+  "누구에게 무슨 문구를 언제 보냈는지" 다 압니다. 복원기를 <b>우리 계정에 돌려 실제 회수율을 계산</b>하면
+  99%가 희망이 아니라 <b>숫자</b>가 됩니다.</p>
+</div>
+
+<h2>1. 먼저 — 무엇의 99%인가</h2>
+<div class="note info">
+<p><b>정의를 고정합니다.</b> "모든 DM을 한 통도 빠짐없이"는 불필요하고 불가능합니다.
+캠페인 문구는 <b>모두에게 동일</b>하므로 게시물당 <span class="num">5~10</span>건만 건지면 내용은 완전히 복원됩니다.</p>
+<p style="margin-bottom:0">따라서 목표는 <b>"캠페인이 돌았던 게시물 중 99%에서 실제 발송 문구·키워드·구조를 복원"</b> 입니다.
+분모는 <b>DM이 1건 이상 실제 전달된 게시물</b>. 전달이 0건인 게시물은 물리적으로 원본이 없으므로
+별도 취급(§7)합니다.</p>
+</div>
+
+<h2>2. 측정된 사실 — 관문 2개는 통과했다</h2>
+
+<h3><span class="badge b-ok">통과</span> 관문 A — IG 대화 보존 기간은 문제가 아니다</h3>
+<p>가장 큰 우려였습니다. "오래된 캠페인은 대화가 사라졌을 것".</p>
+<div class="scroll">
+<table>
+<thead><tr><th>계정</th><th>게시물 기간</th><th>복원된 가장 오래된 DM</th><th>판정</th></tr></thead>
+<tbody>
+<tr><td>@manjzangi</td><td class="nw">2025-10-18 ~ 2026-08-12 (<b>10개월</b>)</td><td class="nw"><b>2025-09-17</b> (11개월 전)</td><td><span class="badge b-ok">보존됨</span></td></tr>
+<tr><td>@3dragon_pd</td><td class="nw">2026-05-10 ~ 2026-07-24</td><td class="nw">2026-05-10 (전 구간)</td><td><span class="badge b-ok">보존됨</span></td></tr>
+</tbody>
+</table>
+</div>
+<p>IG 대화는 <b>사실상 무기한 보존</b>됩니다. 11개월 전 발송 DM이 본문·버튼·URL 그대로 나왔습니다.
+→ <b>오래된 캠페인도 복원 대상입니다.</b></p>
+
+<h3><span class="badge b-ok">통과</span> 관문 B — "댓글러 5명 찔러보기"가 분류기를 대체한다</h3>
+<p>지금 파이프라인은 <b>LLM이 "캠페인 같다"고 판정한 게시물만</b> DM 복원을 시도합니다.
+분류기가 틀리면 그 게시물은 영구히 누락됩니다 — 99%의 최대 적입니다.</p>
+<p>이제 조회 1건이 <span class="num">~1.2</span>초에 적중률이 높으므로, <b>판정하지 말고 그냥 찔러보면</b> 됩니다.
+DM이 있으면 캠페인, 없으면 아님. <b>추론이 관측으로 대체됩니다.</b></p>
+<p>실측: 게시물당 댓글러 <span class="num">5</span>명만 조회한 결과 —</p>
+<div class="bars">
+  <div class="bar"><span class="t">5/5 적중 (완전)</span><span class="track"><span class="fill" style="width:56%;background:var(--ok)"></span></span><span class="v">18개</span></div>
+  <div class="bar"><span class="t">1~4/5 적중 (부분)</span><span class="track"><span class="fill" style="width:22%;background:var(--hi)"></span></span><span class="v">7개</span></div>
+  <div class="bar"><span class="t">0/5 (미적중)</span><span class="track"><span class="fill" style="width:22%;background:var(--no)"></span></span><span class="v">7개</span></div>
+</div>
+<p class="meta">게시물 32개 중 25개(78%)가 5명만으로 즉시 복원. 나머지 7개가 §3의 과제입니다.</p>
+
+<h2>3. 남은 갭 — 딱 하나, "거대 바이럴의 낮은 전달률"</h2>
+<p>0~부분 적중한 게시물을 보면 패턴이 선명합니다.</p>
+<div class="scroll">
+<table>
+<thead><tr><th>댓글 수</th><th>5명 중 적중</th><th>복원 DM</th><th>해석</th></tr></thead>
+<tbody>
+<tr><td class="num nw">10,209</td><td><span class="badge b-no">0 / 5</span></td><td class="num">0</td><td rowspan="4">댓글러 대부분이 비팔로워 → 실제 전달률이 낮다.<br><b>0이 아니라 낮은 것</b> — 표본을 키우면 나온다</td></tr>
+<tr><td class="num nw">8,015</td><td><span class="badge b-hi">1 / 5</span></td><td class="num">6</td></tr>
+<tr><td class="num nw">2,975</td><td><span class="badge b-hi">2 / 5</span></td><td class="num">3</td></tr>
+<tr><td class="num nw">2,538</td><td><span class="badge b-hi">1 / 5</span></td><td class="num">4</td></tr>
+<tr><td class="num nw">353 / 255 / 25 / 19</td><td><span class="badge b-no">0 / 5</span></td><td class="num">0</td>
+  <td>작은 게시물의 0적중 → <b>애초에 캠페인이 없었을 가능성이 높다</b>(정상 동작)</td></tr>
+</tbody>
+</table>
+</div>
+<div class="note ok">
+<p><b>증거: 표본을 키우면 바이럴도 나온다.</b> 2차 연구에서 같은 급의 바이럴 게시물(댓글 1,138~4,935)에
+댓글러 <span class="num">12~24</span>명을 조회하자 게시물당 <b><span class="num">23~116</span>건</b>이 복원됐습니다.
+<span class="num">5</span>명에서 <span class="num">24</span>명으로 늘린 것만으로 <b>0 → 314건</b>.</p>
+<p style="margin-bottom:0">즉 바이럴 게시물은 <b>불가능한 게 아니라 비싼</b> 것입니다. 그리고 "시간이 걸려도 된다"면
+비싼 건 문제가 아닙니다.</p>
+</div>
+
+<h3>필요 표본 수 — 확률 계산</h3>
+<p>댓글러 1명당 적중 확률 <code>p</code> 일 때, <b>99% 확신</b>으로 최소 1건을 건지려면 <code>log(0.01)/log(1-p)</code> 명이 필요합니다.</p>
+<div class="scroll">
+<table>
+<thead><tr><th>적중률 p</th><th>해당 게시물 유형</th><th>99% 확신 필요 표본</th><th>비용(1.2초/건)</th></tr></thead>
+<tbody>
+<tr><td class="num nw">100%</td><td>일반 게시물 (관측 다수)</td><td class="num nw">1명</td><td class="nw">1초</td></tr>
+<tr><td class="num nw">40%</td><td>중형 (댓글 ~3천)</td><td class="num nw">9명</td><td class="nw">11초</td></tr>
+<tr><td class="num nw">20%</td><td>바이럴 (댓글 ~5천)</td><td class="num nw">21명</td><td class="nw">25초</td></tr>
+<tr><td class="num nw">10%</td><td>초대형 (댓글 ~1만)</td><td class="num nw">44명</td><td class="nw">53초</td></tr>
+<tr><td class="num nw">5%</td><td>극단 케이스</td><td class="num nw">90명</td><td class="nw">1분 48초</td></tr>
+</tbody>
+</table>
+</div>
+<p><b>최악의 게시물도 2분이면 끝납니다.</b> 게시물 100개 중 10개가 극단이라 해도 추가 18분입니다.</p>
+
+<h2>4. 99% 설계 — 6단계</h2>
+<div class="stages">
+  <div class="stage"><span class="badge b-info tag">필수</span><b>전 게시물 열거 (분류 게이트 제거)</b>
+    <span class="m">미디어를 끝까지 페이징(50/콜, 100개당 2콜). <code>media_limit</code> 잘라내기 폐지 —
+    캠페인은 1년 전 게시물에도 있다(@manjzangi 2025-10 확인).
+    <b>LLM 분류를 "복원 시도 여부"의 게이트로 쓰지 않는다</b>(분류는 라벨링으로만 강등).</span></div>
+
+  <div class="stage"><span class="badge b-ok tag">핵심</span><b>얕은 스윕 — 전 게시물 × 댓글러 5명</b>
+    <span class="m">댓글 있는 모든 게시물에 5명씩 찔러본다. 실측 78%가 여기서 끝난다.
+    <b>DM 유무가 곧 캠페인 판정</b>이므로 분류 오탐/미탐이 회수율에 영향을 못 준다.</span></div>
+
+  <div class="stage"><span class="badge b-ok tag">핵심</span><b>적응형 에스컬레이션 — 증거가 있으면 끝까지</b>
+    <span class="m">0~부분 적중 게시물만 표본을 늘린다. <b>중단 조건은 "증거 유무"</b>:
+    ① 계정 본인 공개답글 존재 ② 댓글 반복률 높음 ③ 캡션 CTA —
+    하나라도 있으면 <b>캠페인이 돈 물증</b>이므로 <span class="num">p=0.05</span> 가정치(90명)까지 파고,
+    셋 다 없으면 5명에서 종료(캠페인 없음으로 확정). <b>예산을 의심스러운 곳에만 쓴다.</b></span></div>
+
+  <div class="stage"><span class="badge b-hi tag">바이럴 결정타</span><b>확정 타겟 우선 — 공개답글 <code>parent_id</code></b>
+    <span class="m">계정이 단 공개답글의 <code>parent_id</code> = 트리거한 댓글 = <b>자동화가 확실히 발동한 사람</b>.
+    적중률이 100%인 일반 게시물에선 이득이 없지만(97%→100%),
+    <b>적중률이 10~20%로 떨어지는 바이럴에서 표본 효율을 몇 배로 올린다.</b>
+    첫 50댓글만으로도 확정 타겟 <span class="num">491</span>명이 나왔다(실측).</span></div>
+
+  <div class="stage"><span class="badge b-no tag">버그 수정</span><b>7일 시간창 정확 귀속</b>
+    <span class="m">현재 <code>fetch_targeted_dms</code> 는 그 사람에게 보낸 <b>모든</b> 발신 DM을 가져온다 —
+    시간창이 없다. 실측에서 <b>2026-05 게시물에 2025-09 DM이 딸려왔다</b>(무관한 과거 대화).
+    Meta 규칙상 Private Reply 는 <b>댓글 후 7일 내</b>만 가능하므로
+    <code>댓글시각 ≤ DM시각 ≤ 댓글시각+7일</code> 로 자르면 <b>귀속이 확정</b>된다.
+    한 사람이 여러 게시물에 댓글을 달았어도 정확히 갈린다.</span></div>
+
+  <div class="stage"><span class="badge b-info tag">충실도</span><b>관측 기반 재구성 — LLM 추측 제거</b>
+    <span class="m">DM을 받은 사람이 <b>정확히 누구인지</b> 알게 되면, 그들의 <b>댓글 원문</b>도 안다:
+    <br>· <b>트리거 키워드</b> = DM 받은 댓글들의 공통 토큰 <b>(추측 → 관측)</b>
+    <br>· <b>오프닝 → 게이트 → 리워드 순서</b> = 한 대화 내 발신 메시지 시간순
+    <br>· <b>후속 딜레이</b> = 같은 대화 발신 간 시간차
+    <br>· <b>버튼 문구·URL</b> = <code>cta[]</code>
+    <br>지금 LLM이 캡션에서 상상하는 항목들이 전부 관측으로 대체된다.</span></div>
+</div>
+
+<h2>5. 비용과 시간</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>단계</th><th>Graph 호출</th><th>시간</th></tr></thead>
+<tbody>
+<tr><td>미디어 전수 열거 (100 게시물)</td><td class="num nw">2 ~ 8</td><td class="nw">~10초</td></tr>
+<tr><td>댓글 1페이지 × 게시물 (후보 추출)</td><td class="num nw">50 ~ 100</td><td class="nw">1 ~ 2분</td></tr>
+<tr><td>얕은 스윕 (게시물 × 5명)</td><td class="num nw">250 ~ 500</td><td class="nw">5 ~ 10분</td></tr>
+<tr><td>에스컬레이션 (의심 10~15개 × 최대 90명)</td><td class="num nw">900 ~ 1,350</td><td class="nw">18 ~ 27분</td></tr>
+<tr><td>확정 타겟용 댓글 심층 페이징</td><td class="num nw">100 ~ 300</td><td class="nw">2 ~ 5분</td></tr>
+<tr><th>합계 (평균 계정)</th><th class="num nw">1,300 ~ 2,250</th><th class="nw"><b>25 ~ 45분</b></th></tr>
+</tbody>
+</table>
+</div>
+<div class="note">
+<p style="margin-top:0"><b>참고 좌표</b>: 인스타 성장 리포트가 이미 <b>13~18분</b>짜리 잡으로 운영 중입니다.
+25~45분은 <b>같은 성격의 일회성 이전 작업</b>으로 수용 가능한 범위입니다.
+기존 체크포인트 재개·레이트리밋 pause 기계장치를 그대로 씁니다.</p>
+<p style="margin-bottom:0"><b>레이트리밋 여유</b>: 실측 <code>x-app-usage = {"call_volume":0,"cpu_time":0}</code> —
+현재 사용량이 사실상 0입니다. 다만 대량 스윕은 <b>계정 단위 큐 직렬화</b>(동시 1잡) + 기존 토큰버킷(3req/s)을 유지해야 합니다.
+<b>전역 대화 목록 전수 스캔은 하지 마세요</b> — 실측 페이지당 <span class="num">9</span>초, 3만 대화면 <b>91분</b>이고
+타겟 조회로 이미 대체됩니다.</p>
+</div>
+
+<h2>6. 99%를 <u>측정</u>하는 방법 — 이게 이 계획의 핵심</h2>
+<div class="note ok">
+<p><b>우리는 정답을 갖고 있습니다.</b> <code>SentDMLog</code> <span class="num">53,228</span>건 —
+게시물별로 누구에게 어떤 문구를 언제 보냈는지, 성공/실패까지.</p>
+<p><b>채점기(scorer)를 만듭니다:</b></p>
+<pre><code>우리 IG 연결 30개 각각에 대해
+  1. SentDMLog 에서 정답 구성:  {게시물 → 실제 발송 문구·키워드·수신자 집합}
+  2. 복원기를 그 계정에 실행 (SentDMLog 조회 없이, 순수 Graph API 만)
+  3. 대조:
+     · 게시물 회수율   = 복원한 캠페인 게시물 / 실제 캠페인 게시물
+     · 문구 정확도     = 복원 문구가 실제 발송 문구와 일치(지문/유사도)
+     · 키워드 정확도   = 복원 키워드 ∩ 실제 keyword_filter
+     · 오귀속률        = 다른 게시물 DM 을 잘못 붙인 비율   ← 7일 창 검증
+</code></pre>
+<p style="margin-bottom:0">→ <b>"99%"가 주장이 아니라 리포트 숫자가 됩니다.</b> 그리고 이 채점기는 회귀 테스트로 영구히 남습니다
+(자기발송 제외 로직을 끄고 돌려야 정답 대조가 성립 — 채점 모드 플래그 필요).</p>
+</div>
+<div class="note hi">
+<p style="margin-bottom:0"><b>왜 이게 중요한가</b> — 1차 연구가 "구조적 복원 불가"를 잘못 결론 낸 이유가 정확히 이것입니다.
+정답을 모르는 외부 계정에서 시작해 안 나오는 이유를 <b>추론으로 메웠습니다.</b>
+같은 실수를 반복하지 않으려면, <b>정답 있는 데이터로 먼저 채점</b>한 뒤 미지 계정으로 나가야 합니다.</p>
+</div>
+
+<h2>7. 남는 1% — 정직하게</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>못 살리는 것</th><th>왜</th><th>대응</th></tr></thead>
+<tbody>
+<tr><td class="nw">전달이 <b>정말 0건</b>인 게시물</td>
+  <td>모든 댓글러가 비팔로워 + 채널 미개설(<code>2534025</code>). 실측에서 이 버킷은 대화 반환률 <b>50%</b> — 절반은 진짜로 비어 있다</td>
+  <td>같은 시기 <b>형제 게시물의 실제 문구를 시간 상관으로 차용</b> + "추정" 배지</td></tr>
+<tr><td class="nw">대화가 <b>삭제/차단</b>된 상대</td><td>계정 탈퇴·차단·대화 삭제</td><td>표본을 늘리면 다른 수신자로 대체됨</td></tr>
+<tr><td class="nw">후속 <b>분기 조건</b>(if/then)</td><td>발신 기록엔 결과만 남고 조건은 안 남는다</td><td>딜레이·순서까지만 복원, 분기는 사용자 확인</td></tr>
+<tr><td class="nw">캠페인이 <b>공개답글 없이</b> 돌고 전달도 실패한 경우</td><td>물증이 하나도 없다 → 에스컬레이션 근거 없음</td><td>얕은 스윕에서 종료(오탐 방지가 더 중요)</td></tr>
+</tbody>
+</table>
+</div>
+<p><b>최후의 수단은 계속 유효합니다</b> — "이 게시물의 DM 문구를 붙여넣으세요" 입력창.
+자동 복원이 99%여도 남는 1%는 사용자가 30초면 채웁니다. <b>이전 기능은 100% 자동일 필요가 없고, 100% 완성되면 됩니다.</b></p>
+
+<h2>8. 구현 순서 (권장)</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>#</th><th>작업</th><th>효과</th><th>규모</th></tr></thead>
+<tbody>
+<tr><td class="num">1</td><td><code>attachments</code> 필드 + 본문 조립기 (2차 연구 결론)</td><td><span class="badge b-ok">0 → 복원 가능</span></td><td class="nw">S</td></tr>
+<tr><td class="num">2</td><td><b>7일 시간창 귀속</b> — 오귀속 버그 수정</td><td><span class="badge b-no">정밀도 (잘못된 문구 방지)</span></td><td class="nw">S</td></tr>
+<tr><td class="num">3</td><td><b>채점기 + 우리 계정 30개 베이스라인 측정</b></td><td><span class="badge b-info">이후 모든 판단의 근거</span></td><td class="nw">M</td></tr>
+<tr><td class="num">4</td><td>분류 게이트 제거 + 얕은 스윕(전 게시물 × 5)</td><td><span class="badge b-ok">회수율 최대 상승</span></td><td class="nw">M</td></tr>
+<tr><td class="num">5</td><td>적응형 에스컬레이션 + 확정 타겟 우선</td><td><span class="badge b-ok">바이럴 구제</span></td><td class="nw">M</td></tr>
+<tr><td class="num">6</td><td>관측 기반 재구성(키워드·순서·딜레이)</td><td><span class="badge b-info">내용 충실도</span></td><td class="nw">M</td></tr>
+<tr><td class="num">7</td><td>형제 템플릿 차용 + 붙여넣기 입력창</td><td><span class="badge b-hi">남은 1% 마감</span></td><td class="nw">S</td></tr>
+</tbody>
+</table>
+</div>
+<p class="meta"><b>3번을 4번보다 먼저</b> 하는 게 중요합니다. 베이스라인 없이 튜닝하면
+1차 연구처럼 "숫자가 올랐다"를 근거 없이 믿게 됩니다.</p>
+
+<hr>
+<p class="foot">
+검증: prod 읽기 전용 — DB 조회 + Graph API GET 만, 쓰기·발송 없음. 실험 스크립트 <code>probe1</code>~<code>probe9</code>.<br>
+선행 문서: <code>DM_MIGRATION_RESEARCH_R2.html</code>(첨부 발견) · <code>DM_MIGRATION_MECHANISM.html</code>(동작 설명) ·
+<code>apps/integrations/dm_migration/RESEARCH_NOTE.md</code>(1차, 정정 헤더 부착).<br>
+외부 사용자의 DM 원문·링크·계정 식별자는 싣지 않았습니다(집계 수치만).
+</p>
+
+</div>
+</body>
+</html>

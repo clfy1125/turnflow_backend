@@ -133,6 +133,27 @@ class IGAccountConnection(models.Model):
     # Additional metadata
     metadata = models.JSONField(default=dict, blank=True, verbose_name="Additional Metadata")
 
+    # ===== DM 캠페인 이전(다른 서비스에서 불러오기) 계정 단위 상태 =====
+    # 프론트가 "계정당 1회만" 물어야 하는 값들. localStorage 로 가면 기기가 바뀔 때마다
+    # 같은 질문이 다시 떠서 "한 번만 묻는다" 전제가 깨진다 → 서버 보관.
+    dm_migration_prompt_answer = models.CharField(
+        max_length=16,
+        blank=True,
+        default="",
+        choices=[("used", "다른 서비스 써봤음"), ("first_time", "처음임")],
+        verbose_name="이전 설문 답변",
+        help_text="연동 직후 '다른 서비스로 자동 DM 보낸 적 있으세요?' 답.",
+    )
+    dm_migration_prompt_answered_at = models.DateTimeField(
+        null=True, blank=True, verbose_name="이전 설문 응답 시각"
+    )
+    dm_migration_conflict_ack_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="타 서비스 연동 해제 확인 시각",
+        help_text="불러온 캠페인을 처음 켤 때 1회 확인. 중복 발송 경고용.",
+    )
+
     # ===== v3.4 next_media 폴링 추적 =====
 
     # 마지막으로 폴링/감지한 미디어 (이 시점 이전 게시물은 "다음 게시물"이 아님)
@@ -816,6 +837,18 @@ class AutoDMCampaign(models.Model):
         verbose_name="링크 버튼 라벨",
         help_text="링크 버튼 글자 (Meta 한도 20자). link_button_url 있고 비우면 '자세히 보기'.",
     )
+    # 생성 출처 — 프론트가 "불러온 캠페인만" 필터/배지를 그리는 데 쓴다.
+    # (후보→캠페인 방향은 DMCampaignCandidate.applied_campaign 이 있지만 역방향 판별이 불가했다)
+    source = models.CharField(
+        max_length=20,
+        blank=True,
+        default="",
+        db_index=True,
+        choices=[("dm_migration", "다른 서비스에서 불러옴")],
+        verbose_name="생성 출처",
+        help_text="빈 문자열 = 사용자가 직접 만든 캠페인.",
+    )
+
     link_buttons = models.JSONField(
         default=list,
         blank=True,
@@ -2283,11 +2316,13 @@ class DMMigrationJob(models.Model):
         Status.RUNNING,
         Status.PAUSED_RATE_LIMITED,
     )
-    # 24h 재사용 대상(완료 결과) 상태.
+    # 캐시 재사용 대상(완료 결과) 상태 — 창은 뷰의 _REUSE_WINDOW(7일).
+    # FAILED 는 일부러 뺐다. 실패를 캐시하면 사용자가 7일간 재시도조차 못 한다.
     REUSABLE_STATUSES = (Status.READY, Status.PARTIAL)
 
     class Stage(models.TextChoices):
         QUEUED = "queued", "대기"
+        ESTIMATING = "estimating", "예상 시간 계산 중"
         COLLECTING_MEDIA = "collecting_media", "게시물 수집 중"
         COLLECTING_COMMENTS = "collecting_comments", "댓글 수집 중"
         CLASSIFYING_POSTS = "classifying_posts", "게시물 분류 중"
@@ -2352,6 +2387,32 @@ class DMMigrationJob(models.Model):
     )
     llm_model = models.CharField(
         max_length=20, default="deepseek", verbose_name="LLM 모델", help_text="AiJob.LlmModel 값"
+    )
+
+    # ── 2단계 실행: ①예상 시간 산출(수 초) → ②본 분석 ──
+    # 프론트가 "약 N분 걸려요" 를 먼저 띄우고 진행바를 그릴 수 있게 한다.
+    # 게시물 수를 세는 것만으로 계산되므로 예산이 거의 들지 않는다.
+    estimated_seconds = models.IntegerField(
+        null=True,
+        blank=True,
+        verbose_name="예상 소요(초)",
+        help_text="1단계에서 산출. 게시물 수 × 게시물당 실측 단가.",
+    )
+    estimate_detail = models.JSONField(
+        default=dict,
+        blank=True,
+        verbose_name="예상 산출 근거",
+        help_text="{media_total, media_with_comments, per_post_seconds, workers}",
+    )
+    estimated_at = models.DateTimeField(null=True, blank=True, verbose_name="예상 산출 완료 시각")
+
+    # ── 자동 선작업(연동 직후 백그라운드) 식별 ──
+    trigger_source = models.CharField(
+        max_length=16,
+        default="manual",
+        choices=[("manual", "사용자 요청"), ("auto_connect", "연동 직후 자동")],
+        verbose_name="실행 계기",
+        help_text="auto_connect = IG 연동 완료 시 백그라운드 선작업(캐시 목적).",
     )
 
     # 카운터 (관측용)
@@ -2503,6 +2564,62 @@ class DMCampaignCandidate(models.Model):
         verbose_name="키워드 매칭 방식",
     )
     confidence = models.FloatField(default=0.0, verbose_name="신뢰도 (0~1)")
+
+    # ── 지지 근거 (정밀도 판정의 단일 소스) ──
+    # 같은 게시물의 여러 댓글러에게 **공통으로 간** 문구만 그 게시물의 캠페인이다.
+    # 실측 정밀도: 지지비율 ≤20% → 11% · 40~60% → 77% · 60%+ → 100%(오귀속 0).
+    # 1명에게만 간 DM 은 86%가 다른 게시물 캠페인에서 흘러든 것이다.
+    support_hits = models.IntegerField(
+        default=0, verbose_name="같은 문구를 받은 댓글러 수", help_text="지지비율의 분자"
+    )
+    support_probed = models.IntegerField(
+        default=0, verbose_name="조회한 댓글러 수", help_text="지지비율의 분모"
+    )
+    support_score = models.FloatField(
+        default=0.0,
+        verbose_name="지지 신뢰하한(Wilson)",
+        help_text="표본이 작으면 자동 강등된다. 1/2→0.09 · 3/3→0.44 · 10/10→0.72.",
+    )
+
+    # ── 산출물 1순위: 인플루언서가 보내려던 자료 링크 ──
+    offer_url = models.URLField(
+        max_length=1000, blank=True, default="", verbose_name="오퍼 링크(복원)"
+    )
+    offer_button_label = models.CharField(
+        max_length=100, blank=True, default="", verbose_name="오퍼 버튼 문구(복원)"
+    )
+    # 게이트 DM 은 댓글러 전원에게 가서 지지 100%, 오퍼 DM 은 게이트 통과자만 받아 지지가 낮다.
+    # 최고 지지 문구 하나만 뽑으면 **링크 없는 게이트만** 나오므로 따로 저장한다.
+    gate_detected = models.BooleanField(
+        default=False, verbose_name="팔로우 확인 단계 사용", help_text="cta.type=postback 로 판별"
+    )
+    gate_message = models.TextField(blank=True, default="", verbose_name="게이트 문구(복원)")
+    gate_button_label = models.CharField(
+        max_length=100, blank=True, default="", verbose_name="게이트 버튼 문구(복원)"
+    )
+
+    # ── 사용자 확인 (링크가 맞는지만 묻는다) ──
+    confirm_required = models.BooleanField(
+        default=False,
+        verbose_name="사용자 확인 필요",
+        help_text="지지 표본이 적어 링크 확인을 받아야 하는 후보.",
+    )
+    confirmed_at = models.DateTimeField(null=True, blank=True, verbose_name="사용자 확인 시각")
+    confirmed_url = models.URLField(
+        max_length=1000,
+        blank=True,
+        default="",
+        verbose_name="사용자가 확정/수정한 링크",
+        help_text="비어 있으면 offer_url 을 그대로 쓴다.",
+    )
+
+    # ── 이전 불가 항목 (프론트 안내용) ──
+    transfer_drops = models.JSONField(
+        default=list,
+        blank=True,
+        verbose_name="이전 못 하는 항목",
+        help_text='[{"code":"attachment_image","count":3}] — 프론트 i18n 키와 1:1.',
+    )
 
     # 초안(보존 — 제품 가치)
     draft_name = models.CharField(

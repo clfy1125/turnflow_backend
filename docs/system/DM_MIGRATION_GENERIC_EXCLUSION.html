@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DM 캠페인 이전 — 범용성 검증 & 우리 캠페인 제외 규칙 (4차 연구)</title>
+<style>
+  :root{
+    --bg:#fbfbfa; --fg:#1c1b19; --muted:#6b6862; --line:#e4e1da; --card:#fff; --code:#f4f2ee;
+    --ok:#0f7b4f; --ok-bg:#e8f6ee; --no:#c0392b; --no-bg:#fdecec;
+    --hi:#b06d00; --hi-bg:#fdf3e0; --info:#1d6fb8; --info-bg:#e9f2fb;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#16161a; --fg:#e8e6e1; --muted:#9a968e; --line:#2e2e34; --card:#1d1d22; --code:#232329;
+      --ok:#4cc38a; --ok-bg:#12291f; --no:#f07070; --no-bg:#2b1616;
+      --hi:#e0a33a; --hi-bg:#2b2113; --info:#6cb2ee; --info-bg:#13212e;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"Segoe UI","Malgun Gothic","Apple SD Gothic Neo",sans-serif;
+    line-height:1.75;word-break:keep-all;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1060px;margin:0 auto;padding:44px 22px 90px}
+  h1{font-size:1.68rem;line-height:1.35;margin:0 0 8px;letter-spacing:-.02em}
+  .sub{color:var(--muted);font-size:.94rem;margin:0 0 6px}
+  .meta{color:var(--muted);font-size:.83rem;margin:0 0 28px}
+  h2{font-size:1.2rem;margin:52px 0 14px;padding-bottom:9px;border-bottom:2px solid var(--line)}
+  h3{font-size:1rem;margin:28px 0 10px}
+  p{margin:11px 0}
+  code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.86em;
+    background:var(--code);padding:1px 5px;border-radius:4px}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:8px;padding:13px 16px;
+    overflow-x:auto;font-size:.82rem;line-height:1.6;margin:12px 0}
+  pre code{background:none;padding:0}
+  .scroll{overflow-x:auto}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:.87rem}
+  th,td{border:1px solid var(--line);padding:9px 11px;text-align:left;vertical-align:top}
+  th{background:var(--code);font-weight:600;white-space:nowrap}
+  td.nw{white-space:nowrap} .num{font-family:ui-monospace,monospace}
+  .verdict{background:var(--info-bg);border:2px solid var(--info);border-radius:12px;padding:20px 24px;margin:24px 0}
+  .verdict h2{border:0;margin:0 0 10px;padding:0;font-size:1.24rem;color:var(--info)}
+  .verdict ol{margin:8px 0;padding-left:22px} .verdict li{margin:8px 0}
+  .note{background:var(--card);border:1px solid var(--line);border-radius:9px;padding:15px 19px;margin:17px 0}
+  .note.hi{border-left:4px solid var(--hi);background:var(--hi-bg)}
+  .note.bad{border-left:4px solid var(--no);background:var(--no-bg)}
+  .note.info{border-left:4px solid var(--info);background:var(--info-bg)}
+  .note.ok{border-left:4px solid var(--ok);background:var(--ok-bg)}
+  .note p:first-child{margin-top:0} .note p:last-child{margin-bottom:0}
+  .badge{display:inline-block;padding:2px 9px;border-radius:11px;font-size:.76rem;font-weight:700;white-space:nowrap}
+  .b-ok{background:var(--ok-bg);color:var(--ok)} .b-no{background:var(--no-bg);color:var(--no)}
+  .b-hi{background:var(--hi-bg);color:var(--hi)} .b-info{background:var(--info-bg);color:var(--info)}
+  .bars{margin:14px 0}
+  .bar{display:grid;grid-template-columns:210px 1fr 76px;gap:11px;align-items:center;font-size:.85rem;margin:5px 0}
+  .bar .t{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .bar .track{background:var(--code);border-radius:5px;height:17px;overflow:hidden;border:1px solid var(--line)}
+  .bar .fill{height:100%;border-radius:4px 0 0 4px}
+  .bar .v{text-align:right;font-family:ui-monospace,monospace;font-size:.79rem}
+  .layers{display:grid;gap:11px;margin:16px 0;counter-reset:L}
+  .layer{background:var(--card);border:1px solid var(--line);border-radius:9px;padding:14px 18px 14px 54px;position:relative}
+  .layer::before{counter-increment:L;content:"L" counter(L);position:absolute;left:13px;top:14px;
+    width:30px;height:24px;border-radius:6px;background:var(--code);color:var(--muted);
+    display:grid;place-items:center;font-size:.76rem;font-weight:800;border:1px solid var(--line)}
+  .layer b{display:block;margin-bottom:3px}
+  .layer .m{color:var(--muted);font-size:.86rem}
+  hr{border:0;border-top:1px solid var(--line);margin:42px 0}
+  .foot{color:var(--muted);font-size:.83rem;margin-top:46px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>DM 캠페인 이전 — 범용성 검증 &amp; 우리 캠페인 제외 규칙</h1>
+<p class="sub">4차 연구. 요구사항 두 개를 실데이터로 검증했습니다 —
+①우리 캠페인이 도는 게시물은 제외 ②타사 도구도 되게(범용화).</p>
+<p class="meta">2026-08-13 · prod 읽기 전용(GET) · IG 연결 <span class="num">33</span>개 · 발신 DM <span class="num">641</span>건 구조 분석 · 구현 없음(연구만)</p>
+
+<div class="verdict">
+  <h2>세 줄 요약</h2>
+  <ol>
+    <li><b>제외는 반드시 필요합니다.</b> 우리 캠페인이 도는 게시물에서 발견된 발신 DM의 <b>52%가 우리 것</b>이었습니다.
+      제외 대상은 현재 <b>게시물 <span class="num">108</span>개</b>(active 100 + paused 10).</li>
+    <li><b>단, <code>media_id</code> 로만 막으면 구멍이 납니다.</b> <code>any_media</code>(모든 게시물) 캠페인
+      <span class="num">4</span>개는 <code>media_id</code> 가 비어 있어 이 축으로 못 걸립니다 → <b>자기발송 지문 필터가 진짜 방어선</b>입니다.</li>
+    <li><b>범용화의 즉시 이득은 작습니다 — <span class="num">0.5%</span>(3/641).</b> 관측된 모든 도구가 같은
+      <code>generic_template</code> 계열을 씁니다. 다만 변종이 실재하고 미지 포맷의 손실은 <b>계정 단위 전손</b>이라,
+      값싼 보험으로 넣을 가치는 있습니다.</li>
+  </ol>
+</div>
+
+<h2>1. 요구사항 ② 범용성 — 타사 DM은 우리와 얼마나 다른가</h2>
+
+<h3>1-1. 관측된 첨부 구조 전수 (발신 DM 641건)</h3>
+<p>우리가 보낸 DM과 <b>타사 도구가 보낸 DM</b>을 분리해 구조를 집계했습니다(값은 버리고 키 구조만).</p>
+<div class="scroll">
+<table>
+<thead><tr><th>구조</th><th>우리</th><th>타사</th><th>비고</th></tr></thead>
+<tbody>
+<tr><td class="nw"><code>generic_template{title, cta[{title,type}]}</code></td><td class="num">142</td><td class="num">238</td><td>버튼(링크 없음) = 팔로우게이트</td></tr>
+<tr><td class="nw"><code>generic_template{title, cta[{title,type,url}]}</code></td><td class="num">93</td><td class="num">227</td><td>버튼+링크 = 오퍼 DM</td></tr>
+<tr><td class="nw">순수 텍스트 (<code>message</code>)</td><td class="num">12</td><td class="num">223</td><td>타사는 텍스트 DM 비중이 훨씬 높다</td></tr>
+<tr><td class="nw">빈 메시지 · 첨부 없음</td><td class="num">0</td><td class="num">67</td><td><span class="badge b-no">텍스트 복원 불가</span> 이미지/스티커/공유 추정</td></tr>
+<tr><td class="nw"><code>image_data{url, preview_url, w/h}</code></td><td class="num">0</td><td class="num">5</td><td><span class="badge b-hi">우리엔 없는 변종</span> 이미지 첨부</td></tr>
+<tr><td class="nw"><code>generic_template{title, <b>media_url</b>, cta[...]}</code></td><td class="num">0</td><td class="num">4</td><td><span class="badge b-hi">우리엔 없는 변종</span> 카드 이미지 포함</td></tr>
+<tr><td class="nw"><code>generic_template{title}</code> (cta 없음)</td><td class="num">0</td><td class="num">1</td><td><span class="badge b-hi">우리엔 없는 변종</span> 버튼 없는 카드</td></tr>
+<tr><td class="nw"><code>generic_template{title, <b>subtitle</b>}</code></td><td class="num">1</td><td>—</td><td>부제 필드</td></tr>
+</tbody>
+</table>
+</div>
+<p><b>결론</b>: 뼈대는 같고(<code>generic_template</code>), <b>주변 필드가 다릅니다</b> —
+<code>media_url</code> · <code>subtitle</code> · <code>image_data</code> · <code>cta</code> 없는 케이스.
+우리 포맷만 하드코딩하면 이 변종들을 놓칩니다.</p>
+
+<h3>1-2. A/B 측정 — 우리포맷 전용 vs 스키마 무관 범용</h3>
+<p>두 추출기를 같은 641건에 돌렸습니다.</p>
+<div class="scroll">
+<table>
+<thead><tr><th>추출기</th><th>방식</th><th>성공</th></tr></thead>
+<tbody>
+<tr><td class="nw"><b>A. 우리포맷 전용</b></td><td><code>generic_template.title</code> + <code>cta[].title/url</code> 만 읽음</td>
+  <td class="num">587 / 641 (<b>92%</b>)</td></tr>
+<tr><td class="nw"><b>B. 스키마 무관</b></td><td>첨부를 <b>재귀 순회</b>해 텍스트키(<code>title·subtitle·text·name·description</code>)와
+  URL키(<code>url·media_url·link·file_url</code>)를 전부 수집. 모르는 래퍼 키도 통과</td>
+  <td class="num">590 / 641 (<b>92%</b>)</td></tr>
+</tbody>
+</table>
+</div>
+<div class="bars">
+  <div class="bar"><span class="t">B만 성공 (A가 놓친 변종)</span><span class="track"><span class="fill" style="width:4%;background:var(--hi)"></span></span><span class="v">3건 (0.5%)</span></div>
+  <div class="bar"><span class="t">A만 성공 (B가 놓침)</span><span class="track"><span class="fill" style="width:0%;background:var(--no)"></span></span><span class="v">0건</span></div>
+  <div class="bar"><span class="t">둘 다 실패 (텍스트 자체가 없음)</span><span class="track"><span class="fill" style="width:32%;background:var(--no)"></span></span><span class="v">51건 (8%)</span></div>
+</div>
+<div class="note hi">
+<p><b>정직한 평가</b>: 범용 추출기의 <b>즉시 이득은 0.5%</b> 입니다. 지금 시장의 도구들(매니챗·인포크링크 등)이
+전부 Meta 의 <code>generic_template</code> 을 쓰기 때문에, 우리 포맷 전용 추출기도 92%를 잡습니다.</p>
+<p style="margin-bottom:0"><b>그래도 범용으로 가야 하는 이유는 손실의 비대칭성입니다.</b>
+새 도구가 다른 필드명을 쓰면 <b>그 계정의 복원율이 0%</b> 가 됩니다(2차 연구에서 우리가 겪은 일이 정확히 이것).
+범용 추출기는 코드 20줄이고 A가 잡는 걸 100% 포함합니다(A만 성공 = 0건). <b>비용이 0이면 보험을 드는 게 맞습니다.</b></p>
+</div>
+
+<h3>1-3. 텍스트 복원 상한 = 92%</h3>
+<p>타사 발신 DM의 내용 유형 분포:</p>
+<div class="bars">
+  <div class="bar"><span class="t">첨부 + 본문 있음</span><span class="track"><span class="fill" style="width:61%;background:var(--ok)"></span></span><span class="v">61%</span></div>
+  <div class="bar"><span class="t">일반 텍스트</span><span class="track"><span class="fill" style="width:29%;background:var(--ok)"></span></span><span class="v">29%</span></div>
+  <div class="bar"><span class="t">내용 없음 (이미지/스티커)</span><span class="track"><span class="fill" style="width:9%;background:var(--no)"></span></span><span class="v">9%</span></div>
+  <div class="bar"><span class="t">첨부만 · 본문 없음</span><span class="track"><span class="fill" style="width:1%;background:var(--no)"></span></span><span class="v">1%</span></div>
+</div>
+<p><b>메시지 단위 상한은 90~92%</b> 입니다. 단 <b>캠페인 단위 상한은 더 높습니다</b> —
+한 캠페인에서 오프닝 1건만 건지면 문구가 복원되고, 게시물당 <span class="num">5~24</span>건을 수집하므로
+전부 이미지일 확률은 낮습니다.</p>
+
+<h3>1-4. <span class="badge b-ok">도구 무관 발견</span> 버튼 타입으로 캠페인 구조를 판별할 수 있다</h3>
+<div class="scroll">
+<table>
+<thead><tr><th><code>cta[].type</code></th><th>건수</th><th>의미</th></tr></thead>
+<tbody>
+<tr><td class="nw"><code>postback</code></td><td class="num">380</td><td><b>팔로우게이트 버튼</b> — 링크가 없고 도구 서버로 콜백. "팔로우 확인" 단계</td></tr>
+<tr><td class="nw"><code>web_url</code></td><td class="num">354</td><td><b>오퍼 링크</b> — 실제 자료/랜딩 URL</td></tr>
+</tbody>
+</table>
+</div>
+<p>DM 하나만 보고 <b>게이트 전용(postback만) <span class="num">222</span>건 / 오퍼 전용(web_url만) <span class="num">215</span>건</b>으로 깔끔히 갈립니다.
+이건 도구 종류와 무관한 <b>Meta 표준 필드</b>라 범용 판별자로 쓸 수 있습니다.</p>
+<div class="note ok">
+<p style="margin-bottom:0"><b>기존 문서 §8 "팔로우게이트 구조는 복원 불가"는 이걸로 확정 기각됩니다.</b>
+게이트 유무·게이트 버튼 문구·오퍼 링크·2단 구조(게이트 DM → 리워드 DM)가 전부 관측 가능합니다.</p>
+</div>
+
+<h2>2. 요구사항 ① 우리 캠페인 제외 — 얼마나 필요한가</h2>
+
+<h3>2-1. 오염 실측 — 제외하지 않으면 절반이 우리 DM</h3>
+<div class="note bad">
+<p style="margin:0">우리 캠페인이 붙어 있는 게시물 <b><span class="num">14</span>개</b>를 조사한 결과, 그 게시물들에서 발견된 발신 DM
+<b><span class="num">313</span>건 중 우리 것이 <span class="num">164</span>건(52%)</b>, 타사 것이 <span class="num">149</span>건이었습니다.
+→ 제외 없이 돌리면 <b>절반이 자기 DM</b>이고, 우리 캠페인을 "타사 캠페인"으로 오인해 <b>자기증식 후보</b>가 생길 수 있습니다.</p>
+</div>
+
+<h3>2-2. 제외 대상 규모</h3>
+<div class="scroll">
+<table>
+<thead><tr><th>구분</th><th>수량</th><th>제외 여부</th></tr></thead>
+<tbody>
+<tr><td><code>specific_media</code> · <b>active</b></td><td class="num">100</td><td><span class="badge b-no">제외</span> 가동 중</td></tr>
+<tr><td><code>specific_media</code> · <b>paused</b></td><td class="num">10</td><td><span class="badge b-no">제외</span> 재개될 수 있음</td></tr>
+<tr><td><code>specific_media</code> · <b>inactive</b></td><td class="num">0</td><td><span class="badge b-hi">제외 권장</span> 이전으로 만든 초안 = 재실행 시 중복 방지(멱등)</td></tr>
+<tr><td><code>any_media</code> (모든 게시물)</td><td class="num">4 <span class="meta">(active 2 · paused 2)</span></td>
+  <td><span class="badge b-no">이 축으로 불가</span> <code>media_id</code> 가 비어 있음</td></tr>
+<tr><th>고유 게시물 제외 대상</th><th class="num">108개</th><th>33개 계정에 분포</th></tr>
+</tbody>
+</table>
+</div>
+
+<h3>2-3. <span class="badge b-no">구멍</span> <code>any_media</code> 캠페인 — media_id 축으로 못 막는다</h3>
+<div class="note bad">
+<p style="margin-top:0"><code>any_media</code> = <b>"모든 게시물"</b> 트리거입니다. <code>media_id</code> 가 비어 있으므로
+게시물 단위 제외 목록에 아무것도 올라가지 않는데, 실제로는 <b>그 계정의 전 게시물에 우리 DM이 깔려 있습니다.</b></p>
+<p style="margin-bottom:0">현재 <span class="num">4</span>개(active 2개) — 계정 수로는 적지만, 그 계정에서는 <b>제외 규칙이 완전히 무력화</b>됩니다.
+<code>next_media</code>·<code>story_reply</code> 도 같은 성질입니다.</p>
+</div>
+
+<h3>2-4. 그래서 진짜 방어선은 '자기발송 지문 필터' — 실측 방어력</h3>
+<p>발신 DM 641건 중 우리 것으로 판정된 <span class="num">225</span>건에 대해, 어떤 방어층이 잡아내는지 층별로 측정했습니다.</p>
+<div class="layers">
+  <div class="layer"><b>메시지 ID(<code>meta_message_id</code>/<code>echo_mid</code>) 일치</b>
+    <span class="m">225 / 225 <b>(100%)</b> — 실측에서 <b>단독으로 전부 잡았다</b>. 우리가 발송 로그에 mid 를 남기기 때문.</span></div>
+  <div class="layer"><b>텍스트 지문(<code>sha1(정규화)</code>) 일치</b>
+    <span class="m">2 / 225 <b>(1%)</b> — <b>거의 작동하지 않는다.</b> 버튼 DM 은 <code>message</code> 가 비어서
+    지문이 빈 문자열이 되기 때문(2차 연구의 첨부 문제와 같은 뿌리).</span></div>
+  <div class="layer"><b>첨부 제목 지문 일치 <span class="badge b-ok">첨부 추출 시 부활</span></b>
+    <span class="m">225 / 225 <b>(100%)</b> — 첨부에서 본문을 꺼내 지문을 뜨면 <b>2층 방어가 되살아난다.</b>
+    추출된 제목이 우리 <code>message_sent</code> 와 <b>지문 단위로 정확히 일치</b>했다.</span></div>
+</div>
+<div class="note ok">
+<p style="margin-top:0"><b>제가 앞서 세운 우려는 기각합니다.</b> "첨부를 읽기 시작하면 자기발송 제외가 1중 방어로 축소된다"고
+추정했지만, 측정 결과 mid 층이 <b>단독 100%</b> 였습니다.</p>
+<p style="margin-bottom:0">그리고 <b>첨부 추출은 방어를 약화시키는 게 아니라 강화합니다</b> —
+현재 죽어 있는 2층(텍스트 지문 1%)이 100%로 부활합니다. mid 가 없는 과거 로그·타워크스페이스 이관 건에 대한 안전망이 생깁니다.</p>
+</div>
+
+<h2>3. 종합 — 제외 규칙 설계 (연구 결론)</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>층</th><th>규칙</th><th>역할</th></tr></thead>
+<tbody>
+<tr><td class="nw">1차</td><td>우리 캠페인(<code>active</code>/<code>paused</code>/<code>inactive</code>)이 붙은
+  <code>media_id</code> 는 <b>수집 대상에서 제외</b></td>
+  <td>API 예산 절약 + 명백한 중복 방지. 108개 게시물</td></tr>
+<tr><td class="nw">2차</td><td><code>any_media</code>·<code>next_media</code>·<code>story_reply</code> 보유 계정은
+  <b>1차로 못 막으므로</b> 자기발송 필터에 전적으로 의존</td>
+  <td>구멍 인지. 별도 경고 로그 권장</td></tr>
+<tr><td class="nw">3차</td><td><b>자기발송 필터를 첨부까지 확장</b>(mid + 첨부 제목 지문 + 퍼지)</td>
+  <td>진짜 방어선. 죽어 있던 2층 부활</td></tr>
+<tr><td class="nw">4차</td><td>제외된 게시물도 <b>"이미 우리가 운영 중"으로 사용자에게 표시</b>(숨기지 말 것)</td>
+  <td>"내 게시물이 왜 안 나오나" 문의 방지</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>4. 예상 복원율 재산정</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>단계</th><th>상한</th><th>근거</th></tr></thead>
+<tbody>
+<tr><td>게시물 커버리지 (캠페인 감지)</td><td class="num">~99%</td><td>적응형 에스컬레이션 — 3차 연구</td></tr>
+<tr><td>DM 존재 게시물의 문구 복원</td><td class="num">92%</td><td>이번 측정. 8%는 텍스트 자체가 없는 메시지</td></tr>
+<tr><td>캠페인 단위 문구 복원</td><td class="num">95%+</td><td>게시물당 5~24건 수집 → 전부 이미지일 확률 낮음</td></tr>
+<tr><td>구조(게이트/오퍼/2단) 복원</td><td class="num">~100%</td><td><code>cta[].type</code> 이 표준 필드</td></tr>
+<tr><td>키워드 복원</td><td class="num">관측 전환</td><td>DM 받은 사람의 댓글 원문 교집합 — LLM 추측 불필요</td></tr>
+</tbody>
+</table>
+</div>
+<p><b>"99%"는 게시물 커버리지 기준으로 타당하고, 문구 기준으로는 <span class="num">92~95%</span>가 정직한 숫자입니다.</b>
+남은 5~8%는 이미지/스티커 DM 이라 텍스트가 물리적으로 없습니다 → 붙여넣기 입력창으로 마감.</p>
+
+<h2>5. 아직 안 한 연구 (다음 단계)</h2>
+<div class="note info">
+<p style="margin-top:0"><b>채점기(scorer)는 아직 돌리지 않았습니다.</b> 이번 연구는 "구조·범용성·제외 규칙"을 다뤘고,
+회수율 자체의 정답 대조는 남아 있습니다.</p>
+<p><b>다음에 측정할 것:</b></p>
+<ol style="margin:6px 0">
+<li><b>정답 대조 회수율</b> — 우리 <code>SentDMLog</code> <span class="num">53,228</span>건 대비
+  게시물 회수율·문구 일치율·키워드 일치율. <b>단 채점 시엔 우리 캠페인 게시물을 제외하지 않아야</b> 한다
+  (그게 정답지니까) → 채점 모드와 운영 모드의 제외 규칙이 <b>정반대</b>임을 코드에서 분리 필요</li>
+<li><b>7일 시간창 귀속 정확도</b> — 3차 연구에서 발견한 오귀속 버그(2026-05 게시물에 2025-09 DM 이 딸려온 건)의
+  수정 효과를 정답지로 검증</li>
+<li><b>이미지 DM 의 캡션/파일명</b> — <code>image_data</code> 에 <code>preview_url</code> 이 있으니
+  OCR 없이도 파일명·크기로 오퍼를 식별할 수 있는지</li>
+</ol>
+<p style="margin-bottom:0"><b>순서 주의</b>: 1번(베이스라인)을 먼저. 1차 연구가 틀린 이유가
+"정답 없이 추론으로 메운 것"이었습니다.</p>
+</div>
+
+<hr>
+<p class="foot">
+검증: prod 읽기 전용 — DB 조회 + Graph API GET 만. 쓰기·발송·구현 없음. 프로브 <code>probe10</code>~<code>probe13</code>.<br>
+선행 문서: <code>DM_MIGRATION_RESEARCH_R2.html</code>(첨부 발견) · <code>DM_MIGRATION_99_PLAN.html</code>(99% 설계) ·
+<code>DM_MIGRATION_MECHANISM.html</code>(동작 설명) · <code>apps/integrations/dm_migration/RESEARCH_NOTE.md</code>(1차, 정정됨).<br>
+외부 사용자의 DM 원문·링크·수신자 식별자는 싣지 않았습니다(구조 키와 집계 수치만).
+</p>
+
+</div>
+</body>
+</html>

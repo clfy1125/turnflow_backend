@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import difflib
 import logging
+import zlib
 from datetime import timedelta
 
 from django.db import transaction
 from django.utils import timezone
 
+from apps.ai_jobs.services.dm_campaign_assistant import sample_replies
+
 from ..models import AutoDMCampaign, DMCampaignCandidate, DMMigrationJob, SentDMLog
-from . import analyze, collect, llm
+from . import analyze, collect, llm, recover
 from .collect import (
     Budget,
     CollectContext,
@@ -31,6 +34,53 @@ MAX_RATE_PAUSES = 3
 MAX_OUTBOUND = 500
 CANDIDATE_CONFIDENCE_THRESHOLD = 0.50  # 확장 수집 대상(강한/불확실) 하한
 OWN_FUZZY_RATIO = 0.92
+MIN_COMMENTS = 8  # 이보다 적으면 표본이 안 나와 판정이 불가능하다
+# 공개 답글(대댓글) 변주 개수 — AI 새 캠페인(suggest_campaign_fields)의 기본값과 맞춘다.
+# 같은 문장을 계속 달면 인스타 스팸 탐지에 걸리므로 1개만 주던 예전 동작은 위험했다.
+PUBLIC_REPLY_VARIANTS = 50
+
+
+def _reply_variants(media_id: str, llm_draft: str | None) -> list[str]:
+    """공개 답글 후보를 **여러 개** 만든다 (문구 다양화).
+
+    첫 DM 본문은 원본을 그대로 살려야 해서 변주하면 안 되지만, 공개 답글은 "방금 DM
+    보내드렸어요" 류의 정형 인사라 변주해도 의미가 안 바뀐다. 오히려 같은 문장을 수백 번
+    달면 인스타 스팸 탐지에 걸리므로 **다양화가 안전 장치**다(시리얼라이저 안내도 3개 이상 권장).
+
+    문구 풀은 AI 새 캠페인과 같은 소스(``sample_replies``)를 쓴다 — LLM 미사용이라 수 ms 다.
+    LLM 초안이 있으면 맨 앞에 둬 게시물 맥락을 살리고, 나머지는 풀에서 채운다.
+    시드를 media_id 로 고정해 **재분석해도 같은 제안**이 나오게 한다.
+    """
+    seed = zlib.crc32(media_id.encode("utf-8")) if media_id else None
+    out = [t.strip() for t in (llm_draft,) if t and t.strip()]
+    for t in sample_replies(PUBLIC_REPLY_VARIANTS, seed=seed):
+        if t not in out:
+            out.append(t)
+    return out[:PUBLIC_REPLY_VARIANTS]
+
+
+def _recovery_to_dict(r, media: dict) -> dict:
+    """PostRecovery → stage_data 직렬화(체크포인트 재개용)."""
+    return {
+        "media_id": r.media_id,
+        "permalink": media.get("permalink", "") or "",
+        "caption": (media.get("caption") or "")[:300],
+        "timestamp": media.get("timestamp", ""),
+        "comments_count": media.get("comments_count", 0),
+        "probed": r.probed,
+        "trigger": r.trigger,
+        "repetition": r.repetition,
+        "signal": r.is_campaign_signal,
+        "offer": r.offer,
+        "gate": r.gate,
+        "grade": r.grade,
+        "score": r.score,
+        "confirm_required": r.confirm_required,
+        "drops": r.drops,
+        "samples": r.samples,
+        "keyword_hits": r.keyword_hits,
+    }
+
 
 _S = DMMigrationJob.Status
 _ST = DMMigrationJob.Stage
@@ -74,7 +124,12 @@ def run_migration(job_id: str, *, redispatch=None) -> str:
         runner.mark_canceled()
         return _S.CANCELED
     except MigrationTokenError as exc:
-        runner.fail("token_expired", f"IG 토큰 오류로 분석을 중단했습니다 (code={exc.code}).")
+        # 사용자에게 보이는 문장에는 Graph 코드를 붙이지 않는다 — 프론트가 꼬리를 정규식으로
+        # 잘라내고 있었다. 기술 코드는 error_code(머신 키)와 로그로 남긴다.
+        logger.warning("DM이전 토큰 오류 (job=%s, graph_code=%s)", job_id, exc.code)
+        runner.fail(
+            "token_expired", "인스타 연결이 만료되었거나 권한이 없습니다. 계정을 다시 연결해주세요."
+        )
         return _S.FAILED
     except MigrationRateLimitPause as exc:
         runner.pause(exc)
@@ -151,15 +206,86 @@ class _Runner:
         )
 
         self._stage_media()
-        self._stage_comments_first()
-        self._stage_classify_and_expand()
-        self._stage_targeted_dms()
-        self._stage_conversations()
-        self._stage_cluster()
-        self._stage_match()
+        self._stage_estimate()
+        self._stage_recover()
         self._stage_drafts()
         self.finalize()
         return job.status
+
+    # ── 단계 1.5: 예상 소요 산출 (프론트가 진행바를 그릴 수 있게) ──
+    def _stage_estimate(self):
+        if self.job.estimated_seconds is not None:
+            return
+        self._check_cancel()
+        self.job.set_stage(_ST.ESTIMATING, 8, "예상 시간을 계산하고 있습니다...")
+        media = self.sd.get("media", [])
+        targets = self._targets(media)
+        est = recover.estimate_seconds(len(targets))
+        self.job.estimated_seconds = est["seconds"]
+        self.job.estimate_detail = dict(est, media_total=len(media))
+        self.job.estimated_at = timezone.now()
+        self.job.save(
+            update_fields=["estimated_seconds", "estimate_detail", "estimated_at", "updated_at"]
+        )
+
+    def _targets(self, media: list) -> list:
+        """분석 대상 게시물 — 댓글이 있고, **우리 캠페인이 걸려 있지 않은** 것.
+
+        우리 캠페인이 도는 게시물을 넣으면 발신 DM 의 절반이 우리 것이라(실측 164/313)
+        자기 DM 을 '타사 캠페인' 으로 오인해 자기증식 후보가 생긴다.
+        """
+        ours = set(
+            AutoDMCampaign.objects.filter(ig_connection=self.conn)
+            .exclude(media_id="")
+            .values_list("media_id", flat=True)
+        )
+        return [
+            m
+            for m in media
+            if (m.get("comments_count") or 0) >= MIN_COMMENTS and m.get("id") not in ours
+        ]
+
+    # ── 단계 2: 게시물별 정밀 복원 ──
+    def _stage_recover(self):
+        if "recoveries" in self.sd:
+            return
+        self._check_cancel()
+        self.job.set_stage(_ST.COLLECTING_TARGETED_DMS, 15, "예전 DM을 찾고 있습니다...")
+        targets = self._targets(self.sd.get("media", []))
+        # 최신 게시물부터 — 결과가 나오는 대로 보여줄 수 있고, 수확도 최신 쪽이 높다.
+        targets.sort(key=lambda m: m.get("timestamp", ""), reverse=True)
+
+        mids, fps, tmpl_norms = _own_send_context(self.conn)
+        is_own = recover.build_own_dm_matcher(mids, fps, tmpl_norms)
+
+        out = []
+        total = max(len(targets), 1)
+        for i, media in enumerate(targets, 1):
+            if self.budget.total_hit():
+                break
+            if i % 5 == 0 or i == total:
+                self._check_cancel()
+                self.job.set_stage(
+                    _ST.COLLECTING_TARGETED_DMS,
+                    15 + int(70 * i / total),
+                    f"예전 DM을 찾고 있습니다... ({i}/{total})",
+                )
+            try:
+                r = recover.recover_post(self.ctx, media, is_own_dm=is_own)
+            except (MigrationTokenError, MigrationRateLimitPause):
+                raise
+            except Exception:  # noqa: BLE001 — 게시물 1건 실패가 잡을 죽이지 않게
+                logger.exception("recover_post 실패 (media=%s)", media.get("id"))
+                continue
+            if not (r.found or r.is_campaign_signal):
+                continue
+            out.append(_recovery_to_dict(r, media))
+        self.sd["recoveries"] = out
+        self.job.candidates_created = 0
+        self.job.dm_messages_collected = sum(
+            (x["offer"] or {}).get("hits", 0) + (x["gate"] or {}).get("hits", 0) for x in out
+        )
+        self._persist(counter_fields=["dm_messages_collected"])
 
     # ── 단계 1: 미디어 ──
     def _stage_media(self):
@@ -172,427 +298,124 @@ class _Runner:
         self.job.media_scanned = len(media)
         self._persist(counter_fields=["media_scanned"])
 
-    # ── 단계 2: 댓글 1차 ──
-    def _stage_comments_first(self):
-        if "comments" in self.sd:
-            return
-        self._check_cancel()
-        self.job.set_stage(_ST.COLLECTING_COMMENTS, 12, "댓글을 수집하고 있습니다...")
-        media = self.sd.get("media", [])
-        first, failed = collect.fetch_comments_first_pass(self.ctx, media)
-        # media별 텍스트 200자 절단 + media당 250개 캡(원본 최소보관).
-        comments = {}
-        after = {}
-        for mid, v in first.items():
-            comments[mid] = _trim_comments(v["comments"])
-            after[mid] = v["paging_after"]
-        self.sd["comments"] = comments
-        self.sd["comments_after"] = after
-        self.sd["failed_media_ids"] = failed
-        self.job.comments_collected = sum(len(c) for c in comments.values())
-        self._persist(counter_fields=["comments_collected"])
-
-    # ── 단계 3: 분류 + 후보 댓글 확장 ──
-    def _stage_classify_and_expand(self):
-        if "verdicts" in self.sd:
-            return
-        self._check_cancel()
-        self.job.set_stage(_ST.CLASSIFYING_POSTS, 35, "게시물을 분류하고 있습니다...")
-        media_by_id = {m.get("id"): m for m in self.sd.get("media", [])}
-        comments = self.sd.get("comments", {})
-        evidence = {
-            mid: analyze.comment_evidence(
-                media=media_by_id.get(mid, {}), comments=cs, own_account_id=self.ig
-            )
-            for mid, cs in comments.items()
-        }
-        verdicts, usage = llm.classify_posts(list(evidence.values()), model_code=self.job.llm_model)
-        self._bump_llm(usage)
-
-        # 강한/불확실 후보만 댓글 확장(포화 기반 조기 종료).
-        cand_meta = []
-        for v in verdicts:
-            if v.get("is_campaign") or v.get("confidence", 0) >= CANDIDATE_CONFIDENCE_THRESHOLD:
-                mid = v["media_id"]
-                known = {
-                    analyze.normalize_comment(c.get("text", "")) for c in comments.get(mid, [])
-                }
-                known.discard("")
-                cand_meta.append(
-                    {
-                        "media_id": mid,
-                        "after": self.sd.get("comments_after", {}).get(mid),
-                        "comments": list(comments.get(mid, [])),
-                        "known_norms": known,
-                        "keywords": v.get("keywords", []),
-                    }
-                )
-        collect.fetch_comments_expand(self.ctx, cand_meta)
-        for c in cand_meta:
-            comments[c["media_id"]] = _trim_comments(c["comments"])
-            evidence[c["media_id"]] = analyze.comment_evidence(
-                media=media_by_id.get(c["media_id"], {}),
-                comments=comments[c["media_id"]],
-                own_account_id=self.ig,
-            )
-
-        self.sd["comments"] = comments
-        self.sd["evidence"] = evidence
-        self.sd["verdicts"] = verdicts
-        self.job.comments_collected = sum(len(c) for c in comments.values())
-        self._persist(counter_fields=["comments_collected"])
-
-    # ── 단계 3.5: 타겟 DM 복원 (게시물 댓글러 → 그가 받은 발신 DM) ──
-    def _stage_targeted_dms(self):
-        if "targeted_dms" in self.sd:
-            return
-        self._check_cancel()
-        self.job.set_stage(_ST.COLLECTING_TARGETED_DMS, 48, "타겟 DM 을 복원하고 있습니다...")
-        verdicts = self.sd.get("verdicts", [])
-        # 후보(캠페인 판정 or 불확실) 게시물의 **초기(오래된) 댓글러** 를 잡는다.
-        # 캠페인 시점 참여자가 DM 을 받았고, 그들은 댓글 목록 tail 에 있다(실측 38% vs 1.7%).
-        cand_media = [
-            v["media_id"]
-            for v in verdicts
-            if v.get("is_campaign") or v.get("confidence", 0) >= CANDIDATE_CONFIDENCE_THRESHOLD
-        ]
-        media_commenters = collect.fetch_oldest_commenters(self.ctx, cand_media)
-        raw = collect.fetch_targeted_dms(self.ctx, media_commenters)
-        # 자기발송(우리 캠페인 DM)·노이즈(게이트/인사) 제외 → 외부 툴/수동 발신만 남긴다.
-        mids, fps, tmpl_norms = _own_send_context(self.conn)
-        cleaned = {}
-        for mid, rec in raw.items():
-            keep = [
-                m
-                for m in rec
-                if not _is_own(m, mids, fps, tmpl_norms)
-                and not analyze.is_noise_dm(analyze.placeholder_normalize(m.get("text", "")))
-            ]
-            if keep:
-                cleaned[mid] = keep
-        self.sd["targeted_dms"] = cleaned
-        self.job.dm_messages_collected = (self.job.dm_messages_collected or 0) + sum(
-            len(v) for v in cleaned.values()
-        )
-        self._persist(counter_fields=["dm_messages_collected"])
-
-    # ── 단계 4: DM 대화 + 자기발송 제외 ──
-    def _stage_conversations(self):
-        if "outbound_dms" in self.sd:
-            return
-        self._check_cancel()
-        self.job.set_stage(_ST.COLLECTING_DM_CONVERSATIONS, 55, "DM 기록을 수집하고 있습니다...")
-        conv = collect.fetch_conversations(self.ctx)
-        mids, fps, tmpl_norms = _own_send_context(self.conn)
-        filtered = []
-        excluded = 0
-        for m in conv["outbound"]:
-            if _is_own(m, mids, fps, tmpl_norms):
-                excluded += 1
-                continue
-            filtered.append(m)
-            if len(filtered) >= MAX_OUTBOUND:
-                break
-        self.sd["outbound_dms"] = filtered
-        self.sd["dm_scope_missing"] = conv["scope_missing"]
-        self.sd["own_sends_excluded"] = excluded
-        self.job.conversations_scanned = conv["conversations_scanned"]
-        self.job.dm_messages_collected = len(filtered)
-        self._persist(counter_fields=["conversations_scanned", "dm_messages_collected"])
-
-    # ── 단계 5: 템플릿 군집화 ──
-    def _stage_cluster(self):
-        if "templates" in self.sd:
-            return
-        self._check_cancel()
-        self.job.set_stage(_ST.CLUSTERING_DM_TEMPLATES, 70, "DM 패턴을 분석하고 있습니다...")
-        outbound = self.sd.get("outbound_dms", [])
-        templates = analyze.cluster_templates(outbound)
-        verify, usage = llm.verify_templates(templates, model_code=self.job.llm_model)
-        self._bump_llm(usage)
-        templates = [
-            t
-            for t in templates
-            if verify.get(t["template_id"], {}).get("is_campaign_template", True)
-        ]
-        self.sd["templates"] = templates
-        self.job.templates_found = len(templates)
-        self._persist(counter_fields=["templates_found"])
-
-    # ── 단계 6: 매칭 ──
-    def _stage_match(self):
-        if "matches" in self.sd:
-            return
-        self._check_cancel()
-        self.job.set_stage(_ST.MATCHING_CAMPAIGNS, 82, "게시물과 DM을 매칭하고 있습니다...")
-        media_by_id = {m.get("id"): m for m in self.sd.get("media", [])}
-        comments = self.sd.get("comments", {})
-        evidence = self.sd.get("evidence", {})
-        templates = self.sd.get("templates", [])
-        verdicts = self.sd.get("verdicts", [])
-
-        prelim = []
-        uncertain = []
-        for v in verdicts:
-            if not v.get("is_campaign"):
-                continue
-            mid = v["media_id"]
-            media = media_by_id.get(mid, {})
-            cs = comments.get(mid, [])
-            hits = analyze.keyword_hit_counts(cs, v.get("keywords", []))
-            ev = evidence.get(mid) or analyze.comment_evidence(
-                media=media, comments=cs, own_account_id=self.ig
-            )
-            cand = {
-                "media_id": mid,
-                "timestamp": analyze.parse_graph_time(media.get("timestamp", "")),
-                "keywords": v.get("keywords", []),
-                "comment_days": ev.get("comment_days", []),
-                "keyword_comment_count": sum(hits.values()),
-            }
-            best = analyze.match_candidate(cand, templates)
-            prelim.append((v, ev, hits, best))
-            if best and 0.35 <= best["python_score"] <= 0.75:
-                uncertain.append(
-                    {
-                        "media_id": mid,
-                        "template_id": best["template"]["template_id"],
-                        "caption": ev.get("caption_excerpt", ""),
-                        "keywords": v.get("keywords", []),
-                        "template_text": best["template"]["representative"],
-                    }
-                )
-        fits, usage = llm.judge_fit(uncertain, model_code=self.job.llm_model)
-        self._bump_llm(usage)
-
-        targeted = self.sd.get("targeted_dms", {})
-        matches = []
-        for v, _ev, hits, best in prelim:
-            mid = v["media_id"]
-            # 타겟 복원 DM 이 있으면 최우선 — 게시물에 직접 연결된 실제 발신 DM.
-            opening = analyze.pick_recovered_opening(targeted.get(mid) or [])
-            if opening:
-                # 강함 = URL(자료 링크) 포함 or 2명 이상에게 동일 발송 → 자동화 템플릿 확실.
-                # 약함(수동 1회성 메시지)은 그대로 LLM 에 먹이면 환각 위험 → 초안은 캡션/키워드로
-                # 생성하되, 복원 원문은 근거로 보존한다.
-                strong = opening["has_url"] or opening["recipients"] >= 2
-                matches.append(
-                    {
-                        "media_id": mid,
-                        "band": "auto_draft" if strong else "needs_review",
-                        "final_score": 0.9 if strong else 0.55,
-                        "confidence": v.get("confidence", 0),
-                        "keywords": v.get("keywords", []),
-                        "keyword_hit_counts": hits,
-                        "template_id": f"tg_{mid}",
-                        "template_source": "targeted" if strong else "targeted_weak",
-                        "template_text": opening["representative"] if strong else "",
-                        "matched_template": {
-                            "template_id": f"tg_{mid}",
-                            "source": "targeted",
-                            "cluster_size": opening["count"],
-                            "conversation_count": opening["recipients"],
-                            "has_url": opening["has_url"],
-                            "representative": opening["representative"],
-                        },
-                        "recovered_samples": [
-                            {"text": d.get("text", ""), "created_time": d.get("created_time", "")}
-                            for d in (targeted.get(mid) or [])[:3]
-                        ],
-                        "signals": {
-                            "source": "targeted",
-                            "recipients": opening["recipients"],
-                            "has_url": opening["has_url"],
-                        },
-                    }
-                )
-                continue
-            # 폴백: 전역 템플릿 매칭(시간/볼륨/키워드 + 불확실 밴드 LLM 적합도).
-            if best:
-                final = best["python_score"]
-                key = (mid, best["template"]["template_id"])
-                if key in fits:
-                    final = 0.6 * best["python_score"] + 0.4 * fits[key]
-                band = analyze.score_band(final, v.get("confidence", 0))
-                tmpl = best["template"]
-            else:
-                final, band, tmpl = 0.0, "excluded", None
-            matches.append(
-                {
-                    "media_id": mid,
-                    "band": band,
-                    "final_score": round(final, 3),
-                    "confidence": v.get("confidence", 0),
-                    "keywords": v.get("keywords", []),
-                    "keyword_hit_counts": hits,
-                    "template_id": tmpl["template_id"] if tmpl else None,
-                    "template_source": "global",
-                    "template_text": tmpl["representative"] if tmpl else "",
-                    "matched_template": _template_meta(tmpl),
-                    "signals": (
-                        {
-                            k: best[k]
-                            for k in (
-                                "time_score",
-                                "volume_score",
-                                "keyword_in_template",
-                                "sends_in_window",
-                            )
-                        }
-                        if best
-                        else {}
-                    ),
-                }
-            )
-        self.sd["matches"] = matches
-        self._persist()
-
-    # ── 단계 7: 초안 생성 + 후보 저장 ──
+    # ── 단계 3: 초안 생성 + 후보 저장 ──
     def _stage_drafts(self):
         if self.sd.get("drafts_done"):
             return
         self._check_cancel()
-        self.job.set_stage(_ST.GENERATING_DRAFTS, 90, "캠페인 초안을 생성하고 있습니다...")
+        self.job.set_stage(_ST.GENERATING_DRAFTS, 90, "캠페인 초안을 만들고 있습니다...")
+        recs = self.sd.get("recoveries", [])
         media_by_id = {m.get("id"): m for m in self.sd.get("media", [])}
-        evidence = self.sd.get("evidence", {})
-        templates = self.sd.get("templates", [])
-        matches = self.sd.get("matches", [])
-        own_excluded = self.sd.get("own_sends_excluded", 0)
-        existing_media = set(
-            AutoDMCampaign.objects.filter(ig_connection=self.conn)
-            .exclude(media_id="")
-            .values_list("media_id", flat=True)
-        )
+        existing = {
+            c.media_id: c
+            for c in AutoDMCampaign.objects.filter(ig_connection=self.conn).exclude(media_id="")
+        }
 
-        # 초안 입력 (media-bound: auto_draft/needs_review). template_text 는 매치가 이미 결정
-        # (타겟 복원본 or 전역 템플릿 대표). 전역 템플릿 사용분은 template_only 중복 방지에 기록.
-        draft_inputs = []
-        used_global_templates = set()
-        for mt in matches:
-            if mt["band"] not in ("auto_draft", "needs_review"):
-                continue
-            mid = mt["media_id"]
-            ev = evidence.get(mid, {})
-            if mt.get("template_source") == "global" and mt.get("template_id"):
-                used_global_templates.add(mt["template_id"])
-            draft_inputs.append(
-                {
-                    "media_id": mid,
-                    "caption": ev.get("caption_excerpt", ""),
-                    "keywords": mt.get("keywords", []),
-                    "confidence": mt.get("confidence", 0.6),
-                    "owner_reply_top": ev.get("owner_reply_top", ""),
-                    "template_text": mt.get("template_text", ""),
-                    "other_templates": [],
-                }
-            )
+        # LLM 은 '문구 다듬기' 에만 쓴다. 복원된 원문·링크·키워드는 관측값이라 건드리지 않는다.
+        draft_inputs = [
+            {
+                "media_id": r["media_id"],
+                "caption": r.get("caption", ""),
+                "keywords": list((r.get("keyword_hits") or {}).keys())
+                or ([r["trigger"]] if r.get("trigger") else []),
+                "confidence": r.get("score", 0.5),
+                "owner_reply_top": "",
+                "template_text": (r.get("offer") or {}).get("text", ""),
+                # 버튼이 붙으면 한도가 640자, 없으면 1000바이트 → 초안 길이 보장에 필요
+                "has_button": bool((r.get("offer") or {}).get("url"))
+                or bool((r.get("gate") or {}).get("is_gate")),
+                "other_templates": [],
+            }
+            for r in recs
+            if r.get("grade") in ("auto_draft", "needs_review")
+        ]
         drafts, usage = llm.generate_drafts(draft_inputs, model_code=self.job.llm_model)
         self._bump_llm(usage)
 
-        # 재실행 멱등: 이 잡의 기존 후보를 지우고 새로 만든다(READY 전이라 apply 안 됨).
         with transaction.atomic():
             self.job.candidates.all().delete()
             created = 0
-            for mt in matches:
-                if mt["band"] not in ("auto_draft", "needs_review"):
+            for r in recs:
+                if r.get("grade") == "excluded" and not r.get("signal"):
                     continue
                 created += 1
-                self._create_media_candidate(
-                    mt, media_by_id, evidence, drafts, existing_media, own_excluded
-                )
-            # template_only: 매칭에 안 쓰인 전역 min-support 템플릿
-            for t in templates:
-                if t["template_id"] in used_global_templates:
-                    continue
-                created += 1
-                self._create_template_only_candidate(t, own_excluded)
+                self._create_candidate(r, media_by_id, drafts, existing)
             self.job.candidates_created = created
-
         self.sd["drafts_done"] = True
         self._persist(counter_fields=["candidates_created"])
 
-    def _create_media_candidate(
-        self, mt, media_by_id, evidence, drafts, existing_media, own_excluded
-    ):
-        mid = mt["media_id"]
+    def _create_candidate(self, r: dict, media_by_id: dict, drafts: dict, existing: dict):
+        mid = r["media_id"]
         media = media_by_id.get(mid, {})
-        ev = evidence.get(mid, {})
-        tm = mt.get("matched_template") or {}
-        rep = mt.get("template_text", "")
         d = drafts.get(mid, {})
-        # 타겟 복원본이면 실제 발신 DM 샘플을, 아니면 전역 템플릿 대표를 근거 원본으로.
-        sample_dms = mt.get("recovered_samples") or (
-            [{"text": rep, "created_time": tm.get("last_sent_at", "")}] if rep else []
-        )
+        offer = r.get("offer") or {}
+        gate = r.get("gate") or {}
+        trigger = r.get("trigger")
+        keywords = d.get("keywords") or list((r.get("keyword_hits") or {}).keys())
+        if not keywords and trigger:
+            keywords = [trigger]
+        exist = existing.get(mid)
+
+        # ── 본문 길이 ──
+        # 타사 도구는 **여러 통으로 쪼개** 보내서 한 통이 우리 한도를 넘는 원문이 나온다.
+        # 우리도 게이트/오퍼를 각각 별도 DM 으로 복원하므로 한 통에 몰아넣을 일이 없고,
+        # 그래도 길면 초안 생성 단계(llm._enforce_length)가 **한도 안에서 다시 써준다**.
+        # 여기 fit 은 마지막 방어선일 뿐이라 사용자에게 '잘렸다' 고 알리지 않는다
+        # (잘린 문장을 보여주느니 한도 안에서 말이 되는 문구를 주는 게 낫다).
+        raw_opening = d.get("first_dm_draft") or offer.get("text") or ""
+        has_button = bool(offer.get("url")) or bool(gate.get("is_gate"))
+        opening, _ = analyze.fit_dm_text(raw_opening, has_button=has_button)
+        gate_msg, _ = analyze.fit_dm_text(gate.get("text") or "", has_button=True)
+        drops = list(r.get("drops") or [])
         DMCampaignCandidate.objects.create(
             job=self.job,
             ig_connection=self.conn,
             status=DMCampaignCandidate.Status.DETECTED,
-            band=mt["band"],
+            band=r.get("grade") or DMCampaignCandidate.Band.NEEDS_REVIEW,
             media_id=mid,
-            media_permalink=media.get("permalink", "") or "",
-            media_caption_excerpt=(media.get("caption", "") or "")[:300],
+            media_permalink=r.get("permalink", ""),
+            media_caption_excerpt=r.get("caption", "")[:300],
             media_timestamp=analyze.parse_graph_time(media.get("timestamp", "")),
-            suggested_keywords=d.get("keywords") or mt.get("keywords", []),
+            suggested_keywords=keywords[:5],
             suggested_keyword_mode=d.get("keyword_mode") or "any",
-            confidence=mt.get("final_score", 0.0),
+            confidence=r.get("score", 0.0),
             draft_name=d.get("name", ""),
             draft_description=d.get("description", ""),
-            draft_opening_message=d.get("first_dm_draft", ""),
-            draft_public_reply_templates=(
-                [d["public_reply_draft"]] if d.get("public_reply_draft") else []
-            ),
-            follow_up_candidates=[
-                {
-                    "text": t,
-                    "confidence": mt.get("confidence", 0.5),
-                    "source_template_id": mt.get("template_id"),
-                    "cluster_size": tm.get("cluster_size") or tm.get("count", 0),
-                }
-                for t in (d.get("followup_candidates") or [])
-            ],
-            matched_template=tm,
+            # 첫 DM 본문 — 오퍼 원문이 있으면 그것을, 없으면 LLM 초안을(포맷 한도에 맞춰 자름).
+            draft_opening_message=opening,
+            draft_public_reply_templates=_reply_variants(mid, d.get("public_reply_draft")),
+            follow_up_candidates=[],
+            # ── 정밀도 근거 ──
+            support_hits=(offer or gate).get("hits", 0),
+            support_probed=r.get("probed", 0),
+            support_score=r.get("score", 0.0),
+            # ── 산출물 1순위 ──
+            offer_url=(offer.get("url") or "")[:1000],
+            offer_button_label=(offer.get("label") or "")[:100],
+            gate_detected=bool(gate.get("is_gate")),
+            gate_message=gate_msg,
+            gate_button_label=(gate.get("label") or "")[:100],
+            confirm_required=bool(r.get("confirm_required")),
+            transfer_drops=drops,
+            matched_template={
+                "source": "support",
+                "support_hits": (offer or gate).get("hits", 0),
+                "support_probed": r.get("probed", 0),
+                "support_ratio": (offer or gate).get("ratio", 0),
+                "first_sent_at": (r.get("samples") or [{}])[0].get("created_time", ""),
+                "last_sent_at": (r.get("samples") or [{}])[-1].get("created_time", ""),
+            },
             evidence_aggregates={
-                "matched_comment_count": sum((mt.get("keyword_hit_counts") or {}).values()),
-                "total_comment_count": ev.get("comments_analyzed", 0),
-                "keyword_hit_counts": mt.get("keyword_hit_counts", {}),
-                "account_replied_publicly": ev.get("account_replied_publicly", False),
-                "dm_source": mt.get("template_source", ""),
-                "dm_recovered_recipients": (mt.get("signals") or {}).get("recipients", 0),
-                "dm_burst_overlap_ratio": (mt.get("signals") or {}).get("time_score", 0.0),
-                "time_window": [tm.get("first_sent_at", ""), tm.get("last_sent_at", "")],
-                "has_existing_campaign": mid in existing_media,
-                "own_sends_excluded": own_excluded,
+                "matched_comment_count": sum((r.get("keyword_hits") or {}).values()),
+                "total_comment_count": r.get("comments_count", 0),
+                "keyword_hit_counts": r.get("keyword_hits") or {},
+                "repetition_ratio": r.get("repetition", 0),
+                "dm_source": "targeted",
+                "support_ratio": (offer or gate).get("ratio", 0),
+                "has_existing_campaign": bool(exist),
+                "existing_campaign_status": exist.status if exist else "",
             },
-            evidence_raw={
-                "sample_comments": ev.get("sample_comments", []),
-                "sample_outbound_dms": sample_dms,
-                "template_representative_text": rep,
-            },
-        )
-
-    def _create_template_only_candidate(self, t, own_excluded):
-        DMCampaignCandidate.objects.create(
-            job=self.job,
-            ig_connection=self.conn,
-            status=DMCampaignCandidate.Status.DETECTED,
-            band=DMCampaignCandidate.Band.TEMPLATE_ONLY,
-            media_id="",
-            confidence=0.4,
-            draft_opening_message=_strip_urls(t["representative"]),
-            matched_template=_template_meta(t),
-            evidence_aggregates={
-                "cluster_size": t.get("count", 0),
-                "conversation_count": t.get("conversation_count", 0),
-                "time_window": [t.get("first_sent_at", ""), t.get("last_sent_at", "")],
-                "own_sends_excluded": own_excluded,
-            },
-            evidence_raw={
-                "sample_outbound_dms": [
-                    {"text": t["representative"], "created_time": t.get("last_sent_at", "")}
-                ],
-                "template_representative_text": t.get("representative", ""),
-            },
+            evidence_raw={"sample_outbound_dms": r.get("samples", [])},
         )
 
     # ── 종결/상태 전이 ──

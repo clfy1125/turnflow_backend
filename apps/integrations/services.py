@@ -596,6 +596,67 @@ class MockInstagramProvider:
         return items
 
     @classmethod
+    def mock_user_conversation(cls, ig_user_id: str, user_id: str, media_id: str = "") -> list:
+        """특정 댓글러와의 대화 mock — DM 캠페인 이전의 '타겟 복원' 경로용.
+
+        실제 캠페인 구조를 그대로 흉내낸다:
+          · 게이트 DM (버튼만, url 없음 → cta.type=postback)
+          · 오퍼 DM (**attachments.generic_template** 에 본문 + cta.url)
+        ``message`` 는 **일부러 빈 문자열**로 둔다 — 실제 버튼 DM 이 그렇고,
+        추출기가 첨부를 읽지 않으면 복원이 0 이 되는 것을 테스트가 잡아내야 하기 때문.
+
+        캠페인 미디어가 아니면 빈 목록. 캠페인 미디어여도 일부 댓글러는 미수신(비팔로워 등)
+        으로 두어 지지비율이 1.0 이 아닌 현실적인 값이 나오게 한다.
+        """
+        media = {m["id"]: m for m in cls._mock_campaign_media(ig_user_id)}
+        m = media.get(media_id)
+        if not m or not m["is_campaign"]:
+            return []
+        rng = cls._mock_rng(f"userconv:{ig_user_id}:{media_id}:{user_id}")
+        if rng.random() < 0.2:  # 20% 는 DM 미수신
+            return []
+        kw = cls._MOCK_KEYWORDS[m["kw_idx"]]
+        url = f"https://ex.co/{m['index']}"
+        sent = m["timestamp"] + timedelta(minutes=rng.uniform(1, 90))
+        base = {"from": {"id": str(ig_user_id)}, "to": {"data": [{"id": str(user_id)}]}}
+        return [
+            {
+                "id": f"mockmsg-gate-{media_id}-{user_id}",
+                "created_time": cls._mock_graph_ts(sent),
+                "message": "",
+                "attachments": {
+                    "data": [
+                        {
+                            "generic_template": {
+                                "title": "팔로우 확인을 위해 아래 버튼을 눌러주세요.",
+                                "cta": [{"title": "팔로우 확인", "type": "postback"}],
+                            }
+                        }
+                    ]
+                },
+                **base,
+            },
+            {
+                "id": f"mockmsg-offer-{media_id}-{user_id}",
+                "created_time": cls._mock_graph_ts(sent + timedelta(minutes=1)),
+                "message": "",
+                "attachments": {
+                    "data": [
+                        {
+                            "generic_template": {
+                                "title": f"요청하신 {kw} 보내드려요! 아래 버튼에서 확인해주세요 😊",
+                                "cta": [
+                                    {"title": f"{kw} 받기", "type": "web_url", "url": url}
+                                ],
+                            }
+                        }
+                    ]
+                },
+                **base,
+            },
+        ]
+
+    @classmethod
     def mock_list_media_page(
         cls, ig_user_id: str, limit: int = 50, after: str | None = None
     ) -> dict:
@@ -1410,8 +1471,9 @@ class InstagramMessagingService:
         params = {
             "platform": "instagram",
             "fields": (
+                # attachments 필수 — 사유는 list_user_conversation 참조(버튼 DM 본문 은닉).
                 f"id,updated_time,messages.limit({message_limit})"
-                "{id,created_time,from,to,message}"
+                "{id,created_time,from,to,message,attachments}"
             ),
             "limit": limit,
             "access_token": access_token,
@@ -1455,7 +1517,13 @@ class InstagramMessagingService:
         params = {
             "platform": "instagram",
             "user_id": str(user_id),
-            "fields": (f"id,messages.limit({message_limit})" "{id,created_time,from,to,message}"),
+            # ⚠️ attachments 필수 — 버튼 DM(generic_template)은 message 가 빈 문자열로 오고
+            # 본문이 attachments.data[].generic_template.title, 오퍼 링크가 cta[].url 에 들어간다.
+            # 실측(2026-08-13): 자동화 계정의 발신 DM 67~100% 가 이 형태 → 빼면 복원율 0.
+            "fields": (
+                f"id,messages.limit({message_limit})"
+                "{id,created_time,from,to,message,attachments}"
+            ),
             "access_token": access_token,
         }
         resp = get_http_session().get(url, params=params, timeout=cls.DEFAULT_TIMEOUT)

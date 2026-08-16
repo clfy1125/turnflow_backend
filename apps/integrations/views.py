@@ -744,6 +744,18 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 except Exception as e:
                     logger.warning(f"Failed to enqueue insights bootstrap (non-fatal): {e}")
 
+                # 다른 서비스에서 쓰던 DM 캠페인 **선(先)분석** — 사용자가 열어보기 전에
+                # 백그라운드로 미리 돌려 캐시해 둔다(결과 재사용 7일). 분석이 계정당 수 분~
+                # 수십 분이라 요청 시점에 시작하면 그만큼 기다리게 되기 때문.
+                # 전 플랜(무료 포함). 실패해도 사용자에게 노출되지 않는다. best-effort.
+                try:
+                    from .tasks import prewarm_dm_migration
+
+                    prewarm_dm_migration.delay(str(connection.id))
+                    logger.info(f"Enqueued dm-migration prewarm for {connection.id}")
+                except Exception as e:
+                    logger.warning(f"Failed to enqueue dm-migration prewarm (non-fatal): {e}")
+
                 # 프로필 사진 캐싱 — IG CDN URL 은 서명된 일시 URL 이라 만료될 수 있으므로
                 # 연동 즉시 우리 스토리지로 사본을 끌어와서 안정 URL 확보. best-effort.
                 try:
@@ -2332,6 +2344,19 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
             if requested_tt:
                 qs = qs.filter(trigger_type__in=requested_tt)
 
+        # facet: source (생성 출처) — "불러온 캠페인만 보기" 필터.
+        # 빈 문자열은 쿼리스트링으로 구분이 안 되므로 직접 만든 것은 별칭 `direct` 로 받는다.
+        source_param = (params.get("source") or "").strip()
+        if source_param:
+            valid_src = {c[0] for c in AutoDMCampaign._meta.get_field("source").choices} | {
+                "direct"
+            }
+            if source_param not in valid_src:
+                raise DRFValidationError(
+                    {"source": f"허용되지 않은 source: {source_param}. 가능: {sorted(valid_src)}"}
+                )
+            qs = qs.filter(source="" if source_param == "direct" else source_param)
+
         # facet: 불리언 토글 (follow_gate_enabled / public_reply_enabled)
         for bool_field in ("follow_gate_enabled", "public_reply_enabled"):
             raw = params.get(bool_field)
@@ -3225,8 +3250,26 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         로그인한 사용자가 멤버인 workspace 의 모든 Auto DM 캠페인을 조회합니다.
         상태(status)·생성일 범위로 필터링하고, 여러 기준으로 정렬할 수 있습니다.
 
-        ## 응답 형태
-        **페이지네이션 없이** 캠페인 객체 배열을 그대로 반환합니다(평면 리스트).
+        ## 응답 형태 — 페이지네이션은 **opt-in**
+
+        | 요청 | 응답 |
+        |---|---|
+        | `page`·`page_size` **없음** (기존) | 캠페인 객체 **평면 배열** — 전체가 한 번에 옵니다 |
+        | `page` 또는 `page_size` **있음** | `{ count, next, previous, results }` **봉투** |
+
+        기존 클라이언트를 깨지 않으려고 opt-in 으로 두었습니다. 새로 붙이는 화면은
+        `?page=1&page_size=20` 을 붙여 봉투로 받으세요.
+
+        - `page_size` 기본 **20**, 최대 **100**. 범위 밖 값은 400 이 아니라 **clamp** 합니다.
+        - `count` 는 **현재 필터에 걸린 전체 수**입니다 — "전체 선택 N개" 표시의 단일 소스로 쓰세요.
+        - 모든 필터(`status`·`trigger_type`·`source`·`search`·`created_after/before`)와
+          `ordering` 이 페이지네이션과 함께 동작합니다. 정렬은 **서버에서** 하세요 —
+          페이지 안에서만 정렬하면 순서가 페이지마다 뒤섞입니다.
+        - 썸네일 확보 예약도 **현재 페이지 항목만** 수행합니다.
+
+        > 「전체 선택」 후 일괄 처리는 `bulk-pause`/`bulk-resume`/`bulk-delete` 에
+        > **`{"all": true}`** 를 보내고 **목록과 같은 쿼리스트링**을 그대로 붙이세요.
+        > 그러면 현재 페이지가 아니라 **필터에 걸린 전체**가 대상이 됩니다.
 
         **항목별 통계 필드(read-only)** — 항목마다 통계를 따로 호출(N+1)할 필요 없이 함께 옵니다:
         | 필드 | 타입 | 의미 |
@@ -3253,6 +3296,7 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         | `search` | string | 캠페인 이름/설명 + 연동 IG username 부분일치 검색. |
         | `status` | string | 상태 필터. 콤마 다중. 값: `active`/`paused`/`completed`/`inactive`. 예: `status=active,paused` |
         | `trigger_type` | string | 트리거 필터. 콤마 다중. 값: `specific_media`/`any_media`/`next_media`/`story_reply`. |
+        | `source` | string | 생성 출처 필터. `dm_migration`(다른 서비스에서 불러온 것만) / `direct`(사용자가 직접 만든 것만). 빈 문자열은 쿼리로 구분이 안 돼 `direct` 를 별칭으로 쓴다. |
         | `follow_gate_enabled` | bool | Follow-gate 사용 여부 필터 (true/false). |
         | `public_reply_enabled` | bool | 공개 답글 사용 여부 필터 (true/false). |
         | `created_after` | date \\| datetime | 이 시각/날짜 **이후**(포함) 생성분. `YYYY-MM-DD` 또는 ISO8601. 날짜만 주면 그날 **00:00:00**(Asia/Seoul)부터. |
@@ -3327,6 +3371,34 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
                 required=False,
                 enum=["specific_media", "any_media", "next_media", "story_reply"],
                 description="트리거 종류 필터. 콤마로 다중 지정 가능.",
+            ),
+            OpenApiParameter(
+                name="page",
+                type=int,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description=(
+                    "1부터. **주면 응답이 `{count,next,previous,results}` 봉투로 바뀝니다.** "
+                    "안 주면 기존처럼 평면 배열."
+                ),
+            ),
+            OpenApiParameter(
+                name="page_size",
+                type=int,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="페이지당 개수. 기본 20, 최대 100. 범위 밖은 400 이 아니라 clamp.",
+            ),
+            OpenApiParameter(
+                name="source",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                enum=["dm_migration", "direct"],
+                description=(
+                    "생성 출처 필터. `dm_migration`=다른 서비스에서 불러온 캠페인만, "
+                    "`direct`=사용자가 직접 만든 것만(응답의 `source` 는 빈 문자열)."
+                ),
             ),
             OpenApiParameter(
                 name="follow_gate_enabled",
@@ -3411,17 +3483,53 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         # filter_queryset 으로 ?search= (이름/설명/IG username) 적용. get_queryset 에서
         # 이미 통계 annotate + status/facet/날짜 필터 + ordering 이 적용된 상태.
         queryset = self.filter_queryset(self.get_queryset())
-        campaigns = list(queryset)
-        serializer = self.get_serializer(campaigns, many=True)
-        data = serializer.data
 
-        # 썸네일 사본이 아직 없는 캠페인은 **비동기로** 확보를 예약한다.
-        # 예전엔 이 자리에서 캠페인마다 Graph 를 동기 호출했다(항목당 최대 5초 × N, 순차) —
-        # 게다가 얻은 CDN URL 은 만료되고, 릴스/캐러셀에선 이미지도 아니었다.
-        # 이제 응답은 DB 컬럼만 읽고(추가 쿼리 0), 채우는 일은 워커가 한다.
+        # 페이지네이션은 **opt-in** — page 나 page_size 를 준 요청만 봉투로 돌려준다.
+        # 기존 클라이언트(평면 배열 전제)를 깨지 않으면서 새 클라이언트만 옮겨가게 하기 위함.
+        paginated = "page" in request.query_params or "page_size" in request.query_params
+        if not paginated:
+            campaigns = list(queryset)
+            data = self.get_serializer(campaigns, many=True).data
+            self._enqueue_missing_thumbnails(campaigns)
+            return Response(data)
+
+        # 상한 밖 값은 400 대신 clamp (프론트 요청) — 목록 조회가 값 하나로 실패하면 손해가 크다.
+        page_size = min(
+            max(self._int_query("page_size", self.DEFAULT_PAGE_SIZE), 1), self.MAX_PAGE_SIZE
+        )
+        page = max(self._int_query("page", 1), 1)
+        total = queryset.count()
+        start = (page - 1) * page_size
+        campaigns = list(queryset[start : start + page_size])
+        data = self.get_serializer(campaigns, many=True).data
+        # 썸네일 예약도 **현재 페이지만** — 300개 계정에서 목록 한 번에 300건이 큐로 가지 않는다.
         self._enqueue_missing_thumbnails(campaigns)
 
-        return Response(data)
+        return Response(
+            {
+                "count": total,  # 필터에 걸린 전체 수 — "전체 선택 N개" 표시의 단일 소스
+                "next": self._page_url(request, page + 1, page_size, total),
+                "previous": self._page_url(request, page - 1, page_size, total),
+                "results": data,
+            }
+        )
+
+    DEFAULT_PAGE_SIZE = 20
+    MAX_PAGE_SIZE = 100
+
+    def _int_query(self, name, default):
+        try:
+            return int(self.request.query_params.get(name, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _page_url(self, request, page, page_size, total):
+        if page < 1 or (page - 1) * page_size >= total:
+            return None
+        q = request.query_params.copy()
+        q["page"] = page
+        q["page_size"] = page_size
+        return f"{request.build_absolute_uri(request.path)}?{q.urlencode()}"
 
     # 목록 조회마다 같은 캠페인의 동기화를 재발행하지 않도록 하는 큐 억제 창(초).
     _THUMBNAIL_ENQUEUE_THROTTLE_SEC = 300
@@ -4152,12 +4260,26 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
             '요청 `{"ids": [<uuid>, ...]}` (최대 200개). 응답은 '
             '`{"succeeded": [<uuid>...], "failed": [{"id", "reason"}...]}` 형태로, '
             "권한 없거나 존재하지 않는 id 는 `failed`(reason=`not_found`)에 담깁니다 "
-            "(전체 실패가 아니라 건별 부분 성공)."
+            "(전체 실패가 아니라 건별 부분 성공).\n\n"
+            '## 「전체 선택」 — `{"all": true}`\n'
+            "목록에 페이지네이션을 쓰면 화면의 체크박스는 **현재 페이지**만 가리킵니다. "
+            "진짜 전체에 적용하려면 `ids` 대신 `all: true` 를 보내고, **목록 호출에 쓴 "
+            "쿼리스트링을 그대로** 붙이세요(`status`·`trigger_type`·`source`·`search`·"
+            "`created_after/before`·`ig_connection_id`).\n\n"
+            "```\n"
+            "POST .../bulk-pause/?workspace_id=..&status=active&source=dm_migration&search=룩북\n"
+            '{ "all": true, "exclude_ids": ["<사용자가 체크 해제한 id>"] }\n'
+            "```\n\n"
+            "대상은 **목록과 같은 코드**로 계산하므로 `GET` 목록의 `count` 와 정확히 일치합니다. "
+            "상한은 **1000건** — 넘으면 `400 too_many_targets`(`count`·`max` 동봉)이니 필터를 "
+            "좁혀 나눠 실행하세요. 일부만 조용히 처리하지 않습니다."
         ),
         request=CampaignBulkActionRequestSerializer,
         responses={
             200: CampaignBulkActionResponseSerializer,
-            400: OpenApiResponse(description="ids 누락/형식 오류"),
+            400: OpenApiResponse(
+                description="ids 누락/형식 오류 · all 과 ids 동시 지정 · too_many_targets(>1000)"
+            ),
             401: OpenApiResponse(description="인증 필요"),
         },
         tags=["Auto DM"],
@@ -4172,7 +4294,8 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         description=(
             "여러 캠페인을 한 번에 재개(status=active)합니다. 과거가 된 종료 예약은 건별로 "
             "자동 해제합니다(단건 resume 과 동일 규칙).\n\n"
-            "요청/응답 형식은 일괄 일시정지와 동일.\n\n"
+            '요청/응답 형식은 일괄 일시정지와 동일 — **「전체 선택」 `{"all": true}` 도 같습니다** '
+            '(예: `?source=dm_migration&status=inactive` + `{"all": true}` = 불러온 캠페인 전부 켜기).\n\n'
             "**중복 방지**: 같은 게시물(`media_id`)에 이미 다른 활성 캠페인이 있는 건은 재개되지 않고 "
             "`failed` 에 `reason='duplicate_active_campaign'` 으로 담깁니다(전체 실패가 아니라 건별 격리). "
             '프론트는 이 사유를 받아 "이미 활성 캠페인이 있어 재개하지 못했습니다" 안내를 보여주세요.'
@@ -4180,7 +4303,9 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         request=CampaignBulkActionRequestSerializer,
         responses={
             200: CampaignBulkActionResponseSerializer,
-            400: OpenApiResponse(description="ids 누락/형식 오류"),
+            400: OpenApiResponse(
+                description="ids 누락/형식 오류 · all 과 ids 동시 지정 · too_many_targets(>1000)"
+            ),
             401: OpenApiResponse(description="인증 필요"),
         },
         tags=["Auto DM"],
@@ -4194,13 +4319,17 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         summary="캠페인 일괄 삭제",
         description=(
             "여러 캠페인을 한 번에 삭제합니다(되돌릴 수 없음).\n\n"
-            "요청/응답 형식은 일괄 일시정지와 동일. 권한 없거나 없는 id 는 "
-            "`failed`(reason=`not_found`)."
+            '요청/응답 형식은 일괄 일시정지와 동일 — **「전체 선택」 `{"all": true}` 도 같습니다.** '
+            "권한 없거나 없는 id 는 `failed`(reason=`not_found`).\n\n"
+            "⚠️ 삭제는 되돌릴 수 없고 **발송 로그도 함께 사라집니다**. `all: true` 로 보내기 전에 "
+            "`GET` 목록의 `count` 를 사용자에게 보여주고 확인을 받으세요."
         ),
         request=CampaignBulkActionRequestSerializer,
         responses={
             200: CampaignBulkActionResponseSerializer,
-            400: OpenApiResponse(description="ids 누락/형식 오류"),
+            400: OpenApiResponse(
+                description="ids 누락/형식 오류 · all 과 ids 동시 지정 · too_many_targets(>1000)"
+            ),
             401: OpenApiResponse(description="인증 필요"),
         },
         tags=["Auto DM"],
@@ -4210,16 +4339,58 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         """캠페인 일괄 삭제"""
         return self._bulk_action(request, "delete")
 
+    # "전체 선택" 한 번에 처리할 수 있는 최대 캠페인 수. 넘으면 필터를 좁히라고 400 으로 알린다
+    # (조용히 일부만 처리하면 사용자는 전부 처리된 줄 안다).
+    BULK_ALL_MAX = 1000
+
+    # 반환 타입을 문자열로 쓴다 — 이 클래스 안에서 `list` 는 DRF 의 list() 액션이라
+    # `list[str]` 이 "function object is not subscriptable" 로 터진다.
+    def _bulk_all_ids(self, request) -> "list[str]":
+        """``all=true`` 대상 — **목록과 똑같은 필터**에 걸린 전체 캠페인 id.
+
+        페이지네이션이 들어가도 "전체 선택" 이 현재 페이지가 아니라 진짜 전체를 가리키게
+        하는 지점이다. 목록과 같은 코드(`_filter_and_order_list` + SearchFilter)를 타므로
+        필터 해석이 어긋날 수 없다 — 조건을 여기에 복제하면 반드시 갈라진다.
+        """
+        user_workspaces = Workspace.objects.filter(memberships__user=request.user)
+        qs = AutoDMCampaign.objects.filter(ig_connection__workspace__in=user_workspaces)
+        ig_connection_id = request.query_params.get("ig_connection_id")
+        if ig_connection_id:
+            qs = qs.filter(ig_connection_id=ig_connection_id)
+        qs = self._filter_and_order_list(qs)
+        qs = SearchFilter().filter_queryset(request, qs, self)  # ?search= (목록과 동일)
+
+        total = qs.count()
+        if total > self.BULK_ALL_MAX:
+            raise DRFValidationError(
+                {
+                    "all": [
+                        f"대상이 {total}개로 한 번에 처리할 수 있는 상한({self.BULK_ALL_MAX})을 "
+                        "넘습니다. 필터를 좁혀서 나눠 실행해주세요."
+                    ],
+                    "code": "too_many_targets",
+                    "count": total,
+                    "max": self.BULK_ALL_MAX,
+                }
+            )
+        return [str(i) for i in qs.values_list("id", flat=True)]
+
     def _bulk_action(self, request, op):
         """벌크 액션 공통 처리 — 건별 부분 성공.
 
         본인 워크스페이스 소속 캠페인만 대상이며, 그 외 id 는 not_found 로 실패 처리한다.
+        ``all=true`` 면 현재 필터에 걸린 전체가 대상(`_bulk_all_ids`).
         반환: {"succeeded": [id...], "failed": [{"id", "reason"}...]}.
         """
         in_ser = CampaignBulkActionRequestSerializer(data=request.data)
         in_ser.is_valid(raise_exception=True)
-        # 입력 순서 유지하며 중복 제거
-        ids = list(dict.fromkeys(str(i) for i in in_ser.validated_data["ids"]))
+        vd = in_ser.validated_data
+        if vd.get("all"):
+            excluded = {str(i) for i in (vd.get("exclude_ids") or [])}
+            ids = [i for i in self._bulk_all_ids(request) if i not in excluded]
+        else:
+            # 입력 순서 유지하며 중복 제거
+            ids = list(dict.fromkeys(str(i) for i in vd["ids"]))
 
         user_workspaces = Workspace.objects.filter(memberships__user=request.user)
         owned = {

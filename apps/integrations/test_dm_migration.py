@@ -124,7 +124,7 @@ def test_start_returns_running_job_as_is(no_dispatch):
 
 
 @pytest.mark.django_db
-def test_start_reuses_ready_within_24h_else_new(no_dispatch):
+def test_start_reuses_ready_within_cache_window_else_new(no_dispatch):
     user = _user()
     ws = _ws(user)
     conn = _conn(ws)
@@ -140,8 +140,8 @@ def test_start_reuses_ready_within_24h_else_new(no_dispatch):
     assert resp.status_code == 200 and resp.data["reused"] is True
     assert resp.data["job"]["id"] == str(recent.id)
 
-    # 25시간 전 완료 → 재사용 안 함, 새 잡
-    recent.finished_at = timezone.now() - timedelta(hours=25)
+    # 캐시 창(7일)을 넘긴 완료 결과 → 재사용 안 함, 새 잡
+    recent.finished_at = timezone.now() - timedelta(days=8)
     recent.save(update_fields=["finished_at"])
     resp2 = client.post(
         f"{JOBS_URL}?workspace_id={ws.id}", {"ig_connection_id": str(conn.id)}, format="json"
@@ -168,8 +168,8 @@ def test_force_within_cooldown_429_then_allowed(no_dispatch):
     # DRF 가 APIException detail 값을 ErrorDetail(str)로 감싸므로 int 로 캐스팅해 비교.
     assert int(resp.data["error"]["details"]["retry_after"]) > 0
 
-    # 2시간 전 종료 → 쿨다운 해제 → 생성
-    ready.finished_at = timezone.now() - timedelta(hours=2)
+    # force 쿨다운(6h) 밖 + 캐시 창 밖 → 생성
+    ready.finished_at = timezone.now() - timedelta(days=8)
     ready.save(update_fields=["finished_at"])
     resp2 = client.post(
         f"{JOBS_URL}?workspace_id={ws.id}",
@@ -282,6 +282,10 @@ def test_pipeline_e2e_mock_fake_llm(monkeypatch):
     user = _user()
     ws = _ws(user)
     conn = _conn(ws, mock_token=True)
+    # mock 픽스처는 ig 계정 id 를 시드로 쓴다 → 결정적 재현을 위해 고정한다.
+    # (랜덤 uuid 를 쓰면 캠페인 미디어 비율·DM 수신 여부가 실행마다 달라져 플래키해진다)
+    conn.external_account_id = "17841400000000001"
+    conn.save(update_fields=["external_account_id"])
     job = _job(conn, media_limit=50)
     status = pipeline.run_migration(str(job.id))
     assert status in (DMMigrationJob.Status.READY, DMMigrationJob.Status.PARTIAL), status
@@ -292,104 +296,73 @@ def test_pipeline_e2e_mock_fake_llm(monkeypatch):
     assert job.candidates_created > 0
     cands = list(job.candidates.all())
     assert cands
-    # evidence 양쪽 채움 확인 (media-bound 후보 하나 이상)
-    media_bound = [c for c in cands if c.media_id]
-    assert media_bound
-    c = media_bound[0]
+    assert all(c.media_id for c in cands)  # 전부 게시물에 묶인 후보
+    # 실제로 DM 을 복원한 후보(= 오퍼 링크 확보)가 하나 이상 나와야 한다.
+    # mock 대화는 message 가 비고 본문이 attachments 에만 있으므로, 이 단언이
+    # **첨부 추출이 살아 있는지** 를 e2e 로 지킨다.
+    recovered = [c for c in cands if c.offer_url]
+    assert recovered, "첨부에서 오퍼 링크를 복원하지 못했다 (extract_dm_content 회귀?)"
+    c = recovered[0]
     assert c.evidence_aggregates and c.evidence_raw is not None
     assert c.draft_opening_message  # 초안 생성됨
+    assert c.support_probed > 0 and c.support_hits > 0
+    assert c.gate_detected  # mock 캠페인은 팔로우 확인 단계를 쓴다
 
 
 @pytest.mark.django_db
 def test_pipeline_resumes_from_checkpoint(monkeypatch):
+    """stage_data 에 결과가 있으면 수집기를 다시 호출하지 않는다(체크포인트 재개)."""
     monkeypatch.setattr(settings, "DM_MIGRATION_FAKE_LLM", True)
     user = _user()
     ws = _ws(user)
     conn = _conn(ws, mock_token=True)
 
-    # 수집기가 호출되면 실패시켜, 체크포인트 재개(수집 스킵)를 증명.
     def _boom(*a, **k):
         raise AssertionError("collector should not be called on resume")
 
-    monkeypatch.setattr(collect, "fetch_media", _boom)
-    monkeypatch.setattr(collect, "fetch_comments_first_pass", _boom)
-    monkeypatch.setattr(collect, "fetch_comments_expand", _boom)
-    monkeypatch.setattr(collect, "fetch_conversations", _boom)
-    monkeypatch.setattr(collect, "fetch_targeted_dms", _boom)
+    for fn in ("fetch_media", "collect_commenters", "fetch_outbound_for_commenter"):
+        monkeypatch.setattr(collect, fn, _boom)
 
-    media = [
-        {
-            "id": "mm-x-0-camp0",
-            "caption": "댓글에 링크 남겨주세요",
-            "timestamp": "2026-07-01T00:00:00+0000",
-            "permalink": "https://x/0",
-            "comments_count": 5,
-        }
-    ]
-    ev = {
-        "mm-x-0-camp0": {
-            "media_id": "mm-x-0-camp0",
-            "caption_excerpt": "댓글에 링크",
-            "comments_analyzed": 5,
-            "comment_days": ["2026-07-01"],
-            "account_replied_publicly": True,
-            "owner_reply_top": "DM 드렸어요",
-            "sample_comments": [{"text": "링크", "timestamp": "2026-07-01T01:00:00+0000"}],
-        }
-    }
-    tmpl = {
-        "template_id": "t0",
-        "normalized": "요청하신 링크 {url}",
-        "representative": "요청하신 링크 https://x",
-        "count": 10,
-        "conversation_count": 8,
-        "conversation_ids": [],
-        "first_sent_at": "",
-        "last_sent_at": "",
-        "send_times": ["2026-07-01T05:00:00+0000"],
-        "variable_slots": ["url"],
-    }
+    mid = "mm-x-0-camp0"
     job = _job(
         conn,
+        estimated_seconds=42,
         stage_data={
-            "media": media,
-            "comments": {
-                "mm-x-0-camp0": [
-                    {
-                        "id": "c1",
-                        "text": "링크",
-                        "timestamp": "2026-07-01T01:00:00+0000",
-                        "parent_id": None,
-                        "from": {"id": "igsid_1"},
-                    }
-                ]
-            },
-            "comments_after": {},
-            "failed_media_ids": [],
-            "targeted_dms": {},
-            "evidence": ev,
-            "verdicts": [
+            "media": [
                 {
-                    "media_id": "mm-x-0-camp0",
-                    "is_campaign": True,
-                    "confidence": 0.9,
-                    "keywords": ["링크"],
+                    "id": mid,
+                    "caption": "댓글에 '자료' 남겨주세요",
+                    "timestamp": "2026-07-01T00:00:00+0000",
+                    "permalink": "https://x/0",
+                    "comments_count": 20,
                 }
             ],
-            "outbound_dms": [],
-            "dm_scope_missing": False,
-            "own_sends_excluded": 0,
-            "templates": [tmpl],
-            "matches": [
+            "recoveries": [
                 {
-                    "media_id": "mm-x-0-camp0",
-                    "band": "auto_draft",
-                    "final_score": 0.8,
-                    "confidence": 0.9,
-                    "keywords": ["링크"],
-                    "keyword_hit_counts": {"링크": 3},
-                    "template_id": "t0",
-                    "signals": {"time_score": 0.7},
+                    "media_id": mid,
+                    "permalink": "https://x/0",
+                    "caption": "댓글에 '자료' 남겨주세요",
+                    "timestamp": "2026-07-01T00:00:00+0000",
+                    "comments_count": 20,
+                    "probed": 10,
+                    "trigger": "자료",
+                    "repetition": 0.6,
+                    "signal": True,
+                    "offer": {
+                        "text": "요청하신 자료 보내드려요",
+                        "url": "https://ex.co/a",
+                        "label": "자료 받기",
+                        "hits": 8,
+                        "ratio": 0.8,
+                        "score": 0.72,
+                    },
+                    "gate": None,
+                    "grade": "auto_draft",
+                    "score": 0.72,
+                    "confirm_required": False,
+                    "drops": [],
+                    "samples": [{"text": "요청하신 자료", "created_time": "2026-07-01T05:00:00+0000"}],
+                    "keyword_hits": {"자료": 12},
                 }
             ],
         },
@@ -398,62 +371,77 @@ def test_pipeline_resumes_from_checkpoint(monkeypatch):
     assert status == DMMigrationJob.Status.READY, status
     job.refresh_from_db()
     assert job.candidates_created >= 1
-    assert job.candidates.filter(media_id="mm-x-0-camp0").exists()
+    assert job.candidates.filter(media_id=mid).exists()
 
 
 @pytest.mark.django_db
-def test_targeted_dm_recovery_produces_auto_draft(monkeypatch):
-    """타겟 복원 DM(게시물 댓글러가 받은 실제 발신 DM)이 있으면 auto_draft + dm_source=targeted."""
+def test_support_ratio_drives_band_and_offer_url(monkeypatch):
+    """지지비율이 높으면 auto_draft + 링크 확인 불필요, 낮으면 needs_review + 확인 필요.
+
+    이 기능의 산출물 1순위는 **인플루언서가 보내려던 자료 링크**다.
+    """
     monkeypatch.setattr(settings, "DM_MIGRATION_FAKE_LLM", True)
-
-    def _boom(*a, **k):
-        raise AssertionError("collector should not run (all seeded)")
-
-    for fn in ("fetch_media", "fetch_comments_first_pass", "fetch_comments_expand",
-               "fetch_conversations", "fetch_targeted_dms"):
-        monkeypatch.setattr(collect, fn, _boom)
-
     user = _user()
     ws = _ws(user)
     conn = _conn(ws, mock_token=True)
-    mid = "mm-t-1"
-    ev = {
-        mid: {
-            "media_id": mid, "caption_excerpt": "댓글에 자료 남겨주세요", "comments_analyzed": 20,
-            "comment_days": ["2026-07-01"], "account_replied_publicly": False, "owner_reply_top": "",
-            "sample_comments": [{"text": "자료", "timestamp": "2026-07-01T01:00:00+0000"}],
+
+    def _rec(mid, hits, probed, score):
+        return {
+            "media_id": mid,
+            "permalink": f"https://x/{mid}",
+            "caption": "댓글에 '자료' 남겨주세요",
+            "timestamp": "2026-07-01T00:00:00+0000",
+            "comments_count": 30,
+            "probed": probed,
+            "trigger": "자료",
+            "repetition": 0.5,
+            "signal": True,
+            "offer": {
+                "text": "요청하신 자료 보내드려요",
+                "url": "https://ex.co/pack",
+                "label": "자료 받기",
+                "hits": hits,
+                "ratio": hits / probed,
+                "score": score,
+            },
+            "gate": {
+                "text": "팔로우 확인을 위해 아래 버튼을 눌러주세요.",
+                "url": "",
+                "label": "팔로우 확인",
+                "hits": probed,
+                "ratio": 1.0,
+                "score": 0.8,
+                "is_gate": True,
+            },
+            "grade": "auto_draft" if score >= 0.60 else "needs_review",
+            "score": score,
+            "confirm_required": score < 0.60,
+            "drops": [],
+            "samples": [],
+            "keyword_hits": {"자료": 9},
         }
-    }
-    # 같은 오프닝을 2명이 받음(+URL) → strong → auto_draft
-    targeted = {
-        mid: [
-            {"text": "요청하신 자료 보내드려요 https://ex.co/a", "created_time": "2026-07-01T05:00:00+0000", "recipient": "r1"},
-            {"text": "요청하신 자료 보내드려요 https://ex.co/b", "created_time": "2026-07-01T06:00:00+0000", "recipient": "r2"},
-        ]
-    }
+
     job = _job(
         conn,
+        estimated_seconds=10,
         stage_data={
-            "media": [{"id": mid, "caption": "댓글에 자료 남겨주세요", "timestamp": "2026-07-01T00:00:00+0000", "permalink": "https://x/1", "comments_count": 20}],
-            "comments": {mid: [{"id": "c1", "text": "자료", "timestamp": "2026-07-01T01:00:00+0000", "parent_id": None, "from": {"id": "igsid_9"}}]},
-            "comments_after": {},
-            "failed_media_ids": [],
-            "targeted_dms": targeted,
-            "evidence": ev,
-            "verdicts": [{"media_id": mid, "is_campaign": True, "confidence": 0.8, "keywords": ["자료"]}],
-            "outbound_dms": [],
-            "dm_scope_missing": False,
-            "own_sends_excluded": 0,
+            "media": [],
+            "recoveries": [_rec("m-strong", 8, 10, 0.72), _rec("m-weak", 1, 10, 0.09)],
         },
     )
-    status = pipeline.run_migration(str(job.id))
-    assert status == DMMigrationJob.Status.READY, status
-    cand = job.candidates.get(media_id=mid)
-    assert cand.band == DMCampaignCandidate.Band.AUTO_DRAFT
-    assert cand.evidence_aggregates.get("dm_source") == "targeted"
-    assert cand.evidence_aggregates.get("dm_recovered_recipients") == 2
-    assert cand.draft_opening_message  # 초안 생성됨
-    assert (cand.evidence_raw or {}).get("sample_outbound_dms")  # 실제 복원 DM 근거 포함
+    assert pipeline.run_migration(str(job.id)) == DMMigrationJob.Status.READY
+
+    strong = job.candidates.get(media_id="m-strong")
+    assert strong.band == DMCampaignCandidate.Band.AUTO_DRAFT
+    assert strong.offer_url == "https://ex.co/pack"
+    assert strong.offer_button_label == "자료 받기"
+    assert strong.gate_detected is True
+    assert strong.confirm_required is False
+    assert strong.support_hits == 8 and strong.support_probed == 10
+
+    weak = job.candidates.get(media_id="m-weak")
+    assert weak.band == DMCampaignCandidate.Band.NEEDS_REVIEW
+    assert weak.confirm_required is True  # 표본이 적어 링크 확인을 받아야 한다
 
 
 @pytest.mark.django_db
@@ -520,7 +508,7 @@ def test_apply_candidate_full_mapping_and_reapply_409():
     assert campaign.opening_message_template == cand.draft_opening_message
     assert campaign.public_reply_enabled is True
     assert campaign.public_reply_templates == ["DM 드렸어요!"]
-    assert "이전으로 생성" in campaign.description
+    assert "다른 서비스에서 불러옴" in campaign.description
 
     cand.refresh_from_db()
     assert cand.status == DMCampaignCandidate.Status.APPLIED

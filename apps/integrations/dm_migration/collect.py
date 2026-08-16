@@ -25,7 +25,13 @@ from ..services import (
     InstagramMessagingService,
     MockInstagramProvider,
 )
-from .analyze import normalize_comment, parse_graph_time, placeholder_normalize
+from .analyze import (
+    dm_text_for_match,
+    extract_dm_content,
+    normalize_comment,
+    parse_graph_time,
+    placeholder_normalize,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,13 +48,25 @@ DEFAULT_CAPS = {
     "conversations_pages": 30,
     "total_graph": 1500,
 }
-COMMENTS_OLDEST_MAX_PAGES = 10  # 게시물당 최대 페이지(=최대 500댓글)까지 페이징해 tail 확보
+COMMENTS_OLDEST_MAX_PAGES = 12  # 대형 게시물에서 캠페인 기간까지 닿으려면 최대 12페이지
 COMMENT_WORKERS = 6
 COMMENT_EXPAND_MAX_PAGES = 4
 CONVERSATION_CAP = 600
 DM_LOOKBACK_DAYS = 90
-# 게시물당 조회할 댓글러 수. mini_ai_ 실측: 6→12 로 늘리니 복원 게시물 13→25(≈2배).
-# 댓글러당 발신 DM 적중률이 ~6%(비팔로워 미전달이 다수)라, 표본을 늘려야 커버리지가 오른다.
+
+# ── 표본 설계 (실측 근거) ──
+# 조회 인원을 3명에서 멈추면 '지지비율'(= 같은 문구를 받은 사람 / 조회 인원)의 분모가 없어
+# 정밀도를 판정할 수 없다. 실측 정밀도: 지지비율 ≤20% → 11% · 40~60% → 77% · 60%+ → 100%.
+SEED_PROBE = 3  # 우선 3명만 — 0건이면 캠페인이 없던 게시물로 보고 종료(비용 방어)
+FULL_PROBE = 10  # 1건이라도 나오면 여기까지 채워 지지비율을 계산한다
+BIG_PROBE = 30  # 댓글 1,000개 이상 대형 게시물(전달률이 낮아 표본이 더 필요)
+BIG_COMMENTS = 1000
+PROBE_WORKERS = 4  # 병렬 조회. ⚠️ 스레드 안에서 DB 접근 금지(커넥션 폭주)
+# Meta 규칙상 댓글에 대한 Private Reply 는 7일 내만 가능 → 귀속 판정의 상한
+ATTRIBUTION_WINDOW_DAYS = 7
+CAMPAIGN_WINDOW_DAYS = 3  # 댓글 페이징 중단 기준(게시 후 N일 댓글에 닿으면 충분)
+
+# (구) 고정 표본 상한 — 하위 호환용. 신규 코드는 SEED/FULL/BIG_PROBE 를 쓸 것.
 TARGETED_PER_MEDIA = 12
 
 
@@ -338,7 +356,8 @@ def fetch_conversations(ctx: CollectContext, lookback_days: int = DM_LOOKBACK_DA
                 frm = str((msg.get("from") or {}).get("id") or "")
                 if frm != str(ctx.ig):
                     continue  # 발신(계정 본인)만
-                text = msg.get("message") or ""
+                # ⚠️ msg["message"] 직접 읽지 말 것 — 버튼 DM 은 비어 있다(analyze 참조)
+                text = dm_text_for_match(msg)
                 if not text.strip():
                     continue
                 to = (msg.get("to") or {}).get("data") or []
@@ -349,6 +368,7 @@ def fetch_conversations(ctx: CollectContext, lookback_days: int = DM_LOOKBACK_DA
                         "text": text,
                         "created_time": msg.get("created_time"),
                         "recipient": str(to[0].get("id")) if to else "",
+                        "content": extract_dm_content(msg),
                     }
                 )
                 norm = placeholder_normalize(text)
@@ -376,105 +396,169 @@ def fetch_conversations(ctx: CollectContext, lookback_days: int = DM_LOOKBACK_DA
 # ══════════════ 타겟 DM 복원 (게시물 댓글러 → 그가 받은 발신 DM) ══════════════
 
 
-def fetch_oldest_commenters(
+def collect_commenters(
     ctx: CollectContext,
-    media_ids: list,
-    per_media: int = TARGETED_PER_MEDIA,
-    max_pages: int = COMMENTS_OLDEST_MAX_PAGES,
-) -> dict:
-    """각 게시물 댓글을 끝(가장 오래된)까지 페이징해 '초기 댓글러' IGSID 를 뽑는다.
+    media_id: str,
+    *,
+    media_ts=None,
+    pages: int = 1,
+    campaign_window_days: int = 3,
+) -> tuple[list[dict], bool]:
+    """게시물 댓글을 수집해 댓글러 목록을 만든다.
 
-    캠페인은 게시 직후 돌아 **원래 댓글러가 DM 을 받았는데**, IG comments 는 최신순 고정
-    (order=chronological 무시됨, 실측)이라 첫 페이지엔 한참 뒤 온 사람만 있다. 초기 댓글러의
-    DM 복원율이 최신 대비 압도적이다(실측: 38% vs 1.7%). order 를 못 쓰니 끝까지 페이징해
-    tail(오래된) 을 취한다.
+    IG ``/comments`` 는 **최신순 고정**(order=chronological 무시, 실측)이라
+    1페이지만 받으면 대형 게시물에서는 **게시 후 3~4주 뒤 댓글러**만 잡힌다
+    (실측: 댓글 1,366개 게시물의 1페이지 최고령 댓글이 게시 26일 뒤).
+    캠페인은 보통 게시 직후 돌므로 그 사람들은 DM 을 못 받았다.
+    → ``pages`` 를 늘려 **캠페인 기간(게시 후 N일)에 닿을 때까지** 판다.
 
-    media_ids: 후보 게시물 id 리스트. 반환: {media_id: [oldest igsid, ...]}
+    Returns: ([{"id","ts","text","replied"}...], 더_팔_수_있는가)
+        · replied=True 는 계정이 그 댓글에 공개답글을 단 사람(= 자동화 발동 확정)
     """
-    out: dict = {}
-    for mid in media_ids:
+    collected: list = []
+    after = None
+    got = 0
+    while got < pages:
         if ctx.cancelled() or ctx.budget.cap_hit("comments_oldest") or ctx.budget.total_hit():
             break
-        collected: list = []
-        after = None
-        pages = 0
-        while pages < max_pages:
-            if ctx.budget.cap_hit("comments_oldest") or ctx.budget.total_hit():
+        ctx.pacer.acquire()
+        try:
+            page = _fetch_comments_page(ctx, media_id, after)
+        except (MigrationTokenError, MigrationRateLimitPause):
+            raise
+        except requests.RequestException:
+            break
+        ctx.budget.charge("comments_oldest")
+        collected.extend(page.get("data") or [])
+        after = page.get("paging_after")
+        got += 1
+        if not after:
+            break
+        # 캠페인 기간에 닿았으면 그만 판다 (작은 게시물은 1페이지로 끝)
+        if media_ts:
+            oldest = min(
+                (t for t in (parse_graph_time(c.get("timestamp")) for c in collected) if t),
+                default=None,
+            )
+            if oldest and (oldest - media_ts).total_seconds() / 86400 <= campaign_window_days:
                 break
-            ctx.pacer.acquire()
-            try:
-                page = _fetch_comments_page(ctx, mid, after)
-            except (MigrationTokenError, MigrationRateLimitPause):
-                raise
-            except requests.RequestException:
-                break
-            ctx.budget.charge("comments_oldest")
-            collected.extend(page.get("data") or [])
-            after = page.get("paging_after")
-            pages += 1
-            if not after:
-                break
-        # collected 는 최신→오래된 순 → tail(오래된)에서 서로 다른 댓글러 per_media 명.
-        ids, seen = [], set()
-        for c in reversed(collected):
-            f = str((c.get("from") or {}).get("id") or "")
-            if f and f != str(ctx.ig) and f not in seen:
-                seen.add(f)
-                ids.append(f)
-            if len(ids) >= per_media:
-                break
-        if ids:
-            out[mid] = ids
+
+    own = str(ctx.ig)
+    by_id: dict = {}
+    replied_to: set = set()
+    for c in collected:
+        author = str((c.get("from") or {}).get("id") or "")
+        if author == own:
+            # 계정 본인 답글 → parent 댓글 작성자를 '발동 확정' 으로 표시
+            parent = str(c.get("parent_id") or "")
+            if parent:
+                replied_to.add(parent)
+            continue
+        if c.get("parent_id"):
+            continue
+        cid = str(c.get("id") or "")
+        if author and author not in by_id:
+            by_id[author] = {
+                "id": author,
+                "media_id": media_id,
+                "comment_id": cid,
+                "ts": parse_graph_time(c.get("timestamp")),
+                "text": (c.get("text") or "")[:200],
+                "replied": False,
+            }
+    for u in by_id.values():
+        if u["comment_id"] in replied_to:
+            u["replied"] = True
+    return list(by_id.values()), bool(after)
+
+
+def order_probe_targets(commenters: list[dict], trigger: str | None = None) -> list[dict]:
+    """조회 우선순위.
+
+    ①캡션의 트리거 단어를 **실제로 댓글에 단 사람** ②계정이 공개답글을 단 사람
+    ③오래된/최근을 **교대로** — 캠페인이 게시 직후 켜졌는지 나중에 켜졌는지 알 수 없으므로
+    한쪽만 보면 안 된다(실측: '나중에 켠 캠페인' 이 18%).
+    """
+    out: list[dict] = []
+    seen: set = set()
+
+    def push(u):
+        if u["id"] not in seen:
+            seen.add(u["id"])
+            out.append(u)
+
+    if trigger:
+        t = trigger.replace(" ", "")
+        for u in commenters:
+            if t and t in (u.get("text") or "").replace(" ", ""):
+                push(u)
+    for u in commenters:
+        if u.get("replied"):
+            push(u)
+    recent = list(commenters)  # 수집 순서 = 최신순
+    oldest = list(reversed(commenters))
+    for a, b in zip(oldest, recent, strict=False):
+        push(a)
+        push(b)
+    for u in commenters:
+        push(u)
     return out
 
 
-def fetch_targeted_dms(
+def fetch_outbound_for_commenter(
     ctx: CollectContext,
-    media_commenters: dict,
-    per_media: int = TARGETED_PER_MEDIA,
-) -> dict:
-    """후보 게시물의 댓글러 IGSID 로 user_id 대화를 직접 조회해 계정 발신 DM 을 복원한다.
+    commenter: dict,
+    *,
+    window_days: int = ATTRIBUTION_WINDOW_DAYS,
+) -> list[dict]:
+    """댓글러 1명이 **그 댓글 때문에** 받은 발신 DM 을 복원한다.
 
-    댓글 from.id == 메시징 user_id(같은 IGSID, 실측 확인)라, 3만 개 대화방 페이징 없이
-    게시물↔DM 을 정확히 잇는다. 자기발송/노이즈 제외는 상위(pipeline)가 처리.
+    ⚠️ 시간창이 핵심이다. 같은 사람이 여러 게시물에 댓글을 달면 각 캠페인 DM 이 모두
+    그 대화방에 쌓인다. Meta 규칙상 댓글에 대한 Private Reply 는 **7일 내**만 가능하므로
+    ``댓글시각 ≤ DM시각 ≤ 댓글시각+7일`` 로 잘라야 다른 게시물 DM 이 딸려오지 않는다.
+    (창이 없던 시절 실측: 2026-05 게시물에 2025-09 DM 이 섞여 들어왔다.)
 
-    media_commenters: {media_id: [igsid, ...]}
-    반환: {media_id: [{"text","created_time","recipient","msg_id"}, ...]}  (mock 모드면 {})
+    반환: [{"text","created_time","recipient","msg_id","content"}]
+        · content = analyze.extract_dm_content() 결과(버튼·URL·미디어 종류 포함)
     """
+    uid = commenter["id"]
     if ctx.mock:
-        return {}
-    out: dict = {}
-    for mid, igsids in media_commenters.items():
-        if ctx.cancelled() or ctx.budget.cap_hit("targeted_dms") or ctx.budget.total_hit():
-            break
-        rec = []
-        for ig in list(igsids)[:per_media]:
-            if ctx.budget.cap_hit("targeted_dms") or ctx.budget.total_hit():
-                break
-            ctx.pacer.acquire()
-            try:
-                msgs = InstagramMessagingService.list_user_conversation(ctx.ig, ctx.token, ig)
-            except requests.HTTPError as exc:
-                _maybe_raise_fatal(exc)  # token/rate → 전파
-                continue  # 비치명(대화 없음/권한 등) → 다음 댓글러
-            except requests.RequestException:
-                continue
-            ctx.budget.charge("targeted_dms")
-            for m in msgs:
-                if str((m.get("from") or {}).get("id") or "") != str(ctx.ig):
-                    continue  # 계정 발신만
-                text = m.get("message") or ""
-                if not text.strip():
-                    continue
-                to = (m.get("to") or {}).get("data") or []
-                rec.append(
-                    {
-                        "text": text[:640],
-                        "created_time": m.get("created_time"),
-                        "recipient": str(to[0].get("id")) if to else str(ig),
-                        "msg_id": m.get("id"),
-                    }
-                )
-        if rec:
-            out[mid] = rec
+        msgs = MockInstagramProvider.mock_user_conversation(
+            ctx.ig, uid, commenter.get("media_id", "")
+        )
+    else:
+        ctx.pacer.acquire()
+        try:
+            msgs = InstagramMessagingService.list_user_conversation(ctx.ig, ctx.token, uid)
+        except requests.HTTPError as exc:
+            _maybe_raise_fatal(exc)  # token/rate → 전파
+            return []
+        except requests.RequestException:
+            return []
+        ctx.budget.charge("targeted_dms")
+
+    cts = commenter.get("ts")
+    out: list[dict] = []
+    for m in msgs:
+        if str((m.get("from") or {}).get("id") or "") != str(ctx.ig):
+            continue  # 계정 발신만
+        dt = parse_graph_time(m.get("created_time"))
+        if cts and dt:
+            gap = (dt - cts).total_seconds()
+            if gap < -3600 or gap > window_days * 86400:
+                continue  # 이 댓글 때문에 간 DM 이 아니다
+        content = extract_dm_content(m)
+        text = dm_text_for_match(m)
+        if not text:
+            continue
+        to = (m.get("to") or {}).get("data") or []
+        out.append(
+            {
+                "text": text[:640],
+                "created_time": m.get("created_time"),
+                "recipient": str(to[0].get("id")) if to else str(uid),
+                "msg_id": m.get("id"),
+                "content": content,
+            }
+        )
     return out

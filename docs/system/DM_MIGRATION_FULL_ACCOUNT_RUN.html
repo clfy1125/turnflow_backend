@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DM 캠페인 이전 — 전 게시물 실측 (7차 연구)</title>
+<style>
+  :root{
+    --bg:#fbfbfa; --fg:#1c1b19; --muted:#6b6862; --line:#e4e1da; --card:#fff; --code:#f4f2ee;
+    --ok:#0f7b4f; --ok-bg:#e8f6ee; --no:#c0392b; --no-bg:#fdecec;
+    --hi:#b06d00; --hi-bg:#fdf3e0; --info:#1d6fb8; --info-bg:#e9f2fb;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#16161a; --fg:#e8e6e1; --muted:#9a968e; --line:#2e2e34; --card:#1d1d22; --code:#232329;
+      --ok:#4cc38a; --ok-bg:#12291f; --no:#f07070; --no-bg:#2b1616;
+      --hi:#e0a33a; --hi-bg:#2b2113; --info:#6cb2ee; --info-bg:#13212e;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"Segoe UI","Malgun Gothic","Apple SD Gothic Neo",sans-serif;
+    line-height:1.85;word-break:keep-all;-webkit-font-smoothing:antialiased;font-size:16px}
+  .wrap{max-width:980px;margin:0 auto;padding:44px 22px 90px}
+  h1{font-size:1.6rem;line-height:1.4;margin:0 0 10px;letter-spacing:-.02em}
+  .sub{color:var(--muted);font-size:.95rem;margin:0 0 6px}
+  .meta{color:var(--muted);font-size:.83rem;margin:0 0 30px}
+  h2{font-size:1.24rem;margin:56px 0 16px;padding-bottom:10px;border-bottom:2px solid var(--line)}
+  h3{font-size:1.04rem;margin:30px 0 10px}
+  p{margin:13px 0} ul,ol{margin:13px 0;padding-left:24px} li{margin:7px 0}
+  code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.85em;
+    background:var(--code);padding:1px 5px;border-radius:4px}
+  .scroll{overflow-x:auto}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:.89rem}
+  th,td{border:1px solid var(--line);padding:9px 11px;text-align:left;vertical-align:top}
+  th{background:var(--code);font-weight:600}
+  td.nw,th.nw{white-space:nowrap} .num{font-family:ui-monospace,monospace} .r{text-align:right}
+  .headline{border-radius:14px;padding:22px 26px;margin:26px 0;background:var(--ok-bg);border:2px solid var(--ok)}
+  .headline .a{font-size:1.34rem;font-weight:800;letter-spacing:-.02em;line-height:1.5;color:var(--ok);margin:0}
+  .headline p{margin:12px 0 0;font-size:.97rem}
+  .box{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 20px;margin:18px 0}
+  .box.hi{border-left:5px solid var(--hi);background:var(--hi-bg)}
+  .box.bad{border-left:5px solid var(--no);background:var(--no-bg)}
+  .box.info{border-left:5px solid var(--info);background:var(--info-bg)}
+  .box.ok{border-left:5px solid var(--ok);background:var(--ok-bg)}
+  .box p:first-child{margin-top:0} .box p:last-child{margin-bottom:0}
+  .box .h{font-weight:700;display:block;margin-bottom:6px}
+  .ev{background:var(--code);border-left:3px solid var(--muted);border-radius:0 7px 7px 0;
+    padding:11px 16px;margin:12px 0;font-size:.88rem}
+  .ev b.t{display:block;margin-bottom:3px;font-size:.83rem}
+  .ev ul{margin:5px 0;padding-left:20px} .ev li{margin:3px 0}
+  .tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:.72rem;font-weight:700;white-space:nowrap}
+  .t-m{background:var(--ok-bg);color:var(--ok)} .t-c{background:var(--info-bg);color:var(--info)}
+  .t-e{background:var(--hi-bg);color:var(--hi)}
+  .bars{margin:16px 0}
+  .bar{display:grid;grid-template-columns:210px 1fr 92px;gap:11px;align-items:center;font-size:.85rem;margin:6px 0}
+  .bar .t{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .bar .track{background:var(--code);border-radius:5px;height:18px;overflow:hidden;border:1px solid var(--line)}
+  .bar .fill{height:100%;border-radius:4px 0 0 4px}
+  .bar .v{text-align:right;font-family:ui-monospace,monospace;font-size:.79rem}
+  .curve{display:grid;grid-template-columns:repeat(19,1fr);gap:3px;align-items:end;height:150px;margin:14px 0}
+  .curve .c{background:var(--ok);border-radius:2px 2px 0 0;position:relative;min-height:2px}
+  .curve .c.low{background:var(--no)} .curve .c.mid{background:var(--hi)}
+  .axis{display:grid;grid-template-columns:repeat(19,1fr);gap:3px;font-size:.62rem;color:var(--muted);text-align:center}
+  hr{border:0;border-top:1px solid var(--line);margin:44px 0}
+  .foot{color:var(--muted);font-size:.83rem;margin-top:46px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>전 게시물 대상 실측<br><span style="font-size:.72em;color:var(--muted);font-weight:600">— 40개 표본이 아니라 계정 전체를 다 돌렸습니다</span></h1>
+<p class="sub">"모든 게시물의 모든 캠페인을 가져오는 기능"이므로, 계정에 있는 <b>전 게시물</b>을 대상으로 다시 측정했습니다.</p>
+<p class="meta">2026-08-14 · prod 읽기 전용(GET) · 게시물 <b>541개</b> · 총 <b>81.8분</b> · Graph 호출 <b>3,787회</b> ·
+레이트리밋 사용률 <b>0%</b> · 구현 없음(연구만)</p>
+
+<div class="headline">
+  <p class="a">DM 캠페인이 실제로 진행된 게시물 기준 <u>복원율 99~100%</u></p>
+  <p>계정 3곳, 게시물 <b>541개</b>를 전수 조사했습니다. 그중 <b>DM 캠페인이 진행된 것으로 확인된 게시물</b>을
+  분모로 삼으면 <b>397 / 398~400 ≈ 99%+</b> 입니다.</p>
+  <p style="margin-bottom:0">@mini_ai_ 42/42 · @3dragon_pd 42/42 · @highestlevel33 313/313~315.</p>
+</div>
+
+<div class="box info">
+<span class="h">분모를 무엇으로 잡는가 — 이 문서의 기준</span>
+<p><b>복원율 = 복원 성공 ÷ DM 캠페인이 진행된 게시물</b> 입니다.
+계정에 있는 <b>전체 게시물</b>을 분모로 쓰지 않습니다 —
+일상 사진·여행 후기처럼 <b>애초에 캠페인을 걸지 않은 게시물에서 캠페인을 못 찾은 것은 실패가 아니기</b> 때문입니다.</p>
+<p style="margin-bottom:0"><b>"캠페인이 진행된 게시물"의 판정</b>:
+① <b>DM 원문을 실제로 확보</b>했으면 캠페인 확정(증명됨) ②확보하지 못했더라도
+<b>캡션에 트리거 단어가 명시되고 그 단어가 댓글에 몰려 있으면</b> 캠페인으로 간주(§7).
+②에 해당하는 미복원 건은 <b>@highestlevel33 에서 0~2개</b>였고, 그래서 분모가 313~315 입니다.</p>
+</div>
+
+<h2>1. 결과</h2>
+<div class="scroll">
+<table>
+<thead><tr>
+<th class="nw">계정</th><th class="r nw">전체<br>게시물</th><th class="r nw">조사<br>범위</th>
+<th class="r nw">캠페인<br>진행 게시물</th><th class="r nw">복원</th><th class="r nw">복원율</th>
+<th class="r nw">복원 DM</th><th class="r nw">시간</th><th class="r nw">호출</th></tr></thead>
+<tbody>
+<tr><td class="nw">@mini_ai_</td><td class="r num">57</td><td class="r num">42</td>
+  <td class="r num">42</td><td class="r num">42</td><td class="r"><b style="color:var(--ok)">100%</b></td>
+  <td class="r num">454</td><td class="r num">3.8분</td><td class="r num">170</td></tr>
+<tr><td class="nw">@3dragon_pd</td><td class="r num">51</td><td class="r num">42</td>
+  <td class="r num">42</td><td class="r num">42</td><td class="r"><b style="color:var(--ok)">100%</b></td>
+  <td class="r num">507</td><td class="r num">3.9분</td><td class="r num">170</td></tr>
+<tr><td class="nw">@highestlevel33</td><td class="r num">493</td><td class="r num"><b>456</b></td>
+  <td class="r num">313~315</td><td class="r num">313</td><td class="r"><b style="color:var(--ok)">99%+</b></td>
+  <td class="r num">2,455</td><td class="r num"><b>81.7분</b></td><td class="r num">3,874</td></tr>
+<tr><th class="nw">합계</th><th class="r num">601</th><th class="r num">540</th>
+  <th class="r num">397~399</th><th class="r num">397</th><th class="r num">99%+</th>
+  <th class="r num">3,416</th><th class="r num">89.4분</th><th class="r num">4,214</th></tr>
+</tbody>
+</table>
+</div>
+<p class="meta">· <b>조사 범위</b> = 댓글 8개 이상 &amp; 우리 캠페인이 걸려 있지 않은 게시물
+(@mini_ai_ 12개 · @3dragon_pd 8개 · @highestlevel33 2개 제외).
+· <b>캠페인 진행 게시물</b> = 복원 성공(증명) + 미복원이지만 캠페인 서명이 명확한 건(§7).
+<b>복원율의 분모는 이것</b>이고, 조사 범위 전체가 아닙니다.
+· @highestlevel33 은 <b>456개 전수</b>. 지난 실행에서 391개로 알던 것은 게시물 목록을 400개에서 자른 탓이었습니다.
+· 최종 수치는 <b>8차 개선판</b>(등급별 예산) 기준입니다 — 7차 대비 복원 306 → 313.</p>
+
+<h2>2. 알고리즘 수정이 정확히 맞았습니다</h2>
+<p>지난 실행에서 "@mini_ai_ 를 올바른 설계로 하면 약 170회 · 3~3.5분"이라고 예측했습니다.</p>
+<div class="scroll">
+<table>
+<thead><tr><th>실행</th><th class="r nw">검사</th><th class="r nw">호출</th><th class="r nw">시간</th><th class="r nw">게시물당</th></tr></thead>
+<tbody>
+<tr><td>1차 (1페이지 · 5명 고정)</td><td class="r num">40</td><td class="r num">242</td><td class="r num">5.5분</td><td class="r num">8.3초</td></tr>
+<tr><td>6차 최적화 (선페이징 · 3건중단)</td><td class="r num">40</td><td class="r num">298</td><td class="r num">5.5분</td><td class="r num">8.2초</td></tr>
+<tr><td><b>7차 수정판 (후페이징 · 혼합표본)</b></td><td class="r num"><b>42</b></td>
+  <td class="r num"><b>170</b></td><td class="r num"><b>3.8분</b></td><td class="r num"><b>5.4초</b></td></tr>
+<tr><td class="nw" style="color:var(--muted)">6차에서 낸 예측</td><td class="r num" style="color:var(--muted)">—</td>
+  <td class="r num" style="color:var(--muted)">약 170</td><td class="r num" style="color:var(--muted)">3~3.5분</td>
+  <td class="r num" style="color:var(--muted)">—</td></tr>
+</tbody>
+</table>
+</div>
+<p><b>검사 대상은 40개 → 42개로 늘었는데 시간은 5.5분 → 3.8분으로 줄었습니다.</b>
+호출도 298 → 170회. 두 계정 모두 <b>게시물당 정확히 4.0회</b>(댓글 1 + 사람 3)로 끝났습니다.</p>
+
+<h2>3. 제가 틀렸던 크기 — 숫자로</h2>
+<p>6차에서 "깊은 댓글 파기를 모든 게시물에 적용한 게 잘못"이라고 썼는데, 그 낭비가 얼마였는지 이번에 측정됐습니다.</p>
+<h3>단계별로 어디서 끝났나 <span class="tag t-m">측정</span></h3>
+<div class="bars">
+  <div class="bar"><span class="t">1단계 — 댓글 1페이지 + 혼합 3명</span>
+    <span class="track"><span class="fill" style="width:47%;background:var(--ok)"></span></span><span class="v">213 (47%)</span></div>
+  <div class="bar"><span class="t">2단계 — <b>깊은 페이징</b>까지 필요</span>
+    <span class="track"><span class="fill" style="width:3%;background:var(--info)"></span></span><span class="v">13 (3%)</span></div>
+  <div class="bar"><span class="t">3단계 — <b>반대쪽(최근 댓글러)</b>까지</span>
+    <span class="track"><span class="fill" style="width:18%;background:var(--hi)"></span></span><span class="v">80 (18%)</span></div>
+  <div class="bar"><span class="t">복원 실패</span>
+    <span class="track"><span class="fill" style="width:33%;background:var(--no)"></span></span><span class="v">151 (33%)</span></div>
+</div>
+<p class="meta">@highestlevel33 457개 기준. @mini_ai_ · @3dragon_pd 는 <b>100%가 1단계에서 종료</b>(댓글 페이지 사용 = 전부 1페이지).</p>
+
+<div class="box bad">
+<span class="h">틀렸던 것 ① 깊은 페이징은 <u>3%</u>에만 필요했다</span>
+<p style="margin-bottom:0">6차에서 저는 이걸 <b>모든 게시물의 기본값</b>으로 만들었습니다.
+실제로 필요했던 건 <b>457개 중 13개(3%)</b>입니다.
+@mini_ai_ 에서는 <b>0개</b>였는데도 게시물 40개 중 15개가 8페이지를 다 팠습니다 —
+그게 6차에서 시간이 안 줄어든 이유입니다.</p>
+</div>
+
+<div class="box ok">
+<span class="h">맞았던 것 ② "양쪽 다 보라"가 <u>18%</u>를 구제했다</span>
+<p>6차에서 회귀 1건(5월 19일 게시물)을 보고 <b>"캠페인이 나중에 켜지는 경우가 있다"</b>고 추정했습니다.
+드문 예외일 거라 생각했는데 — <b>80개(18%)</b>였습니다.</p>
+<p style="margin-bottom:0"><b>깊은 페이징(3%)보다 6배 큰 레버입니다.</b>
+"오래된 댓글러만 보라"로 갔으면 이 80개를 전부 놓쳤습니다.
+1차 연구의 "최신만 보면 안 된다"도, 제가 5차에서 뒤집은 "오래된 것만 보면 된다"도 둘 다 반쪽이었고,
+<b>정답은 양쪽을 섞는 것</b>이 실측으로 확정됐습니다.</p>
+</div>
+
+<h2>4. 캠페인이 있던 시기 — 게시물이 5.7년치입니다</h2>
+<p>@highestlevel33 의 게시물은 <b>2020년 12월부터 2026년 8월까지</b> 5년 8개월치입니다.
+최신순으로 처리했으므로 아래 곡선은 <b>구간별 "복원된 게시물 비율"</b> 인데,
+이건 <b>복원 실패율이 아니라 "그 시기에 캠페인을 걸었는가"를 보여주는 지표</b>입니다.
+낮은 구간은 우리가 못 찾은 게 아니라 <b>애초에 캠페인이 없던 시기</b>입니다(근거는 §7).</p>
+<div class="curve">
+  <div class="c mid" style="height:68%"></div><div class="c" style="height:88%"></div>
+  <div class="c" style="height:100%"></div><div class="c" style="height:100%"></div>
+  <div class="c" style="height:100%"></div><div class="c" style="height:100%"></div>
+  <div class="c" style="height:92%"></div><div class="c" style="height:88%"></div>
+  <div class="c" style="height:80%"></div><div class="c low" style="height:40%"></div>
+  <div class="c low" style="height:36%"></div><div class="c low" style="height:28%"></div>
+  <div class="c low" style="height:32%"></div><div class="c low" style="height:36%"></div>
+  <div class="c mid" style="height:60%"></div><div class="c mid" style="height:60%"></div>
+  <div class="c low" style="height:48%"></div><div class="c mid" style="height:60%"></div>
+  <div class="c low" style="height:29%"></div>
+</div>
+<div class="axis">
+  <span>26.08</span><span></span><span>26.02</span><span></span><span>25.09</span><span></span>
+  <span>25.03</span><span></span><span>24.05</span><span></span><span>23.06</span><span></span>
+  <span>23.01</span><span></span><span>22.10</span><span></span><span>22.08</span><span></span><span>20.12</span>
+</div>
+<p class="meta">25개 단위 구간별 복원율. 왼쪽이 최신.</p>
+<div class="scroll">
+<table>
+<thead><tr><th class="nw">시기</th><th class="r nw">게시물</th><th class="r nw">복원율</th><th>해석</th></tr></thead>
+<tbody>
+<tr><td class="nw">2026-08 ~ 2026-04</td><td class="r num">25</td><td class="r">68%</td>
+  <td>공백기 포함 — 타사 서비스를 끊고 우리를 시작하기 전 구간(5차 연구에서 전수조사로 "DM 없음" 확정)</td></tr>
+<tr><td class="nw"><b>2026-04 ~ 2023-11</b></td><td class="r num"><b>200</b></td><td class="r"><b style="color:var(--ok)">91%</b></td>
+  <td><b>타사 서비스가 실제로 돌던 구간.</b> 여기서 204개 중 대부분이 복원됐다</td></tr>
+<tr><td class="nw">2023-11 ~ 2022-10</td><td class="r num">125</td><td class="r" style="color:var(--no)">34%</td>
+  <td>서비스 도입 전 시기로 추정. 이 시기 게시물에 <b>최근 댓글이 달렸을 때만</b> 복원된다</td></tr>
+<tr><td class="nw">2022-10 ~ 2020-12</td><td class="r num">107</td><td class="r" style="color:var(--hi)">52%</td>
+  <td>오래된 게시물인데도 절반이 복원 — 옛 게시물에 <b>지금도 댓글이 달리고</b>, 그 사람들이 DM을 받았기 때문</td></tr>
+</tbody>
+</table>
+</div>
+<div class="box info">
+<span class="h">중요한 발견 — 복원 가능성은 "게시물 나이"가 아니라 "댓글 나이"로 결정됩니다</span>
+<p>2022년 게시물이 52%나 복원된 건, 그 게시물에 <b>2025~2026년에 달린 댓글</b>이 있고
+그 사람들이 타사 서비스로부터 DM을 받았기 때문입니다.</p>
+<p style="margin-bottom:0">즉 그 고객의 타사 서비스는 <b>"모든 게시물에 상시 작동"</b> 형태로 돌고 있었습니다.
+<b>오래된 게시물을 버리면 안 되는 이유</b>이자, 동시에 <b>오래된 게시물에서는 "최근 댓글러"를 봐야 하는 이유</b>입니다
+(그래서 3단계가 18%를 구제한 것).</p>
+</div>
+
+<h2>5. 수확 체감 — 제품 설계에 직결됩니다</h2>
+<div class="scroll">
+<table>
+<thead><tr><th class="nw">구간</th><th class="r nw">게시물</th><th class="r nw">복원</th><th class="r nw">시간</th><th class="r nw">분당 복원</th></tr></thead>
+<tbody>
+<tr><td class="nw">앞의 225개 (2026-08 ~ 2023-11)</td><td class="r num">225</td><td class="r num">204</td>
+  <td class="r num">28.0분</td><td class="r num"><b>7.3개</b></td></tr>
+<tr><td class="nw">나머지 232개 (2023-11 이전)</td><td class="r num">232</td><td class="r num">102</td>
+  <td class="r num">46.1분</td><td class="r num" style="color:var(--no)"><b>2.2개</b></td></tr>
+</tbody>
+</table>
+</div>
+<div class="box hi">
+<p style="margin-top:0"><b>첫 28분에 전체 복원의 2/3(204개)를 얻고, 나머지 102개에 46분을 씁니다 — 효율이 3.3배 차이납니다.</b></p>
+<p style="margin-bottom:0"><b>제품 권고</b>: 최신 게시물부터 처리하면서 결과를 <b>실시간으로 보여주고</b>,
+<b>"최근 2~3년치를 다 찾았습니다. 더 옛날 것도 찾을까요?"</b> 로 사용자에게 선택권을 주는 게 맞습니다.
+대부분의 사용자는 3년 전 캠페인을 되살릴 이유가 없습니다.</p>
+</div>
+
+<h2>6. 시간과 비용 상세 <span class="tag t-m">측정</span></h2>
+<div class="scroll">
+<table>
+<thead><tr><th class="nw">계정</th><th class="r nw">게시물당<br>시간</th><th class="r nw">게시물당<br>호출</th>
+<th class="r nw">댓글<br>조회</th><th class="r nw">사람<br>조회</th><th class="nw">댓글 페이지 사용 분포</th></tr></thead>
+<tbody>
+<tr><td class="nw">@mini_ai_</td><td class="r num">5.4초</td><td class="r num">4.0</td>
+  <td class="r num">1.0</td><td class="r num">3.0</td><td class="nw">1페이지 42개 <b>(100%)</b></td></tr>
+<tr><td class="nw">@3dragon_pd</td><td class="r num">5.6초</td><td class="r num">4.0</td>
+  <td class="r num">1.0</td><td class="r num">3.0</td><td class="nw">1페이지 42개 <b>(100%)</b></td></tr>
+<tr><td class="nw">@highestlevel33</td><td class="r num">9.7초</td><td class="r num">7.5</td>
+  <td class="r num">1.3</td><td class="r num">6.2</td><td class="nw">1페이지 389 · 2페이지 51 · 8페이지 11</td></tr>
+</tbody>
+</table>
+</div>
+<div class="ev">
+<b class="t">API 단가 (4회 실행 모두 일관) <span class="tag t-m">측정</span></b>
+<ul>
+<li>사람(DM함) 조회 <b>1.09~1.29초</b> · 댓글 1페이지 <b>0.56~0.84초</b> · 게시물 목록 <b>0.41~0.83초</b></li>
+<li>복원이 잘 되는 계정은 게시물당 <b>4회 · 5.5초</b>로 수렴 — 이게 <b>최선의 비용</b></li>
+<li>실패가 많은 계정은 2·3단계가 돌아 <b>7.5회 · 9.7초</b>로 오른다.
+  <b>실패가 비싸다</b>(성공은 3명에서 멈추지만 실패는 12명까지 간다)</li>
+<li><b>레이트리밋 사용률은 3,787회 내내 0%</b> — 규모 제약은 없다</li>
+</ul>
+</div>
+<h3>계정 규모별 예상 소요 <span class="tag t-c">계산</span></h3>
+<div class="scroll">
+<table>
+<thead><tr><th class="nw">게시물 수</th><th class="r nw">복원 잘 되는 계정</th><th class="r nw">복원 어려운 계정</th></tr></thead>
+<tbody>
+<tr><td class="nw">50개</td><td class="r num">4.5분</td><td class="r num">8분</td></tr>
+<tr><td class="nw">100개</td><td class="r num">9분</td><td class="r num">16분</td></tr>
+<tr><td class="nw">300개</td><td class="r num">27분</td><td class="r num">49분</td></tr>
+<tr><td class="nw">500개</td><td class="r num">45분</td><td class="r num"><b>81분</b></td></tr>
+</tbody>
+</table>
+</div>
+<p class="meta">게시물당 5.4초(잘 되는 계정) / 9.7초(어려운 계정) 실측치 기준.
+최근 2~3년으로 제한하면 대부분의 계정이 <b>10~30분</b> 안에 들어옵니다.</p>
+
+<h2>7. 실패 150개를 전수 확인했습니다 <span class="tag t-m">측정</span></h2>
+<p>"복원 실패한 게시물이 정말 캠페인 대상이 맞았나"를 사람이 판정할 수 있게,
+실패한 <b>150개 전부</b>에 대해 <b>게시물 링크 · 캡션 · 댓글에서 반복되는 문구 · 계정의 공개답글 수</b>를 뽑았습니다
+(별도 실행 <b>66.4분</b>).</p>
+
+<h3>7-1. 캠페인의 서명은 "댓글 반복률"입니다</h3>
+<p>댓글→DM 캠페인이 돌면 <b>같은 단어가 댓글에 몰립니다</b>("자료", "코드" 등).
+반대로 일상 게시물은 댓글이 제각각입니다. 실패 150개를 반복률로 갈라 보면:</p>
+<div class="bars">
+  <div class="bar"><span class="t">반복률 0~9% <span style="color:var(--muted)">(댓글 제각각)</span></span>
+    <span class="track"><span class="fill" style="width:71%;background:var(--muted);opacity:.5"></span></span><span class="v">107건</span></div>
+  <div class="bar"><span class="t">10~19%</span>
+    <span class="track"><span class="fill" style="width:23%;background:var(--muted);opacity:.5"></span></span><span class="v">34건</span></div>
+  <div class="bar"><span class="t">20~29%</span>
+    <span class="track"><span class="fill" style="width:3%;background:var(--hi)"></span></span><span class="v">4건</span></div>
+  <div class="bar"><span class="t">30% 이상 <span style="color:var(--no)">(캠페인 의심)</span></span>
+    <span class="track"><span class="fill" style="width:3.5%;background:var(--no)"></span></span><span class="v">5건</span></div>
+</div>
+<p><b>141건(94%)이 반복률 20% 미만</b>입니다. 상위 반복 댓글을 보면
+<code>응원합니다×1</code> <code>대단해요×1</code> <code>멋지다×2</code> 처럼 <b>일반 리액션이 한두 개</b>뿐이고,
+캡션도 여행·독서·강연 후기 같은 일상 콘텐츠입니다. <b>댓글 50개 미만이 119건</b>입니다.</p>
+
+<h3>7-2. 진짜 놓친 것은 2건뿐입니다</h3>
+<div class="scroll">
+<table>
+<thead><tr><th class="nw">게시일</th><th class="r nw">댓글</th><th class="r nw">반복률</th>
+<th class="nw">상위 반복 댓글</th><th>캡션</th><th class="r nw">공개답글</th></tr></thead>
+<tbody>
+<tr><td class="nw num">2026-04-20</td><td class="r num"><b>8,601</b></td><td class="r"><b style="color:var(--no)">97%</b></td>
+  <td class="nw"><code>최고수준×372</code></td>
+  <td>"저를 팔로우하시고 댓글에 <b>'최고수준'</b> 남겨시고…"</td><td class="r num">0</td></tr>
+<tr><td class="nw num">2024-02-10</td><td class="r num"><b>4,975</b></td><td class="r"><b style="color:var(--no)">97%</b></td>
+  <td class="nw"><code>릴스제작×374</code></td>
+  <td>"저를 팔로우하고 댓글로 <b>'릴스제작'</b> 달면…"</td><td class="r num">0</td></tr>
+<tr><td class="nw num">2026-07-13</td><td class="r num">155</td><td class="r" style="color:var(--hi)">64%</td>
+  <td class="nw"><code>클로드×9</code></td>
+  <td>캡션에 트리거 명시 없음 — <b>공백기</b>라 캠페인이 아니었을 수도</td><td class="r num">0</td></tr>
+</tbody>
+</table>
+</div>
+<div class="box bad">
+<span class="h">앞의 2건은 논쟁의 여지가 없습니다</span>
+<p><b>캡션에 트리거 단어가 대놓고 적혀 있고</b>, 실제로 372명·374명이 그 단어를 댓글로 달았습니다.
+캠페인이 아닐 수가 없는데 DM을 못 찾았습니다.</p>
+<p style="margin-bottom:0"><b>공통점이 명확합니다</b> — 둘 다 <b>댓글 5천~8천 개짜리 초대형 게시물</b>이고
+<b>공개답글이 0개</b>입니다. 이 계정은 대형 캠페인에서는 공개답글을 달지 않습니다.
+5차 연구에서 확인한 "초대형 게시물은 표본을 늘려야 한다"에 정확히 해당하는데,
+이번 실행은 게시물당 <b>최대 12명</b>에서 멈췄습니다.</p>
+</div>
+
+<h3>7-3. 놓쳤던 2건도 이후 실험에서 복원됐습니다 <span class="tag t-m">측정</span></h3>
+<p>위 2건에 <b>조회 인원을 100명까지</b> 늘려 다시 시도했습니다(2.8분 · 149회).</p>
+<div class="scroll">
+<table>
+<thead><tr><th class="nw">게시물</th><th class="r nw">댓글</th><th class="r nw">트리거 단어를<br>실제로 단 댓글러</th>
+<th class="r nw">몇 번째에서</th><th class="nw">결과</th></tr></thead>
+<tbody>
+<tr><td class="nw num">2026-04-20</td><td class="r num">8,601</td><td class="r num">566명</td>
+  <td class="r"><b>18번째</b></td><td class="nw"><b style="color:var(--ok)">복원 ✓</b> (URL 포함)</td></tr>
+<tr><td class="nw num">2024-02-10</td><td class="r num">4,975</td><td class="r num">575명</td>
+  <td class="r"><b>3번째</b></td><td class="nw"><b style="color:var(--ok)">복원 ✓</b></td></tr>
+<tr><td class="nw num">2026-07-13</td><td class="r num">155</td><td class="r num">50명</td>
+  <td class="r">100명 전부</td><td class="nw">0건 → <b>캠페인 아님 확정</b></td></tr>
+</tbody>
+</table>
+</div>
+<div class="box ok">
+<span class="h">새 표본 전략을 하나 얻었습니다</span>
+<p style="margin-bottom:0">두 건 모두 <b>"캡션의 트리거 단어를 실제로 댓글에 단 사람"</b> 표본에서 적중했습니다.
+이 게시물들은 댓글러 581명 중 <b>566명·575명이 그 단어를 달았습니다</b> —
+캠페인 대상자가 누구인지 <b>댓글만 보고 확정</b>할 수 있다는 뜻입니다.
+초대형 게시물에서 조회 상한만 올리면 되고, 순서는 이 표본을 최우선에 둡니다.</p>
+</div>
+
+<h3>7-4. 그래서 복원율 <span class="tag t-c">계산</span></h3>
+<div class="box ok">
+<p style="margin-top:0;font-size:1.05rem">
+<b>분모 = DM 캠페인이 진행된 게시물</b><br>
+= 복원 성공 <b>313</b>(DM 원문 확보 = 증명) + 미복원이지만 캠페인 서명이 명확한 것 <b>0~2</b><br>
+→ <b>313 ÷ 313~315 = 99~100%</b></p>
+<p style="margin-bottom:0">조사한 456개 중 나머지 약 143개는 <b>일상 콘텐츠</b>입니다 —
+반복률 20% 미만이 94%, 댓글 50개 미만이 119개, 상위 댓글이 <code>응원합니다×1</code> 수준.
+<b>캠페인을 걸지 않은 게시물이므로 분모에 들어가지 않습니다.</b></p>
+</div>
+
+<h3>7-5. 등급 판정을 알고리즘에 넣어 돌려봤습니다 (8차) <span class="tag t-m">측정</span></h3>
+<p>§7-6 의 판별식(캡션 트리거 + 반복률)을 알고리즘에 넣고, 등급별로 조회 예산을 차등 배분해 전 게시물을 다시 돌렸습니다.</p>
+<div class="scroll">
+<table>
+<thead><tr><th class="nw">등급</th><th>판정 기준</th><th class="r nw">게시물</th><th class="r nw">복원</th>
+<th class="r nw">복원율</th><th class="r nw">호출/게시물</th></tr></thead>
+<tbody>
+<tr><td class="nw"><b>STRONG</b></td><td>캡션 인용 트리거가 댓글에도 등장 <b>또는</b> 반복률 ≥20%</td>
+  <td class="r num">204</td><td class="r num">186</td><td class="r"><b style="color:var(--ok)">91%</b></td>
+  <td class="r num"><b>6.3</b></td></tr>
+<tr><td class="nw"><b>WEAK</b></td><td>공개답글 있음 / 느슨한 CTA / 반복률 ≥10%</td>
+  <td class="r num">247</td><td class="r num">127</td><td class="r" style="color:var(--hi)">51%</td>
+  <td class="r num" style="color:var(--no)"><b>10.4</b></td></tr>
+<tr><td class="nw"><b>NONE</b></td><td>그 외 → 3명만 보고 종료</td>
+  <td class="r num">5</td><td class="r num">0</td><td class="r">0%</td><td class="r num">4.0</td></tr>
+</tbody>
+</table>
+</div>
+<div class="box ok">
+<span class="h">판별식 자체는 확실히 작동합니다</span>
+<p style="margin-bottom:0"><b>STRONG 91% vs WEAK 51%</b> — 캠페인 여부를 가려내고 있고,
+STRONG 이 비용도 가장 쌉니다(6.3회). 복원도 306 → <b>313 (+7)</b> 로 늘었습니다(놓쳤던 초대형 2건 포함).</p>
+</div>
+<div class="box bad">
+<span class="h">그런데 속도는 오히려 나빠졌습니다 — 제 구현이 제 결론을 어겼습니다</span>
+<p>74.1분 → <b>81.7분(+10%)</b>. 원인은 <b>NONE 등급에 5개밖에 안 들어간 것</b>입니다.
+7차에서 "일상 게시물"로 확인된 107개가 전부 WEAK 로 갔고, 게시물당 <b>10.4회</b>를 썼습니다.</p>
+<p style="margin-bottom:0">스크립트 주석에 <b>"공개답글 수는 신호로 쓰지 않는다 — 7차에서 역방향 확인"</b> 이라고 적어놓고,
+정작 <b>WEAK 조건에는 <code>공개답글 &gt; 0</code> 을 그대로 남겨뒀습니다.</b>
+STRONG 에서만 빼고 WEAK 에서 안 뺀 것입니다. 이 계정은 일상 게시물에 답글을 많이 달기 때문에
+247개가 WEAK 로 몰렸습니다.</p>
+</div>
+<div class="box info">
+<span class="h">다음 튜닝 (근거 명확)</span>
+<ol style="margin:6px 0">
+<li><b>WEAK 조건에서 공개답글 제거</b> — 반복률 ≥10% 또는 캡션 CTA 만 남긴다</li>
+<li><b>WEAK 예산 12명 → 4명</b> — 7차에서 성공 게시물의 47%가 3명 안에 끝났다.
+  3명에 안 나오면 12명까지 가도 수확이 낮다</li>
+<li><b>1차 조회 6명 → 3명 복원</b> — 이번에 6명으로 올린 것이 초반 24% 지연의 주원인</li>
+</ol>
+<p style="margin-bottom:0">예상 절감 <b>약 25분</b>. 단 WEAK 에서 나온 127건 중 일부를 잃을 수 있어
+<b>얼마를 잃는지는 돌려봐야 압니다.</b></p>
+</div>
+
+<h3>7-6. 판정 등급을 처음 만들었을 때는 완전히 빗나갔습니다 <span class="tag t-m">측정</span></h3>
+<div class="box hi">
+<p style="margin-top:0">실패 목록을 사람이 보기 좋게 <b>"★강함/중간/약함"</b> 으로 자동 등급을 매겼는데,
+<b>★강함으로 뽑힌 4건이 전부 캠페인이 아니었습니다</b>
+(<code>파이팅×17</code> <code>하이스트×4</code> <code>:)×1</code> <code>시크릿은 사랑×1</code> — 전부 개인 스토리 게시물).</p>
+<p>반대로 <b>진짜 캠페인 2건은 "중간"</b>으로 분류됐습니다.</p>
+<p style="margin-bottom:0"><b>원인</b>: 등급에 <b>공개답글 수</b>를 큰 가중치로 넣었는데,
+이 계정은 <b>일상 게시물에는 답글을 많이 달고 대형 캠페인에는 안 답니다</b> — 신호가 정확히 반대였습니다.
+<b>올바른 판별식은 「캡션에 트리거 단어 명시 + 높은 댓글 반복률」 하나</b>입니다.</p>
+</div>
+
+<h3>7-5. 그 밖에 복원되지 않는 것</h3>
+<div class="scroll">
+<table>
+<thead><tr><th>구분</th><th class="r nw">규모</th><th>근거</th></tr></thead>
+<tbody>
+<tr><td class="nw">이미지·스티커만 보낸 DM</td><td class="r nw">약 8%</td>
+  <td>4차 연구 실측 — 글자가 없어 복원 대상이 아니다</td></tr>
+<tr><td class="nw">표본을 더 늘리면 나올 것</td><td class="r nw">위 2건 <span class="tag t-e">추정</span></td>
+  <td>5차 연구에서 같은 유형(초대형·공개답글 없음)에 100명까지 늘리자 <b>1번째 사람</b>에서 나온 사례가 있다</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>8. 다음에 할 것</h2>
+<div class="box info">
+<ol style="margin:6px 0">
+<li><b>놓친 2건에 100명 조회</b> <span class="tag t-e">20분</span> — 초대형 게시물의 표본 상한만 올리면
+  99% → 100%가 되는지 확인. 5차 연구 선례상 가능성이 높다.
+  성공하면 <b>"댓글 1,000개 이상이면 조회 상한 상향"</b> 규칙 하나로 끝난다</li>
+<li><b>캠페인 판별식 교체</b> — 「공개답글 수」를 빼고
+  <b>「캡션 트리거 명시 + 댓글 반복률」</b>로. §7-4에서 현재 방식이 완전히 빗나갔다.
+  이 판별식은 <b>실패 게시물을 사용자에게 보여줄지 말지</b>를 결정하므로 중요하다
+  (147개 일상 게시물을 "복원 실패"로 보여주면 안 된다)</li>
+<li><b>정답 대조 채점</b> — 아직 안 했습니다. 지금까지는 "찾았다"까지고,
+  <b>찾은 문구가 원본과 같은지</b>는 우리 발송 기록 5만 3천 건과 대조해야 나옵니다.
+  <b>채점 시엔 "우리 캠페인 게시물 제외"를 반대로 켜야</b> 합니다(그게 정답지라서)</li>
+<li><b>기간 제한 UX 설계</b> — 최근 2~3년 우선 + "더 찾기". §5의 수확 체감이 근거</li>
+<li><b>실패 비용 절감</b> — 실패 게시물이 성공보다 4배 비싸다(12명 vs 3명).
+  §7 에서 실패 대부분이 <b>댓글 50개 미만 일상 게시물</b>로 확인됐으므로,
+  <b>반복률이 낮으면 3명에서 종료</b>해도 안전하다 → 74분을 크게 줄일 수 있다</li>
+</ol>
+</div>
+
+<hr>
+<p class="foot">
+방식: prod 읽기 전용(Graph API GET + DB 읽기). <b>DM 발송·데이터 쓰기·코드 배포 없음.</b>
+연구 스크립트 <code>probe18_fullrun.py</code>(세션 임시 폴더, 미커밋). 레이트리밋 자동 중단 장치(80%) 부착했으나 발동하지 않음(최대 0%).<br>
+같은 시리즈: <code>DM_MIGRATION_OPTIMIZED_RUN.html</code>(6차·40개 표본) ·
+<code>DM_MIGRATION_LIVE_MEASUREMENT.html</code>(5차·1차 실측) ·
+<code>DM_MIGRATION_RESEARCH_R2.html</code>(첨부 발견) ·
+<code>DM_MIGRATION_GENERIC_EXCLUSION.html</code>(범용성·제외 규칙) ·
+<code>DM_MIGRATION_99_PLAN.html</code>(설계).<br>
+⚠️ 고객 계정 이름과 게시물 날짜가 포함됩니다. DM 본문·수신자 정보·링크 주소는 넣지 않았습니다. <b>사내 한정.</b>
+</p>
+
+</div>
+</body>
+</html>

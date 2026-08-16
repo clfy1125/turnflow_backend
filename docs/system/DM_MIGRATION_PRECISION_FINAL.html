@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DM 캠페인 이전 — 정밀도 우선 알고리즘 최종 (9차 연구)</title>
+<style>
+  :root{
+    --bg:#fbfbfa; --fg:#1c1b19; --muted:#6b6862; --line:#e4e1da; --card:#fff; --code:#f4f2ee;
+    --ok:#0f7b4f; --ok-bg:#e8f6ee; --no:#c0392b; --no-bg:#fdecec;
+    --hi:#b06d00; --hi-bg:#fdf3e0; --info:#1d6fb8; --info-bg:#e9f2fb;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#16161a; --fg:#e8e6e1; --muted:#9a968e; --line:#2e2e34; --card:#1d1d22; --code:#232329;
+      --ok:#4cc38a; --ok-bg:#12291f; --no:#f07070; --no-bg:#2b1616;
+      --hi:#e0a33a; --hi-bg:#2b2113; --info:#6cb2ee; --info-bg:#13212e;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"Segoe UI","Malgun Gothic","Apple SD Gothic Neo",sans-serif;
+    line-height:1.85;word-break:keep-all;-webkit-font-smoothing:antialiased;font-size:16px}
+  .wrap{max-width:980px;margin:0 auto;padding:44px 22px 90px}
+  h1{font-size:1.58rem;line-height:1.4;margin:0 0 10px;letter-spacing:-.02em}
+  .sub{color:var(--muted);font-size:.95rem;margin:0 0 6px}
+  .meta{color:var(--muted);font-size:.83rem;margin:0 0 30px}
+  h2{font-size:1.22rem;margin:54px 0 16px;padding-bottom:10px;border-bottom:2px solid var(--line)}
+  h3{font-size:1.02rem;margin:30px 0 10px}
+  p{margin:13px 0} ul,ol{margin:13px 0;padding-left:24px} li{margin:7px 0}
+  code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.85em;
+    background:var(--code);padding:1px 5px;border-radius:4px}
+  .scroll{overflow-x:auto}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:.89rem}
+  th,td{border:1px solid var(--line);padding:9px 11px;text-align:left;vertical-align:top}
+  th{background:var(--code);font-weight:600}
+  td.nw,th.nw{white-space:nowrap} .num{font-family:ui-monospace,monospace} .r{text-align:right}
+  .headline{border-radius:14px;padding:22px 26px;margin:26px 0;background:var(--ok-bg);border:2px solid var(--ok)}
+  .headline .a{font-size:1.3rem;font-weight:800;letter-spacing:-.02em;line-height:1.5;color:var(--ok);margin:0}
+  .headline p{margin:12px 0 0;font-size:.97rem}
+  .box{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 20px;margin:18px 0}
+  .box.hi{border-left:5px solid var(--hi);background:var(--hi-bg)}
+  .box.bad{border-left:5px solid var(--no);background:var(--no-bg)}
+  .box.info{border-left:5px solid var(--info);background:var(--info-bg)}
+  .box.ok{border-left:5px solid var(--ok);background:var(--ok-bg)}
+  .box p:first-child{margin-top:0} .box p:last-child{margin-bottom:0}
+  .box .h{font-weight:700;display:block;margin-bottom:6px}
+  .tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:.72rem;font-weight:700;white-space:nowrap}
+  .t-m{background:var(--ok-bg);color:var(--ok)} .t-c{background:var(--info-bg);color:var(--info)}
+  .t-e{background:var(--hi-bg);color:var(--hi)}
+  .steps{counter-reset:st;display:grid;gap:11px;margin:18px 0}
+  .step{background:var(--card);border:1px solid var(--line);border-radius:10px;
+    padding:14px 18px 14px 56px;position:relative;font-size:.93rem}
+  .step::before{counter-increment:st;content:counter(st);position:absolute;left:16px;top:14px;
+    width:27px;height:27px;border-radius:50%;background:var(--info-bg);color:var(--info);
+    display:grid;place-items:center;font-size:.8rem;font-weight:800}
+  .step b{display:block;margin-bottom:2px}
+  .step .m{color:var(--muted);font-size:.87rem}
+  .grade{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:18px 0}
+  @media(max-width:760px){.grade{grid-template-columns:1fr}}
+  .g{background:var(--card);border:1px solid var(--line);border-radius:11px;padding:16px 18px}
+  .g.a{border-top:5px solid var(--ok)} .g.b{border-top:5px solid var(--hi)} .g.c{border-top:5px solid var(--no)}
+  .g .t{font-weight:700;font-size:.97rem} .g .p{font-size:1.5rem;font-weight:800;letter-spacing:-.02em}
+  .g.a .p{color:var(--ok)} .g.b .p{color:var(--hi)} .g.c .p{color:var(--no)}
+  .g .d{color:var(--muted);font-size:.85rem;line-height:1.55;margin-top:5px}
+  hr{border:0;border-top:1px solid var(--line);margin:44px 0}
+  .foot{color:var(--muted);font-size:.83rem;margin-top:46px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>정밀도 우선 알고리즘 — 최종형<br><span style="font-size:.72em;color:var(--muted);font-weight:600">신규 계정 @pure_skin2856 음성 대조군 포함</span></h1>
+<p class="sub">"복원 건수"를 버리고 <b>정밀도</b>를 지표로 삼아 알고리즘을 다시 짰습니다.</p>
+<p class="meta">2026-08-14 · prod 읽기 전용(GET) · 계정 3곳 · 병렬 4워커 · 구현 아님(연구판)</p>
+
+<div class="headline">
+  <p class="a">오퍼 URL 확보율 100%. 없는 캠페인은 하나도 만들지 않았습니다.</p>
+  <p>캠페인을 쓰는 계정 2곳에서 <b>후보 42/42 전부에 오퍼 URL을 확보</b>했고,
+  캠페인을 쓰지 않는 계정에서는 <b>자동채택 0건</b>이었습니다.
+  게시물 42개에 <b>4분</b>이 걸립니다.</p>
+</div>
+
+<h2>1. 결과</h2>
+<div class="scroll">
+<table>
+<thead><tr><th class="nw">계정</th><th class="r nw">검사</th><th class="r nw">캠페인<br>후보</th>
+<th class="r nw">오퍼 URL<br>확보</th><th class="r nw">자동<br>채택</th><th class="r nw">확인<br>권장</th>
+<th class="r nw">검수<br>필수</th><th class="r nw">시간</th><th class="r nw">게시물당</th></tr></thead>
+<tbody>
+<tr><td class="nw">@mini_ai_</td><td class="r num">42</td><td class="r num">42</td>
+  <td class="r"><b style="color:var(--ok)">42 (100%)</b></td><td class="r num">36</td>
+  <td class="r num">6</td><td class="r num">0</td><td class="r num">3.8분</td><td class="r num">5.5초</td></tr>
+<tr><td class="nw">@3dragon_pd</td><td class="r num">42</td><td class="r num">42</td>
+  <td class="r"><b style="color:var(--ok)">42 (100%)</b></td><td class="r num">35</td>
+  <td class="r num">5</td><td class="r num">2</td><td class="r num">4.4분</td><td class="r num">6.3초</td></tr>
+<tr><td class="nw"><b>@pure_skin2856</b><br><span style="color:var(--muted);font-size:.85em">음성 대조군</span></td>
+  <td class="r num">14</td><td class="r num">3</td>
+  <td class="r"><b>0</b></td><td class="r"><b style="color:var(--ok)">0</b></td>
+  <td class="r num">2</td><td class="r num">1</td><td class="r num">0.2분</td><td class="r num">1.0초</td></tr>
+</tbody>
+</table>
+</div>
+<div class="box ok">
+<span class="h">@pure_skin2856 — 음성 대조군이 통과했습니다</span>
+<p>이 계정은 우리 서비스에 연동돼 있지만 <b>캠페인 0개 · 발송 로그 0건</b>이고,
+게시물 34개에 댓글이 최대 5개인 <b>소형 뷰티 계정</b>입니다. 댓글→DM 자동화를 쓰지 않습니다.</p>
+<p style="margin-bottom:0"><b>알고리즘은 자동채택을 하나도 만들지 않았습니다.</b>
+14개 중 11개는 "없음", 3개는 낮은 지지로 검수 대상. 오퍼 URL은 0건.
+<b>없는 캠페인을 지어내지 않는다</b>는 것이 확인됐습니다 — 이게 정밀도 지표의 핵심입니다.</p>
+</div>
+
+<h2>2. 최종 알고리즘</h2>
+<div class="steps">
+  <div class="step"><b>게시물 열거 + 우리 캠페인 게시물 제외</b>
+    <span class="m">댓글 8개 이상. 우리가 이미 운영 중인 게시물은 제외(자기 DM 오염 방지).</span></div>
+  <div class="step"><b>댓글 1페이지 → 3명 탐색</b>
+    <span class="m">순서: 캡션 트리거 단어를 실제로 단 사람 → 계정이 공개답글 단 사람 → 오래된/최근 교대.
+    <b>0건이면 즉시 종료</b>(비캠페인 방어).</span></div>
+  <div class="step"><b>1건이라도 나오면 10명까지 채운다</b> <span class="tag t-m">정밀도의 핵심</span>
+    <span class="m">지지비율(= 그 문구를 받은 사람 ÷ 조회한 사람)을 계산하려면 <b>분모가 고정</b>돼야 한다.
+    "3건 확보 후 중단"을 폐지한 이유. 댓글 1,000개 이상이면 30명.</span></div>
+  <div class="step"><b>서명이 강한데 0건이면 댓글을 깊게 판다</b>
+    <span class="m">캡션 인용 트리거 또는 반복률 20%+ 인 게시물만. 캠페인 기간에 닿을 때까지 최대 12페이지.</span></div>
+  <div class="step"><b>게이트와 오퍼를 <u>따로</u> 뽑는다</b> <span class="tag t-m">URL 확보의 핵심</span>
+    <span class="m"><b>오퍼</b> = URL 있는 문구 중 지지 최고 · <b>게이트</b> = URL 없는 문구 중 지지 최고.
+    등급은 <b>오퍼 기준</b>으로 매긴다.</span></div>
+  <div class="step"><b>지지비율로 3단 등급</b>
+    <span class="m">7일 귀속창은 1차 필터로만 유지(시간 컷오프를 좁히는 건 효과 없음 — §4).</span></div>
+</div>
+
+<div class="grade">
+  <div class="g a"><div class="t">자동채택</div><div class="p">지지 60%+</div>
+    <div class="d">실측 정밀도 <b>100%</b>(정 29 / 오 0). 초안을 바로 생성.</div></div>
+  <div class="g b"><div class="t">확인 권장</div><div class="p">40~60%</div>
+    <div class="d">실측 정밀도 77%. 초안은 만들되 <b>확인 배지</b>를 단다.</div></div>
+  <div class="g c"><div class="t">검수 필수</div><div class="p">40% 미만</div>
+    <div class="d">실측 정밀도 11~21%. <b>자동 생성 금지</b> — 인플루언서가 직접 확인.</div></div>
+</div>
+
+<h2>3. 이번에 고친 것 두 가지</h2>
+
+<h3>3-1. 배타 할당은 폐기했습니다 <span class="tag t-m">역효과 확인</span></h3>
+<div class="box bad">
+<p style="margin-top:0">"같은 문구가 여러 게시물에 뜨면 지지가 가장 높은 하나에만 배정한다"는 규칙을 넣었습니다.
+직전 측정에서 <b>정밀도 97%</b>로 좋아 보였는데, 실계정에 적용하니 <b>@mini_ai_ 42개 중 35개가 '없음'</b>이 됐습니다.</p>
+<p><b>원인</b>: 이 계정은 <code>팔로우 확인 🙌🏻</code> 같은 <b>동일한 게이트 문구를 모든 게시물에서 씁니다.</b>
+배타 규칙이 그걸 한 게시물에만 남기고 나머지 34개에서 지워버린 것입니다.</p>
+<p style="margin-bottom:0"><b>왜 측정이 속였나</b>: 97%는 <b>우리 캠페인</b>을 정답지로 잰 값인데,
+우리 캠페인은 게시물마다 문구가 다릅니다. <b>측정 표본이 현실을 대표하지 못했습니다.</b>
+→ 배타 할당 없이 <b>지지비율만으로도 60%+ 구간 정밀도가 100%</b> 이므로 제거하는 게 맞습니다.</p>
+</div>
+
+<h3>3-2. 게이트와 오퍼를 분리했습니다 <span class="tag t-m">URL 3 → 42</span></h3>
+<div class="box hi">
+<p style="margin-top:0">"지지비율이 가장 높은 문구 하나"를 캠페인으로 뽑았더니, 나온 것이 전부
+<code>팔로우 확인 🙌🏻</code> 였습니다. <b>오퍼 URL 확보가 42개 중 3개</b>에 그쳤습니다.</p>
+<p><b>이유는 구조에 있습니다</b> — 게이트 DM은 <b>댓글 단 사람 전원</b>에게 가서 지지 100%,
+오퍼 DM(URL 포함)은 <b>팔로우를 실제로 누른 사람</b>에게만 가서 지지가 낮습니다.
+최고 지지 하나만 뽑으면 <b>구조적으로 URL 없는 게이트만</b> 나옵니다.</p>
+<p style="margin-bottom:0">URL 있는 문구와 없는 문구를 <b>각각 최고 지지로</b> 뽑아 한 쌍으로 묶자
+<b>오퍼 URL 확보가 3 → 42 (100%)</b> 가 됐습니다.
+덤으로 <b>팔로우게이트 유무·문구까지 함께 복원</b>되어 2단 구조가 그대로 재현됩니다.</p>
+</div>
+
+<h2>4. 앞서 검토했다 버린 신호들</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>신호</th><th class="nw">판정</th><th>근거</th></tr></thead>
+<tbody>
+<tr><td class="nw"><b>지지 절대수</b>(5명 이상)</td><td class="nw"><span class="tag t-e">대체됨</span></td>
+  <td>정밀도 95%. 다만 <b>조회량에 따라 의미가 달라진다</b>(10명 중 5명=50% vs 30명 중 5명=17%) → <b>비율</b>로 교체</td></tr>
+<tr><td class="nw"><b>시간 컷오프</b></td><td class="nw"><span class="tag" style="background:var(--no-bg);color:var(--no)">폐기</span></td>
+  <td>1분 이내로 좁혀도 정밀도 76%. <b>한 사람이 여러 게시물에 연달아 댓글</b>을 달면 각 캠페인 DM 이 모두 몇 초 안에 도착해 시간으로 갈리지 않는다</td></tr>
+<tr><td class="nw"><b>트리거 일치율</b></td><td class="nw"><span class="tag" style="background:var(--no-bg);color:var(--no)">폐기</span></td>
+  <td>100% 일치인데 정밀도 20%. <b>수신자는 정의상 이 게시물 댓글러</b>라 트리거를 이미 포함한다 — 논리적으로 무의미한 신호였다(설계 오류)</td></tr>
+<tr><td class="nw"><b>공개답글 수</b></td><td class="nw"><span class="tag" style="background:var(--no-bg);color:var(--no)">폐기</span></td>
+  <td>이 계정들은 <b>일상 게시물에 답글을 많이 달고 대형 캠페인에는 안 단다</b> — 신호가 역방향</td></tr>
+<tr><td class="nw"><b>배타 할당</b></td><td class="nw"><span class="tag" style="background:var(--no-bg);color:var(--no)">폐기</span></td>
+  <td>§3-1. 같은 게이트 문구가 전 게시물에 쓰이는 현실과 충돌</td></tr>
+<tr><td class="nw"><b>지지 비율</b></td><td class="nw"><span class="tag t-m">채택</span></td>
+  <td>60%+ 구간 정밀도 <b>100%</b>(정 29 / 오 0). 단독으로 충분</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>5. 속도 — 병렬화로 해결</h2>
+<div class="scroll">
+<table>
+<thead><tr><th class="nw">방식</th><th class="r nw">게시물당</th><th class="r nw">50개 환산</th><th class="r nw">456개 환산</th></tr></thead>
+<tbody>
+<tr><td class="nw">순차 · 3건 중단(구)</td><td class="r num">5.1초</td><td class="r num">4.3분</td><td class="r num">39분</td></tr>
+<tr><td class="nw">순차 · 10명 고정</td><td class="r num">14.5초</td><td class="r num">12.1분</td><td class="r num">110분</td></tr>
+<tr><td class="nw"><b>병렬 4워커 · 10명 고정</b></td><td class="r num"><b>5.5초</b></td><td class="r num"><b>4.6분</b></td><td class="r num"><b>42분</b></td></tr>
+</tbody>
+</table>
+</div>
+<div class="box info">
+<p style="margin-top:0"><b>정밀도를 3배 올리면서 속도는 그대로입니다.</b>
+조회 인원을 3명 → 10명으로 늘렸지만 4워커 병렬로 게시물당 5.5초를 유지했습니다.</p>
+<p style="margin-bottom:0"><b>속도는 알고리즘으로 짜낼 게 아니라 병렬화로 푸는 문제</b>였습니다.
+직전에 시도한 알고리즘 튜닝(44분)은 정밀도를 모르는 상태의 최적화라 폐기합니다.
+레이트리밋 여유도 확인됐습니다 — 누적 호출 <b>4,000회 이상에서 사용률 0%</b>.
+단, 스레드 안에서는 DB를 만지지 않습니다(조회만 병렬, 판정·저장은 메인).</p>
+</div>
+
+<h2>6. 남은 보정 1건</h2>
+<div class="box hi">
+<span class="h">표본이 작으면 비율이 왜곡됩니다</span>
+<p style="margin-top:0">@pure_skin2856 에서 <b>2명 조회 중 1명 = 50%</b> 로 "확인권장"이 붙은 건이 나왔습니다.
+내용은 <code>답글 1개 · 좋아요 3개</code> 로 <b>인스타 시스템 알림</b>으로 보입니다.</p>
+<p style="margin-bottom:0"><b>보정</b>: 등급 판정에 <b>절대 수신자 최소 3명</b> 조건을 함께 걸어야 합니다
+(지지비율 60%+ <b>AND</b> 수신자 3명+). 댓글이 극소수인 계정에서 헛 후보가 생기는 것을 막습니다.
+아울러 시스템 알림류 문구를 노이즈 목록에 추가할 필요가 있습니다.</p>
+</div>
+
+<h2>7. 다음</h2>
+<div class="box info">
+<ol style="margin:6px 0">
+<li><b>절대 수신자 3명 조건 추가</b> 후 3계정 재측정 (§6)</li>
+<li><b>대형 계정(@highestlevel33 456개) 정밀도판 실행</b> — 병렬 4워커면 42분 예상.
+  자동채택 비율과 검수 부담을 대형 계정 기준으로 확인</li>
+<li><b>검수 화면 설계</b> — 등급이 "확인권장/검수필수"인 후보에 <b>①오퍼 URL ②버튼 문구 ③몇 명에게 갔는지 ④그 사람들 댓글</b>을 함께 보여주면 건당 5초면 판단된다</li>
+<li><b>구현</b> — 여기까지가 연구입니다. 알고리즘은 확정됐습니다</li>
+</ol>
+</div>
+
+<hr>
+<p class="foot">
+방식: prod 읽기 전용(Graph API GET + DB 읽기). DM 발송·데이터 쓰기·코드 배포 없음.
+연구 스크립트 <code>probe29</code>~<code>probe31</code>(세션 임시 폴더, 미커밋).<br>
+같은 시리즈: <code>DM_MIGRATION_FULL_ACCOUNT_RUN.html</code>(전 게시물 실측) ·
+<code>DM_MIGRATION_OPTIMIZED_RUN.html</code> · <code>DM_MIGRATION_LIVE_MEASUREMENT.html</code> ·
+<code>DM_MIGRATION_RESEARCH_R2.html</code>(첨부 발견) · <code>DM_MIGRATION_GENERIC_EXCLUSION.html</code>.<br>
+⚠️ 고객 계정 이름·게시물 ID·오퍼 링크 도메인이 포함됩니다. <b>사내 한정.</b>
+</p>
+
+</div>
+</body>
+</html>

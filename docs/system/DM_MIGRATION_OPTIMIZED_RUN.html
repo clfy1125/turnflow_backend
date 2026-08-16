@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DM 캠페인 이전 — 최적화판 재측정 (6차 연구)</title>
+<style>
+  :root{
+    --bg:#fbfbfa; --fg:#1c1b19; --muted:#6b6862; --line:#e4e1da; --card:#fff; --code:#f4f2ee;
+    --ok:#0f7b4f; --ok-bg:#e8f6ee; --no:#c0392b; --no-bg:#fdecec;
+    --hi:#b06d00; --hi-bg:#fdf3e0; --info:#1d6fb8; --info-bg:#e9f2fb;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#16161a; --fg:#e8e6e1; --muted:#9a968e; --line:#2e2e34; --card:#1d1d22; --code:#232329;
+      --ok:#4cc38a; --ok-bg:#12291f; --no:#f07070; --no-bg:#2b1616;
+      --hi:#e0a33a; --hi-bg:#2b2113; --info:#6cb2ee; --info-bg:#13212e;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"Segoe UI","Malgun Gothic","Apple SD Gothic Neo",sans-serif;
+    line-height:1.85;word-break:keep-all;-webkit-font-smoothing:antialiased;font-size:16px}
+  .wrap{max-width:960px;margin:0 auto;padding:44px 22px 90px}
+  h1{font-size:1.6rem;line-height:1.4;margin:0 0 10px;letter-spacing:-.02em}
+  .sub{color:var(--muted);font-size:.95rem;margin:0 0 6px}
+  .meta{color:var(--muted);font-size:.83rem;margin:0 0 30px}
+  h2{font-size:1.24rem;margin:56px 0 16px;padding-bottom:10px;border-bottom:2px solid var(--line)}
+  h3{font-size:1.04rem;margin:30px 0 10px}
+  p{margin:13px 0} ul,ol{margin:13px 0;padding-left:24px} li{margin:7px 0}
+  code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.85em;
+    background:var(--code);padding:1px 5px;border-radius:4px}
+  .scroll{overflow-x:auto}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:.89rem}
+  th,td{border:1px solid var(--line);padding:9px 11px;text-align:left;vertical-align:top}
+  th{background:var(--code);font-weight:600}
+  td.nw,th.nw{white-space:nowrap} .num{font-family:ui-monospace,monospace} .r{text-align:right}
+  .headline{border-radius:14px;padding:22px 26px;margin:26px 0;
+    background:var(--hi-bg);border:2px solid var(--hi)}
+  .headline .a{font-size:1.32rem;font-weight:800;letter-spacing:-.02em;line-height:1.5;color:var(--hi);margin:0}
+  .headline p{margin:12px 0 0;font-size:.97rem}
+  .box{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 20px;margin:18px 0}
+  .box.hi{border-left:5px solid var(--hi);background:var(--hi-bg)}
+  .box.bad{border-left:5px solid var(--no);background:var(--no-bg)}
+  .box.info{border-left:5px solid var(--info);background:var(--info-bg)}
+  .box.ok{border-left:5px solid var(--ok);background:var(--ok-bg)}
+  .box p:first-child{margin-top:0} .box p:last-child{margin-bottom:0}
+  .box .h{font-weight:700;display:block;margin-bottom:6px}
+  .ev{background:var(--code);border-left:3px solid var(--muted);border-radius:0 7px 7px 0;
+    padding:11px 16px;margin:12px 0;font-size:.88rem}
+  .ev b.t{display:block;margin-bottom:3px;font-size:.83rem}
+  .ev ul{margin:5px 0;padding-left:20px} .ev li{margin:3px 0}
+  .tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:.72rem;font-weight:700;white-space:nowrap}
+  .t-m{background:var(--ok-bg);color:var(--ok)} .t-c{background:var(--info-bg);color:var(--info)}
+  .t-e{background:var(--hi-bg);color:var(--hi)}
+  .up{color:var(--no);font-weight:700} .down{color:var(--ok);font-weight:700} .same{color:var(--muted)}
+  .scorecard{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:22px 0}
+  @media(max-width:760px){.scorecard{grid-template-columns:1fr}}
+  .sc{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+  .sc.win{border-top:5px solid var(--ok)} .sc.lose{border-top:5px solid var(--no)}
+  .sc.mixed{border-top:5px solid var(--hi)}
+  .sc .t{font-weight:700;font-size:.95rem;margin-bottom:4px}
+  .sc .d{color:var(--muted);font-size:.86rem;line-height:1.55}
+  .flow{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:4px 20px;margin:16px 0}
+  .flow ol{padding-left:22px} .flow li{margin:10px 0}
+  hr{border:0;border-top:1px solid var(--line);margin:44px 0}
+  .foot{color:var(--muted);font-size:.83rem;margin-top:46px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>최적화판으로 다시 돌려봤습니다<br><span style="font-size:.72em;color:var(--muted);font-weight:600">— 절반만 성공했고, 회귀도 하나 나왔습니다</span></h1>
+<p class="sub">5차 연구에서 찾은 "댓글을 깊이 파야 한다"를 알고리즘에 넣고, 같은 고객 3명에게 다시 돌렸습니다.</p>
+<p class="meta">2026-08-14 · prod 읽기 전용(GET) · 게시물 120개 · 총 26.5분 · 구현 없음(연구만)</p>
+
+<div class="headline">
+  <p class="a">복원 능력은 올랐지만, <u>시간은 오히려 늘었습니다.</u><br>
+  최적화 방향은 맞았는데 <u>적용 위치가 틀렸습니다.</u></p>
+  <p>깊은 댓글 파기를 <b>모든 게시물에 미리</b> 적용했는데,
+  실제로 그게 필요한 건 <b>얕게 해서 실패하는 게시물뿐</b>이었습니다.
+  이미 잘 되던 계정 두 곳에서는 순수한 낭비가 됐습니다.</p>
+</div>
+
+<h2>1. 무엇을 바꿨나</h2>
+<div class="scroll">
+<table>
+<thead><tr><th class="nw">항목</th><th>이전</th><th>최적화판</th><th>의도</th></tr></thead>
+<tbody>
+<tr><td class="nw"><b>댓글 수집</b></td><td>무조건 1페이지(50개)</td>
+  <td><b>캠페인 기간에 닿을 때까지</b> 페이징<br>(게시 후 3일 이내 댓글 도달 시 중단, 최대 8페이지)</td>
+  <td>DM을 실제로 받은 "게시 직후 댓글러"를 잡기 위해</td></tr>
+<tr><td class="nw"><b>사람 조회</b></td><td>5명 고정</td><td><b>DM 3건 확보하면 즉시 중단</b> (최대 6명)</td>
+  <td>올바른 사람이면 적중률 ~100%이므로 낭비를 줄이려고</td></tr>
+<tr><td class="nw"><b>추가 조회</b></td><td>15명 (계정당 8개 게시물 한도)</td><td>12명, <b>한도 없음</b></td>
+  <td>실패 게시물을 끝까지 시도</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>2. 결과 — 세 줄 요약</h2>
+<div class="scorecard">
+  <div class="sc win">
+    <div class="t">✅ 성공한 것</div>
+    <div class="d">이전에 <b>20명을 봐도 실패</b>하던 대형 게시물 4개가,
+    <b>단 3명 조회로</b> 복원됐습니다. 5차 연구의 발견이 알고리즘에서 그대로 작동합니다.</div>
+  </div>
+  <div class="sc lose">
+    <div class="t">❌ 실패한 것</div>
+    <div class="d">이미 100%였던 계정 두 곳에서 <b>댓글 조회가 4~5배</b>로 늘어
+    시간이 <b>같거나 더 걸렸습니다</b>(5.6분 → 6.4분). 필요 없는 곳에 판 것입니다.</div>
+  </div>
+  <div class="sc mixed">
+    <div class="t">⚠️ 회귀 1건</div>
+    <div class="d">이전에 <b>복원되던 게시물 1개가 실패</b>했습니다.
+    원인이 중요합니다 — <b>캠페인이 게시 직후가 아니라 나중에 켜진</b> 경우였습니다(§5).</div>
+  </div>
+</div>
+
+<h2>3. 시간과 비용 <span class="tag t-m">측정</span></h2>
+<div class="scroll">
+<table>
+<thead><tr>
+<th class="nw">계정</th><th class="r nw">복원(이전)</th><th class="r nw">복원(최적화)</th>
+<th class="r nw">시간(이전)</th><th class="r nw">시간(최적화)</th>
+<th class="r nw">호출(이전)</th><th class="r nw">호출(최적화)</th>
+<th class="r nw">댓글 조회</th><th class="r nw">사람 조회</th></tr></thead>
+<tbody>
+<tr><td class="nw">@mini_ai_</td><td class="r num">40/40</td><td class="r num">40/40</td>
+  <td class="r num">5.5분</td><td class="r num"><span class="same">5.5분</span></td>
+  <td class="r num">242</td><td class="r num"><span class="up">298 ↑</span></td>
+  <td class="r num"><span class="up">40 → 167</span></td><td class="r num"><span class="down">200 → 129</span></td></tr>
+<tr><td class="nw">@3dragon_pd</td><td class="r num">40/40</td><td class="r num">40/40</td>
+  <td class="r num">5.6분</td><td class="r num"><span class="up">6.4분 ↑</span></td>
+  <td class="r num">242</td><td class="r num"><span class="up">338 ↑</span></td>
+  <td class="r num"><span class="up">40 → 213</span></td><td class="r num"><span class="down">200 → 123</span></td></tr>
+<tr><td class="nw">@highestlevel33</td><td class="r num">29/40<br><span style="color:var(--muted);font-size:.85em">+심층재시도 후 34</span></td>
+  <td class="r num">31/40 <span style="color:var(--muted);font-size:.85em">※</span></td>
+  <td class="r num">7.7분<br><span style="color:var(--muted);font-size:.85em">+7.5분 = 15.2분</span></td>
+  <td class="r num"><span class="down">7.9분</span></td>
+  <td class="r num">368<br><span style="color:var(--muted);font-size:.85em">+366 = 734</span></td>
+  <td class="r num"><span class="down">404</span></td>
+  <td class="r num">40 → 120</td><td class="r num">328 → 276</td></tr>
+</tbody>
+</table>
+</div>
+<div class="box bad">
+<span class="h">※ 중요한 주의 — @highestlevel33 의 31/40 은 이전 29/40 과 직접 비교할 수 없습니다</span>
+<p style="margin-bottom:0">두 실행이 <b>서로 다른 게시물 40개</b>를 검사했습니다.
+이전은 2026-04-16 ~ 08-03, 이번은 2026-03-17 ~ 08-13 범위입니다.
+이 계정은 게시물이 400개가 넘어 <b>어느 40개를 고르냐가 실행마다 달라졌습니다</b>(선택 기준이 날짜순이 아니었음).
+따라서 <b>78% vs 74% 를 개선으로 읽으면 안 됩니다.</b>
+비교는 아래 <b>같은 게시물끼리</b>만 유효합니다.</p>
+</div>
+
+<h2>4. 진짜 비교 — 이전에 실패했던 그 게시물들</h2>
+<p>@highestlevel33 에서 <b>1차 실행 때 0건이던 11개</b>가 최적화판에서 어떻게 됐는지가 유일하게 공정한 비교입니다.</p>
+<div class="scroll">
+<table>
+<thead><tr><th class="nw">게시물</th><th class="r nw">댓글</th>
+<th class="r nw">이전<br>(1페이지·20명)</th>
+<th class="r nw">최적화<br>댓글 페이지</th><th class="r nw">도달<br>(게시 후)</th>
+<th class="r nw">사람 조회</th><th class="nw">결과</th></tr></thead>
+<tbody>
+<tr><td class="nw">6월 8일</td><td class="r num">1,366</td><td class="r">0건</td>
+  <td class="r num">8</td><td class="r num">5일</td><td class="r num"><b>3명</b></td>
+  <td class="nw"><b style="color:var(--ok)">복원 ✓</b></td></tr>
+<tr><td class="nw">6월 10일</td><td class="r num">1,873</td><td class="r">0건</td>
+  <td class="r num">8</td><td class="r num">13일</td><td class="r num"><b>3명</b></td>
+  <td class="nw"><b style="color:var(--ok)">복원 ✓</b></td></tr>
+<tr><td class="nw">6월 23일</td><td class="r num">1,405</td><td class="r">0건</td>
+  <td class="r num">8</td><td class="r num">7일</td><td class="r num"><b>3명</b></td>
+  <td class="nw"><b style="color:var(--ok)">복원 ✓</b></td></tr>
+<tr><td class="nw">6월 27일</td><td class="r num">227</td><td class="r">0건</td>
+  <td class="r num">2</td><td class="r num">1일</td><td class="r num"><b>3명</b></td>
+  <td class="nw"><b style="color:var(--ok)">복원 ✓</b></td></tr>
+<tr><td class="nw">7월 6일 ~ 8월 3일<br><span style="color:var(--muted);font-size:.85em">게시물 7개</span></td>
+  <td class="r num">9~155</td><td class="r">0건</td>
+  <td class="r num">1</td><td class="r num">0~3일</td><td class="r num">6~18명</td>
+  <td class="nw">0건 <span style="color:var(--muted)">(이미 전수조사로<br>"DM 없음" 확정된 구간)</span></td></tr>
+</tbody>
+</table>
+</div>
+<div class="box ok">
+<span class="h">여기가 이번 최적화의 진짜 성과입니다 <span class="tag t-m">측정</span></span>
+<p style="margin-bottom:0">대형 게시물 4개가 <b>사람 3명만 조회하고</b> 복원됐습니다.
+5차 연구에서 이 게시물들을 살리려고 <b>별도로 7.5분·366회</b>를 더 썼는데,
+이번엔 <b>본 실행 안에서</b> 해결됐습니다. 즉 @highestlevel33 기준으로
+<b>15.2분·734회 → 7.9분·404회</b>로 <b>절반</b>이 됐습니다.</p>
+</div>
+
+<h2>5. 회귀 1건 — 그리고 이게 더 중요한 발견입니다</h2>
+<div class="box bad">
+<p style="margin-top:0"><b>5월 19일 게시물(댓글 1,291개)</b>이 이전엔 복원됐는데 이번엔 실패했습니다.</p>
+<div class="ev" style="background:var(--card)">
+<b class="t">무슨 일이 있었나</b>
+<ul>
+<li><b>이전</b>: 댓글 1페이지(최근 댓글러) → 20명 조회 → <b>2명 적중</b></li>
+<li><b>최적화</b>: 댓글 6페이지(게시 후 2일까지 도달) → 18명 조회 → <b>0명 적중</b></li>
+</ul>
+</div>
+<p style="margin-bottom:0"><b>즉 이 게시물은 "오래된 댓글러"에게 DM이 안 갔고, "최근 댓글러"에게 갔습니다.</b>
+5차 연구에서 확인한 패턴과 <b>정반대</b>입니다.</p>
+</div>
+<div class="box info">
+<span class="h">해석: 캠페인이 항상 게시 직후에 켜지는 게 아닙니다</span>
+<p>보통은 게시물을 올리면서 캠페인을 켭니다. 그래서 <b>게시 직후 댓글러</b>가 DM을 받습니다 — 5차 연구의 발견.</p>
+<p style="margin-bottom:0">그런데 <b>나중에 켜는 경우</b>도 있습니다. 예전 게시물이 갑자기 잘 되기 시작하면
+그때 캠페인을 붙이는 식입니다. 그러면 <b>그 시점 이후 댓글러</b>가 DM을 받고, 초기 댓글러는 못 받습니다.
+5월 19일 게시물이 정확히 이 경우로 보입니다.</p>
+</div>
+<div class="box hi">
+<span class="h">그래서 "무조건 오래된 댓글러"도 틀렸습니다</span>
+<p style="margin-bottom:0">1차 연구는 "최신 댓글러만 보면 안 된다"고 했고 그건 맞았습니다.
+그런데 제가 이번에 <b>"오래된 댓글러만 보면 된다"</b>로 뒤집은 것도 마찬가지로 틀렸습니다.
+<b>정답은 둘 다 보는 것</b>입니다 — 캠페인이 언제 켜졌는지는 알 수 없으니까요.</p>
+</div>
+
+<h2>6. 그래서 올바른 설계</h2>
+<p>이번 실행으로 세 가지가 분명해졌습니다. 이걸 합치면 이렇게 됩니다.</p>
+<div class="flow">
+<ol>
+<li><b>댓글 1페이지만 받고, 3명 조회한다 — 단 "섞어서"</b><br>
+  <span style="color:var(--muted)">최근 댓글러 1~2명 + 그 페이지에서 가장 오래된 댓글러 1~2명.
+  캠페인이 언제 켜졌든 한쪽은 걸린다. <b>대부분의 게시물이 여기서 끝난다</b>(실측: 보통 게시물은 거의 100% 적중)</span></li>
+<li><b>0건이면 그때 댓글을 캠페인 기간까지 판다</b><br>
+  <span style="color:var(--muted)">여기서 대형 게시물이 살아난다. 실측: 8페이지까지 파면 3명 조회로 복원.
+  <b>이 단계에 들어오는 게시물은 소수</b>라 전체 비용에 거의 영향이 없다</span></li>
+<li><b>그래도 0건이고 캠페인 물증이 있으면, 반대쪽(최근)도 더 조회한다</b><br>
+  <span style="color:var(--muted)">5월 19일 같은 "나중에 켠 캠페인"을 잡는 단계</span></li>
+<li><b>물증도 없고 0건이면 종료</b><br>
+  <span style="color:var(--muted)">캠페인이 없었던 것으로 확정. 실측으로 이런 게시물이 실제로 존재한다(전수조사 0 확정 4개)</span></li>
+</ol>
+</div>
+<h3>예상 비용 <span class="tag t-c">계산</span></h3>
+<div class="scroll">
+<table>
+<thead><tr><th>방식</th><th class="r nw">보통 게시물</th><th class="r nw">대형 게시물</th><th class="r nw">@mini_ai_ 40개 환산</th></tr></thead>
+<tbody>
+<tr><td>1차 실행 (1페이지·5명 고정)</td><td class="r num">6회</td><td class="r num">21회(실패)</td><td class="r nw">242회 · 5.5분</td></tr>
+<tr><td>이번 최적화 (선페이징·3건중단)</td><td class="r num">9~11회</td><td class="r num">11회</td><td class="r nw">298회 · 5.5분</td></tr>
+<tr><td><b>올바른 설계 (후페이징·혼합표본)</b></td><td class="r num"><b>4회</b></td><td class="r num">12회</td>
+  <td class="r nw"><b>약 170회 · 3~3.5분</b> <span class="tag t-e">추정</span></td></tr>
+</tbody>
+</table>
+</div>
+<p class="meta">환산 근거: @mini_ai_ 는 1차 실행에서 <b>1페이지만으로 40/40</b>을 달성했으므로,
+그 계정의 모든 게시물은 1단계에서 종료된다 → 댓글 40회 + 사람 약 120회.
+실측 단가(댓글 0.65초 · 사람 1.05초 · 대기 0.25초)로 환산하면 약 3~3.5분.</p>
+
+<h2>7. 시간 상세 <span class="tag t-m">측정</span></h2>
+<div class="scroll">
+<table>
+<thead><tr><th class="nw">계정</th><th class="r nw">총 시간</th><th class="r nw">게시물당</th>
+<th class="r nw">댓글 페이지<br>평균/게시물</th><th class="r nw">사람 조회<br>평균/게시물</th>
+<th class="r nw">캠페인 기간<br>도달률</th></tr></thead>
+<tbody>
+<tr><td class="nw">@mini_ai_</td><td class="r num">5.5분</td><td class="r num">8.2초</td>
+  <td class="r num">4.2</td><td class="r num">3.2</td><td class="r num">27/40 (68%)</td></tr>
+<tr><td class="nw">@3dragon_pd</td><td class="r num">6.4분</td><td class="r num">9.6초</td>
+  <td class="r num">5.3</td><td class="r num">3.1</td><td class="r num">22/40 (55%)</td></tr>
+<tr><td class="nw">@highestlevel33</td><td class="r num">7.9분</td><td class="r num">11.8초</td>
+  <td class="r num">3.0</td><td class="r num">6.9</td><td class="r num">34/40 (85%)</td></tr>
+<tr><th class="nw">합계</th><th class="r num">19.8분</th><th class="r num">9.9초</th>
+  <th class="r num">4.2</th><th class="r num">4.4</th><th class="r num">83/120 (69%)</th></tr>
+</tbody>
+</table>
+</div>
+<div class="ev">
+<b class="t">API 단가 (3회 실행 모두 일관)</b>
+<ul>
+<li>사람(DM함) 조회 <b>1.05초</b> · 댓글 1페이지 <b>0.65초</b> · 게시물 목록 <b>0.74초</b></li>
+<li><b>사람 조회가 댓글 조회보다 1.6배 비쌉니다</b> → 비싼 걸 줄이고 싼 걸 늘리는 교환은 옳은 방향</li>
+<li>다만 이번엔 <b>싼 걸 너무 많이 늘려서</b>(댓글 4~5배) 절감분을 다 까먹었습니다</li>
+</ul>
+</div>
+<div class="box hi">
+<span class="h">댓글 페이징 분포를 보면 낭비가 보입니다</span>
+<p style="margin-bottom:0">@mini_ai_ 게시물 40개 중 <b>15개가 8페이지를 다 썼습니다</b>(상한까지 파고도 캠페인 기간 미도달).
+그런데 이 계정은 <b>1차 실행에서 1페이지만으로 40/40</b>이었습니다.
+즉 그 <b>120회의 댓글 조회는 전부 헛일</b>이었습니다 — 약 78초.</p>
+</div>
+
+<h2>8. 정리</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>질문</th><th>답</th></tr></thead>
+<tbody>
+<tr><td class="nw">최적화가 효과가 있었나?</td>
+  <td><b>대형 게시물에는 확실히.</b> 이전에 20명을 봐도 못 찾던 것을 3명으로 찾았다.
+  @highestlevel33 은 15.2분 → 7.9분으로 절반이 됐다</td></tr>
+<tr><td class="nw">전체 시간이 줄었나?</td>
+  <td><b>아니다.</b> 이미 잘 되던 계정에서 오히려 늘었다(5.6 → 6.4분). 적용 위치가 틀렸다</td></tr>
+<tr><td class="nw">복원율이 올랐나?</td>
+  <td><b>같은 게시물 기준으로는 올랐다</b>(실패 11개 중 4개 구제).
+  계정 전체 숫자(78% vs 74%)는 검사 대상이 달라 비교 불가</td></tr>
+<tr><td class="nw">다음에 뭘 해야 하나?</td>
+  <td><b>후페이징 + 혼합 표본</b>으로 고쳐서 재측정. 예상 3~3.5분(현재 5.5분)</td></tr>
+</tbody>
+</table>
+</div>
+<div class="box info">
+<span class="h">이번 연구에서 배운 것 (방법론)</span>
+<p style="margin-bottom:0"><b>"A가 문제였다"를 찾았다고 해서 "항상 A를 하라"가 되지는 않습니다.</b>
+5차 연구에서 "깊은 댓글 파기"가 대형 게시물을 살렸더니, 저는 그걸 <b>모든 게시물의 기본값</b>으로 만들었습니다.
+그 결과 필요 없는 곳에서 비용을 쓰고, "오래된 댓글러만" 보다가 <b>정반대 케이스를 놓쳤습니다.</b>
+<b>발견은 조건부로 적용해야 합니다</b> — "실패했을 때만", "양쪽 다".</p>
+</div>
+
+<hr>
+<p class="foot">
+방식: prod 읽기 전용(Graph API GET + DB 읽기). DM 발송·데이터 쓰기·코드 배포 없음.
+연구 스크립트 <code>probe17_optimized.py</code>(세션 임시 폴더, 미커밋).<br>
+같은 시리즈: <code>DM_MIGRATION_LIVE_MEASUREMENT.html</code>(1차 실측·심층 재시도) ·
+<code>DM_MIGRATION_RESEARCH_R2.html</code>(첨부 발견) ·
+<code>DM_MIGRATION_99_PLAN.html</code>(99% 설계) ·
+<code>DM_MIGRATION_GENERIC_EXCLUSION.html</code>(범용성·제외 규칙).<br>
+⚠️ 고객 계정 이름과 게시물 날짜가 포함됩니다. DM 본문·수신자 정보·링크 주소는 넣지 않았습니다. <b>사내 한정.</b>
+</p>
+
+</div>
+</body>
+</html>

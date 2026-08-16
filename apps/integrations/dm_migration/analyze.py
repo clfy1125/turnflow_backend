@@ -322,6 +322,189 @@ def keyword_hit_counts(comments: list[dict], keywords: list[str]) -> dict:
     return out
 
 
+# ══════════════ 발신 DM 내용 추출 (단일 소스) ══════════════
+#
+# 버튼/템플릿 DM 은 ``message`` 가 빈 문자열이고 본문이 ``attachments`` 안에 들어간다.
+# 도구마다 래퍼 키가 다를 수 있으므로(4차 연구: media_url·subtitle·image_data 변종 실재)
+# **스키마 무관 재귀 순회**로 텍스트키/URL키를 수집한다. 미지 포맷도 통과시키는 게 목적.
+# 이 함수를 거치지 않고 ``msg["message"]`` 를 직접 읽는 코드를 만들지 말 것.
+
+# 첨부에서 본문으로 쓸 수 있는 텍스트 키 / 링크로 쓸 수 있는 URL 키
+_ATT_TEXT_KEYS = {"title", "subtitle", "text", "name", "description", "caption"}
+_ATT_URL_KEYS = {"url", "media_url", "link", "file_url", "image_url", "permalink"}
+# 미디어 첨부 판정용 (프론트 transfer.drops 의 attachment_* 코드로 매핑)
+_MEDIA_ATT_KEYS = {
+    "image_data": "attachment_image",
+    "video_data": "attachment_video",
+    "file_url": "attachment_file",
+}
+
+
+def extract_dm_content(msg: dict) -> dict:
+    """발신 DM 1건 → 구조화된 내용.
+
+    Returns:
+        {
+          "text": str,             # 본문(평문 or 템플릿 제목)
+          "buttons": [{"label","url","type"}],
+          "urls": [str],           # 본문·버튼·첨부에서 발견된 모든 URL
+          "media_drops": [str],    # attachment_image / attachment_video / attachment_file
+          "carousel": bool,        # 카드 2장 이상(넘겨보는 형태)
+          "has_gate_button": bool, # url 없는 postback 버튼 = 팔로우 확인 게이트
+          "kind": "text" | "template" | "media_only" | "empty",
+        }
+    """
+    out = {
+        "text": "",
+        "buttons": [],
+        "urls": [],
+        "media_drops": [],
+        "carousel": False,
+        "has_gate_button": False,
+        "kind": "empty",
+    }
+    if not isinstance(msg, dict):
+        return out
+
+    body = (msg.get("message") or "").strip()
+    if body:
+        out["text"] = body
+        out["kind"] = "text"
+        out["urls"] = [u.rstrip(").,") for u in _URL_RE.findall(body)]
+
+    data = ((msg.get("attachments") or {}).get("data") or []) if msg.get("attachments") else []
+    if len(data) > 1:
+        out["carousel"] = True
+
+    texts: list[str] = []
+    urls: list[str] = list(out["urls"])
+
+    def walk(node):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                kl = str(k).lower()
+                if kl in _MEDIA_ATT_KEYS and v:
+                    code = _MEDIA_ATT_KEYS[kl]
+                    if code not in out["media_drops"]:
+                        out["media_drops"].append(code)
+                if isinstance(v, str) and v.strip():
+                    if kl in _ATT_URL_KEYS or v.startswith("http"):
+                        urls.append(v.strip())
+                    elif kl in _ATT_TEXT_KEYS:
+                        texts.append(v.strip())
+                else:
+                    walk(v)
+        elif isinstance(node, list):
+            for x in node:
+                walk(x)
+
+    for att in data:
+        gt = att.get("generic_template") if isinstance(att, dict) else None
+        if isinstance(gt, dict):
+            for c in gt.get("cta") or []:
+                if not isinstance(c, dict):
+                    continue
+                btn = {
+                    "label": (c.get("title") or "").strip(),
+                    "url": (c.get("url") or "").strip(),
+                    "type": (c.get("type") or "").strip(),
+                }
+                out["buttons"].append(btn)
+                # 링크 없는 버튼 = 도구 서버로 돌아가는 콜백 = 팔로우 확인 게이트.
+                # cta.type 은 Meta 표준이라 도구 종류와 무관하게 판별된다(4차 연구).
+                if not btn["url"] and (btn["type"] == "postback" or not btn["type"]):
+                    out["has_gate_button"] = True
+        walk(att)
+
+    if not out["text"] and texts:
+        out["text"] = texts[0]
+        out["kind"] = "template"
+    elif out["text"] and data:
+        out["kind"] = "template"
+    # dedupe (순서 보존)
+    seen: set[str] = set()
+    out["urls"] = [u for u in urls if not (u in seen or seen.add(u))]
+    if not out["text"] and (out["media_drops"] or data):
+        out["kind"] = "media_only"
+    return out
+
+
+def dm_text_for_match(msg: dict) -> str:
+    """군집화·지문 비교용 텍스트 (본문 + 버튼문구 + URL 을 한 줄로)."""
+    c = extract_dm_content(msg)
+    parts = [c["text"]] + [b["label"] for b in c["buttons"] if b["label"]] + c["urls"]
+    seen: set[str] = set()
+    return " ".join(p for p in parts if p and not (p in seen or seen.add(p))).strip()
+
+
+# Meta 가 정한 DM 본문 한도 — 우리가 고른 값이 아니다.
+#   버튼 카드(button template): text **640자**
+#   일반 텍스트:                UTF-8 **1000바이트** (한글 ≈ 333자)
+# ⚠️ 링크 버튼을 붙이면 한도가 **오히려 늘어난다**(한글 333자 → 640자).
+#    그래서 복원한 링크는 본문에 박지 않고 버튼으로 올리는 편이 길이에도 유리하다.
+DM_TEXT_MAX_BYTES = 1000
+BUTTON_TEMPLATE_TEXT_MAX = 640
+
+
+def fit_dm_text(text: str, *, has_button: bool) -> tuple[str, dict | None]:
+    """DM 본문을 포맷별 한도에 맞춰 자른다. (맞춘 문구, 초과정보 or None)
+
+    타사 도구는 **여러 통으로 쪼개서** 보내기 때문에 한 통이 우리 한도를 넘는 원문이 존재한다
+    (실측: 복원된 캠페인이 게이트 DM + 오퍼 DM 2통 구조였다). 그대로 넣으면 생성이 400 으로
+    실패하므로, 여기서 잘라 넣고 **얼마나 잘렸는지를 초과정보로 돌려준다**
+    (프론트 ``transfer.drops`` 의 ``opening_too_long``).
+
+    자를 때는 문장 경계(``. ! ? \\n``)를 우선해 말이 끊기지 않게 한다.
+    """
+    t = (text or "").strip()
+    if not t:
+        return "", None
+
+    if has_button:
+        over = len(t) > BUTTON_TEMPLATE_TEXT_MAX
+        limit_desc = {"limit": BUTTON_TEMPLATE_TEXT_MAX, "unit": "chars", "format": "button_card"}
+        if not over:
+            return t, None
+        cut = t[:BUTTON_TEMPLATE_TEXT_MAX]
+    else:
+        raw = t.encode("utf-8")
+        over = len(raw) > DM_TEXT_MAX_BYTES
+        limit_desc = {"limit": DM_TEXT_MAX_BYTES, "unit": "bytes", "format": "plain_text"}
+        if not over:
+            return t, None
+        cut = raw[:DM_TEXT_MAX_BYTES].decode("utf-8", errors="ignore")
+
+    # 문장 경계로 되감기 (너무 많이 버리지 않는 선에서)
+    boundary = max(cut.rfind("."), cut.rfind("!"), cut.rfind("?"), cut.rfind("\n"))
+    if boundary >= len(cut) * 0.6:
+        cut = cut[: boundary + 1]
+    cut = cut.rstrip()
+    detail = dict(
+        limit_desc,
+        original_chars=len(t),
+        original_bytes=len(t.encode("utf-8")),
+        kept_chars=len(cut),
+    )
+    return cut, detail
+
+
+def wilson_lower_bound(hits: int, n: int, z: float = 1.96) -> float:
+    """지지비율의 95% 신뢰하한.
+
+    표본이 작으면 자동으로 강등된다 — 1/2 → 0.09, 3/3 → 0.44, 10/10 → 0.72.
+    실측 정밀도(1~2명 9~14% · 3~4명 43% · 5명+ 95%)와 거의 일치해,
+    '비율'과 '표본 크기'를 하나의 값으로 합칠 수 있다.
+    """
+    if n <= 0:
+        return 0.0
+    p = hits / n
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    center = p + z2 / (2 * n)
+    margin = z * ((p * (1 - p) / n + z2 / (4 * n * n)) ** 0.5)
+    return max(0.0, (center - margin) / denom)
+
+
 # ══════════════ DM 템플릿 군집화 ══════════════
 
 

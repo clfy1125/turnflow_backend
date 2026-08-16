@@ -407,6 +407,7 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
             "effective_link_buttons",  # 실제 첨부될 버튼 (read-only)
             # 운영
             "status",
+            "source",  # "dm_migration" = 다른 서비스에서 불러옴 / "" = 직접 만듦
             "total_sent",
             "total_failed",
             "is_active",
@@ -431,6 +432,7 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
             "id",
             "ig_connection_id",
             "ig_username",
+            "source",  # 생성 경로가 정하는 값 — 사용자가 바꿀 수 없다
             "total_sent",
             "total_failed",
             "public_reply_posted_count",
@@ -673,14 +675,48 @@ class AutoDMCampaignSummarySerializer(serializers.Serializer):
 
 
 class CampaignBulkActionRequestSerializer(serializers.Serializer):
-    """벌크 액션 요청 — 캠페인 id 배열."""
+    """벌크 액션 요청 — 캠페인 id 배열, 또는 **필터에 걸린 전체**.
+
+    목록에 페이지네이션이 들어가면 프론트의 "전체 선택" 이 화면에 보이는 한 페이지만
+    가리키게 된다. 그래서 ``all=true`` 를 받는다 — 이때 대상은 **목록 호출과 똑같은 쿼리
+    파라미터**(``status``/``trigger_type``/``source``/``search``/``created_after|before``/
+    ``ig_connection_id``)에 걸린 전체다. 프론트는 목록 요청의 쿼리스트링을 그대로 붙이면
+    되고, 그러면 "선택한 것 == 목록에서 본 것" 이 서버에서 보장된다.
+    """
 
     ids = serializers.ListField(
         child=serializers.UUIDField(),
+        required=False,
         min_length=1,
         max_length=200,
-        help_text="대상 캠페인 UUID 배열 (최대 200개).",
+        help_text="대상 캠페인 UUID 배열 (최대 200개). all=true 면 생략한다.",
     )
+    all = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text=(
+            "true 면 **현재 필터에 걸린 전체**가 대상 (쿼리 파라미터로 필터를 넘길 것). "
+            "대상이 상한(1000)을 넘으면 400 `too_many_targets` 로 거부한다."
+        ),
+    )
+    exclude_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        default=list,
+        max_length=200,
+        help_text="all=true 일 때 제외할 캠페인 (사용자가 전체 선택 후 몇 개를 해제한 경우).",
+    )
+
+    def validate(self, attrs):
+        if attrs.get("all") and attrs.get("ids"):
+            raise serializers.ValidationError(
+                {"ids": ["all=true 와 ids 는 함께 쓸 수 없습니다. 둘 중 하나만 보내세요."]}
+            )
+        if not attrs.get("all") and not attrs.get("ids"):
+            raise serializers.ValidationError(
+                {"ids": ["ids 배열 또는 all=true 중 하나는 반드시 필요합니다."]}
+            )
+        return attrs
 
 
 class CampaignBulkFailureSerializer(serializers.Serializer):
