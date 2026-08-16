@@ -19,9 +19,12 @@
 |                  |                                        | OR webhook_backlog >= 1                    | 30분+ 미처리 토스 웹훅 존재                       |
 
 - overall = worst-of(subsystems): ok < warning < critical.
+- overall = worst-of(subsystems): ok < warning < critical.
 - 경계 의미론: 비율(rate) 임계값은 **strict <** (rate == 0.90 → ok, rate == 0.75 → warning).
   토큰 만료 컷오프는 **<=** (token_expires_at == now+24h → expiring_24h 포함).
-- action_required 항목 severity: count == 0 → "ok", count >= 1 → "warning" (고정 규칙).
+- **판정 구간은 선택 window 와 무관하게 최근 24h** (OPS-7, `STATUS_BASIS_HOURS`).
+  "지금 건강한가"를 묻는 지표에 90일 평균을 넣으면 어제 생긴 장애가 희석돼 보이지 않는다.
+  위 표의 "윈도우 내"는 그 24h 를 가리킨다.
 """
 
 # ── DM 발송 품질 ──────────────────────────────────────────────────────
@@ -31,10 +34,10 @@ DM_DELIVERY_WARNING_THRESHOLD = 0.90
 DM_DELIVERY_CRITICAL_THRESHOLD = 0.75  # rate < 0.75 → critical
 # accepted_or_after 표본이 이 값 미만이면 상태 판정 안 함 (ok + insufficient_sample=true)
 DM_MIN_SAMPLE_FOR_STATUS = 20
-# 기존 정책 재사용 — views/dashboard.py::STUCK_SUBMITTING_MINUTES 와 동일 값.
-# WIP 인접 파일을 리팩터링하지 않기 위해 의도적으로 중복(상호 참조 주석)한다.
-STUCK_SUBMITTING_MINUTES = 10
-QUEUE_WINDOW_RISK_HOURS = 6  # 기존 AdminDMBacklogView(risk_hours) 기본값 재사용
+# STUCK_SUBMITTING_MINUTES / QUEUE_WINDOW_RISK_HOURS 는 OPS-5(2026-08-16)에서
+# `action_required` 와 함께 제거됐다. 같은 신호가 필요하면 살아 있는 소유자를 쓸 것 —
+# SUBMITTING 정체는 views/dashboard.py::STUCK_SUBMITTING_MINUTES,
+# 윈도우 만료 임박은 AdminDMBacklogView(views/autodm.py) 의 risk_hours.
 
 # ── IG 연동 ──────────────────────────────────────────────────────────
 TOKEN_EXPIRING_SOON_HOURS = 24  # token_expires_at <= now+24h 인 ACTIVE 연동 → 주의

@@ -56,12 +56,18 @@ ADMIN_API_PREFIX = "/api/v1/admin/"
 DJANGO_ADMIN_PREFIX = "/admin/"
 
 CHANNEL_LINKS_PATH = f"{ADMIN_API_PREFIX}marketing/channel-links/"
+# UI-1: 화면 설정은 **자기 계정의 표시 상태**일 뿐이라 역할과 무관하게 열어둔다.
+# 외주도 자기 모바일 탭은 자기가 골라야 하고, 여기 담기는 값은 권한 판정에 쓰이지 않는다.
+PREFERENCES_PATH = f"{ADMIN_API_PREFIX}me/preferences/"
 
 # {역할: {(METHOD, 절대경로), ...}} — 여기 없으면 거부. 경로는 끝슬래시 포함 정본.
 ROLE_ALLOWED_ENDPOINTS: dict[str, set[tuple[str, str]]] = {
     ROLE_MARKETING_VIEWER: {
         ("GET", f"{ADMIN_API_PREFIX}me/"),
         ("GET", f"{ADMIN_API_PREFIX}dashboard/marketing/"),
+        # UI-1 — 자기 화면 설정 (모바일 탭 구성 등). 권한 판정 값은 담기지 않는다.
+        ("GET", PREFERENCES_PATH),
+        ("PATCH", PREFERENCES_PATH),
         # RBAC-4-a: UTM 링크 생성은 캠페인 운영의 기본 작업이라 조회+생성까지 허용.
         # (직전 라운드 Q3 "전체 불허" 결정을 프론트 요청으로 철회)
         ("GET", CHANNEL_LINKS_PATH),

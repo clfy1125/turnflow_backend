@@ -184,9 +184,7 @@ def _mk_spam_log(conn, status, error_message="", category=""):
     )
 
 
-def _item(res, key):
-    """action_required 배열에서 key 항목을 찾는다."""
-    return next(i for i in res.data["action_required"] if i["key"] == key)
+# OPS-5(2026-08-16): `action_required` 가 응답에서 제거되면서 `_item()` 헬퍼도 사라졌다.
 
 
 # ─── 권한 ────────────────────────────────────────────────────────────
@@ -334,24 +332,9 @@ class TestEmptyState:
         assert res.data["recent_errors"] == []
         assert res.data["risk_accounts"] == []
 
-    def test_action_required_fixed_order_with_zero_counts(self, staff_client, clean_slate):
-        res = staff_client.get(URL)
-        keys = [i["key"] for i in res.data["action_required"]]
-        assert keys == [
-            "expired_tokens",
-            "expiring_tokens_24h",
-            "failed_param_recent",
-            "failed_no_trace_recent",
-            "stuck_submitting",
-            "queued_window_risk",
-            "past_due_subscriptions",
-            "ig_activation_review",
-            "unprocessed_webhooks",
-        ]
-        for item in res.data["action_required"]:
-            assert item["count"] == 0
-            assert item["severity"] == "ok"
-            assert "link" in item and "params" in item["link"]
+    def test_action_required_is_gone(self, staff_client, clean_slate):
+        """OPS-5 — 응답에서 완전히 빠졌다. 남아 있으면 30초마다 9종 집계가 계속 돈다."""
+        assert "action_required" not in staff_client.get(URL).data
 
 
 # ─── DM 도착률 임계값 경계 ───────────────────────────────────────────
@@ -422,40 +405,16 @@ class TestTokenExpiry:
         assert sub["status"] == "warning"
         assert res.data["status_summary"]["overall"] == "warning"
 
-        assert _item(res, "expired_tokens")["count"] == 1
-        assert _item(res, "expired_tokens")["severity"] == "warning"
-        assert _item(res, "expiring_tokens_24h")["count"] == 1
+
+# ─── 빌링 신호 (OPS-5 로 action_required 는 사라졌고 status_summary 만 남았다) ──
 
 
-# ─── action_required 신호들 ──────────────────────────────────────────
-
-
-class TestActionRequired:
-    def test_stuck_submitting_10min_boundary(self, staff_client, clean_slate):
-        now = timezone.now()
-        camp = _mk_campaign(_mk_conn())
-        stuck = _mk_dms(camp, SentDMLog.Status.SUBMITTING, 1)
-        _backdate_dms(stuck, now - timedelta(minutes=11))  # 포함
-        fresh = _mk_dms(camp, SentDMLog.Status.SUBMITTING, 1)
-        _backdate_dms(fresh, now - timedelta(minutes=9))  # 미포함
-
-        res = staff_client.get(URL)
-        assert _item(res, "stuck_submitting")["count"] == 1
-
-    def test_past_due_and_review_flags(self, staff_client, clean_slate, free_plan):
+class TestBillingSignals:
+    def test_past_due_marks_billing_warning(self, staff_client, clean_slate, free_plan):
         u1 = _mk_owner()
         UserSubscription.objects.create(user=u1, plan=free_plan, status=SubscriptionStatus.PAST_DUE)
-        u2 = _mk_owner()
-        UserSubscription.objects.create(
-            user=u2,
-            plan=free_plan,
-            status=SubscriptionStatus.ACTIVE,
-            ig_activation_review_needed=True,
-        )
 
         res = staff_client.get(URL)
-        assert _item(res, "past_due_subscriptions")["count"] == 1
-        assert _item(res, "ig_activation_review")["count"] == 1
         billing = res.data["status_summary"]["subsystems"]["billing"]
         assert billing["past_due"] == 1
         assert billing["status"] == "warning"
@@ -472,7 +431,6 @@ class TestActionRequired:
         TossWebhookLog.objects.filter(pk=fresh.pk).update(created_at=now - timedelta(minutes=5))
 
         res = staff_client.get(URL)
-        assert _item(res, "unprocessed_webhooks")["count"] == 1
         assert res.data["status_summary"]["subsystems"]["billing"]["webhook_backlog"] == 1
         assert res.data["status_summary"]["subsystems"]["billing"]["status"] == "warning"
 
@@ -614,12 +572,17 @@ class TestHiddenSpamSeparation:
         assert dm["failed"] == 0
         assert dm["hidden_spam"] == 0
 
-    def test_action_required_failed_param_excludes_2534025(self, staff_client, clean_slate):
+    def test_failed_excludes_2534025(self, staff_client, clean_slate):
+        """숨겨진 요청·스팸(2534025)은 '실패'가 아니라 hidden_spam 이다.
+
+        (OPS-5 이전에는 같은 불변식을 `action_required.failed_param_recent` 로 지켰다.)
+        """
         camp = _mk_campaign(_mk_conn())
         _mk_dms(camp, SentDMLog.Status.FAILED_PARAM, 4, error_subcode="2534025")
         _mk_dms(camp, SentDMLog.Status.FAILED_PARAM, 2)  # 진짜 파라미터 오류
-        res = staff_client.get(URL)
-        assert _item(res, "failed_param_recent")["count"] == 2
+        dm = staff_client.get(URL).data["dm_quality"]
+        assert dm["failed"] == 2
+        assert dm["hidden_spam"] == 4
 
     def test_recent_errors_excludes_hidden_spam(self, staff_client, clean_slate):
         camp = _mk_campaign(_mk_conn(username="hidden_acc"))
@@ -1168,3 +1131,91 @@ class TestSkippedBreakdown:
         camp = _mk_campaign(_mk_conn())
         _mk_dms(camp, SentDMLog.Status.DELIVERED, 1)
         assert staff_client.get(URL).data["dm_quality"]["skipped_breakdown"] == []
+
+
+# ─── OPS-6: pending_total (미종결 건수) ──────────────────────────────
+
+
+class TestPendingTotal:
+    """프론트가 `accepted_pending + queued + submitting` 으로 만들던 '대기' 를 서버로 옮긴다.
+
+    그 공식은 **rate_limited 와 legacy pending 을 빠뜨리고 있었다** — 두 상태는 `requested`
+    에는 잡히는데 다른 어느 KPI 에도 안 잡히는 투명 상태였다(dev 실측 2 vs 16).
+    """
+
+    def test_includes_rate_limited_and_legacy_pending(self, staff_client, clean_slate):
+        camp = _mk_campaign(_mk_conn())
+        _mk_dms(camp, SentDMLog.Status.ACCEPTED, 1)
+        _mk_dms(camp, SentDMLog.Status.QUEUED, 2)
+        _mk_dms(camp, SentDMLog.Status.SUBMITTING, 3)
+        _mk_dms(camp, SentDMLog.Status.RATE_LIMITED, 4)
+        _mk_dms(camp, SentDMLog.Status.PENDING, 5)
+
+        dm = staff_client.get(URL).data["dm_quality"]
+        assert dm["rate_limited"] == 4
+        assert dm["legacy_pending"] == 5
+        assert dm["pending_total"] == 15
+        # 프론트의 옛 공식이었으면 6 이었다 — 이 차이가 이 필드를 만든 이유다.
+        assert dm["accepted_pending"] + dm["queued"] + dm["submitting"] == 6
+
+    def test_settled_rows_are_excluded(self, staff_client, clean_slate):
+        camp = _mk_campaign(_mk_conn())
+        _mk_dms(camp, SentDMLog.Status.DELIVERED, 2)
+        _mk_dms(camp, SentDMLog.Status.READ, 1)
+        _mk_dms(camp, SentDMLog.Status.FAILED_TOKEN, 3)
+        _mk_dms(camp, SentDMLog.Status.SKIPPED, 1)
+        assert staff_client.get(URL).data["dm_quality"]["pending_total"] == 0
+
+    def test_zero_on_empty(self, staff_client, clean_slate):
+        dm = staff_client.get(URL).data["dm_quality"]
+        assert dm["pending_total"] == 0
+        assert dm["rate_limited"] == 0
+        assert dm["legacy_pending"] == 0
+
+
+# ─── OPS-7: status_summary 는 선택 window 를 타지 않는다 ─────────────
+
+
+class TestStatusSummaryBasis:
+    def test_basis_is_declared(self, staff_client, clean_slate):
+        summary = staff_client.get(URL).data["status_summary"]
+        assert summary["basis"] == "now_24h"
+        assert summary["basis_hours"] == 24
+
+    def test_old_failures_do_not_leak_into_status(self, staff_client, clean_slate):
+        """30일 전 장애가 `window=30d` 신호등을 물들이면 안 된다 — '지금 건강한가' 가 질문이다."""
+        camp = _mk_campaign(_mk_conn())
+        old = _mk_dms(camp, SentDMLog.Status.FAILED_NO_TRACE, 40)
+        _backdate_dms(old, timezone.now() - timedelta(days=20))
+
+        res = staff_client.get(URL, {"window": "30d"})
+        dm_card = res.data["dm_quality"]
+        dm_status = res.data["status_summary"]["subsystems"]["dm"]
+        # 카드(선택 범위)는 그 40건을 본다
+        assert dm_card["failed"] == 40
+        # 신호등(최근 24h)은 표본이 없어 판정하지 않는다
+        assert dm_status["insufficient_sample"] is True
+        assert dm_status["status"] == "ok"
+
+    def test_recent_failure_is_caught_even_on_wide_window(self, staff_client, clean_slate):
+        """반대 방향 — 넓은 window 를 골라도 **어제 난 장애**는 신호등에 잡혀야 한다."""
+        camp = _mk_campaign(_mk_conn())
+        _mk_dms(camp, SentDMLog.Status.FAILED_NO_TRACE, 30)  # now 기준
+        _mk_dms(camp, SentDMLog.Status.DELIVERED, 1)
+
+        for window in ("24h", "30d"):
+            dm = staff_client.get(URL, {"window": window}).data["status_summary"]["subsystems"][
+                "dm"
+            ]
+            assert dm["status"] == "critical", window
+            assert dm["sample"] == 31, window
+
+    def test_same_verdict_across_windows(self, staff_client, clean_slate):
+        """window 를 바꿔도 신호등은 같아야 한다 — 프론트가 24h 를 재조회할 이유가 없어진다."""
+        camp = _mk_campaign(_mk_conn())
+        _mk_dms(camp, SentDMLog.Status.DELIVERED, 25)
+        verdicts = {
+            w: staff_client.get(URL, {"window": w}).data["status_summary"]["overall"]
+            for w in ("1h", "24h", "7d", "30d")
+        }
+        assert len(set(verdicts.values())) == 1, verdicts

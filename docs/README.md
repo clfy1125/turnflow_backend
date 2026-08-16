@@ -43,6 +43,9 @@
 - [USER_NOTIFICATION_PLAN.md](frontend/USER_NOTIFICATION_PLAN.md) — 사용자 알림 계획(구현 전)
 
 **어드민 콘솔**
+- [ADMIN_20TH_ROUND_RESPONSE.md](frontend/ADMIN_20TH_ROUND_RESPONSE.md) — 20차 회신(OPS-5/6/7·UI-1, 구현 완료·prod 미배포). 🔴 **OPS-6: 프론트의 '대기' 공식이 `rate_limited`·legacy `pending` 을 빠뜨려 이미 8배 어긋나 있었다**(dev 2 vs 16) → `pending_total` 신설 · OPS-5 `action_required` 응답에서 제거 · OPS-7 `status_summary` 를 window 비종속(24h 고정)+`basis` · UI-1 `/admin/me/preferences/`
+- [ADMIN_AUTH_MFA_FRONTEND.md](frontend/ADMIN_AUTH_MFA_FRONTEND.md) — **v2 계약(구현 완료·prod 미배포)** · 2단계 로그인(비번 → TOTP) + 어드민 전용 토큰(access 2h / 신뢰기기 refresh 7d). `/api/v1/admin/**` 에 일반 토큰은 403 `admin_token_required`. 마케팅 전용 계정은 제외(1단계 로그인 유지, **갱신 URL 이 갈린다**)
+- [ADMIN_AUTH_MFA_RESPONSE.md](frontend/ADMIN_AUTH_MFA_RESPONSE.md) — 위 계약 Q1~Q5 회신 + **v1→v2 변경점 4건**(백업코드 별도 필드·12자 / confirm 의 setup_token 필수 / 재등록에 현재 코드 / password_changed 삭제)
 - [ADMIN_SNAPSHOT_ROSTER_RESPONSE.md](frontend/ADMIN_SNAPSHOT_ROSTER_RESPONSE.md) — 18차 회신(SNAP-1/2) · 전체 현황 타일 → 회원 명단(`/admin/snapshot/paying|trial/`, 타일-명단 항등·id 집합 캐시)
 
 **기타**
@@ -61,6 +64,7 @@
 - [PROD_HARDENING_2026-08-04.md](ops/PROD_HARDENING_2026-08-04.md) — 08-03~04 하드닝 실행 기록 + 사고 3건
 - [DNS_RETIRE_API_TURNFLOW.md](ops/DNS_RETIRE_API_TURNFLOW.md) — 옛 API 호스트 DNS 삭제(2026-08-12) + **복구 레시피** · 오리진 IP 직노출 제거
 - [SECURITY_AUDIT_2026-06.md](ops/SECURITY_AUDIT_2026-06.md) — 애플리케이션 취약점 감사(미해결 포함)
+- [ADMIN_AUTH_HARDENING_PLAN.md](ops/ADMIN_AUTH_HARDENING_PLAN.md) — 🟡 **계획(미구현)** · 어드민 계정 3인 분리 + 어드민 전용 JWT(TOTP 2요소) + Django admin 세션 MFA. 지문은 서버가 검증 불가 → 실선택지는 TOTP/이메일/패스키
 - [DR_IMPLEMENTATION_PLAN.md](ops/DR_IMPLEMENTATION_PLAN.md) — 재해복구 설계·결정 로그
 - [INSTAGRAM_OAUTH_FLOW.md](ops/INSTAGRAM_OAUTH_FLOW.md) · [INSTAGRAM_TEST_GUIDE.md](ops/INSTAGRAM_TEST_GUIDE.md)
 - [CLOUDFLARE_TUNNEL_SETUP.md](ops/CLOUDFLARE_TUNNEL_SETUP.md) — dev 공개(`dev-api.turnflow.link`)

@@ -98,22 +98,14 @@ class _SubsystemStatusSerializer(serializers.Serializer):
 class _StatusSummarySerializer(serializers.Serializer):
     """신호등 요약 — 프론트 색상 매핑 계약 (dashboard_constants 도크스트링 참고)."""
 
+    basis = serializers.CharField(
+        help_text='이 블록의 계산 기준 (OPS-7). 현재 값은 항상 `"now_24h"` — **선택 window 와 '
+        "무관하게 최근 24시간**으로 판정한다. 프론트는 이 값을 보고 분기하면 되고, 전체 기간을 "
+        "고를 때 24h 를 한 번 더 조회할 필요가 없다"
+    )
+    basis_hours = serializers.IntegerField(help_text="판정 구간 길이(시간). 현재 24")
     overall = serializers.CharField(help_text="worst-of(subsystems): ok < warning < critical")
     subsystems = _SubsystemStatusSerializer(help_text="서브시스템별 상태")
-
-
-class _ActionItemSerializer(serializers.Serializer):
-    """즉시 조치 항목 1건 — 고정 순서 배열의 원소 (count=0 도 포함)."""
-
-    key = serializers.CharField(
-        help_text="고정 키: expired_tokens / expiring_tokens_24h / failed_param_recent / "
-        "failed_no_trace_recent / stuck_submitting / queued_window_risk / "
-        "past_due_subscriptions / ig_activation_review / unprocessed_webhooks"
-    )
-    label = serializers.CharField(help_text="표시용 한국어 라벨")
-    count = serializers.IntegerField(help_text="해당 항목 건 수")
-    severity = serializers.CharField(help_text="count == 0 → ok, count >= 1 → warning")
-    link = _LinkHintSerializer(help_text="드릴다운 화면 힌트")
 
 
 class _DmSeriesBucketSerializer(serializers.Serializer):
@@ -350,6 +342,19 @@ class _DmQualitySerializer(serializers.Serializer):
     )
     queued = serializers.IntegerField(help_text="queued (발송 대기)")
     submitting = serializers.IntegerField(help_text="submitting (API 호출 중)")
+    rate_limited = serializers.IntegerField(
+        help_text="rate_limited (Meta 응답 대기·재시도 예정). OPS-6 로 새로 드러낸 진행 중 상태"
+    )
+    legacy_pending = serializers.IntegerField(
+        help_text="legacy `pending` (구 데이터). OPS-6 로 새로 드러낸 진행 중 상태"
+    )
+    pending_total = serializers.IntegerField(
+        help_text="**아직 성공으로도 실패로도 종결되지 않은 건수** (OPS-6) = accepted_pending + "
+        "queued + submitting + rate_limited + legacy_pending. "
+        "⚠️ `dm_status_groups` 의 '대기중(waiting)' 그룹과 다르다 — waiting 은 '아직 Meta 미접수'라 "
+        "`accepted` 를 빼므로 로그 목록 `?status_group=waiting` 은 이 값보다 작게 나온다(정상). "
+        "화면 라벨을 '대기'로 두면 그 차이가 버그로 보이므로 '진행 중' 을 권장"
+    )
     delivery_rate = serializers.FloatField(
         help_text="(delivered+read) / (accepted+delivered+read+failed_no_trace) — "
         "dm-verification/stats 와 동일 공식"
@@ -493,11 +498,11 @@ class AdminOpsDashboardSerializer(serializers.Serializer):
     generated_at = serializers.DateTimeField(
         help_text="집계 생성 시각 — 캐시(OPS_DASHBOARD_CACHE_TTL=30s) 신선도 표시용"
     )
-    status_summary = _StatusSummarySerializer(help_text="서브시스템 신호등 + overall")
-    action_required = _ActionItemSerializer(
-        many=True,
-        help_text="고정 순서 조치 목록 (count=0 항목 포함 — 프론트 고정 레이아웃)",
+    status_summary = _StatusSummarySerializer(
+        help_text="서브시스템 신호등 + overall. **선택 window 와 무관하게 최근 24h 기준**(OPS-7)"
     )
+    # OPS-5(2026-08-16): `action_required` 제거. 프론트가 '처리 필요' 화면을 없앴고 다른
+    # 소비자가 없어, 30초마다 항목 9종을 집계하던 비용(특히 QUEUED 2000행 스캔)을 걷어냈다.
     dm_quality = _DmQualitySerializer(help_text="DM 발송 품질 (윈도우)")
     ig_connections = _IgConnectionsSerializer(help_text="IG 연동 현황 (전역)")
     spam = _SpamOpsSerializer(help_text="스팸 필터 운영 지표 (윈도우)")

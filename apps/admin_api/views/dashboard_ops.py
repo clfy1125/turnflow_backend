@@ -51,13 +51,11 @@ from apps.admin_api.dashboard_constants import (
     OPS_DASHBOARD_CACHE_TTL,
     PAST_DUE_CRITICAL_COUNT,
     PAYMENT_FAILED_WARNING_COUNT,
-    QUEUE_WINDOW_RISK_HOURS,
     RECENT_ERRORS_LIMIT,
     RISK_ACCOUNTS_LIMIT,
     RISK_REPEATED_PARAM_ERRORS_COUNT,
     SPAM_HIDE_FAILED_CRITICAL_COUNT,
     SPAM_HIDE_FAILED_WARNING_COUNT,
-    STUCK_SUBMITTING_MINUTES,
     TOKEN_EXPIRING_SOON_HOURS,
     TRENDS_DAY_MAX_SPAN_DAYS,
     WEBHOOK_BACKLOG_CRITICAL_MINUTES,
@@ -92,6 +90,11 @@ ALLOWED_WINDOWS = ("1h", "24h", "today", "7d", "30d", "all")
 CACHE_KEY_TMPL = "admin:dash:ops:{window}"
 CACHE_KEY_CUSTOM_TMPL = "admin:dash:ops:custom:{start}:{end}"
 MAX_CUSTOM_SPAN_DAYS = 92  # 커스텀 범위 상한 (초과 시 400)
+
+# OPS-7: 신호등(status_summary)은 **선택 window 와 무관하게** 이 구간으로만 판정한다.
+# "지금 건강한가"를 묻는 지표에 90일 평균을 넣으면 어제 생긴 장애가 희석돼 보이지 않는다.
+STATUS_BASIS_HOURS = 24
+STATUS_BASIS = timedelta(hours=STATUS_BASIS_HOURS)
 
 # ── 상태 집합 ────────────────────────────────────────────────────────
 # succeeded: 도착 확정 (+ legacy sent + 복구 재전송 성공)
@@ -397,6 +400,10 @@ def _dm_quality(until, since, granularity: str) -> tuple[dict, dict]:
         skipped=Count("id", filter=Q(status=SentDMLog.Status.SKIPPED)),
         queued=Count("id", filter=Q(status=SentDMLog.Status.QUEUED)),
         submitting=Count("id", filter=Q(status=SentDMLog.Status.SUBMITTING)),
+        # OPS-6 — 미종결 집계에 필요한 나머지 두 상태. 지금까지 `requested` 에는 잡히는데
+        # 다른 어느 KPI 에도 안 잡히던 **투명 상태**였다(legacy failed_api 와 같은 종류의 구멍).
+        rate_limited=Count("id", filter=Q(status=SentDMLog.Status.RATE_LIMITED)),
+        legacy_pending=Count("id", filter=Q(status=SentDMLog.Status.PENDING)),
     )
 
     fields = (
@@ -532,6 +539,24 @@ def _dm_quality(until, since, granularity: str) -> tuple[dict, dict]:
         "skipped_breakdown": _skipped_breakdown(in_range, people_by_reason),
         "queued": dm_agg["queued"],
         "submitting": dm_agg["submitting"],
+        # OPS-6 — 진행 중 상태 2종을 **드러낸다**. 프론트가 `accepted_pending + queued +
+        # submitting` 으로 '대기'를 만들고 있었는데 이 둘이 빠져 실제보다 작은 수를 보여줬다
+        # (dev 실측 2 vs 16). 개별 필드도 함께 내려 합이 눈으로 검산되게 한다.
+        "rate_limited": dm_agg["rate_limited"],
+        "legacy_pending": dm_agg["legacy_pending"],
+        # 요청은 만들어졌고 아직 성공으로도 실패로도 **종결되지 않은** 건수.
+        # ⚠️ 이것은 `dm_status_groups` 의 '대기중(waiting)' 그룹과 **다르다** — waiting 은
+        # "아직 Meta 미접수"라 `accepted` 를 빼지만, 여기는 "결과가 안 났다"라 포함한다
+        # (accepted 는 delivered/read 로도, failed_no_trace 로도 갈 수 있다).
+        # 로그 목록의 `?status_group=waiting` 으로 드릴다운하면 이 수보다 작게 나오는 것이
+        # 정상이다. 화면 라벨을 '대기'로 두면 그 차이가 버그로 보인다 → '진행 중' 권장.
+        "pending_total": (
+            dm_agg["accepted"]
+            + dm_agg["queued"]
+            + dm_agg["submitting"]
+            + dm_agg["rate_limited"]
+            + dm_agg["legacy_pending"]
+        ),
         "delivery_rate": _delivery_rate(dm_agg),
         # J-1: 오류 세분화(코드·상태별) + 복구 퍼널. series 는 변경 없음(KPI/드릴다운용 스칼라).
         "failure_breakdown": failure_breakdown,
@@ -623,106 +648,12 @@ def _spam(until, since, granularity: str) -> dict:
     }
 
 
-def _count_queue_window_risk(now, risk_hours: int) -> int:
-    """QUEUED 중 메시징 윈도우 만료까지 risk_hours 이내인 건수.
-
-    AdminDMBacklogView(views/autodm.py) 의 window_risk 로직을 그대로 복제한다
-    (comment_id 있으면 7일, 없으면 24h 윈도우; created_at 순 스캔 상한 2000).
-    autodm.py 는 안정 파일이라 리팩터링하지 않는다 — 로직 변경 시 양쪽 동기화 필요.
-    """
-    risk_cut = timedelta(hours=risk_hours)
-    count = 0
-    queued = SentDMLog.objects.filter(status=SentDMLog.Status.QUEUED)
-    for cid, created in queued.order_by("created_at").values_list("comment_id", "created_at")[
-        :2000
-    ]:
-        window = timedelta(days=7) if cid else timedelta(hours=24)
-        if (created + window) - now <= risk_cut:
-            count += 1
-    return count
-
-
-def _action_required(now, since, dm_agg: dict, ig_block: dict, billing: dict) -> list[dict]:
-    """고정 순서 조치 목록 — count=0 항목도 포함(프론트 고정 레이아웃).
-
-    severity 규칙: count == 0 → "ok", count >= 1 → "warning".
-    """
-    since_iso = timezone.localtime(since).isoformat()
-    stuck_cutoff = now - timedelta(minutes=STUCK_SUBMITTING_MINUTES)
-    stuck_submitting = SentDMLog.objects.filter(
-        status=SentDMLog.Status.SUBMITTING, created_at__lt=stuck_cutoff
-    ).count()
-    queued_window_risk = _count_queue_window_risk(now, QUEUE_WINDOW_RISK_HOURS)
-    ig_review = UserSubscription.objects.filter(ig_activation_review_needed=True).count()
-
-    items = [
-        (
-            "expired_tokens",
-            "토큰 만료 IG 계정",
-            ig_block["by_status"]["expired"],
-            {"page": "/auto-dm/ig-connections", "params": {"status": "expired"}},
-        ),
-        (
-            "expiring_tokens_24h",
-            "24h 내 토큰 만료 예정",
-            ig_block["expiring_24h"],
-            # 프론트 힌트 — 목록 API 에 필터 추가 전까지는 안내용 파라미터
-            {"page": "/auto-dm/ig-connections", "params": {"expiring_within_hours": "24"}},
-        ),
-        (
-            "failed_param_recent",
-            "파라미터 오류 실패 (윈도우)",
-            # 2534025(숨겨진 요청·스팸)은 조치 대상 실패가 아니므로 제외 (hidden_spam 으로 분리 집계).
-            dm_agg["failed_param"] - dm_agg["failed_param_hidden"],
-            {"page": "/auto-dm/logs", "params": {"status": "failed_param", "since": since_iso}},
-        ),
-        (
-            "failed_no_trace_recent",
-            "도착 미확인 (윈도우)",
-            dm_agg["failed_no_trace"],
-            {"page": "/auto-dm/logs", "params": {"status": "failed_no_trace", "since": since_iso}},
-        ),
-        (
-            "stuck_submitting",
-            f"SUBMITTING {STUCK_SUBMITTING_MINUTES}분+ 정체",
-            stuck_submitting,
-            {"page": "/auto-dm/logs", "params": {"status": "submitting"}},
-        ),
-        (
-            "queued_window_risk",
-            f"윈도우 만료 임박 대기건 ({QUEUE_WINDOW_RISK_HOURS}h)",
-            queued_window_risk,
-            {"page": "/auto-dm/backlog", "params": {}},
-        ),
-        (
-            "past_due_subscriptions",
-            "결제 연체(past_due) 구독",
-            billing["past_due"],
-            {"page": "/users", "params": {"subscription_status": "past_due"}},
-        ),
-        (
-            "ig_activation_review",
-            "IG 활성 계정 재선택 필요",
-            ig_review,
-            {"page": "/users", "params": {"ig_activation_review": "true"}},
-        ),
-        (
-            "unprocessed_webhooks",
-            f"미처리 토스 웹훅 ({WEBHOOK_BACKLOG_STALE_MINUTES}분+)",
-            billing["webhook_backlog"],
-            {"page": None, "params": {}},
-        ),
-    ]
-    return [
-        {
-            "key": key,
-            "label": label,
-            "count": count,
-            "severity": "ok" if count == 0 else "warning",
-            "link": link,
-        }
-        for key, label, count, link in items
-    ]
+# OPS-5 — ``action_required`` 제거 (2026-08-16).
+#   프론트가 '처리 필요' 화면을 없앴고 다른 소비자(배치·알림·내부 대시보드)가 없음을 확인했다
+#   (레포 전체 grep 0건). 30초마다 항목 9종을 각각 집계하던 비용이 그대로 사라진다 —
+#   특히 `_count_queue_window_risk` 는 QUEUED 2000행을 파이썬으로 스캔하던 가장 비싼 계산이다.
+#   같은 신호가 필요해지면 `/admin/auto-dm/backlog` · `/admin/ig-connections` · `/admin/users`
+#   목록 필터에 이미 다 있다(그래서 이 블록은 아무도 누르지 않았다).
 
 
 def _recent_errors(since, until) -> list[dict]:
@@ -928,6 +859,34 @@ def _billing_signals(now, since) -> dict:
     }
 
 
+def _status_inputs(now, window: str, dm_agg: dict, spam_block: dict) -> tuple[dict, dict, dict]:
+    """신호등 판정에 쓸 **현재 시점 기준(최근 24h)** 입력 (OPS-7).
+
+    신호등이 선택 window 를 타면 "서비스 개설 이후 누적 평균"으로 `모든 시스템 정상` 이 떠서
+    화면 전체가 틀린 말을 한다. 전체 상태가 접힌 한 줄이 된 뒤로는 그 한 마디가 기본 화면의
+    유일한 건강 신호라 무게가 달라졌다.
+
+    ``window`` 가 이미 24h 면 방금 계산한 값을 그대로 재사용한다 — 기본 화면(24h)에서는
+    추가 쿼리가 **0** 이다. 그 외 window 에서만 가벼운 집계 3개가 더 나가는데, 같은 배포에서
+    없앤 ``action_required``(항목 9종 + QUEUED 2000행 스캔)보다 훨씬 싸다.
+    """
+    if window == "24h":
+        return dm_agg, {"failed": spam_block["failed"]}, _billing_signals(now, now - STATUS_BASIS)
+
+    since = now - STATUS_BASIS
+    # _accepted_or_after / _delivery_rate 가 요구하는 4개 필드만 센다 (전체 집계 재실행 아님).
+    dm = SentDMLog.objects.filter(created_at__gte=since, created_at__lt=now).aggregate(
+        accepted=Count("id", filter=Q(status=SentDMLog.Status.ACCEPTED)),
+        delivered=Count("id", filter=Q(status=SentDMLog.Status.DELIVERED)),
+        read=Count("id", filter=Q(status=SentDMLog.Status.READ)),
+        failed_no_trace=Count("id", filter=Q(status=SentDMLog.Status.FAILED_NO_TRACE)),
+    )
+    spam_failed = SpamCommentLog.objects.filter(
+        created_at__gte=since, created_at__lt=now, status=SpamCommentLog.Status.FAILED
+    ).count()
+    return dm, {"failed": spam_failed}, _billing_signals(now, since)
+
+
 def _status_summary(dm_agg: dict, dm_rate: float, ig_block: dict, spam_block: dict, billing: dict):
     """이미 계산된 수치로 서브시스템 신호등 판정 — 규칙은 dashboard_constants 도크스트링 참고."""
     # dm: 표본 미달이면 판정 안 함(ok + insufficient_sample). 경계는 strict < .
@@ -973,6 +932,11 @@ def _status_summary(dm_agg: dict, dm_rate: float, ig_block: dict, spam_block: di
     statuses = [dm_status, ig_status, spam_status, billing_status]
     overall = max(statuses, key=lambda s: _STATUS_RANK[s])
     return {
+        # OPS-7 — 이 블록이 무엇을 기준으로 계산됐는지 응답에 박아둔다. 프론트가 "전체 기간이면
+        # window 종속일 것"이라고 짐작해 24h 를 한 번 더 조회하던 것을 없애기 위한 필드다.
+        # 값이 "now_24h" 인 한 프론트는 두 번째 요청을 보내지 않아도 된다.
+        "basis": "now_24h",
+        "basis_hours": STATUS_BASIS_HOURS,
         "overall": overall,
         "subsystems": {
             "dm": {
@@ -1470,7 +1434,9 @@ curl -H "Authorization: Bearer <staff_token>" \\
         dm_block, dm_agg = _dm_quality(until, since, granularity)
         ig_block = _ig_connections(now)
         spam_block = _spam(until, since, granularity)
-        billing = _billing_signals(now, since)
+
+        # OPS-7: 신호등만 현재 시점(24h) 기준으로 따로 계산한다. 카드·시계열은 선택 범위 그대로.
+        status_dm, status_spam, status_billing = _status_inputs(now, window, dm_agg, spam_block)
 
         payload = {
             "window": window,
@@ -1481,9 +1447,8 @@ curl -H "Authorization: Bearer <staff_token>" \\
             "since": timezone.localtime(since).isoformat(),
             "generated_at": timezone.localtime(now).isoformat(),
             "status_summary": _status_summary(
-                dm_agg, dm_block["delivery_rate"], ig_block, spam_block, billing
+                status_dm, _delivery_rate(status_dm), ig_block, status_spam, status_billing
             ),
-            "action_required": _action_required(now, since, dm_agg, ig_block, billing),
             "dm_quality": dm_block,
             "ig_connections": ig_block,
             "spam": spam_block,
