@@ -86,6 +86,81 @@
 
 ---
 
+## 3-b. 🔴 실제 코드를 대조했습니다 — 지금 고쳐야 할 4곳
+
+회신서에 적어주신 구현 목록을 **실제로 열어 배포된 API 와 대조**했습니다. v1 계약으로
+만드신 상태라 **네 곳이 어긋납니다.** 이대로 배포하면 백업코드 로그인과 MFA 등록이 동작하지
+않습니다. 파일·행을 그대로 적으니 바로 고치실 수 있습니다.
+
+| # | 위치 | 지금 | 배포된 서버가 기대하는 것 | 그대로 두면 |
+|---|---|---|---|---|
+| 1 | `useAdminAuth.ts` `useVerifyMfa` 타입<br>`MfaStep.tsx:89` | 백업코드를 **`code` 에 담아** 전송 (`useBackup ? backupCode : code`) | **별도 필드 `backup_code`** | 🔴 **백업코드 로그인 전부 실패** — 서버가 `code` 를 TOTP 로만 보므로 6자리 숫자가 아니면 `invalid_code` |
+| 2 | `useAdminAuth.ts` `useMfaConfirm` | `{ code }` | `{ setup_token, code, email_code? }` | 🔴 **MFA 등록 불가** — 400 `challenge_expired` |
+| 3 | `useAdminAuth.ts` `useMfaSetup` | `{ password?, setup_token? }` | **재등록**은 `password` + **현재 `code`** | 재등록 400 `invalid_code` (최초 등록은 정상) |
+| 4 | `apiClient.ts:77` `REFRESH_PATH` | 항상 `/admin/auth/refresh/` 고정 | **마케팅 계정은 `/auth/token/refresh/`** | 마케팅 파트너 계정 토큰 갱신 실패 |
+
+추가로 **`MfaStep.tsx:81` 의 백업코드 길이 검증이 `>= 8`** 인데 v2 는 **12자**
+(`ABCD-EFGH-JKLM`)입니다. 하이픈·공백·대소문자는 서버가 무시하니 **프론트에서 정규화하지
+마시고** 길이 검증만 완화해 주세요.
+
+그리고 `login/page.tsx:236` 의 `AUTH_CODES.backupCodeUsed` 분기는 **죽은 코드**입니다 —
+v2 는 이미 쓴 백업코드도 `invalid_code` 로 답합니다(유효했던 코드라는 정보를 흘리지 않기
+위해서입니다). 지우셔도 되고 남겨두셔도 무해합니다.
+
+### 사유 코드 — 불일치 1건 + 누락 7건
+
+`src/types/adminAuth.ts` 의 `AUTH_CODES` 를 서버와 대조했습니다.
+
+**🔴 불일치 — 이건 조용히 깨집니다.**
+
+```ts
+rateLimited: "rate_limited",   // ← 서버는 대문자 "RATE_LIMITED" 를 보냅니다
+```
+
+프로젝트 표준(`apps/core/exceptions.py`)이 스로틀 429 를 **`RATE_LIMITED`(대문자)** 로 내보냅니다.
+소문자로 비교하면 **429 분기가 영영 안 걸려** "요청이 너무 잦습니다" 대신 일반 오류로 떨어집니다.
+어드민 로그인은 5회/분이라 실제로 마주칠 값입니다.
+
+**누락 — 화면 분기가 필요한 것들.**
+
+| 코드 | HTTP | 언제 | 권장 처리 |
+|---|---|---|---|
+| `already_enrolled` | 400 | 등록된 계정이 최초등록 경로 사용 | 로그인 화면으로 |
+| `setup_not_started` | 400 | QR 없이 confirm 호출 | 등록 처음부터 |
+| `not_enrolled` | 400 | 미등록 상태로 백업코드 재발급 | 등록 화면으로 |
+| `token_expired` | 401 | refresh 만료·폐기 | 로그아웃 |
+| `device_revoked` | 401 | 보안 화면에서 해제된 기기 | 로그아웃 + "이 기기 로그인이 해제됨" 안내 |
+| `user_inactive` | 401 | 계정 비활성/스태프 해제 | 로그아웃 |
+| `device_not_found` | 404 | 남의 기기·이미 해제된 기기 | 목록 새로고침 |
+
+### `mfa/status/` 응답 — Q4 요청분이 목에 아직 없습니다
+
+요청하신 필드를 **전부 넣어 배포**했는데 `src/mocks/handlers/adminAuth.ts` 의 목에는 아직
+없습니다. 실서버 응답에는 옵니다.
+
+```jsonc
+{
+  "last_login_at": "2026-08-21T09:02:11Z",   // Q4 요청분 (계정 단위)
+  "backup_codes_low_threshold": 3,           // Q4 요청분 — 3 하드코딩 대신 이 값과 비교
+  "trusted_devices": [{
+    "is_trusted": true,                       // false = 신뢰 등록 없는 임시 세션 (해제 대상에서 빼지 마세요)
+    "created_at": "2026-08-18T02:11:00Z",     // Q4 요청분
+    "expires_at": null                        // Q4 답: 항상 null = "해제할 때까지"
+  }]
+}
+```
+
+### 4번 보충 — 역할별 갱신 URL
+
+마케팅 계정은 `/admin/auth/login/` 에서 **일반 토큰**을 받습니다(2단계 없음). 일반 토큰은
+어드민 갱신 엔드포인트가 거부하므로(400 `not_admin_token`) 갱신 경로를 갈라야 합니다.
+
+```ts
+// apiClient.ts — single-flight 구조는 그대로, URL 만 역할로 고른다
+const isMarketing = qc.getQueryData<AdminMe>(ADMIN_ME_KEY)?.admin_role === "marketing_viewer";
+const path = isMarketing ? "/auth/token/refresh/" : "/admin/auth/refresh/";
+```
+
 ## 4. 지금 prod 상태 (참고)
 
 - 마이그레이션 4건 적용 (`admin_api` 0008·0009, `emails` 0009, `integrations` 0050)
