@@ -3,12 +3,24 @@
 단계 실행 + 체크포인트 재개(stage_data 키 존재 시 스킵) + 취소 + 레이트리밋 pause(재개
 디스패치) + 자기발송 제외 + 후보(DMCampaignCandidate) 생성. Celery 태스크(tasks.py)가
 ``run_migration(job_id, redispatch=...)`` 를 호출한다.
+
+**시간 분할 실행(슬라이스)** — 게시물 1건 복원에 6~10초가 든다. 456개짜리 계정이면
+74분+ 이 필요한데 Celery 태스크 한도는 25분이라 한 번에 끝낼 수 없다. 그래서:
+
+    1. 비싼 단계(``_stage_recover``)는 **게시물 20개마다 중간 저장**한다. 예전에는 루프를
+       끝까지 돌아야만 결과를 썼기 때문에, 타임리밋에 잘리면 수집분이 통째로 증발하고
+       재개가 1번 게시물부터 다시 시작해 **영원히 완주하지 못했다**(실측: highestlevel33
+       456개 — 25분에 잘려 0건 저장).
+    2. ``SLICE_SECONDS`` 를 넘기면 스스로 멈추고 체크포인트를 저장한 뒤 **재큐**한다.
+       25분씩 이어 달려 완주한다. 태스크가 슬롯을 몇 시간씩 물지 않으므로 같은 큐를 쓰는
+       라이브 경로(스팸 판정)도 밀리지 않는다.
 """
 
 from __future__ import annotations
 
 import difflib
 import logging
+import time
 import zlib
 from datetime import timedelta
 
@@ -31,6 +43,18 @@ logger = logging.getLogger(__name__)
 
 RAW_RETENTION_DAYS = 7
 MAX_RATE_PAUSES = 3
+# ── 시간 분할 실행 ──
+# 태스크 소프트 한도(tasks.py soft_time_limit)보다 넉넉히 앞에서 스스로 접는다. 소프트
+# 한도는 어디까지나 백스톱이고, 정상 경로는 이 값으로 잘려야 저장·재큐가 안전하게 끝난다.
+SLICE_SECONDS = 1200  # 20분
+MAX_SLICES = 12  # 20분 × 12 = 최대 4시간까지 수집. 그 뒤엔 모은 것으로 마무리한다.
+# 수집을 끊은 뒤 초안 생성·종결에 쓸 여유 슬라이스. 여기까지 오면 무조건 종결한다
+# (재큐 루프가 무한히 도는 것을 막는 절대 상한).
+ABSOLUTE_MAX_SLICES = MAX_SLICES + 2
+# 재개 디스패치 지연. run_migration 의 중복 실행 가드(60초 내 갱신이면 양보)보다 커야
+# 한다 — 짧게 잡으면 재개 태스크가 자기 자신의 방금 저장을 보고 조용히 스킵된다.
+RESUME_COUNTDOWN = 75
+RECOVER_CHECKPOINT_EVERY = 20  # 게시물 N개마다 중간 저장 (크래시 시 손실 상한)
 MAX_OUTBOUND = 500
 CANDIDATE_CONFIDENCE_THRESHOLD = 0.50  # 확장 수집 대상(강한/불확실) 하한
 OWN_FUZZY_RATIO = 0.92
@@ -57,6 +81,14 @@ def _reply_variants(media_id: str, llm_draft: str | None) -> list[str]:
         if t not in out:
             out.append(t)
     return out[:PUBLIC_REPLY_VARIANTS]
+
+
+def _support_hits(recoveries: list[dict]) -> int:
+    """복원 결과에서 '되살린 DM 수'(오퍼+게이트 지지 인원) 합계."""
+    return sum(
+        (x.get("offer") or {}).get("hits", 0) + (x.get("gate") or {}).get("hits", 0)
+        for x in recoveries
+    )
 
 
 def _recovery_to_dict(r, media: dict) -> dict:
@@ -90,6 +122,10 @@ class _Canceled(Exception):
     """사용자 취소 요청 감지."""
 
 
+class _SliceExhausted(Exception):
+    """이번 슬라이스의 시간을 다 썼다 — 체크포인트를 저장하고 재큐한다(실패 아님)."""
+
+
 def run_migration(job_id: str, *, redispatch=None) -> str:
     """마이그레이션 파이프라인 1회 실행(또는 체크포인트 재개). 최종 status 문자열 반환.
 
@@ -116,10 +152,13 @@ def run_migration(job_id: str, *, redispatch=None) -> str:
     runner = _Runner(job, redispatch=redispatch)
     try:
         return runner.run()
+    except _SliceExhausted:
+        # 정상 경로 — 시간을 다 써서 스스로 접었다. 저장 후 이어서 실행한다.
+        return runner.continue_later(reason="slice")
     except SoftTimeLimitExceeded:
-        logger.warning("run_migration: soft time limit — finalizing partial (job=%s)", job_id)
-        runner.finalize(forced_partial=True, note="시간 제한으로 일부만 분석했습니다.")
-        return job.status
+        # 백스톱 — 슬라이스 판정보다 먼저 소프트 한도가 왔다(단일 호출이 길게 물렸을 때).
+        logger.warning("run_migration: soft time limit (job=%s)", job_id)
+        return runner.continue_later(reason="soft_limit")
     except _Canceled:
         runner.mark_canceled()
         return _S.CANCELED
@@ -162,6 +201,12 @@ class _Runner:
         # 트랜잭션 밖 + 운영 커넥션 폭주). 스테이지 경계(메인 스레드)에서만 DB refresh 로
         # 갱신하고, ThreadPool 워커는 이 in-memory 스냅샷만 읽는다.
         self._cancel_snapshot = bool(job.cancel_requested)
+        # 시간 분할 — 이번 슬라이스 시작 시각과 지금까지 소비한 슬라이스 수.
+        self._slice_start = time.monotonic()
+        self.slices = int(prev.get("slices") or 0)
+        # 복원 단계 진행분(중간 저장·소프트 한도 저장의 대상). 단계 밖에서는 None.
+        self._rec_out: list | None = None
+        self._rec_done: set | None = None
         self.ctx = CollectContext(
             ig=self.ig,
             token=self.token,
@@ -180,10 +225,14 @@ class _Runner:
         if self._cancel_snapshot:
             raise _Canceled()
 
+    def _time_up(self) -> bool:
+        return (time.monotonic() - self._slice_start) >= SLICE_SECONDS
+
     def _budget_state(self) -> dict:
         st = dict(self.job.api_budget_state or {})
         st["caps"] = self.budget.caps
         st["made"] = self.budget.made
+        st["slices"] = self.slices
         return st
 
     def _persist(self, *, counter_fields=None):
@@ -251,45 +300,108 @@ class _Runner:
 
     # ── 단계 2: 게시물별 정밀 복원 ──
     def _stage_recover(self):
+        """게시물을 하나씩 복원한다. **단계 안에서 이어달리기가 되는 유일한 단계.**
+
+        비용의 95%가 여기 있다(게시물당 6~10초). 그래서 다른 단계와 달리 완료 여부만이
+        아니라 **어디까지 했는지**(``recover_done``)와 **거기까지의 결과**(``recover_partial``)를
+        중간 저장한다. 재개는 남은 게시물부터 이어서 한다.
+
+        진행 위치를 인덱스가 아니라 **media_id 집합**으로 잡는 이유: 재개 사이에 게시물이
+        추가되거나 우리 캠페인이 걸려 ``_targets`` 가 달라지면 인덱스는 엉뚱한 곳을 가리킨다.
+        """
         if "recoveries" in self.sd:
             return
         self._check_cancel()
-        self.job.set_stage(_ST.COLLECTING_TARGETED_DMS, 15, "예전 DM을 찾고 있습니다...")
         targets = self._targets(self.sd.get("media", []))
         # 최신 게시물부터 — 결과가 나오는 대로 보여줄 수 있고, 수확도 최신 쪽이 높다.
         targets.sort(key=lambda m: m.get("timestamp", ""), reverse=True)
 
+        # 이어달리기 상태 복원.
+        out = self._rec_out = list(self.sd.get("recover_partial") or [])
+        done = self._rec_done = set(self.sd.get("recover_done") or [])
+        total = max(len(targets), 1)
+        i = len(done)
+        self.job.set_stage(
+            _ST.COLLECTING_TARGETED_DMS,
+            15 + int(70 * min(i, total) / total),
+            f"예전 DM을 찾고 있습니다... ({i}/{total})",
+        )
+
         mids, fps, tmpl_norms = _own_send_context(self.conn)
         is_own = recover.build_own_dm_matcher(mids, fps, tmpl_norms)
 
-        out = []
-        total = max(len(targets), 1)
-        for i, media in enumerate(targets, 1):
+        since_ckpt = 0
+        for media in targets:
+            mid = media.get("id") or ""
+            if mid in done:
+                continue
             if self.budget.total_hit():
                 break
-            if i % 5 == 0 or i == total:
-                self._check_cancel()
-                self.job.set_stage(
-                    _ST.COLLECTING_TARGETED_DMS,
-                    15 + int(70 * i / total),
-                    f"예전 DM을 찾고 있습니다... ({i}/{total})",
+            if self._time_up():
+                # 이번 슬라이스 종료. 저장은 continue_later 가 한다(여기서 두 번 쓰지 않게).
+                logger.info(
+                    "DM이전 슬라이스 만료 (job=%s, %d/%d 완료)", self.job.id, len(done), total
                 )
+                raise _SliceExhausted()
             try:
                 r = recover.recover_post(self.ctx, media, is_own_dm=is_own)
             except (MigrationTokenError, MigrationRateLimitPause):
                 raise
             except Exception:  # noqa: BLE001 — 게시물 1건 실패가 잡을 죽이지 않게
-                logger.exception("recover_post 실패 (media=%s)", media.get("id"))
+                logger.exception("recover_post 실패 (media=%s)", mid)
+                done.add(mid)  # 재개해도 같은 게시물에서 다시 넘어지지 않게
                 continue
-            if not (r.found or r.is_campaign_signal):
-                continue
-            out.append(_recovery_to_dict(r, media))
+            done.add(mid)
+            i = len(done)
+            if r.found or r.is_campaign_signal:
+                out.append(_recovery_to_dict(r, media))
+            if i % 5 == 0:
+                self._check_cancel()
+                self.job.set_stage(
+                    _ST.COLLECTING_TARGETED_DMS,
+                    15 + int(70 * min(i, total) / total),
+                    f"예전 DM을 찾고 있습니다... ({i}/{total})",
+                )
+            since_ckpt += 1
+            if since_ckpt >= RECOVER_CHECKPOINT_EVERY:
+                self._save_recover_progress()
+                since_ckpt = 0
+
+        # 단계 완료 — 중간 상태를 지우고 확정 결과로 승격한다.
         self.sd["recoveries"] = out
+        self.sd.pop("recover_partial", None)
+        self.sd.pop("recover_done", None)
+        self._rec_out = self._rec_done = None
         self.job.candidates_created = 0
-        self.job.dm_messages_collected = sum(
-            (x["offer"] or {}).get("hits", 0) + (x["gate"] or {}).get("hits", 0) for x in out
-        )
+        self.job.dm_messages_collected = _support_hits(out)
         self._persist(counter_fields=["dm_messages_collected"])
+
+    def _stash_recover_progress(self) -> bool:
+        """진행분을 self.sd 에 반영만 한다(DB 쓰기 없음). 단계 밖이면 False."""
+        if self._rec_out is None or self._rec_done is None:
+            return False
+        self.sd["recover_partial"] = self._rec_out
+        self.sd["recover_done"] = sorted(self._rec_done)
+        self.job.dm_messages_collected = _support_hits(self._rec_out)
+        return True
+
+    def _save_recover_progress(self):
+        """복원 단계 중간 저장. 단계 밖(또는 이미 확정)이면 아무것도 하지 않는다."""
+        if self._stash_recover_progress():
+            self._persist(counter_fields=["dm_messages_collected"])
+
+    def _freeze_recoveries(self):
+        """수집을 중단하고 지금까지 모은 것을 **확정 결과로 승격**한다(부분 표시).
+
+        이후 실행은 ``_stage_recover`` 를 건너뛰고 초안 생성·종결로 바로 간다.
+        """
+        if not self._stash_recover_progress():
+            return
+        self.sd["recoveries"] = list(self._rec_out or [])
+        self.sd["truncated"] = True
+        self.sd.pop("recover_partial", None)
+        self.sd.pop("recover_done", None)
+        self._rec_out = self._rec_done = None
 
     # ── 단계 1: 미디어 ──
     def _stage_media(self):
@@ -426,8 +538,11 @@ class _Runner:
     def finalize(self, *, forced_partial: bool = False, note: str = ""):
         job = self.job
         now = timezone.now()
+        # 복원 단계 도중 종결(부분 완료)이면 그때까지 모은 것을 결과로 승격한다.
+        self._freeze_recoveries()
         partial = (
             forced_partial
+            or bool(self.sd.get("truncated"))
             or bool(self.sd.get("failed_media_ids"))
             or bool(self.sd.get("dm_scope_missing"))
             or self.budget.total_hit()
@@ -444,8 +559,69 @@ class _Runner:
         job.api_budget_state = self._budget_state()
         job.save()
 
+    def continue_later(self, *, reason: str = "slice") -> str:
+        """이번 슬라이스를 접고 **이어서 실행**을 예약한다 (실패 아님).
+
+        재개 경로가 없으면(동기 테스트·슬라이스 상한 초과) 부분 완료로 종결한다 —
+        재큐 없이 running 으로 두면 잡이 스위퍼(2h)까지 연결을 잠근 채 방치된다.
+        """
+        job = self.job
+        self._stash_recover_progress()
+        self.slices += 1
+        if self.slices >= MAX_SLICES:
+            # 수집은 여기서 끊는다. 남은 슬라이스로 **모은 것까지는 초안을 만들어** 준다 —
+            # 여기서 그냥 종결하면 몇 시간 수집한 결과가 후보 0건으로 나간다.
+            self._freeze_recoveries()
+        if not self.redispatch or self.slices >= ABSOLUTE_MAX_SLICES:
+            logger.warning(
+                "DM이전 이어달리기 종료 (job=%s, reason=%s, slices=%d, redispatch=%s)",
+                job.id,
+                reason,
+                self.slices,
+                bool(self.redispatch),
+            )
+            self._freeze_recoveries()
+            # 모은 것까지는 초안을 만들어 내보낸다 — 안 하면 수집 결과가 후보 0건으로 나간다.
+            # 단 소프트 한도로 들어온 경우는 하드 킬까지 남은 시간이 불확실해 손대지 않는다
+            # (초안 생성 중에 잘리면 잡이 running 에 박혀 스위퍼까지 연결을 잠근다).
+            if reason != "soft_limit" and not self.sd.get("drafts_done"):
+                try:
+                    self._stage_drafts()
+                except Exception:  # noqa: BLE001 — 종결은 반드시 한다
+                    logger.exception("DM이전 종결 직전 초안 생성 실패 (job=%s)", job.id)
+            self.finalize(forced_partial=True, note="시간 제한으로 일부만 분석했습니다.")
+            return job.status
+
+        now = timezone.now()
+        job.status = _S.RUNNING
+        job.resume_at = now + timedelta(seconds=RESUME_COUNTDOWN)
+        job.message = "분석을 이어서 진행하고 있습니다..."
+        job.stage_data = self.sd
+        job.api_budget_state = self._budget_state()
+        job.save(
+            update_fields=[
+                "status",
+                "resume_at",
+                "message",
+                "stage_data",
+                "api_budget_state",
+                "dm_messages_collected",
+                "updated_at",
+            ]
+        )
+        self.redispatch(str(job.id), RESUME_COUNTDOWN)
+        logger.info(
+            "DM이전 이어달리기 예약 (job=%s, reason=%s, slice=%d/%d)",
+            job.id,
+            reason,
+            self.slices,
+            MAX_SLICES,
+        )
+        return "continued"
+
     def pause(self, exc: MigrationRateLimitPause):
         job = self.job
+        self._stash_recover_progress()  # 재개 시 여기서부터 이어간다
         job.rate_limit_pauses = (job.rate_limit_pauses or 0) + 1
         st = self._budget_state()
         st.setdefault("throttle_events", []).append({"code": exc.code, "stage": job.stage})
@@ -453,7 +629,13 @@ class _Runner:
         job.stage_data = self.sd  # 체크포인트 보존
         if job.rate_limit_pauses > MAX_RATE_PAUSES:
             job.save(
-                update_fields=["rate_limit_pauses", "api_budget_state", "stage_data", "updated_at"]
+                update_fields=[
+                    "rate_limit_pauses",
+                    "api_budget_state",
+                    "stage_data",
+                    "dm_messages_collected",
+                    "updated_at",
+                ]
             )
             self.finalize(forced_partial=True, note="레이트리밋이 반복되어 일부만 분석했습니다.")
             return
@@ -469,6 +651,7 @@ class _Runner:
                 "message",
                 "api_budget_state",
                 "stage_data",
+                "dm_messages_collected",
                 "updated_at",
             ]
         )
@@ -477,6 +660,7 @@ class _Runner:
 
     def fail(self, code: str, message: str):
         job = self.job
+        self._stash_recover_progress()  # 재시도 시 이어서 갈 수 있게 진행분 보존
         now = timezone.now()
         job.status = _S.FAILED
         job.error_code = code

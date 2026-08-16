@@ -4978,8 +4978,11 @@ def process_messaging_event(self, event_key: str):
     acks_late=True,
     reject_on_worker_lost=True,
     max_retries=0,
-    soft_time_limit=1500,  # 25분 — 전역 30분 한도 내
-    time_limit=1560,
+    # 파이프라인이 SLICE_SECONDS(20분)에 스스로 접고 재큐하므로 아래 두 값은 **백스톱**이다.
+    # soft→hard 간격을 넉넉히(5분) 둬야 소프트 한도가 먼저 왔을 때 체크포인트 저장·재큐가
+    # 끝난다. 예전엔 60초뿐이라 부분 저장이 하드 킬에 같이 잘려 수집분이 통째로 사라졌다.
+    soft_time_limit=1440,  # 24분
+    time_limit=1740,  # 29분 — 전역 30분 한도 내
 )
 def run_dm_migration_job(self, job_id: str):
     """DM 캠페인 이전 분석 파이프라인 실행/재개 (라우팅: ai_jobs 큐).
@@ -4987,6 +4990,10 @@ def run_dm_migration_job(self, job_id: str):
     체크포인트 재개(stage_data)·취소·레이트리밋 pause 는 pipeline 이 관리한다. 레이트리밋
     시 pipeline 이 아래 redispatch 로 countdown 후 재개를 예약한다(celery retry state 를
     들고 있지 않음 — acks_late 재전달과 함께 체크포인트에서 이어서 실행).
+
+    게시물이 많은 계정은 한 태스크로 끝나지 않는다. pipeline 이 20분마다 진행분을 저장하고
+    같은 redispatch 로 **이어달리기**를 예약한다 — 태스크가 슬롯을 몇 시간씩 물지 않으므로
+    같은 ai_jobs 큐를 쓰는 라이브 경로(스팸 판정)가 밀리지 않는다.
     """
     from .dm_migration.pipeline import run_migration
 
