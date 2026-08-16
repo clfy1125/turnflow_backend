@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import html
-import json
 from collections import Counter
 
 from django.core.management.base import BaseCommand, CommandError
@@ -44,9 +43,7 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument("job_id")
         parser.add_argument("-o", "--out", default="/tmp/dm_migration_report.html")
-        parser.add_argument(
-            "--all", action="store_true", help="excluded 까지 전부 (기본은 후보만)"
-        )
+        parser.add_argument("--all", action="store_true", help="excluded 까지 전부 (기본은 후보만)")
 
     def handle(self, *args, **o):
         try:
@@ -54,22 +51,50 @@ class Command(BaseCommand):
         except (DMMigrationJob.DoesNotExist, ValueError) as exc:
             raise CommandError(f"잡을 찾을 수 없습니다: {o['job_id']}") from exc
 
-        recs = {r["media_id"]: r for r in (job.stage_data or {}).get("recoveries") or []}
-        cands = list(job.candidates.all())
-        rows = []
-        for c in cands:
-            rows.append((c, recs.get(c.media_id) or {}))
+        sd = job.stage_data or {}
+        recs = {r["media_id"]: r for r in sd.get("recoveries") or []}
+        rows = [(c, recs.get(c.media_id) or {}) for c in job.candidates.all()]
         # 검수 효율: 확신도 낮은 것부터 위로 올린다 (사람이 볼 가치가 큰 순서).
         order = {"needs_review": 0, "excluded": 1, "template_only": 2, "auto_draft": 3}
         rows.sort(key=lambda x: (order.get(x[0].band, 9), -(x[0].support_hits or 0)))
 
-        htmlout = self._render(job, rows)
+        # 탈락분 — 점수가 높은 순(= 아슬아슬하게 떨어진 것)으로. 미탐 검수의 핵심.
+        rejected = list(sd.get("rejected") or [])
+        if not rejected:
+            # 탈락 기록을 남기기 전(2026-08-17 이전)에 돈 잡 — 미디어 목록에서 역산한다.
+            # 점수·근거는 없지만 "무엇이 떨어졌나" 는 보여줄 수 있다.
+            rejected = [
+                {
+                    "media_id": m.get("id"),
+                    "caption": (m.get("caption") or "")[:300],
+                    "comments_count": m.get("comments_count") or 0,
+                    "permalink": m.get("permalink", ""),
+                    "content_score": None,  # 기록 없음
+                    "content_reasons": [],
+                    "repetition": None,
+                }
+                for m in (sd.get("media") or [])
+                if m.get("id") not in recs and (m.get("comments_count") or 0) >= 8
+            ]
+        rejected.sort(
+            key=lambda r: (-(r.get("content_score") or 0), -(r.get("comments_count") or 0))
+        )
+        # 아예 조사하지 않은 것(댓글 8개 미만).
+        seen = set(recs) | {r["media_id"] for r in rejected}
+        skipped = [
+            m
+            for m in (sd.get("media") or [])
+            if m.get("id") not in seen and (m.get("comments_count") or 0) < 8
+        ]
+        skipped.sort(key=lambda m: -(m.get("comments_count") or 0))
+
+        htmlout = self._render(job, rows, rejected, skipped)
         with open(o["out"], "w", encoding="utf-8") as f:
             f.write(htmlout)
         self.stdout.write(f"저장: {o['out']} · 후보 {len(rows)}건")
 
     # ── 렌더 ──
-    def _render(self, job, rows) -> str:
+    def _render(self, job, rows, rejected, skipped) -> str:
         conn = job.ig_connection
         sd = job.stage_data or {}
         bands = Counter(c.band for c, _ in rows)
@@ -121,6 +146,14 @@ background:rgba(128,128,128,.16);color:var(--mut);margin:2px 4px 2px 0}}
 table{{width:100%;border-collapse:collapse;font-size:13px}}
 td{{padding:3px 0;vertical-align:top}}
 td:first-child{{color:var(--mut);width:92px}}
+.tbl{{border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--card)}}
+.tbl th{{text-align:left;font-size:12px;color:var(--mut);padding:8px 10px;
+border-bottom:1px solid var(--line);white-space:nowrap}}
+.tbl td{{padding:7px 10px;border-bottom:1px solid var(--line);width:auto}}
+.tbl tr:last-child td{{border-bottom:0}}
+.tbl .num{{font-variant-numeric:tabular-nums;white-space:nowrap;color:var(--fg);width:auto}}
+.cap2{{color:var(--mut);max-width:520px}}
+h2{{border-top:2px solid var(--line);padding-top:20px}}
 </style></head><body><div class="wrap">
 <h1>DM 이전 검수 — @{esc(conn.username)}</h1>
 <div class="sub">잡 {esc(job.id)} · {job.created_at:%Y-%m-%d %H:%M} · 상태 {esc(job.status)}</div>
@@ -133,11 +166,75 @@ td:first-child{{color:var(--mut);width:92px}}
   {'· 귀속 정리: 시간 짝짓기 ' + str(attribution.get('moved', 0)) + '건 이동, 문구 경쟁 ' + str(attribution.get('demoted', 0)) + '건 내림' if attribution else ''}
   </span>
 </div>
-<div class="sub">👀 <b>확인 방법</b> — 왼쪽 게시물 내용과 오른쪽 DM 문구가 <b>서로 맞는 이야기</b>인지 보세요.
+<h2 style="font-size:18px;margin:26px 0 4px">1. 캠페인으로 본 것 — {len(rows)}건</h2>
+<div class="sub">👀 왼쪽 게시물 내용과 오른쪽 DM 문구가 <b>서로 맞는 이야기</b>인지 보세요.
 캡션이 "AI 자료 드려요" 인데 DM 이 "다이어트 특강" 이면 잘못 붙은 겁니다.
 확신이 낮은 것(검수필요)부터 위에 놓았습니다.</div>
 {cards}
+
+<h2 style="font-size:18px;margin:34px 0 4px">2. 캠페인이 아니라고 본 것 — {len(rejected)}건</h2>
+<div class="sub">👀 <b>여기가 놓친 게 있는지 보는 자리입니다.</b> 판정 점수가 높은 순
+(= 아슬아슬하게 떨어진 순)으로 놓았습니다. 위쪽 몇 개만 봐도 기준이 맞는지 감이 옵니다.
+캡션에 "댓글 남기면 드려요" 가 있는데 여기 있으면 잘못 떨어진 겁니다.</div>
+{self._reject_table(rejected)}
+
+<h2 style="font-size:18px;margin:34px 0 4px">3. 아예 조사하지 않은 것 — {len(skipped)}건</h2>
+<div class="sub">댓글이 8개 미만이라 판정 자체를 못 합니다(표본이 안 나옴).
+댓글 수 많은 순으로 놓았습니다.</div>
+{self._skip_table(skipped)}
 </div></body></html>"""
+
+    @staticmethod
+    def _link(url: str) -> str:
+        return f'<a href="{esc(url)}" rel="noreferrer">열기 ↗</a>' if url else "—"
+
+    @staticmethod
+    def _tags(reasons) -> str:
+        if not reasons:
+            return "—"
+        return " ".join(f'<span class="tag">{esc(REASON_LABEL.get(x, x))}</span>' for x in reasons)
+
+    def _reject_table(self, rejected) -> str:
+        if not rejected:
+            return '<div class="sub">없음</div>'
+        body = []
+        for r in rejected:
+            score = r.get("content_score")
+            rep = r.get("repetition")
+            body.append(
+                "<tr>"
+                f'<td class="num">{"—" if score is None else f"{score:.2f}"}</td>'
+                f'<td class="num">{r.get("comments_count", 0)}</td>'
+                f'<td class="num">{"—" if rep is None else f"{rep:.0%}"}</td>'
+                f"<td>{self._tags(r.get('content_reasons'))}</td>"
+                f'<td class="cap2">{esc((r.get("caption") or "")[:160])}</td>'
+                f"<td>{self._link(r.get('permalink', ''))}</td>"
+                "</tr>"
+            )
+        return (
+            '<table class="tbl"><thead><tr><th>점수</th><th>댓글</th><th>복붙</th>'
+            "<th>걸린 신호</th><th>캡션</th><th></th></tr></thead><tbody>"
+            + "\n".join(body)
+            + "</tbody></table>"
+        )
+
+    def _skip_table(self, skipped) -> str:
+        if not skipped:
+            return '<div class="sub">없음</div>'
+        body = []
+        for m in skipped[:200]:
+            body.append(
+                "<tr>"
+                f'<td class="num">{m.get("comments_count", 0)}</td>'
+                f'<td class="cap2">{esc((m.get("caption") or "")[:160])}</td>'
+                f"<td>{self._link(m.get('permalink', ''))}</td>"
+                "</tr>"
+            )
+        more = f'<div class="sub">…외 {len(skipped) - 200}건</div>' if len(skipped) > 200 else ""
+        return (
+            '<table class="tbl"><thead><tr><th>댓글</th><th>캡션</th><th></th>'
+            "</tr></thead><tbody>" + "\n".join(body) + "</tbody></table>" + more
+        )
 
     def _card(self, i, c, r) -> str:
         label, color = BAND_LABEL.get(c.band, (c.band, "#888"))

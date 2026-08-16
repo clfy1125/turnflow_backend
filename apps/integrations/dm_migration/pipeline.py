@@ -104,6 +104,26 @@ def _support_hits(recoveries: list[dict]) -> int:
     )
 
 
+def _rejection_to_dict(r, media: dict) -> dict:
+    """'캠페인 아님' 으로 본 게시물의 **판정 근거**를 남긴다 (검수용, 가볍게).
+
+    이 기록이 없으면 놓친 캠페인이 있는지 사람이 확인할 수가 없다. 점수 순으로 정렬하면
+    아슬아슬하게 탈락한 것이 위로 오므로 눈으로 훑기 좋다.
+    """
+    return {
+        "media_id": r.media_id,
+        "permalink": media.get("permalink", "") or "",
+        "caption": (media.get("caption") or "")[:300],
+        "timestamp": media.get("timestamp", ""),
+        "comments_count": media.get("comments_count", 0),
+        "probed": r.probed,
+        "trigger": r.trigger,
+        "repetition": r.repetition,
+        "content_score": r.content_score,
+        "content_reasons": r.content_reasons,
+    }
+
+
 def _recovery_to_dict(r, media: dict) -> dict:
     """PostRecovery → stage_data 직렬화(체크포인트 재개용)."""
     return {
@@ -222,6 +242,7 @@ class _Runner:
         # 복원 단계 진행분(중간 저장·소프트 한도 저장의 대상). 단계 밖에서는 None.
         self._rec_out: list | None = None
         self._rec_done: set | None = None
+        self._rec_rejected: list | None = None
         self.ctx = CollectContext(
             ig=self.ig,
             token=self.token,
@@ -334,6 +355,9 @@ class _Runner:
         # 이어달리기 상태 복원.
         out = self._rec_out = list(self.sd.get("recover_partial") or [])
         done = self._rec_done = set(self.sd.get("recover_done") or [])
+        # 탈락 기록 — "캠페인 아님" 판정도 남긴다. 남기지 않으면 **놓친 게 있는지 사람이
+        # 확인할 방법이 없다**(검수는 오탐만이 아니라 미탐도 봐야 한다).
+        rejected = self._rec_rejected = list(self.sd.get("recover_rejected") or [])
         total = max(len(targets), 1)
         i = len(done)
         self.job.set_stage(
@@ -370,6 +394,8 @@ class _Runner:
             i = len(done)
             if r.found or r.is_campaign_signal:
                 out.append(_recovery_to_dict(r, media))
+            else:
+                rejected.append(_rejection_to_dict(r, media))
             if i % 5 == 0:
                 self._check_cancel()
                 self.job.set_stage(
@@ -392,10 +418,13 @@ class _Runner:
             logger.info("DM이전 귀속 정리 (job=%s): %s", self.job.id, stats)
 
         # 단계 완료 — 중간 상태를 지우고 확정 결과로 승격한다.
+        # rejected 는 지우지 않는다 — 검수 리포트가 "왜 캠페인이 아니라고 봤나" 를 보여준다.
         self.sd["recoveries"] = out
+        self.sd["rejected"] = rejected
         self.sd.pop("recover_partial", None)
         self.sd.pop("recover_done", None)
-        self._rec_out = self._rec_done = None
+        self.sd.pop("recover_rejected", None)
+        self._rec_out = self._rec_done = self._rec_rejected = None
         self.job.candidates_created = 0
         self.job.dm_messages_collected = _support_hits(out)
         self._persist(counter_fields=["dm_messages_collected"])
@@ -406,6 +435,7 @@ class _Runner:
             return False
         self.sd["recover_partial"] = self._rec_out
         self.sd["recover_done"] = sorted(self._rec_done)
+        self.sd["recover_rejected"] = self._rec_rejected or []
         self.job.dm_messages_collected = _support_hits(self._rec_out)
         return True
 
@@ -422,10 +452,12 @@ class _Runner:
         if not self._stash_recover_progress():
             return
         self.sd["recoveries"] = list(self._rec_out or [])
+        self.sd["rejected"] = list(self._rec_rejected or [])
         self.sd["truncated"] = True
         self.sd.pop("recover_partial", None)
         self.sd.pop("recover_done", None)
-        self._rec_out = self._rec_done = None
+        self.sd.pop("recover_rejected", None)
+        self._rec_out = self._rec_done = self._rec_rejected = None
 
     # ── 단계 1: 미디어 ──
     def _stage_media(self):
