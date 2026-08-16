@@ -30,7 +30,7 @@ from django.utils import timezone
 from apps.ai_jobs.services.dm_campaign_assistant import sample_replies
 
 from ..models import AutoDMCampaign, DMCampaignCandidate, DMMigrationJob, SentDMLog
-from . import analyze, collect, llm, recover
+from . import analyze, attribute, collect, llm, recover
 from .collect import (
     Budget,
     CollectContext,
@@ -381,6 +381,15 @@ class _Runner:
             if since_ckpt >= RECOVER_CHECKPOINT_EVERY:
                 self._save_recover_progress()
                 since_ckpt = 0
+
+        # ── 귀속 정리 ──
+        # 여기서만 할 수 있는 일이다. 게시물을 하나씩 조사하는 동안에는 "이 DM 을 다른
+        # 게시물도 근거로 쓰고 있는지" 를 알 수 없다. 전부 모은 지금 시점에 시간 짝짓기와
+        # 문구 경쟁으로 중복 주장을 정리한다(추가 API 호출 없음).
+        stats = attribute.resolve(out)
+        self.sd["attribution"] = stats
+        if any(stats.values()):
+            logger.info("DM이전 귀속 정리 (job=%s): %s", self.job.id, stats)
 
         # 단계 완료 — 중간 상태를 지우고 확정 결과로 승격한다.
         self.sd["recoveries"] = out

@@ -81,10 +81,14 @@ class PostRecovery:
 
     @property
     def score(self) -> float:
-        """등급 판정 점수 — **오퍼 기준**(사용자에게 중요한 건 자료 링크)."""
+        """등급 판정 점수 — **오퍼 기준**(사용자에게 중요한 건 자료 링크).
+
+        키 접근이 아니라 get 을 쓴다 — 재개·이전 버전 캐시에서 온 기록은 필드가 빠져 있을
+        수 있고, 여기서 KeyError 가 나면 잡 전체가 죽는다.
+        """
         if self.offer:
-            return self.offer["score"]
-        return self.gate["score"] if self.gate else 0.0
+            return float(self.offer.get("score") or 0.0)
+        return float(self.gate.get("score") or 0.0) if self.gate else 0.0
 
     @property
     def grade(self) -> str:
@@ -275,6 +279,7 @@ def recover_post(
             results = list(ex.map(lambda u: (u, C.fetch_outbound_for_commenter(ctx, u)), todo))
         for user, dms in results:
             probed_ids.add(user["id"])
+            cts = user.get("ts")
             for d in dms:
                 content = d.get("content") or {}
                 urls = content.get("urls") or []
@@ -282,11 +287,17 @@ def recover_post(
                     continue
                 if is_own_dm(d.get("msg_id"), d["text"]):
                     continue
+                # 댓글↔DM 시간차 — 수집 후 '이 DM 이 어느 게시물 것인가' 를 가리는 근거.
+                # 문턱값으로 쓰면 안 갈린다(연달아 댓글 달면 둘 다 몇 초 안에 온다).
+                # 여러 게시물이 같은 DM 을 주장할 때 **더 가까운 쪽**을 고르는 데 쓴다.
+                dts = C.parse_graph_time(d.get("created_time"))
+                gap = int((dts - cts).total_seconds()) if (dts and cts) else None
                 key = placeholder_normalize(d["text"])[:120]
                 slot = tmpl.setdefault(
                     key,
                     {
                         "users": set(),
+                        "evidence": {},
                         "text": content.get("text") or d["text"],
                         "urls": Counter(),
                         "labels": Counter(),
@@ -296,6 +307,15 @@ def recover_post(
                     },
                 )
                 slot["users"].add(user["id"])
+                # 사용자당 가장 가까운 DM 1건만 근거로 둔다(팔로우게이트의 2통은 문구가
+                # 달라 서로 다른 slot 에 들어가므로 여기서 잘리지 않는다).
+                prev = slot["evidence"].get(user["id"])
+                if prev is None or (gap is not None and abs(gap) < abs(prev.get("g") or 10**9)):
+                    slot["evidence"][user["id"]] = {
+                        "u": user["id"],
+                        "m": d.get("msg_id") or "",
+                        "g": gap,
+                    }
                 for u_ in urls:
                     slot["urls"][u_] += 1
                 for b in content.get("buttons") or []:
@@ -355,6 +375,9 @@ def recover_post(
             "text": slot["text"],
             "url": url,
             "label": label,
+            # 누가·어느 메시지로·댓글과 몇 초 차이로 뒷받침했나 — 수집이 다 끝난 뒤
+            # attribute.resolve 가 이걸 보고 게시물 간 중복 주장을 정리한다.
+            "users": list(slot.get("evidence", {}).values()),
             "hits": hits,
             "ratio": round(hits / out.probed, 3),
             "score": round(wilson_lower_bound(hits, out.probed), 3),
