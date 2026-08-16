@@ -813,3 +813,45 @@ def test_generate_drafts_never_exceeds_limit(monkeypatch):
     text = out["m1"]["first_dm_draft"]
     assert 0 < len(text) <= 640
     assert "가" * 900 not in text  # 원문을 잘라 붙인 게 아니라 다시 쓴 문구
+
+
+# ─── 예산 확장 (전수 복원) ────────────────────────────────────────────
+#
+# 연구는 @highestlevel33 456개 전수에서 313/313~315(99%+)를 복원했는데, 배포본은
+# total_graph 1,500 고정이라 실측 3,874콜에 닿을 수 없었다. 예산이 게시물 수를 따라가야
+# 한다 — 이 테스트가 그 회귀를 막는다.
+
+
+class TestBudgetScaling:
+    def test_caps_scale_with_media_limit(self):
+        small = C.caps_for(100)
+        big = C.caps_for(1000)
+        assert big["total_graph"] == small["total_graph"] * 10
+        assert big["targeted_dms"] == small["targeted_dms"] * 10
+
+    def test_full_account_budget_covers_measured_cost(self):
+        """실측: 456개 전수 = 3,874콜. 예산이 그보다 작으면 전수 복원이 구조적으로 불가능."""
+        caps = C.caps_for(456)
+        assert caps["total_graph"] >= 3874, caps["total_graph"]
+
+    def test_media_pages_cover_requested_count(self):
+        """미디어 목록은 1페이지 50개 — 페이지 캡이 모자라면 뒤쪽 게시물을 아예 못 본다."""
+        for n in (50, 100, 456, 1500):
+            caps = C.caps_for(n)
+            assert caps["media"] * C.MEDIA_PAGE_SIZE >= n, (n, caps["media"])
+
+    def test_conversations_cap_does_not_scale(self):
+        """대화 목록은 계정당 1회 훑기라 게시물이 늘어도 늘 이유가 없다."""
+        assert C.caps_for(100)["conversations_pages"] == C.caps_for(2000)["conversations_pages"]
+
+    def test_small_accounts_are_not_starved(self):
+        """게시물이 적어도 최소 예산은 남는다(0 으로 수렴하면 아무것도 못 한다)."""
+        caps = C.caps_for(10)
+        assert caps["total_graph"] > 0 and caps["targeted_dms"] > 0
+        assert caps["media"] >= C.MIN_MEDIA_PAGES
+
+    def test_default_caps_matches_100_media(self):
+        """하위 호환 — 기존 DEFAULT_CAPS 는 media_limit=100 과 같아야 한다."""
+        c100 = C.caps_for(100)
+        for k, v in C.DEFAULT_CAPS.items():
+            assert c100[k] == v, k

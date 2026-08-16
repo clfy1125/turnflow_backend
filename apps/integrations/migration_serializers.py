@@ -32,8 +32,13 @@ class DMMigrationJobStartSerializer(serializers.Serializer):
         required=False,
         default=50,
         min_value=10,
-        max_value=100,
-        help_text="분석할 최근 게시물 수 (10~100, 기본 50).",
+        max_value=3000,
+        help_text=(
+            "분석할 최근 게시물 수 (10~3000, 기본 50). "
+            "**전수 복원을 원하면 계정 게시물 수를 그대로 넣는다** — 예산(Graph 호출 상한)이 "
+            "이 값에 비례해 함께 늘어난다. 예전 상한 100 은 대형 계정에서 전수 복원을 "
+            "구조적으로 막고 있었다(연구 실측 456개 전수 = 3,874콜)."
+        ),
     )
     force = serializers.BooleanField(
         required=False,

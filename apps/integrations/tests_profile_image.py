@@ -145,12 +145,15 @@ class TestSyncIgProfilePictureTask:
         from apps.integrations.tasks import sync_ig_profile_picture
 
         # mock account_info → profile_picture_url 없음
-        with patch(
-            "apps.integrations.services.MockInstagramProvider.is_mock_token",
-            return_value=True,
-        ), patch(
-            "apps.integrations.services.MockInstagramProvider.get_mock_account_info",
-            return_value={"id": "x", "username": "u", "name": "n"},
+        with (
+            patch(
+                "apps.integrations.services.MockInstagramProvider.is_mock_token",
+                return_value=True,
+            ),
+            patch(
+                "apps.integrations.services.MockInstagramProvider.get_mock_account_info",
+                return_value={"id": "x", "username": "u", "name": "n"},
+            ),
         ):
             result = sync_ig_profile_picture.apply(args=[str(ig_connection.id)]).get()
 
@@ -165,16 +168,19 @@ class TestSyncIgProfilePictureTask:
         ig_connection.profile_picture_url = "https://r2.example/cached.jpg"
         ig_connection.save()
 
-        with patch(
-            "apps.integrations.services.MockInstagramProvider.is_mock_token",
-            return_value=True,
-        ), patch(
-            "apps.integrations.services.MockInstagramProvider.get_mock_account_info",
-            return_value={
-                "id": "x",
-                "username": "u",
-                "profile_picture_url": "https://cdn.example.com/p.jpg",
-            },
+        with (
+            patch(
+                "apps.integrations.services.MockInstagramProvider.is_mock_token",
+                return_value=True,
+            ),
+            patch(
+                "apps.integrations.services.MockInstagramProvider.get_mock_account_info",
+                return_value={
+                    "id": "x",
+                    "username": "u",
+                    "profile_picture_url": "https://cdn.example.com/p.jpg",
+                },
+            ),
         ):
             result = sync_ig_profile_picture.apply(args=[str(ig_connection.id)]).get()
 
@@ -188,20 +194,24 @@ class TestSyncIgProfilePictureTask:
         png = _make_png_bytes()
         new_remote = "https://cdn.example.com/new.jpg"
 
-        with patch(
-            "apps.integrations.services.MockInstagramProvider.is_mock_token",
-            return_value=True,
-        ), patch(
-            "apps.integrations.services.MockInstagramProvider.get_mock_account_info",
-            return_value={
-                "id": "x",
-                "username": "newname",
-                "name": "New Name",
-                "profile_picture_url": new_remote,
-            },
-        ), patch(
-            "urllib.request.urlopen",
-            return_value=_make_urlopen_mock(png),
+        with (
+            patch(
+                "apps.integrations.services.MockInstagramProvider.is_mock_token",
+                return_value=True,
+            ),
+            patch(
+                "apps.integrations.services.MockInstagramProvider.get_mock_account_info",
+                return_value={
+                    "id": "x",
+                    "username": "newname",
+                    "name": "New Name",
+                    "profile_picture_url": new_remote,
+                },
+            ),
+            patch(
+                "urllib.request.urlopen",
+                return_value=_make_urlopen_mock(png),
+            ),
         ):
             result = sync_ig_profile_picture.apply(args=[str(ig_connection.id)]).get()
 

@@ -645,9 +645,7 @@ class MockInstagramProvider:
                         {
                             "generic_template": {
                                 "title": f"요청하신 {kw} 보내드려요! 아래 버튼에서 확인해주세요 😊",
-                                "cta": [
-                                    {"title": f"{kw} 받기", "type": "web_url", "url": url}
-                                ],
+                                "cta": [{"title": f"{kw} 받기", "type": "web_url", "url": url}],
                             }
                         }
                     ]

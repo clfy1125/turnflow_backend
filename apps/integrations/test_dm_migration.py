@@ -361,7 +361,9 @@ def test_pipeline_resumes_from_checkpoint(monkeypatch):
                     "score": 0.72,
                     "confirm_required": False,
                     "drops": [],
-                    "samples": [{"text": "요청하신 자료", "created_time": "2026-07-01T05:00:00+0000"}],
+                    "samples": [
+                        {"text": "요청하신 자료", "created_time": "2026-07-01T05:00:00+0000"}
+                    ],
                     "keyword_hits": {"자료": 12},
                 }
             ],

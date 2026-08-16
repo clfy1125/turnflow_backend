@@ -149,8 +149,12 @@ class _Runner:
         self.token = self.conn.access_token  # EncryptedTextField → 복호화
         self.mock = collect.is_mock(self.token)
         prev = job.api_budget_state or {}
+        # 예산은 **게시물 수에 비례**해야 한다. 고정 상한(=100개 기준)을 쓰면 대형 계정에서
+        # 게시물 상한을 풀어도 예산에서 먼저 잘린다(collect.caps_for 도크스트링 참조).
+        # 재개 잡은 이미 저장된 caps 를 그대로 이어 쓴다 — 중간에 예산이 바뀌면 made/caps
+        # 대조가 어긋난다.
         self.budget = Budget(
-            caps=prev.get("caps") or dict(collect.DEFAULT_CAPS),
+            caps=prev.get("caps") or collect.caps_for(job.media_limit),
             made=dict(prev.get("made") or {}),
         )
         self.pacer = RateLimiter(enabled=not self.mock)

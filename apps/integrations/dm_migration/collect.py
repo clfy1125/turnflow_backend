@@ -38,16 +38,52 @@ logger = logging.getLogger(__name__)
 # pause(재개) 대상 코드 — 레이트리밋/Action Block. code 1(데이터 과다)·2·5xx 는 별도/비치명.
 _RATE_PAUSE_CODES = {4, 17, 32, 368, 613}
 
-# 기본 예산 상한(worst case 100 media 기준, 계획서 §1.7 + 타겟 복원).
-DEFAULT_CAPS = {
-    "media": 4,
+# 기본 예산 상한 — **media 100개 기준의 단가표**다. 실제 상한은 :func:`caps_for` 가
+# 잡의 ``media_limit`` 에 비례해 늘려서 만든다.
+#
+# ⚠️ 이 dict 를 그대로 쓰면 안 된다(과거 그렇게 쓰여서 대형 계정이 잘렸다).
+#   @highestlevel33(게시물 493개) 전수 조사는 실측 3,874 콜이 필요했는데 total_graph 가
+#   1,500 에 고정돼 있어, 게시물 상한을 풀어도 예산에서 먼저 잘렸다. 연구 결론은
+#   "전수 복원"(docs/system/DM_MIGRATION_FULL_ACCOUNT_RUN.html — 313/313~315, 99%+)인데
+#   구현이 100개 기준 고정 예산이라 그 결론에 닿을 수 없었다.
+CAPS_PER_100_MEDIA = {
     "comments_first": 110,
     "comments_expand": 170,
     "comments_oldest": 400,  # 후보 게시물 댓글 끝까지 페이징(초기 댓글러 확보)
     "targeted_dms": 600,  # 후보 게시물 댓글러 user_id 조회
-    "conversations_pages": 30,
     "total_graph": 1500,
 }
+# 게시물 수와 무관한 항목 — 대화 목록은 계정당 1회 훑는 것이라 게시물이 늘어도 안 늘어난다.
+CAPS_FIXED = {"conversations_pages": 30}
+# 미디어 목록은 1페이지 50개 → 필요한 페이지 수 + 여유 1.
+MEDIA_PAGE_SIZE = 50
+MIN_MEDIA_PAGES = 4
+
+# 하위 호환 — 기존 호출부/테스트가 참조한다. media_limit=100 일 때의 caps 와 같다.
+DEFAULT_CAPS = {
+    "media": MIN_MEDIA_PAGES,
+    **CAPS_PER_100_MEDIA,
+    **CAPS_FIXED,
+}
+
+
+def caps_for(media_limit: int) -> dict:
+    """``media_limit`` 에 비례한 예산 상한.
+
+    단가는 실측(docs/system/DM_MIGRATION_FULL_ACCOUNT_RUN.html §6)에서 나왔다 —
+    복원이 잘 되는 계정은 게시물당 4.0콜, 실패가 많은 계정은 7.5콜(댓글 1.3 + 사람 6.2).
+    total_graph 15/게시물은 그 worst case(7.5)의 2배로, 재개·재시도까지 흡수하는 여유다.
+
+    선형 확장이라 게시물 456개면 total_graph 6,840 — 실측 3,874 를 넉넉히 덮는다.
+    """
+    n = max(int(media_limit or 0), 10)
+    scale = n / 100.0
+    caps = {k: max(int(v * scale), v // 4) for k, v in CAPS_PER_100_MEDIA.items()}
+    caps.update(CAPS_FIXED)
+    caps["media"] = max(MIN_MEDIA_PAGES, -(-n // MEDIA_PAGE_SIZE) + 1)  # ceil + 여유 1
+    return caps
+
+
 COMMENTS_OLDEST_MAX_PAGES = 12  # 대형 게시물에서 캠페인 기간까지 닿으려면 최대 12페이지
 COMMENT_WORKERS = 6
 COMMENT_EXPAND_MAX_PAGES = 4

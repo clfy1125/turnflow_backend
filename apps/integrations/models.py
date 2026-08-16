@@ -2383,7 +2383,10 @@ class DMMigrationJob(models.Model):
         default=50,
         validators=[MinValueValidator(10)],
         verbose_name="분석 게시물 수",
-        help_text="최근 게시물 몇 개까지 분석할지 (10~100).",
+        help_text=(
+            "최근 게시물 몇 개까지 분석할지. Graph 호출 예산이 이 값에 비례해 정해진다 "
+            "(dm_migration.collect.caps_for). 전수 복원은 계정 게시물 수를 그대로 넣는다."
+        ),
     )
     llm_model = models.CharField(
         max_length=20, default="deepseek", verbose_name="LLM 모델", help_text="AiJob.LlmModel 값"

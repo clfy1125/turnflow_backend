@@ -5059,6 +5059,13 @@ def purge_dm_migration_raw():
     return {"purged": purged, "stalled": stalled}
 
 
+# 선분석 게시물 상한. media_count 를 모르는 계정(연동 시 수집 실패)에 쓰는 폴백과,
+# 아무리 큰 계정이라도 한 잡이 무한정 돌지 않게 하는 천장.
+# 실측 단가 9.7초/게시물(worst case) 기준 3,000개 = 약 8시간이라, 천장은 그보다 낮게 잡는다.
+PREWARM_FALLBACK_MEDIA = 300
+PREWARM_MAX_MEDIA = 1500
+
+
 @shared_task(name="integrations.prewarm_dm_migration", queue="ai_jobs")
 def prewarm_dm_migration(connection_id: str):
     """IG 연동 직후 **백그라운드 선작업** — 사용자가 열어보기 전에 미리 분석해 둔다.
@@ -5091,11 +5098,17 @@ def prewarm_dm_migration(connection_id: str):
     ).exists():
         return "skipped:cached"
 
+    # **전수 복원이 목표다.** 기본값(50)으로 두면 게시물이 많은 계정에서 최근 10~20% 만 보고
+    # 끝난다 — @highestlevel33(493개)에서 후보 40개가 나왔는데 연구 전수 조사는 313개였다.
+    # media_count 는 연동 시 수집되며(없으면 보수적으로 넉넉히 잡는다) 예산도 이 값에
+    # 비례해 늘어난다(collect.caps_for).
+    media_limit = min(max(int(conn.media_count or PREWARM_FALLBACK_MEDIA), 50), PREWARM_MAX_MEDIA)
     try:
         job = DMMigrationJob.objects.create(
             ig_connection=conn,
             requested_by=None,
             trigger_source="auto_connect",
+            media_limit=media_limit,
         )
     except IntegrityError:
         return "skipped:race"
