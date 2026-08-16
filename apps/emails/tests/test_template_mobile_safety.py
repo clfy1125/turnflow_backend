@@ -67,13 +67,19 @@ def test_cta_is_not_shrink_to_fit(key: str):
     assert "display:inline-block" not in html, f"{key}: inline-block CTA can collapse to 1 glyph"
 
 
+# `white-space:nowrap` 이 허용되는 유일한 맥락 = 6자리 코드 칩.
+# 새 코드 칩을 만들면 여기에 **명시적으로** 추가한다 — 정규식으로 느슨하게 열면
+# 라벨 열에 붙은 nowrap 을 놓치게 되고, 이 가드가 막으려던 것이 정확히 그것이다.
+CODE_CHIP_VARS = ("verification_code", "device_code")
+
+
 @pytest.mark.parametrize("key", ALL_KEYS)
 def test_detail_labels_do_not_force_nowrap(key: str):
     """A nowrap label column claims max-content and squeezes the value column."""
     html = DEFAULTS[key]["html_body"]
     for m in re.finditer(r"white-space:nowrap", html):
         window = html[max(0, m.start() - 300) : m.end() + 200]
-        assert "verification_code" in window, (
+        assert any(v in window for v in CODE_CHIP_VARS), (
             f"{key}: white-space:nowrap outside the 6-digit code chip — "
             "it squeezes the neighbouring column"
         )

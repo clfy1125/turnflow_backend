@@ -31,6 +31,7 @@ def log_admin_action(
     target_id: str | int = "",
     target_repr: str = "",
     changes: dict | None = None,
+    actor=None,
 ) -> None:
     """관리자 변경 1건을 ``AdminActionLog`` 에 적재하고 표준 로그를 남긴다.
 
@@ -42,11 +43,15 @@ def log_admin_action(
         target_repr: 사람이 읽을 대상 라벨 (email/name/slug 등).
             **호출부에서 자를 필요 없다** — 여기서 컬럼 상한(255)으로 절단한다.
         changes: ``{"field": {"before": x, "after": y}}`` 형태 dict (선택).
+        actor: 수행자 명시 지정. **로그인 기록처럼 ``request.user`` 가 아직 익명인 시점**에
+            쓴다(2단계 인증이 끝나야 사용자가 정해지는데, 그 사실 자체를 남겨야 한다).
+            생략하면 종전대로 ``request.user`` 를 쓴다.
     """
     from .models import AdminActionLog
 
     request_id = getattr(request, "id", "") or ""
-    actor = getattr(request, "user", None)
+    if actor is None:
+        actor = getattr(request, "user", None)
     actor = actor if getattr(actor, "is_authenticated", False) else None
     try:
         AdminActionLog.objects.create(

@@ -22,6 +22,8 @@ TEMPLATE_INSTA_REPORT_READY = "insta_report_ready"
 # 유료전환 2차 동의 (전자상거래법 §13⑥) — 알림용. 동의는 앱 화면에서 받는다.
 TEMPLATE_CONVERSION_CONSENT = "conversion_consent"
 TEMPLATE_CONSENT_MISSING_DOWNGRADE = "consent_missing_downgrade"
+# 어드민 2단계 로그인 — 신규 기기 승인 코드 (일반 회원에게는 발송되지 않는다).
+TEMPLATE_ADMIN_DEVICE_CODE = "admin_device_code"
 
 TEMPLATE_KEYS = [
     TEMPLATE_EMAIL_VERIFICATION,
@@ -37,6 +39,7 @@ TEMPLATE_KEYS = [
     TEMPLATE_INSTA_REPORT_READY,
     TEMPLATE_CONVERSION_CONSENT,
     TEMPLATE_CONSENT_MISSING_DOWNGRADE,
+    TEMPLATE_ADMIN_DEVICE_CODE,
 ]
 
 TEMPLATE_CHOICES = [(k, k) for k in TEMPLATE_KEYS]
@@ -157,6 +160,15 @@ AVAILABLE_VARIABLES: dict[str, dict[str, str]] = {
         "trial_end_date": "체험 종료일 (YYYY-MM-DD)",
         "consent_url": "다시 구독(동의) 화면 URL",
         "billing_url": "콘솔 결제/구독 설정 URL",
+        "service_name": "서비스명",
+        "support_email": "고객센터 이메일",
+    },
+    TEMPLATE_ADMIN_DEVICE_CODE: {
+        "full_name": "관리자 이름",
+        "device_code": "6자리 기기 승인 코드",
+        "expires_minutes": "코드 유효 시간(분)",
+        "device_label": "로그인을 시도한 기기 표시명 (비어 있을 수 있음)",
+        "request_ip": "로그인을 시도한 IP",
         "service_name": "서비스명",
         "support_email": "고객센터 이메일",
     },

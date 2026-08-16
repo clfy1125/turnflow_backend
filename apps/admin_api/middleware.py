@@ -1,10 +1,16 @@
-"""apps/admin_api/middleware.py — 어드민 역할 게이트 (deny-by-default).
+"""apps/admin_api/middleware.py — 어드민 게이트 (deny-by-default).
 
-``/api/v1/admin/**`` 전 구간을 **경로 프리픽스 한 곳**에서 막는다 (RBAC-2).
-개별 뷰의 ``permission_classes`` 로 막으면 새 어드민 엔드포인트가 추가될 때 누락되어
-조용히 열리므로, 제한 역할(:data:`apps.admin_api.roles.ROLE_ALLOWED_ENDPOINTS`)은
-**화이트리스트에 없으면 전부 403** 으로 처리한다. 이 프리픽스에는 admin_api 뿐 아니라
-``admin/emails/``(apps.emails) · ``admin/pages/...``(apps.pages) 마운트도 함께 들어온다.
+``/api/v1/admin/**`` 전 구간을 **경로 프리픽스 한 곳**에서 막는다. 개별 뷰의
+``permission_classes`` 로 막으면 새 어드민 엔드포인트가 추가될 때 누락되어 조용히 열린다.
+이 프리픽스에는 admin_api 뿐 아니라 ``admin/emails/``(apps.emails) ·
+``admin/pages/...``(apps.pages) 마운트도 함께 들어온다.
+
+여기서 거르는 것은 두 가지다.
+
+1. **역할 게이트 (RBAC-2)** — 제한 역할(:data:`~apps.admin_api.roles.ROLE_ALLOWED_ENDPOINTS`)은
+   화이트리스트에 없으면 전부 403.
+2. **어드민 토큰 게이트** — 2단계 인증을 통과한 토큰(``adm`` 클레임)만 어드민 API 에
+   닿게 한다. 판정 규칙은 :mod:`apps.admin_api.gate` 에 있다(플래그·제외 대상 포함).
 
 인증 해석: 세션 사용자(AuthenticationMiddleware)가 있으면 그대로 쓰고, 없으면 DRF 와
 **동일한 JWTAuthentication 클래스**로 Authorization 헤더를 해석한다(토큰 파싱 로직 복제
@@ -21,6 +27,12 @@ import logging
 
 from django.http import HttpResponseForbidden, JsonResponse
 
+from apps.admin_api.gate import (
+    ADMIN_TOKEN_REQUIRED_CODE,
+    ADMIN_TOKEN_REQUIRED_MESSAGE,
+    has_admin_token,
+    requires_admin_token,
+)
 from apps.admin_api.roles import (
     ADMIN_API_PREFIX,
     DJANGO_ADMIN_PREFIX,
@@ -35,21 +47,25 @@ from apps.admin_api.roles import (
 logger = logging.getLogger(__name__)
 
 
-def _jwt_user(request):
-    """Authorization 헤더의 JWT → 사용자 (DRF 와 동일 클래스). 실패 시 None."""
+def _jwt_auth(request):
+    """Authorization 헤더의 JWT → (사용자, 검증된 토큰). 실패 시 (None, None).
+
+    사용자만이 아니라 **토큰까지** 돌려주는 이유는 어드민 토큰 게이트가 ``adm`` 클레임을
+    봐야 하기 때문이다. DRF 와 같은 클래스를 쓰므로 판정이 갈라지지 않는다.
+    """
     if not request.META.get("HTTP_AUTHORIZATION"):
-        return None
+        return None, None
     try:
         from rest_framework_simplejwt.authentication import JWTAuthentication
 
         result = JWTAuthentication().authenticate(request)
     except Exception:  # noqa: BLE001 — 인증 실패는 뷰가 401 로 처리한다
-        return None
-    return result[0] if result else None
+        return None, None
+    return result if result else (None, None)
 
 
 class AdminRoleGuardMiddleware:
-    """제한 역할(marketing_viewer)의 어드민 접근을 화이트리스트로 좁힌다."""
+    """어드민 접근을 역할 화이트리스트 + 어드민 토큰으로 좁힌다."""
 
     def __init__(self, get_response):
         self.get_response = get_response
@@ -62,16 +78,51 @@ class AdminRoleGuardMiddleware:
 
         if is_api or is_django_admin:
             user = getattr(request, "user", None)
+            token = None
             if not getattr(user, "is_authenticated", False):
-                user = _jwt_user(request)
+                user, token = _jwt_auth(request)
+            else:
+                # 세션 사용자여도 Bearer 가 함께 오면 그 토큰이 실제 판정 대상이다
+                # (DRF 는 JWTAuthentication 을 먼저 시도한다 — 순서를 맞춘다).
+                _, token = _jwt_auth(request)
             role = admin_role(user)
             request.admin_role = role  # 뷰/시리얼라이저 재사용 (역할 조회 1회)
             if is_restricted(role) and (
                 is_django_admin or not is_endpoint_allowed(role, request.method, path)
             ):
                 return self._deny(request, user, role)
+            # 어드민 토큰 게이트 — 인증된 요청에만 적용한다. 미인증은 뷰가 401 을 낸다
+            # (여기서 403 을 내면 "로그인 만료"가 "권한 없음"으로 보인다).
+            if (
+                getattr(user, "is_authenticated", False)
+                and requires_admin_token(path, role)
+                and not has_admin_token(token)
+            ):
+                return self._deny_admin_token(request, user)
 
         return self.get_response(request)
+
+    @staticmethod
+    def _deny_admin_token(request, user):
+        """2단계를 통과하지 않은 토큰 — 프론트는 이 코드를 보고 로그인 화면으로 보낸다."""
+        logger.warning(
+            "[admin-gate] req=%s actor=%s 어드민 토큰 아님 %s %s",
+            getattr(request, "id", "") or "",
+            getattr(user, "email", None),
+            request.method,
+            request.path,
+        )
+        return JsonResponse(
+            {
+                "success": False,
+                "error": {
+                    "code": 403,
+                    "message": ADMIN_TOKEN_REQUIRED_MESSAGE,
+                    "details": {"code": ADMIN_TOKEN_REQUIRED_CODE},
+                },
+            },
+            status=403,
+        )
 
     def _deny(self, request, user, role: str):
         self._audit(request, user, role)

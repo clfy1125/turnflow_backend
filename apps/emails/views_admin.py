@@ -9,13 +9,13 @@ from __future__ import annotations
 from django.conf import settings
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
-from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiResponse, extend_schema
+from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import filters, generics, status
 from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
 
 from .constants import AVAILABLE_VARIABLES
-from .models import EmailLog, EmailStatus, EmailTemplate
+from .models import EmailLog, EmailTemplate
 from .serializers import (
     EmailLogDetailSerializer,
     EmailLogSerializer,

@@ -66,6 +66,9 @@ class EmailTemplate(models.Model):
 class EmailTokenPurpose(models.TextChoices):
     EMAIL_VERIFY = "email_verify", "Email Verification"
     PASSWORD_RESET = "password_reset", "Password Reset"
+    # 어드민 2단계 로그인 — 신규 기기 승인. opaque token 은 쓰지 않고 6자리 code 만 쓴다
+    # (메일 링크 클릭으로 승인되면 메일함 접근만으로 기기가 등록된다).
+    ADMIN_DEVICE = "admin_device", "Admin Device Approval"
 
 
 class EmailToken(models.Model):
@@ -116,7 +119,7 @@ class EmailToken(models.Model):
         purpose: str,
         ttl_minutes: int,
         request_ip: str | None = None,
-    ) -> tuple["EmailToken", str]:
+    ) -> tuple[EmailToken, str]:
         """Create a new token row. Returns (row, raw_token).  Raw token is
         returned only once — it is hashed before storage."""
         raw_token = secrets.token_urlsafe(48)
@@ -134,7 +137,7 @@ class EmailToken(models.Model):
     @classmethod
     def consume(
         cls, *, raw_token: str | None = None, code: str | None = None, user=None, purpose: str
-    ) -> "EmailToken | None":
+    ) -> EmailToken | None:
         """Look up a live token by raw token OR (user + code), atomically mark used."""
         qs = cls.objects.filter(
             purpose=purpose, used_at__isnull=True, expires_at__gt=timezone.now()

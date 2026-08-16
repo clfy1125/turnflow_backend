@@ -18,6 +18,7 @@ Brand palette (from turnflow.link):
 from __future__ import annotations
 
 from apps.emails.constants import (
+    TEMPLATE_ADMIN_DEVICE_CODE,
     TEMPLATE_CONSENT_MISSING_DOWNGRADE,
     TEMPLATE_CONVERSION_CONSENT,
     TEMPLATE_EMAIL_VERIFICATION,
@@ -433,6 +434,39 @@ DEFAULTS: dict[str, dict[str, str]] = {
             preheader="결제 없이 무료 플랜으로 전환됐습니다 (데이터는 보관)",
         ),
     },
+    # 관리자 전용 — 새 기기에서 어드민 콘솔에 로그인할 때 1회. 일반 회원에게는 가지 않는다.
+    # CTA 버튼이 없다: 이 메일에서 눌러야 할 것이 있으면 그 자체가 피싱 훈련이 된다.
+    # 코드를 읽어 로그인 화면에 옮겨 적는 것이 유일한 동작이다.
+    TEMPLATE_ADMIN_DEVICE_CODE: {
+        "subject": "[{{ service_name }}] 관리자 로그인 기기 승인 코드 {{ device_code }}",
+        "html_body": _wrap(
+            """
+<p style="font-size:18px;font-weight:700;color:#111827;margin:0 0 4px;">새 기기에서 관리자 로그인 시도</p>
+<p style="margin:0 0 8px;color:#4b5563;"><strong>{{ full_name }}</strong>님, 등록되지 않은 기기에서 관리자 콘솔 로그인이 요청됐습니다.</p>
+<p style="margin:0 0 4px;color:#4b5563;">본인이 맞다면 아래 코드를 <strong>{{ expires_minutes }}분 이내</strong>에 입력해 주세요.</p>
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-collapse:collapse;">
+  <tr><td align="center" style="padding:22px 0;">
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 auto;">
+      <tr><td align="center" bgcolor="#f5f1fe" style="padding:14px 18px;border-radius:12px;color:#6D28D9;font-size:26px;font-weight:800;letter-spacing:6px;line-height:1.3;white-space:nowrap;">{{ device_code }}</td></tr>
+    </table>
+  </td></tr>
+</table>
+"""
+            + _detail_rows(
+                [
+                    ("기기", "{{ device_label }}"),
+                    ("요청 IP", "{{ request_ip }}"),
+                ]
+            )
+            + """
+<div style="margin:16px 0;padding:14px 18px;background:#fef2f2;border:1px solid #fee2e2;border-radius:12px;color:#991b1b;font-size:13px;line-height:1.7;">
+  <strong>본인이 요청하지 않았다면 비밀번호가 유출된 것입니다.</strong><br>
+  이 코드를 아무에게도 알려주지 마시고, 즉시 비밀번호를 변경한 뒤 <a href="mailto:{{ support_email }}" style="color:#991b1b;">{{ support_email }}</a>로 알려 주세요.
+</div>
+""",
+            preheader="관리자 로그인 기기 승인 코드 {{ device_code }}",
+        ),
+    },
 }
 
 
@@ -482,6 +516,10 @@ SAMPLE_CONTEXT: dict[str, str] = {
     "videos_analyzed": "28",
     "comments_analyzed": "214",
     "report_url": "https://app.turnflow.link/insta-reports/8f14e45f",
+    # 어드민 기기 승인 코드
+    "device_code": "482913",
+    "device_label": "이재원 MacBook",
+    "request_ip": "121.130.44.14",
     # company footer
     "company_name": "주식회사 씨엘에프와이 (CLFY Co., Ltd.)",
     "company_ceo": "김시현",

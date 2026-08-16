@@ -259,6 +259,13 @@ REST_FRAMEWORK = {
         "email_send": config("THROTTLE_EMAIL_SEND", default="5/hour"),
         "password_reset": config("THROTTLE_PASSWORD_RESET", default="10/hour"),
         "password_reset_confirm": config("THROTTLE_PASSWORD_RESET_CONFIRM", default="10/min"),
+        # ── 어드민 2단계 로그인 (docs/ops/ADMIN_AUTH_HARDENING_PLAN.md) ──
+        # 일반 로그인(auth_login)보다 조인다 — 어드민 계정은 3개뿐이라 정상 트래픽이 극히 적고,
+        # 뚫렸을 때 열리는 범위는 전 회원 데이터다. 6자리 코드 무차별 대입 방어가 핵심.
+        "admin_login": config("THROTTLE_ADMIN_LOGIN", default="5/min"),
+        "admin_mfa": config("THROTTLE_ADMIN_MFA", default="10/min"),
+        # 신규 기기 승인 메일 — 메일폭탄 방어. 기기 등록은 사람당 며칠에 한 번 수준.
+        "admin_device_code": config("THROTTLE_ADMIN_DEVICE_CODE", default="5/hour"),
         # 랜딩 방문 트래킹 비콘 (POST /track/visit/) — IP 기준. 한국 모바일 CGNAT(수백 명이
         # 한 egress IP 공유) 특성상 느슨하게 — 실질 어뷰즈 방어는 visitor_id당 시간당 캡(6회).
         "track_visit": config("THROTTLE_TRACK_VISIT", default="120/hour"),
@@ -376,6 +383,42 @@ SIMPLE_JWT = {
     "AUTH_TOKEN_CLASSES": ("rest_framework_simplejwt.tokens.AccessToken",),
     "TOKEN_TYPE_CLAIM": "token_type",
 }
+
+# ── 어드민 2단계 인증 / 어드민 전용 토큰 ────────────────────────────────────
+# 계획·근거: docs/ops/ADMIN_AUTH_HARDENING_PLAN.md, 프론트 계약: docs/frontend/ADMIN_AUTH_MFA_FRONTEND.md
+#
+# ⚠️ ADMIN_MFA_ENFORCED 는 **기본 False** 다. True 로 배포하면 아직 인증앱을 등록하지 않은
+#    관리자 전원이 동시에 잠긴다. 롤아웃 순서는 "엔드포인트 배포(False) → 전원 등록 확인 →
+#    env 만 True" — prod.py 에서 기본값을 올리지 않는 것은 이 순서를 강제하기 위함이다.
+ADMIN_MFA_ENFORCED = config("ADMIN_MFA_ENFORCED", default=False, cast=bool)
+
+# 어드민 토큰 수명. 일반 사용자(access 1일/refresh 7일)보다 짧다 — 어드민 토큰 하나가
+# 전 회원 데이터를 연다.
+ADMIN_ACCESS_TOKEN_LIFETIME = timedelta(
+    hours=config("ADMIN_ACCESS_TOKEN_HOURS", default=2, cast=int)
+)
+# 비신뢰 기기 = 이메일 승인 없이 들어온 임시 세션.
+ADMIN_REFRESH_TOKEN_LIFETIME = timedelta(
+    hours=config("ADMIN_REFRESH_TOKEN_HOURS", default=12, cast=int)
+)
+# 신뢰 기기 = 이메일 코드 1회를 통과해 등록된 기기 (프론트 Q3 수락).
+# 12시간이면 하루 1~2회 인증앱을 다시 꺼내야 해서 폰 WebView 에서 체감이 특히 나쁘다.
+# 신뢰 등록 자체가 이미 2요소를 통과한 기기이고 보안 화면에서 즉시 해제할 수 있으므로,
+# 약하게 가져가는 것은 refresh 수명뿐이고 access 는 그대로 2시간이다(권한 회수는 2시간 내 반영).
+ADMIN_REFRESH_TRUSTED_LIFETIME = timedelta(
+    days=config("ADMIN_REFRESH_TRUSTED_DAYS", default=7, cast=int)
+)
+
+# 1단계(비밀번호) 통과 후 2단계까지의 유예. 짧게 — 이 창 안에서는 비밀번호가 이미 뚫린 상태다.
+ADMIN_MFA_CHALLENGE_TTL_SECONDS = 300
+# 한 challenge 로 시도할 수 있는 코드 횟수 (스로틀과 별개의 2차 방어 — IP 를 바꿔도 못 넘는다).
+ADMIN_MFA_CHALLENGE_MAX_ATTEMPTS = 5
+# 신규 기기 승인 메일 코드 유효시간 (메일 지연을 감안해 challenge 보다 길다 —
+# 만료되면 로그인을 다시 시작하면 되고, 코드 자체는 1회용이다).
+ADMIN_DEVICE_CODE_TTL_MINUTES = 10
+# 백업코드 — 발급 개수와 "이제 재발급하라" 경고 임계 (프론트 Q4 답).
+ADMIN_BACKUP_CODE_COUNT = 10
+ADMIN_BACKUP_CODE_LOW_THRESHOLD = 3
 
 # Google OAuth
 GOOGLE_CLIENT_ID = config("GOOGLE_CLIENT_ID", default="")

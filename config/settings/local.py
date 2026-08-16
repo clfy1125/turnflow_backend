@@ -60,6 +60,10 @@ for _auth_scope in (
     "password_reset_confirm",
     "track_visit",  # 랜딩 방문 비콘 — 스로틀 테스트는 override_settings 로 개별 활성화
     "checkout_event",  # 결제 진입 텔레메트리 — 동일
+    # 어드민 2단계 로그인 — 테스트가 한 IP 로 로그인을 반복해 429 로 깨지는 것을 방지
+    "admin_login",
+    "admin_mfa",
+    "admin_device_code",
 ):
     REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"][_auth_scope] = None
 

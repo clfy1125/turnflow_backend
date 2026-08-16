@@ -12,7 +12,7 @@ PK 컨버터:
 - Page: slug → ``<slug:slug>``
 """
 
-from django.urls import path
+from django.urls import include, path
 
 from apps.admin_api.views.autodm import (
     AdminCampaignDetailView,
@@ -45,6 +45,7 @@ from apps.admin_api.views.pages import (
     AdminPageListView,
     AdminPageSubscriptionListView,
 )
+from apps.admin_api.views.preferences import AdminPreferencesView
 from apps.admin_api.views.referral import (
     AdminReferralCodeDetailView,
     AdminReferralCodeListCreateView,
@@ -68,8 +69,14 @@ from apps.admin_api.views.workspaces import (
 app_name = "admin_api"
 
 urlpatterns = [
+    # A-0. 어드민 2단계 로그인 — 이 프리픽스만 어드민 토큰 게이트에서 제외된다
+    #      (토큰을 받아가는 곳이라 토큰을 요구하면 로그인이 불가능하다).
+    path("auth/", include("apps.admin_api.auth.urls", namespace="admin_auth")),
     # A. 어드민 신원 / 게이팅
     path("me/", AdminMeView.as_view(), name="me"),
+    # A-2. 관리자별 화면 설정 (UI-1) — 본인 것만. 마케팅 전용 계정도 자기 탭은 고쳐야 하므로
+    #      RBAC 화이트리스트에 포함돼 있다 (roles.py).
+    path("me/preferences/", AdminPreferencesView.as_view(), name="me-preferences"),
     # B. 대시보드 지표
     path("metrics/overview/", AdminMetricsOverviewView.as_view(), name="metrics-overview"),
     path(

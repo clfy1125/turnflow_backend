@@ -8,7 +8,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from rest_framework import serializers
 
-from .constants import AVAILABLE_VARIABLES, TEMPLATE_KEYS
+from .constants import AVAILABLE_VARIABLES
 from .models import EmailLog, EmailTemplate
 from .services.renderer import find_variables
 
