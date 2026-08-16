@@ -285,6 +285,126 @@ def test_sliced_run_matches_single_run_end_to_end(monkeypatch):
     assert _run(sliced=True) == whole
 
 
+class TestDraftSlicing:
+    """초안(LLM) 단계도 한 태스크에 안 들어간다 — 후보 200건이면 LLM 호출 30여 회.
+
+    실측(2026-08-17 prod): 복원은 456/456 끝냈는데 초안 단계에서 하드 킬(1740s). 원인은
+    ``max_tokens=4000`` 이 추론 모델의 reasoning 예산에 통째로 먹혀 빈 응답 → 재시도 →
+    이어받기 6회로 번져 **배치 1개에 195초**가 걸린 것. 예산은 llm.DRAFTS_MAX_TOKENS 로
+    올렸고, 그래도 오래 걸리는 계정을 위해 여기서 이어달리기를 보장한다.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _offline(self, monkeypatch):
+        _no_network(monkeypatch)
+
+    def _job_with_recoveries(self, conn, n):
+        recs = [
+            {
+                "media_id": f"dm-{i}",
+                "permalink": f"https://x/{i}",
+                "caption": "댓글에 자료 남겨주세요",
+                "timestamp": "2026-07-01T00:00:00+0000",
+                "comments_count": 30,
+                "probed": 10,
+                "trigger": "자료",
+                "repetition": 0.5,
+                "signal": True,
+                "offer": {
+                    "text": "요청하신 자료 보내드려요",
+                    "url": f"https://ex.co/{i}",
+                    "label": "자료 받기",
+                    "hits": 8,
+                    "ratio": 0.8,
+                    "score": 0.72,
+                },
+                "gate": None,
+                "grade": "auto_draft",
+                "score": 0.72,
+                "confirm_required": False,
+                "drops": [],
+                "samples": [],
+                "keyword_hits": {"자료": 9},
+            }
+            for i in range(n)
+        ]
+        return _job(conn, estimated_seconds=10, stage_data={"media": [], "recoveries": recs})
+
+    @staticmethod
+    def _counting_llm(calls: list):
+        def _fn(batch, *, model_code="deepseek"):
+            calls.append([c["media_id"] for c in batch])
+            out = {
+                c["media_id"]: {
+                    "media_id": c["media_id"],
+                    "name": f"캠페인 {c['media_id']}",
+                    "description": "설명",
+                    "keywords": ["자료"],
+                    "keyword_mode": "any",
+                    "public_reply_draft": "DM 드렸어요",
+                    "first_dm_draft": "요청하신 자료 보내드려요",
+                    "followup_candidates": [],
+                    "confidence": 0.8,
+                }
+                for c in batch
+            }
+            return out, {"llm_calls": 1, "llm_tokens": 100}
+
+        return _fn
+
+    @pytest.mark.django_db
+    def test_drafts_resume_without_recalling_llm(self, monkeypatch):
+        """초안도 슬라이스로 쪼개지고, 재개해도 **같은 게시물을 다시 LLM 에 안 보낸다**."""
+        conn = _conn(_ws(_user()), mock_token=True)
+        job = self._job_with_recoveries(conn, 18)
+        calls: list = []
+        monkeypatch.setattr(pipeline.llm, "generate_drafts", self._counting_llm(calls))
+        monkeypatch.setattr(pipeline, "time", _FakeClock(step=700))  # 배치 1개마다 자름
+
+        status, runs = _drive(job, MagicMock())
+
+        assert status == DMMigrationJob.Status.READY, status
+        assert runs > 1, "초안 단계가 쪼개지지 않았다"
+        sent = [mid for batch in calls for mid in batch]
+        assert len(sent) == len(set(sent)) == 18, f"LLM 재호출 발생: {sent}"
+        job.refresh_from_db()
+        assert job.candidates.count() == 18
+        assert job.candidates.filter(draft_name__startswith="캠페인").count() == 18
+        assert job.llm_calls == len(calls)
+
+    @pytest.mark.django_db
+    def test_terminal_path_creates_candidates_without_more_llm(self, monkeypatch):
+        """상한에 닿으면 남은 초안은 **규칙 기반**으로 채우고 후보를 반드시 만든다.
+
+        여기서 포기하면 몇 시간 복원한 결과가 후보 0건으로 나간다(실측 265건 위험).
+        """
+        conn = _conn(_ws(_user()), mock_token=True)
+        job = self._job_with_recoveries(conn, 18)
+        calls: list = []
+        monkeypatch.setattr(pipeline.llm, "generate_drafts", self._counting_llm(calls))
+        monkeypatch.setattr(pipeline, "time", _FakeClock(step=700))
+        monkeypatch.setattr(pipeline, "MAX_SLICES", 1)
+        monkeypatch.setattr(pipeline, "ABSOLUTE_MAX_SLICES", 1)
+
+        status, _runs = _drive(job, MagicMock())
+
+        assert status == DMMigrationJob.Status.PARTIAL, status
+        drafted = len([m for b in calls for m in b])
+        assert drafted < 18, "상한이 걸리지 않았다 — 테스트 전제가 깨졌다"
+        job.refresh_from_db()
+        assert job.candidates.count() == 18, "복원분이 후보로 안 나왔다"
+        assert job.stage_data.get("drafts_truncated") == 18 - drafted
+        # LLM 초안이 없는 후보도 **복원된 원문**은 들고 있어야 한다.
+        assert job.candidates.exclude(offer_url="").count() == 18
+
+    @pytest.mark.django_db
+    def test_drafts_budget_is_large_enough_for_reasoning_tail(self):
+        """추론 모델은 reasoning 이 completion 예산 안에 든다 — 4000 은 빈 응답을 만든다."""
+        from apps.integrations.dm_migration import llm
+
+        assert llm.DRAFTS_MAX_TOKENS >= 16000, llm.DRAFTS_MAX_TOKENS
+
+
 class TestSliceTimingInvariants:
     """시간 상수들 사이의 관계 — 하나만 바꾸면 조용히 고장 나는 것들."""
 

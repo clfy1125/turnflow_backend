@@ -415,11 +415,23 @@ class _Runner:
         self._persist(counter_fields=["media_scanned"])
 
     # ── 단계 3: 초안 생성 + 후보 저장 ──
-    def _stage_drafts(self):
+    def _stage_drafts(self, *, finish_now: bool = False):
+        """LLM 으로 초안을 만들고 후보를 저장한다.
+
+        복원 단계와 같은 이유로 **여기도 이어달리기가 필요하다**. 후보가 200건이면 LLM 호출이
+        30여 회이고, 추론 모델은 호출당 30초~3분이 걸린다 → 한 태스크에 안 들어간다.
+        그래서 배치마다 결과를 ``drafts_partial`` 에 저장하고, 재개는 남은 것만 만든다.
+        후보 생성(DB) 은 초안이 **전부** 모인 뒤 한 트랜잭션으로 한다.
+
+        ``finish_now`` — 종결 직전 호출. LLM 을 더 부르지 않고 남은 초안은 규칙 기반으로
+        채워 **반드시 후보를 만들어 낸다**. 여기서 포기하면 몇 시간 복원한 결과가 0건이 된다.
+        """
         if self.sd.get("drafts_done"):
             return
-        self._check_cancel()
-        self.job.set_stage(_ST.GENERATING_DRAFTS, 90, "캠페인 초안을 만들고 있습니다...")
+        if not finish_now:
+            # 종결 경로에서는 취소를 확인하지 않는다 — 여기서 _Canceled 를 올리면 이미
+            # 확정된 종결이 뒤집히고 복원 결과가 후보 없이 사라진다.
+            self._check_cancel()
         recs = self.sd.get("recoveries", [])
         media_by_id = {m.get("id"): m for m in self.sd.get("media", [])}
         existing = {
@@ -445,8 +457,21 @@ class _Runner:
             for r in recs
             if r.get("grade") in ("auto_draft", "needs_review")
         ]
-        drafts, usage = llm.generate_drafts(draft_inputs, model_code=self.job.llm_model)
-        self._bump_llm(usage)
+        if finish_now:
+            drafts = dict(self.sd.get("drafts_partial") or {})
+            missing = [c for c in draft_inputs if c["media_id"] not in drafts]
+            for c in missing:
+                drafts[c["media_id"]] = llm.fallback_draft(c)
+            if missing:
+                self.sd["drafts_truncated"] = len(missing)
+                logger.warning(
+                    "DM이전 초안 %d/%d 건을 규칙 기반으로 채우고 종결 (job=%s)",
+                    len(missing),
+                    len(draft_inputs),
+                    self.job.id,
+                )
+        else:
+            drafts = self._generate_drafts_chunked(draft_inputs)
 
         with transaction.atomic():
             self.job.candidates.all().delete()
@@ -458,7 +483,44 @@ class _Runner:
                 self._create_candidate(r, media_by_id, drafts, existing)
             self.job.candidates_created = created
         self.sd["drafts_done"] = True
+        self.sd.pop("drafts_partial", None)
         self._persist(counter_fields=["candidates_created"])
+
+    def _generate_drafts_chunked(self, draft_inputs: list[dict]) -> dict:
+        """초안을 배치 단위로 만들며 **배치마다 저장**한다. 시간이 다 되면 슬라이스를 접는다."""
+        drafts = dict(self.sd.get("drafts_partial") or {})
+        pending = [c for c in draft_inputs if c["media_id"] not in drafts]
+        total = max(len(draft_inputs), 1)
+        self.job.set_stage(
+            _ST.GENERATING_DRAFTS,
+            90 + int(8 * (total - len(pending)) / total),
+            f"캠페인 초안을 만들고 있습니다... ({total - len(pending)}/{total})",
+        )
+        step = llm.DRAFTS_PER_CALL
+        for start in range(0, len(pending), step):
+            if self._time_up():
+                self.sd["drafts_partial"] = drafts
+                self._persist(counter_fields=["llm_calls", "llm_tokens_used"])
+                logger.info(
+                    "DM이전 초안 슬라이스 만료 (job=%s, %d/%d 완료)",
+                    self.job.id,
+                    len(drafts),
+                    total,
+                )
+                raise _SliceExhausted()
+            self._check_cancel()
+            batch = pending[start : start + step]
+            got, usage = llm.generate_drafts(batch, model_code=self.job.llm_model)
+            drafts.update(got)
+            self._bump_llm(usage)
+            self.sd["drafts_partial"] = drafts
+            self._persist(counter_fields=["llm_calls", "llm_tokens_used"])
+            self.job.set_stage(
+                _ST.GENERATING_DRAFTS,
+                90 + int(8 * len(drafts) / total),
+                f"캠페인 초안을 만들고 있습니다... ({len(drafts)}/{total})",
+            )
+        return drafts
 
     def _create_candidate(self, r: dict, media_by_id: dict, drafts: dict, existing: dict):
         mid = r["media_id"]
@@ -540,9 +602,18 @@ class _Runner:
         now = timezone.now()
         # 복원 단계 도중 종결(부분 완료)이면 그때까지 모은 것을 결과로 승격한다.
         self._freeze_recoveries()
+        # **모든 종결 경로가 여기를 지난다** — 초안 단계를 못 끝냈어도 후보는 반드시 만든다.
+        # 여기서 포기하면 몇 시간 복원한 265건이 후보 0건으로 나간다. finish_now=True 라
+        # LLM 을 더 부르지 않고(남은 초안은 규칙 기반) DB 쓰기만 하므로 항상 짧게 끝난다.
+        if not self.sd.get("drafts_done"):
+            try:
+                self._stage_drafts(finish_now=True)
+            except Exception:  # noqa: BLE001 — 종결 자체는 반드시 한다
+                logger.exception("DM이전 종결 직전 후보 생성 실패 (job=%s)", job.id)
         partial = (
             forced_partial
             or bool(self.sd.get("truncated"))
+            or bool(self.sd.get("drafts_truncated"))
             or bool(self.sd.get("failed_media_ids"))
             or bool(self.sd.get("dm_scope_missing"))
             or self.budget.total_hit()
@@ -580,15 +651,6 @@ class _Runner:
                 self.slices,
                 bool(self.redispatch),
             )
-            self._freeze_recoveries()
-            # 모은 것까지는 초안을 만들어 내보낸다 — 안 하면 수집 결과가 후보 0건으로 나간다.
-            # 단 소프트 한도로 들어온 경우는 하드 킬까지 남은 시간이 불확실해 손대지 않는다
-            # (초안 생성 중에 잘리면 잡이 running 에 박혀 스위퍼까지 연결을 잠근다).
-            if reason != "soft_limit" and not self.sd.get("drafts_done"):
-                try:
-                    self._stage_drafts()
-                except Exception:  # noqa: BLE001 — 종결은 반드시 한다
-                    logger.exception("DM이전 종결 직전 초안 생성 실패 (job=%s)", job.id)
             self.finalize(forced_partial=True, note="시간 제한으로 일부만 분석했습니다.")
             return job.status
 
