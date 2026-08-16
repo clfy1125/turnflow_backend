@@ -83,6 +83,19 @@ def _reply_variants(media_id: str, llm_draft: str | None) -> list[str]:
     return out[:PUBLIC_REPLY_VARIANTS]
 
 
+def _content_strong(rec: dict) -> bool:
+    """DM 원문이 없어도 후보로 낼 만큼 **글·댓글 증거가 강한가**.
+
+    "캠페인은 확실한데 문구를 못 살린" 게시물을 숨기면 사용자는 그 게시물에 캠페인이
+    있었다는 사실조차 모른다. 그래서 강한 것은 내보내고(문구는 직접 작성), 약한 것만 버린다.
+    content_score 가 없는 **예전 실행 기록**은 옛 판정(signal)을 그대로 존중한다.
+    """
+    score = rec.get("content_score")
+    if score is None:
+        return bool(rec.get("signal"))
+    return float(score) >= recover.CONTENT_STRONG_MIN
+
+
 def _support_hits(recoveries: list[dict]) -> int:
     """복원 결과에서 '되살린 DM 수'(오퍼+게이트 지지 인원) 합계."""
     return sum(
@@ -103,6 +116,8 @@ def _recovery_to_dict(r, media: dict) -> dict:
         "trigger": r.trigger,
         "repetition": r.repetition,
         "signal": r.is_campaign_signal,
+        "content_score": r.content_score,
+        "content_reasons": r.content_reasons,
         "offer": r.offer,
         "gate": r.gate,
         "grade": r.grade,
@@ -477,7 +492,7 @@ class _Runner:
             self.job.candidates.all().delete()
             created = 0
             for r in recs:
-                if r.get("grade") == "excluded" and not r.get("signal"):
+                if r.get("grade") == "excluded" and not _content_strong(r):
                     continue
                 created += 1
                 self._create_candidate(r, media_by_id, drafts, existing)
@@ -545,6 +560,11 @@ class _Runner:
         opening, _ = analyze.fit_dm_text(raw_opening, has_button=has_button)
         gate_msg, _ = analyze.fit_dm_text(gate.get("text") or "", has_button=True)
         drops = list(r.get("drops") or [])
+        if not (offer or gate):
+            # 글·댓글로는 캠페인이 확실한데 DM 원문을 못 건진 건. 후보는 내되 "문구는
+            # 직접 써주세요" 를 프론트가 알 수 있게 표시한다 — 숨기면 사용자는 이 게시물에
+            # 캠페인이 있었다는 사실조차 모른다.
+            drops.append({"code": "message_not_recovered", "count": 1})
         DMCampaignCandidate.objects.create(
             job=self.job,
             ig_connection=self.conn,

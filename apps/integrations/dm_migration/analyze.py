@@ -155,6 +155,46 @@ def normalize_comment(text: str) -> str:
     return t.strip(" .,!?~…\"'")
 
 
+EMOJI_TOKEN = "«emoji»"
+
+
+def comment_key(text: str) -> str:
+    """댓글 군집화용 키 — **이모지만 있는 댓글도 한 종류로 살려둔다.**
+
+    ``normalize_comment`` 은 이모지를 지운다. 그래서 "🙌" 같은 댓글이 빈 문자열이 되고,
+    호출부가 빈 것을 버리면서 **그 댓글은 존재 자체가 사라졌다.** "아무 댓글이나 달면 DM"
+    캠페인은 사람들이 이모지 하나만 달기 때문에, 그런 게시물은 댓글이 0개인 것처럼 보였다.
+    여기서는 이모지-only 를 하나의 키로 묶어 반복률 계산에 포함시킨다.
+    """
+    n = normalize_comment(text)
+    if n:
+        return n
+    return EMOJI_TOKEN if (text or "").strip() else ""
+
+
+def comment_shape(texts: list[str], *, tiny_chars: int = 3) -> dict:
+    """댓글 뭉치의 '모양' — 캠페인 지문을 숫자로.
+
+    캠페인 게시물의 댓글은 **짧고 서로 비슷하다**(키워드 복붙·이모지). 일상 게시물의 댓글은
+    길고 제각각이다. 실측(@highestlevel33 459개): 복붙 20%+ 는 확실한 캠페인의 99%에서
+    나오고 오탐의 29%에서만 나온다. 3자 이하 초단문 30%+ 는 64% vs 17%.
+    """
+    keys = [k for k in (comment_key(t) for t in texts) if k]
+    n = len(keys) or 1
+    top = Counter(keys).most_common(1)
+    stripped = [normalize_comment(t) for t in texts if (t or "").strip()]
+    emoji_only = sum(1 for s in stripped if not s)
+    tiny = sum(1 for s in stripped if 0 < len(s) <= tiny_chars)
+    return {
+        "total": len(keys),
+        "repetition": round((top[0][1] / n) if top else 0.0, 3),
+        "top_key": top[0][0] if top else "",
+        "top_count": top[0][1] if top else 0,
+        "emoji_only_ratio": round(emoji_only / n, 3),
+        "tiny_ratio": round((emoji_only + tiny) / n, 3),
+    }
+
+
 def placeholder_normalize(text: str) -> str:
     """DM 템플릿 군집화용 — 개인화 토큰(URL/이메일/전화/@/숫자/이모지)을 슬롯으로 치환 후 정규화.
 
