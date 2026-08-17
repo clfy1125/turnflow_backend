@@ -67,6 +67,12 @@ MIN_PROBED_FOR_AUTO = 5  # 3/3 같은 "몇 명 안 봤는데 다 맞음" 을 걸
 # → 그래서 자동채택 두 번째 문을 **'몇 명이 몇 초 안에 받았나'**(auto_hits)로 만든다.
 #    분모가 없으므로 조회를 더 깊게 파도 판정이 흔들리지 않는다.
 AUTO_FAST_MIN_HITS = 5
+# 자동채택 ③ — **페이서로 지연된 자동 발송**. 도구들도 우리처럼 발송을 흩뿌리므로
+# 중앙값이 몇 분까지 밀린다. 같은 문구를 3명 이상이 1시간 안에 받았고 글·댓글도 캠페인
+# 이라고 말하면 사람에게 안 묻는다. 실측(@highestlevel33): 이 문을 열면 검수 34 → 24 로
+# 줄고, 남는 24건 중 22건은 "문구가 다른 게시물 것"(사장님 규칙상 확인 대상)이다.
+SLOW_AUTO_MIN_HITS = 3
+SLOW_AUTO_MAX_GAP = 3600
 GRADE_REVIEW = 0.40  # 확인 권장 — 실측 정밀도 77%
 MIN_SUPPORT_HITS = 3  # 표본이 작을 때 비율만 믿지 않기 위한 절대 하한
 GRADE_AUTO = GRADE_AUTO_RATIO  # 하위 호환(외부 참조)
@@ -151,9 +157,22 @@ class PostRecovery:
         # 게이트 문구는 원래 전 게시물에 공유돼 이 잣대로 재면 안 된다.
         # (문구 경쟁에서 내려간 오퍼는 attribute._repack 이 auto_hits 를 0 으로 만든다.)
         offer = self.offer or {}
+        has_text = bool((offer.get("text") or "").strip())
         if (
             int(offer.get("auto_hits") or 0) >= AUTO_FAST_MIN_HITS
-            and (offer.get("text") or "").strip()
+            and has_text
+            and self.probed >= MIN_PROBED_FOR_AUTO
+        ):
+            return "auto_draft"
+        # 자동채택 ③ — 페이서로 몇 분 밀린 자동 발송. 속도가 느린 대신 **글·댓글도 캠페인
+        # 이라고 말할 때만** 통과시킨다(사장님이 라벨링한 0.55 컷을 그대로 쓴다).
+        gap_med = offer.get("gap_median")
+        if (
+            int(offer.get("hits") or 0) >= SLOW_AUTO_MIN_HITS
+            and gap_med is not None
+            and 0 <= gap_med <= SLOW_AUTO_MAX_GAP
+            and has_text
+            and self.content_score > WEAK_SUPPORT_CONTENT_MIN
             and self.probed >= MIN_PROBED_FOR_AUTO
         ):
             return "auto_draft"
@@ -528,7 +547,7 @@ def recover_post(
             "users": list(slot.get("evidence", {}).values()),
             # 댓글→DM 간격 — **자동 발송의 지문**. 중앙값과 '몇 초 안에 온 건수'를 남긴다.
             "gap_median": gaps[len(gaps) // 2] if gaps else None,
-            "auto_hits": sum(1 for g in gaps if 0 <= g <= C.AUTO_DM_MAX_GAP),
+            "auto_hits": C.fast_hits(gaps),
             "hits": hits,
             "ratio": round(hits / out.probed, 3),
             "score": round(wilson_lower_bound(hits, out.probed), 3),

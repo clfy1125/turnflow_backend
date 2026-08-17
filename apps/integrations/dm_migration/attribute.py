@@ -27,9 +27,9 @@ import re
 from collections import defaultdict
 
 from .analyze import wilson_lower_bound
-from .collect import AUTO_DM_MAX_GAP
 from .collect import CLOCK_SKEW_TOLERANCE as CLOCK_SKEW
 from .collect import MANUAL_DM_MIN_GAP as MANUAL_GAP
+from .collect import fast_hits
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +63,7 @@ def _repack(slot: dict, probed: int) -> None:
     slot["score"] = round(wilson_lower_bound(hits, max(probed, 1)), 3)
     gaps = sorted(g for g in (ev.get("g") for ev in users if isinstance(ev, dict)) if g is not None)
     slot["gap_median"] = gaps[len(gaps) // 2] if gaps else None
-    slot["auto_hits"] = sum(1 for g in gaps if 0 <= g <= AUTO_DM_MAX_GAP)
+    slot["auto_hits"] = fast_hits(gaps)
 
 
 def drop_impossible(recoveries: list[dict]) -> int:

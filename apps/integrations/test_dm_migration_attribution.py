@@ -369,8 +369,13 @@ class TestFastSendFingerprint:
         assert r.offer["auto_hits"] >= recover.AUTO_FAST_MIN_HITS
 
     def test_four_fast_sends_is_not_enough(self):
-        """지문 컷 아래(4명)는 승격하지 않는다 — 실측에서 gap 52초/4명은 약했다."""
-        r = self._rec_obj(probed=49, gaps=[52] * 4 + [90000] * 3)
+        """지문 컷 아래(4명)는 승격하지 않는다 — 실측에서 gap 52초/4명은 약했다.
+
+        중앙값을 1시간 밖에 둬서 페이서 문(자동채택 ③)이 끼어들지 않게 격리한다.
+        """
+        r = self._rec_obj(probed=49, gaps=[52] * 4 + [90000] * 5)
+        assert r.offer["auto_hits"] == 4
+        assert r.offer["gap_median"] == 90000  # 페이서 문 범위(1시간) 밖
         assert r.grade != "auto_draft"
 
     def test_gate_only_is_not_auto_adopted(self):
@@ -430,3 +435,60 @@ class TestDerivedNumbersFollowEvidence:
         attribute.resolve([owner, loser])
         assert owner["grade"] == "auto_draft"
         assert loser["grade"] != "auto_draft"
+
+
+class TestSkewWindowAndPacedSends:
+    """지문 창을 부호로 자르면 안 되고, 페이서로 밀린 발송도 살려야 한다."""
+
+    def test_negative_gap_within_skew_still_counts_as_fingerprint(self):
+        """중앙값 -80초에 17명이 같은 문구를 받았다 — 이걸 검수로 내리면 안 된다.
+
+        한 사람이 몇 초 사이에 댓글을 두 번 달면(신청 → 완료) 캠페인은 첫 댓글에 반응하는데
+        우리가 쥔 건 두 번째 댓글이라 음수가 된다. 실측 11건이 이 모양이었다.
+        """
+        from apps.integrations.dm_migration.recover import PostRecovery
+
+        r = PostRecovery(media_id="m1", probed=45, content_score=0.95, is_campaign_signal=True)
+        r.offer = _slot_g("자료", [-80] * 17, url="https://x")
+        assert r.offer["auto_hits"] == 0  # 헬퍼의 옛 정의(0 이상만)로는 0 이다
+        attribute._repack(r.offer, r.probed)  # 실제 파생 계산을 태운다
+        assert r.offer["auto_hits"] == 17
+        assert r.grade == "auto_draft"
+
+    def test_beyond_skew_tolerance_is_not_a_fingerprint(self):
+        """시계 오차를 넘는 음수(-643초)는 이 댓글의 응답이 아니다."""
+        slot = _slot_g("자료", [-643] * 17, url="https://x")
+        attribute._repack(slot, 45)
+        assert slot["auto_hits"] == 0
+
+    def test_paced_send_with_three_supporters_is_auto(self):
+        """3명이 8분 안에 같은 문구를 받았고 글도 캠페인이라 말한다 → 안 묻는다."""
+        from apps.integrations.dm_migration.recover import PostRecovery
+
+        r = PostRecovery(media_id="m1", probed=46, content_score=0.75, is_campaign_signal=True)
+        r.offer = _slot_g("자료", [462, 470, 480], url="https://x")
+        assert r.grade == "auto_draft"
+
+    def test_paced_send_needs_the_content_to_agree(self):
+        """사장님 라벨 컷(0.55) 아래면 페이서 문은 열지 않는다."""
+        from apps.integrations.dm_migration.recover import PostRecovery
+
+        r = PostRecovery(media_id="m1", probed=46, content_score=0.40, is_campaign_signal=True)
+        r.offer = _slot_g("자료", [462, 470, 480], url="https://x")
+        assert r.grade != "auto_draft"
+
+    def test_paced_send_beyond_an_hour_is_not_auto(self):
+        from apps.integrations.dm_migration.recover import PostRecovery
+
+        r = PostRecovery(media_id="m1", probed=46, content_score=0.95, is_campaign_signal=True)
+        r.offer = _slot_g("자료", [29246] * 11, url="https://x")
+        assert r.grade != "auto_draft"
+
+    def test_pack_and_repack_agree_on_the_window(self):
+        """두 곳이 갈리면 귀속 정리 뒤 등급이 옛 숫자로 매겨진다 — 단일 소스 고정."""
+        from apps.integrations.dm_migration import collect
+
+        gaps = [-200, -100, -1, 0, 30, 60, 61, 5000]
+        slot = _slot("자료", [{"u": f"u{i}", "m": f"d{i}", "g": g} for i, g in enumerate(gaps)])
+        attribute._repack(slot, 10)
+        assert slot["auto_hits"] == collect.fast_hits(gaps) == 5
