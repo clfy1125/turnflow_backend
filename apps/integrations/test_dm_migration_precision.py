@@ -1126,3 +1126,101 @@ class TestExpensivePathIsGatedByContentScore:
         assert (r.offer or {}).get("hits") == 1
         assert C.EXHAUSTIVE_COMMENT_PAGES in calls["comment_pages"], "지지 1명이면 더 파야 한다"
         assert calls["deep_convo"] > 0, "대화도 처음까지 넘겨야 한다"
+
+    def test_support_above_min_but_review_grade_still_digs(self, monkeypatch):
+        """`지지 4명·링크O` 라도 **등급이 검수면 아직 안 끝났다.**
+
+        실측 사고(2026-08-18): 문지기를 "URL 있는 오퍼의 지지가 3명 미만" 으로 재던 판에서
+        지지 4명이 통과해 탐색이 멈췄는데, 등급은 간격이 창 밖이라 검수로 갔다. 검수 23건
+        중 19건이 두 축을 하나도 안 판 상태였다.
+        "그만 파도 될 만큼" 과 "사람에게 안 물어도 될 만큼" 은 다른 질문이다.
+        """
+        from apps.integrations.dm_migration import collect as C
+        from apps.integrations.dm_migration import recover as R
+        from apps.integrations.dm_migration.recover import recover_post
+
+        calls = self._spy(monkeypatch)
+        calls["ncmt"] = 2294
+
+        def _four_slow(ctx, u, **kw):
+            calls["probed"] += 1
+            if u["id"] not in ("u0", "u1", "u2", "u3"):
+                return []
+            return [
+                {
+                    "text": "자료 보내드려요 https://ex.co/pack",
+                    # 댓글보다 이틀 뒤 = 지문·페이서 창 밖 → 등급은 검수
+                    "created_time": "2024-02-15T00:00:00+0000",
+                    "msg_id": f"m{u['id']}",
+                    "recipient": u["id"],
+                    "content": {"text": "자료 보내드려요", "urls": ["https://ex.co/pack"]},
+                }
+            ]
+
+        monkeypatch.setattr(C, "fetch_outbound_for_commenter", _four_slow)
+        monkeypatch.setattr(R.C, "fetch_outbound_for_commenter", _four_slow)
+        media = {
+            "id": "m-slow4",
+            "comments_count": 2294,
+            "caption": "저를 팔로우하고 댓글로 '블로그' 달면 10만 원 상당 전자책 전송🔥",
+            "timestamp": "2024-02-13T00:00:00+0000",
+        }
+        ctx = self._ctx()
+        ctx.outbox = {"nobody": []}
+        r = recover_post(ctx, media, is_own_dm=lambda *a: False)
+        assert r.grade != "auto_draft", "이 조건이면 등급은 검수여야 한다(전제 확인)"
+        assert (
+            C.EXHAUSTIVE_COMMENT_PAGES in calls["comment_pages"]
+        ), "검수로 보낼 거면 두 축을 팠어야 한다"
+        assert r.dug_all_comments is True
+
+    def test_every_review_grade_post_was_dug(self, monkeypatch):
+        """계약: **검수 등급으로 끝나는 게시물은 두 축을 판 상태여야 한다** (글이 강할 때).
+
+        개별 사례가 아니라 이 성질 자체를 고정한다 — 문지기를 또 다른 방식으로 잘못 고치면
+        여기서 걸린다(같은 자리에서 세 번 틀렸다).
+        """
+        from apps.integrations.dm_migration import collect as C
+        from apps.integrations.dm_migration import recover as R
+        from apps.integrations.dm_migration.recover import recover_post
+
+        cases = [
+            ("gate-only", {"text": "댓글 감사합니다 곧 보내드려요", "urls": []}),
+            ("one-link", {"text": "자료 드려요", "urls": ["https://ex.co/a"]}),
+        ]
+        for name, content in cases:
+            calls = self._spy(monkeypatch)
+            calls["ncmt"] = 3000
+
+            def _hit(ctx, u, _c=content, **kw):
+                calls["probed"] += 1
+                if _c["urls"] and u["id"] != "u0":
+                    return []  # 링크판은 지지 1명만
+                return [
+                    {
+                        "text": _c["text"],
+                        "created_time": "2024-02-20T00:00:00+0000",
+                        "msg_id": f"m{u['id']}",
+                        "recipient": u["id"],
+                        "content": _c,
+                    }
+                ]
+
+            monkeypatch.setattr(C, "fetch_outbound_for_commenter", _hit)
+            monkeypatch.setattr(R.C, "fetch_outbound_for_commenter", _hit)
+            ctx = self._ctx()
+            ctx.outbox = {"nobody": []}
+            r = recover_post(
+                ctx,
+                {
+                    "id": f"m-{name}",
+                    "comments_count": 3000,
+                    "caption": "팔로우하고 댓글로 '자료' 달면 보내드려요🔥",
+                    "timestamp": "2024-02-13T00:00:00+0000",
+                },
+                is_own_dm=lambda *a: False,
+            )
+            if r.grade == "auto_draft":
+                continue  # 자동채택이면 팔 필요 없다
+            assert r.dug_all_comments is True, f"{name}: 검수인데 댓글을 안 팠다"
+            assert r.dug_conversations is True, f"{name}: 검수인데 대화를 안 팠다"

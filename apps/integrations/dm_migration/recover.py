@@ -488,6 +488,46 @@ def recover_post(
                         {"text": d["text"][:400], "created_time": d.get("created_time", "")}
                     )
 
+    def _pack(slot, probed: int) -> dict:
+        """문구 슬롯 → 결과 dict. ``probed`` 를 인자로 받는 이유는 **조사 중에도** 이걸
+        불러 "지금 상태면 자동채택인가" 를 물어야 하기 때문이다(_would_auto_adopt)."""
+        hits = len(slot["users"])
+        url = slot["urls"].most_common(1)[0][0] if slot["urls"] else ""
+        label = slot["labels"].most_common(1)[0][0] if slot["labels"] else ""
+        gaps = sorted(
+            g for g in (e.get("g") for e in slot.get("evidence", {}).values()) if g is not None
+        )
+        probed = max(int(probed or 0), 1)
+        return {
+            "text": slot["text"],
+            "url": url,
+            "label": label,
+            # 누가·어느 메시지로·댓글과 몇 초 차이로 뒷받침했나 — 수집이 다 끝난 뒤
+            # attribute.resolve 가 이걸 보고 게시물 간 중복 주장을 정리한다.
+            "users": list(slot.get("evidence", {}).values()),
+            # 댓글→DM 간격 — **자동 발송의 지문**. 중앙값과 '몇 초 안에 온 건수'를 남긴다.
+            "gap_median": gaps[len(gaps) // 2] if gaps else None,
+            "auto_hits": C.fast_hits(gaps),
+            "hits": hits,
+            "ratio": round(hits / probed, 3),
+            "score": round(wilson_lower_bound(hits, probed), 3),
+            "drops": sorted(slot["drops"]),
+            "samples": slot["samples"],
+        }
+
+    def _best_slots(probed: int):
+        """지금까지 모은 것에서 최고 오퍼(URL 있음)·최고 게이트를 뽑는다."""
+        bo = bg = None
+        for slot in tmpl.values():
+            packed = _pack(slot, probed)
+            if packed["url"]:
+                if bo is None or packed["hits"] > bo["hits"]:
+                    bo = packed
+            elif bg is None or packed["hits"] > bg["hits"]:
+                bg = packed
+                bg["is_gate"] = slot["gate"]
+        return bo, bg
+
     order = C.order_probe_targets(commenters, trigger)
     # 지난 실행이 **끝까지 파서** 얻어둔 캠페인 시기 댓글러 — 있으면 맨 앞에 세운다.
     # 이게 없으면 같은 게시물의 200페이지 댓글 페이징을 매번 다시 한다(가장 비싼 재작업).
@@ -514,25 +554,44 @@ def recover_post(
         return top / max(len(probed_ids), 1)
 
     def _needs_more() -> bool:
-        """**더 파야 하나** — 링크 있는 오퍼를 충분한 지지와 함께 얻었나.
+        """**더 파야 하나** — 지금 상태로 끝내면 사람에게 넘어가나.
 
-        이 함수가 '소진의 기준'(CLAUDE.md §1)의 문지기다. 두 번 틀렸다(실측 @highestlevel33):
+        이 함수가 '소진의 기준'(CLAUDE.md §1)의 문지기다. **세 번 틀렸고, 세 번 다 원인이
+        같았다 — "무엇을 찾았나" 로 판정한 것.** 실측은 모두 @highestlevel33.
 
-        ① ``if tmpl:`` 로 판정하던 시절 — 게이트("팔로우 확인") 하나 나오면 더 파는 경로를
-           통째로 건너뛰었다. 게이트는 전 게시물에 같은 문구가 나가므로 이 게시물의 근거가
-           못 된다. (댓글 10,050개 게시물이 최신 50개만 보고 종료됐다.)
-        ② ``_found_offer()`` = "링크 있거나 **게이트 버튼이 안 달린** 슬롯" 으로 고쳤을 때 —
-           버튼 없는 텍스트 DM 이 후자에 걸려 또 '찾았다' 가 됐다. 그런데 최종 결과를 만드는
-           :func:`_pack` 은 **URL 있는 슬롯만 오퍼**로 본다. 두 정의가 어긋나서, 검수로 넘어간
-           7건 중 4건이 "오퍼 없음" 인데도 두 축을 하나도 파지 않았다.
+        ① ``if tmpl:`` — 게이트("팔로우 확인") 하나 나오면 더 파는 경로를 통째로 건너뛰었다.
+           게이트는 전 게시물에 같은 문구가 나가 이 게시물의 근거가 못 된다.
+           (댓글 10,050개 게시물이 최신 50개만 보고 종료됐다.)
+        ② ``_found_offer()`` = "URL 있거나 **게이트 버튼이 안 달린** 슬롯" — 버튼 없는 텍스트
+           DM 이 후자에 걸려 또 '찾았다' 가 됐다. 그런데 :func:`_pack` 은 **URL 있는 슬롯만**
+           오퍼로 본다. 두 정의가 어긋나 검수 7건 중 4건이 "오퍼 없음" 인데도 안 팠다.
+        ③ "URL 있는 오퍼의 지지가 3명 미만" — `지지 4명·링크O` 가 통과해 멈췄는데 **등급은
+           간격이 창 밖이라 검수로 갔다.** 실측(2026-08-18): 검수 23건 중 19건이 두 축을
+           하나도 안 판 상태였고 그중 10건은 캡션이 대놓고 캠페인이었다.
 
-        → 정의를 ``_pack`` 과 일치시킨다(**URL 있는 슬롯 = 오퍼**). 그리고 문구를 찾았어도
-          **지지가 얕으면 아직 끝난 게 아니다.** 실측: 댓글 1,876개 게시물이 캡션·DM 문구가
-          정확히 맞아떨어지는데 조회 60명 중 1명만 걸렸다(조회한 60명이 캠페인 끝난 뒤
-          댓글 단 사람들이었다). 여기서 멈추면 사람에게 넘기게 된다.
+        "그만 파도 될 만큼 찾았나" 와 "**사람에게 안 물어도 될 만큼** 찾았나" 는 다른 질문인데
+        계속 앞의 것으로 판정한 것이 잘못이었다.
+
+        → **등급으로 판정한다.** 지금 상태로 자동채택이 안 되면 아직 안 끝난 것이다.
+          판정 규칙을 여기 복제하지 않는다 — :class:`PostRecovery` 가 단일 소스여야
+          등급 규칙을 고칠 때 이 문지기가 저절로 따라온다.
         """
-        best = max((len(s["users"]) for s in tmpl.values() if s["urls"]), default=0)
-        return best < MIN_SUPPORT_HITS
+        probed_now = max(len(probed_ids), 1)
+        bo, bg = _best_slots(probed_now)
+        # 옮길 **링크**가 아직 없으면 등급과 무관하게 안 끝났다. 등급만 보면 안 되는 이유:
+        # 자동채택 1번 규칙(비율)이 ``offer or gate`` 를 보기 때문에, 게이트가 전원에게 가서
+        # 비율 1.0 이 되면 **오퍼를 못 찾았는데도 auto_draft** 가 나온다(= ① 실패의 재현).
+        if not bo or not (bo.get("url") or "").strip():
+            return True
+        probe = PostRecovery(
+            media_id=mid,
+            probed=probed_now,
+            content_score=out.content_score,
+            is_campaign_signal=out.is_campaign_signal,
+            offer=bo,
+            gate=bg,
+        )
+        return probe.grade != "auto_draft"
 
     def _resolve_ambiguity() -> None:
         """판정이 애매하면 **결론이 날 때까지** 더 조회한다.
@@ -651,40 +710,7 @@ def recover_post(
     if not tmpl:
         return out
 
-    def _pack(slot) -> dict:
-        hits = len(slot["users"])
-        url = slot["urls"].most_common(1)[0][0] if slot["urls"] else ""
-        label = slot["labels"].most_common(1)[0][0] if slot["labels"] else ""
-        gaps = sorted(
-            g for g in (e.get("g") for e in slot.get("evidence", {}).values()) if g is not None
-        )
-        return {
-            "text": slot["text"],
-            "url": url,
-            "label": label,
-            # 누가·어느 메시지로·댓글과 몇 초 차이로 뒷받침했나 — 수집이 다 끝난 뒤
-            # attribute.resolve 가 이걸 보고 게시물 간 중복 주장을 정리한다.
-            "users": list(slot.get("evidence", {}).values()),
-            # 댓글→DM 간격 — **자동 발송의 지문**. 중앙값과 '몇 초 안에 온 건수'를 남긴다.
-            "gap_median": gaps[len(gaps) // 2] if gaps else None,
-            "auto_hits": C.fast_hits(gaps),
-            "hits": hits,
-            "ratio": round(hits / out.probed, 3),
-            "score": round(wilson_lower_bound(hits, out.probed), 3),
-            "drops": sorted(slot["drops"]),
-            "samples": slot["samples"],
-        }
-
-    best_offer = best_gate = None
-    for slot in tmpl.values():
-        packed = _pack(slot)
-        if packed["url"]:
-            if best_offer is None or packed["hits"] > best_offer["hits"]:
-                best_offer = packed
-        else:
-            if best_gate is None or packed["hits"] > best_gate["hits"]:
-                best_gate = packed
-                best_gate["is_gate"] = slot["gate"]
+    best_offer, best_gate = _best_slots(out.probed)
     out.offer, out.gate = best_offer, best_gate
 
     drops: Counter = Counter()
