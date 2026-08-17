@@ -55,8 +55,15 @@ class Command(BaseCommand):
         recs = {r["media_id"]: r for r in sd.get("recoveries") or []}
         rows = [(c, recs.get(c.media_id) or {}) for c in job.candidates.all()]
         # 검수 효율: 확신도 낮은 것부터 위로 올린다 (사람이 볼 가치가 큰 순서).
+        # AI 가 의심한 건을 맨 위로 — 사람이 봐야 할 가치가 가장 큰 순서.
         order = {"needs_review": 0, "excluded": 1, "template_only": 2, "auto_draft": 3}
-        rows.sort(key=lambda x: (order.get(x[0].band, 9), -(x[0].support_hits or 0)))
+        rows.sort(
+            key=lambda x: (
+                0 if (x[1] or {}).get("ai_doubt") else 1,
+                order.get(x[0].band, 9),
+                -(x[0].support_hits or 0),
+            )
+        )
 
         # 탈락분 — 점수가 높은 순(= 아슬아슬하게 떨어진 것)으로. 미탐 검수의 핵심.
         rejected = list(sd.get("rejected") or [])
@@ -267,9 +274,15 @@ h2{{border-top:2px solid var(--line);padding-top:20px}}
         ai_block = ""
         if ai:
             ok = ai.get("match")
+            note = (
+                "같은 캠페인 맞음"
+                if ok
+                else "다른 캠페인으로 보임 — <b>참고용</b>(AI 는 확실한 캠페인의 20%도 "
+                "'아니다' 라고 했습니다. 직접 보고 판단하세요)"
+            )
             ai_block = (
                 f'<div class="kv" style="color:{"#0a7" if ok else "#c62"}">'
-                f'🤖 AI 내용 대조: <b>{"같은 캠페인 맞음" if ok else "다른 캠페인으로 보임"}</b>'
+                f"🤖 AI 내용 대조: {note}"
                 f' (확신 {ai.get("confidence", 0):.0%}) — {esc(ai.get("reason"))}</div>'
             )
         demoted = r.get("offer_demoted")

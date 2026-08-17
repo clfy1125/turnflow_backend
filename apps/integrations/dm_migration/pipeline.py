@@ -90,8 +90,10 @@ def _needs_verify(rec: dict) -> bool:
     문구 자체가 없다. 애매한 구간에만 걸어야 비용이 안 튄다.
     """
     o, g = rec.get("offer") or {}, rec.get("gate") or {}
-    text = o.get("text") or g.get("text") or ""
-    if not text:
+    text = (o.get("text") or g.get("text") or "").strip()
+    # 문구가 비어 있으면 대조할 게 없다 — 예전엔 빈 문자열을 AI 에 물어보고 "안 맞는다"
+    # 는 답을 받아 멀쩡한 건을 의심 처리했다(버튼만 있는 DM 에서 실제로 발생).
+    if len(text) < 10:
         return False
     hits = max(int(o.get("hits") or 0), int(g.get("hits") or 0))
     return 0 < hits <= 2

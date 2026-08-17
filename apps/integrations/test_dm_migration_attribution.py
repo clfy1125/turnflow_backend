@@ -182,16 +182,32 @@ class TestApplyVerdicts:
         )
         assert rec["grade"] == "needs_review"
         assert rec["ai_match"]["reason"] == "같은 자료"
-        assert stats == {"checked": 1, "kept": 1, "dropped": 0}
+        assert stats == {"checked": 1, "kept": 1, "doubted": 0}
 
-    def test_mismatch_drops_it(self):
+    def test_mismatch_marks_doubt_but_never_deletes(self):
+        """AI 에 거부권을 주면 안 된다 — 실측에서 확실한 캠페인의 20%를 '아니다' 라고 했다.
+
+        캡션 "조회수 터지는 인스타 비밀 점수표" ↔ DM "노출 높이는 5가지 필수 세팅" 처럼
+        인플루언서는 예고한 말과 실제 문구를 그대로 맞추지 않는다. 표시만 하고 사람이 판단.
+        """
         rec = _rec("m1", offer=_slot("특강 신청", [], hits=2))
+        before = rec["grade"]
         stats = attribute.apply_verdicts(
             [rec], {"m1": {"match": False, "confidence": 0.8, "reason": "주제 다름"}}
         )
-        assert rec["grade"] == "excluded"
-        assert rec["confirm_required"] is False
-        assert stats["dropped"] == 1
+        assert rec["grade"] == before, "AI 가 후보를 지웠다"
+        assert rec["ai_doubt"] is True
+        assert rec["confirm_required"] is True
+        assert stats["doubted"] == 1
+
+    def test_empty_dm_text_is_not_sent_to_ai(self):
+        """빈 문구를 물어보면 '안 맞는다' 는 답이 와서 멀쩡한 건이 의심 처리된다."""
+        from apps.integrations.dm_migration.pipeline import _needs_verify
+
+        assert _needs_verify({"offer": {"text": "", "hits": 1}}) is False
+        assert _needs_verify({"offer": {"text": "   ", "hits": 1}}) is False
+        assert _needs_verify({"offer": {"text": "짧음", "hits": 1}}) is False
+        assert _needs_verify({"offer": {"text": "요청하신 자료 보내드려요", "hits": 1}}) is True
 
     def test_no_verdict_leaves_it_alone(self):
         """판정을 못 받으면 그대로 둔다 — LLM 실패가 후보를 지우면 안 된다(fail-open)."""
@@ -200,14 +216,15 @@ class TestApplyVerdicts:
         stats = attribute.apply_verdicts([rec], {})
         assert rec["grade"] == before
         assert "ai_match" not in rec
-        assert stats == {"checked": 0, "kept": 0, "dropped": 0}
+        assert stats == {"checked": 0, "kept": 0, "doubted": 0}
 
     def test_strong_support_is_not_sent_to_ai(self):
         """지지 3명+ 는 이미 정밀도가 충분하다 — 비용을 거기 쓰지 않는다."""
         from apps.integrations.dm_migration.pipeline import _needs_verify
 
-        assert _needs_verify({"offer": {"text": "x", "hits": 1}}) is True
-        assert _needs_verify({"offer": {"text": "x", "hits": 2}}) is True
-        assert _needs_verify({"offer": {"text": "x", "hits": 3}}) is False
+        real = "요청하신 자료 보내드려요 아래 링크 확인해주세요"
+        assert _needs_verify({"offer": {"text": real, "hits": 1}}) is True
+        assert _needs_verify({"offer": {"text": real, "hits": 2}}) is True
+        assert _needs_verify({"offer": {"text": real, "hits": 3}}) is False
         assert _needs_verify({"offer": None, "gate": None}) is False
         assert _needs_verify({"offer": {"text": "", "hits": 1}}) is False

@@ -156,28 +156,36 @@ def regrade(recoveries: list[dict]) -> int:
 
 
 def apply_verdicts(recoveries: list[dict], verdicts: dict) -> dict:
-    """AI 내용 대조 결과를 등급에 반영한다.
+    """AI 내용 대조 결과를 반영한다. **AI 는 후보를 지우지 못한다 — 표시만 한다.**
 
     · match=True  → 지지가 1~2명이어도 **살린다**(도달률 낮은 게시물 구제).
-    · match=False → 남의 게시물에서 흘러든 것으로 보고 **내린다**.
-    · 판정 없음   → 손대지 않는다(fail-open — 후보를 잃지 않는다).
+    · match=False → **지우지 않는다.** 의심 표시만 달아 검수에서 아래로 내린다.
+    · 판정 없음   → 손대지 않는다(fail-open).
 
-    판정 근거는 기록에 남긴다 — 검수 리포트가 "AI 가 왜 그렇게 봤나" 를 보여준다.
+    ⚠️ 왜 삭제를 안 시키나 — 실측(@highestlevel33, 2026-08-17):
+        확실한 캠페인(지지 3명+) 30건에 돌렸더니 **6건(20%)을 '아니다' 라고 했다.**
+        예: 캡션 "조회수 터지는 인스타 비밀 점수표" ↔ DM "노출 높이는 5가지 필수 세팅"
+            → 30명 중 23명이 받은 확정 캠페인인데 문구가 안 맞는다고 기각.
+        인플루언서는 캡션에서 예고한 말과 DM 문구를 그대로 맞추지 않는다. AI 에 거부권을
+        주면 진짜를 그만큼 잃는다. 반대로 특이도는 높아서(가짜 33건 중 32건 정확) **의심
+        표시로는 값이 있다** — 사람이 30초 보고 지우는 편이 낫다.
+        (CLAUDE.md §1: 정밀도와 충돌하면 버리지 말고 등급으로 가른다.)
     """
-    kept = dropped = 0
+    kept = doubted = 0
     for rec in recoveries:
         v = verdicts.get(rec.get("media_id"))
         if not v:
             continue
         rec["ai_match"] = v
         if v.get("match"):
-            rec["grade"] = "needs_review" if rec.get("grade") == "excluded" else rec["grade"]
+            if rec.get("grade") == "excluded":
+                rec["grade"] = "needs_review"
             kept += 1
         else:
-            rec["grade"] = "excluded"
-            rec["confirm_required"] = False
-            dropped += 1
-    return {"checked": len(verdicts), "kept": kept, "dropped": dropped}
+            rec["ai_doubt"] = True  # 검수 정렬용. 등급은 건드리지 않는다
+            rec["confirm_required"] = True
+            doubted += 1
+    return {"checked": len(verdicts), "kept": kept, "doubted": doubted}
 
 
 def resolve(recoveries: list[dict]) -> dict:
