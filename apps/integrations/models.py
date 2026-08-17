@@ -2682,3 +2682,78 @@ class DMCampaignCandidate(models.Model):
 
     def __str__(self):
         return f"DMCampaignCandidate({self.id}) {self.band} conf={self.confidence:.2f}"
+
+
+class IGPostAnalysis(models.Model):
+    """게시물 1건의 DM 캠페인 **판정 캐시** (연결 × media_id 유일).
+
+    왜 필요한가 — 게시물 1건 조사는 실측 19.6 Graph 콜이고 계정 전수는 3~4시간이다.
+    그런데 게시물의 캡션은 안 바뀌고, 2024년에 끝난 캠페인은 앞으로도 안 바뀐다.
+    **이미 깔끔하게 판정된 게시물을 다시 조사하는 것은 Meta 쿼터 낭비**이고, 그 쿼터는
+    다른 워크스페이스의 댓글 수집·DM 발송에서 빼오는 것이다(CLAUDE.md §1).
+
+    ⚠️ **타인의 DM 원문·댓글 원문은 담지 않는다.** 7일 파기 정책
+    (``tasks.purge_dm_migration_raw``)의 대상은 원문이고, 이 표에는 우리가 만든 **판정
+    수치**만 둔다. 문구가 필요한 재사용(후보 생성)은 이미 영구 보관되는
+    :class:`DMCampaignCandidate` 에서 가져온다.
+
+    ⚠️ ``rules_version`` 이 안전장치다. 판정 규칙을 고치면 이 값을 올려서 **옛 판정을
+    전부 무효화**한다. 안 하면 버그가 있던 버전의 결론이 영구히 캐시된다 — 실제로
+    2026-08-17 에 "게이트 하나 찾으면 탐색 종료" 버그가 있었고, 그때의 '문구 없음' 판정이
+    영원히 남을 수 있었다.
+    """
+
+    ig_connection = models.ForeignKey(
+        IGAccountConnection,
+        on_delete=models.CASCADE,
+        related_name="post_analyses",
+        verbose_name="IG 연결",
+    )
+    media_id = models.CharField(max_length=64, verbose_name="게시물 ID")
+    media_timestamp = models.DateTimeField(null=True, blank=True, verbose_name="게시 시각")
+    permalink = models.CharField(max_length=500, blank=True, default="")
+
+    # ── 재조사 판단용 ──
+    rules_version = models.PositiveIntegerField(default=1, verbose_name="판정 규칙 버전")
+    comments_count = models.IntegerField(default=0, verbose_name="분석 당시 댓글 수")
+    analyzed_at = models.DateTimeField(auto_now=True, verbose_name="분석 시각")
+
+    # ── 판정 결과 ──
+    grade = models.CharField(max_length=20, default="", verbose_name="등급")
+    content_score = models.FloatField(default=0.0, verbose_name="글·댓글 판정 점수")
+    content_reasons = models.JSONField(default=list, blank=True, verbose_name="걸린 신호")
+    trigger = models.CharField(max_length=100, blank=True, default="", verbose_name="트리거 낱말")
+
+    # ── DM 근거 수치 (원문 아님) ──
+    probed = models.IntegerField(default=0, verbose_name="조회 인원")
+    support_hits = models.IntegerField(default=0, verbose_name="같은 문구 수신 인원")
+    gap_median = models.IntegerField(null=True, blank=True, verbose_name="댓글→DM 간격 중앙값(초)")
+    auto_hits = models.IntegerField(default=0, verbose_name="자동발송 창 안 수신 인원")
+    has_offer_url = models.BooleanField(default=False, verbose_name="오퍼 링크 확보")
+
+    # ── 어디까지 팠나 (두 축 소진 여부 — CLAUDE.md §1 '소진의 기준') ──
+    dug_all_comments = models.BooleanField(default=False, verbose_name="첫 댓글까지 팠나")
+    dug_conversations = models.BooleanField(default=False, verbose_name="대화 처음까지 팠나")
+    # 끝까지 파서 얻은 **캠페인 시기 댓글러**(id·시각만, 텍스트 없음). 이걸 저장하면
+    # 다음 실행이 200페이지 재페이징을 건너뛴다 — 가장 비싼 재작업이다.
+    probe_pool = models.JSONField(default=list, blank=True, verbose_name="조회 대상 풀(id·시각)")
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "ig_post_analysis"
+        verbose_name = "게시물 DM 분석 캐시"
+        verbose_name_plural = "게시물 DM 분석 캐시"
+        ordering = ["-analyzed_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["ig_connection", "media_id"], name="uniq_post_analysis_per_media"
+            )
+        ]
+        indexes = [
+            models.Index(fields=["ig_connection", "rules_version"]),
+            models.Index(fields=["ig_connection", "grade"]),
+        ]
+
+    def __str__(self):
+        return f"IGPostAnalysis({self.media_id}) {self.grade} cs={self.content_score:.2f}"

@@ -457,7 +457,7 @@ class TestOutboxSlicing:
         seen_cursors = []
         pages = {"n": 0}
 
-        def _fake_conv(ctx, lookback_days=400, *, after=None, should_stop=None):
+        def _fake_conv(ctx, lookback_days=400, *, after=None, should_stop=None, **kw):
             seen_cursors.append(after)
             pages["n"] += 1
             last = pages["n"] >= 3
@@ -517,7 +517,7 @@ class TestOutboxSlicing:
         monkeypatch.setattr(C, "OUTBOX_MAX_SLICES", 2)
         calls = {"n": 0}
 
-        def _endless(ctx, lookback_days=400, *, after=None, should_stop=None):
+        def _endless(ctx, lookback_days=400, *, after=None, should_stop=None, **kw):
             calls["n"] += 1
             return {
                 "outbound": [

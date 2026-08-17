@@ -166,6 +166,24 @@ OUTBOX_MAX_PROBE = 60
 OUTBOX_MESSAGE_TARGET = 50000  # 이만큼 모았으면 그만 (직전 실측 3,171건의 15배)
 OUTBOX_MAX_SLICES = 4  # 발신함에 쓸 슬라이스 상한 — 나머지는 복원·초안에 남긴다
 
+# ── 발신함은 **비싸다 → 저장하고 다시 쓴다** ──
+# 실측: @highestlevel33 발신함 훑기 = 122분 · 1,577 페이지 · 88,899건. 그런데 이 결과가
+# 잡의 stage_data 에만 있어서 **다음 잡이 0 에서 다시 훑었다.** 같은 계정 같은 데이터를
+# 두 번 사는 셈이고, 그만큼 Meta 쿼터를 써서 다른 워크스페이스를 굶긴다(CLAUDE.md §1).
+# → 같은 IG 연결의 최근 잡이 모아둔 것을 **그대로 물려받고**, 최신 몇 페이지만 덧칠한다.
+#
+# ⚠️ 영구 테이블에 담지 않는 이유: 발신함은 **타인의 DM 원문**이다. 7일 파기 정책
+#    (tasks.purge_dm_migration_raw)이 붙은 stage_data 안에 두면 그 시계를 그대로 따른다.
+#    재사용 창을 파기 기한보다 짧게 잡는 것이 정책과 어긋나지 않는 유일한 방법이다.
+OUTBOX_REUSE_HOURS = 72  # 이 안에 모은 것이면 물려받는다 (7일 파기 기한보다 짧게)
+# 대화 목록은 updated_time 내림차순이라 앞쪽 몇 페이지가 '그 사이에 새로 온 것' 이다.
+OUTBOX_TOPUP_PAGES = 40  # 물려받은 뒤 최신 1,000 대화만 덧칠 (≈40콜)
+# 중간 저장 주기 — 슬라이스 끝(20분)에만 저장하면 워커가 죽을 때 20분치가 날아간다.
+OUTBOX_CHECKPOINT_PAGES = 60  # 1,500 대화마다 저장
+# 게시물별로 다음 실행에 물려줄 조회 대상 수. 캠페인 시기 댓글러만 남기면 되므로 500 이면
+# 충분하다(지지 판정에 필요한 표본은 60명 수준).
+PROBE_POOL_KEEP = 500
+
 ADAPTIVE_STEP = 10  # 한 번에 더 볼 인원
 ADAPTIVE_MAX_PROBE = 40  # 여기까지 봐도 애매하면 사람에게 넘긴다
 AMBIGUOUS_LOW = 0.35  # 이 아래면 '아님' 으로 확실
@@ -449,6 +467,8 @@ def fetch_conversations(
     *,
     after: str | None = None,
     should_stop=None,
+    max_pages: int | None = None,
+    on_progress=None,
 ) -> dict:
     """발신 DM 메시지 수집(직렬 커서·네스티드 메시지). 스코프 없음/레이트리밋 처리.
 
@@ -471,7 +491,8 @@ def fetch_conversations(
     cutoff = _tz.now() - timedelta(days=lookback_days)
     seen_norms: set = set()
     no_new_streak = 0
-    max_pages = ctx.budget.caps.get("conversations_pages", 30)
+    if max_pages is None:
+        max_pages = ctx.budget.caps.get("conversations_pages", 30)
     exhausted = False
 
     while pages < max_pages and convs_scanned < CONVERSATION_CAP:
@@ -543,6 +564,11 @@ def fetch_conversations(
         # 근거가 쌓이는 곳이다. 여기서 끊으면 뒤쪽 게시물의 수신자를 통째로 놓친다.
         # (원래 이 조기 종료 때문에 발신함 조사가 표본 수준에 머물렀다.)
         no_new_streak = no_new_streak + 1 if page_new == 0 else 0
+        # 중간 저장 — 슬라이스가 끝날 때(20분)만 저장하면 **워커가 죽으면 20분치가 날아간다.**
+        # 실측: 발신함 훑기가 122분/6슬라이스였다 → 최악의 경우 한 번에 22,000건이 사라진다.
+        # stage_data 쓰기가 수 MB 라 매 페이지는 못 하고, 호출부가 정한 주기로만 부른다.
+        if on_progress and pages % OUTBOX_CHECKPOINT_PAGES == 0:
+            on_progress(outbound, after)
         if not after:
             exhausted = True  # 커서 끝 = 발신함을 다 봤다
             break

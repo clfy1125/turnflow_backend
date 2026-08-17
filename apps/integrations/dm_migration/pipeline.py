@@ -30,7 +30,7 @@ from django.utils import timezone
 from apps.ai_jobs.services.dm_campaign_assistant import sample_replies
 
 from ..models import AutoDMCampaign, DMCampaignCandidate, DMMigrationJob, SentDMLog
-from . import analyze, attribute, collect, llm, recover
+from . import analyze, attribute, cache, collect, llm, recover
 from .collect import (
     Budget,
     CollectContext,
@@ -138,6 +138,69 @@ def _rejection_to_dict(r, media: dict) -> dict:
         "content_score": r.content_score,
         "content_reasons": r.content_reasons,
     }
+
+
+def _rejection_to_dict_from_cache(rec: dict) -> dict:
+    """캐시에서 되살린 '캠페인 아님' 기록 — 새로 조사한 것과 같은 모양으로 맞춘다."""
+    return {
+        k: rec.get(k)
+        for k in (
+            "media_id",
+            "permalink",
+            "caption",
+            "timestamp",
+            "comments_count",
+            "probed",
+            "trigger",
+            "repetition",
+            "content_score",
+            "content_reasons",
+        )
+    }
+
+
+_OUTBOX_CONTENT_KEYS = ("text", "urls", "buttons", "media_drops", "carousel", "has_gate_button")
+
+
+def _slim(messages: list) -> list[dict]:
+    """발신함 메시지에서 **색인에 필요한 것만** 남긴다.
+
+    stage_data(JSONB)에 원본을 그대로 넣으면 체크포인트마다 수 MB 를 다시 쓴다.
+    """
+    return [
+        {
+            "recipient": m.get("recipient"),
+            "msg_id": m.get("msg_id"),
+            "created_time": m.get("created_time"),
+            "text": (m.get("text") or "")[:400],
+            "content": {
+                k: (m.get("content") or {}).get(k)
+                for k in _OUTBOX_CONTENT_KEYS
+                if (m.get("content") or {}).get(k)
+            },
+        }
+        for m in messages
+        if m.get("recipient")
+    ]
+
+
+def _merge_outbox(prev: list, new: list) -> list:
+    """발신함 합치기 — ``msg_id`` 로 중복을 지운다.
+
+    물려받은 색인에 최신 페이지를 덧칠하면 겹치는 메시지가 나온다. 그대로 두면 같은 DM 이
+    두 번 세어져 지지 인원이 부풀 수 있다(근거는 사용자 단위로 묶이므로 실제 영향은 작지만,
+    색인 크기가 무의미하게 커진다).
+    """
+    seen = set()
+    out = []
+    for m in list(prev) + list(new):
+        mid = m.get("msg_id")
+        if mid and mid in seen:
+            continue
+        if mid:
+            seen.add(mid)
+        out.append(m)
+    return out
 
 
 def _recovery_to_dict(r, media: dict) -> dict:
@@ -320,6 +383,48 @@ class _Runner:
         return job.status
 
     # ── 단계 1.7: 발신함 전수 조사 ──
+    def _adopt_previous_outbox(self) -> list:
+        """같은 IG 연결의 최근 잡이 모아둔 발신함을 물려받는다 (Graph 호출 0).
+
+        발신함 훑기는 이 기능에서 **가장 비싼 단계**다(실측 122분·1,577페이지·88,899건).
+        잡마다 다시 훑으면 같은 데이터를 두 번 사고, 그만큼 Meta 앱 쿼터를 써서 다른
+        워크스페이스의 댓글 수집·DM 발송을 굶긴다(CLAUDE.md §1).
+
+        조건: 같은 연결 · 원문 미파기 · 훑기 완료 · ``OUTBOX_REUSE_HOURS`` 안.
+        물려받은 뒤에는 **최신 몇 페이지만 덧칠**한다(``_stage_outbox``) — 대화 목록이
+        updated_time 내림차순이라 그 사이 새로 온 DM 은 앞쪽에 있다.
+
+        색인이 조금 낡아도 안전하다: 색인에 없는 사람은 '모름' 으로 취급해 개별 조회로
+        내려가고(``outbound_from_index``), '안 받았음' 으로 세지 않는다.
+        """
+        cutoff = timezone.now() - timedelta(hours=collect.OUTBOX_REUSE_HOURS)
+        prev_job = (
+            DMMigrationJob.objects.filter(
+                ig_connection=self.conn,
+                raw_purged_at__isnull=True,
+                updated_at__gte=cutoff,
+            )
+            .exclude(id=self.job.id)
+            .order_by("-updated_at")
+            .only("id", "stage_data", "updated_at")
+            .first()
+        )
+        sd = (prev_job.stage_data or {}) if prev_job else {}
+        box = sd.get("outbox") or []
+        if not (sd.get("outbox_done") and box):
+            return []
+        self.sd["outbox"] = list(box)
+        self.sd["outbox_reused_from"] = str(prev_job.id)
+        age_h = (timezone.now() - prev_job.updated_at).total_seconds() / 3600
+        logger.info(
+            "DM이전 발신함 물려받음 (job=%s ← %s): %d건 · %.1f시간 전 — 재훑기 생략",
+            self.job.id,
+            prev_job.id,
+            len(box),
+            age_h,
+        )
+        return list(box)
+
     def _stage_outbox(self):
         """계정의 **보낸 DM 을 한 번에 다 훑어** 색인을 만든다.
 
@@ -339,6 +444,10 @@ class _Runner:
         prev = list(self.sd.get("outbox") or [])
         cursor = self.sd.get("outbox_cursor")
         used = int(self.sd.get("outbox_slices") or 0)
+        # 이 계정을 최근에 훑은 잡이 있으면 **물려받는다** — 122분·1,577페이지짜리 작업을
+        # 계정마다 한 번만 사고 싶다(collect.OUTBOX_REUSE_HOURS 주석 참조).
+        if not prev and not cursor and not self.sd.get("outbox_reused_from"):
+            prev = self._adopt_previous_outbox()
         # 충분히 모았으면 여기서 끊는다 — 안 그러면 대화가 많은 계정에서 발신함이 슬라이스를
         # 다 먹고 **복원 0건으로 종결**된다(실측: 130분·6슬라이스를 쓰고도 게시물 조회 0).
         if prev and (
@@ -359,8 +468,30 @@ class _Runner:
             10,
             f"보낸 DM을 모으고 있습니다... ({len(prev)}건)",
         )
+        # 물려받았으면 **최신 페이지만 덧칠**한다 — 그 사이 새로 온 DM 만 있으면 된다.
+        reused = bool(self.sd.get("outbox_reused_from"))
+        topup = collect.OUTBOX_TOPUP_PAGES if reused else None
+
+        def _checkpoint(partial: list, cur):
+            """페이지 몇십 개마다 저장 — 워커가 죽어도 그때까지가 남는다."""
+            self.sd["outbox"] = prev + _slim(partial)
+            self.sd["outbox_cursor"] = cur
+            self.job.dm_messages_collected = len(self.sd["outbox"])
+            self._persist(counter_fields=["dm_messages_collected"])
+            self.job.set_stage(
+                _ST.COLLECTING_DM_CONVERSATIONS,
+                10,
+                f"보낸 DM을 모으고 있습니다... ({len(self.sd['outbox'])}건)",
+            )
+
         try:
-            res = collect.fetch_conversations(self.ctx, after=cursor, should_stop=self._time_up)
+            res = collect.fetch_conversations(
+                self.ctx,
+                after=cursor,
+                should_stop=self._time_up,
+                max_pages=topup,
+                on_progress=None if reused else _checkpoint,
+            )
         except (MigrationTokenError, MigrationRateLimitPause):
             raise
         except Exception:  # noqa: BLE001 — 없으면 기존 경로로 간다
@@ -369,30 +500,7 @@ class _Runner:
             self._persist()
             return
 
-        # stage_data 에 그대로 넣으면 체크포인트마다 수 MB 를 다시 쓴다 — 필요한 것만 남긴다.
-        out = [
-            {
-                "recipient": m.get("recipient"),
-                "msg_id": m.get("msg_id"),
-                "created_time": m.get("created_time"),
-                "text": (m.get("text") or "")[:400],
-                "content": {
-                    k: (m.get("content") or {}).get(k)
-                    for k in (
-                        "text",
-                        "urls",
-                        "buttons",
-                        "media_drops",
-                        "carousel",
-                        "has_gate_button",
-                    )
-                    if (m.get("content") or {}).get(k)
-                },
-            }
-            for m in (res.get("outbound") or [])
-            if m.get("recipient")
-        ]
-        merged = prev + out
+        merged = _merge_outbox(prev, _slim(res.get("outbound") or []))
         self.sd["outbox"] = merged
         self.sd["outbox_slices"] = used + 1
         self.sd["dm_scope_missing"] = bool(res.get("scope_missing"))
@@ -401,7 +509,8 @@ class _Runner:
         )
         self.job.dm_messages_collected = len(merged)
         done = (
-            bool(res.get("exhausted"))
+            reused  # 물려받았으면 덧칠 한 번으로 끝 — 전체를 다시 훑지 않는다
+            or bool(res.get("exhausted"))
             or bool(res.get("scope_missing"))
             or len(merged) >= collect.OUTBOX_MESSAGE_TARGET
             or (used + 1) >= collect.OUTBOX_MAX_SLICES
@@ -579,6 +688,36 @@ class _Runner:
                 len(outbox),
             )
 
+        # ── 이미 결론이 난 게시물은 다시 조사하지 않는다 ──
+        # 캡션은 안 바뀌고 끝난 캠페인은 앞으로도 안 바뀐다. 자동채택된 것과 명백히
+        # 캠페인이 아닌 것을 매번 재조사하면 Meta 쿼터를 다른 워크스페이스에서 빼오는 셈이다
+        # (CLAUDE.md §1). 규칙을 고치면 cache.RULES_VERSION 을 올려 전부 무효화한다.
+        cached = cache.load(self.conn)
+        settled = [
+            (m, cached.get(m.get("id") or ""))
+            for m, _d in targets
+            if (m.get("id") or "") not in done
+            and cache.is_settled(cached.get(m.get("id") or ""), m)
+        ]
+        if settled:
+            texts = cache.texts_for(self.conn, [m.get("id") or "" for m, _r in settled])
+            for m, row in settled:
+                mid_s = m.get("id") or ""
+                rec = cache.to_recovery(row, m, texts.get(mid_s))
+                if rec.get("offer") or rec.get("gate") or rec.get("signal"):
+                    out.append(rec)
+                else:
+                    rejected.append(_rejection_to_dict_from_cache(rec))
+                done.add(mid_s)
+            self.sd["reused_from_cache"] = len(settled)
+            logger.info(
+                "DM이전 판정 재사용 (job=%s): %d/%d 게시물 — 재조사 생략(호출 0)",
+                self.job.id,
+                len(settled),
+                len(targets),
+            )
+            self._save_recover_progress()
+
         since_ckpt = 0
         for media, deep in targets:
             mid = media.get("id") or ""
@@ -593,7 +732,14 @@ class _Runner:
                 )
                 raise _SliceExhausted()
             try:
-                r = recover.recover_post(self.ctx, media, is_own_dm=is_own, probe=deep)
+                r = recover.recover_post(
+                    self.ctx,
+                    media,
+                    is_own_dm=is_own,
+                    probe=deep,
+                    # 저장해둔 조회 대상 풀 — 있으면 댓글 재페이징(최대 200페이지)을 건너뛴다.
+                    seed_pool=cache.probe_pool_for(cached.get(mid)),
+                )
             except (MigrationTokenError, MigrationRateLimitPause):
                 raise
             except Exception:  # noqa: BLE001 — 게시물 1건 실패가 잡을 죽이지 않게
@@ -602,10 +748,20 @@ class _Runner:
                 continue
             done.add(mid)
             i = len(done)
+            rec = _recovery_to_dict(r, media)
             if r.found or r.is_campaign_signal:
-                out.append(_recovery_to_dict(r, media))
+                out.append(rec)
             else:
                 rejected.append(_rejection_to_dict(r, media))
+            # 판정을 캐시에 남긴다 — 다음 실행이 이 게시물을 다시 조사하지 않게.
+            cache.save(
+                self.conn,
+                media,
+                rec,
+                dug_all=r.dug_all_comments,
+                dug_convo=r.dug_conversations,
+                probe_pool=r.probe_pool,
+            )
             if i % 5 == 0:
                 self._check_cancel()
                 self.job.set_stage(

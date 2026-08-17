@@ -108,6 +108,12 @@ class PostRecovery:
     drops: list = field(default_factory=list)
     samples: list = field(default_factory=list)  # 근거 원문(7일 후 파기)
     keyword_hits: dict = field(default_factory=dict)
+    # ── 캐시용: 어디까지 팠나 + 다음 실행에 물려줄 조회 대상 ──
+    # 두 축(댓글·대화)을 다 소진했는지 남긴다(CLAUDE.md §1 '소진의 기준'). 조회 풀은
+    # 끝까지 파서 얻은 캠페인 시기 댓글러라 **가장 비싼 재작업(200페이지)을 없애준다.**
+    dug_all_comments: bool = False
+    dug_conversations: bool = False
+    probe_pool: list = field(default_factory=list)
 
     @property
     def found(self) -> bool:
@@ -333,6 +339,7 @@ def recover_post(
     campaign: int = C.CAMPAIGN_PROBE,
     workers: int = C.PROBE_WORKERS,
     probe: bool = True,
+    seed_pool: list | None = None,
 ) -> PostRecovery:
     """게시물 1건을 복원한다.
 
@@ -482,6 +489,21 @@ def recover_post(
                     )
 
     order = C.order_probe_targets(commenters, trigger)
+    # 지난 실행이 **끝까지 파서** 얻어둔 캠페인 시기 댓글러 — 있으면 맨 앞에 세운다.
+    # 이게 없으면 같은 게시물의 200페이지 댓글 페이징을 매번 다시 한다(가장 비싼 재작업).
+    if seed_pool:
+        known = {u["id"] for u in commenters}
+        revived = [
+            {"id": p["u"], "ts": C.parse_graph_time(p.get("ts")), "text": "", "replied": False}
+            for p in seed_pool
+            if p.get("u") and p["u"] not in known
+        ]
+        if revived:
+            order = revived + order
+            out.dug_all_comments = True  # 그 페이징 결과를 물려받았다
+            logger.info(
+                "DM이전 조회풀 재사용 (media=%s): %d명 — 댓글 재페이징 생략", mid, len(revived)
+            )
     _probe(order[:seed])
 
     def _best_ratio() -> float:
@@ -562,6 +584,7 @@ def recover_post(
                 pages=C.EXHAUSTIVE_COMMENT_PAGES,
                 campaign_window_days=0,
             )
+            out.dug_all_comments = True
             if len(allc) > len(commenters):
                 logger.info(
                     "DM이전 끝까지 파기 (media=%s): 댓글러 %d → %d",
@@ -603,11 +626,19 @@ def recover_post(
                 _probe_deep(
                     C.order_deep_targets(commenters, mts, out.trigger)[: C.CONVO_DEEP_MAX_USERS]
                 )
+                out.dug_conversations = True
         if tmpl:
             _probe(order[: (big if ncmt >= C.BIG_COMMENTS else full)])
             _resolve_ambiguity()
 
     out.probed = max(len(probed_ids), 1)
+    # 다음 실행에 물려줄 조회 대상 — 게시 시점에 가까운 순으로 자른다. **id·시각만** 담는다
+    # (댓글 원문은 7일 파기 대상이라 영구 캐시에 넣지 않는다).
+    if out.dug_all_comments:
+        out.probe_pool = [
+            {"u": u["id"], "ts": u["ts"].isoformat() if u.get("ts") else None}
+            for u in C.order_deep_targets(commenters, mts, out.trigger)[: C.PROBE_POOL_KEEP]
+        ]
     if not tmpl:
         return out
 
