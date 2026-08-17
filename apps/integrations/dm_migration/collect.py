@@ -395,28 +395,42 @@ def fetch_comments_expand(ctx: CollectContext, candidates: list[dict]) -> None:
 # ══════════════ DM 대화 ══════════════
 
 
-def fetch_conversations(ctx: CollectContext, lookback_days: int = DM_LOOKBACK_DAYS) -> dict:
+def fetch_conversations(
+    ctx: CollectContext,
+    lookback_days: int = DM_LOOKBACK_DAYS,
+    *,
+    after: str | None = None,
+    should_stop=None,
+) -> dict:
     """발신 DM 메시지 수집(직렬 커서·네스티드 메시지). 스코프 없음/레이트리밋 처리.
 
-    반환: {"outbound":[{conv_id,msg_id,text,created_time,recipient}],
-           "scope_missing": bool, "conversations_scanned": int}
+    ``after`` / ``should_stop`` 은 **이어달리기**용이다. 전수 훑기는 수백~천 페이지가 될 수
+    있어 한 태스크(25분) 안에 안 끝난다. 시간이 다 되면 ``should_stop()`` 이 True 를 주고,
+    그때까지 모은 것과 ``paging_after`` 를 반환한다. 다음 슬라이스가 그 커서부터 잇는다.
+    (이 장치가 없으면 슬라이스마다 1페이지부터 다시 시작해 **영원히 못 끝낸다** —
+     복원 단계에서 이미 겪은 실패다.)
+
+    반환: {"outbound":[...], "scope_missing": bool, "conversations_scanned": int,
+           "paging_after": 커서|None, "exhausted": 끝까지 갔나}
     """
     from django.utils import timezone as _tz
 
     outbound: list[dict] = []
     scope_missing = False
     convs_scanned = 0
-    after = None
     pages = 0
     msg_limit = 20
     cutoff = _tz.now() - timedelta(days=lookback_days)
     seen_norms: set = set()
     no_new_streak = 0
     max_pages = ctx.budget.caps.get("conversations_pages", 30)
+    exhausted = False
 
     while pages < max_pages and convs_scanned < CONVERSATION_CAP:
         if ctx.cancelled() or ctx.budget.total_hit():
             break
+        if should_stop and should_stop():
+            break  # 시간 소진 — 여기까지 모은 것 + 커서를 돌려주고 다음 슬라이스가 잇는다
         ctx.pacer.acquire()
         try:
             if ctx.mock:
@@ -482,6 +496,7 @@ def fetch_conversations(ctx: CollectContext, lookback_days: int = DM_LOOKBACK_DA
         # (원래 이 조기 종료 때문에 발신함 조사가 표본 수준에 머물렀다.)
         no_new_streak = no_new_streak + 1 if page_new == 0 else 0
         if not after:
+            exhausted = True  # 커서 끝 = 발신함을 다 봤다
             break
         if all_old and data:  # 페이지 전체가 lookback 밖(대화는 updated_time desc)
             break
@@ -490,6 +505,8 @@ def fetch_conversations(ctx: CollectContext, lookback_days: int = DM_LOOKBACK_DA
         "outbound": outbound,
         "scope_missing": scope_missing,
         "conversations_scanned": convs_scanned,
+        "paging_after": after,
+        "exhausted": exhausted or not after,
     }
 
 

@@ -108,7 +108,13 @@ def _no_network(monkeypatch):
     monkeypatch.setattr(
         C,
         "fetch_conversations",
-        lambda *a, **k: {"outbound": [], "scope_missing": False, "conversations_scanned": 0},
+        lambda *a, **k: {
+            "outbound": [],
+            "scope_missing": False,
+            "conversations_scanned": 0,
+            "paging_after": None,
+            "exhausted": True,  # 한 번에 다 훑었다 — 이어달리기 없이 다음 단계로
+        },
     )
 
 
@@ -432,3 +438,68 @@ class TestSliceTimingInvariants:
 
         assert task.time_limit - task.soft_time_limit >= 240
         assert task.time_limit <= settings.CELERY_TASK_TIME_LIMIT
+
+
+# ══════════════ 발신함 전수 훑기도 이어달리기가 된다 ══════════════
+#
+# 전수 훑기는 수백~천 페이지가 될 수 있어 한 태스크(25분)에 안 들어간다. 커서를 저장하지
+# 않으면 슬라이스마다 1페이지부터 다시 시작해 **영원히 못 끝낸다** — 복원 단계에서 이미
+# 겪은 실패라 같은 함정을 두 번 밟지 않도록 고정한다.
+
+
+class TestOutboxSlicing:
+    @pytest.mark.django_db
+    def test_outbox_resumes_from_cursor(self, monkeypatch):
+        monkeypatch.setattr(settings, "DM_MIGRATION_FAKE_LLM", True)
+        for name in ("fetch_media", "collect_commenters", "fetch_outbound_for_commenter"):
+            monkeypatch.setattr(C, name, lambda *a, **k: [])
+
+        seen_cursors = []
+        pages = {"n": 0}
+
+        def _fake_conv(ctx, lookback_days=400, *, after=None, should_stop=None):
+            seen_cursors.append(after)
+            pages["n"] += 1
+            last = pages["n"] >= 3
+            return {
+                "outbound": [
+                    {
+                        "recipient": f"u{pages['n']}",
+                        "msg_id": f"m{pages['n']}",
+                        "created_time": "2026-07-01T00:00:00+0000",
+                        "text": "자료 링크",
+                        "content": {},
+                    }
+                ],
+                "scope_missing": False,
+                "conversations_scanned": 25,
+                "paging_after": None if last else f"cur{pages['n']}",
+                "exhausted": last,
+            }
+
+        monkeypatch.setattr(C, "fetch_conversations", _fake_conv)
+        conn = _conn(_ws(_user()), mock_token=True)
+        job = _job(conn, estimated_seconds=10, stage_data={"media": []})
+
+        status, _runs = _drive(job, MagicMock())
+
+        assert seen_cursors == [None, "cur1", "cur2"], seen_cursors  # 커서를 이어받았다
+        job.refresh_from_db()
+        assert len(job.stage_data["outbox"]) == 3  # 슬라이스별 수집분이 **누적**됐다
+        assert job.stage_data["outbox_done"] is True
+        assert "outbox_cursor" not in job.stage_data
+        assert job.conversations_scanned == 75  # 누적 집계
+        assert status in (DMMigrationJob.Status.READY, DMMigrationJob.Status.PARTIAL)
+
+    @pytest.mark.django_db
+    def test_outbox_failure_falls_back_to_per_post(self, monkeypatch):
+        """발신함은 가속기다 — 실패해도 기존 경로로 파이프라인이 끝나야 한다."""
+        monkeypatch.setattr(settings, "DM_MIGRATION_FAKE_LLM", True)
+        monkeypatch.setattr(C, "fetch_media", lambda *a, **k: [])
+        monkeypatch.setattr(C, "fetch_conversations", lambda *a, **k: 1 / 0)  # noqa: ARG005
+        conn = _conn(_ws(_user()), mock_token=True)
+        job = _job(conn, estimated_seconds=10, stage_data={"media": []})
+        status = pipeline.run_migration(str(job.id))
+        assert status in (DMMigrationJob.Status.READY, DMMigrationJob.Status.PARTIAL)
+        job.refresh_from_db()
+        assert job.stage_data["outbox_done"] is False

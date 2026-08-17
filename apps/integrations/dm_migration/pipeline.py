@@ -336,9 +336,15 @@ class _Runner:
         if "outbox_done" in self.sd or "recoveries" in self.sd:
             return  # 이미 훑었거나, 복원이 끝나 쓸 데가 없다(재개·캐시 재사용 경로)
         self._check_cancel()
-        self.job.set_stage(_ST.COLLECTING_DM_CONVERSATIONS, 10, "보낸 DM을 모으고 있습니다...")
+        prev = list(self.sd.get("outbox") or [])
+        cursor = self.sd.get("outbox_cursor")
+        self.job.set_stage(
+            _ST.COLLECTING_DM_CONVERSATIONS,
+            10,
+            f"보낸 DM을 모으고 있습니다... ({len(prev)}건)",
+        )
         try:
-            res = collect.fetch_conversations(self.ctx)
+            res = collect.fetch_conversations(self.ctx, after=cursor, should_stop=self._time_up)
         except (MigrationTokenError, MigrationRateLimitPause):
             raise
         except Exception:  # noqa: BLE001 — 없으면 기존 경로로 간다
@@ -370,18 +376,31 @@ class _Runner:
             for m in (res.get("outbound") or [])
             if m.get("recipient")
         ]
-        self.sd["outbox_done"] = True
+        merged = prev + out
+        self.sd["outbox"] = merged
         self.sd["dm_scope_missing"] = bool(res.get("scope_missing"))
-        self.sd["outbox"] = out
-        self.job.conversations_scanned = int(res.get("conversations_scanned") or 0)
-        self.job.dm_messages_collected = len(out)
+        self.job.conversations_scanned = (self.job.conversations_scanned or 0) + int(
+            res.get("conversations_scanned") or 0
+        )
+        self.job.dm_messages_collected = len(merged)
+        done = bool(res.get("exhausted")) or bool(res.get("scope_missing"))
         logger.info(
-            "DM이전 발신함: 대화 %s개에서 보낸 DM %d건 (job=%s)",
+            "DM이전 발신함%s: 누적 대화 %s개 · 보낸 DM %d건 (job=%s)",
+            "" if done else "(이어서)",
             self.job.conversations_scanned,
-            len(out),
+            len(merged),
             self.job.id,
         )
+        if done:
+            self.sd["outbox_done"] = True
+            self.sd.pop("outbox_cursor", None)
+            self._persist(counter_fields=["conversations_scanned", "dm_messages_collected"])
+            return
+        # 아직 남았다 — 커서를 저장하고 다음 슬라이스가 잇는다. 이게 없으면 슬라이스마다
+        # 1페이지부터 다시 시작해 영원히 못 끝낸다(복원 단계에서 이미 겪은 실패).
+        self.sd["outbox_cursor"] = res.get("paging_after")
         self._persist(counter_fields=["conversations_scanned", "dm_messages_collected"])
+        raise _SliceExhausted()
 
     # ── 단계 2.5: 귀속 검증 (애매한 것만 AI 대조) ──
     def _stage_verify(self):
