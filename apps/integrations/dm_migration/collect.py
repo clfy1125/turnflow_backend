@@ -90,8 +90,15 @@ def caps_for(media_limit: int) -> dict:
 COMMENTS_OLDEST_MAX_PAGES = 12  # 대형 게시물에서 캠페인 기간까지 닿으려면 최대 12페이지
 COMMENT_WORKERS = 6
 COMMENT_EXPAND_MAX_PAGES = 4
-CONVERSATION_CAP = 600
-DM_LOOKBACK_DAYS = 90
+# ── DM 함 전수 조사 ──
+# 게시물마다 댓글러를 몇 명씩 찍어보는 방식은 **표본 조사**라, 덜 본 만큼이 그대로
+# "애매함" 이 되어 사람 검수로 넘어간다. 대신 **발신함을 한 번 통째로** 훑어두면
+#   · 게시물당 추가 호출 0 (메모리에서 조회)
+#   · 댓글러를 몇 명이든 전부 대조 → 지지비율이 표본이 아니라 **실측치**가 된다
+#   · 표본에서 빠져 못 찾던 문구도 나온다
+# 한 번의 비용으로 전 게시물이 덕을 보므로, 여기 상한은 넉넉히 잡는 게 이득이다.
+CONVERSATION_CAP = 20000
+DM_LOOKBACK_DAYS = 400  # 캠페인은 켜두면 계속 돈다 — 90일은 오래된 게시물을 통째로 놓친다
 
 # ── 표본 설계 (실측 근거) ──
 # 조회 인원을 3명에서 멈추면 '지지비율'(= 같은 문구를 받은 사람 / 조회 인원)의 분모가 없어
@@ -114,6 +121,22 @@ CAMPAIGN_PROBE = 12
 # 비용은 이 조건(콘텐츠 강함 & 0건)에 걸린 소수 게시물에만 든다.
 EXHAUSTIVE_COMMENT_PAGES = 250  # 50개/페이지 → 최대 12,500개 댓글까지
 EXHAUSTIVE_PROBE = 40
+
+# ── 답이 확실해질 때까지 더 본다 (사람 검수를 줄이는 핵심) ──────────────
+# 10명에서 무조건 멈추면 9/10 같은 **애매한 채로** 끝나고, 그걸 사람에게 "검수하세요" 로
+# 넘기게 된다. 실측(@highestlevel33): 검수필요 108건 중 61건이 이 경우였다.
+# 우리가 덜 본 것을 사람에게 떠넘기는 셈이다.
+# → 판정이 애매한 구간에 걸린 게시물만 **결론이 날 때까지** 더 조회한다.
+#   이미 확실한 것(비율이 확 높거나 확 낮은 것)은 10명에서 그대로 멈춘다 — 비용은
+#   애매한 것에만 쓴다.
+# 발신함 색인이 있을 때의 표본 — 색인 적중분은 공짜라 크게 잡는다.
+OUTBOX_SEED_PROBE = 10
+OUTBOX_MAX_PROBE = 60
+
+ADAPTIVE_STEP = 10  # 한 번에 더 볼 인원
+ADAPTIVE_MAX_PROBE = 40  # 여기까지 봐도 애매하면 사람에게 넘긴다
+AMBIGUOUS_LOW = 0.35  # 이 아래면 '아님' 으로 확실
+AMBIGUOUS_HIGH = 0.75  # 이 위면 '맞음' 으로 확실
 
 # ── 댓글 → DM 간격 (자동 발송의 지문) ──────────────────────────────
 # 자동화 도구는 댓글이 달리면 **몇 초 안에** DM 을 쏜다. 사람이 손으로 쓴 개인 DM 은
@@ -211,6 +234,9 @@ class CollectContext:
     pacer: RateLimiter
     budget: Budget
     cancelled: Callable[[], bool] = _never_cancel
+    # 발신함 전수 색인 {수신자id: [메시지]}. 있으면 댓글러 조회가 **메모리 조회**가 되어
+    # Graph 호출 없이 전원 대조할 수 있다(build_outbound_index).
+    outbox: dict | None = None
 
 
 def is_mock(token: str) -> bool:
@@ -446,10 +472,11 @@ def fetch_conversations(ctx: CollectContext, lookback_days: int = DM_LOOKBACK_DA
                     page_new += 1
 
         after = page.get("paging_after")
-        if pages >= 4:  # 2연속 신규 클러스터 없음 → 조기 종료
-            no_new_streak = no_new_streak + 1 if page_new == 0 else 0
-            if no_new_streak >= 2:
-                break
+        # ⚠️ "새 문구가 안 나오면 그만" 으로 끊으면 안 된다. 우리가 찾는 건 **새 문구**가
+        # 아니라 **누가 그 문구를 받았는가**다. 같은 문구가 계속 나오는 페이지야말로 지지
+        # 근거가 쌓이는 곳이다. 여기서 끊으면 뒤쪽 게시물의 수신자를 통째로 놓친다.
+        # (원래 이 조기 종료 때문에 발신함 조사가 표본 수준에 머물렀다.)
+        no_new_streak = no_new_streak + 1 if page_new == 0 else 0
         if not after:
             break
         if all_old and data:  # 페이지 전체가 lookback 밖(대화는 updated_time desc)
@@ -574,6 +601,20 @@ def order_probe_targets(commenters: list[dict], trigger: str | None = None) -> l
     return out
 
 
+def build_outbound_index(outbound: list[dict]) -> dict:
+    """발신 DM 목록 → ``{수신자id: [메시지, ...]}``.
+
+    이 색인이 있으면 게시물마다 댓글러를 Graph 로 다시 찾아볼 필요가 없다. 표본이 아니라
+    **댓글러 전원**을 대조할 수 있어 지지비율이 추정치가 아닌 실측치가 된다.
+    """
+    idx: dict[str, list] = {}
+    for m in outbound:
+        rid = str(m.get("recipient") or "")
+        if rid:
+            idx.setdefault(rid, []).append(m)
+    return idx
+
+
 def fetch_outbound_for_commenter(
     ctx: CollectContext,
     commenter: dict,
@@ -591,6 +632,24 @@ def fetch_outbound_for_commenter(
         · content = analyze.extract_dm_content() 결과(버튼·URL·미디어 종류 포함)
     """
     uid = commenter["id"]
+    # 발신함 색인에 이 사람이 있으면 **공짜로** 꺼낸다(Graph 호출 0).
+    # ⚠️ 색인은 완전하지 않다 — Meta 는 대화당 최근 ~20개 메시지만 준다. 그래서 "색인에
+    # 없음"은 "DM 을 안 받았음"이 아니라 "모름"이다. 그 경우엔 아래 개별 조회로 내려간다.
+    if ctx.outbox:
+        cached = ctx.outbox.get(str(uid))
+        if cached:
+            cts0 = commenter.get("ts")
+            hits = []
+            for m in cached:
+                dt = parse_graph_time(m.get("created_time"))
+                if cts0 and dt:
+                    gap = (dt - cts0).total_seconds()
+                    if gap < -3600 or gap > window_days * 86400:
+                        continue
+                hits.append(m)
+            if hits:
+                return hits
+
     if ctx.mock:
         msgs = MockInstagramProvider.mock_user_conversation(
             ctx.ig, uid, commenter.get("media_id", "")

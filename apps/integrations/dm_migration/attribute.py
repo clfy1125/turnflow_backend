@@ -151,8 +151,14 @@ def by_template(recoveries: list[dict]) -> int:
                 continue
             if best < hits * TEMPLATE_DOMINANCE:
                 continue  # 고르게 강하다 = 상시 캠페인. 건드리지 않는다
+            # ⚠️ 문구를 지우지 않는다. 지우면 그 게시물은 "캠페인은 있는데 문구 없음"
+            # 으로 나가고 사용자가 처음부터 써야 한다. 인플루언서가 여러 게시물에 **같은
+            # DM 을 돌려쓰는** 경우가 실제로 많아(실측 34종이 여러 게시물에 걸침) 이 문구가
+            # 이 게시물의 문구일 가능성도 충분하다.
+            # 대신 지지 근거만 무효화하고(등급이 내려간다) 표시를 남긴다 —
+            # 사용자는 "다른 게시물에서 더 많이 쓰인 문구" 라는 안내와 함께 문구를 받는다.
             r["offer_demoted"] = {"reason": "owned_elsewhere", "owner_hits": best, "hits": hits}
-            r["offer"] = None
+            r["offer"] = {**r["offer"], "hits": 0, "ratio": 0.0, "score": 0.0, "shared": True}
             demoted += 1
     if demoted:
         logger.info("DM이전 귀속: 문구 경쟁으로 오퍼 %d건 내림", demoted)

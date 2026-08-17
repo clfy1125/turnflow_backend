@@ -306,6 +306,14 @@ def recover_post(
     ncmt = media.get("comments_count") or 0
     out = PostRecovery(media_id=mid)
 
+    if ctx.outbox:
+        # 발신함 색인이 있으면 **색인에 있는 사람은 공짜**다(Graph 호출 0). 표본을 크게
+        # 잡아 지지비율을 실측치에 가깝게 만든다 — "덜 봐서 애매한" 건이 사람 검수의
+        # 최대 원인이었다(실측: 검수필요 108건 중 61건).
+        # 색인에 없는 사람은 개별 조회로 내려가 돈이 드므로 무한대로 열지는 않는다.
+        seed = max(seed, C.OUTBOX_SEED_PROBE)
+        full = big = campaign = max(big, C.OUTBOX_MAX_PROBE)
+
     commenters, more = C.collect_commenters(ctx, mid, media_ts=mts, pages=1)
     # 댓글을 못 가져와도 **캡션만으로 판정은 남긴다.** 예전에는 여기서 그냥 return 해서
     # "댓글에 ○○ 남겨주세요" 라고 대놓고 쓰인 게시물이 점수 0 으로 사라졌다.
@@ -398,9 +406,35 @@ def recover_post(
     order = C.order_probe_targets(commenters, trigger)
     _probe(order[:seed])
 
+    def _best_ratio() -> float:
+        """지금까지 모은 근거 중 최고 지지비율."""
+        if not probed_ids or not tmpl:
+            return 0.0
+        top = max(len(s["users"]) for s in tmpl.values())
+        return top / max(len(probed_ids), 1)
+
+    def _resolve_ambiguity() -> None:
+        """판정이 애매하면 **결론이 날 때까지** 더 조회한다.
+
+        10명에서 무조건 멈추면 9/10 같은 애매한 상태로 끝나고, 그걸 사람에게 넘기게 된다.
+        우리가 덜 본 것을 검수로 떠넘기지 않는다 — 애매한 것만 골라 더 본다.
+        """
+        while len(probed_ids) < C.ADAPTIVE_MAX_PROBE:
+            r = _best_ratio()
+            if r >= C.AMBIGUOUS_HIGH or r < C.AMBIGUOUS_LOW:
+                return  # 이미 결론이 났다
+            nxt = order[: len(probed_ids) + C.ADAPTIVE_STEP]
+            if len(nxt) <= len(probed_ids):
+                return  # 더 볼 사람이 없다
+            before = len(probed_ids)
+            _probe(nxt)
+            if len(probed_ids) == before:
+                return  # 예산 소진 등으로 진전 없음
+
     if tmpl:
         cap = big if ncmt >= C.BIG_COMMENTS else full
         _probe(order[:cap])
+        _resolve_ambiguity()
     elif verdict.is_campaign:
         # ── 글·댓글이 "여기 캠페인 돌았다" 고 말하는데 씨앗에서 0건 ──
         # 예전에는 여기서 사실상 포기했다(댓글을 더 파도 다시 3명만 봤다). 그래서
@@ -452,6 +486,7 @@ def recover_post(
                 _probe(order[: C.EXHAUSTIVE_PROBE])
         if tmpl:
             _probe(order[: (big if ncmt >= C.BIG_COMMENTS else full)])
+            _resolve_ambiguity()
 
     out.probed = max(len(probed_ids), 1)
     if not tmpl:

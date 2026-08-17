@@ -312,11 +312,76 @@ class _Runner:
 
         self._stage_media()
         self._stage_estimate()
+        self._stage_outbox()
         self._stage_recover()
         self._stage_verify()
         self._stage_drafts()
         self.finalize()
         return job.status
+
+    # ── 단계 1.7: 발신함 전수 조사 ──
+    def _stage_outbox(self):
+        """계정의 **보낸 DM 을 한 번에 다 훑어** 색인을 만든다.
+
+        게시물마다 댓글러를 몇 명씩 찍어보는 방식은 표본 조사라, 덜 본 만큼이 그대로
+        "애매함" 이 되어 사람 검수로 넘어갔다(실측: 검수필요 108건 중 61건이 '10명만 보고
+        멈춰서' 생긴 것). 발신함을 통째로 갖고 있으면:
+            · 게시물당 추가 Graph 호출 **0** — 색인에서 꺼낸다
+            · 댓글러를 **전원** 대조 → 지지비율이 추정치가 아니라 실측치가 된다
+            · 표본에서 빠져 못 찾던 문구도 나온다
+
+        스코프가 없거나(권한 미승인) 실패하면 색인 없이 기존 경로로 돌아간다 —
+        이 단계는 **가속기이지 필수 관문이 아니다**.
+        """
+        if "outbox_done" in self.sd or "recoveries" in self.sd:
+            return  # 이미 훑었거나, 복원이 끝나 쓸 데가 없다(재개·캐시 재사용 경로)
+        self._check_cancel()
+        self.job.set_stage(_ST.COLLECTING_DM_CONVERSATIONS, 10, "보낸 DM을 모으고 있습니다...")
+        try:
+            res = collect.fetch_conversations(self.ctx)
+        except (MigrationTokenError, MigrationRateLimitPause):
+            raise
+        except Exception:  # noqa: BLE001 — 없으면 기존 경로로 간다
+            logger.exception("DM이전 발신함 수집 실패 (job=%s)", self.job.id)
+            self.sd["outbox_done"] = False
+            self._persist()
+            return
+
+        # stage_data 에 그대로 넣으면 체크포인트마다 수 MB 를 다시 쓴다 — 필요한 것만 남긴다.
+        out = [
+            {
+                "recipient": m.get("recipient"),
+                "msg_id": m.get("msg_id"),
+                "created_time": m.get("created_time"),
+                "text": (m.get("text") or "")[:400],
+                "content": {
+                    k: (m.get("content") or {}).get(k)
+                    for k in (
+                        "text",
+                        "urls",
+                        "buttons",
+                        "media_drops",
+                        "carousel",
+                        "has_gate_button",
+                    )
+                    if (m.get("content") or {}).get(k)
+                },
+            }
+            for m in (res.get("outbound") or [])
+            if m.get("recipient")
+        ]
+        self.sd["outbox_done"] = True
+        self.sd["dm_scope_missing"] = bool(res.get("scope_missing"))
+        self.sd["outbox"] = out
+        self.job.conversations_scanned = int(res.get("conversations_scanned") or 0)
+        self.job.dm_messages_collected = len(out)
+        logger.info(
+            "DM이전 발신함: 대화 %s개에서 보낸 DM %d건 (job=%s)",
+            self.job.conversations_scanned,
+            len(out),
+            self.job.id,
+        )
+        self._persist(counter_fields=["conversations_scanned", "dm_messages_collected"])
 
     # ── 단계 2.5: 귀속 검증 (애매한 것만 AI 대조) ──
     def _stage_verify(self):
@@ -461,6 +526,17 @@ class _Runner:
 
         mids, fps, tmpl_norms = _own_send_context(self.conn)
         is_own = recover.build_own_dm_matcher(mids, fps, tmpl_norms)
+
+        # 발신함을 훑어뒀으면 색인을 켠다 — 이후 댓글러 조회는 Graph 호출 0.
+        outbox = self.sd.get("outbox")
+        if outbox:
+            self.ctx.outbox = collect.build_outbound_index(outbox)
+            logger.info(
+                "DM이전 발신함 색인 (job=%s): 수신자 %d명 · 메시지 %d건",
+                self.job.id,
+                len(self.ctx.outbox),
+                len(outbox),
+            )
 
         since_ckpt = 0
         for media, deep in targets:

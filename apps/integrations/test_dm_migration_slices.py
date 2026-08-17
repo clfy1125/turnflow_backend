@@ -103,6 +103,13 @@ def _no_network(monkeypatch):
             raise AssertionError(f"{__n} 이 호출됐다 — 오프라인 테스트가 깨졌다")
 
         monkeypatch.setattr(C, name, _boom)
+    # 발신함 전수 조사는 '가속기' 라 없어도 파이프라인이 돌아야 한다. 빈 결과로 두고
+    # 기존(게시물별 조회) 경로가 그대로 동작하는지를 본다.
+    monkeypatch.setattr(
+        C,
+        "fetch_conversations",
+        lambda *a, **k: {"outbound": [], "scope_missing": False, "conversations_scanned": 0},
+    )
 
 
 class TestSliceResume:

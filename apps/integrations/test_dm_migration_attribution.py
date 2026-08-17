@@ -89,13 +89,21 @@ class TestByTime:
 
 
 class TestByTemplate:
-    def test_weak_claim_loses_to_dominant_owner(self):
+    def test_weak_claim_loses_support_but_keeps_the_text(self):
+        """진 쪽도 **문구는 남긴다** — 지우면 사용자가 처음부터 써야 한다.
+
+        인플루언서가 여러 게시물에 같은 DM 을 돌려쓰는 경우가 많아(실측 34종이 여러
+        게시물에 걸침) 이 문구가 이 게시물 문구일 가능성도 있다. 지지 근거만 무효화하고
+        표시를 남겨, 사용자는 "다른 게시물에서 더 많이 쓰인 문구" 라는 안내와 함께 받는다.
+        """
         strong = _rec("m-owner", offer=_slot("AI 자료 보내드려요", [], url="https://x", hits=21))
         weak = _rec("m-leak", offer=_slot("AI 자료 보내드려요", [], url="https://x", hits=1))
         demoted = attribute.by_template([strong, weak])
         assert demoted == 1
-        assert strong["offer"] is not None
-        assert weak["offer"] is None
+        assert strong["offer"]["hits"] == 21
+        assert weak["offer"]["text"] == "AI 자료 보내드려요"  # 문구는 남는다
+        assert weak["offer"]["hits"] == 0  # 지지 근거만 무효화
+        assert weak["offer"]["shared"] is True
         assert weak["offer_demoted"]["owner_hits"] == 21
 
     def test_evenly_strong_posts_are_left_alone(self):
