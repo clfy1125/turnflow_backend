@@ -228,3 +228,95 @@ class TestApplyVerdicts:
         assert _needs_verify({"offer": {"text": real, "hits": 3}}) is False
         assert _needs_verify({"offer": None, "gate": None}) is False
         assert _needs_verify({"offer": {"text": "", "hits": 1}}) is False
+
+
+# ══════════════ 5. 댓글 → DM 간격 (자동 발송의 지문) ══════════════
+#
+# 실측(@highestlevel33, 근거 2,916건):
+#   확실한 캠페인(지지 3명+) 중앙값   7초 · 1분 내 79%
+#   애매(지지 1~2명)        중앙값 190초 · 1분 내  9%
+#   캠페인 아님             중앙값 3.7일 · 1분 내  0%
+#   간격별 '지지 3명+' 비율: 0~10초 99% · 10~60초 99% · 1~10분 85% · 1일+ 52%
+# 낱말·말투 패턴과 달리 계정 성격을 안 타서 재튜닝이 필요 없다.
+
+
+def _slot_g(text, gaps, *, url="", hits=None):
+    users = [{"u": f"u{i}", "m": f"d{i}", "g": g} for i, g in enumerate(gaps)]
+    s = _slot(text, users, url=url, hits=hits)
+    s["gap_median"] = sorted(gaps)[len(gaps) // 2] if gaps else None
+    return s
+
+
+class TestTimingRule:
+    def test_dm_before_the_comment_is_impossible(self):
+        """DM 이 댓글보다 먼저 갔으면 그 댓글의 응답일 수 없다(실측 195건)."""
+        rec = _rec("m1", offer=_slot_g("자료", [-5000, 8]))
+        removed = attribute.drop_impossible([rec])
+        assert removed == 1
+        assert rec["offer"]["hits"] == 1
+
+    def test_clock_skew_is_tolerated(self):
+        """시계 오차 정도의 음수는 살린다 — 진짜 자동 발송을 잃으면 안 된다."""
+        rec = _rec("m1", offer=_slot_g("자료", [-30]))
+        assert attribute.drop_impossible([rec]) == 0
+        assert rec["offer"]["hits"] == 1
+
+    def test_a_reply_a_week_later_is_not_automation(self):
+        rec = _rec("m1", offer=_slot_g("고마워요", [700000]))
+        assert attribute.drop_impossible([rec]) == 1
+        assert rec["offer"]["hits"] == 0
+
+    def test_seconds_gap_rescues_a_single_supporter(self):
+        """7초 만에 온 DM 은 사람이 못 쓴다 — 1명이 받았어도 자동 발송이다."""
+        from apps.integrations.dm_migration.recover import PostRecovery
+
+        r = PostRecovery(media_id="m1", probed=12, content_score=0.1)
+        r.offer = {"text": "자료", "url": "", "hits": 1, "score": 0.05, "gap_median": 7}
+        assert r.grade == "needs_review"
+
+    def test_slow_dm_is_dropped_even_with_link_and_score(self):
+        """간격이 하루를 넘으면 링크·점수가 좋아도 자동 발송이 아니다."""
+        from apps.integrations.dm_migration.recover import PostRecovery
+
+        r = PostRecovery(media_id="m1", probed=12, content_score=0.9, is_campaign_signal=True)
+        r.offer = {
+            "text": "자료",
+            "url": "https://x",
+            "hits": 1,
+            "score": 0.05,
+            "gap_median": 200000,
+        }
+        assert r.grade == "excluded"
+
+    def test_middle_zone_falls_back_to_review_rules(self):
+        """1분~1일 구간은 콘텐츠 점수·링크로 가른다(사장님 검수 규칙)."""
+        from apps.integrations.dm_migration.recover import PostRecovery
+
+        mid = PostRecovery(media_id="m1", probed=12, content_score=0.9, is_campaign_signal=True)
+        mid.offer = {
+            "text": "자료",
+            "url": "https://x",
+            "hits": 1,
+            "score": 0.05,
+            "gap_median": 600,
+        }
+        assert mid.grade == "needs_review"
+
+        weak = PostRecovery(media_id="m2", probed=12, content_score=0.4, is_campaign_signal=True)
+        weak.offer = {
+            "text": "자료",
+            "url": "https://x",
+            "hits": 1,
+            "score": 0.05,
+            "gap_median": 600,
+        }
+        assert weak.grade == "excluded"
+
+    def test_impossible_runs_before_competition(self):
+        """순서가 뒤집히면 시간상 말이 안 되는 근거가 경쟁에서 이겨버린다."""
+        good = _rec("m-good", offer=_slot_g("자료", [5], url="https://x"))
+        stale = _rec("m-stale", offer=_slot_g("자료", [500000], url="https://x"))
+        stats = attribute.resolve([stale, good])
+        assert stats["impossible"] == 1
+        assert stale["offer"] is None
+        assert good["offer"]["hits"] == 1

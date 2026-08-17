@@ -35,6 +35,7 @@ from .analyze import (
     caption_keywords,
     comment_shape,
     fingerprint,
+    is_personal_dm,
     normalize_comment,
     placeholder_normalize,
     wilson_lower_bound,
@@ -46,6 +47,10 @@ logger = logging.getLogger(__name__)
 GRADE_AUTO = 0.60  # 자동 채택 — 실측 정밀도 100%
 GRADE_REVIEW = 0.40  # 확인 권장 — 77%
 MIN_SUPPORT_HITS = 3  # 표본이 작을 때 비율만 믿지 않기 위한 절대 하한
+# 지지 1~2명짜리를 살릴 때 요구하는 콘텐츠 점수 하한. 사장님이 애매 59건을 전수 검수한
+# 결과 **0.55 이하는 전부 캠페인이 아니었다**(2026-08-17). 자동 판정으로는 못 얻는 값이라
+# 사람 라벨을 그대로 상수로 박는다 — 바꾸려면 같은 방식으로 다시 라벨링할 것.
+WEAK_SUPPORT_CONTENT_MIN = 0.55
 
 # 캡션 행동유도. 어미 변화를 놓치면 안 된다 — 실측에서 "아무 댓글 **남기면**" 캠페인이
 # "남겨" 만 보던 패턴에 안 걸려 통째로 탈락했다(점수 0.34, 기준 0.35).
@@ -110,8 +115,26 @@ class PostRecovery:
             return "auto_draft"
         if s >= GRADE_REVIEW:
             return "needs_review"
-        # 지지가 얕다 — 콘텐츠가 뒷받침하면 검수 대상, 아니면 오귀속으로 보고 제외.
-        if hits >= MIN_SUPPORT_HITS or self.is_campaign_signal:
+        if hits >= MIN_SUPPORT_HITS:
+            return "needs_review"
+        # ── 지지 1~2명 — 여기가 오귀속의 온상이다 ──
+        slot = self.offer or self.gate or {}
+        gap = slot.get("gap_median")
+
+        # ① 댓글 → DM 간격이 우선한다. 자동화 도구는 몇 초 안에 쏘고, 사람은 그렇게 못 한다.
+        #    실측: 이 구간(≤60초)의 99%가 지지 3명+ 였다. 낱말·말투와 달리 계정 성격을
+        #    안 타므로 가장 신뢰할 수 있는 잣대다.
+        if gap is not None:
+            if 0 <= gap <= C.AUTO_DM_MAX_GAP:
+                return "needs_review"  # 자동 발송 확실 — 1명이 받았어도 인정
+            if gap > C.MANUAL_DM_MIN_GAP or gap < -C.CLOCK_SKEW_TOLERANCE:
+                return "excluded"  # 사람이 쓴 것 / 이 댓글의 응답이 아님
+
+        # ② 간격이 애매한 구간(1분~1일)은 사장님 검수 규칙으로 가른다.
+        #    (2026-08-17, 애매 59건 전수: 콘텐츠 0.55 이하는 **전부** 캠페인이 아니었고,
+        #     링크 없는 것은 대부분 팬과의 1:1 잡담이었다. 두 조건을 모두 요구하면
+        #     59건 → 19건. 확실한 캠페인 159건에는 영향 0.)
+        if self.content_score > WEAK_SUPPORT_CONTENT_MIN and (self.offer or {}).get("url"):
             return "needs_review"
         return "excluded"
 
@@ -294,6 +317,15 @@ def recover_post(
                     continue
                 if is_own_dm(d.get("msg_id"), d["text"]):
                     continue
+                # 팬과의 1:1 잡담("존맛탱이죠 ㅎㅎ", "행복한 명절되세용")은 캠페인 문구가
+                # 아니다. 그 사람이 마침 이 게시물에도 댓글을 달았을 뿐이다.
+                # 버튼이 붙어 있으면 자동 발송이므로 잡담일 수 없다(게이트 보호).
+                if is_personal_dm(
+                    content.get("text") or d["text"],
+                    has_url=bool(urls),
+                    has_button=bool(content.get("buttons") or content.get("has_gate_button")),
+                ):
+                    continue
                 # 댓글↔DM 시간차 — 수집 후 '이 DM 이 어느 게시물 것인가' 를 가리는 근거.
                 # 문턱값으로 쓰면 안 갈린다(연달아 댓글 달면 둘 다 몇 초 안에 온다).
                 # 여러 게시물이 같은 DM 을 주장할 때 **더 가까운 쪽**을 고르는 데 쓴다.
@@ -378,6 +410,9 @@ def recover_post(
         hits = len(slot["users"])
         url = slot["urls"].most_common(1)[0][0] if slot["urls"] else ""
         label = slot["labels"].most_common(1)[0][0] if slot["labels"] else ""
+        gaps = sorted(
+            g for g in (e.get("g") for e in slot.get("evidence", {}).values()) if g is not None
+        )
         return {
             "text": slot["text"],
             "url": url,
@@ -385,6 +420,9 @@ def recover_post(
             # 누가·어느 메시지로·댓글과 몇 초 차이로 뒷받침했나 — 수집이 다 끝난 뒤
             # attribute.resolve 가 이걸 보고 게시물 간 중복 주장을 정리한다.
             "users": list(slot.get("evidence", {}).values()),
+            # 댓글→DM 간격 — **자동 발송의 지문**. 중앙값과 '몇 초 안에 온 건수'를 남긴다.
+            "gap_median": gaps[len(gaps) // 2] if gaps else None,
+            "auto_hits": sum(1 for g in gaps if 0 <= g <= C.AUTO_DM_MAX_GAP),
             "hits": hits,
             "ratio": round(hits / out.probed, 3),
             "score": round(wilson_lower_bound(hits, out.probed), 3),

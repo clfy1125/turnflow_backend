@@ -27,6 +27,8 @@ import re
 from collections import defaultdict
 
 from .analyze import wilson_lower_bound
+from .collect import CLOCK_SKEW_TOLERANCE as CLOCK_SKEW
+from .collect import MANUAL_DM_MIN_GAP as MANUAL_GAP
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,33 @@ def _repack(slot: dict, probed: int) -> None:
     slot["hits"] = hits
     slot["ratio"] = round(hits / max(probed, 1), 3)
     slot["score"] = round(wilson_lower_bound(hits, max(probed, 1)), 3)
+
+
+def drop_impossible(recoveries: list[dict]) -> int:
+    """**이 댓글의 응답일 수 없는 근거**를 걷어낸다 (시간만으로 판정).
+
+    · DM 이 댓글보다 먼저 갔다 → 그 사람이 예전에 다른 게시물에 단 댓글로 받은 것이다
+      (실측 195건이 이 경우였다).
+    · 하루가 지나서 갔다 → 자동 발송이 아니다. 사람이 손으로 쓴 개인 DM 이다
+      (실측: 캠페인 아닌 구간의 중앙값이 3.7일).
+    """
+    removed = 0
+    for rec in recoveries:
+        for key in ("offer", "gate"):
+            slot = rec.get(key)
+            if not slot or not isinstance(slot.get("users"), list):
+                continue
+            before = len(slot["users"])
+            slot["users"] = [
+                ev
+                for ev in slot["users"]
+                if ev.get("g") is None or (-CLOCK_SKEW <= ev["g"] <= MANUAL_GAP)
+            ]
+            removed += before - len(slot["users"])
+            _repack(slot, int(rec.get("probed") or 1))
+    if removed:
+        logger.info("DM이전 귀속: 시간상 불가능한 근거 %d건 제외", removed)
+    return removed
 
 
 def by_time(recoveries: list[dict]) -> int:
@@ -189,7 +218,12 @@ def apply_verdicts(recoveries: list[dict], verdicts: dict) -> dict:
 
 
 def resolve(recoveries: list[dict]) -> dict:
-    """수집 종료 후 귀속 정리 일괄 실행. 통계 반환."""
+    """수집 종료 후 귀속 정리 일괄 실행. 통계 반환.
+
+    순서가 중요하다 — **불가능한 근거를 먼저 걷어내고** 나서 게시물 간 경쟁을 붙인다.
+    거꾸로 하면 시간상 말이 안 되는 근거가 경쟁에서 이겨버린다.
+    """
+    impossible = drop_impossible(recoveries)
     moved = by_time(recoveries)
     demoted = by_template(recoveries)
     # 근거가 다 빠진 슬롯은 제거한다.
@@ -207,4 +241,10 @@ def resolve(recoveries: list[dict]) -> dict:
         for key in ("offer", "gate"):
             if rec.get(key):
                 rec[key].pop("users", None)
-    return {"moved": moved, "demoted": demoted, "emptied": emptied, "regraded": changed}
+    return {
+        "impossible": impossible,
+        "moved": moved,
+        "demoted": demoted,
+        "emptied": emptied,
+        "regraded": changed,
+    }

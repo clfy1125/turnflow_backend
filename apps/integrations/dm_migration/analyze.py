@@ -277,6 +277,53 @@ def content_match(caption: str, dm_text: str, trigger: str | None = None) -> lis
     return matched
 
 
+# ── 개인 대화 DM 걸러내기 ─────────────────────────────────────────────
+# 인플루언서는 팬과 1:1 잡담도 한다("존맛탱이죠 ㅎㅎ", "행복한 명절되세용", "응원드립니다🔥").
+# 그 사람이 마침 이 게시물에도 댓글을 달았으면 그 잡담이 '캠페인 문구' 로 잡힌다.
+# **정보 전달 목적이 없고 캠페인화해도 인플루언서가 얻을 게 없는 말** 은 후보가 되면 안 된다.
+# (사장님 검수, 2026-08-17: 애매 59건 중 29건이 이런 개인 대화였다. 확실한 캠페인
+#  159건에는 하나도 안 걸린다 — 실측으로 부작용 0 확인.)
+_CHAT_RE = re.compile(r"ㅋㅋ|ㅎㅎ|ㅠㅠ|ㅜㅜ|헤헤|앜|넵|넹")
+_SOCIAL_RE = re.compile(
+    r"응원|고마워|고맙|감사해|명절|행복|축하|멋져|멋지|화이팅|파이팅|반가|친해|만나|"
+    r"소통|잘\s*봤|귀여|사랑|축복|건강하",
+    re.I,
+)
+# 뭔가 **주겠다**는 말 — 이게 있으면 잡담이 아니라 캠페인 쪽이다.
+_OFFERISH_RE = re.compile(
+    r"자료|링크|가이드|정리|보내드|받아|신청|다운|무료|템플릿|특강|전자책|프롬프트|"
+    r"강의|클래스|노하우|비법|공유",
+    re.I,
+)
+_PERSONAL_Q_RE = re.compile(r"까요\?|나요\?|괜찮으시|혹시\s|어떻게\s")
+# 팔로우 게이트 문구 — **짧고 링크도 없지만 캠페인의 일부다.**
+# "팔로우 확인 부탁드려요"(11자)는 잡담 규칙에 그대로 걸린다. 게이트를 죽이면 2단 구조
+# 캠페인(게이트 → 오퍼)의 앞부분이 통째로 사라진다.
+_GATE_RE = re.compile(r"팔로(우|잉)?.{0,6}(확인|눌러|클릭|해주|했|하시)|구독.{0,4}확인|인증", re.I)
+PERSONAL_MAX_LEN = 60
+PERSONAL_BARE_LEN = 25
+
+
+def is_personal_dm(text: str, *, has_url: bool = False, has_button: bool = False) -> bool:
+    """캠페인 문구가 될 수 없는 **개인 대화**인가.
+
+    아래 중 하나라도 있으면 개인 대화로 보지 않는다 — 전부 '자동화된 전달' 의 표식이다.
+        · 링크        · 버튼        · 뭔가 주겠다는 말        · 팔로우 확인(게이트)
+    남는 것(링크도 버튼도 없고 줄 것도 없는 짧은 잡담·인사·응원)만 걸러낸다.
+    """
+    t = (text or "").strip()
+    if not t or has_url or has_button:
+        return False
+    if _OFFERISH_RE.search(t) or _GATE_RE.search(t):
+        return False
+    if len(t) <= PERSONAL_MAX_LEN and (
+        _CHAT_RE.search(t) or _SOCIAL_RE.search(t) or _PERSONAL_Q_RE.search(t)
+    ):
+        return True
+    # 링크도 버튼도 없고 줄 것도 없는 아주 짧은 말 — 정보 전달이 아니다.
+    return len(t) <= PERSONAL_BARE_LEN
+
+
 def placeholder_normalize(text: str) -> str:
     """DM 템플릿 군집화용 — 개인화 토큰(URL/이메일/전화/@/숫자/이모지)을 슬롯으로 치환 후 정규화.
 

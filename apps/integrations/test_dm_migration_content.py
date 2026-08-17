@@ -16,7 +16,12 @@ from __future__ import annotations
 
 import pytest
 
-from apps.integrations.dm_migration.analyze import EMOJI_TOKEN, comment_key, comment_shape
+from apps.integrations.dm_migration.analyze import (
+    EMOJI_TOKEN,
+    comment_key,
+    comment_shape,
+    is_personal_dm,
+)
 from apps.integrations.dm_migration.recover import (
     CONTENT_CAMPAIGN_MIN,
     CONTENT_STRONG_MIN,
@@ -142,15 +147,26 @@ class TestGrading:
         )
         assert r.grade == "excluded"
 
-    def test_shallow_support_with_content_is_reviewed_not_dropped(self):
-        """같은 1명이어도 글이 캠페인이라고 말하면 버리지 않고 검수로 내린다."""
-        r = _rec(
+    def test_shallow_support_needs_a_link_too(self):
+        """지지 1명 + 콘텐츠 강함 만으로는 부족하다 — **링크까지 있어야** 살린다.
+
+        사장님이 애매 59건을 전수 검수한 결과(2026-08-17), 링크 없는 것은 대부분 팬과의
+        1:1 잡담이었다. 콘텐츠 점수가 높아도 링크가 없으면 내린다.
+        """
+        no_link = _rec(
             offer={"text": "안내드려요", "url": "", "hits": 1, "score": 0.05},
             is_campaign_signal=True,
             content_score=0.7,
         )
-        assert r.grade == "needs_review"
-        assert r.confirm_required is True
+        assert no_link.grade == "excluded"
+
+        with_link = _rec(
+            offer={"text": "안내드려요", "url": "https://ex.co/a", "hits": 1, "score": 0.05},
+            is_campaign_signal=True,
+            content_score=0.7,
+        )
+        assert with_link.grade == "needs_review"
+        assert with_link.confirm_required is True  # 사용자 확인을 받는다
 
 
 # ══════════════ 4. 탐색 깊이 — 목표(전수 이전)와 직결 ══════════════
@@ -183,3 +199,102 @@ class TestProbeDepth:
 def test_end_to_end_shapes(caption, comments, expect):
     v = judge_content({"caption": caption}, _cs(*comments))
     assert v.is_campaign is expect, (caption, v.score, v.reasons)
+
+
+# ══════════════ 5. 개인 대화는 캠페인이 아니다 ══════════════
+#
+# 인플루언서는 팬과 1:1 잡담도 한다. 그 사람이 마침 이 게시물에도 댓글을 달았으면
+# 그 잡담이 '캠페인 문구' 로 잡힌다. 사장님 검수(2026-08-17): 애매 59건 중 **29건**이
+# 이런 개인 대화였다. 캠페인화해도 인플루언서가 얻을 게 없는 말이다.
+
+
+class TestPersonalDM:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "앜ㅋㅋㅋㅋㅋㅋㅋㅋ존맛탱이죠 ㅎㅎ",
+            "헐 ㅠㅠㅠㅠ아쉽지만 조금 더 빠르게 보내주신 분이 계시네용 ㅠㅠㅠ",
+            "오 동휘님 행복함 명절되세용 ㅎㅎ😍",
+            "응원드립니다🔥🔥",
+            "항상 고마워용🥰",
+            "혹시 괜찮으시면 강연 때 성공사례로 말씀드려도 될까요?",
+            "아하 그 부분은 저도 잘모르겠내요!!!!",
+            "네네 응원합니다🔥",
+        ],
+    )
+    def test_chitchat_is_rejected(self, text):
+        assert is_personal_dm(text) is True, text
+
+    @pytest.mark.parametrize(
+        "text,url",
+        [
+            ("2025년 모르면 절대 안되는 AI리스트 싹다 정리해두었으니 아래 링크를 통해", False),
+            ("요청하신 자료 보내드려요! 아래 버튼에서 받아가세요", False),
+            ("감사합니다 ㅎㅎ 아래 링크에서 받아가세요", True),  # 링크가 있으면 캠페인
+            ("팔로우 확인 부탁드려요! 확인되면 자료 보내드릴게요", False),
+        ],
+    )
+    def test_campaign_dm_survives(self, text, url):
+        assert is_personal_dm(text, has_url=url) is False, text
+
+    def test_a_link_always_means_informational(self):
+        """링크가 있으면 잡담처럼 보여도 캠페인으로 본다 — 링크가 전달의 본질이다."""
+        assert is_personal_dm("ㅋㅋㅋ 감사해요🥰", has_url=True) is False
+
+
+# ══════════════ 6. 지지가 얕을 때의 구제 조건 ══════════════
+#
+# 사장님이 애매 59건을 전수 검수한 결과: 실제 캠페인이었던 것은 **콘텐츠 0.55 초과 &
+# DM 에 링크 있음** 뿐이었다. 두 조건을 요구하면 59 → 19건으로 좁혀지고, 확실한 캠페인
+# 159건에는 영향이 0 이다.
+
+
+def _weak(hits, content, url):
+    r = PostRecovery(media_id="m1", probed=12, content_score=content, is_campaign_signal=True)
+    r.offer = {"text": "자료 보내드려요", "url": url, "hits": hits, "score": 0.05}
+    return r
+
+
+class TestWeakSupportRescue:
+    def test_low_score_is_dropped_even_with_link(self):
+        assert _weak(1, 0.50, "https://x").grade == "excluded"
+
+    def test_no_link_is_dropped_even_with_high_score(self):
+        assert _weak(2, 0.85, "").grade == "excluded"
+
+    def test_high_score_with_link_survives_for_review(self):
+        r = _weak(2, 0.75, "https://x")
+        assert r.grade == "needs_review"
+        assert r.confirm_required is True  # 사용자 확인을 받는다
+
+    def test_threshold_is_exclusive(self):
+        """0.55 '이하' 가 전부 아니었다 → 0.55 자체는 통과시키지 않는다."""
+        assert _weak(2, 0.55, "https://x").grade == "excluded"
+        assert _weak(2, 0.56, "https://x").grade == "needs_review"
+
+    def test_strong_support_is_unaffected(self):
+        """지지 3명+ 는 이 규칙을 타지 않는다 — 실측 부작용 0 을 코드로 고정."""
+        r = PostRecovery(media_id="m1", probed=10, content_score=0.1)
+        r.offer = {"text": "자료", "url": "", "hits": 3, "score": 0.2}
+        assert r.grade == "needs_review"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "팔로우 확인 부탁드려요",
+            "팔로우했어요?",
+            "팔로우 눌러주셨나요",
+            "구독 확인되면 보내드려요",
+        ],
+    )
+    def test_follow_gate_is_never_personal(self, text):
+        """게이트 문구는 짧고 링크도 없지만 **캠페인의 앞부분**이다.
+
+        여기가 잡담으로 걸리면 2단 구조(게이트 → 오퍼) 캠페인의 절반이 사라진다.
+        실제로 이 필터를 넣자마자 mock e2e 의 gate_detected 가 깨졌다.
+        """
+        assert is_personal_dm(text) is False, text
+
+    def test_button_means_automated(self):
+        """버튼이 붙은 DM 은 사람이 손으로 쓴 잡담일 수 없다."""
+        assert is_personal_dm("ㅋㅋ 감사해요", has_button=True) is False
