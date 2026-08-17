@@ -398,11 +398,14 @@ class _Runner:
         내려가고(``outbound_from_index``), '안 받았음' 으로 세지 않는다.
         """
         cutoff = timezone.now() - timedelta(hours=collect.OUTBOX_REUSE_HOURS)
+        # ⚠️ **"최신 잡" 이 아니라 "발신함을 끝낸 최신 잡"** 을 골라야 한다. 그냥 최신을
+        #    집으면 방금 취소된 빈 잡이 걸려 "물려받을 게 없다" 고 판단한다(실제로 그랬다).
         prev_job = (
             DMMigrationJob.objects.filter(
                 ig_connection=self.conn,
                 raw_purged_at__isnull=True,
                 updated_at__gte=cutoff,
+                stage_data__outbox_done=True,
             )
             .exclude(id=self.job.id)
             .order_by("-updated_at")

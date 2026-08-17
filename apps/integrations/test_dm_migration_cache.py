@@ -185,3 +185,28 @@ class TestOutboxAdoption:
         new = [{"msg_id": "b"}, {"msg_id": "c"}]
         got = pipeline._merge_outbox(prev, new)
         assert [m["msg_id"] for m in got] == ["a", "b", "c"]
+
+    @pytest.mark.django_db
+    def test_picks_the_latest_job_that_actually_finished_a_scan(self):
+        """**최신 잡이 아니라 '발신함을 끝낸' 최신 잡**을 골라야 한다.
+
+        실측 사고(2026-08-17): 방금 취소된 빈 잡이 최신이라 그것만 보고 "물려받을 게 없다"
+        고 판단해, 88,899건이 같은 DB 에 있는데도 0 에서 다시 훑기 시작했다.
+        """
+        conn = _conn(_ws(_user()))
+        good = _job(conn, status=DMMigrationJob.Status.READY)
+        good.stage_data = {
+            "outbox": [{"recipient": "u1", "msg_id": "d1"}],
+            "outbox_done": True,
+        }
+        good.save(update_fields=["stage_data"])
+        # 그 뒤에 취소된 빈 잡 — 이게 최신이다
+        empty = _job(conn, status=DMMigrationJob.Status.CANCELED)
+        empty.stage_data = {}
+        empty.save(update_fields=["stage_data"])
+        assert empty.updated_at >= good.updated_at
+
+        runner = pipeline._Runner(_job(conn))
+        got = runner._adopt_previous_outbox()
+        assert len(got) == 1, "빈 최신 잡에 가려 물려받기가 실패했다"
+        assert runner.sd["outbox_reused_from"] == str(good.id)
