@@ -89,6 +89,93 @@ def _call_json(model: str, system: str, user: str, *, max_tokens: int, temperatu
     return calls, tokens, None
 
 
+# ══════════════ Stage C — 귀속 검증 (게시물 ↔ DM 내용 대조) ══════════════
+#
+# 지지비율(몇 명이 같은 문구를 받았나)만으로는 **도달률이 낮은 게시물이 억울하게 잘린다.**
+# 받은 사람이 1명이어도 캡션이 "AI 툴 7가지 정리했어요" 이고 DM 이 "요청하신 AI 툴 7가지
+# 자료" 면 이 게시물 캠페인이 맞다. 반대로 캡션은 여행 사진인데 DM 이 "인스타 강의 신청" 이면
+# 다른 게시물에서 흘러든 것이다.
+#
+# 낱말 겹침으로도 재봤는데(실측: 진짜 58% vs 가짜 6%) 이 계정은 전 게시물이 같은 주제라
+# "인스타·수익화" 같은 단어가 양쪽에 다 나와 오판이 생겼다. **의미를 읽어야 갈린다.**
+# 그래서 이 판단만 LLM 에 맡긴다 — 애매한 건(지지 1~2명)에만 걸어 비용을 묶는다.
+VERIFY_PER_CALL = 8
+VERIFY_MAX_TOKENS = 32000
+CAP_VERIFY_DM = 500
+
+
+def verify_attribution(items: list[dict], *, model_code: str = "deepseek") -> tuple[dict, dict]:
+    """게시물 글 ↔ 복원된 DM 이 **같은 캠페인인지** 판정. → ({media_id: 판정}, usage)
+
+    items: [{"media_id","caption","dm_text","trigger"}]
+    판정: {"match": bool, "confidence": 0~1, "reason": "짧은 근거"}
+
+    실패는 fail-open — 판정을 못 하면 기존 등급을 그대로 둔다(후보를 잃지 않는다).
+    """
+    if not items:
+        return {}, {"llm_calls": 0, "llm_tokens": 0}
+    if _fake():
+        from .analyze import content_match
+
+        out = {}
+        for c in items:
+            m = content_match(c.get("caption", ""), c.get("dm_text", ""), c.get("trigger"))
+            out[c["media_id"]] = {
+                "match": len(m) >= 2,
+                "confidence": 0.8 if len(m) >= 2 else 0.2,
+                "reason": f"공통 낱말 {m[:3]}" if m else "공통 낱말 없음",
+            }
+        return out, {"llm_calls": 0, "llm_tokens": 0}
+
+    model = resolve_model(model_code)
+    system = (
+        "당신은 인스타그램 댓글→DM 자동화의 '이 DM 이 이 게시물의 자동응답인가' 를 판정합니다. "
+        + _DATA_FENCE_RULE
+        + " 판정 기준: 게시물이 약속한 것(자료·강의·링크 등)과 DM 이 실제로 준 것이 "
+        "**같은 이야기**면 match=true. 주제가 다르거나 게시물이 아무것도 약속하지 않았으면 "
+        "false. 같은 계정이라 말투·브랜드명이 겹치는 것만으로는 true 가 아닙니다 — "
+        "**약속한 내용물이 일치**해야 합니다. 확신이 없으면 false 로 두세요. "
+        '출력: {"results":[{"idx":"v1","match":true,"confidence":0.0~1.0,"reason":"20자 이내"}]}'
+    )
+
+    out: dict = {}
+    calls = tokens = 0
+    for start in range(0, len(items), VERIFY_PER_CALL):
+        batch = items[start : start + VERIFY_PER_CALL]
+        handles = {f"v{i}": c for i, c in enumerate(batch)}
+        lines = []
+        for h, c in handles.items():
+            lines.append(
+                f"[{h}] 게시물=<data>{(c.get('caption') or '')[:CAP_CAPTION]}</data> "
+                f"댓글트리거=<data>{(c.get('trigger') or '')[:CAP_PHRASE]}</data> "
+                f"보낸DM=<data>{(c.get('dm_text') or '')[:CAP_VERIFY_DM]}</data>"
+            )
+        user = "각 항목이 같은 캠페인인지 판정하세요.\n" + "\n".join(lines)
+        n, t, obj = _call_json(model, system, user, max_tokens=VERIFY_MAX_TOKENS, temperature=0.0)
+        calls += n
+        tokens += t
+        rows = (obj or {}).get("results") if isinstance(obj, dict) else None
+        by_idx = (
+            {str(r.get("idx")): r for r in rows if isinstance(r, dict)}
+            if isinstance(rows, list)
+            else {}
+        )
+        for h, c in handles.items():
+            r = by_idx.get(h)
+            if not r:
+                continue  # fail-open — 판정 없음 = 기존 등급 유지
+            try:
+                conf = max(0.0, min(float(r.get("confidence") or 0.0), 1.0))
+            except (TypeError, ValueError):
+                conf = 0.0
+            out[c["media_id"]] = {
+                "match": bool(r.get("match")),
+                "confidence": round(conf, 2),
+                "reason": str(r.get("reason") or "")[:60],
+            }
+    return out, {"llm_calls": calls, "llm_tokens": tokens}
+
+
 # ══════════════ Stage D — 초안 생성 ══════════════
 
 

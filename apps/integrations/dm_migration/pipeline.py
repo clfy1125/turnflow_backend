@@ -83,6 +83,20 @@ def _reply_variants(media_id: str, llm_draft: str | None) -> list[str]:
     return out[:PUBLIC_REPLY_VARIANTS]
 
 
+def _needs_verify(rec: dict) -> bool:
+    """AI 대조를 걸 대상 — **지지가 얕아 지지비율로는 못 가르는 것**만.
+
+    지지 3명+ 는 이미 실측 정밀도가 충분하고(60%+ 구간 100%), DM 이 아예 없으면 대조할
+    문구 자체가 없다. 애매한 구간에만 걸어야 비용이 안 튄다.
+    """
+    o, g = rec.get("offer") or {}, rec.get("gate") or {}
+    text = o.get("text") or g.get("text") or ""
+    if not text:
+        return False
+    hits = max(int(o.get("hits") or 0), int(g.get("hits") or 0))
+    return 0 < hits <= 2
+
+
 def _content_strong(rec: dict) -> bool:
     """DM 원문이 없어도 후보로 낼 만큼 **글·댓글 증거가 강한가**.
 
@@ -297,9 +311,75 @@ class _Runner:
         self._stage_media()
         self._stage_estimate()
         self._stage_recover()
+        self._stage_verify()
         self._stage_drafts()
         self.finalize()
         return job.status
+
+    # ── 단계 2.5: 귀속 검증 (애매한 것만 AI 대조) ──
+    def _stage_verify(self):
+        """지지가 얕은 건을 **게시물 글 ↔ DM 내용** 으로 갈라준다.
+
+        지지비율만으로는 도달률 낮은 게시물이 억울하게 잘리고, 반대로 남의 게시물에서
+        흘러든 DM 이 살아남는다. 사람이 눈으로 하는 판단("이 캡션이랑 이 DM 이 같은
+        이야기인가")을 AI 에 맡긴다 — **애매한 것에만** 걸어 비용을 묶는다.
+
+        실패는 fail-open: 판정을 못 하면 기존 등급을 그대로 둔다(후보를 잃지 않는다).
+        """
+        if self.sd.get("verify_done"):
+            return
+        recs = self.sd.get("recoveries") or []
+        pending = [
+            r
+            for r in recs
+            if _needs_verify(r) and r["media_id"] not in (self.sd.get("verify_partial") or {})
+        ]
+        verdicts = dict(self.sd.get("verify_partial") or {})
+        if not pending and not verdicts:
+            self.sd["verify_done"] = True
+            return
+
+        total = len(pending) + len(verdicts)
+        self._check_cancel()
+        self.job.set_stage(
+            _ST.CLASSIFYING_POSTS, 86, f"복원한 DM 이 맞는지 확인하고 있습니다... (0/{total})"
+        )
+        step = llm.VERIFY_PER_CALL
+        for start in range(0, len(pending), step):
+            if self._time_up():
+                self.sd["verify_partial"] = verdicts
+                self._persist(counter_fields=["llm_calls", "llm_tokens_used"])
+                raise _SliceExhausted()
+            self._check_cancel()
+            batch = [
+                {
+                    "media_id": r["media_id"],
+                    "caption": r.get("caption", ""),
+                    "trigger": r.get("trigger") or "",
+                    "dm_text": (r.get("offer") or {}).get("text")
+                    or (r.get("gate") or {}).get("text")
+                    or "",
+                }
+                for r in pending[start : start + step]
+            ]
+            got, usage = llm.verify_attribution(batch, model_code=self.job.llm_model)
+            verdicts.update(got)
+            self._bump_llm(usage)
+            self.sd["verify_partial"] = verdicts
+            self._persist(counter_fields=["llm_calls", "llm_tokens_used"])
+            self.job.set_stage(
+                _ST.CLASSIFYING_POSTS,
+                86,
+                f"복원한 DM 이 맞는지 확인하고 있습니다... ({len(verdicts)}/{total})",
+            )
+
+        applied = attribute.apply_verdicts(recs, verdicts)
+        self.sd["recoveries"] = recs
+        self.sd["verify_done"] = True
+        self.sd["verify_stats"] = applied
+        self.sd.pop("verify_partial", None)
+        logger.info("DM이전 AI 귀속 검증 (job=%s): %s", self.job.id, applied)
+        self._persist(counter_fields=["llm_calls", "llm_tokens_used"])
 
     # ── 단계 1.5: 예상 소요 산출 (프론트가 진행바를 그릴 수 있게) ──
     def _stage_estimate(self):
@@ -309,7 +389,9 @@ class _Runner:
         self.job.set_stage(_ST.ESTIMATING, 8, "예상 시간을 계산하고 있습니다...")
         media = self.sd.get("media", [])
         targets = self._targets(media)
-        est = recover.estimate_seconds(len(targets))
+        # 예상 시간은 **DM 까지 조회하는 게시물** 기준이다. 판정만 하는 가벼운 건은
+        # 게시물당 1콜(~1초)이라 체감에 영향이 없다.
+        est = recover.estimate_seconds(sum(1 for _m, deep in targets if deep))
         self.job.estimated_seconds = est["seconds"]
         self.job.estimate_detail = dict(est, media_total=len(media))
         self.job.estimated_at = timezone.now()
@@ -317,22 +399,31 @@ class _Runner:
             update_fields=["estimated_seconds", "estimate_detail", "estimated_at", "updated_at"]
         )
 
-    def _targets(self, media: list) -> list:
-        """분석 대상 게시물 — 댓글이 있고, **우리 캠페인이 걸려 있지 않은** 것.
+    def _targets(self, media: list) -> list[tuple]:
+        """분석 대상 → ``[(게시물, DM까지 조회할까), ...]``.
 
-        우리 캠페인이 도는 게시물을 넣으면 발신 DM 의 절반이 우리 것이라(실측 164/313)
-        자기 DM 을 '타사 캠페인' 으로 오인해 자기증식 후보가 생긴다.
+        **우리 캠페인이 걸린 게시물은 제외**한다. 넣으면 발신 DM 의 절반이 우리 것이라
+        (실측 164/313) 자기 DM 을 '타사 캠페인' 으로 오인해 자기증식 후보가 생긴다.
+
+        댓글이 적은 게시물(< MIN_COMMENTS)도 **판정은 한다.** 예전에는 통째로 스킵했는데,
+        댓글이 3개여도 캡션에 "댓글 남기면 자료 드려요" 라고 쓰여 있으면 캠페인이 맞다.
+        다만 DM 조회는 하지 않는다 — 표본이 1~7명이면 '몇 명이 같은 문구를 받았나' 라는
+        지지비율이 의미를 못 가져서, 조회해봐야 오귀속만 늘린다.
         """
         ours = set(
             AutoDMCampaign.objects.filter(ig_connection=self.conn)
             .exclude(media_id="")
             .values_list("media_id", flat=True)
         )
-        return [
-            m
-            for m in media
-            if (m.get("comments_count") or 0) >= MIN_COMMENTS and m.get("id") not in ours
-        ]
+        out = []
+        for m in media:
+            if m.get("id") in ours:
+                continue
+            n = m.get("comments_count") or 0
+            if n <= 0:
+                continue  # 댓글이 아예 없으면 볼 것이 없다
+            out.append((m, n >= MIN_COMMENTS))
+        return out
 
     # ── 단계 2: 게시물별 정밀 복원 ──
     def _stage_recover(self):
@@ -350,7 +441,7 @@ class _Runner:
         self._check_cancel()
         targets = self._targets(self.sd.get("media", []))
         # 최신 게시물부터 — 결과가 나오는 대로 보여줄 수 있고, 수확도 최신 쪽이 높다.
-        targets.sort(key=lambda m: m.get("timestamp", ""), reverse=True)
+        targets.sort(key=lambda t: t[0].get("timestamp", ""), reverse=True)
 
         # 이어달리기 상태 복원.
         out = self._rec_out = list(self.sd.get("recover_partial") or [])
@@ -370,7 +461,7 @@ class _Runner:
         is_own = recover.build_own_dm_matcher(mids, fps, tmpl_norms)
 
         since_ckpt = 0
-        for media in targets:
+        for media, deep in targets:
             mid = media.get("id") or ""
             if mid in done:
                 continue
@@ -383,7 +474,7 @@ class _Runner:
                 )
                 raise _SliceExhausted()
             try:
-                r = recover.recover_post(self.ctx, media, is_own_dm=is_own)
+                r = recover.recover_post(self.ctx, media, is_own_dm=is_own, probe=deep)
             except (MigrationTokenError, MigrationRateLimitPause):
                 raise
             except Exception:  # noqa: BLE001 — 게시물 1건 실패가 잡을 죽이지 않게

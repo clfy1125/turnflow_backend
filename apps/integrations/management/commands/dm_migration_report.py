@@ -101,6 +101,15 @@ class Command(BaseCommand):
         n_url = sum(1 for c, _ in rows if c.offer_url)
         n_msg = sum(1 for c, _ in rows if c.draft_opening_message)
         attribution = sd.get("attribution") or {}
+        # f-string 표현식 안에서는 {{}} 가 빈 dict 가 아니라 **set 리터럴**로 파싱된다
+        # (TypeError: unhashable type). 값은 밖에서 계산해 넣는다.
+        calls = sum(((job.api_budget_state or {}).get("made") or {}).values())
+        attr_note = (
+            f"· 귀속 정리: 시간 짝짓기 {attribution.get('moved', 0)}건 이동, "
+            f"문구 경쟁 {attribution.get('demoted', 0)}건 내림"
+            if attribution
+            else ""
+        )
 
         cards = "\n".join(self._card(i, c, r) for i, (c, r) in enumerate(rows, 1))
         chips = " ".join(
@@ -162,8 +171,7 @@ h2{{border-top:2px solid var(--line);padding-top:20px}}
   <span style="color:var(--mut);font-size:13px">
   게시물 {job.media_scanned}개 스캔 · 되살린 DM {job.dm_messages_collected}통 ·
   링크 확보 {n_url}건 · 문구 확보 {n_msg}건 ·
-  Graph 호출 {sum((job.api_budget_state or {{}}).get('made', {{}}).values())}
-  {'· 귀속 정리: 시간 짝짓기 ' + str(attribution.get('moved', 0)) + '건 이동, 문구 경쟁 ' + str(attribution.get('demoted', 0)) + '건 내림' if attribution else ''}
+  Graph 호출 {calls} {attr_note}
   </span>
 </div>
 <h2 style="font-size:18px;margin:26px 0 4px">1. 캠페인으로 본 것 — {len(rows)}건</h2>
@@ -255,6 +263,15 @@ h2{{border-top:2px solid var(--line);padding-top:20px}}
             if c.offer_url
             else ""
         )
+        ai = r.get("ai_match")
+        ai_block = ""
+        if ai:
+            ok = ai.get("match")
+            ai_block = (
+                f'<div class="kv" style="color:{"#0a7" if ok else "#c62"}">'
+                f'🤖 AI 내용 대조: <b>{"같은 캠페인 맞음" if ok else "다른 캠페인으로 보임"}</b>'
+                f' (확신 {ai.get("confidence", 0):.0%}) — {esc(ai.get("reason"))}</div>'
+            )
         demoted = r.get("offer_demoted")
         warn = (
             f'<div class="kv warn">⚠ 같은 문구가 다른 게시물에서 {demoted.get("owner_hits")}명 지지 '
@@ -292,7 +309,7 @@ h2{{border-top:2px solid var(--line);padding-top:20px}}
   </div>
   <div class="col">
     <div class="lbl">복원된 DM 문구</div>
-    {dm_block}{gate_block}{warn}
+    {dm_block}{gate_block}{ai_block}{warn}
     <table style="margin-top:10px">
       {url_row}
       <tr><td>버튼</td><td>{esc(c.offer_button_label) or "—"}</td></tr>

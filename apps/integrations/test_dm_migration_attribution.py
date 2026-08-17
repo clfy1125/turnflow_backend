@@ -164,3 +164,50 @@ class TestResolve:
         stats = attribute.resolve([old, _rec("m2")])
         assert stats["moved"] == 0
         assert old["offer"] is not None
+
+
+# ══════════════ 4. AI 내용 대조 반영 ══════════════
+#
+# 지지비율만으로는 도달률 낮은 게시물이 억울하게 잘리고, 남의 게시물에서 흘러든 DM 이
+# 살아남는다. 낱말 겹침으로도 재봤지만(진짜 58% vs 가짜 6%) 같은 주제를 계속 올리는
+# 계정에서는 "인스타·수익화" 가 양쪽에 다 나와 안 갈렸다 → 의미 판단은 AI 에 맡긴다.
+
+
+class TestApplyVerdicts:
+    def test_match_rescues_a_weak_candidate(self):
+        rec = _rec("m1", offer=_slot("자료", [], hits=1))
+        rec["grade"] = "excluded"
+        stats = attribute.apply_verdicts(
+            [rec], {"m1": {"match": True, "confidence": 0.9, "reason": "같은 자료"}}
+        )
+        assert rec["grade"] == "needs_review"
+        assert rec["ai_match"]["reason"] == "같은 자료"
+        assert stats == {"checked": 1, "kept": 1, "dropped": 0}
+
+    def test_mismatch_drops_it(self):
+        rec = _rec("m1", offer=_slot("특강 신청", [], hits=2))
+        stats = attribute.apply_verdicts(
+            [rec], {"m1": {"match": False, "confidence": 0.8, "reason": "주제 다름"}}
+        )
+        assert rec["grade"] == "excluded"
+        assert rec["confirm_required"] is False
+        assert stats["dropped"] == 1
+
+    def test_no_verdict_leaves_it_alone(self):
+        """판정을 못 받으면 그대로 둔다 — LLM 실패가 후보를 지우면 안 된다(fail-open)."""
+        rec = _rec("m1", offer=_slot("자료", [], hits=2))
+        before = rec["grade"]
+        stats = attribute.apply_verdicts([rec], {})
+        assert rec["grade"] == before
+        assert "ai_match" not in rec
+        assert stats == {"checked": 0, "kept": 0, "dropped": 0}
+
+    def test_strong_support_is_not_sent_to_ai(self):
+        """지지 3명+ 는 이미 정밀도가 충분하다 — 비용을 거기 쓰지 않는다."""
+        from apps.integrations.dm_migration.pipeline import _needs_verify
+
+        assert _needs_verify({"offer": {"text": "x", "hits": 1}}) is True
+        assert _needs_verify({"offer": {"text": "x", "hits": 2}}) is True
+        assert _needs_verify({"offer": {"text": "x", "hits": 3}}) is False
+        assert _needs_verify({"offer": None, "gate": None}) is False
+        assert _needs_verify({"offer": {"text": "", "hits": 1}}) is False

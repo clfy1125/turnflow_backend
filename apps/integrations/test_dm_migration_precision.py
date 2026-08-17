@@ -269,7 +269,12 @@ def test_estimate_stage_runs_before_analysis(monkeypatch):
 
 @pytest.mark.django_db
 def test_posts_with_our_campaign_are_excluded(monkeypatch):
-    """우리 캠페인이 도는 게시물은 분석 대상에서 뺀다 — 자기 DM 오염 방지."""
+    """우리 캠페인이 도는 게시물만 뺀다 — 자기 DM 오염 방지.
+
+    댓글이 적은 게시물은 **빼지 않는다.** 댓글이 3개여도 캡션에 "댓글 남기면 자료 드려요"
+    라고 쓰여 있으면 캠페인이 맞다. 다만 DM 조회는 안 한다(표본이 없어 지지비율이 무의미).
+    댓글이 0개인 것만 볼 게 없어 제외한다.
+    """
     monkeypatch.setattr(settings, "DM_MIGRATION_FAKE_LLM", True)
     conn = _conn(_ws(_user()), mock_token=True)
     job = _job(conn)
@@ -278,6 +283,7 @@ def test_posts_with_our_campaign_are_excluded(monkeypatch):
         {"id": "mine", "comments_count": 50},
         {"id": "theirs", "comments_count": 50},
         {"id": "quiet", "comments_count": 1},
+        {"id": "silent", "comments_count": 0},
     ]
     AutoDMCampaign.objects.create(
         ig_connection=conn,
@@ -286,8 +292,11 @@ def test_posts_with_our_campaign_are_excluded(monkeypatch):
         media_id="mine",
         message_template="자료 드려요",
     )
-    ids = [m["id"] for m in runner._targets(media)]
-    assert ids == ["theirs"]  # 우리 것 제외 + 댓글 적은 것 제외
+    targets = runner._targets(media)
+    assert {m["id"]: deep for m, deep in targets} == {
+        "theirs": True,  # 댓글 50개 → DM 까지 조회
+        "quiet": False,  # 댓글 1개 → 판정만
+    }
 
 
 # ══════════════ 5. 적용 — 소급발송 강제 OFF + 링크 버튼 승격 ══════════════

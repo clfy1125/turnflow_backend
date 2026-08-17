@@ -195,6 +195,88 @@ def comment_shape(texts: list[str], *, tiny_chars: int = 3) -> dict:
     }
 
 
+# 어느 게시물에나 나오는 말 — 내용 대조에서 빼야 우연 일치가 안 생긴다.
+_GENERIC_WORDS = {
+    "감사합니다",
+    "감사",
+    "안녕하세요",
+    "여러분",
+    "댓글",
+    "디엠",
+    "링크",
+    "자료",
+    "확인",
+    "보내드릴게요",
+    "보내드려요",
+    "드릴게요",
+    "드려요",
+    "드립니다",
+    "받으세요",
+    "신청",
+    "팔로우",
+    "팔로",
+    "무료",
+    "지금",
+    "바로",
+    "아래",
+    "여기",
+    "그리고",
+    "하지만",
+    "제가",
+    "저는",
+    "이제",
+    "정말",
+    "너무",
+    "많이",
+    "합니다",
+    "했습니다",
+    "있습니다",
+    "없습니다",
+    "instagram",
+    "http",
+    "https",
+    "www",
+    "com",
+}
+_TOKEN_RE = re.compile(r"[가-힣]{2,}|[A-Za-z]{3,}")
+_MATCH_STEM = 4  # 한국어는 조사가 붙는다 — 앞 4글자로 대조해야 '가이드북을' ↔ '가이드북' 이 걸린다
+
+
+def content_tokens(text: str) -> list[str]:
+    """대조용 낱말 — 흔한 말은 뺀다."""
+    out, seen = [], set()
+    for t in _TOKEN_RE.findall(text or ""):
+        t = t.casefold()
+        if len(t) < 3 or t in _GENERIC_WORDS or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
+
+
+def content_match(caption: str, dm_text: str, trigger: str | None = None) -> list[str]:
+    """**게시물 글과 DM 문구가 같은 이야기인가** — 겹치는 고유 낱말을 돌려준다.
+
+    지지비율(몇 명이 받았나)만으로는 도달률 낮은 게시물이 억울하게 잘린다. 받은 사람이
+    1명이어도 캡션이 "AI 툴 7가지 정리했어요" 이고 DM 이 "요청하신 AI 툴 7가지 자료" 면
+    그건 이 게시물 캠페인이 맞다. 사람이 눈으로 하는 판단을 그대로 옮긴 것.
+
+    한국어는 조사가 붙으므로 앞 4글자로 대조한다('가이드북을' ↔ '가이드북').
+    흔한 말(감사합니다·자료·링크…)은 제외해야 아무 DM 이나 걸리지 않는다.
+    """
+    dm_norm = (dm_text or "").casefold()
+    if not dm_norm:
+        return []
+    matched = []
+    if trigger and len(trigger) >= 2 and trigger.casefold() in dm_norm:
+        matched.append(trigger)
+    for t in content_tokens(caption):
+        stem = t[:_MATCH_STEM]
+        if stem in dm_norm and t not in matched:
+            matched.append(t)
+    return matched
+
+
 def placeholder_normalize(text: str) -> str:
     """DM 템플릿 군집화용 — 개인화 토큰(URL/이메일/전화/@/숫자/이모지)을 슬롯으로 치환 후 정규화.
 

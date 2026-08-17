@@ -155,6 +155,31 @@ def regrade(recoveries: list[dict]) -> int:
     return changed
 
 
+def apply_verdicts(recoveries: list[dict], verdicts: dict) -> dict:
+    """AI 내용 대조 결과를 등급에 반영한다.
+
+    · match=True  → 지지가 1~2명이어도 **살린다**(도달률 낮은 게시물 구제).
+    · match=False → 남의 게시물에서 흘러든 것으로 보고 **내린다**.
+    · 판정 없음   → 손대지 않는다(fail-open — 후보를 잃지 않는다).
+
+    판정 근거는 기록에 남긴다 — 검수 리포트가 "AI 가 왜 그렇게 봤나" 를 보여준다.
+    """
+    kept = dropped = 0
+    for rec in recoveries:
+        v = verdicts.get(rec.get("media_id"))
+        if not v:
+            continue
+        rec["ai_match"] = v
+        if v.get("match"):
+            rec["grade"] = "needs_review" if rec.get("grade") == "excluded" else rec["grade"]
+            kept += 1
+        else:
+            rec["grade"] = "excluded"
+            rec["confirm_required"] = False
+            dropped += 1
+    return {"checked": len(verdicts), "kept": kept, "dropped": dropped}
+
+
 def resolve(recoveries: list[dict]) -> dict:
     """수집 종료 후 귀속 정리 일괄 실행. 통계 반환."""
     moved = by_time(recoveries)

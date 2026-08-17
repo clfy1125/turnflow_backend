@@ -246,6 +246,7 @@ def recover_post(
     big: int = C.BIG_PROBE,
     campaign: int = C.CAMPAIGN_PROBE,
     workers: int = C.PROBE_WORKERS,
+    probe: bool = True,
 ) -> PostRecovery:
     """게시물 1건을 복원한다.
 
@@ -259,13 +260,19 @@ def recover_post(
     out = PostRecovery(media_id=mid)
 
     commenters, more = C.collect_commenters(ctx, mid, media_ts=mts, pages=1)
-    if not commenters:
-        return out
-    verdict = judge_content(media, commenters)
+    # 댓글을 못 가져와도 **캡션만으로 판정은 남긴다.** 예전에는 여기서 그냥 return 해서
+    # "댓글에 ○○ 남겨주세요" 라고 대놓고 쓰인 게시물이 점수 0 으로 사라졌다.
+    verdict = judge_content(media, commenters or [])
     out.trigger, out.repetition = verdict.trigger, verdict.repetition
     out.is_campaign_signal = verdict.is_campaign
     out.content_score, out.content_reasons = verdict.score, verdict.reasons
     trigger = verdict.trigger
+    if not commenters:
+        return out
+    if not probe:
+        # 가벼운 경로 — 댓글이 적어 지지비율을 낼 수 없는 게시물. 판정만 하고 DM 은 안 본다
+        # (표본이 1~7명이면 '몇 명이 같은 문구를 받았나' 가 의미를 못 가진다).
+        return out
 
     tmpl: dict = {}
     probed_ids: set = set()
