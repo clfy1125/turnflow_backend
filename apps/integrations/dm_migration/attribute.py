@@ -27,6 +27,7 @@ import re
 from collections import defaultdict
 
 from .analyze import wilson_lower_bound
+from .collect import AUTO_DM_MAX_GAP
 from .collect import CLOCK_SKEW_TOLERANCE as CLOCK_SKEW
 from .collect import MANUAL_DM_MIN_GAP as MANUAL_GAP
 
@@ -48,11 +49,21 @@ def _norm_template(text: str) -> str:
 
 
 def _repack(slot: dict, probed: int) -> None:
-    """users 가 바뀐 뒤 hits/ratio/score 를 다시 계산한다."""
-    hits = len(slot.get("users") or [])
+    """users 가 바뀐 뒤 **근거에서 파생된 모든 수치**를 다시 계산한다.
+
+    ⚠️ ``auto_hits``/``gap_median`` 을 빼먹으면 안 된다. 자동채택 ②(자동 발송 지문)가
+    ``auto_hits`` 로 판정하므로, 귀속 정리로 근거를 걷어낸 뒤에도 옛 숫자가 남아 있으면
+    **방금 오귀속으로 판정한 것을 그대로 자동채택한다.** 파생 수치는 여기 한 곳에서만
+    만든다(:func:`recover._pack` 과 정의가 같아야 한다).
+    """
+    users = slot.get("users") or []
+    hits = len(users)
     slot["hits"] = hits
     slot["ratio"] = round(hits / max(probed, 1), 3)
     slot["score"] = round(wilson_lower_bound(hits, max(probed, 1)), 3)
+    gaps = sorted(g for g in (ev.get("g") for ev in users if isinstance(ev, dict)) if g is not None)
+    slot["gap_median"] = gaps[len(gaps) // 2] if gaps else None
+    slot["auto_hits"] = sum(1 for g in gaps if 0 <= g <= AUTO_DM_MAX_GAP)
 
 
 def drop_impossible(recoveries: list[dict]) -> int:
@@ -158,7 +169,15 @@ def by_template(recoveries: list[dict]) -> int:
             # 대신 지지 근거만 무효화하고(등급이 내려간다) 표시를 남긴다 —
             # 사용자는 "다른 게시물에서 더 많이 쓰인 문구" 라는 안내와 함께 문구를 받는다.
             r["offer_demoted"] = {"reason": "owned_elsewhere", "owner_hits": best, "hits": hits}
-            r["offer"] = {**r["offer"], "hits": 0, "ratio": 0.0, "score": 0.0, "shared": True}
+            # auto_hits 도 같이 0 으로 — 안 하면 자동채택 ②(지문)가 방금 내린 것을 되살린다.
+            r["offer"] = {
+                **r["offer"],
+                "hits": 0,
+                "ratio": 0.0,
+                "score": 0.0,
+                "auto_hits": 0,
+                "shared": True,
+            }
             demoted += 1
     if demoted:
         logger.info("DM이전 귀속: 문구 경쟁으로 오퍼 %d건 내림", demoted)

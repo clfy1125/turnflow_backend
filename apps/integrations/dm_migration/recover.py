@@ -59,6 +59,14 @@ GRADE_AUTO_RATIO = 0.60  # 받은 비율 — 연구가 정밀도 100% 를 측정
 # 6/10(60%, 하한 0.313)·8/12(67%, 0.391) 처럼 연구가 검증한 구간이 막힌다.
 # 반대로 3/3(100%)은 하한 0.438 로 통과해버려 방어가 거꾸로 걸린다.
 MIN_PROBED_FOR_AUTO = 5  # 3/3 같은 "몇 명 안 봤는데 다 맞음" 을 걸러낸다
+# ⚠️ **비율은 조회 인원을 늘리면 저절로 떨어진다.** 조회를 10명 → 50명으로 키운 뒤
+#    실측(@highestlevel33, 251건 시점): 검수필요 77건 중 **65건이 "지지 3명+ 인데 비율<60%"**
+#    였고, 그 안에는 `29/49(비율 0.59) · 댓글 후 34초` 처럼 자동 발송이 명백한 건이 줄줄이
+#    있었다. 깊게 파면 캠페인 시작 전 댓글·키워드 불일치 댓글·DM 차단 계정이 분모에 섞인다.
+#    비율 컷은 10명 조회 시절 기준이라, 조회를 늘린 개선이 스스로 판정을 망가뜨렸다.
+# → 그래서 자동채택 두 번째 문을 **'몇 명이 몇 초 안에 받았나'**(auto_hits)로 만든다.
+#    분모가 없으므로 조회를 더 깊게 파도 판정이 흔들리지 않는다.
+AUTO_FAST_MIN_HITS = 5
 GRADE_REVIEW = 0.40  # 확인 권장 — 실측 정밀도 77%
 MIN_SUPPORT_HITS = 3  # 표본이 작을 때 비율만 믿지 않기 위한 절대 하한
 GRADE_AUTO = GRADE_AUTO_RATIO  # 하위 호환(외부 참조)
@@ -134,6 +142,18 @@ class PostRecovery:
         if (
             ratio >= GRADE_AUTO_RATIO
             and hits >= MIN_SUPPORT_HITS
+            and self.probed >= MIN_PROBED_FOR_AUTO
+        ):
+            return "auto_draft"
+        # 자동채택 ② — **자동 발송 지문**. 사람이 흉내낼 수 없는 것은 비율이 아니라 속도다.
+        # "5명 이상이 자기 댓글 60초 안에 **같은 문구**를 받았다" 면 비율이 얼마든 캠페인이다.
+        # 게이트가 아니라 오퍼 슬롯만 본다 — 옮길 문구가 있어야 후보로서 의미가 있고,
+        # 게이트 문구는 원래 전 게시물에 공유돼 이 잣대로 재면 안 된다.
+        # (문구 경쟁에서 내려간 오퍼는 attribute._repack 이 auto_hits 를 0 으로 만든다.)
+        offer = self.offer or {}
+        if (
+            int(offer.get("auto_hits") or 0) >= AUTO_FAST_MIN_HITS
+            and (offer.get("text") or "").strip()
             and self.probed >= MIN_PROBED_FOR_AUTO
         ):
             return "auto_draft"

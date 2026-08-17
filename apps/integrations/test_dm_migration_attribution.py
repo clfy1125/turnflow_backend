@@ -251,7 +251,10 @@ class TestApplyVerdicts:
 def _slot_g(text, gaps, *, url="", hits=None):
     users = [{"u": f"u{i}", "m": f"d{i}", "g": g} for i, g in enumerate(gaps)]
     s = _slot(text, users, url=url, hits=hits)
+    # recover._pack 과 같은 정의로 파생 수치를 만든다 — 여기서 갈리면 테스트가 현실을
+    # 검증하지 않는다.
     s["gap_median"] = sorted(gaps)[len(gaps) // 2] if gaps else None
+    s["auto_hits"] = sum(1 for g in gaps if 0 <= g <= 60)
     return s
 
 
@@ -328,3 +331,102 @@ class TestTimingRule:
         assert stats["impossible"] == 1
         assert stale["offer"] is None
         assert good["offer"]["hits"] == 1
+
+
+# ══════════════ 6. 자동 발송 지문 — 비율이 아니라 속도로 자동채택 ══════════════
+#
+# 왜 필요한가 (실측 @highestlevel33, 2026-08-17 · 251건 시점):
+#   조회 인원을 10명 → 50명으로 키우자 **비율이 저절로 떨어졌다.** 깊게 파면 캠페인
+#   시작 전 댓글·키워드 불일치 댓글·DM 차단 계정이 분모에 섞이기 때문이다.
+#   그 결과 검수필요 77건 중 **65건이 "지지 3명+ 인데 비율<60%"** 였고, 그 안에
+#   `29/49(0.59) · 댓글 후 34초`, `28/48(0.58) · 32초` 처럼 자동 발송이 명백한 건이
+#   줄줄이 있었다. 비율 컷은 10명 조회 시절 기준이라 개선이 스스로 판정을 망가뜨렸다.
+# → 분모가 없는 잣대(auto_hits = 60초 내 수신 인원)로 두 번째 자동채택 문을 만든다.
+
+
+class TestFastSendFingerprint:
+    def _rec_obj(self, *, probed, gaps, url="https://x", text="자료"):
+        from apps.integrations.dm_migration.recover import PostRecovery
+
+        r = PostRecovery(media_id="m1", probed=probed, content_score=0.75, is_campaign_signal=True)
+        r.offer = _slot_g(text, gaps, url=url)
+        return r
+
+    def test_low_ratio_but_many_fast_sends_is_auto(self):
+        """29/49 = 0.59 인데 전원이 30초 안에 받았다 → 사람이 못 하는 일이다."""
+        r = self._rec_obj(probed=49, gaps=[30] * 29)
+        assert r.offer["ratio"] == 0.0  # 비율 컷(0.60)에는 못 미치게 둔 상태
+        assert r.grade == "auto_draft"
+        assert r.confirm_required is False
+
+    def test_ratio_gate_alone_would_have_held_it(self):
+        """비율만 보던 규칙이라면 이 건은 검수필요였다 — 회귀 감시용."""
+        from apps.integrations.dm_migration import recover
+
+        r = self._rec_obj(probed=49, gaps=[30] * 29)
+        hits, ratio = r.offer["hits"], r.offer["hits"] / r.probed
+        assert ratio < recover.GRADE_AUTO_RATIO and hits >= recover.MIN_SUPPORT_HITS
+        assert r.offer["auto_hits"] >= recover.AUTO_FAST_MIN_HITS
+
+    def test_four_fast_sends_is_not_enough(self):
+        """지문 컷 아래(4명)는 승격하지 않는다 — 실측에서 gap 52초/4명은 약했다."""
+        r = self._rec_obj(probed=49, gaps=[52] * 4 + [90000] * 3)
+        assert r.grade != "auto_draft"
+
+    def test_gate_only_is_not_auto_adopted(self):
+        """게이트 문구는 원래 전 게시물 공유다. 옮길 오퍼가 없으면 자동채택 안 한다."""
+        from apps.integrations.dm_migration.recover import PostRecovery
+
+        r = PostRecovery(media_id="m1", probed=49, content_score=0.75, is_campaign_signal=True)
+        r.gate = _slot_g("팔로우 확인 부탁드려요", [5] * 20)
+        assert r.offer is None
+        assert r.grade != "auto_draft"
+
+    def test_shallow_probe_still_blocked(self):
+        """조회 인원이 적으면 지문이어도 승격하지 않는다(초소표본 방어 유지)."""
+        r = self._rec_obj(probed=4, gaps=[5] * 6)
+        assert r.grade != "auto_draft"
+
+
+class TestDerivedNumbersFollowEvidence:
+    """근거가 걷힌 뒤 파생 수치가 남아 있으면 **방금 내린 것을 자동채택한다.**"""
+
+    def test_impossible_removal_recomputes_auto_hits(self):
+        rec = _rec("m1", probed=49, offer=_slot_g("자료", [8] * 6 + [500000] * 2, url="https://x"))
+        assert rec["offer"]["auto_hits"] == 6
+        attribute.drop_impossible([rec])
+        assert rec["offer"]["hits"] == 6
+        assert rec["offer"]["auto_hits"] == 6  # 살아남은 근거만 센다
+        assert rec["offer"]["gap_median"] == 8
+
+    def test_time_pairing_loss_lowers_auto_hits(self):
+        """같은 DM 을 두 게시물이 주장하면 가까운 쪽만 남고, 진 쪽 지문도 줄어야 한다."""
+        near = _rec("m-near", probed=49, offer=_slot("자료", [], url="https://x"))
+        far = _rec("m-far", probed=49, offer=_slot("자료", [], url="https://x"))
+        shared = [{"u": f"u{i}", "m": f"d{i}", "g": 5} for i in range(6)]
+        near["offer"]["users"] = [dict(ev) for ev in shared]
+        far["offer"]["users"] = [dict(ev, g=40) for ev in shared]
+        for r in (near, far):
+            r["offer"]["auto_hits"] = 6
+            r["offer"]["gap_median"] = 5
+        attribute.by_time([near, far])
+        assert near["offer"]["auto_hits"] == 6
+        assert far["offer"]["auto_hits"] == 0  # 전부 near 로 갔다
+        assert far["offer"]["gap_median"] is None
+
+    def test_template_demotion_zeroes_the_fingerprint(self):
+        """문구 경쟁에서 내려간 오퍼가 지문으로 되살아나면 안 된다."""
+        owner = _rec("m-owner", probed=49, offer=_slot_g("같은 자료", [5] * 30, url="https://x"))
+        loser = _rec("m-loser", probed=49, offer=_slot_g("같은 자료", [5] * 2, url="https://x"))
+        loser["offer"]["auto_hits"] = 9  # 오귀속으로 부풀려진 상태를 흉내낸다
+        attribute.by_template([owner, loser])
+        assert loser["offer"]["auto_hits"] == 0
+        assert loser["offer"]["shared"] is True
+
+    def test_resolve_then_regrade_does_not_auto_adopt_demoted(self):
+        """resolve 전체를 거쳐도 내려간 건은 자동채택으로 안 올라간다."""
+        owner = _rec("m-owner", probed=49, offer=_slot_g("같은 자료", [5] * 30, url="https://x"))
+        loser = _rec("m-loser", probed=49, offer=_slot_g("같은 자료", [5] * 2, url="https://x"))
+        attribute.resolve([owner, loser])
+        assert owner["grade"] == "auto_draft"
+        assert loser["grade"] != "auto_draft"
