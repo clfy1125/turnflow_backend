@@ -928,3 +928,107 @@ class TestExhaustionRules:
         assert C.EXHAUSTIVE_COMMENT_PAGES >= 200  # 댓글 1만 개를 덮는다
         assert C.CONVO_DEEP_MAX_PAGES >= 10  # 대화 1,000통 이상 거슬러 간다
         assert C.INDEX_SWEEP_MAX >= 10000  # 색인 대조는 공짜라 상한이 사실상 없다
+
+
+class TestExpensivePathIsGatedByContentScore:
+    """비싼 경로는 **유력 후보에만** — 점수 낮은 게시물은 거기서 종료(2026-08-17 제품 결정).
+
+    실측(@highestlevel33 455건): 비싼 경로 대상은 35건(7.7%)뿐이고
+    183건은 글 점수 <0.35 라 씨앗만 보고 끝난다. 추가 호출 2,631 / 상한 16,762.
+    """
+
+    def _ctx(self):
+        from apps.integrations.dm_migration import collect as C
+
+        return C.CollectContext(
+            ig="1", token="mock", mock=True, budget=C.Budget(), pacer=C.RateLimiter(0.1)
+        )
+
+    def _spy(self, monkeypatch):
+        """수집 함수 호출을 기록한다 — 어느 경로가 열렸는지 본다."""
+        from apps.integrations.dm_migration import collect as C
+        from apps.integrations.dm_migration import recover as R
+
+        calls = {
+            "comment_pages": [],
+            "deep_convo": 0,
+            "index_sweep": 0,
+            "probed": 0,
+            "ncmt": 50,
+            "text": lambda i: "ai",
+        }
+
+        # 댓글러 수는 **페이지 수에 비례**해야 한다(1페이지 50개). 항상 50명만 주면
+        # 유료 조회가 전원을 덮어버려 '색인 전수 대조' 가 할 일이 없어진다 — 실제와 다르다.
+        def fake_collect(ctx, mid, *, media_ts=None, pages=1, campaign_window_days=3):
+            calls["comment_pages"].append(pages)
+            n = min(pages * 50, calls["ncmt"])
+            users = [
+                {"id": f"u{i}", "ts": media_ts, "text": calls["text"](i), "replied": False}
+                for i in range(n)
+            ]
+            return users, n < calls["ncmt"]
+
+        def fake_fetch(ctx, u, **kw):
+            calls["probed"] += 1
+            return []
+
+        def fake_index(ctx, u, **kw):
+            calls["index_sweep"] += 1
+            return [], False
+
+        def fake_deep(ctx, u, **kw):
+            calls["deep_convo"] += 1
+            return []
+
+        monkeypatch.setattr(C, "collect_commenters", fake_collect)
+        monkeypatch.setattr(C, "fetch_outbound_for_commenter", fake_fetch)
+        monkeypatch.setattr(C, "outbound_from_index", fake_index)
+        monkeypatch.setattr(C, "fetch_outbound_deep", fake_deep)
+        monkeypatch.setattr(R.C, "collect_commenters", fake_collect)
+        monkeypatch.setattr(R.C, "fetch_outbound_for_commenter", fake_fetch)
+        monkeypatch.setattr(R.C, "outbound_from_index", fake_index)
+        monkeypatch.setattr(R.C, "fetch_outbound_deep", fake_deep)
+        return calls
+
+    def test_weak_post_stops_early(self, monkeypatch):
+        """캠페인 기미가 없는 게시물은 댓글을 더 파지도, 대화를 파지도 않는다."""
+        from apps.integrations.dm_migration.recover import recover_post
+
+        calls = self._spy(monkeypatch)
+        calls["ncmt"] = 5000
+        calls["text"] = lambda i: f"사진 너무 좋아요 {i}번째로 왔습니다 오늘도 잘 보고 갑니다"
+        media = {
+            "id": "m-weak",
+            "comments_count": 5000,
+            "caption": "오늘 산책하면서 찍은 사진들 🙂 다들 좋은 하루 보내세요",
+            "timestamp": "2024-02-13T14:47:05+0000",
+        }
+        r = recover_post(self._ctx(), media, is_own_dm=lambda *a: False)
+        assert r.content_score < 0.35, r.content_reasons
+        assert calls["comment_pages"] == [1], "댓글을 더 파면 안 된다"
+        assert calls["deep_convo"] == 0, "대화 끝까지 파기는 유력 후보에만"
+        assert calls["index_sweep"] == 0
+
+    def test_strong_post_opens_every_path(self, monkeypatch):
+        """글이 '캠페인 확실' 이라 말하면 두 축을 다 소진한다."""
+        from apps.integrations.dm_migration import collect as C
+        from apps.integrations.dm_migration.recover import recover_post
+
+        calls = self._spy(monkeypatch)
+        calls["ncmt"] = 10050
+        media = {
+            "id": "m-strong",
+            "comments_count": 10050,
+            "caption": (
+                "저를 팔로우하고 댓글로 'ai' 달면 1인 기업 필수 ai 사이트 10가지 보내드려요 🔥"
+            ),
+            "timestamp": "2024-02-13T14:47:05+0000",
+        }
+        ctx = self._ctx()
+        ctx.outbox = {"nobody": []}  # 색인이 있는 상태
+        r = recover_post(ctx, media, is_own_dm=lambda *a: False)
+        assert r.content_score >= 0.60, r.content_reasons
+        assert C.EXHAUSTIVE_COMMENT_PAGES in calls["comment_pages"], "첫 댓글까지 파야 한다"
+        assert calls["index_sweep"] > 0, "색인 전수 대조가 돌아야 한다(공짜)"
+        assert calls["deep_convo"] > 0, "대화도 처음까지 넘겨야 한다"

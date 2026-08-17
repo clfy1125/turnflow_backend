@@ -597,7 +597,12 @@ def recover_post(
             # → 엣지 페이징 43통(3년 6개월치). "오래된 DM 은 API 에 없다" 는 결론은 틀렸다.
             # 여기까지 하고도 없으면 **그건 인정하고** 사람에게 넘긴다(제품 결정).
             if not _found_offer() and not ctx.budget.total_hit():
-                _probe_deep(order[: C.CONVO_DEEP_MAX_USERS])
+                # ⚠️ order(최신·최고령 교대)를 쓰면 안 된다. 최근 댓글러는 캠페인이 꺼진
+                # 뒤라 받은 게 없고, 받았다면 기본 조회로 이미 나왔다 — 깊게 파는 의미가
+                # 없다. **게시 시점에 가까운 댓글러**가 오래된 DM 을 가진 사람들이다.
+                _probe_deep(
+                    C.order_deep_targets(commenters, mts, out.trigger)[: C.CONVO_DEEP_MAX_USERS]
+                )
         if tmpl:
             _probe(order[: (big if ncmt >= C.BIG_COMMENTS else full)])
             _resolve_ambiguity()

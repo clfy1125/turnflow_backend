@@ -670,6 +670,32 @@ def order_probe_targets(commenters: list[dict], trigger: str | None = None) -> l
     return out
 
 
+def order_deep_targets(
+    commenters: list[dict], media_ts=None, trigger: str | None = None
+) -> list[dict]:
+    """**대화 끝까지 파기** 전용 우선순위 — 게시 시점에 가까운 댓글러부터.
+
+    :func:`order_probe_targets` 와 목적이 다르다. 그쪽은 "이 게시물 캠페인의 지지비율" 을
+    재려고 최신·최고령을 교대로 본다. 이쪽은 **"오래된 DM 이 이후 대화에 밀려 안 보이는
+    사람"** 을 찾는 일이다. 최근에 댓글 단 사람은 캠페인이 이미 꺼진 뒤라 받은 게 없고,
+    받았다면 기본 조회(최근 25통)로 이미 나왔다 — 깊게 파는 의미가 없다.
+
+    실측(@highestlevel33, 2024-02 게시물): 댓글 1페이지가 2024-12~2026-02 였다.
+    게시 시점 댓글러는 200페이지 뒤에 있고, 그 사람들이 캠페인 DM 을 받은 사람들이다.
+    """
+    t = (trigger or "").replace(" ", "")
+
+    def key(u):
+        # ①트리거를 실제로 단 사람 ②게시 시점에 가까운 순
+        hit = 0 if (t and t in (u.get("text") or "").replace(" ", "")) else 1
+        ts = u.get("ts")
+        if media_ts and ts:
+            return (hit, abs((ts - media_ts).total_seconds()))
+        return (hit, float("inf") if ts is None else -ts.timestamp())
+
+    return sorted(commenters, key=key)
+
+
 def build_outbound_index(outbound: list[dict]) -> dict:
     """발신 DM 목록 → ``{수신자id: [메시지, ...]}``.
 
