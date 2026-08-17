@@ -333,7 +333,11 @@ def test_apply_forces_backfill_off_and_promotes_link_to_button():
 
 
 @pytest.mark.django_db
-def test_confirm_link_edit_then_apply_uses_confirmed_url():
+def test_confirm_link_edit_then_apply_uses_confirmed_url(settings):
+    """⚠️ 2026-08-18 부터 `needs_review` 는 고객 API 에서 숨는다(visibility). 이 흐름은
+    그 밴드를 다시 열 때를 위한 계약이므로 설정으로 열어놓고 검증한다 — 지우면 다시 열
+    때 깨진 걸 모른다."""
+    settings.DM_MIGRATION_VISIBLE_BANDS = ["auto_draft", "needs_review", "excluded"]
     from apps.integrations.migration_views import apply_candidate
 
     user = _user()
@@ -369,7 +373,11 @@ def test_confirm_link_edit_then_apply_uses_confirmed_url():
 
 
 @pytest.mark.django_db
-def test_confirm_link_reject_dismisses_candidate():
+def test_confirm_link_reject_dismisses_candidate(settings):
+    """⚠️ 2026-08-18 부터 `needs_review` 는 고객 API 에서 숨는다(visibility). 이 흐름은
+    그 밴드를 다시 열 때를 위한 계약이므로 설정으로 열어놓고 검증한다 — 지우면 다시 열
+    때 깨진 걸 모른다."""
+    settings.DM_MIGRATION_VISIBLE_BANDS = ["auto_draft", "needs_review", "excluded"]
     user = _user()
     ws = _ws(user)
     conn = _conn(ws)
@@ -392,7 +400,11 @@ def test_confirm_link_reject_dismisses_candidate():
 
 
 @pytest.mark.django_db
-def test_candidates_list_pagination_search_ordering_and_summary():
+def test_candidates_list_pagination_search_ordering_and_summary(settings):
+    """⚠️ 2026-08-18 부터 `needs_review` 는 고객 API 에서 숨는다(visibility). 이 흐름은
+    그 밴드를 다시 열 때를 위한 계약이므로 설정으로 열어놓고 검증한다 — 지우면 다시 열
+    때 깨진 걸 모른다."""
+    settings.DM_MIGRATION_VISIBLE_BANDS = ["auto_draft", "needs_review", "excluded"]
     user = _user()
     ws = _ws(user)
     conn = _conn(ws)

@@ -614,3 +614,102 @@ def test_purge_raw_and_stale_sweeper():
     stale.refresh_from_db()
     assert stale.status == DMMigrationJob.Status.FAILED
     assert stale.error_code == "stalled"
+
+
+# ══════════════ 고객에게 넘기는 것 = 확실한 것만 (2026-08-18 제품 결정) ══════════════
+#
+# needs_review 는 **DB 에는 남기고 고객 API 에서만 숨는다.** 우리가 확신하지 못한 것을
+# 고객에게 "검수해 주세요" 로 떠넘기지 않는다. 지우지 않는 이유: 판정을 고칠 근거가
+# 되고(ops 리포트가 본다), 나중에 판정이 좋아지면 그대로 열 수 있다.
+
+
+@pytest.mark.django_db
+class TestCustomerSeesOnlyCertainCandidates:
+    def _setup(self):
+        user = _user()
+        ws = _ws(user)
+        conn = _conn(ws)
+        job = _job(conn, status=DMMigrationJob.Status.READY)
+        made = {}
+        for band, mid in (
+            (DMCampaignCandidate.Band.AUTO_DRAFT, "m-auto"),
+            (DMCampaignCandidate.Band.NEEDS_REVIEW, "m-review"),
+            (DMCampaignCandidate.Band.EXCLUDED, "m-excl"),
+        ):
+            made[band] = DMCampaignCandidate.objects.create(
+                job=job,
+                ig_connection=conn,
+                band=band,
+                media_id=mid,
+                draft_name=f"{band} 캠페인",
+                draft_opening_message="자료 드려요",
+                offer_url="https://ex.co/a",
+                suggested_keywords=["자료"],
+            )
+        job.candidates_created = 3
+        job.save(update_fields=["candidates_created"])
+        return _client(user), ws, job, made
+
+    def test_list_shows_only_auto_draft(self):
+        client_auth, ws, job, made = self._setup()
+        r = client_auth.get(f"{JOBS_URL}{job.id}/candidates/?workspace_id={ws.id}")
+        assert r.status_code == 200, r.data
+        got = {row["media_id"] for row in r.data["results"]}
+        assert got == {"m-auto"}, got
+        assert r.data["count"] == 1
+
+    def test_asking_for_a_hidden_band_returns_nothing(self):
+        """band=needs_review 로 직접 물어봐도 안 준다 — 필터를 우회할 수 없다."""
+        client_auth, ws, job, made = self._setup()
+        r = client_auth.get(
+            f"{JOBS_URL}{job.id}/candidates/?workspace_id={ws.id}&band=needs_review"
+        )
+        assert r.status_code == 200
+        assert r.data["count"] == 0
+
+    def test_summary_counts_match_the_list(self):
+        """타일 숫자와 목록이 어긋나면 「N개 찾음」을 눌렀을 때 그만큼 안 나온다."""
+        client_auth, ws, job, made = self._setup()
+        r = client_auth.get(f"{JOBS_URL}{job.id}/candidates/summary/?workspace_id={ws.id}")
+        assert r.status_code == 200, r.data
+        assert r.data["total"] == 1
+        assert r.data["by_band"] == {"auto_draft": 1}
+
+    def test_job_counters_report_visible_only(self):
+        client_auth, ws, job, made = self._setup()
+        r = client_auth.get(f"{JOBS_URL}{job.id}/?workspace_id={ws.id}")
+        assert r.status_code == 200, r.data
+        assert r.data["candidate_count"] == 1
+        assert r.data["counters"]["candidates_created"] == 1
+
+    def test_hidden_candidate_cannot_be_applied_or_dismissed(self):
+        """숨은 후보는 **존재 자체를 알리지 않는다**(404). 403 이면 '있긴 있다' 가 샌다."""
+        client_auth, ws, job, made = self._setup()
+        cid = made[DMCampaignCandidate.Band.NEEDS_REVIEW].id
+        for path in ("apply", "dismiss"):
+            r = client_auth.post(f"{CAND_URL}{cid}/{path}/?workspace_id={ws.id}", {}, "json")
+            assert r.status_code == 404, (path, r.status_code, r.data)
+
+    def test_bulk_apply_ignores_hidden_bands(self):
+        """클라이언트가 bands 로 숨은 밴드를 지정해도 적용되지 않는다."""
+        client_auth, ws, job, made = self._setup()
+        r = client_auth.post(
+            f"{JOBS_URL}{job.id}/apply-all/?workspace_id={ws.id}",
+            {"bands": ["needs_review"]},
+            "json",
+        )
+        assert r.status_code in (200, 201), r.data
+        assert AutoDMCampaign.objects.filter(ig_connection__workspace=ws).count() == 0
+
+    def test_rows_stay_in_the_database(self):
+        """숨긴다 ≠ 지운다. ops 리포트가 봐야 판정을 고칠 근거가 남는다."""
+        _c, ws, job, made = self._setup()
+        assert job.candidates.count() == 3
+        assert job.candidates.filter(band="needs_review").count() == 1
+
+    def test_setting_can_open_it_back_up(self, settings):
+        """나중에 판정이 좋아지면 배포 없이 열 수 있어야 한다."""
+        client_auth, ws, job, made = self._setup()
+        settings.DM_MIGRATION_VISIBLE_BANDS = ["auto_draft", "needs_review"]
+        r = client_auth.get(f"{JOBS_URL}{job.id}/candidates/?workspace_id={ws.id}")
+        assert {row["media_id"] for row in r.data["results"]} == {"m-auto", "m-review"}

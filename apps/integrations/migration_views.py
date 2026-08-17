@@ -24,6 +24,7 @@ from rest_framework.response import Response
 
 from apps.workspace.models import Workspace
 
+from .dm_migration import visibility
 from .migration_serializers import (
     BulkApplyRequestSerializer,
     CandidateApplyRequestSerializer,
@@ -645,7 +646,7 @@ class DMMigrationJobViewSet(_WorkspaceScopedViewSet):
         workspace = self._get_workspace(request)
         job = self._get_job(pk, workspace)
         heal_orphaned_applied(job)
-        qs = _filter_candidates(job.candidates.all(), request.query_params)
+        qs = _filter_candidates(visibility.visible(job.candidates.all()), request.query_params)
 
         page_size = min(max(_int_param(request, "page_size", 20), 1), 100)
         page = max(_int_param(request, "page", 1), 1)
@@ -704,7 +705,9 @@ class DMMigrationJobViewSet(_WorkspaceScopedViewSet):
         workspace = self._get_workspace(request)
         job = self._get_job(pk, workspace)
         heal_orphaned_applied(job)
-        qs = job.candidates.all()
+        # 고객에게 안 넘기는 밴드는 여기서도 빠진다 — 타일 숫자와 목록이 어긋나면
+        # "N개 찾음" 을 눌렀을 때 그만큼 안 나온다.
+        qs = visibility.visible(job.candidates.all())
         agg = qs.aggregate(first=Min("media_timestamp"), last=Max("media_timestamp"))
         return Response(
             {
@@ -765,6 +768,8 @@ class DMMigrationJobViewSet(_WorkspaceScopedViewSet):
         bands = req.validated_data.get("bands") or [DMCampaignCandidate.Band.AUTO_DRAFT]
 
         heal_orphaned_applied(job)
+        # 클라이언트가 숨은 밴드를 지정해도 적용되지 않게 교집합을 취한다.
+        bands = [b for b in bands if b in visibility.visible_bands()]
         qs = job.candidates.filter(band__in=bands).exclude(media_id="")
         applied, failed, skipped = [], [], 0
         for cand in qs:
@@ -906,7 +911,9 @@ class DMCampaignCandidateViewSet(_WorkspaceScopedViewSet):
             .select_related("ig_connection")
             .first()
         )
-        if not cand:
+        if not cand or not visibility.is_visible(cand):
+            # 숨은 밴드는 **존재 자체를 알리지 않는다.** 403 을 주면 "있긴 있다" 가 새고,
+            # 프론트는 처리 못 하는 오류를 받는다.
             raise NotFound("후보를 찾을 수 없습니다.")
         return cand
 

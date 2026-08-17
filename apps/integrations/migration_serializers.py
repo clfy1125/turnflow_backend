@@ -7,7 +7,14 @@ from rest_framework import serializers
 
 from apps.ai_jobs.models import AiJob
 
+from .dm_migration import visibility
 from .models import AutoDMCampaign, DMCampaignCandidate, DMMigrationJob
+
+
+def _visible_count(job) -> int:
+    """고객에게 넘기는 후보 수. 화면의 「N개 찾음」이 목록과 어긋나지 않게 한 곳에서 센다."""
+    return visibility.visible(job.candidates.all()).count()
+
 
 # 실제로 채워지는 transfer.drops 코드 — 관측으로 판정 가능한 것만 넣는다.
 # (프론트가 들고 있는 12종 중 나머지는 원본 DM 만 봐서는 알 수 없어 **절대 안 내려간다**.)
@@ -102,7 +109,8 @@ class DMMigrationJobSerializer(serializers.ModelSerializer):
             "conversations_scanned": obj.conversations_scanned,
             "dm_messages_collected": obj.dm_messages_collected,
             "templates_found": obj.templates_found,
-            "candidates_created": obj.candidates_created,
+            # 고객에게 넘기는 것만 센다 — DB 에는 검수필요분도 남아 있다(visibility).
+            "candidates_created": _visible_count(obj),
         }
 
     def get_estimate(self, obj) -> dict | None:
@@ -136,7 +144,7 @@ class DMMigrationJobSerializer(serializers.ModelSerializer):
 
     def get_candidate_count(self, obj) -> int:
         # prefetch/annotate 없으면 쿼리 1회 — 폴링 빈도 감안 허용(후보 수는 작다).
-        return obj.candidates.count()
+        return _visible_count(obj)
 
 
 class DMMigrationJobStartResponseSerializer(serializers.Serializer):
