@@ -503,3 +503,80 @@ class TestOutboxSlicing:
         assert status in (DMMigrationJob.Status.READY, DMMigrationJob.Status.PARTIAL)
         job.refresh_from_db()
         assert job.stage_data["outbox_done"] is False
+
+    @pytest.mark.django_db
+    def test_outbox_stops_before_eating_all_slices(self, monkeypatch):
+        """발신함이 슬라이스를 다 먹으면 **복원 0건으로 종결**된다 — 상한이 그걸 막는다.
+
+        실측(@highestlevel33): 대화가 아주 많아 130분·6슬라이스를 발신함에만 쓰고도 게시물
+        조회가 0 이었다. conversations_pages 상한은 호출 1회당이라 슬라이스마다 초기화된다.
+        """
+        monkeypatch.setattr(settings, "DM_MIGRATION_FAKE_LLM", True)
+        for name in ("fetch_media", "collect_commenters", "fetch_outbound_for_commenter"):
+            monkeypatch.setattr(C, name, lambda *a, **k: [])
+        monkeypatch.setattr(C, "OUTBOX_MAX_SLICES", 2)
+        calls = {"n": 0}
+
+        def _endless(ctx, lookback_days=400, *, after=None, should_stop=None):
+            calls["n"] += 1
+            return {
+                "outbound": [
+                    {
+                        "recipient": f"u{calls['n']}",
+                        "msg_id": f"m{calls['n']}",
+                        "created_time": "2026-07-01T00:00:00+0000",
+                        "text": "자료",
+                        "content": {},
+                    }
+                ],
+                "scope_missing": False,
+                "conversations_scanned": 25,
+                "paging_after": f"cur{calls['n']}",  # 절대 끝나지 않는다
+                "exhausted": False,
+            }
+
+        monkeypatch.setattr(C, "fetch_conversations", _endless)
+        conn = _conn(_ws(_user()), mock_token=True)
+        job = _job(conn, estimated_seconds=10, stage_data={"media": []})
+
+        status, _runs = _drive(job, MagicMock())
+
+        assert calls["n"] == 2, f"상한을 넘겨 계속 훑었다: {calls['n']}"
+        job.refresh_from_db()
+        assert job.stage_data["outbox_done"] is True
+        assert status in (DMMigrationJob.Status.READY, DMMigrationJob.Status.PARTIAL)
+
+    @pytest.mark.django_db
+    def test_outbox_stops_when_target_reached(self, monkeypatch):
+        """목표 건수를 넘기면 커서가 남아 있어도 멈추고 복원으로 넘어간다."""
+        monkeypatch.setattr(settings, "DM_MIGRATION_FAKE_LLM", True)
+        for name in ("fetch_media", "collect_commenters", "fetch_outbound_for_commenter"):
+            monkeypatch.setattr(C, name, lambda *a, **k: [])
+        monkeypatch.setattr(C, "OUTBOX_MESSAGE_TARGET", 3)
+        monkeypatch.setattr(
+            C,
+            "fetch_conversations",
+            lambda *a, **k: {
+                "outbound": [
+                    {
+                        "recipient": f"u{i}",
+                        "msg_id": f"m{i}",
+                        "created_time": "2026-07-01T00:00:00+0000",
+                        "text": "자료",
+                        "content": {},
+                    }
+                    for i in range(5)
+                ],
+                "scope_missing": False,
+                "conversations_scanned": 25,
+                "paging_after": "more",
+                "exhausted": False,
+            },
+        )
+        conn = _conn(_ws(_user()), mock_token=True)
+        job = _job(conn, estimated_seconds=10, stage_data={"media": []})
+        status, _runs = _drive(job, MagicMock())
+        job.refresh_from_db()
+        assert job.stage_data["outbox_done"] is True
+        assert len(job.stage_data["outbox"]) == 5
+        assert status in (DMMigrationJob.Status.READY, DMMigrationJob.Status.PARTIAL)

@@ -137,6 +137,14 @@ EXHAUSTIVE_PROBE = 40
 OUTBOX_SEED_PROBE = 10
 OUTBOX_MAX_PROBE = 60
 
+# ── 발신함 훑기 상한 (슬라이스 예산 보호) ──
+# ⚠️ conversations_pages 상한은 **호출 1회당**이라 슬라이스마다 초기화된다. 그래서 대화가
+# 아주 많은 계정에서는 발신함 훑기가 슬라이스를 통째로 먹어치우고, MAX_SLICES 에 닿는
+# 순간 **복원 결과 0건으로 종결**된다(실측: 130분/6슬라이스를 쓰고도 게시물 조회 0).
+# 대화는 updated_time 내림차순이라 앞쪽이 최신·활성 캠페인이다 → 충분히 모았으면 멈춘다.
+OUTBOX_MESSAGE_TARGET = 50000  # 이만큼 모았으면 그만 (직전 실측 3,171건의 15배)
+OUTBOX_MAX_SLICES = 4  # 발신함에 쓸 슬라이스 상한 — 나머지는 복원·초안에 남긴다
+
 ADAPTIVE_STEP = 10  # 한 번에 더 볼 인원
 ADAPTIVE_MAX_PROBE = 40  # 여기까지 봐도 애매하면 사람에게 넘긴다
 AMBIGUOUS_LOW = 0.35  # 이 아래면 '아님' 으로 확실

@@ -338,6 +338,22 @@ class _Runner:
         self._check_cancel()
         prev = list(self.sd.get("outbox") or [])
         cursor = self.sd.get("outbox_cursor")
+        used = int(self.sd.get("outbox_slices") or 0)
+        # 충분히 모았으면 여기서 끊는다 — 안 그러면 대화가 많은 계정에서 발신함이 슬라이스를
+        # 다 먹고 **복원 0건으로 종결**된다(실측: 130분·6슬라이스를 쓰고도 게시물 조회 0).
+        if prev and (
+            len(prev) >= collect.OUTBOX_MESSAGE_TARGET or used >= collect.OUTBOX_MAX_SLICES
+        ):
+            self.sd["outbox_done"] = True
+            self.sd.pop("outbox_cursor", None)
+            logger.info(
+                "DM이전 발신함 조기 종료 (job=%s): %d건 · 슬라이스 %d — 나머지는 복원에 쓴다",
+                self.job.id,
+                len(prev),
+                used,
+            )
+            self._persist()
+            return
         self.job.set_stage(
             _ST.COLLECTING_DM_CONVERSATIONS,
             10,
@@ -378,12 +394,18 @@ class _Runner:
         ]
         merged = prev + out
         self.sd["outbox"] = merged
+        self.sd["outbox_slices"] = used + 1
         self.sd["dm_scope_missing"] = bool(res.get("scope_missing"))
         self.job.conversations_scanned = (self.job.conversations_scanned or 0) + int(
             res.get("conversations_scanned") or 0
         )
         self.job.dm_messages_collected = len(merged)
-        done = bool(res.get("exhausted")) or bool(res.get("scope_missing"))
+        done = (
+            bool(res.get("exhausted"))
+            or bool(res.get("scope_missing"))
+            or len(merged) >= collect.OUTBOX_MESSAGE_TARGET
+            or (used + 1) >= collect.OUTBOX_MAX_SLICES
+        )
         logger.info(
             "DM이전 발신함%s: 누적 대화 %s개 · 보낸 DM %d건 (job=%s)",
             "" if done else "(이어서)",
