@@ -1032,3 +1032,97 @@ class TestExpensivePathIsGatedByContentScore:
         assert C.EXHAUSTIVE_COMMENT_PAGES in calls["comment_pages"], "첫 댓글까지 파야 한다"
         assert calls["index_sweep"] > 0, "색인 전수 대조가 돌아야 한다(공짜)"
         assert calls["deep_convo"] > 0, "대화도 처음까지 넘겨야 한다"
+
+    def test_gate_only_text_without_button_still_digs(self, monkeypatch):
+        """버튼 없는 텍스트 DM 을 '오퍼 찾음' 으로 세면 안 된다.
+
+        실측 사고(2026-08-17): `_found_offer()` 를 "링크 있거나 **게이트 버튼이 안 달린**
+        슬롯" 으로 판정했더니, 버튼 없는 안내 DM 이 후자에 걸려 '찾았다' 가 됐다. 그런데
+        최종 결과를 만드는 `_pack` 은 URL 있는 슬롯만 오퍼로 본다 → 검수로 넘어간 7건 중
+        4건이 "오퍼 없음" 인데도 두 축을 하나도 파지 않았다.
+        """
+        from apps.integrations.dm_migration import collect as C
+        from apps.integrations.dm_migration.recover import recover_post
+
+        calls = self._spy(monkeypatch)
+        calls["ncmt"] = 10880
+
+        def _textonly(ctx, u, **kw):
+            calls["probed"] += 1
+            return [
+                {
+                    "text": "댓글 남겨주셔서 감사합니다! 곧 보내드릴게요",
+                    "created_time": "2024-05-28T00:00:30+0000",
+                    "msg_id": f"m{u['id']}",
+                    "recipient": u["id"],
+                    "content": {"text": "댓글 남겨주셔서 감사합니다! 곧 보내드릴게요"},
+                }
+            ]
+
+        monkeypatch.setattr(C, "fetch_outbound_for_commenter", _textonly)
+        monkeypatch.setattr(
+            __import__("apps.integrations.dm_migration.recover", fromlist=["C"]).C,
+            "fetch_outbound_for_commenter",
+            _textonly,
+        )
+        media = {
+            "id": "m-textonly",
+            "comments_count": 10880,
+            "caption": "저를 팔로우하고 댓글로 '릴스' 달면 1초만에 이 사이트 보내드려요 🔥",
+            "timestamp": "2024-05-28T00:00:00+0000",
+        }
+        ctx = self._ctx()
+        ctx.outbox = {"nobody": []}
+        r = recover_post(ctx, media, is_own_dm=lambda *a: False)
+        assert r.content_score >= 0.60
+        assert (r.offer or {}).get("url", "") == "", "링크가 없으니 오퍼가 아니다"
+        assert (
+            C.EXHAUSTIVE_COMMENT_PAGES in calls["comment_pages"]
+        ), "링크를 못 얻었으면 더 파야 한다"
+        assert r.dug_all_comments is True
+
+    def test_thin_support_with_a_link_still_digs(self, monkeypatch):
+        """문구·링크를 얻었어도 **지지가 얕으면 끝난 게 아니다.**
+
+        실측: 댓글 1,876개 게시물이 캡션·DM 문구가 정확히 맞는데 조회 60명 중 1명만 걸렸다
+        (조회한 60명이 캠페인 끝난 뒤 댓글 단 사람들이었다). 여기서 멈추면 사람에게 넘긴다.
+        """
+        from apps.integrations.dm_migration import collect as C
+        from apps.integrations.dm_migration import recover as R
+        from apps.integrations.dm_migration.recover import recover_post
+
+        calls = self._spy(monkeypatch)
+        calls["ncmt"] = 1876
+
+        def _one_hit(ctx, u, **kw):
+            calls["probed"] += 1
+            if u["id"] != "u0":  # 딱 1명만 받았다
+                return []
+            return [
+                {
+                    "text": "자료 보내드려요 https://ex.co/pack",
+                    "created_time": "2026-06-10T00:00:05+0000",
+                    "msg_id": "m-one",
+                    "recipient": u["id"],
+                    "content": {
+                        "text": "자료 보내드려요",
+                        "urls": ["https://ex.co/pack"],
+                    },
+                }
+            ]
+
+        monkeypatch.setattr(C, "fetch_outbound_for_commenter", _one_hit)
+        monkeypatch.setattr(R.C, "fetch_outbound_for_commenter", _one_hit)
+        media = {
+            "id": "m-thin",
+            "comments_count": 1876,
+            "caption": "클로드 마스터 가이드 (팔로우하고 댓글에 클로드 남겨주시면 자료 보내드릴게요)",
+            "timestamp": "2026-06-10T00:00:00+0000",
+        }
+        ctx = self._ctx()
+        ctx.outbox = {"nobody": []}
+        r = recover_post(ctx, media, is_own_dm=lambda *a: False)
+        assert (r.offer or {}).get("url") == "https://ex.co/pack"
+        assert (r.offer or {}).get("hits") == 1
+        assert C.EXHAUSTIVE_COMMENT_PAGES in calls["comment_pages"], "지지 1명이면 더 파야 한다"
+        assert calls["deep_convo"] > 0, "대화도 처음까지 넘겨야 한다"

@@ -513,17 +513,26 @@ def recover_post(
         top = max(len(s["users"]) for s in tmpl.values())
         return top / max(len(probed_ids), 1)
 
-    def _found_offer() -> bool:
-        """**옮길 수 있는 문구**를 찾았나.
+    def _needs_more() -> bool:
+        """**더 파야 하나** — 링크 있는 오퍼를 충분한 지지와 함께 얻었나.
 
-        ⚠️ 게이트 문구(팔로우 확인)는 찾은 것으로 세지 않는다. 게이트는 전 게시물에서
-        같은 문구가 나가므로 "이 게시물에 캠페인이 있었나" 의 근거가 못 된다. 예전에
-        ``if tmpl:`` 로 판정해서, 게이트 하나 나오면 **더 파는 경로를 통째로 건너뛰었다.**
-        실측 사고(@highestlevel33, 댓글 10,050개 · 캡션 "댓글로 'ai' 달면 …보내드려요"):
-        게이트 2명이 잡혔다는 이유로 댓글 최신 50개만 보고 종료 → 문구 미복원.
-        캠페인이 돌던 시기(2024-02) 댓글러는 200페이지 뒤에 있었다.
+        이 함수가 '소진의 기준'(CLAUDE.md §1)의 문지기다. 두 번 틀렸다(실측 @highestlevel33):
+
+        ① ``if tmpl:`` 로 판정하던 시절 — 게이트("팔로우 확인") 하나 나오면 더 파는 경로를
+           통째로 건너뛰었다. 게이트는 전 게시물에 같은 문구가 나가므로 이 게시물의 근거가
+           못 된다. (댓글 10,050개 게시물이 최신 50개만 보고 종료됐다.)
+        ② ``_found_offer()`` = "링크 있거나 **게이트 버튼이 안 달린** 슬롯" 으로 고쳤을 때 —
+           버튼 없는 텍스트 DM 이 후자에 걸려 또 '찾았다' 가 됐다. 그런데 최종 결과를 만드는
+           :func:`_pack` 은 **URL 있는 슬롯만 오퍼**로 본다. 두 정의가 어긋나서, 검수로 넘어간
+           7건 중 4건이 "오퍼 없음" 인데도 두 축을 하나도 파지 않았다.
+
+        → 정의를 ``_pack`` 과 일치시킨다(**URL 있는 슬롯 = 오퍼**). 그리고 문구를 찾았어도
+          **지지가 얕으면 아직 끝난 게 아니다.** 실측: 댓글 1,876개 게시물이 캡션·DM 문구가
+          정확히 맞아떨어지는데 조회 60명 중 1명만 걸렸다(조회한 60명이 캠페인 끝난 뒤
+          댓글 단 사람들이었다). 여기서 멈추면 사람에게 넘기게 된다.
         """
-        return any(s["urls"] or not s["gate"] for s in tmpl.values())
+        best = max((len(s["users"]) for s in tmpl.values() if s["urls"]), default=0)
+        return best < MIN_SUPPORT_HITS
 
     def _resolve_ambiguity() -> None:
         """판정이 애매하면 **결론이 날 때까지** 더 조회한다.
@@ -544,7 +553,7 @@ def recover_post(
             if len(probed_ids) == before:
                 return  # 예산 소진 등으로 진전 없음
 
-    if _found_offer():
+    if not _needs_more():
         cap = big if ncmt >= C.BIG_COMMENTS else full
         _probe(order[:cap])
         _resolve_ambiguity()
@@ -555,7 +564,7 @@ def recover_post(
         # 실측(그 52개를 15명까지 조회): 28개에서 DM 이 나왔고 **8번째까지 보면 71%,
         # 10번째까지 71→82%** 가 걸린다. 3명은 구조적으로 모자란다.
         _probe(order[:campaign])
-        if not _found_offer() and more:
+        if _needs_more() and more:
             # 그래도 0건이면 댓글이 모자란 것 — 게시 직후 댓글러까지 파고 다시 본다.
             # 실측: 미복원 253개 중 34개가 댓글 수백~1만 개라 첫 페이지가 엉뚱한
             # (한참 뒤에 단) 사람만 보여주고 있었다.
@@ -570,7 +579,7 @@ def recover_post(
                 commenters = deep
                 order = C.order_probe_targets(deep, verdict.trigger)
                 _probe(order[:campaign])
-        if not _found_offer() and verdict.is_strong:
+        if _needs_more() and verdict.is_strong:
             # ── 끝까지 판다 ──
             # 글·댓글이 캠페인이 확실하다는데 아직 0건이다. 여기서 멈추면 그 게시물은
             # "캠페인은 있는데 문구를 못 살림" 으로 나간다. 실측 18건이 전부 댓글
@@ -603,7 +612,7 @@ def recover_post(
             # 개별 조회는 1명당 1콜이라 댓글 1만 개짜리를 다 볼 수 없지만, 발신함 색인
             # 대조는 메모리 조회라 공짜다. 상한을 둘 이유가 없으므로 전원을 본다.
             # (색인에 없는 사람은 '모름' 이라 분모에 넣지 않는다 — _probe 참조)
-            if not _found_offer() and ctx.outbox:
+            if _needs_more() and ctx.outbox:
                 before = len(probed_ids)
                 _probe(order[: C.INDEX_SWEEP_MAX], index_only=True)
                 if len(probed_ids) > before:
@@ -619,7 +628,7 @@ def recover_post(
             # 오래된 캠페인 DM 이 뒤로 밀려 안 보인다. 실측(2026-08-17): 중첩 13통(26분치)
             # → 엣지 페이징 43통(3년 6개월치). "오래된 DM 은 API 에 없다" 는 결론은 틀렸다.
             # 여기까지 하고도 없으면 **그건 인정하고** 사람에게 넘긴다(제품 결정).
-            if not _found_offer() and not ctx.budget.total_hit():
+            if _needs_more() and not ctx.budget.total_hit():
                 # ⚠️ order(최신·최고령 교대)를 쓰면 안 된다. 최근 댓글러는 캠페인이 꺼진
                 # 뒤라 받은 게 없고, 받았다면 기본 조회로 이미 나왔다 — 깊게 파는 의미가
                 # 없다. **게시 시점에 가까운 댓글러**가 오래된 DM 을 가진 사람들이다.
