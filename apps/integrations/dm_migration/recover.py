@@ -371,13 +371,52 @@ def recover_post(
     tmpl: dict = {}
     probed_ids: set = set()
 
-    def _probe(users: list[dict]) -> None:
-        todo = [u for u in users if u["id"] not in probed_ids]
+    swept_ids: set = set()  # 색인만으로 훑은 사람(모름 포함) — 중복 작업 방지용
+    deep_ids: set = set()  # 대화를 끝까지 넘겨본 사람 — 두 번 넘기지 않게
+
+    def _probe(users: list[dict], *, index_only: bool = False) -> None:
+        """댓글러들이 받은 발신 DM 을 모아 문구별로 묶는다.
+
+        ``index_only`` 면 발신함 색인만 본다(Graph 호출 0). 이때 **색인에 없는 사람은
+        ``probed_ids`` 에 넣지 않는다** — 그건 '안 받았음' 이 아니라 '모름' 이고, 분모에
+        넣으면 지지비율만 깎여서 멀쩡한 캠페인이 탈락한다.
+        """
+        if index_only:
+            todo = [u for u in users if u["id"] not in probed_ids and u["id"] not in swept_ids]
+            if not todo:
+                return
+            results = []
+            for u in todo:
+                swept_ids.add(u["id"])
+                hits, known = C.outbound_from_index(ctx, u)
+                if known:
+                    results.append((u, hits))
+        else:
+            todo = [u for u in users if u["id"] not in probed_ids]
+            if not todo:
+                return
+            # 병렬 조회 — 스레드는 HTTP 만. 집계는 아래 루프(메인 스레드)에서.
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                results = list(ex.map(lambda u: (u, C.fetch_outbound_for_commenter(ctx, u)), todo))
+        _absorb(results)
+
+    def _probe_deep(users: list[dict]) -> None:
+        """마지막 관문 — 대화를 **처음까지** 넘겨본다. 비싸므로 소수에게만 쓴다."""
+        todo = [u for u in users if u["id"] not in deep_ids]
         if not todo:
             return
-        # 병렬 조회 — 스레드는 HTTP 만. 집계는 아래 루프(메인 스레드)에서.
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            results = list(ex.map(lambda u: (u, C.fetch_outbound_for_commenter(ctx, u)), todo))
+        results = []
+        for u in todo:
+            if ctx.budget.total_hit():
+                break
+            deep_ids.add(u["id"])
+            results.append((u, C.fetch_outbound_deep(ctx, u)))
+        if results:
+            logger.info("DM이전 대화 끝까지 파기 (media=%s): %d명", mid, len(results))
+        _absorb(results)
+
+    def _absorb(results: list) -> None:
+        """조회 결과를 문구별 슬롯으로 묶는다(경로가 달라도 집계는 한 곳)."""
         for user, dms in results:
             probed_ids.add(user["id"])
             cts = user.get("ts")
@@ -452,13 +491,26 @@ def recover_post(
         top = max(len(s["users"]) for s in tmpl.values())
         return top / max(len(probed_ids), 1)
 
+    def _found_offer() -> bool:
+        """**옮길 수 있는 문구**를 찾았나.
+
+        ⚠️ 게이트 문구(팔로우 확인)는 찾은 것으로 세지 않는다. 게이트는 전 게시물에서
+        같은 문구가 나가므로 "이 게시물에 캠페인이 있었나" 의 근거가 못 된다. 예전에
+        ``if tmpl:`` 로 판정해서, 게이트 하나 나오면 **더 파는 경로를 통째로 건너뛰었다.**
+        실측 사고(@highestlevel33, 댓글 10,050개 · 캡션 "댓글로 'ai' 달면 …보내드려요"):
+        게이트 2명이 잡혔다는 이유로 댓글 최신 50개만 보고 종료 → 문구 미복원.
+        캠페인이 돌던 시기(2024-02) 댓글러는 200페이지 뒤에 있었다.
+        """
+        return any(s["urls"] or not s["gate"] for s in tmpl.values())
+
     def _resolve_ambiguity() -> None:
         """판정이 애매하면 **결론이 날 때까지** 더 조회한다.
 
         10명에서 무조건 멈추면 9/10 같은 애매한 상태로 끝나고, 그걸 사람에게 넘기게 된다.
         우리가 덜 본 것을 검수로 떠넘기지 않는다 — 애매한 것만 골라 더 본다.
         """
-        while len(probed_ids) < C.ADAPTIVE_MAX_PROBE:
+        limit = max(C.ADAPTIVE_MAX_PROBE, C.OUTBOX_MAX_PROBE if ctx.outbox else 0)
+        while len(probed_ids) < limit:
             r = _best_ratio()
             if r >= C.AMBIGUOUS_HIGH or r < C.AMBIGUOUS_LOW:
                 return  # 이미 결론이 났다
@@ -470,7 +522,7 @@ def recover_post(
             if len(probed_ids) == before:
                 return  # 예산 소진 등으로 진전 없음
 
-    if tmpl:
+    if _found_offer():
         cap = big if ncmt >= C.BIG_COMMENTS else full
         _probe(order[:cap])
         _resolve_ambiguity()
@@ -481,7 +533,7 @@ def recover_post(
         # 실측(그 52개를 15명까지 조회): 28개에서 DM 이 나왔고 **8번째까지 보면 71%,
         # 10번째까지 71→82%** 가 걸린다. 3명은 구조적으로 모자란다.
         _probe(order[:campaign])
-        if not tmpl and more:
+        if not _found_offer() and more:
             # 그래도 0건이면 댓글이 모자란 것 — 게시 직후 댓글러까지 파고 다시 본다.
             # 실측: 미복원 253개 중 34개가 댓글 수백~1만 개라 첫 페이지가 엉뚱한
             # (한참 뒤에 단) 사람만 보여주고 있었다.
@@ -496,7 +548,7 @@ def recover_post(
                 commenters = deep
                 order = C.order_probe_targets(deep, verdict.trigger)
                 _probe(order[:campaign])
-        if not tmpl and verdict.is_strong:
+        if not _found_offer() and verdict.is_strong:
             # ── 끝까지 판다 ──
             # 글·댓글이 캠페인이 확실하다는데 아직 0건이다. 여기서 멈추면 그 게시물은
             # "캠페인은 있는데 문구를 못 살림" 으로 나간다. 실측 18건이 전부 댓글
@@ -523,6 +575,29 @@ def recover_post(
                 out.content_score, out.content_reasons = v2.score, v2.reasons
                 order = C.order_probe_targets(allc, v2.trigger)
                 _probe(order[: C.EXHAUSTIVE_PROBE])
+
+            # ── 축1 마무리: 남은 댓글러 **전원**을 색인으로 대조 (Graph 호출 0) ──
+            # 개별 조회는 1명당 1콜이라 댓글 1만 개짜리를 다 볼 수 없지만, 발신함 색인
+            # 대조는 메모리 조회라 공짜다. 상한을 둘 이유가 없으므로 전원을 본다.
+            # (색인에 없는 사람은 '모름' 이라 분모에 넣지 않는다 — _probe 참조)
+            if not _found_offer() and ctx.outbox:
+                before = len(probed_ids)
+                _probe(order[: C.INDEX_SWEEP_MAX], index_only=True)
+                if len(probed_ids) > before:
+                    logger.info(
+                        "DM이전 색인 전수대조 (media=%s): 댓글러 %d명 훑음 → 확인 %d명 (호출 0)",
+                        mid,
+                        len(swept_ids),
+                        len(probed_ids) - before,
+                    )
+
+            # ── 축2: 그 사람 **대화의 처음까지** 넘긴다 ──
+            # 기본 조회는 대화 최근 25통만 본다. 그 사람이 이후에 대화를 많이 했으면
+            # 오래된 캠페인 DM 이 뒤로 밀려 안 보인다. 실측(2026-08-17): 중첩 13통(26분치)
+            # → 엣지 페이징 43통(3년 6개월치). "오래된 DM 은 API 에 없다" 는 결론은 틀렸다.
+            # 여기까지 하고도 없으면 **그건 인정하고** 사람에게 넘긴다(제품 결정).
+            if not _found_offer() and not ctx.budget.total_hit():
+                _probe_deep(order[: C.CONVO_DEEP_MAX_USERS])
         if tmpl:
             _probe(order[: (big if ncmt >= C.BIG_COMMENTS else full)])
             _resolve_ambiguity()

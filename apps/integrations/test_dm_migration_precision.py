@@ -864,3 +864,67 @@ class TestBudgetScaling:
         c100 = C.caps_for(100)
         for k, v in C.DEFAULT_CAPS.items():
             assert c100[k] == v, k
+
+
+# ══════════════ 소진의 기준 — 두 축을 다 파고서야 사람에게 넘긴다 ══════════════
+#
+# 제품 결정(2026-08-17): "조금 파보고 안 나오면 검수하세요" 는 우리가 덜 한 일을 사람에게
+# 떠넘기는 것이다. ①댓글은 제일 첫 댓글까지 ②대화는 그 사람 대화의 처음까지 — 둘 다
+# 소진하고도 흔적이 없으면 그때 인정하고 넘긴다.
+#
+# 실측 사고(@highestlevel33, l/C3SqJuhxpah/): 댓글 10,050개 · 캡션 "댓글로 'ai' 달면
+# 1인 기업 필수 ai 사이트 10가지 보내드려요" · 글 점수 0.95.
+#   → 게이트 DM 2명이 잡혔다는 이유로 `if tmpl:` 분기를 타서 **댓글 최신 50개만** 보고 종료.
+#     캠페인이 돌던 2024-02 댓글러는 200페이지 뒤에 있었다(1페이지 = 2024-12~2026-02).
+
+
+class TestExhaustionRules:
+    def test_gate_only_does_not_count_as_found(self):
+        """게이트는 전 게시물 공유 문구 → '찾았다' 로 세면 더 파는 경로를 건너뛴다."""
+        from apps.integrations.dm_migration.recover import PostRecovery
+
+        r = PostRecovery(media_id="m1", probed=50, content_score=0.95, is_campaign_signal=True)
+        r.gate = {"text": "팔로우해주셨다면 아래 버튼을 클릭해주세요", "hits": 2, "is_gate": True}
+        # 오퍼가 없으므로 후보로는 나가지만(문구는 직접) 자동채택은 아니다.
+        assert r.offer is None
+        assert r.grade != "auto_draft"
+
+    def test_conversation_messages_are_paged_not_truncated(self):
+        """대화 messages 엣지 페이징 헬퍼가 있어야 한다 — 없으면 25통에서 잘린다.
+
+        예전에는 중첩 필드(messages.limit(25))로만 받고 그 안의 paging.next 를 버렸다.
+        실측: 중첩 13통(26분치) → 엣지 페이징 43통(3년 6개월치).
+        """
+        from apps.integrations.services import InstagramMessagingService as M
+
+        assert hasattr(M, "page_conversation_messages")
+        assert hasattr(M, "list_conversation_id")
+
+    def test_index_sweep_distinguishes_unknown_from_negative(self):
+        """색인에 없는 사람은 '안 받았음' 이 아니라 '모름' 이다.
+
+        모름을 분모에 넣으면 지지비율만 깎여 멀쩡한 캠페인이 탈락한다.
+        """
+        from datetime import UTC, datetime
+
+        from apps.integrations.dm_migration import collect as C
+
+        ctx = C.CollectContext(
+            ig="1", token="mock", mock=True, budget=C.Budget(), pacer=C.RateLimiter(0.1)
+        )
+        ctx.outbox = {
+            "u-known": [{"created_time": "2026-01-01T00:00:00+0000", "text": "자료"}],
+        }
+        cts = datetime(2026, 1, 1, tzinfo=UTC)
+        hits, known = C.outbound_from_index(ctx, {"id": "u-known", "ts": cts})
+        assert known is True and len(hits) == 1
+        hits, known = C.outbound_from_index(ctx, {"id": "u-missing", "ts": cts})
+        assert known is False and hits == []
+
+    def test_exhaustive_paths_are_reachable_with_a_gate_hit(self):
+        """게이트만 찾은 상태에서도 '끝까지 파기' 상수들이 살아 있어야 한다."""
+        from apps.integrations.dm_migration import collect as C
+
+        assert C.EXHAUSTIVE_COMMENT_PAGES >= 200  # 댓글 1만 개를 덮는다
+        assert C.CONVO_DEEP_MAX_PAGES >= 10  # 대화 1,000통 이상 거슬러 간다
+        assert C.INDEX_SWEEP_MAX >= 10000  # 색인 대조는 공짜라 상한이 사실상 없다

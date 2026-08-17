@@ -132,6 +132,21 @@ CAMPAIGN_PROBE = 12
 EXHAUSTIVE_COMMENT_PAGES = 250  # 50개/페이지 → 최대 12,500개 댓글까지
 EXHAUSTIVE_PROBE = 40
 
+# ── 소진의 기준 (2026-08-17 제품 결정) ────────────────────────────────
+# "조금 파보고 안 나오면 사람이 검수하세요" 는 우리가 덜 한 일을 사람에게 떠넘기는 것이다.
+# **두 축을 다 소진**한 뒤에야 검수로 넘긴다.
+#   축1. 댓글 — 제일 첫 댓글까지 넘긴다(EXHAUSTIVE_COMMENT_PAGES).
+#   축2. 대화 — 그 사람 대화의 처음까지 넘긴다(CONVO_DEEP_MAX_PAGES).
+# 그래도 DM 흔적이 없으면 **그건 인정하고** 사람에게 넘긴다.
+#
+# 축2 는 완전히 새로 생긴 경로다. 예전에는 대화당 최근 25통만 보고 "오래된 캠페인 DM 은
+# API 에 없다" 고 결론지었는데 **틀렸다** — 중첩 필드의 paging.next 를 우리가 버리고 있었다.
+# 실측(2026-08-17): 중첩 13통(26분치) → 엣지 페이징 43통(3년 6개월치, 2022-10 까지).
+CONVO_DEEP_MAX_PAGES = 12  # 100통/페이지 → 대화 1,200통까지 거슬러 간다
+CONVO_DEEP_MAX_USERS = 12  # 이 경로를 쓸 사람 수(게시물당) — 페이지 비용이 곱해지므로 제한
+# 색인 전수 대조는 Graph 호출 0이라 상한이 필요 없다. 이 값은 로그·안전장치용 상한이다.
+INDEX_SWEEP_MAX = 20000
+
 # ── 답이 확실해질 때까지 더 본다 (사람 검수를 줄이는 핵심) ──────────────
 # 10명에서 무조건 멈추면 9/10 같은 **애매한 채로** 끝나고, 그걸 사람에게 "검수하세요" 로
 # 넘기게 된다. 실측(@highestlevel33): 검수필요 108건 중 61건이 이 경우였다.
@@ -669,6 +684,41 @@ def build_outbound_index(outbound: list[dict]) -> dict:
     return idx
 
 
+def outbound_from_index(
+    ctx: CollectContext,
+    commenter: dict,
+    *,
+    window_days: int = ATTRIBUTION_WINDOW_DAYS,
+) -> tuple[list[dict], bool]:
+    """발신함 색인만 보고 조회한다 — **Graph 호출 0, 상한을 둘 이유가 없다.**
+
+    이것이 "끝까지 파기" 를 가능하게 하는 열쇠다. 댓글러를 개별 조회하면 1명당 1콜이라
+    댓글 1만 개짜리 게시물은 예산으로 감당이 안 되는데, 색인 대조는 메모리 조회라 전원을
+    훑어도 공짜다. (실측 @highestlevel33: 색인 88,899건)
+
+    Returns: ``(hits, known)``
+        · ``known=True``  — 이 사람의 대화가 색인에 있다. ``hits`` 가 비었으면 **진짜로
+          창 안에 받은 게 없다**(= 음성 근거로 세도 된다).
+        · ``known=False`` — 색인에 아예 없다 = **모름**. 이걸 '안 받았음' 으로 세면
+          지지비율의 분모만 부풀어 멀쩡한 캠페인이 탈락한다. 개별 조회로만 알 수 있다.
+    """
+    if not ctx.outbox:
+        return [], False
+    cached = ctx.outbox.get(str(commenter["id"]))
+    if not cached:
+        return [], False
+    cts0 = commenter.get("ts")
+    hits = []
+    for m in cached:
+        dt = parse_graph_time(m.get("created_time"))
+        if cts0 and dt:
+            gap = (dt - cts0).total_seconds()
+            if gap < -3600 or gap > window_days * 86400:
+                continue
+        hits.append(m)
+    return hits, True
+
+
 def fetch_outbound_for_commenter(
     ctx: CollectContext,
     commenter: dict,
@@ -690,19 +740,9 @@ def fetch_outbound_for_commenter(
     # ⚠️ 색인은 완전하지 않다 — Meta 는 대화당 최근 ~20개 메시지만 준다. 그래서 "색인에
     # 없음"은 "DM 을 안 받았음"이 아니라 "모름"이다. 그 경우엔 아래 개별 조회로 내려간다.
     if ctx.outbox:
-        cached = ctx.outbox.get(str(uid))
-        if cached:
-            cts0 = commenter.get("ts")
-            hits = []
-            for m in cached:
-                dt = parse_graph_time(m.get("created_time"))
-                if cts0 and dt:
-                    gap = (dt - cts0).total_seconds()
-                    if gap < -3600 or gap > window_days * 86400:
-                        continue
-                hits.append(m)
-            if hits:
-                return hits
+        hits, _known = outbound_from_index(ctx, commenter, window_days=window_days)
+        if hits:
+            return hits
 
     if ctx.mock:
         msgs = MockInstagramProvider.mock_user_conversation(
@@ -743,4 +783,78 @@ def fetch_outbound_for_commenter(
                 "content": content,
             }
         )
+    return out
+
+
+def fetch_outbound_deep(
+    ctx: CollectContext,
+    commenter: dict,
+    *,
+    window_days: int = ATTRIBUTION_WINDOW_DAYS,
+    max_pages: int = CONVO_DEEP_MAX_PAGES,
+) -> list[dict]:
+    """댓글러 1명의 대화를 **처음까지 넘겨** 받은 발신 DM 을 복원한다.
+
+    마지막 수단이다. 기본 조회(``fetch_outbound_for_commenter``)는 대화의 최근 25통만
+    보므로, 그 사람이 이후에 대화를 많이 했으면 오래된 캠페인 DM 이 뒤로 밀려 안 보인다.
+    실측(2026-08-17): 중첩 조회 13통(26분치) vs 엣지 페이징 43통(3년 6개월치).
+
+    비용은 대화당 페이지 수만큼이라(1페이지 100통) 아무 때나 쓰면 안 된다 — 글·댓글이
+    "캠페인 확실" 이라고 말하는데 다른 모든 경로가 실패했을 때만 호출한다.
+    """
+    uid = commenter["id"]
+    if ctx.mock:
+        return fetch_outbound_for_commenter(ctx, commenter, window_days=window_days)
+    cts = commenter.get("ts")
+    ctx.pacer.acquire()
+    try:
+        conv = InstagramMessagingService.list_conversation_id(ctx.ig, ctx.token, uid)
+    except requests.HTTPError as exc:
+        _maybe_raise_fatal(exc)
+        return []
+    ctx.budget.charge("targeted_dms")
+    if not conv:
+        return []
+
+    out: list[dict] = []
+    after, pages = None, 0
+    while pages < max_pages:
+        if ctx.budget.cap_hit("targeted_dms") or ctx.budget.total_hit():
+            break
+        ctx.pacer.acquire()
+        try:
+            msgs, after = InstagramMessagingService.page_conversation_messages(
+                ctx.token, conv, after=after
+            )
+        except requests.HTTPError as exc:
+            _maybe_raise_fatal(exc)
+            break
+        ctx.budget.charge("targeted_dms")
+        pages += 1
+        stop = False
+        for m in msgs:
+            dt = parse_graph_time(m.get("created_time"))
+            # 메시지는 최신순이다 → 댓글보다 확실히 오래된 구간에 닿으면 더 볼 필요가 없다.
+            if cts and dt and (dt - cts).total_seconds() < -3600:
+                stop = True
+                continue
+            if str((m.get("from") or {}).get("id") or "") != str(ctx.ig):
+                continue
+            if cts and dt and (dt - cts).total_seconds() > window_days * 86400:
+                continue
+            text = dm_text_for_match(m)
+            if not text:
+                continue
+            to = (m.get("to") or {}).get("data") or []
+            out.append(
+                {
+                    "text": text[:640],
+                    "created_time": m.get("created_time"),
+                    "recipient": str(to[0].get("id")) if to else str(uid),
+                    "msg_id": m.get("id"),
+                    "content": extract_dm_content(m),
+                }
+            )
+        if stop or not after or not msgs:
+            break
     return out

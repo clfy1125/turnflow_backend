@@ -1533,6 +1533,58 @@ class InstagramMessagingService:
         return (data[0].get("messages") or {}).get("data") or []
 
     @classmethod
+    def list_conversation_id(cls, ig_user_id: str, access_token: str, user_id: str) -> str:
+        """상대(IGSID)와의 대화 **id 만** 조회. 없으면 빈 문자열."""
+        url = f"{cls.GRAPH_API_BASE}/{ig_user_id}/conversations"
+        params = {
+            "platform": "instagram",
+            "user_id": str(user_id),
+            "fields": "id",
+            "access_token": access_token,
+        }
+        resp = get_http_session().get(url, params=params, timeout=cls.DEFAULT_TIMEOUT)
+        raise_for_status_clean(resp)
+        data = (resp.json() or {}).get("data") or []
+        return (data[0].get("id") or "") if data else ""
+
+    @classmethod
+    def page_conversation_messages(
+        cls,
+        access_token: str,
+        conversation_id: str,
+        *,
+        after: str | None = None,
+        limit: int = 100,
+    ) -> tuple[list, str]:
+        """대화 1건의 messages 엣지를 **뒤로 넘긴다** — 오래된 메시지 복원용.
+
+        GET /{conversation_id}/messages?fields=...&limit=N&after=<cursor>
+
+        ⚠️ ``list_user_conversation`` 은 중첩 필드(``messages.limit(25)``)로 받기 때문에
+        **25통에서 잘리고 그 안의 ``paging.next`` 를 우리가 버렸다.** 실측(2026-08-17,
+        @highestlevel33): 중첩으로 받은 13통은 26분치였는데 이 엣지를 3페이지 넘기니
+        43통·3년 6개월치가 나왔다. "오래된 캠페인 DM 은 API 에 없다" 는 결론은 틀렸다 —
+        안 넘겨본 것이었다.
+
+        Returns: ``(messages, next_after)`` — next_after 가 빈 문자열이면 대화의 끝.
+        """
+        url = f"{cls.GRAPH_API_BASE}/{conversation_id}/messages"
+        params = {
+            # attachments 필수 — 버튼 DM 은 message 가 비고 본문이 여기 들어온다.
+            "fields": "id,created_time,from,to,message,attachments",
+            "limit": limit,
+            "access_token": access_token,
+        }
+        if after:
+            params["after"] = after
+        resp = get_http_session().get(url, params=params, timeout=cls.DEFAULT_TIMEOUT)
+        raise_for_status_clean(resp)
+        body = resp.json() or {}
+        paging = body.get("paging") or {}
+        nxt = ((paging.get("cursors") or {}).get("after") or "") if paging.get("next") else ""
+        return (body.get("data") or []), nxt
+
+    @classmethod
     def check_messaging_window(cls, comment_timestamp: datetime) -> bool:
         """
         24시간 메시징 윈도우 체크
