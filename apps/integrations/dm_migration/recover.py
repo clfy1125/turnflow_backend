@@ -43,10 +43,25 @@ from .analyze import (
 
 logger = logging.getLogger(__name__)
 
-# 등급 컷 (지지 신뢰하한 기준)
-GRADE_AUTO = 0.60  # 자동 채택 — 실측 정밀도 100%
-GRADE_REVIEW = 0.40  # 확인 권장 — 77%
+# ── 등급 컷 ──
+# 목표는 "사람이 검수할 게 적게, 정확하게, 전부 옮기기"(CLAUDE.md §1)다. 검수 목록이
+# 길면 그 자체로 실패다.
+#
+# ⚠️ 자동채택을 **신뢰하한**으로 재던 것이 실패였다. 연구가 "지지 60%+ → 정밀도 100%"
+#    라고 측정한 건 **받은 비율**인데 코드는 윌슨 신뢰하한을 썼다. 표본 10명이면
+#    9/10(90%)의 신뢰하한이 0.596 이라 **0.004 차이로** 자동채택에서 떨어진다.
+#    실측(@highestlevel33): 검수필요 108건 중 **61건이 비율 60%+ 인데 신뢰하한 미달**
+#    이었고, 그중 10건은 9/10(90%)였다. 사람에게 "10명 중 9명이 받은 것"을 검수시키는
+#    셈이라 목표와 정면으로 어긋난다.
+# → 자동채택은 **비율**로 재고, 신뢰하한은 표본이 아주 작을 때만 거르는 보조로 쓴다.
+GRADE_AUTO_RATIO = 0.60  # 받은 비율 — 연구가 정밀도 100% 를 측정한 그 기준
+# 초소표본 방어는 신뢰하한이 아니라 **조회 인원**으로 한다. 신뢰하한을 바닥으로 쓰면
+# 6/10(60%, 하한 0.313)·8/12(67%, 0.391) 처럼 연구가 검증한 구간이 막힌다.
+# 반대로 3/3(100%)은 하한 0.438 로 통과해버려 방어가 거꾸로 걸린다.
+MIN_PROBED_FOR_AUTO = 5  # 3/3 같은 "몇 명 안 봤는데 다 맞음" 을 걸러낸다
+GRADE_REVIEW = 0.40  # 확인 권장 — 실측 정밀도 77%
 MIN_SUPPORT_HITS = 3  # 표본이 작을 때 비율만 믿지 않기 위한 절대 하한
+GRADE_AUTO = GRADE_AUTO_RATIO  # 하위 호환(외부 참조)
 # 지지 1~2명짜리를 살릴 때 요구하는 콘텐츠 점수 하한. 사장님이 애매 59건을 전수 검수한
 # 결과 **0.55 이하는 전부 캠페인이 아니었다**(2026-08-17). 자동 판정으로는 못 얻는 값이라
 # 사람 라벨을 그대로 상수로 박는다 — 바꾸려면 같은 방식으로 다시 라벨링할 것.
@@ -111,7 +126,16 @@ class PostRecovery:
             # DM 원문을 못 건진 건. 밴드는 excluded 를 유지하고(프론트 계약), 후보로 낼지는
             # 파이프라인이 content_score 로 정한다 — 글·댓글이 캠페인이라고 말하면 낸다.
             return "excluded"
-        if s >= GRADE_AUTO and hits >= MIN_SUPPORT_HITS:
+        best = self.offer or self.gate or {}
+        # ratio 가 없는 옛 기록(재개·이전 버전 캐시)은 hits/probed 로 되살린다.
+        ratio = float(best.get("ratio") or 0.0) or (hits / max(self.probed, 1))
+        # 자동채택 — 받은 **비율**이 60%+ 이고, 사람 수와 조회 인원이 충분하면 사람 손을
+        # 안 탄다. 검수 목록을 짧게 유지하는 것이 이 기능의 목표다.
+        if (
+            ratio >= GRADE_AUTO_RATIO
+            and hits >= MIN_SUPPORT_HITS
+            and self.probed >= MIN_PROBED_FOR_AUTO
+        ):
             return "auto_draft"
         if s >= GRADE_REVIEW:
             return "needs_review"
@@ -399,6 +423,33 @@ def recover_post(
                 commenters = deep
                 order = C.order_probe_targets(deep, verdict.trigger)
                 _probe(order[:campaign])
+        if not tmpl and verdict.is_strong:
+            # ── 끝까지 판다 ──
+            # 글·댓글이 캠페인이 확실하다는데 아직 0건이다. 여기서 멈추면 그 게시물은
+            # "캠페인은 있는데 문구를 못 살림" 으로 나간다. 실측 18건이 전부 댓글
+            # 600~10,050개짜리였다 — 도달률이 아니라 **보는 사람이 틀린** 것이다.
+            # 캠페인 기간 컷오프를 풀고(campaign_window_days=0) 게시 직후 댓글러까지
+            # 전부 훑은 뒤 다시 조회한다.
+            allc, _ = C.collect_commenters(
+                ctx,
+                mid,
+                media_ts=mts,
+                pages=C.EXHAUSTIVE_COMMENT_PAGES,
+                campaign_window_days=0,
+            )
+            if len(allc) > len(commenters):
+                logger.info(
+                    "DM이전 끝까지 파기 (media=%s): 댓글러 %d → %d",
+                    mid,
+                    len(commenters),
+                    len(allc),
+                )
+                commenters = allc
+                v2 = judge_content(media, allc)
+                out.trigger, out.repetition = v2.trigger, v2.repetition
+                out.content_score, out.content_reasons = v2.score, v2.reasons
+                order = C.order_probe_targets(allc, v2.trigger)
+                _probe(order[: C.EXHAUSTIVE_PROBE])
         if tmpl:
             _probe(order[: (big if ncmt >= C.BIG_COMMENTS else full)])
 

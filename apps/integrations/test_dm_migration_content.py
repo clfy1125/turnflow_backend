@@ -128,9 +128,18 @@ def _rec(**kw):
 
 class TestGrading:
     def test_strong_support_is_auto(self):
-        r = _rec(offer={"text": "자료 보내드려요", "url": "https://x", "hits": 9, "score": 0.75})
+        r = _rec(
+            probed=10,
+            offer={"text": "자료 보내드려요", "url": "https://x", "hits": 9, "score": 0.75},
+        )
         assert r.grade == "auto_draft"
         assert r.confirm_required is False
+
+    def test_old_records_without_ratio_still_grade(self):
+        """옛 기록엔 ratio 가 없다 — hits/probed 로 되살리지 않으면 전부 검수필요로 떨어진다."""
+        r = _rec(probed=10, offer={"text": "자료", "url": "https://x", "hits": 9, "score": 0.75})
+        assert "ratio" not in r.offer
+        assert r.grade == "auto_draft"
 
     def test_no_dm_but_strong_content_is_kept(self):
         """글·댓글이 캠페인이라고 말하면 DM 이 없어도 후보로 남는다(밴드는 excluded)."""
@@ -298,3 +307,54 @@ class TestWeakSupportRescue:
     def test_button_means_automated(self):
         """버튼이 붙은 DM 은 사람이 손으로 쓴 잡담일 수 없다."""
         assert is_personal_dm("ㅋㅋ 감사해요", has_button=True) is False
+
+
+# ══════════════ 7. 자동채택 컷 — 검수 목록을 짧게 유지하는 핵심 ══════════════
+#
+# 목표는 "사람이 검수할 게 적게, 정확하게, 전부 옮기기"(CLAUDE.md §1).
+# 자동채택을 신뢰하한으로 재던 것이 실패였다 — 실측(@highestlevel33): 검수필요 108건 중
+# **61건이 받은 비율 60%+ 인데 신뢰하한 미달**이었다. 10명 중 9명이 받은 것을 사람에게
+# 검수시키면 목표와 정면으로 어긋난다.
+
+
+def _sup(hits, probed):
+    from apps.integrations.dm_migration.analyze import wilson_lower_bound
+
+    r = PostRecovery(media_id="m1", probed=probed)
+    r.offer = {
+        "text": "자료 보내드려요",
+        "url": "https://x",
+        "hits": hits,
+        "ratio": round(hits / probed, 3),
+        "score": round(wilson_lower_bound(hits, probed), 3),
+        "gap_median": 7,
+    }
+    return r
+
+
+class TestAutoAdoptCut:
+    def test_nine_of_ten_is_auto_not_review(self):
+        """10명 중 9명이 받았으면 자동채택이다. 신뢰하한 0.596 으로 떨어뜨리면 안 된다."""
+        r = _sup(9, 10)
+        assert r.grade == "auto_draft", (r.grade, r.offer["score"])
+        assert r.confirm_required is False
+
+    @pytest.mark.parametrize("hits,probed", [(9, 10), (8, 12), (20, 30), (29, 30), (6, 10)])
+    def test_ratio_over_60_percent_is_auto(self, hits, probed):
+        assert _sup(hits, probed).grade == "auto_draft", (hits, probed)
+
+    @pytest.mark.parametrize("hits,probed", [(4, 10), (5, 12), (10, 30)])
+    def test_ratio_under_60_percent_still_needs_review(self, hits, probed):
+        assert _sup(hits, probed).grade == "needs_review", (hits, probed)
+
+    def test_tiny_sample_is_not_auto(self):
+        """3/3(100%)은 비율만 보면 완벽하지만 3명밖에 안 봤다 — 조회 인원이 막는다.
+
+        신뢰하한으로 막으려던 시도는 실패했다: 3/3 의 하한은 0.438 로 오히려 통과하고,
+        정작 연구가 검증한 6/10(0.313)·8/12(0.391)이 막혔다. 방어가 거꾸로 걸렸다.
+        """
+        r = _sup(3, 3)
+        assert r.grade == "needs_review", (r.grade, r.offer["score"])
+
+    def test_two_supporters_never_auto(self):
+        assert _sup(2, 2).grade != "auto_draft"
