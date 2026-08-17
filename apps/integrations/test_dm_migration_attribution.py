@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from apps.integrations.dm_migration import attribute
 
 
@@ -492,3 +494,86 @@ class TestSkewWindowAndPacedSends:
         slot = _slot("자료", [{"u": f"u{i}", "m": f"d{i}", "g": g} for i, g in enumerate(gaps)])
         attribute._repack(slot, 10)
         assert slot["auto_hits"] == collect.fast_hits(gaps) == 5
+
+
+# ══════════════ 7. 끝난 잡 재채점 (manage.py dm_migration_regrade) ══════════════
+#
+# 등급 규칙은 판정 로직이지 수집 결과가 아니다. 규칙을 고쳤을 때 3~4시간 걸린 수집을
+# 처음부터 다시 돌리면 Meta 쿼터를 또 써서 다른 워크스페이스에 피해를 준다(CLAUDE.md §1).
+
+
+class TestRegradeCommand:
+    def _setup(self):
+        from apps.integrations.models import DMCampaignCandidate, DMMigrationJob
+        from apps.integrations.test_dm_migration import _conn, _job, _user, _ws
+
+        conn = _conn(_ws(_user()))
+        job = _job(conn, status=DMMigrationJob.Status.READY)
+        # 비율 0.59 · 60초 내 17명 → 옛 규칙은 검수필요, 새 규칙은 자동채택
+        rec = {
+            "media_id": "m-fast",
+            "probed": 49,
+            "content_score": 0.75,
+            "signal": True,
+            "grade": "needs_review",
+            "score": 0.44,
+            "confirm_required": True,
+            "offer": {
+                "text": "자료 보내드려요",
+                "url": "https://ex.co/a",
+                "hits": 29,
+                "ratio": 0.59,
+                "score": 0.44,
+                "gap_median": 34,
+                "auto_hits": 17,
+            },
+            "gate": None,
+        }
+        job.stage_data = {"recoveries": [rec]}
+        job.save(update_fields=["stage_data"])
+        cand = DMCampaignCandidate.objects.create(
+            job=job,
+            ig_connection=conn,
+            band=DMCampaignCandidate.Band.NEEDS_REVIEW,
+            media_id="m-fast",
+            confirm_required=True,
+            support_hits=29,
+            support_probed=49,
+        )
+        return job, cand
+
+    def test_dry_run_does_not_write(self, db):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        job, cand = self._setup()
+        out = StringIO()
+        call_command("dm_migration_regrade", str(job.id), stdout=out)
+        cand.refresh_from_db()
+        assert cand.band == "needs_review"  # 손대지 않았다
+        assert "미리보기" in out.getvalue()
+
+    def test_apply_promotes_candidate_and_stage_data(self, db):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        job, cand = self._setup()
+        call_command("dm_migration_regrade", str(job.id), "--apply", stdout=StringIO())
+        cand.refresh_from_db()
+        job.refresh_from_db()
+        assert cand.band == "auto_draft"
+        assert cand.confirm_required is False
+        assert job.stage_data["recoveries"][0]["grade"] == "auto_draft"
+        assert job.stage_data["regraded_at_rule"]["changed"] == 1
+
+    def test_refuses_a_job_without_recoveries(self, db):
+        from django.core.management import call_command
+        from django.core.management.base import CommandError
+
+        from apps.integrations.test_dm_migration import _conn, _job, _user, _ws
+
+        job = _job(_conn(_ws(_user())))
+        with pytest.raises(CommandError, match="recoveries"):
+            call_command("dm_migration_regrade", str(job.id))
