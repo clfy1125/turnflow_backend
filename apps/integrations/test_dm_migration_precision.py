@@ -1284,3 +1284,53 @@ class TestExpensivePathIsGatedByContentScore:
         assert C.EXHAUSTIVE_COMMENT_PAGES in calls["comment_pages"], "첫 댓글까지 파야 한다"
         assert r.dug_all_comments is True
         assert calls["deep_convo"] > 0, "대화도 처음까지 넘겨야 한다"
+
+    def test_deep_probe_stops_as_soon_as_the_verdict_is_settled(self, monkeypatch):
+        """대화 깊이 파기는 **답이 나면 멈춘다** — 40명을 다 사면 상한을 올릴 수 없다.
+
+        예전 구조는 N명을 전부 조회한 뒤에야 결과를 봤다. 5번째에서 확정돼도 40명을
+        다 사므로 사람 수를 12명에 묶어둘 수밖에 없었고, 그래서 댓글러 2,151명 게시물을
+        12명만 깊게 파고 검수로 넘겼다(실측 @highestlevel33).
+        """
+        from apps.integrations.dm_migration import collect as C
+        from apps.integrations.dm_migration import recover as R
+        from apps.integrations.dm_migration.recover import recover_post
+
+        calls = self._spy(monkeypatch)
+        calls["ncmt"] = 3000
+        deep_seen = []
+
+        def _deep(ctx, u, **kw):
+            """깊게 파면 전원이 같은 캠페인 DM 을 갖고 있다 — 몇 명 만에 확정된다."""
+            calls["deep_convo"] += 1
+            deep_seen.append(u["id"])
+            return [
+                {
+                    "text": "신청하신 자료 보내드려요 https://ex.co/pack",
+                    "created_time": "2024-02-13T14:47:10+0000",
+                    "msg_id": f"deep-{u['id']}",
+                    "recipient": u["id"],
+                    "content": {
+                        "text": "신청하신 자료 보내드려요",
+                        "urls": ["https://ex.co/pack"],
+                        "buttons": [{"label": "자료 받기", "url": "https://ex.co/pack"}],
+                    },
+                }
+            ]
+
+        for mod in (C, R.C):
+            monkeypatch.setattr(mod, "fetch_outbound_deep", _deep)
+        media = {
+            "id": "m-deepstop",
+            "comments_count": 3000,
+            "caption": "저를 팔로우하고 댓글로 'ai' 달면 1인 기업 필수 ai 사이트 보내드려요 🔥",
+            "timestamp": "2024-02-13T14:47:05+0000",
+        }
+        ctx = self._ctx()
+        ctx.outbox = {"nobody": []}
+        r = recover_post(ctx, media, is_own_dm=lambda *a: False)
+
+        assert r.grade == "auto_draft", (r.grade, r.offer)
+        # 상한(40명)까지 다 사지 않았다 — 확정되자마자 멈췄다
+        assert 0 < calls["deep_convo"] < C.CONVO_DEEP_MAX_USERS, calls["deep_convo"]
+        assert C.CONVO_DEEP_MAX_USERS >= 40  # 상한 자체는 넉넉히

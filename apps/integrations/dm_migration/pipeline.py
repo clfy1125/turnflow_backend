@@ -220,6 +220,9 @@ def _recovery_to_dict(r, media: dict) -> dict:
         "offer": r.offer,
         "gate": r.gate,
         "grade": r.grade,
+        # 왜 제외했나 — AI 내용 대조가 되살릴 수 있는 건인지 가리는 데 쓴다
+        # (attribute.RESCUABLE). 없으면 시간상 불가능한 건까지 되살아난다.
+        "reject_reason": r.reject_reason,
         "score": r.score,
         "confirm_required": r.confirm_required,
         "drops": r.drops,

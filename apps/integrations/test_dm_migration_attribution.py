@@ -192,7 +192,7 @@ class TestApplyVerdicts:
         )
         assert rec["grade"] == "needs_review"
         assert rec["ai_match"]["reason"] == "같은 자료"
-        assert stats == {"checked": 1, "kept": 1, "doubted": 0}
+        assert stats == {"checked": 1, "kept": 1, "doubted": 0, "blocked": 0}
 
     def test_mismatch_marks_doubt_but_never_deletes(self):
         """AI 에 거부권을 주면 안 된다 — 실측에서 확실한 캠페인의 20%를 '아니다' 라고 했다.
@@ -226,7 +226,7 @@ class TestApplyVerdicts:
         stats = attribute.apply_verdicts([rec], {})
         assert rec["grade"] == before
         assert "ai_match" not in rec
-        assert stats == {"checked": 0, "kept": 0, "doubted": 0}
+        assert stats == {"checked": 0, "kept": 0, "doubted": 0, "blocked": 0}
 
     def test_strong_support_is_not_sent_to_ai(self):
         """지지 3명+ 는 이미 정밀도가 충분하다 — 비용을 거기 쓰지 않는다."""
@@ -280,12 +280,51 @@ class TestTimingRule:
         assert rec["offer"]["hits"] == 0
 
     def test_seconds_gap_rescues_a_single_supporter(self):
-        """7초 만에 온 DM 은 사람이 못 쓴다 — 1명이 받았어도 자동 발송이다."""
+        """7초 만에 온 DM 은 사람이 못 쓴다 — 1명이 받았어도 자동 발송이다.
+
+        단 **글·댓글이 캠페인이라고 말할 때만**이다(아래 테스트 참조).
+        """
+        from apps.integrations.dm_migration.recover import PostRecovery
+
+        r = PostRecovery(media_id="m1", probed=12, content_score=0.7)
+        r.offer = {"text": "자료", "url": "", "hits": 1, "score": 0.05, "gap_median": 7}
+        assert r.grade == "needs_review"
+
+    def test_human_label_beats_the_gap_signal(self):
+        """글 점수가 사장님 라벨(0.55) 이하면 7초짜리 1통도 제외다.
+
+        순서가 뒤집혀 있었다 — 간격 검사가 먼저라서 "60초 안에 왔으면 인정" 이 라벨을
+        덮었다. 실측(@highestlevel33, 2026-08-18): 검수 17건 중 11건이 글에 캠페인 기미가
+        거의 없는데(내용 0.00~0.40) 이 경로로 살아남았다. 간격은 **추론**이고 0.55 컷은
+        사장님이 59건을 눈으로 보고 매긴 **사실**이다.
+        """
         from apps.integrations.dm_migration.recover import PostRecovery
 
         r = PostRecovery(media_id="m1", probed=12, content_score=0.1)
         r.offer = {"text": "자료", "url": "", "hits": 1, "score": 0.05, "gap_median": 7}
-        assert r.grade == "needs_review"
+        assert r.grade == "excluded"
+        assert r.reject_reason == "content_says_no"
+
+    def test_strong_reach_wins_even_when_the_post_is_quiet(self):
+        """글이 조용해도 도달이 넓으면 확정이다 — 라벨 컷이 여기까지 내려오면 안 된다.
+
+        실측 `46/46 · 내용 0.245`. 46명 전원이 같은 문구를 받은 것을 글 점수로 죽이면
+        회수가 무너진다(CLAUDE.md §1).
+        """
+        from apps.integrations.dm_migration.recover import PostRecovery
+
+        r = PostRecovery(media_id="m1", probed=46, content_score=0.245)
+        r.offer = {
+            "text": "자료",
+            "url": "https://x",
+            "hits": 46,
+            "ratio": 1.0,
+            "score": 0.9,
+            "gap_median": 8,
+            "auto_hits": 46,
+        }
+        assert r.grade == "auto_draft"
+        assert r.reject_reason == ""
 
     def test_slow_dm_is_dropped_even_with_link_and_score(self):
         """간격이 하루를 넘으면 링크·점수가 좋아도 자동 발송이 아니다."""

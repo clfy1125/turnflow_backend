@@ -33,6 +33,13 @@ from .collect import fast_hits
 
 logger = logging.getLogger(__name__)
 
+# AI 내용 대조가 되살릴 수 있는 제외 이유(:func:`apply_verdicts`).
+# 되살릴 수 없는 것 = AI 가 **보지 않는 근거**로 내려간 것:
+#   impossible_timing — 간격이 하루 넘거나 DM 이 댓글보다 먼저. AI 는 시간을 안 본다.
+#   content_says_no   — 글·댓글 점수가 0.55 이하. 사장님이 59건을 눈으로 매긴 라벨이다.
+# ``None`` 은 fail-open — 아주 옛 기록(이유 필드가 없던 시절)은 예전처럼 되살린다.
+RESCUABLE = frozenset({"", "no_link", "thin_support", None})
+
 # 다른 게시물이 이만큼 강해야 이쪽을 오귀속으로 본다.
 TEMPLATE_DOMINANCE = 3.0
 TEMPLATE_MIN_OWNER_HITS = 3
@@ -202,9 +209,11 @@ def regrade(recoveries: list[dict]) -> int:
             is_campaign_signal=bool(rec.get("signal")),
             content_score=float(rec.get("content_score") or 0.0),
         )
-        if rec.get("grade") != r.grade:
+        grade, reason = r.verdict()
+        if rec.get("grade") != grade:
             changed += 1
-        rec["score"], rec["grade"] = r.score, r.grade
+        rec["score"], rec["grade"] = r.score, grade
+        rec["reject_reason"] = reason
         rec["confirm_required"] = r.confirm_required
     return changed
 
@@ -225,7 +234,7 @@ def apply_verdicts(recoveries: list[dict], verdicts: dict) -> dict:
         표시로는 값이 있다** — 사람이 30초 보고 지우는 편이 낫다.
         (CLAUDE.md §1: 정밀도와 충돌하면 버리지 말고 등급으로 가른다.)
     """
-    kept = doubted = 0
+    kept = doubted = blocked = 0
     for rec in recoveries:
         v = verdicts.get(rec.get("media_id"))
         if not v:
@@ -233,13 +242,25 @@ def apply_verdicts(recoveries: list[dict], verdicts: dict) -> dict:
         rec["ai_match"] = v
         if v.get("match"):
             if rec.get("grade") == "excluded":
-                rec["grade"] = "needs_review"
+                # ⚠️ **왜 제외됐는지 보고 되살린다.** 예전엔 이유를 안 봤다.
+                #    실측(@highestlevel33, 2026-08-18): 검수 17건 중 10건이 이 경로로
+                #    올라온 것이었고 간격이 516,379초·602,519초(6~7일)였다 — 이 댓글의
+                #    응답일 수 없는 DM 이다. AI 는 캡션↔DM 문구만 보고 시간도 사장님
+                #    라벨도 보지 않으므로, 그 두 이유로 내려간 건을 뒤집을 자격이 없다.
+                #    구제는 원래 목적인 **얕은 지지**(도달률 낮은 게시물)에만 쓴다.
+                if rec.get("reject_reason") in RESCUABLE:
+                    rec["grade"] = "needs_review"
+                    kept += 1
+                else:
+                    rec["ai_match_blocked"] = rec.get("reject_reason") or "unknown"
+                    blocked += 1
+                continue
             kept += 1
         else:
             rec["ai_doubt"] = True  # 검수 정렬용. 등급은 건드리지 않는다
             rec["confirm_required"] = True
             doubted += 1
-    return {"checked": len(verdicts), "kept": kept, "doubted": doubted}
+    return {"checked": len(verdicts), "kept": kept, "doubted": doubted, "blocked": blocked}
 
 
 def resolve(recoveries: list[dict]) -> dict:

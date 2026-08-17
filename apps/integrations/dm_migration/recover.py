@@ -132,20 +132,38 @@ class PostRecovery:
 
     @property
     def grade(self) -> str:
-        """등급. **DM 증거와 콘텐츠 판정을 함께 본다.**
+        """등급 — :meth:`verdict` 의 앞부분."""
+        return self.verdict()[0]
+
+    @property
+    def reject_reason(self) -> str:
+        """제외한 **이유**. 빈 문자열이면 제외가 아니다.
+
+        왜 이유를 남기나 — AI 내용 대조(:func:`attribute.apply_verdicts`)가 제외된 건을
+        검수로 되살리는데, **왜 제외됐는지 안 보고 되살렸다.** 실측(@highestlevel33,
+        2026-08-18): 검수 17건 중 10건이 이렇게 올라온 것이었고 간격이 `516,379초`·
+        `602,519초`(6~7일)였다. 이 댓글의 응답일 수 없는 DM 이고, AI 는 시간을 보지
+        않으므로 되살릴 자격이 없다. 사장님 라벨(내용 0.55 이하)도 마찬가지다.
+        """
+        return self.verdict()[1]
+
+    def verdict(self) -> tuple[str, str]:
+        """``(등급, 제외이유)``. **DM 증거와 콘텐츠 판정을 함께 본다.**
 
         예전에는 DM 증거만 봤다. 그래서 두 방향으로 틀렸다(실측 @highestlevel33):
           · 글이 "캠페인 맞다" 는데 DM 을 못 찾아 **52개를 통째로 버렸다**
           · 글이 "캠페인 아니다" 는데 DM 한 통 나왔다고 **35개를 통과시켰다**
         이제 콘텐츠가 강하면 DM 이 없어도 후보로 내고(문구는 사용자가 작성), 콘텐츠가
         아니라는데 지지가 1~2명뿐이면 내린다(= 남의 게시물 DM 이 흘러든 것).
+
+        제외이유는 AI 구제 가능 여부를 가른다 — ``thin_support`` 만 되살릴 수 있다.
         """
         s = self.score
         hits = (self.offer or self.gate or {}).get("hits", 0)
         if not self.found:
             # DM 원문을 못 건진 건. 밴드는 excluded 를 유지하고(프론트 계약), 후보로 낼지는
             # 파이프라인이 content_score 로 정한다 — 글·댓글이 캠페인이라고 말하면 낸다.
-            return "excluded"
+            return "excluded", "not_found"
         best = self.offer or self.gate or {}
         # ratio 가 없는 옛 기록(재개·이전 버전 캐시)은 hits/probed 로 되살린다.
         ratio = float(best.get("ratio") or 0.0) or (hits / max(self.probed, 1))
@@ -156,7 +174,7 @@ class PostRecovery:
             and hits >= MIN_SUPPORT_HITS
             and self.probed >= MIN_PROBED_FOR_AUTO
         ):
-            return "auto_draft"
+            return "auto_draft", ""
         # 자동채택 ② — **자동 발송 지문**. 사람이 흉내낼 수 없는 것은 비율이 아니라 속도다.
         # "5명 이상이 자기 댓글 60초 안에 **같은 문구**를 받았다" 면 비율이 얼마든 캠페인이다.
         # 게이트가 아니라 오퍼 슬롯만 본다 — 옮길 문구가 있어야 후보로서 의미가 있고,
@@ -169,7 +187,7 @@ class PostRecovery:
             and has_text
             and self.probed >= MIN_PROBED_FOR_AUTO
         ):
-            return "auto_draft"
+            return "auto_draft", ""
         # 자동채택 ③ — 페이서로 몇 분 밀린 자동 발송. 속도가 느린 대신 **글·댓글도 캠페인
         # 이라고 말할 때만** 통과시킨다(사장님이 라벨링한 0.55 컷을 그대로 쓴다).
         gap_med = offer.get("gap_median")
@@ -181,11 +199,11 @@ class PostRecovery:
             and self.content_score > WEAK_SUPPORT_CONTENT_MIN
             and self.probed >= MIN_PROBED_FOR_AUTO
         ):
-            return "auto_draft"
+            return "auto_draft", ""
         if s >= GRADE_REVIEW:
-            return "needs_review"
+            return "needs_review", ""
         if hits >= MIN_SUPPORT_HITS:
-            return "needs_review"
+            return "needs_review", ""
         # ── 지지 1~2명 — 여기가 오귀속의 온상이다 ──
         slot = self.offer or self.gate or {}
         gap = slot.get("gap_median")
@@ -193,19 +211,29 @@ class PostRecovery:
         # ① 댓글 → DM 간격이 우선한다. 자동화 도구는 몇 초 안에 쏘고, 사람은 그렇게 못 한다.
         #    실측: 이 구간(≤60초)의 99%가 지지 3명+ 였다. 낱말·말투와 달리 계정 성격을
         #    안 타므로 가장 신뢰할 수 있는 잣대다.
+        # ⚠️ **사람 라벨이 간격 신호보다 앞에 온다.** 순서가 뒤집혀 있었다 — 간격 검사가
+        #    먼저라서 "60초 안에 1통 왔으면 인정" 이 사장님 라벨을 덮었다. 실측
+        #    (@highestlevel33, 2026-08-18): 검수 17건 중 11건이 글·댓글에 캠페인 기미가
+        #    거의 없는데(내용 0.00~0.40, 8건은 0.10 이하) 이 경로로 살아남은 것이었다.
+        #    간격은 **추론**이고 0.55 컷은 사장님이 59건을 눈으로 보고 매긴 **사실**이다.
+        #    지지가 1~2명뿐일 때는 사실이 이긴다.
+        # (지지가 3명+ 이거나 자동채택 조건을 맞춘 건은 여기까지 내려오지 않는다 —
+        #  실측 `46/46 · 내용 0.245` 처럼 글이 조용해도 도달이 넓으면 위에서 확정된다.)
+        if self.content_score <= WEAK_SUPPORT_CONTENT_MIN:
+            return "excluded", "content_says_no"
+
+        # 여기부터는 글·댓글이 캠페인이라고 말하는 건들이다. 이제 간격을 본다.
         if gap is not None:
             if 0 <= gap <= C.AUTO_DM_MAX_GAP:
-                return "needs_review"  # 자동 발송 확실 — 1명이 받았어도 인정
+                return "needs_review", ""  # 자동 발송 확실 — 1명이 받았어도 인정
             if gap > C.MANUAL_DM_MIN_GAP or gap < -C.CLOCK_SKEW_TOLERANCE:
-                return "excluded"  # 사람이 쓴 것 / 이 댓글의 응답이 아님
+                return "excluded", "impossible_timing"  # 사람이 쓴 것 / 이 댓글의 응답이 아님
 
-        # ② 간격이 애매한 구간(1분~1일)은 사장님 검수 규칙으로 가른다.
-        #    (2026-08-17, 애매 59건 전수: 콘텐츠 0.55 이하는 **전부** 캠페인이 아니었고,
-        #     링크 없는 것은 대부분 팬과의 1:1 잡담이었다. 두 조건을 모두 요구하면
-        #     59건 → 19건. 확실한 캠페인 159건에는 영향 0.)
-        if self.content_score > WEAK_SUPPORT_CONTENT_MIN and (self.offer or {}).get("url"):
-            return "needs_review"
-        return "excluded"
+        # 간격이 애매한 구간(1분~1일)은 링크 유무로 가른다 — 링크 없는 것은 대부분 팬과의
+        # 1:1 잡담이었다(위 59건 전수 검수).
+        if (self.offer or {}).get("url"):
+            return "needs_review", ""
+        return "excluded", "no_link"
 
     @property
     def confirm_required(self) -> bool:
@@ -408,19 +436,36 @@ def recover_post(
         _absorb(results)
 
     def _probe_deep(users: list[dict]) -> None:
-        """마지막 관문 — 대화를 **처음까지** 넘겨본다. 비싸므로 소수에게만 쓴다."""
+        """마지막 관문 — 대화를 **처음까지** 넘겨본다.
+
+        여기가 20통 창을 뚫는 유일한 경로다. 대화 목록에 딸려오는 메시지는 최근 20통이
+        상한이라, 그 사람이 이후에 DM 을 더 받았으면 오래된 캠페인 DM 이 창 밖으로 밀린다.
+        실측(@highestlevel33): 우리가 가진 발신 DM 이 2025년 45,263건인데 **2024년은
+        1,474건**뿐이다 — 2024년에 안 보낸 게 아니라 창에 가려 안 보이는 것이다.
+
+        ⚠️ 예전에는 **N명을 전부 조회한 뒤에야** 결과를 봤다. 5번째에서 답이 나도 40명을
+        다 사는 구조라, 사람 수를 못 늘렸다(12명). 이제 한 명씩 넣고 등급이 확정되면
+        멈춘다 → 상한을 올려도 보통은 몇 명에서 끝난다.
+        """
         todo = [u for u in users if u["id"] not in deep_ids]
         if not todo:
             return
-        results = []
+        used = 0
         for u in todo:
             if ctx.budget.total_hit():
                 break
             deep_ids.add(u["id"])
-            results.append((u, C.fetch_outbound_deep(ctx, u)))
-        if results:
-            logger.info("DM이전 대화 끝까지 파기 (media=%s): %d명", mid, len(results))
-        _absorb(results)
+            _absorb([(u, C.fetch_outbound_deep(ctx, u))])
+            used += 1
+            if not _needs_more():
+                break  # 답이 났다 — 여기서 멈춘다(뒤 사람들은 안 산다)
+        if used:
+            logger.info(
+                "DM이전 대화 끝까지 파기 (media=%s): %d명 조회 (상한 %d)",
+                mid,
+                used,
+                len(todo),
+            )
 
     def _absorb(results: list) -> None:
         """조회 결과를 문구별 슬롯으로 묶는다(경로가 달라도 집계는 한 곳)."""
