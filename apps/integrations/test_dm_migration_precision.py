@@ -1192,8 +1192,10 @@ class TestExpensivePathIsGatedByContentScore:
             calls = self._spy(monkeypatch)
             calls["ncmt"] = 3000
 
-            def _hit(ctx, u, _c=content, **kw):
-                calls["probed"] += 1
+            # _c·_k 를 기본인자로 묶는다 — 루프 변수를 클로저로 늦게 읽으면 마지막 판의
+            # 값이 잡힌다(ruff B023). content 는 이미 묶여 있었고 calls 가 빠져 있었다.
+            def _hit(ctx, u, _c=content, _k=calls, **kw):
+                _k["probed"] += 1
                 if _c["urls"] and u["id"] != "u0":
                     return []  # 링크판은 지지 1명만
                 return [
@@ -1224,3 +1226,61 @@ class TestExpensivePathIsGatedByContentScore:
                 continue  # 자동채택이면 팔 필요 없다
             assert r.dug_all_comments is True, f"{name}: 검수인데 댓글을 안 팠다"
             assert r.dug_conversations is True, f"{name}: 검수인데 대화를 안 팠다"
+
+    def test_middle_score_post_that_would_go_to_review_still_digs(self, monkeypatch):
+        """**내용점수가 중간이어도 검수로 갈 상태면 끝까지 판다.**
+
+        같은 자리의 네 번째 사고(2026-08-18). 끝까지 파는 문이 `verdict.is_strong`
+        (내용점수 ≥0.60)만 봤다. 그래서 내용점수 0.4 인 게시물이 12명 보고 멈춘 뒤
+        **검수필요로 올라갔다** — 실측(@highestlevel33 검수 10건 전수): `조회 23/댓글 47`,
+        `조회 23/댓글 29` 두 건이 두 축을 하나도 안 판 상태였다. 댓글이 29~47개뿐이라
+        전원을 봐도 호출 24번인데 아끼려고 안 본 것이다.
+
+        문지기는 "충분히 찾았나" 가 아니라 "**사람에게 안 물어도 되나**" 를 물어야 한다.
+        """
+        from apps.integrations.dm_migration import collect as C
+        from apps.integrations.dm_migration import recover as R
+        from apps.integrations.dm_migration.recover import recover_post
+
+        calls = self._spy(monkeypatch)
+        calls["ncmt"] = 47
+        # 댓글은 제각각·길게 — 복붙·초단문 신호를 안 켜서 점수를 중간대에 둔다.
+        calls["text"] = lambda i: f"이번 편 진짜 도움됐어요 {i}번째로 저장하고 갑니다 감사합니다"
+
+        def _three_hits(ctx, u, **kw):
+            calls["probed"] += 1
+            if u["id"] not in ("u0", "u1", "u2"):
+                return []
+            return [
+                {
+                    "text": "신청하신 자료 보내드려요 https://ex.co/pack",
+                    "created_time": "2024-06-01T00:03:20+0000",  # 댓글 +200초
+                    "msg_id": f"m{u['id']}",
+                    "recipient": u["id"],
+                    "content": {
+                        "text": "신청하신 자료 보내드려요",
+                        "urls": ["https://ex.co/pack"],
+                        "buttons": [{"label": "자료 받기", "url": "https://ex.co/pack"}],
+                    },
+                }
+            ]
+
+        for mod in (C, R.C):
+            monkeypatch.setattr(mod, "fetch_outbound_for_commenter", _three_hits)
+        media = {
+            "id": "m-middle",
+            "comments_count": 47,
+            "caption": "요청 주신 자료 정리해뒀어요. 필요하신 분 댓글 남겨주시면 보내드릴게요",
+            "timestamp": "2024-06-01T00:00:00+0000",
+        }
+        ctx = self._ctx()
+        ctx.outbox = {"nobody": []}
+        r = recover_post(ctx, media, is_own_dm=lambda *a: False)
+
+        # 전제: 내용점수가 '중간'(캠페인 기미는 있으나 확실하지는 않음)
+        assert 0.35 <= r.content_score < 0.60, (r.content_score, r.content_reasons)
+        # 이 상태로 끝내면 검수필요다 — 그러니 끝까지 파야 한다
+        assert r.grade == "needs_review", (r.grade, r.offer)
+        assert C.EXHAUSTIVE_COMMENT_PAGES in calls["comment_pages"], "첫 댓글까지 파야 한다"
+        assert r.dug_all_comments is True
+        assert calls["deep_convo"] > 0, "대화도 처음까지 넘겨야 한다"

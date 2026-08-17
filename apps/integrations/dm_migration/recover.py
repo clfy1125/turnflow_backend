@@ -593,6 +593,42 @@ def recover_post(
         )
         return probe.grade != "auto_draft"
 
+    def _would_review() -> bool:
+        """지금 상태로 끝내면 **사람 검수 목록에 올라가나.**
+
+        :func:`_needs_more` 와 한 글자 차이지만 쓰임이 다르다.
+          · ``_needs_more``  = 자동채택이 아니다 (검수 **또는** 제외)
+          · ``_would_review`` = 검수로 **올라간다** (제외는 아니다)
+
+        더 팔지 말지를 정할 때는 이쪽을 봐야 한다. 제외로 떨어질 건은 아무도 안 보므로
+        더 파도 사람의 일이 줄지 않는다 — 비용만 쓴다. 반대로 검수로 갈 건은 **우리가 덜
+        본 것을 사람에게 떠넘기는 것**이라 끝까지 파야 한다.
+        """
+        # ⚠️ 근거가 **하나도** 없으면 여기서 True 를 주면 안 된다. 등급은 excluded 이고
+        #    후보로 낼지는 파이프라인이 콘텐츠 점수로 정한다(= `verdict.is_strong` 이
+        #    맡는 몫). 여기서 True 를 주면 글이 조용한 게시물까지 비싼 경로가 열려
+        #    "비싼 경로는 유력 후보에만"(2026-08-17 제품 결정)이 무너진다.
+        if not tmpl:
+            return False
+        probed_now = max(len(probed_ids), 1)
+        bo, bg = _best_slots(probed_now)
+        # 게이트만 나왔다 = 옮길 링크가 없다. 이대로 내면 사용자가 문구를 직접 써야 하므로
+        # 사람의 일이다. 등급만 보면 게이트가 전원에게 가서 비율 1.0 → auto_draft 로
+        # 잘못 끝난다(그래서 등급을 묻기 전에 링크를 본다).
+        if not bo or not (bo.get("url") or "").strip():
+            return True
+        return (
+            PostRecovery(
+                media_id=mid,
+                probed=probed_now,
+                content_score=out.content_score,
+                is_campaign_signal=out.is_campaign_signal,
+                offer=bo,
+                gate=bg,
+            ).grade
+            == "needs_review"
+        )
+
     def _resolve_ambiguity() -> None:
         """판정이 애매하면 **결론이 날 때까지** 더 조회한다.
 
@@ -616,7 +652,11 @@ def recover_post(
         cap = big if ncmt >= C.BIG_COMMENTS else full
         _probe(order[:cap])
         _resolve_ambiguity()
-    elif verdict.is_campaign:
+    elif verdict.is_campaign or _would_review():
+        # ⚠️ 바깥 문도 **같은 질문**을 해야 한다. 예전엔 `verdict.is_campaign`(내용점수
+        #    ≥0.35) 만 봐서, 글이 조용한 게시물은 씨앗 몇 명만 보고 통째로 끝났다. 그중
+        #    근거가 조금 나온 건은 그대로 **검수필요**로 올라갔다 — 우리가 덜 본 것을
+        #    사람에게 넘긴 것이다. 제외로 떨어질 건은 여기 안 걸리므로 비용도 안 늘어난다.
         # ── 글·댓글이 "여기 캠페인 돌았다" 고 말하는데 씨앗에서 0건 ──
         # 예전에는 여기서 사실상 포기했다(댓글을 더 파도 다시 3명만 봤다). 그래서
         # @highestlevel33 에서 콘텐츠상 캠페인 215개 중 52개를 통째로 버렸다.
@@ -638,8 +678,19 @@ def recover_post(
                 commenters = deep
                 order = C.order_probe_targets(deep, verdict.trigger)
                 _probe(order[:campaign])
-        if _needs_more() and verdict.is_strong:
+        if _needs_more() and (verdict.is_strong or _would_review()):
             # ── 끝까지 판다 ──
+            # ⚠️ **네 번째 같은 실수를 여기서 막는다.** 이 문은 `verdict.is_strong`
+            #    (내용점수 ≥0.60) 만 봤다. 그래서 내용점수 0.4 인 게시물이 12명 보고
+            #    멈춘 뒤 **검수필요로 넘어갔다** — 실측(@highestlevel33, 2026-08-18,
+            #    검수 10건 전수): `조회 23/댓글 47`·`조회 23/댓글 29` 두 건이 두 축을
+            #    하나도 안 판 상태였다. 댓글이 29~47개뿐이라 전원을 봐도 호출 24번인데
+            #    아끼려고 안 본 것이다.
+            #    `_needs_more()` 는 지난 수정에서 등급으로 판정하게 고쳤는데, 그 **바깥
+            #    문**이 아직 내용점수로 판정하고 있었다(안쪽만 고치고 바깥을 놔둔 것).
+            # → 근거(tmpl)가 하나라도 나왔으면 내용점수와 무관하게 두 축을 다 판다.
+            #   근거가 나왔는데 자동채택이 안 되는 상태 = 그대로 두면 검수로 넘어가는
+            #   상태이고, 그건 "우리가 덜 본 것을 사람에게 떠넘기는" 것이다.
             # 글·댓글이 캠페인이 확실하다는데 아직 0건이다. 여기서 멈추면 그 게시물은
             # "캠페인은 있는데 문구를 못 살림" 으로 나간다. 실측 18건이 전부 댓글
             # 600~10,050개짜리였다 — 도달률이 아니라 **보는 사람이 틀린** 것이다.
