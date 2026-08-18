@@ -92,6 +92,11 @@ _JS_REDIR_RE = re.compile(
 # 남의 도구가 붙인 추적 파라미터 — 이것만 뗀다(소문자 비교).
 _TRACKERS = frozenset({"mcp_token", "recipientid", "recipient_id", "subscriber_id", "psid"})
 
+# 스킴 없이 적은 링크(`www.minimax.io/audio`) — 캠페인 링크 버튼은 http(s) 만 받으므로
+# (`LinkButtonItemSerializer.validate_url`) 이대로 두면 **자동채택인데 불러오기가 400** 난다.
+# 실측: prod 후보 1,597건 중 1건이 이 상태로 auto_draft 였다. 호스트+TLD 모양일 때만 붙인다.
+_SCHEMELESS_RE = re.compile(r"^[\w-]+(\.[\w-]+)+(/|\?|$)")
+
 
 def _host_of(url: str) -> str:
     host = urlsplit(url).netloc.lower().split(":")[0]
@@ -188,9 +193,12 @@ def unwrap_url(url: str, *, strip: bool = True) -> tuple[str, str]:
     전부 실패한다(실측: 이 순서를 틀려 75개 uuid 가 모두 실패했다).
     """
     cur = (url or "").strip()
-    if not _is_abs(cur):
-        return url or "", ""
     hops: list[str] = []
+    if not _is_abs(cur):
+        if not _SCHEMELESS_RE.match(cur):
+            return url or "", ""
+        cur = "https://" + cur  # 스킴만 붙인다 — 링크 자체는 그대로다
+        hops.append("scheme")
     seen = {cur}
     for _ in range(MAX_HOPS):
         nxt, how = _unwrap_once(cur)
@@ -337,7 +345,7 @@ class Resolver:
     def resolve(self, url: str) -> tuple[str, str]:
         """``(최종 URL, 방법)``. 어떤 이유로든 못 풀면 **입력을 그대로** 돌려준다."""
         raw = (url or "").strip()
-        if not _is_abs(raw):
+        if not _is_abs(raw) and not _SCHEMELESS_RE.match(raw):
             return url or "", ""
         # 조회가 필요한 래퍼면 **트래커를 떼지 않은 채로** 홉을 푼다 (_probe_url 이 그 값을 쓴다).
         offline, how = unwrap_url(raw, strip=False)

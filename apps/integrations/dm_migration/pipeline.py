@@ -127,8 +127,10 @@ def _urls_in_recovery(rec: dict) -> list[str]:
     gate = rec.get("gate") or {}
     out: list[str] = []
     for u in ((offer.get("url") or ""), (gate.get("url") or "")):
+        # 스킴 없이 적힌 링크도 넘긴다 — links.unwrap_url 이 http(s) 로 고쳐야
+        # 캠페인 링크 버튼 검증(http/https 만 허용)을 통과한다.
         u = u.strip()
-        if u.lower().startswith(("http://", "https://")) and u not in out:
+        if u and u not in out:
             out.append(u)
     for text in ((offer.get("text") or ""), (gate.get("text") or "")):
         for u in analyze.find_urls(text):

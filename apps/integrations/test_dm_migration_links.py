@@ -131,10 +131,22 @@ class TestOfflineUnwrap:
             assert (final, how) == (u, "")
 
     def test_non_url_input_survives(self):
-        for u in ("", "   ", "사진 참고", None):
+        for u in ("", "   ", "사진 참고", "프로필 링크", None):
             final, how = links.unwrap_url(u)
             assert how == ""
             assert final == (u or "")
+
+    def test_schemeless_link_gets_https(self):
+        """캠페인 링크 버튼은 http(s) 만 받는다 — 스킴이 없으면 **자동채택인데 불러오기가
+        400** 난다(실측: prod 후보 1,597건 중 1건이 이 상태로 auto_draft 였다)."""
+        final, how = links.unwrap_url("www.minimax.io/audio")
+        assert final == "https://www.minimax.io/audio"
+        assert how == "scheme"
+
+    def test_schemeless_wrapper_is_still_unwrapped(self):
+        final, how = links.unwrap_url(INPOCK.replace("https://", ""))
+        assert final == "https://open.kakao.com/o/gi3MUPji"
+        assert how == "scheme+param"
 
     def test_broken_jwt_falls_back_to_input(self):
         """남의 토큰 포맷이 바뀌어도 **입력을 그대로** 돌려준다(링크가 사라지면 안 된다)."""

@@ -33,8 +33,9 @@ def _urls_of(cand: DMCampaignCandidate) -> list[str]:
     out: list[str] = []
     mt = cand.matched_template or {}
     for u in (cand.offer_url or "", (mt.get("recovered_url") or "")):
+        # 스킴 없이 적힌 링크도 대상이다 — 그대로 두면 자동채택인데 불러오기가 400 난다.
         u = (u or "").strip()
-        if u.lower().startswith(("http://", "https://")) and u not in out:
+        if u and u not in out:
             out.append(u)
     for text in (cand.draft_opening_message or "", cand.gate_message or ""):
         for u in find_urls(text):
