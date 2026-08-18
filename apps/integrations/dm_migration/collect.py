@@ -9,6 +9,7 @@ paused_rate_limited/failed 로 전이하게 예외를 올린다.
 from __future__ import annotations
 
 import logging
+import math
 import random
 import threading
 import time
@@ -205,7 +206,54 @@ AMBIGUOUS_HIGH = 0.75  # 이 위면 '맞음' 으로 확실
 # 낱말·말투 패턴과 달리 **계정 성격을 안 타서** 재튜닝이 필요 없다. 지금까지 찾은 신호 중
 # 가장 강하다.
 AUTO_DM_MAX_GAP = 60  # 이 안에 왔으면 자동 발송으로 본다
-MANUAL_DM_MIN_GAP = 86400  # 하루가 지났으면 사람이 쓴 것 — 근거로 안 쓴다
+MANUAL_DM_MIN_GAP = 86400  # (구) 하루 컷 — 하위 호환용. 신규 코드는 EVIDENCE_MAX_GAP 을 쓸 것
+
+# ── 간격은 컷이 아니라 **곡선**이다 (2026-08-18 사장님 검수 결정) ──
+# 하루 컷으로 잘랐더니 @reels_drgn 에서 검수 52건이 나왔고, 사장님이 31건을 눈으로 보고
+# **27건이 실제 캠페인**(내용도 일치, 복원도 정확)이라고 확인했다. 간격이 길어지는 실제
+# 사유가 있다 — 자동화 도구 오류로 늦게 발송, 또는 사장님이 나중에 손으로 보낸 경우.
+# 간격 하나만으로 부정할 수 없고, **내용 일치와 함께** 봐야 한다.
+# 인스타 Private Reply 창이 7일이므로 1시간에서 0 으로 떨어뜨릴 근거도 없다.
+# → 신뢰도를 곡선으로 주고, **느릴수록 더 많은 사람이 받았어야** 인정한다.
+# 7일 = Meta 의 Private Reply 창(아래 ATTRIBUTION_WINDOW_DAYS 와 같은 값).
+# ⚠️ 그 상수를 참조하지 않는다 — 이 블록이 더 위에 있어서 NameError 가 난다.
+EVIDENCE_MAX_GAP = 7 * 86400  # 이 밖은 이 댓글의 응답일 수 없다
+GAP_CONFIDENCE = (
+    (60, 1.00),  # 1분 이내 — 사람이 흉내 못 낸다
+    (600, 0.95),
+    (3600, 0.85),
+    (12 * 3600, 0.70),  # 12시간까지는 강하게 본다(도구 지연·수동 발송)
+    (86400, 0.55),
+    (3 * 86400, 0.35),
+    (EVIDENCE_MAX_GAP, 0.20),
+)
+
+
+def gap_confidence(gap) -> float:
+    """댓글→DM 간격의 신뢰도 0~1. 부호는 시계오차 범위에서 무시한다(:func:`fast_hits` 참조)."""
+    if gap is None:
+        return 0.0
+    if gap < -CLOCK_SKEW_TOLERANCE or gap > EVIDENCE_MAX_GAP:
+        return 0.0
+    a = abs(gap)
+    for limit, conf in GAP_CONFIDENCE:
+        if a <= limit:
+            return conf
+    return 0.0
+
+
+def required_hits(gap, base: int) -> int:
+    """이 간격에서 자동채택으로 인정하려면 **몇 명이 같은 문구를 받았어야** 하나.
+
+    ``base / 신뢰도`` — 1분 이내면 base 명, 3일이면 3배 가까이 요구한다.
+    신뢰도 0(7일 밖)이면 어떤 인원으로도 인정하지 않는다.
+    """
+    conf = gap_confidence(gap)
+    if conf <= 0:
+        return 10**9
+    return math.ceil(base / conf)
+
+
 # 댓글보다 DM 이 먼저인 건 이 댓글의 응답일 수 없다(실측 195건 — 그 사람이 예전에 다른
 # 게시물에 단 댓글로 받은 DM 이 여기 근거로 잘못 붙은 것). 시계 오차만 허용한다.
 CLOCK_SKEW_TOLERANCE = 120

@@ -28,7 +28,7 @@ from collections import defaultdict
 
 from .analyze import wilson_lower_bound
 from .collect import CLOCK_SKEW_TOLERANCE as CLOCK_SKEW
-from .collect import MANUAL_DM_MIN_GAP as MANUAL_GAP
+from .collect import EVIDENCE_MAX_GAP as MANUAL_GAP
 from .collect import fast_hits
 
 logger = logging.getLogger(__name__)
@@ -78,8 +78,11 @@ def drop_impossible(recoveries: list[dict]) -> int:
 
     · DM 이 댓글보다 먼저 갔다 → 그 사람이 예전에 다른 게시물에 단 댓글로 받은 것이다
       (실측 195건이 이 경우였다).
-    · 하루가 지나서 갔다 → 자동 발송이 아니다. 사람이 손으로 쓴 개인 DM 이다
-      (실측: 캠페인 아닌 구간의 중앙값이 3.7일).
+    · **7일**이 지나서 갔다 → 인스타 Private Reply 창 밖이라 이 댓글의 응답일 수 없다.
+      ⚠️ 예전에는 **하루**로 잘랐다. 그런데 사장님이 @reels_drgn 검수 31건을 눈으로 보고
+      27건이 실제 캠페인이라고 확인했다(2026-08-18) — 도구 오류로 늦게 가거나 나중에 손으로
+      보낸 경우가 있어 간격만으로 부정할 수 없다. 하루~7일 구간은 지우지 말고 남기고,
+      **신뢰도를 낮춰**(collect.gap_confidence) 더 많은 지지를 요구하는 쪽으로 바꿨다.
     """
     removed = 0
     for rec in recoveries:

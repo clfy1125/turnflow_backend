@@ -200,6 +200,22 @@ class PostRecovery:
             and self.probed >= MIN_PROBED_FOR_AUTO
         ):
             return "auto_draft", ""
+        # 자동채택 ④ — **간격을 컷이 아니라 곡선으로.** 느릴수록 더 많은 사람이 받았어야
+        # 인정한다(collect.required_hits). 사장님이 @reels_drgn 검수 31건을 눈으로 보고
+        # **27건이 실제 캠페인**(내용 일치·복원 정확)이라고 확인한 데서 나왔다 —
+        # 간격이 길어지는 실제 사유가 있다(도구 오류로 지연 발송·나중에 손으로 보냄).
+        # 인스타 Private Reply 창이 7일이므로 1시간에서 0 으로 떨어뜨릴 근거가 없다.
+        #
+        # ⚠️ **글 점수 0.55 초과를 요구한다.** 사장님이 애매 59건을 전수 라벨링한 컷이고,
+        #    이 문이 그것을 우회하면 @highestlevel33 에서 제대로 걸러낸 것들이 풀린다.
+        #    (시뮬레이션 확인: 제외 127건 → 127건 그대로.)
+        if (
+            has_text
+            and self.probed >= MIN_PROBED_FOR_AUTO
+            and self.content_score > WEAK_SUPPORT_CONTENT_MIN
+            and int(offer.get("hits") or 0) >= C.required_hits(gap_med, MIN_SUPPORT_HITS)
+        ):
+            return "auto_draft", ""
         if s >= GRADE_REVIEW:
             return "needs_review", ""
         if hits >= MIN_SUPPORT_HITS:
@@ -226,7 +242,7 @@ class PostRecovery:
         if gap is not None:
             if 0 <= gap <= C.AUTO_DM_MAX_GAP:
                 return "needs_review", ""  # 자동 발송 확실 — 1명이 받았어도 인정
-            if gap > C.MANUAL_DM_MIN_GAP or gap < -C.CLOCK_SKEW_TOLERANCE:
+            if gap > C.EVIDENCE_MAX_GAP or gap < -C.CLOCK_SKEW_TOLERANCE:
                 return "excluded", "impossible_timing"  # 사람이 쓴 것 / 이 댓글의 응답이 아님
 
         # 간격이 애매한 구간(1분~1일)은 링크 유무로 가른다 — 링크 없는 것은 대부분 팬과의
@@ -279,7 +295,19 @@ CONTENT_WEIGHTS = {
     "tiny_comments": 0.20,  # 이모지·초단문 위주
     "caption_offer": 0.10,  # "무료 자료 드려요"
     "owner_reply_sent": 0.15,  # 계정이 "DM 보내드렸어요" 라고 답글
+    # ⚠️ 위 가중치는 @highestlevel33 에서 뽑았고, **그 계정은 캡션에 행동유도를 96% 썼다.**
+    #    캡션에 "댓글 남겨주세요" 를 안 쓰고 낱말만 흘리는 계정은 caption_cta(0.30)가 영영
+    #    안 붙어 **구조적으로 0.45 에 갇힌다.** 실측(@reels_drgn, 2026-08-18 사장님 검수):
+    #    복붙 80.6% · 트리거 'deevid' · 11/31명이 "Deevid AI 링크 보냅니다" 를 받은 게시물이
+    #    0.45 로 검수에 떨어졌다. 복붙 40% 와 80% 가 같은 점수를 받는 것이 원인이었다.
+    # → 트리거 낱말이 댓글에 **쏟아지면** 별도 신호로 센다. 캠페인 방식(캡션형/낱말형)에
+    #    따라 신호가 갈리므로, 댓글 쪽에도 독립된 문이 있어야 한다.
+    #    0.25 인 이유: 복붙(0.35)과 합쳐 **0.60** 이 되어 사장님 라벨 컷(0.55)을 넘고
+    #    CONTENT_STRONG_MIN 에 닿는다. 댓글의 60%+ 가 같은 낱말이면 그것만으로
+    #    캠페인이 확실하다는 뜻이다 — 캡션을 안 보고도 판정이 서야 한다.
+    "trigger_flood": 0.25,
 }
+TRIGGER_FLOOD_MIN = 0.60  # 댓글의 이만큼이 같은 낱말이면 '쏟아진다' 로 본다
 CONTENT_CAMPAIGN_MIN = 0.35  # 이 이상이면 "캠페인으로 본다"
 CONTENT_STRONG_MIN = 0.60  # 이 이상이면 DM 을 못 찾아도 후보로 낸다
 
@@ -333,7 +361,13 @@ def judge_content(
     if owner_replies and any(_REPLY_SENT_RE.search(t or "") for t in owner_replies):
         hits["owner_reply_sent"] = 1.0
 
-    v.score = round(sum(CONTENT_WEIGHTS[k] * w for k, w in hits.items()), 3)
+    # 트리거 낱말이 댓글에 쏟아지는가 — 캡션에 행동유도를 안 쓰는 계정의 유일한 단서다.
+    # (트리거 자체는 아래에서 정하지만, 판정은 '복붙 비율' 로 충분하다 — 같은 말이 60%면
+    #  그 말이 트리거다.)
+    if shape["repetition"] >= TRIGGER_FLOOD_MIN:
+        hits["trigger_flood"] = 1.0
+
+    v.score = round(min(1.0, sum(CONTENT_WEIGHTS[k] * w for k, w in hits.items())), 3)
     v.reasons = sorted(hits)
 
     # 트리거 단어 — 캡션이 인용한 것 우선, 없으면 가장 많이 복붙된 댓글.

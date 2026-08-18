@@ -326,8 +326,14 @@ class TestTimingRule:
         assert r.grade == "auto_draft"
         assert r.reject_reason == ""
 
-    def test_slow_dm_is_dropped_even_with_link_and_score(self):
-        """간격이 하루를 넘으면 링크·점수가 좋아도 자동 발송이 아니다."""
+    def test_slow_dm_with_thin_support_is_not_auto(self):
+        """간격이 하루를 넘고 **받은 사람이 1명**이면 자동채택하지 않는다.
+
+        ⚠️ 2026-08-18 부터 '제외' 가 아니라 **검수**로 간다. 1~7일 구간은 인스타 Private
+        Reply 창 안이고, 도구 지연·수동 발송이 실제로 있어 지워버릴 근거가 없다
+        (사장님 @reels_drgn 검수 확인). 대신 자동채택은 인원으로 막는다 — 2.3일이면
+        9명이 받았어야 하는데 1명뿐이다.
+        """
         from apps.integrations.dm_migration.recover import PostRecovery
 
         r = PostRecovery(media_id="m1", probed=12, content_score=0.9, is_campaign_signal=True)
@@ -338,7 +344,11 @@ class TestTimingRule:
             "score": 0.05,
             "gap_median": 200000,
         }
-        assert r.grade == "excluded"
+        from apps.integrations.dm_migration import collect as C
+
+        assert C.required_hits(200000, 3) == 9  # 2.3일 → 9명 필요
+        assert r.grade != "auto_draft"
+        assert r.grade == "needs_review"  # 지우지 않고 사람에게 묻는다
 
     def test_middle_zone_falls_back_to_review_rules(self):
         """1분~1일 구간은 콘텐츠 점수·링크로 가른다(사장님 검수 규칙)."""
@@ -367,7 +377,9 @@ class TestTimingRule:
     def test_impossible_runs_before_competition(self):
         """순서가 뒤집히면 시간상 말이 안 되는 근거가 경쟁에서 이겨버린다."""
         good = _rec("m-good", offer=_slot_g("자료", [5], url="https://x"))
-        stale = _rec("m-stale", offer=_slot_g("자료", [500000], url="https://x"))
+        # 8일 — 인스타 Private Reply 창(7일) 밖이라 이 댓글의 응답일 수 없다.
+        # (5.8일짜리는 2026-08-18 부터 살아남는다 — 창을 하루에서 7일로 넓혔다.)
+        stale = _rec("m-stale", offer=_slot_g("자료", [8 * 86400], url="https://x"))
         stats = attribute.resolve([stale, good])
         assert stats["impossible"] == 1
         assert stale["offer"] is None
@@ -410,11 +422,16 @@ class TestFastSendFingerprint:
         assert r.offer["auto_hits"] >= recover.AUTO_FAST_MIN_HITS
 
     def test_four_fast_sends_is_not_enough(self):
-        """지문 컷 아래(4명)는 승격하지 않는다 — 실측에서 gap 52초/4명은 약했다.
+        """지문 컷 아래(4명)는 이 문으로 승격하지 않는다 — 실측에서 gap 52초/4명은 약했다.
 
-        중앙값을 1시간 밖에 둬서 페이서 문(자동채택 ③)이 끼어들지 않게 격리한다.
+        다른 문이 끼어들지 않게 격리한다 — 중앙값을 1시간 밖에 둬 페이서 문(③)을 막고,
+        글 점수를 사장님 라벨 컷 아래로 둬 곡선 문(④)을 막는다.
+        (곡선 문 자체는 TestGapCurve 가 따로 시험한다.)
         """
-        r = self._rec_obj(probed=49, gaps=[52] * 4 + [90000] * 5)
+        from apps.integrations.dm_migration.recover import PostRecovery
+
+        r = PostRecovery(media_id="m1", probed=49, content_score=0.40, is_campaign_signal=True)
+        r.offer = _slot_g("자료", [52] * 4 + [90000] * 5, url="https://x")
         assert r.offer["auto_hits"] == 4
         assert r.offer["gap_median"] == 90000  # 페이서 문 범위(1시간) 밖
         assert r.grade != "auto_draft"
@@ -438,11 +455,19 @@ class TestDerivedNumbersFollowEvidence:
     """근거가 걷힌 뒤 파생 수치가 남아 있으면 **방금 내린 것을 자동채택한다.**"""
 
     def test_impossible_removal_recomputes_auto_hits(self):
-        rec = _rec("m1", probed=49, offer=_slot_g("자료", [8] * 6 + [500000] * 2, url="https://x"))
-        assert rec["offer"]["auto_hits"] == 6
+        """근거 창은 **7일**이다 — 하루 컷이던 것을 2026-08-18 에 넓혔다.
+
+        5.8일(500,000초)짜리는 살아남고(신뢰도 0.20 으로 낮게 셈), 8일짜리는 인스타
+        Private Reply 창 밖이라 걷어낸다.
+        """
+        rec = _rec(
+            "m1",
+            probed=49,
+            offer=_slot_g("자료", [8] * 6 + [500000] * 2 + [8 * 86400] * 3, url="https://x"),
+        )
         attribute.drop_impossible([rec])
-        assert rec["offer"]["hits"] == 6
-        assert rec["offer"]["auto_hits"] == 6  # 살아남은 근거만 센다
+        assert rec["offer"]["hits"] == 8  # 6 + 5.8일짜리 2건 (8일짜리 3건은 빠진다)
+        assert rec["offer"]["auto_hits"] == 6  # '거의 동시' 는 6명뿐
         assert rec["offer"]["gap_median"] == 8
 
     def test_time_pairing_loss_lowers_auto_hits(self):
@@ -518,12 +543,23 @@ class TestSkewWindowAndPacedSends:
         r.offer = _slot_g("자료", [462, 470, 480], url="https://x")
         assert r.grade != "auto_draft"
 
-    def test_paced_send_beyond_an_hour_is_not_auto(self):
+    def test_paced_send_beyond_an_hour_uses_the_curve_not_the_pacer_gate(self):
+        """1시간 밖은 페이서 문(③)이 안 열린다 — 대신 곡선 문(④)이 인원으로 판정한다.
+
+        2026-08-18 이전에는 1시간 밖이면 무조건 검수였다. 사장님이 @reels_drgn 31건을
+        검수해 27건이 실제 캠페인임을 확인한 뒤, 간격을 컷에서 곡선으로 바꿨다.
+        """
+        from apps.integrations.dm_migration import collect as C
         from apps.integrations.dm_migration.recover import PostRecovery
 
-        r = PostRecovery(media_id="m1", probed=46, content_score=0.95, is_campaign_signal=True)
-        r.offer = _slot_g("자료", [29246] * 11, url="https://x")
-        assert r.grade != "auto_draft"
+        gap = 29246  # 8.1시간 → 신뢰도 0.70 → 5명 필요
+        assert C.required_hits(gap, 3) == 5
+        thin = PostRecovery(media_id="m1", probed=46, content_score=0.95, is_campaign_signal=True)
+        thin.offer = _slot_g("자료", [gap] * 4, url="https://x")
+        assert thin.grade != "auto_draft"  # 4명 → 아직 아니다
+        ok = PostRecovery(media_id="m2", probed=46, content_score=0.95, is_campaign_signal=True)
+        ok.offer = _slot_g("자료", [gap] * 11, url="https://x")
+        assert ok.grade == "auto_draft"  # 11명 → 살린다
 
     def test_pack_and_repack_agree_on_the_window(self):
         """두 곳이 갈리면 귀속 정리 뒤 등급이 옛 숫자로 매겨진다 — 단일 소스 고정."""
@@ -616,3 +652,140 @@ class TestRegradeCommand:
         job = _job(_conn(_ws(_user())))
         with pytest.raises(CommandError, match="recoveries"):
             call_command("dm_migration_regrade", str(job.id))
+
+
+# ══════════════ 8. 간격은 컷이 아니라 곡선 (2026-08-18 사장님 검수) ══════════════
+#
+# 하루 컷으로 잘랐더니 @reels_drgn 에서 검수 52건이 나왔고, 사장님이 31건을 눈으로 보고
+# **27건이 실제 캠페인**(내용 일치·복원 정확)이라고 확인했다. 간격이 길어지는 실제 사유가
+# 있다 — 자동화 도구 오류로 지연 발송, 또는 나중에 손으로 보냄. 인스타 Private Reply 창이
+# 7일이므로 1시간에서 0 으로 떨어뜨릴 근거가 없다.
+# → 느릴수록 더 많은 사람이 받았어야 인정한다(collect.required_hits).
+
+
+class TestGapCurve:
+    def _rec(self, *, hits, probed, gap, content):
+        from apps.integrations.dm_migration.recover import PostRecovery
+
+        r = PostRecovery(
+            media_id="m1", probed=probed, content_score=content, is_campaign_signal=True
+        )
+        r.offer = {
+            "text": "자료 보내드려요",
+            "url": "https://ex.co/a",
+            "hits": hits,
+            "ratio": round(hits / probed, 3),
+            "score": 0.1,
+            "gap_median": gap,
+            "auto_hits": 0,
+        }
+        return r
+
+    def test_curve_shape(self):
+        """1분=만점, 12시간까지 강하게, 7일까지 감소, 그 밖은 0."""
+        from apps.integrations.dm_migration import collect as C
+
+        assert C.gap_confidence(30) == 1.00
+        assert C.gap_confidence(12 * 3600) == 0.70
+        assert C.gap_confidence(7 * 86400) == 0.20
+        assert C.gap_confidence(8 * 86400) == 0.0  # Private Reply 창 밖
+        assert C.gap_confidence(None) == 0.0
+        # 느릴수록 더 많이 요구한다
+        need = [C.required_hits(g, 3) for g in (30, 3600, 12 * 3600, 86400, 3 * 86400)]
+        assert need == sorted(need) and need[0] == 3 and need[-1] > need[0]
+
+    def test_slow_send_with_enough_support_is_adopted(self):
+        """3.8시간 뒤에 5명이 같은 문구를 받았다 → 살린다(사장님 확인 27건이 이 모양)."""
+        r = self._rec(hits=5, probed=12, gap=int(3.8 * 3600), content=0.85)
+        assert r.grade == "auto_draft", (r.grade, r.reject_reason)
+
+    def test_slow_send_with_thin_support_is_not(self):
+        """같은 3.8시간인데 3명뿐이면 인정 안 한다(12시간 구간은 5명 필요)."""
+        r = self._rec(hits=3, probed=12, gap=int(3.8 * 3600), content=0.85)
+        assert r.grade != "auto_draft"
+
+    def test_three_days_needs_many_more(self):
+        """3일이면 9명 — 느린 만큼 더 요구한다."""
+        assert self._rec(hits=5, probed=30, gap=3 * 86400, content=0.9).grade != "auto_draft"
+        assert self._rec(hits=9, probed=30, gap=3 * 86400, content=0.9).grade == "auto_draft"
+
+    def test_beyond_seven_days_never(self):
+        """7일 밖은 인원이 아무리 많아도 이 댓글의 응답이 아니다."""
+        # 분모를 크게 둬 비율 문(60%+)이 먼저 열리지 않게 한다 — 곡선 문만 시험한다.
+        assert self._rec(hits=50, probed=200, gap=8 * 86400, content=0.95).grade != "auto_draft"
+
+    # ── 여기가 회귀 방지의 핵심 ──
+    def test_curve_never_bypasses_the_owner_label(self):
+        """★ 글 점수 0.55 이하는 이 문으로도 못 들어온다.
+
+        사장님이 애매 59건을 전수 라벨링한 컷이다. 이 문이 그걸 우회하면
+        @highestlevel33 에서 제대로 걸러낸 것들이 풀린다(시뮬레이션: 제외 127→127 유지).
+        """
+        for cs in (0.0, 0.10, 0.40, 0.55):
+            r = self._rec(hits=30, probed=200, gap=int(3.8 * 3600), content=cs)
+            assert r.grade != "auto_draft", (cs, r.grade)
+            r2 = self._rec(hits=30, probed=200, gap=30, content=cs)
+            assert r2.grade != "auto_draft", (cs, r2.grade)
+
+    def test_curve_requires_a_message_to_migrate(self):
+        """옮길 문구가 없으면(게이트만) 이 문도 안 열린다."""
+        from apps.integrations.dm_migration.recover import PostRecovery
+
+        r = PostRecovery(media_id="m1", probed=200, content_score=0.95, is_campaign_signal=True)
+        r.gate = {"text": "팔로우 확인", "hits": 30, "ratio": 0.15, "score": 0.1, "gap_median": 30}
+        assert r.grade != "auto_draft"
+
+
+class TestCommentSideScoring:
+    """캡션에 행동유도를 안 쓰는 계정이 구조적으로 0.45 에 갇혀 있었다."""
+
+    def test_trigger_flood_lifts_the_quiet_caption_case(self):
+        """실측 재현(@reels_drgn): 복붙 80.6% · 캡션에 '댓글 남겨주세요' 없음 → 0.45 였다.
+
+        캡션은 프로필 링크만 가리키고 트리거 낱말('deevid')은 댓글에만 쏟아진다.
+        11/31명이 "Deevid AI 링크 보냅니다" 를 받았는데 0.45 로 검수에 떨어졌다.
+        """
+        from apps.integrations.dm_migration.recover import judge_content
+
+        media = {
+            "id": "m-quiet",
+            "comments_count": 40,
+            "caption": (
+                "✅ 주요 어플: Deevid AI\n"
+                "🎬 해당 프롬프트는 프로필 링크의 상단 링크에서 “엘베” 검색하시면 확인 가능합니다!"
+            ),
+            "timestamp": "2026-02-27T00:00:00+0000",
+        }
+        # 댓글의 80% 가 같은 낱말
+        cmts = [{"text": "deevid"} for _ in range(32)] + [
+            {"text": f"영상 퀄리티 진짜 좋네요 {i}번째 저장합니다"} for i in range(8)
+        ]
+        v = judge_content(media, cmts)
+        assert v.repetition >= 0.60, v.repetition
+        assert "trigger_flood" in v.reasons, v.reasons
+        assert v.score > 0.55, (v.score, v.reasons)  # 사장님 라벨 컷을 넘는다
+
+    def test_mild_repetition_does_not_get_the_bonus(self):
+        """복붙이 40% 대면 가산하지 않는다 — 아무 게시물이나 올라가면 안 된다."""
+        from apps.integrations.dm_migration.recover import judge_content
+
+        media = {"id": "m2", "comments_count": 20, "caption": "오늘 산책 사진", "timestamp": ""}
+        cmts = [{"text": "좋아요"} for _ in range(8)] + [
+            {"text": f"사진 분위기가 참 좋습니다 {i}"} for i in range(12)
+        ]
+        v = judge_content(media, cmts)
+        assert "trigger_flood" not in v.reasons, (v.repetition, v.reasons)
+
+    def test_score_never_exceeds_one(self):
+        from apps.integrations.dm_migration.recover import judge_content
+
+        media = {
+            "id": "m3",
+            "comments_count": 99,
+            "caption": "팔로우하고 댓글에 'ai' 남겨주시면 무료 자료 전자책 보내드려요",
+            "timestamp": "",
+        }
+        v = judge_content(
+            media, [{"text": "ai"} for _ in range(50)], owner_replies=["보내드렸어요"]
+        )
+        assert v.score <= 1.0
