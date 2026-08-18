@@ -560,6 +560,48 @@ class TestResolveLinksCommand:
         cand.refresh_from_db()
         assert cand.offer_url == SOCIALBIZ  # 조회가 필요한 것은 손대지 않는다
 
+    def _campaign(self, conn, *, source):
+        from apps.integrations.models import AutoDMCampaign
+
+        return AutoDMCampaign.objects.create(
+            ig_connection=conn,
+            name="캠페인",
+            trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
+            media_id="m9",
+            status=AutoDMCampaign.Status.ACTIVE,
+            source=source,
+            opening_message_template=f"자료는 {INPOCK} 에서",
+            link_buttons=[{"url": INPOCK, "label": "받기"}],
+            link_button_url=INPOCK,
+        )
+
+    def test_campaigns_flag_fixes_migrated_live_campaigns(self, monkeypatch):
+        job, _cand = self._cand()
+        camp = self._campaign(job.ig_connection, source="dm_migration")
+        self._call(monkeypatch, job, "--campaigns", "--apply")
+        camp.refresh_from_db()
+        assert camp.link_buttons[0]["url"] == "https://open.kakao.com/o/gi3MUPji"
+        assert camp.link_button_url == "https://open.kakao.com/o/gi3MUPji"
+        assert "inpock" not in camp.opening_message_template
+        assert camp.link_buttons[0]["label"] == "받기"  # 라벨은 건드리지 않는다
+
+    def test_user_made_campaigns_are_never_touched(self, monkeypatch):
+        """사용자가 직접 인포크 링크를 넣어 만든 캠페인은 **본인 선택**이다."""
+        job, _cand = self._cand()
+        mine = self._campaign(job.ig_connection, source="")
+        self._call(monkeypatch, job, "--campaigns", "--apply")
+        mine.refresh_from_db()
+        assert mine.link_buttons[0]["url"] == INPOCK
+        assert mine.link_button_url == INPOCK
+        assert INPOCK in mine.opening_message_template
+
+    def test_campaigns_are_untouched_without_the_flag(self, monkeypatch):
+        job, _cand = self._cand()
+        camp = self._campaign(job.ig_connection, source="dm_migration")
+        self._call(monkeypatch, job, "--apply")
+        camp.refresh_from_db()
+        assert camp.link_buttons[0]["url"] == INPOCK
+
 
 # ── 10. `[링크]` 자리표시자 — 치환하는 곳이 없어서 글자가 그대로 발송됐다 ──
 class TestLinkPlaceholder:

@@ -10,11 +10,17 @@
     · ``matched_template.recovered_url`` 은 **건드리지 않는다** — 관측한 원문 근거다.
       되돌린 값은 ``matched_template.resolved_url`` 에 따로 남겨 감사할 수 있게 한다.
 
+``--campaigns`` 를 주면 **이미 활성화된 캠페인**(``source=dm_migration``)의 링크 버튼·본문도
+같이 되돌린다. 후보만 고치면 이미 불러오기를 누른 계정은 계속 남의 래퍼로 발송한다
+(실측 2026-08-19: @3dragon_pd 42개가 active 상태로 인포크 래퍼를 물고 있었다).
+**사용자가 직접 만든 캠페인은 건드리지 않는다** — 본인이 넣은 링크는 본인 선택이다.
+
 사용법::
 
     manage.py dm_migration_resolve_links --job <job_id>
     manage.py dm_migration_resolve_links --username highestlevel33 --apply
     manage.py dm_migration_resolve_links --job <job_id> --offline-only --apply
+    manage.py dm_migration_resolve_links --username 3dragon_pd --campaigns --apply
 """
 
 from __future__ import annotations
@@ -26,7 +32,83 @@ from django.db import transaction
 
 from apps.integrations.dm_migration import links
 from apps.integrations.dm_migration.analyze import find_urls
-from apps.integrations.models import DMCampaignCandidate, DMMigrationJob
+from apps.integrations.models import AutoDMCampaign, DMCampaignCandidate, DMMigrationJob
+
+# ⚠️ **우리가 만든 캠페인만 건드린다.** 사용자가 직접 인포크 링크를 넣어 만든 캠페인은
+#    그게 본인 선택이라 손대면 안 된다. 설명 문자열("불러옴")로 판정하지 않는다 — 사용자가
+#    설명을 지우면 판정이 깨진다. `source` 는 apply 경로가 박아주는 값이고,
+#    실측(2026-08-19)에서 설명 표기 42건과 정확히 일치했다.
+#    (모델이 inline choices 를 쓰므로 열거형 대신 값 그대로 쓴다 — models.py `source` 참조)
+MIGRATED = "dm_migration"
+
+# 캠페인에서 링크가 들어 있는 곳 — 버튼과 본문 양쪽.
+CAMPAIGN_TEXT_FIELDS = (
+    "opening_message_template",
+    "message_template",
+    "reward_message_template",
+    "follow_gate_retry_message",
+    "public_reply_template",
+)
+CAMPAIGN_TEXT_LISTS = (
+    "opening_message_templates",
+    "follow_gate_prompt_templates",
+    "public_reply_templates",
+    "recovery_reply_templates",
+)
+
+
+def _urls_of_campaign(c: AutoDMCampaign) -> list[str]:
+    out: list[str] = []
+    for b in c.link_buttons or []:
+        if isinstance(b, dict) and (b.get("url") or "").strip():
+            out.append(b["url"].strip())
+    if (getattr(c, "link_button_url", "") or "").strip():
+        out.append(c.link_button_url.strip())
+    for f in CAMPAIGN_TEXT_FIELDS:
+        out += find_urls(getattr(c, f, "") or "")
+    for f in CAMPAIGN_TEXT_LISTS:
+        for t in getattr(c, f, None) or []:
+            if isinstance(t, str):
+                out += find_urls(t)
+    seen: set = set()
+    return [u for u in out if not (u in seen or seen.add(u))]
+
+
+def _fix_campaign(c: AutoDMCampaign, mapping: dict) -> list[str]:
+    """캠페인의 버튼·본문 링크를 되돌리고 **바뀐 필드 이름**을 돌려준다."""
+    changed: list[str] = []
+    buttons = c.link_buttons or []
+    if isinstance(buttons, list):
+        new_btns = []
+        for b in buttons:
+            if isinstance(b, dict) and mapping.get((b.get("url") or "").strip()):
+                nb = dict(b)
+                nb["url"] = mapping[b["url"].strip()]
+                new_btns.append(nb)
+            else:
+                new_btns.append(b)
+        if new_btns != buttons:
+            c.link_buttons = new_btns
+            changed.append("link_buttons")
+    legacy = (getattr(c, "link_button_url", "") or "").strip()
+    if legacy and mapping.get(legacy) and mapping[legacy] != legacy:
+        c.link_button_url = mapping[legacy][:1000]
+        changed.append("link_button_url")
+    for f in CAMPAIGN_TEXT_FIELDS:
+        old = getattr(c, f, "") or ""
+        new = links.rewrite_text(old, mapping)
+        if new != old:
+            setattr(c, f, new)
+            changed.append(f)
+    for f in CAMPAIGN_TEXT_LISTS:
+        old = getattr(c, f, None)
+        if not isinstance(old, list) or not old:
+            continue
+        new = [links.rewrite_text(t, mapping) if isinstance(t, str) else t for t in old]
+        if new != old:
+            setattr(c, f, new)
+            changed.append(f)
+    return changed
 
 
 def _urls_of(cand: DMCampaignCandidate) -> list[str]:
@@ -55,10 +137,19 @@ class Command(BaseCommand):
             action="store_true",
             help="조회 없이 파라미터·JWT 로 풀리는 것만 되돌린다(소셜비즈·매니챗 제외)",
         )
+        parser.add_argument(
+            "--campaigns",
+            action="store_true",
+            help=(
+                "⚠️ **살아있는 캠페인**(source=dm_migration)의 버튼·본문 링크도 되돌린다. "
+                "사용자가 직접 만든 캠페인은 건드리지 않는다."
+            ),
+        )
         parser.add_argument("--apply", action="store_true", help="실제로 저장한다")
 
     def handle(self, *args, **opts):
         qs = DMCampaignCandidate.objects.all()
+        camps: list[AutoDMCampaign] = []
         if opts.get("job"):
             try:
                 job = DMMigrationJob.objects.get(id=opts["job"])
@@ -71,12 +162,23 @@ class Command(BaseCommand):
             raise CommandError("--job 또는 --username 중 하나는 필요합니다")
 
         cands = list(qs.select_related("ig_connection"))
-        if not cands:
-            raise CommandError("대상 후보가 없습니다")
+        if opts["campaigns"]:
+            cq = AutoDMCampaign.objects.filter(source=MIGRATED)
+            if opts.get("username"):
+                cq = cq.filter(ig_connection__username=opts["username"])
+            elif opts.get("job"):
+                cq = cq.filter(ig_connection=job.ig_connection)
+            camps = list(cq.select_related("ig_connection"))
+        if not cands and not camps:
+            raise CommandError("대상이 없습니다")
 
         wanted: list[str] = []
         for c in cands:
             for u in _urls_of(c):
+                if u not in wanted:
+                    wanted.append(u)
+        for c in camps:
+            for u in _urls_of_campaign(c):
                 if u not in wanted:
                     wanted.append(u)
 
@@ -132,6 +234,27 @@ class Command(BaseCommand):
             self.stdout.write(f"      {(mt.get('recovered_url') or '')[:96]}")
             self.stdout.write(f"   →  {c.offer_url[:96]}")
 
+        # ── 살아있는 캠페인 ──
+        camp_todo: list[AutoDMCampaign] = []
+        camp_fields: set = set()
+        for c in camps:
+            fields = _fix_campaign(c, changed_urls)
+            if fields:
+                camp_todo.append(c)
+                camp_fields.update(fields)
+        if camps:
+            from collections import Counter as _C
+
+            self.stdout.write("")
+            self.stdout.write(
+                f"  캠페인(이전분만) {len(camps)}건 중 갱신 대상 {len(camp_todo)}건 "
+                f"{dict(_C(c.status for c in camp_todo))}"
+            )
+            for c in camp_todo[:10]:
+                btn = (c.link_buttons or [{}])[0].get("url", "") if c.link_buttons else ""
+                self.stdout.write(f"    {c.ig_connection.username} · {c.name[:34]}")
+                self.stdout.write(f"   →  버튼 {btn[:92]}")
+
         if not opts["apply"]:
             self.stdout.write(self.style.WARNING("미리보기입니다 — 반영하려면 --apply"))
             return
@@ -147,4 +270,8 @@ class Command(BaseCommand):
                         "matched_template",
                     ],
                 )
-        self.stdout.write(self.style.SUCCESS(f"반영 완료 — 후보 {len(todo)}건 갱신"))
+            if camp_todo:
+                AutoDMCampaign.objects.bulk_update(camp_todo, sorted(camp_fields))
+        self.stdout.write(
+            self.style.SUCCESS(f"반영 완료 — 후보 {len(todo)}건 · 캠페인 {len(camp_todo)}건 갱신")
+        )
