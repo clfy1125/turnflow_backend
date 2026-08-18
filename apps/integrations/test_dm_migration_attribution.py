@@ -144,10 +144,16 @@ class TestByTemplate:
 class TestResolve:
     def test_regrades_after_support_changes(self):
         """지지가 바뀌면 등급도 바뀌어야 한다 — 안 그러면 화면 숫자와 등급이 어긋난다."""
+        # 링크를 준다 — 2026-08-18 부터 **옮길 링크가 없으면 자동채택하지 않는다.**
+        # 이 테스트가 보려는 건 '지지가 바뀌면 등급도 바뀐다' 이므로 링크 규칙과 분리한다.
         a = _rec(
             "m-a",
             probed=12,
-            offer=_slot("자료", [{"u": f"u{i}", "m": f"d{i}", "g": 10} for i in range(12)]),
+            offer=_slot(
+                "자료",
+                [{"u": f"u{i}", "m": f"d{i}", "g": 10} for i in range(12)],
+                url="https://ex.co/a",
+            ),
         )
         stats = attribute.resolve([a])
         assert a["offer"]["hits"] == 12

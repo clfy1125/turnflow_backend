@@ -1012,6 +1012,13 @@ class _Runner:
             transfer_drops=drops,
             matched_template={
                 "source": "support",
+                # ⚠️ **복원한 원문을 여기 남긴다.** draft_opening_message 는 LLM 초안이
+                #    우선이라(first_dm_draft or offer.text) 원문이 덮인다. 그걸 다음 실행이
+                #    캐시로 읽어 "복원된 DM" 으로 쓰면 순환이 된다 —
+                #    LLM 이 캡션 보고 쓴 글을 캡션과 대조해 "내용 일치" 로 판정하게 된다
+                #    (실측 C3SqJuhxpah: 지지 3/50 인데 그 순환으로 자동채택됐다).
+                "recovered_text": (offer.get("text") or gate.get("text") or "")[:2000],
+                "recovered_url": offer.get("url") or "",
                 "support_hits": (offer or gate).get("hits", 0),
                 "support_probed": r.get("probed", 0),
                 "support_ratio": (offer or gate).get("ratio", 0),

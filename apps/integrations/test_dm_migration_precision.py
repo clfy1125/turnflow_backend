@@ -1346,3 +1346,105 @@ class TestExpensivePathIsGatedByContentScore:
         # 상한(40명)까지 다 사지 않았다 — 확정되자마자 멈췄다
         assert 0 < calls["deep_convo"] < C.CONVO_DEEP_MAX_USERS, calls["deep_convo"]
         assert C.CONVO_DEEP_MAX_USERS >= 40  # 상한 자체는 넉넉히
+
+
+# ══════════════ 캐시가 LLM 초안을 원문으로 되먹이면 안 된다 (2026-08-18) ══════════════
+
+
+@pytest.mark.django_db
+class TestCacheDoesNotFeedDraftsBackAsEvidence:
+    """실측 사고(C3SqJuhxpah): 댓글 10,050개 게시물이 조회 50명·지지 3명인데 auto_draft.
+
+    `to_recovery` 가 offer.text 에 `draft_opening_message` 를 넣었고 그 값은 LLM 초안이
+    우선이라, 2회차부터 **LLM 이 캡션 보고 쓴 글을 캡션과 대조**해 '내용 일치' 로 판정했다.
+    문구는 "자료는 [링크]에서 확인하실 수 있어요" — 자리표시자가 그대로 있었다.
+    """
+
+    def _cand(self, conn, *, recovered=None, draft="자료는 [링크]에서 확인하실 수 있어요"):
+        from apps.integrations.models import DMCampaignCandidate, DMMigrationJob
+        from apps.integrations.test_dm_migration import _job
+
+        job = _job(conn, status=DMMigrationJob.Status.READY)
+        mt = {"source": "support"}
+        if recovered is not None:
+            mt["recovered_text"] = recovered
+        return DMCampaignCandidate.objects.create(
+            job=job,
+            ig_connection=conn,
+            band=DMCampaignCandidate.Band.AUTO_DRAFT,
+            media_id="m1",
+            draft_opening_message=draft,
+            matched_template=mt,
+            offer_url="https://ex.co/a" if recovered is not None else "",
+        )
+
+    def _row(self, conn):
+        from apps.integrations.dm_migration import cache
+        from apps.integrations.models import IGPostAnalysis
+
+        return IGPostAnalysis.objects.create(
+            ig_connection=conn,
+            media_id="m1",
+            rules_version=cache.RULES_VERSION,
+            grade="auto_draft",
+            content_score=0.95,
+            probed=50,
+            support_hits=3,
+            gap_median=289,
+            auto_hits=0,
+        )
+
+    def test_draft_text_is_flagged_and_cannot_open_the_match_gate(self):
+        from apps.integrations.dm_migration import cache
+        from apps.integrations.dm_migration.recover import PostRecovery
+        from apps.integrations.test_dm_migration import _conn, _user, _ws
+
+        conn = _conn(_ws(_user()))
+        cand, row = self._cand(conn), self._row(conn)
+        rec = cache.to_recovery(
+            row, {"id": "m1", "caption": "댓글로 ai 달면 자료 보내드려요"}, cand
+        )
+        assert rec["offer"]["text_is_draft"] is True
+
+        r = PostRecovery(
+            media_id="m1",
+            probed=50,
+            content_score=0.95,
+            offer=rec["offer"],
+            # 순환의 핵심 — LLM 초안이라 캡션과 당연히 겹친다
+            content_match=["자료", "ai"],
+        )
+        assert r.grade != "auto_draft", r.grade
+        assert r.reject_reason in ("", "no_link"), r.reject_reason
+
+    def test_real_recovered_text_still_opens_it(self):
+        """원문이 저장돼 있으면 정상 동작해야 한다 — 문을 아예 막은 게 아니다."""
+        from apps.integrations.dm_migration import cache
+        from apps.integrations.dm_migration.recover import PostRecovery
+        from apps.integrations.test_dm_migration import _conn, _user, _ws
+
+        conn = _conn(_ws(_user()))
+        cand = self._cand(conn, recovered="요청하신 ai 자료 보내드려요 https://ex.co/a")
+        rec = cache.to_recovery(
+            self._row(conn), {"id": "m1", "caption": "댓글로 ai 달면 자료"}, cand
+        )
+        assert rec["offer"]["text_is_draft"] is False
+        assert "ex.co" in rec["offer"]["url"] or rec["offer"]["text"].startswith("요청하신")
+
+        r = PostRecovery(
+            media_id="m1",
+            probed=50,
+            content_score=0.95,
+            offer=rec["offer"],
+            content_match=["자료", "ai"],
+        )
+        assert r.grade == "auto_draft"
+
+    def test_rules_version_was_bumped(self):
+        """★ 오염된 판정이 auto_draft 로 굳어 있어 is_settled 가 재조사를 막는다.
+
+        규칙만 고치면 그 게시물에는 닿지 못한다 → 버전을 올려 무효화해야 한다.
+        """
+        from apps.integrations.dm_migration import cache
+
+        assert cache.RULES_VERSION >= 3

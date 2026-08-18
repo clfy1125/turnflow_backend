@@ -31,18 +31,18 @@ logger = logging.getLogger(__name__)
 
 # ⚠️ 판정 로직을 바꿀 때마다 올릴 것. 올리면 그 계정의 옛 판정이 전부 재조사 대상이 된다.
 #   1 → 2 (2026-08-17): 게이트 오판·두 축 소진·지문 판정·페이서 문 도입.
-RULES_VERSION = 2
-# 2026-08-18 판정 규칙을 고쳤는데(사장님 라벨을 간격보다 앞으로 · AI 구제를 제외이유로 제한 ·
-# 끝까지 파는 문을 등급으로 판정 · 대화 깊이 12→40명) **올리지 않았다.** 근거:
-#   · :func:`is_settled` 가 '끝났다' 고 보는 것은 ①자동채택 ②글 점수 <0.35 인 제외뿐이다.
-#     needs_review 와 '글은 강한데 문구 못 살림' 은 어차피 매번 다시 판다 → 새 규칙이 적용된다.
-#   · 새 규칙은 auto_draft 를 내리지 않는다(라벨 컷은 자동채택 문들보다 **아래**에 있다).
-#     글 점수 <0.35 인 제외도 새 규칙에서 그대로 제외다(content_says_no).
-#     → 굳어 있는 판정 중 새 규칙에서 뒤집히는 것이 없다.
-#   · 올리면 :func:`probe_pool_for` 까지 무효화돼 게시물당 최대 200페이지 댓글 재페이징이
-#     되살아난다. 얻는 것 없이 가장 비싼 재작업만 다시 산다.
-# 규칙을 또 고칠 때는 위 세 가지를 다시 확인할 것 — auto_draft 를 내리거나 글 점수 <0.35
-# 판정을 뒤집는 변경이면 **반드시 올려야 한다**.
+#   2 → 3 (2026-08-18): **캐시가 LLM 초안을 '복원된 DM' 으로 되먹이던 순환을 끊었다.**
+#     `to_recovery` 가 offer.text 에 `draft_opening_message` 를 넣었는데, 그 값은
+#     `_create_candidate` 에서 **LLM 초안이 우선**(first_dm_draft or offer.text)이다.
+#     그래서 2회차부터 "LLM 이 캡션 보고 쓴 글" 을 캡션과 대조해 '내용 일치' 로 판정했다.
+#     실측(C3SqJuhxpah): 댓글 10,050개 게시물이 **조회 50명·지지 3명·두 축 미소진**인데
+#     그 순환으로 auto_draft 로 굳었고, is_settled 가 auto_draft 를 '끝났다' 로 보아
+#     **다시 파지도 않았다.** 문구는 "자료는 [링크]에서" — 자리표시자가 그대로 남아 있다.
+#     → 이번엔 **반드시 올려야 한다.** 오염된 판정이 auto_draft 로 굳어 있어서
+#       is_settled 가 재조사를 막고, 규칙만 고쳐도 그 게시물에는 닿지 못한다.
+#       (직전 2026-08-18 변경들은 auto_draft 를 내리지 않아 올리지 않았다 — 판단 근거는
+#        "굳은 판정 중 뒤집히는 것이 있나" 다.)
+RULES_VERSION = 3
 
 # 댓글이 이만큼 늘었으면 새 댓글러가 DM 을 받았을 수 있다 → 다시 본다.
 COMMENT_GROWTH_RATIO = 1.10
@@ -119,9 +119,14 @@ def to_recovery(row, media: dict, cand=None) -> dict:
     offer = None
     gate = None
     if cand and (cand.draft_opening_message or cand.offer_url):
+        # 복원 원문을 우선한다. 없으면(옛 후보) 초안을 쓰되 **초안임을 표시**해서
+        # 판정이 그것을 근거로 쓰지 못하게 한다(recover.PostRecovery 참조).
+        mt = cand.matched_template or {}
+        recovered = (mt.get("recovered_text") or "").strip()
         offer = {
-            "text": cand.draft_opening_message or "",
-            "url": cand.offer_url or "",
+            "text": recovered or cand.draft_opening_message or "",
+            "text_is_draft": not recovered,
+            "url": mt.get("recovered_url") or cand.offer_url or "",
             "label": cand.offer_button_label or "",
             "hits": row.support_hits,
             "ratio": round(row.support_hits / max(row.probed, 1), 3),
@@ -133,7 +138,7 @@ def to_recovery(row, media: dict, cand=None) -> dict:
         }
     if cand and cand.gate_detected and cand.gate_message:
         gate = {
-            "text": cand.gate_message,
+            "text": cand.gate_message,  # 게이트 문구는 LLM 이 다시 쓰지 않는다(원문 유지)
             "url": "",
             "label": cand.gate_button_label or "",
             "hits": row.support_hits,

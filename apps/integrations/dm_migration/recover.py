@@ -172,10 +172,24 @@ class PostRecovery:
         best = self.offer or self.gate or {}
         # ratio 가 없는 옛 기록(재개·이전 버전 캐시)은 hits/probed 로 되살린다.
         ratio = float(best.get("ratio") or 0.0) or (hits / max(self.probed, 1))
+        offer = self.offer or {}
+        has_text = bool((offer.get("text") or "").strip())
+        # ── 자동채택의 최소 조건: **옮길 수 있는 것이 있어야 한다** ──
+        # 2026-08-18 사장님 지시: "끝까지 다 팠는데도 링크가 없으면 자동채택에서 빼는 게 맞다."
+        # 실측 사고(C3SqJuhxpah): 링크 없는 3건이 자동채택에 있었고 문구가
+        # "자료는 [링크]에서 확인하실 수 있어요" — **자리표시자가 그대로** 였다.
+        # 그대로 켜면 "[링크]" 라는 글자가 DM 으로 나간다.
+        # 초안 문구도 안 된다 — LLM 이 쓴 글을 옮기는 건 '복원' 이 아니다.
+        #
+        # ⚠️ 이건 **자동채택 문에만** 건다. 등급을 여기서 결정하면 아래의 제외 이유
+        #    (content_says_no·impossible_timing)가 덮여 "왜 제외됐나" 가 흐려진다.
+        #    (게이트만 나온 건도 여기서 함께 막힌다 — 옮길 링크가 없다.)
+        can_auto = bool((offer.get("url") or "").strip()) and not offer.get("text_is_draft")
         # 자동채택 — 받은 **비율**이 60%+ 이고, 사람 수와 조회 인원이 충분하면 사람 손을
         # 안 탄다. 검수 목록을 짧게 유지하는 것이 이 기능의 목표다.
         if (
-            ratio >= GRADE_AUTO_RATIO
+            can_auto
+            and ratio >= GRADE_AUTO_RATIO
             and hits >= MIN_SUPPORT_HITS
             and self.probed >= MIN_PROBED_FOR_AUTO
         ):
@@ -185,10 +199,9 @@ class PostRecovery:
         # 게이트가 아니라 오퍼 슬롯만 본다 — 옮길 문구가 있어야 후보로서 의미가 있고,
         # 게이트 문구는 원래 전 게시물에 공유돼 이 잣대로 재면 안 된다.
         # (문구 경쟁에서 내려간 오퍼는 attribute._repack 이 auto_hits 를 0 으로 만든다.)
-        offer = self.offer or {}
-        has_text = bool((offer.get("text") or "").strip())
         if (
-            int(offer.get("auto_hits") or 0) >= AUTO_FAST_MIN_HITS
+            can_auto
+            and int(offer.get("auto_hits") or 0) >= AUTO_FAST_MIN_HITS
             and has_text
             and self.probed >= MIN_PROBED_FOR_AUTO
         ):
@@ -197,7 +210,8 @@ class PostRecovery:
         # 이라고 말할 때만** 통과시킨다(사장님이 라벨링한 0.55 컷을 그대로 쓴다).
         gap_med = offer.get("gap_median")
         if (
-            int(offer.get("hits") or 0) >= SLOW_AUTO_MIN_HITS
+            can_auto
+            and int(offer.get("hits") or 0) >= SLOW_AUTO_MIN_HITS
             and gap_med is not None
             and 0 <= gap_med <= SLOW_AUTO_MAX_GAP
             and has_text
@@ -215,7 +229,8 @@ class PostRecovery:
         #    이 문이 그것을 우회하면 @highestlevel33 에서 제대로 걸러낸 것들이 풀린다.
         #    (시뮬레이션 확인: 제외 127건 → 127건 그대로.)
         if (
-            has_text
+            can_auto
+            and has_text
             and self.probed >= MIN_PROBED_FOR_AUTO
             and self.content_score > WEAK_SUPPORT_CONTENT_MIN
             and int(offer.get("hits") or 0) >= C.required_hits(gap_med, MIN_SUPPORT_HITS)
@@ -229,8 +244,11 @@ class PostRecovery:
         #   버릴 것: 캡션 "캡컷 편집 효과 4가지" ↔ DM "Higgsfield X Claude 링크"
         # 내용이 일치하면 **인원·간격 요구를 완화**한다(간격은 7일 창 안이기만 하면 된다).
         # 지지 3명 하한은 유지한다 — 1명짜리는 남의 게시물 DM 이 흘러든 것이 86% 였다.
+        # ⚠️ 초안 텍스트로는 이 문을 열지 않는다. 캐시가 LLM 초안을 원문 자리에 넣어주면
+        #    "LLM 이 캡션 보고 쓴 글" 을 캡션과 대조하는 **순환**이 된다.
         if (
-            has_text
+            can_auto
+            and has_text
             and int(offer.get("hits") or 0) >= MIN_SUPPORT_HITS
             and self.content_match
             and C.gap_confidence(gap_med) > 0
