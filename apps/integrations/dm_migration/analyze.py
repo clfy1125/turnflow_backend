@@ -598,6 +598,24 @@ def extract_dm_content(msg: dict) -> dict:
     return out
 
 
+_URL_TAIL = ").,\"'」』】]>;:!?"
+
+
+def find_urls(text: str) -> list[str]:
+    """본문에서 **http(s) 절대 URL 만** 뽑는다 (문장부호 꼬리 제거·순서 유지·중복 제거).
+
+    링크 되돌리기(:mod:`.links`)가 본문 안의 래퍼도 바꿔야 해서 필요하다. ``www.`` 같은
+    스킴 없는 형태는 제외한다 — 되돌릴 대상이 아니고, 문자열 치환 대상이 되면
+    본문 다른 곳을 잘못 건드릴 수 있다.
+    """
+    out: list[str] = []
+    for raw in _URL_RE.findall(text or ""):
+        u = raw.rstrip(_URL_TAIL)
+        if u.lower().startswith(("http://", "https://")) and u not in out:
+            out.append(u)
+    return out
+
+
 def dm_text_for_match(msg: dict) -> str:
     """군집화·지문 비교용 텍스트 (본문 + 버튼문구 + URL 을 한 줄로)."""
     c = extract_dm_content(msg)

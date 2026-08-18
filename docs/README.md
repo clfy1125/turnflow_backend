@@ -13,6 +13,14 @@
 
 ---
 
+## 루트 문서
+
+- [TURNFLOW_사업_기술_개요.md](TURNFLOW_사업_기술_개요.md) — ⭐ **회사·제품 소개(백엔드 기준)** —
+  "TurnFlow가 무슨 사업인지" 처음 접하는 사람용. 사업 모델·요금제·기능 전체·개발 자산 규모·운영 성숙도.
+  기업가치 평가/투자 자료용 원천
+
+---
+
 ## frontend/ — 프론트 연동 계약서
 
 작성 시점의 API 계약입니다. 구현이 바뀌면 이 문서도 갱신하세요.
@@ -79,6 +87,7 @@
 - [SPAM_FILTER_SYSTEM.md](system/SPAM_FILTER_SYSTEM.md) — 스팸 판정 체계
 - [DM_ERROR_POLICY_PLAN.md](system/DM_ERROR_POLICY_PLAN.md) (+ `DM_ERROR_POLICY_MATRIX.html`) — DM 오류 2분류 정책
 - [AD_COMMENT_WEBHOOK_EVIDENCE.md](system/AD_COMMENT_WEBHOOK_EVIDENCE.md) — 광고 댓글 웹훅 실측 근거(코드가 참조)
+- [DM_MIGRATION_LINK_UNWRAP.md](system/DM_MIGRATION_LINK_UNWRAP.md) — 이전 시 타사 래퍼 링크(매니챗·인포크·소셜비즈·리틀리)를 원본으로 되돌리기. 실측·소급 명령·새 도구 추가법
 - [SERVICE_DIFFERENTIATION.md](system/SERVICE_DIFFERENTIATION.md) — 서비스 차별점(세일즈)
 
 ## archive/ — 완료·대체됨

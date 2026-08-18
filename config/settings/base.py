@@ -855,6 +855,14 @@ META_APP_SECRET = config("META_APP_SECRET", default="")
 # 생성기로 전 파이프라인을 돌린다(LLM 의존 없이 mock 데이터로 e2e 검증). 운영은 반드시 False.
 DM_MIGRATION_FAKE_LLM = config("DM_MIGRATION_FAKE_LLM", default=False, cast=bool)
 
+# 이전할 링크를 **원본 목적지로 되돌린다**(타사 래퍼 → 사장님 링크). 소셜비즈·매니챗은
+# 조회가 필요해서(302 Location / 본문 <a href>) 이 플래그로 끌 수 있게 해뒀다. False 면
+# 오프라인으로 풀리는 것(인포크·리틀리·인스타)만 되돌리고 나머지는 원본 래퍼를 유지한다.
+DM_MIGRATION_RESOLVE_LINKS = config("DM_MIGRATION_RESOLVE_LINKS", default=True, cast=bool)
+# 잡 1건이 쓸 수 있는 링크 조회 수 상한. 실측 필요량은 대형 계정 1개당 98회(래퍼 키 단위
+# 캐시 30일이라 2회차부터는 0회). 상한에 닿으면 남은 링크는 원본을 유지한다.
+DM_MIGRATION_LINK_FETCH_MAX = config("DM_MIGRATION_LINK_FETCH_MAX", default=300, cast=int)
+
 # P2c — 웹훅 echo/read 이벤트를 EventInbox 멱등 INSERT + Celery(webhook_followup) 비동기 처리.
 # True(기본): 동시 UPDATE 레이스 제거 + webhook 응답 빨라짐.
 # False: 레거시 inline 처리로 즉시 롤백 (코드 재배포 없이 env 만으로).

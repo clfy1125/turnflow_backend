@@ -30,7 +30,7 @@ from django.utils import timezone
 from apps.ai_jobs.services.dm_campaign_assistant import sample_replies
 
 from ..models import AutoDMCampaign, DMCampaignCandidate, DMMigrationJob, SentDMLog
-from . import analyze, attribute, cache, collect, llm, recover
+from . import analyze, attribute, cache, collect, links, llm, recover
 from .collect import (
     Budget,
     CollectContext,
@@ -55,6 +55,11 @@ ABSOLUTE_MAX_SLICES = MAX_SLICES + 2
 # 한다 — 짧게 잡으면 재개 태스크가 자기 자신의 방금 저장을 보고 조용히 스킵된다.
 RESUME_COUNTDOWN = 75
 RECOVER_CHECKPOINT_EVERY = 20  # 게시물 N개마다 중간 저장 (크래시 시 손실 상한)
+# 링크 되돌리기 예산. **슬라이스와 별개**로 짧게 잡는다 — 이 단계는 링크 1개마다 끊기므로
+# 슬라이스로 쪼개면 슬라이스 1개당 링크 1개만 처리하고 상한을 태운다(회귀 테스트 있음).
+# 실측(2026-08-18, 대형 계정 1개): 조회 98회 · 24.7초(회당 0.25초). 2회차는 캐시로 0.02초.
+# 넘겨도 슬라이스(1200s)+이 값 < 태스크 하드 한도(1800s) 라 안전하다.
+LINK_RESOLVE_SECONDS = 180
 MAX_OUTBOUND = 500
 CANDIDATE_CONFIDENCE_THRESHOLD = 0.50  # 확장 수집 대상(강한/불확실) 하한
 OWN_FUZZY_RATIO = 0.92
@@ -110,6 +115,26 @@ def _content_strong(rec: dict) -> bool:
     if score is None:
         return bool(rec.get("signal"))
     return float(score) >= recover.CONTENT_STRONG_MIN
+
+
+def _urls_in_recovery(rec: dict) -> list[str]:
+    """이 게시물에서 **되돌리기 대상 링크** — 버튼 URL + 본문에 박힌 URL.
+
+    버튼만 챙기면 "자료는 https://... 에서" 처럼 본문에 링크를 넣은 캠페인이 래퍼를
+    그대로 물고 나간다. 게이트 문구까지 훑는다(게이트에도 링크를 넣는 도구가 있다).
+    """
+    offer = rec.get("offer") or {}
+    gate = rec.get("gate") or {}
+    out: list[str] = []
+    for u in ((offer.get("url") or ""), (gate.get("url") or "")):
+        u = u.strip()
+        if u.lower().startswith(("http://", "https://")) and u not in out:
+            out.append(u)
+    for text in ((offer.get("text") or ""), (gate.get("text") or "")):
+        for u in analyze.find_urls(text):
+            if u not in out:
+                out.append(u)
+    return out
 
 
 def _support_hits(recoveries: list[dict]) -> int:
@@ -903,14 +928,17 @@ class _Runner:
         else:
             drafts = self._generate_drafts_chunked(draft_inputs)
 
+        keep = [r for r in recs if not (r.get("grade") == "excluded" and not _content_strong(r))]
+        # HTTP 조회가 섞이므로 **트랜잭션 밖에서** 먼저 끝낸다(DB 커넥션을 붙잡고 남의 서버를
+        # 기다리는 일이 없어야 한다). 실패하면 원본 링크가 그대로 남는다.
+        link_map = self._resolve_links(keep, finish_now=finish_now)
+
         with transaction.atomic():
             self.job.candidates.all().delete()
             created = 0
-            for r in recs:
-                if r.get("grade") == "excluded" and not _content_strong(r):
-                    continue
+            for r in keep:
                 created += 1
-                self._create_candidate(r, media_by_id, drafts, existing)
+                self._create_candidate(r, media_by_id, drafts, existing, link_map)
             self.job.candidates_created = created
         self.sd["drafts_done"] = True
         self.sd.pop("drafts_partial", None)
@@ -952,7 +980,65 @@ class _Runner:
             )
         return drafts
 
-    def _create_candidate(self, r: dict, media_by_id: dict, drafts: dict, existing: dict):
+    def _resolve_links(self, recs: list[dict], *, finish_now: bool = False) -> dict:
+        """옮길 링크를 **원본 목적지로 되돌린다** — ``{원본: 최종}``.
+
+        타사 래퍼를 그대로 옮기면 사용자가 그 도구를 해지한 날 우리 DM 의 링크가 죽고,
+        소셜비즈 래퍼는 수신자 id 가 박혀 있어 전원에게 한 사람의 링크가 나간다
+        (:mod:`.links` 참조). 되돌리기가 실패하면 **원본을 그대로 쓴다.**
+
+        조회가 섞이므로 ``link_map`` 을 체크포인트로 남긴다 — 슬라이스가 끝나면 이어서 한다.
+        """
+        done = dict(self.sd.get("link_map") or {})
+        wanted = []
+        for r in recs:
+            for u in _urls_in_recovery(r):
+                if u not in done and u not in wanted:
+                    wanted.append(u)
+        if not wanted:
+            return done
+
+        # ⚠️ 여기서 슬라이스를 접지 않는다(`_SliceExhausted` 금지). 링크 되돌리기는 링크
+        #    1개마다 짧게 끊기므로 슬라이스로 쪼개면 **슬라이스 1개당 링크 1개**를 처리하고
+        #    상한(MAX_SLICES)을 태워버린다. 대신 이 단계 자체에 짧은 예산을 두고, 예산을
+        #    넘기면 **남은 링크는 원본을 그대로 쓴다**(원본도 동작하는 링크다).
+        #    예산을 넘겨도 슬라이스+예산 < Celery 태스크 한도라 안전하다.
+        deadline = time.monotonic() + LINK_RESOLVE_SECONDS
+        resolver = links.Resolver()
+        left = 0
+        try:
+            for i, u in enumerate(wanted):
+                if time.monotonic() >= deadline:
+                    left = len(wanted) - i
+                    break
+                done[u] = resolver.resolve(u)[0]
+        finally:
+            resolver.close()
+
+        self.sd["link_map"] = done
+        self._persist()
+        changed = sum(1 for k, v in done.items() if v and v != k)
+        logger.info(
+            "DM이전 링크 되돌리기 %d/%d건 (조회 %d회·실패 %d) job=%s",
+            changed,
+            len(done),
+            resolver.fetched,
+            resolver.failed,
+            self.job.id,
+        )
+        if left:
+            # 다음 실행은 래퍼 키 캐시(30일)로 즉시 끝난다 — 지금 못 한 것이 영구 손실은 아니다.
+            logger.warning(
+                "DM이전 링크 되돌리기 예산(%ds) 소진 — %d건은 원본 링크 유지 (job=%s)",
+                LINK_RESOLVE_SECONDS,
+                left,
+                self.job.id,
+            )
+        return done
+
+    def _create_candidate(
+        self, r: dict, media_by_id: dict, drafts: dict, existing: dict, link_map: dict | None = None
+    ):
         mid = r["media_id"]
         media = media_by_id.get(mid, {})
         d = drafts.get(mid, {})
@@ -972,8 +1058,16 @@ class _Runner:
         # (잘린 문장을 보여주느니 한도 안에서 말이 되는 문구를 주는 게 낫다).
         raw_opening = d.get("first_dm_draft") or offer.get("text") or ""
         has_button = bool(offer.get("url")) or bool(gate.get("is_gate"))
-        opening, _ = analyze.fit_dm_text(raw_opening, has_button=has_button)
-        gate_msg, _ = analyze.fit_dm_text(gate.get("text") or "", has_button=True)
+        # 링크 되돌리기 — 버튼만 바꾸고 본문을 놔두면 한 DM 안에서 두 링크가 갈린다.
+        lmap = link_map or {}
+        raw_url = (offer.get("url") or "").strip()
+        final_url = lmap.get(raw_url) or raw_url
+        opening, _ = analyze.fit_dm_text(
+            links.rewrite_text(raw_opening, lmap), has_button=has_button
+        )
+        gate_msg, _ = analyze.fit_dm_text(
+            links.rewrite_text(gate.get("text") or "", lmap), has_button=True
+        )
         drops = list(r.get("drops") or [])
         if not (offer or gate):
             # 글·댓글로는 캠페인이 확실한데 DM 원문을 못 건진 건. 후보는 내되 "문구는
@@ -1003,7 +1097,7 @@ class _Runner:
             support_probed=r.get("probed", 0),
             support_score=r.get("score", 0.0),
             # ── 산출물 1순위 ──
-            offer_url=(offer.get("url") or "")[:1000],
+            offer_url=final_url[:1000],
             offer_button_label=(offer.get("label") or "")[:100],
             gate_detected=bool(gate.get("is_gate")),
             gate_message=gate_msg,
@@ -1018,7 +1112,11 @@ class _Runner:
                 #    LLM 이 캡션 보고 쓴 글을 캡션과 대조해 "내용 일치" 로 판정하게 된다
                 #    (실측 C3SqJuhxpah: 지지 3/50 인데 그 순환으로 자동채택됐다).
                 "recovered_text": (offer.get("text") or gate.get("text") or "")[:2000],
-                "recovered_url": offer.get("url") or "",
+                # ⚠️ 여기는 **DM 에서 실제로 발견한 링크**(래퍼 그대로)를 남긴다. 근거는
+                #    관측값이어야 하고, 되돌리기가 나중에 틀렸다고 밝혀져도 원본이 있어야
+                #    복구할 수 있다. 사용자에게 나가는 것은 offer_url(되돌린 것)이다.
+                "recovered_url": raw_url,
+                "resolved_url": final_url if final_url != raw_url else "",
                 "support_hits": (offer or gate).get("hits", 0),
                 "support_probed": r.get("probed", 0),
                 "support_ratio": (offer or gate).get("ratio", 0),
