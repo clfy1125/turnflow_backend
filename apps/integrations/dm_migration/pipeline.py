@@ -60,6 +60,11 @@ RECOVER_CHECKPOINT_EVERY = 20  # 게시물 N개마다 중간 저장 (크래시 �
 # 실측(2026-08-18, 대형 계정 1개): 조회 98회 · 24.7초(회당 0.25초). 2회차는 캐시로 0.02초.
 # 넘겨도 슬라이스(1200s)+이 값 < 태스크 하드 한도(1800s) 라 안전하다.
 LINK_RESOLVE_SECONDS = 180
+# 구제 라운드 — 귀속 정리가 근거를 빼앗은 게시물을 두 축까지 다시 판다.
+# 라운드를 1회로 묶는 이유: 판다→또 내려간다가 무한히 돌 수 있다. 한 번 제대로 파고,
+# 그래도 근거가 옆 게시물로 가면 그건 인정하고 사람에게 넘긴다(CLAUDE.md §1 '소진의 기준').
+RESCUE_ROUNDS = 1
+RESCUE_MAX_POSTS = 30  # 실측(@highestlevel33 493개): 대상 6건. 상한은 안전장치다.
 MAX_OUTBOUND = 500
 CANDIDATE_CONFIDENCE_THRESHOLD = 0.50  # 확장 수집 대상(강한/불확실) 하한
 OWN_FUZZY_RATIO = 0.92
@@ -813,9 +818,21 @@ class _Runner:
         # 여기서만 할 수 있는 일이다. 게시물을 하나씩 조사하는 동안에는 "이 DM 을 다른
         # 게시물도 근거로 쓰고 있는지" 를 알 수 없다. 전부 모은 지금 시점에 시간 짝짓기와
         # 문구 경쟁으로 중복 주장을 정리한다(추가 API 호출 없음).
-        stats = attribute.resolve(out)
+        #
+        # ⚠️ ``keep_users=True`` — 구제 라운드가 다시 판 결과를 **남은 근거와 경쟁**시켜야
+        #    하고, by_time 은 사용자·메시지 단위로 비교한다. 근거 목록은 구제가 끝난 뒤
+        #    (또는 구제 대상이 없을 때) 반드시 버린다.
+        before = {r.get("media_id"): r.get("grade") for r in out}
+        stats = attribute.resolve(out, keep_users=True)
+        rescue = self._rescue_demoted(out, before, targets, is_own=is_own, cached=cached)
+        if rescue.get("rescued"):
+            # 새 근거가 들어왔으니 **경쟁을 다시 붙인다.** 여기서 users 도 정리된다.
+            stats = attribute.resolve(out)
+        else:
+            attribute.drop_users(out)
+        stats["rescue"] = rescue
         self.sd["attribution"] = stats
-        if any(stats.values()):
+        if any(v for k, v in stats.items() if k != "rescue"):
             logger.info("DM이전 귀속 정리 (job=%s): %s", self.job.id, stats)
 
         # 단계 완료 — 중간 상태를 지우고 확정 결과로 승격한다.
@@ -981,6 +998,77 @@ class _Runner:
                 f"캠페인 초안을 만들고 있습니다... ({len(drafts)}/{total})",
             )
         return drafts
+
+    def _rescue_demoted(self, out, before, targets, *, is_own, cached) -> dict:
+        """귀속 정리가 근거를 빼앗은 게시물을 **두 축까지 다시 판다** (구제 라운드).
+
+        왜 필요한가 — :func:`attribute.demoted_targets` 설명 참조. 요약하면 파는 판단이
+        귀속 정리보다 **먼저** 일어나서, "자동채택이니 됐다" 고 멈춘 게시물의 근거가 나중에
+        취소되면 **안 파고 끝난 게시물이 사람 검수 목록에 올라간다.**
+
+        그냥 다시 돌리면 같은 DM 을 다시 찾아 같은 등급으로 같은 자리에서 멈추므로
+        ``force_deep=True`` 로 판다. 다시 판 결과는 호출한 쪽에서 귀속 정리를 **한 번 더**
+        돌려 남은 근거와 경쟁시킨다 — 새로 찾은 사람의 DM 이 정말 이 게시물 것이면 이기고,
+        아니면 또 옆 게시물로 간다. 판정을 우리가 손으로 바꾸는 게 아니다.
+
+        라운드는 1회다(:data:`RESCUE_ROUNDS`) — 판다→내려간다가 무한히 돌지 않게.
+        """
+        targets_ids = attribute.demoted_targets(before, out)
+        info: dict = {"targets": len(targets_ids), "rescued": 0, "promoted": 0, "skipped": ""}
+        if not targets_ids:
+            return info
+        media_by_id = {m.get("id"): m for m, _d in targets}
+        # 이미 두 축을 다 판 게시물은 더 팔 것이 없다(같은 결론이 나온다).
+        todo = [
+            mid
+            for mid in targets_ids
+            if not getattr(cached.get(mid), "dug_all_comments", False) and mid in media_by_id
+        ][:RESCUE_MAX_POSTS]
+        if len(targets_ids) > len(todo):
+            info["skipped"] = f"이미 다 판 것/미디어 없음 {len(targets_ids) - len(todo)}"
+        if not todo:
+            return info
+        logger.info(
+            "DM이전 구제 라운드 (job=%s): 근거 빼앗긴 %d건 중 %d건을 두 축까지 다시 판다",
+            self.job.id,
+            len(targets_ids),
+            len(todo),
+        )
+        by_media = {r.get("media_id"): r for r in out}
+        for mid in todo:
+            if self.budget.total_hit() or self._time_up():
+                info["skipped"] = f"{info['skipped']} · 예산·시간으로 중단".strip(" ·")
+                break
+            self._check_cancel()
+            media = media_by_id[mid]
+            try:
+                r = recover.recover_post(
+                    self.ctx, media, is_own_dm=is_own, probe=True, force_deep=True
+                )
+            except (MigrationTokenError, MigrationRateLimitPause):
+                raise
+            except Exception:  # noqa: BLE001 — 구제 실패가 잡을 죽이지 않게
+                logger.exception("구제 라운드 recover_post 실패 (media=%s)", mid)
+                continue
+            rec = _recovery_to_dict(r, media)
+            old = by_media.get(mid)
+            if old is not None:
+                out[out.index(old)] = rec
+            else:
+                out.append(rec)
+            by_media[mid] = rec
+            info["rescued"] += 1
+            cache.save(
+                self.conn,
+                media,
+                rec,
+                dug_all=r.dug_all_comments,
+                dug_convo=r.dug_conversations,
+                probe_pool=r.probe_pool,
+            )
+        if info["rescued"]:
+            self._save_recover_progress()
+        return info
 
     def _resolve_links(self, recs: list[dict], *, finish_now: bool = False) -> dict:
         """옮길 링크를 **원본 목적지로 되돌린다** — ``{원본: 최종}``.

@@ -1347,6 +1347,83 @@ class TestExpensivePathIsGatedByContentScore:
         assert 0 < calls["deep_convo"] < C.CONVO_DEEP_MAX_USERS, calls["deep_convo"]
         assert C.CONVO_DEEP_MAX_USERS >= 40  # 상한 자체는 넉넉히
 
+    def _shallow_hit(self, monkeypatch, calls):
+        """얕은 조회만으로 캠페인 DM 이 나오는 상황 — 실측 DUfiDBkgdQ7 의 모양.
+
+        여기서는 첫 배치에서 자동채택 등급이 나오므로 **평소라면 아무것도 더 안 판다.**
+        그런데 그 근거는 귀속 정리에서 옆 게시물로 넘어갈 수 있다.
+        """
+        from apps.integrations.dm_migration import collect as C
+        from apps.integrations.dm_migration import recover as R
+
+        def _fetch(ctx, u, **kw):
+            calls["probed"] += 1
+            return [
+                {
+                    "text": "신청하신 자료 보내드려요 https://ex.co/pack",
+                    "created_time": "2024-02-13T14:47:35+0000",
+                    "msg_id": f"shallow-{u['id']}",
+                    "recipient": u["id"],
+                    "content": {
+                        "text": "신청하신 자료 보내드려요",
+                        "urls": ["https://ex.co/pack"],
+                        "buttons": [{"label": "자료 받기", "url": "https://ex.co/pack"}],
+                    },
+                }
+            ]
+
+        for mod in (C, R.C):
+            monkeypatch.setattr(mod, "fetch_outbound_for_commenter", _fetch)
+        return {
+            "id": "m-force",
+            "comments_count": 3000,
+            "caption": "저를 팔로우하고 댓글로 'ai' 달면 1인 기업 필수 ai 사이트 보내드려요 🔥",
+            "timestamp": "2024-02-13T14:47:05+0000",
+        }
+
+    def test_without_force_deep_an_auto_draft_post_stops_early(self, monkeypatch):
+        """★ 대조군 — 자동채택 등급이 나오면 두 축을 **안** 판다 (평소 동작, 의도된 것)."""
+        from apps.integrations.dm_migration.recover import recover_post
+
+        calls = self._spy(monkeypatch)
+        calls["ncmt"] = 3000
+        media = self._shallow_hit(monkeypatch, calls)
+        ctx = self._ctx()
+        ctx.outbox = {"nobody": []}
+
+        r = recover_post(ctx, media, is_own_dm=lambda *a: False)
+
+        assert r.grade == "auto_draft", (r.grade, r.offer)
+        assert r.dug_all_comments is False
+        assert r.dug_conversations is False
+        assert calls["deep_convo"] == 0
+
+    def test_force_deep_digs_both_axes_even_when_the_grade_says_stop(self, monkeypatch):
+        """구제 라운드 — **등급이 "됐다" 고 해도 두 축을 다 판다.**
+
+        파는 판단이 귀속 정리보다 먼저 일어나서, "자동채택이니 됐다" 고 멈춘 게시물의 근거가
+        나중에 취소되면 **안 파고 끝난 게시물이 사람 검수 목록에 올라간다.** 그냥 다시 돌리면
+        같은 DM 을 다시 찾아 같은 자리에서 또 멈추므로 force_deep 이 필요하다.
+        실측(@highestlevel33 febb6b6c, 2026-08-19): 검수 5건 중 3건이 이 경로였다.
+        위 대조군과 **같은 게시물·같은 조회 결과**인데 두 축을 파는 것이 차이다.
+        """
+        from apps.integrations.dm_migration import collect as C
+        from apps.integrations.dm_migration.recover import recover_post
+
+        calls = self._spy(monkeypatch)
+        calls["ncmt"] = 3000
+        media = self._shallow_hit(monkeypatch, calls)
+        ctx = self._ctx()
+        ctx.outbox = {"nobody": []}
+
+        r = recover_post(ctx, media, is_own_dm=lambda *a: False, force_deep=True)
+
+        assert r.grade == "auto_draft", (r.grade, r.offer)
+        assert r.dug_all_comments is True, "댓글을 끝까지 파야 한다"
+        assert r.dug_conversations is True, "대화도 끝까지 파야 한다"
+        assert C.EXHAUSTIVE_COMMENT_PAGES in calls["comment_pages"]
+        assert calls["deep_convo"] > 0
+
 
 # ══════════════ 캐시가 LLM 초안을 원문으로 되먹이면 안 된다 (2026-08-18) ══════════════
 

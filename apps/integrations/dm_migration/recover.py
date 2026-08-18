@@ -440,12 +440,18 @@ def recover_post(
     workers: int = C.PROBE_WORKERS,
     probe: bool = True,
     seed_pool: list | None = None,
+    force_deep: bool = False,
 ) -> PostRecovery:
     """게시물 1건을 복원한다.
 
     Args:
         is_own_dm: ``(msg_id, text) -> bool`` — 우리(TurnFlow)가 보낸 DM 판정.
             ⚠️ 이 콜러블은 **DB 를 만지지 않아야** 한다(스레드에서 호출됨).
+        force_deep: **두 축을 다 파기 전에는 멈추지 않는다.** 구제 라운드
+            (:func:`attribute.demoted_targets`)에서만 쓴다 — 그 게시물들은 얕은 근거가
+            귀속 정리에서 취소된다는 것을 **이미 알고 있으므로**, 등급으로 판정하는 문
+            (:func:`_needs_more`)이 또 같은 자리에서 멈추면 안 된다. 그냥 다시 돌리면
+            같은 DM 을 다시 찾아 같은 등급으로 같은 곳에서 멈춘다.
     """
     mid = media.get("id") or ""
     mts = C.parse_graph_time(media.get("timestamp"))
@@ -692,7 +698,13 @@ def recover_post(
         → **등급으로 판정한다.** 지금 상태로 자동채택이 안 되면 아직 안 끝난 것이다.
           판정 규칙을 여기 복제하지 않는다 — :class:`PostRecovery` 가 단일 소스여야
           등급 규칙을 고칠 때 이 문지기가 저절로 따라온다.
+
+        ④ **등급은 나중에 취소될 수 있다.** 귀속 정리(:mod:`.attribute`)가 "그 DM 은 옆
+           게시물 것" 이라고 판정하면 근거가 사라지는데, 그때는 이미 조사가 끝났다.
+           그 게시물들은 ``force_deep`` 으로 다시 들어와 두 축을 다 판다.
         """
+        if force_deep and not (out.dug_all_comments and out.dug_conversations):
+            return True
         probed_now = max(len(probed_ids), 1)
         bo, bg = _best_slots(probed_now)
         # 옮길 **링크**가 아직 없으면 등급과 무관하게 안 끝났다. 등급만 보면 안 되는 이유:
@@ -769,7 +781,7 @@ def recover_post(
         cap = big if ncmt >= C.BIG_COMMENTS else full
         _probe(order[:cap])
         _resolve_ambiguity()
-    elif verdict.is_campaign or _would_review():
+    elif verdict.is_campaign or _would_review() or force_deep:
         # ⚠️ 바깥 문도 **같은 질문**을 해야 한다. 예전엔 `verdict.is_campaign`(내용점수
         #    ≥0.35) 만 봐서, 글이 조용한 게시물은 씨앗 몇 명만 보고 통째로 끝났다. 그중
         #    근거가 조금 나온 건은 그대로 **검수필요**로 올라갔다 — 우리가 덜 본 것을
@@ -795,7 +807,7 @@ def recover_post(
                 commenters = deep
                 order = C.order_probe_targets(deep, verdict.trigger)
                 _probe(order[:campaign])
-        if _needs_more() and (verdict.is_strong or _would_review()):
+        if _needs_more() and (verdict.is_strong or _would_review() or force_deep):
             # ── 끝까지 판다 ──
             # ⚠️ **네 번째 같은 실수를 여기서 막는다.** 이 문은 `verdict.is_strong`
             #    (내용점수 ≥0.60) 만 봤다. 그래서 내용점수 0.4 인 게시물이 12명 보고

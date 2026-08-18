@@ -992,3 +992,103 @@ class TestContentMatchGate:
                 content=0.10,
             )
             assert r.grade != "auto_draft", (hits, r.grade)
+
+
+# ══════════════ 10. 구제 라운드 — 귀속이 근거를 빼앗은 게시물 ══════════════
+
+
+class TestDemotedTargets:
+    """파는 판단이 귀속 정리보다 **먼저** 일어나서 생기는 구멍.
+
+    실측(@highestlevel33 febb6b6c, 2026-08-19): 검수 5건 중 **3건**이 이 경로였다.
+    C9zn4g3ItKv 는 댓글 10,878개인데 46명만 보고 멈췄고, 그 46명의 DM 이 옆 게시물 것으로
+    판정나서 빈손이 됐는데 남은 1만 명은 안 봤다. 제외 32건 중에도 3건 있었다.
+    """
+
+    def test_picks_posts_whose_auto_draft_was_revoked(self):
+        recs = [
+            {"media_id": "a", "grade": "needs_review"},
+            {"media_id": "b", "grade": "auto_draft"},
+            {"media_id": "c", "grade": "excluded"},
+        ]
+        before = {"a": "auto_draft", "b": "auto_draft", "c": "auto_draft"}
+        assert attribute.demoted_targets(before, recs) == ["a", "c"]
+
+    def test_ignores_posts_that_never_reached_auto_draft(self):
+        """처음부터 자동채택이 아니었으면 **문지기가 멈추지 않았다** — 이미 팠다."""
+        recs = [{"media_id": "a", "grade": "excluded"}]
+        assert attribute.demoted_targets({"a": "needs_review"}, recs) == []
+
+    def test_ignores_posts_that_kept_auto_draft(self):
+        recs = [{"media_id": "a", "grade": "auto_draft"}]
+        assert attribute.demoted_targets({"a": "auto_draft"}, recs) == []
+
+    def test_real_shape_the_fast_supporters_get_taken_away(self):
+        """실측 모양(DUfiDBkgdQ7) — **빠른 지지자만 옆 게시물이 가져간다.**
+
+        조사 당시엔 60초 내 6명이라 자동 발송 지문으로 자동채택이었다. 시간 짝짓기가 그 6명을
+        더 가까운 게시물로 넘기자 남은 것은 간격 38.8시간짜리 6명뿐 — 지문이 사라지고 곡선이
+        요구하는 지지(9명)에 못 미쳐 검수필요로 떨어졌다. 그런데 **조사는 이미 끝났다.**
+        """
+        fast = [{"u": f"u{i}", "m": f"m{i}", "g": 30} for i in range(6)]
+        slow = [{"u": f"s{i}", "m": f"t{i}", "g": 139858} for i in range(6)]
+        weak = _rec(
+            "weak",
+            probed=47,
+            offer=_slot("자료 보내드려요", fast + slow, url="https://a.b/c"),
+            content=0.9,
+        )
+        # 옆 게시물이 같은 6명의 **같은 DM** 을 더 가까운 간격으로 주장한다.
+        closer = _rec(
+            "closer",
+            probed=50,
+            offer=_slot("자료 보내드려요", [{**ev, "g": 10} for ev in fast], url="https://a.b/c"),
+            content=0.9,
+        )
+        recs = [weak, closer]
+        # 파생 수치는 production 과 같은 함수로 만든다 — 여기서 갈리면 현실을 검증하지 않는다.
+        for r in recs:
+            attribute._repack(r["offer"], r["probed"])
+        attribute.regrade(recs)
+        before = {r["media_id"]: r["grade"] for r in recs}
+        assert before["weak"] == "auto_draft", before  # 조사 당시엔 자동채택 → 여기서 멈췄다
+
+        attribute.resolve(recs, keep_users=True)
+
+        assert weak["offer"]["auto_hits"] == 0, "빠른 지지자가 넘어가야 한다"
+        assert weak["grade"] != "auto_draft", weak["grade"]
+        assert attribute.demoted_targets(before, recs) == ["weak"]
+
+    def test_keep_users_lets_a_second_round_compete(self):
+        """⚠️ 근거 목록을 버리면 다시 판 결과를 **경쟁시킬 수 없다**(by_time 이 사용자 단위)."""
+        recs = [
+            _rec("a", offer=_slot("t", [{"u": "u1", "m": "m1", "g": 10}], url="https://a/b")),
+            _rec("b", offer=_slot("t", [{"u": "u1", "m": "m1", "g": 99}], url="https://a/b")),
+        ]
+        attribute.resolve(recs, keep_users=True)
+        assert isinstance(recs[0]["offer"]["users"], list)  # 남아 있어야 2차가 가능하다
+
+        attribute.drop_users(recs)
+        assert "users" not in recs[0]["offer"]
+
+    def test_default_still_drops_users(self):
+        """기본값은 예전과 같다 — 개인 식별자를 오래 들고 있지 않는다(7일 파기)."""
+        recs = [_rec("a", offer=_slot("t", [{"u": "u1", "m": "m1", "g": 10}], url="https://a/b"))]
+        attribute.resolve(recs)
+        assert "users" not in (recs[0]["offer"] or {})
+
+    def test_resolve_is_idempotent_so_a_second_pass_is_safe(self):
+        """구제 후 정리를 **한 번 더** 돌리므로 두 번 돌려도 결과가 같아야 한다."""
+
+        def build():
+            return [
+                _rec("a", offer=_slot("t", [{"u": "u1", "m": "m1", "g": 10}], url="https://a/b")),
+                _rec("b", offer=_slot("t", [{"u": "u1", "m": "m1", "g": 99}], url="https://a/b")),
+            ]
+
+        once = build()
+        attribute.resolve(once, keep_users=True)
+        snap = [(r["media_id"], r["grade"], (r.get("offer") or {}).get("hits")) for r in once]
+        attribute.resolve(once)
+        twice = [(r["media_id"], r["grade"], (r.get("offer") or {}).get("hits")) for r in once]
+        assert snap == twice

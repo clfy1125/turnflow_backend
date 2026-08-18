@@ -268,11 +268,50 @@ def apply_verdicts(recoveries: list[dict], verdicts: dict) -> dict:
     return {"checked": len(verdicts), "kept": kept, "doubted": doubted, "blocked": blocked}
 
 
-def resolve(recoveries: list[dict]) -> dict:
+def drop_users(recoveries: list[dict]) -> None:
+    """근거 목록(사용자·메시지 id)을 버린다.
+
+    정리에만 쓰고 남기지 않는다 — stage_data 를 불리지 않고, 개인 식별자를 필요 이상으로
+    오래 들고 있지 않는다(7일 파기 정책).
+    """
+    for rec in recoveries:
+        for key in ("offer", "gate"):
+            if rec.get(key):
+                rec[key].pop("users", None)
+
+
+def demoted_targets(before: dict, recoveries: list[dict]) -> list[str]:
+    """**귀속 정리가 근거를 빼앗아 등급이 내려간** 게시물 id 를 고른다.
+
+    왜 이게 필요한가 — 파는 판단(``recover._needs_more``)은 "지금 자동채택인가" 로 멈추는데,
+    그 등급은 **귀속 정리에서 취소될 수 있다.** 조사는 게시물 하나씩 하므로 그때는 옆
+    게시물이 같은 DM 을 더 강하게 주장하는지 알 수 없다.
+
+        조사 중  지지 7명·링크 있음 → 자동채택 → "됐다" 하고 멈춤
+        정리 후  "그 7명은 옆 게시물 것" → 근거 0 → 검수필요
+        결과     **안 파고 끝난 게시물이 사람 검수 목록에 올라간다**
+
+    실측(@highestlevel33 febb6b6c, 2026-08-19): 검수 5건 중 **3건**이 이 경로였고
+    (C9zn4g3ItKv 는 댓글 10,878개인데 46명만 보고 멈췄다), 제외 32건 중에도 3건 있었다.
+    그래서 "자동채택이었다가 내려간" 것만 골라 한 번 더 판다(:data:`RESCUE_ROUNDS`).
+    """
+    out = []
+    for rec in recoveries:
+        mid = rec.get("media_id")
+        if before.get(mid) == "auto_draft" and rec.get("grade") != "auto_draft":
+            out.append(mid)
+    return out
+
+
+def resolve(recoveries: list[dict], *, keep_users: bool = False) -> dict:
     """수집 종료 후 귀속 정리 일괄 실행. 통계 반환.
 
     순서가 중요하다 — **불가능한 근거를 먼저 걷어내고** 나서 게시물 간 경쟁을 붙인다.
     거꾸로 하면 시간상 말이 안 되는 근거가 경쟁에서 이겨버린다.
+
+    ``keep_users=True`` 는 **구제 라운드 전**에 쓴다. 근거 목록을 버리면 다시 판 결과를
+    남은 근거와 **경쟁시킬 수 없다**(``by_time`` 이 사용자·메시지 단위로 비교한다).
+    구제가 끝나면 :func:`drop_users` 로 반드시 버릴 것.
     """
     impossible = drop_impossible(recoveries)
     moved = by_time(recoveries)
@@ -286,12 +325,8 @@ def resolve(recoveries: list[dict]) -> dict:
                 rec[key] = None
                 emptied += 1
     changed = regrade(recoveries)
-    # 근거 목록(사용자·메시지 id)은 정리에만 쓰고 버린다 — stage_data 를 불리지 않고,
-    # 개인 식별자를 필요 이상으로 오래 들고 있지 않는다.
-    for rec in recoveries:
-        for key in ("offer", "gate"):
-            if rec.get(key):
-                rec[key].pop("users", None)
+    if not keep_users:
+        drop_users(recoveries)
     return {
         "impossible": impossible,
         "moved": moved,
