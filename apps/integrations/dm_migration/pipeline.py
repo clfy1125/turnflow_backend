@@ -1064,11 +1064,15 @@ class _Runner:
         lmap = link_map or {}
         raw_url = (offer.get("url") or "").strip()
         final_url = lmap.get(raw_url) or raw_url
+        # `[링크]` 대괄호 제거는 여기서 한 번 더 한다 — 후보를 만드는 **유일한 지점**이라
+        # 어느 경로(LLM·규칙 폴백·복원 원문)로 온 문구든 이 문을 지난다.
         opening, _ = analyze.fit_dm_text(
-            links.rewrite_text(raw_opening, lmap), has_button=has_button
+            analyze.unwrap_link_placeholder(links.rewrite_text(raw_opening, lmap)),
+            has_button=has_button,
         )
         gate_msg, _ = analyze.fit_dm_text(
-            links.rewrite_text(gate.get("text") or "", lmap), has_button=True
+            analyze.unwrap_link_placeholder(links.rewrite_text(gate.get("text") or "", lmap)),
+            has_button=True,
         )
         drops = list(r.get("drops") or [])
         if not (offer or gate):

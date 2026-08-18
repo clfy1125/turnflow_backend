@@ -561,7 +561,149 @@ class TestResolveLinksCommand:
         assert cand.offer_url == SOCIALBIZ  # 조회가 필요한 것은 손대지 않는다
 
 
-# ── 10. 판정용 표시 ──
+# ── 10. `[링크]` 자리표시자 — 치환하는 곳이 없어서 글자가 그대로 발송됐다 ──
+class TestLinkPlaceholder:
+    """실측(2026-08-19 prod): 후보 1,829건 · active 캠페인 42개 · 실제 발송 2건(둘 다 읽음)."""
+
+    def test_brackets_are_removed_keeping_korean_particles(self):
+        """``버튼`` 으로 바꾸면 조사가 깨진다 — 링크(종성 없음) vs 버튼(종성 있음)."""
+        from apps.integrations.dm_migration.analyze import unwrap_link_placeholder as f
+
+        cases = [
+            ("아래 [링크]를 눌러 받아가세요!", "아래 링크를 눌러 받아가세요!"),
+            ("아래 [링크]로 참여하실 수 있고", "아래 링크로 참여하실 수 있고"),
+            (
+                "자세한 자료는 [링크]에서 받아보실 수 있습니다.",
+                "자세한 자료는 링크에서 받아보실 수 있습니다.",
+            ),
+            ("확인해 보세요 👇 [링크]", "확인해 보세요 👇 링크"),
+            ("아래 [ 링크 ] 를 확인해주세요", "아래 링크 를 확인해주세요"),
+            ("아래 [link]를 확인", "아래 링크를 확인"),
+            ("【링크】 확인", "링크 확인"),
+        ]
+        for src, want in cases:
+            assert f(src) == want, src
+
+    def test_untouched_when_absent(self):
+        from apps.integrations.dm_migration.analyze import unwrap_link_placeholder as f
+
+        for t in ("", None, "아래 링크를 눌러주세요", "[중요] 확인 부탁드려요", "[이벤트] 참여"):
+            assert f(t) == t
+
+    def test_idempotent(self):
+        from apps.integrations.dm_migration.analyze import unwrap_link_placeholder as f
+
+        once = f("아래 [링크]를 눌러")
+        assert f(once) == once
+
+    @pytest.mark.django_db
+    def test_pipeline_never_writes_a_placeholder_into_a_candidate(self, monkeypatch):
+        """LLM 이 자리표시자를 내놔도 **후보에는 남지 않는다** (유일한 쓰기 지점에서 막는다)."""
+        from unittest.mock import MagicMock
+
+        from apps.integrations.dm_migration import pipeline
+        from apps.integrations.test_dm_migration import _conn, _job, _user, _ws
+        from apps.integrations.test_dm_migration_slices import _drive
+
+        monkeypatch.setattr(
+            pipeline.links, "Resolver", lambda **kw: _resolver(_FakeClient({}), **kw)
+        )
+        monkeypatch.setattr(
+            pipeline.llm,
+            "generate_drafts",
+            lambda batch, *, model_code="deepseek": (
+                {
+                    c["media_id"]: {
+                        "media_id": c["media_id"],
+                        "name": "캠페인",
+                        "description": "설명",
+                        "first_dm_draft": "자료는 아래 [링크]를 눌러 받아가세요",
+                        "public_reply_draft": "DM 확인해주세요",
+                        "keywords": ["자료"],
+                        "keyword_mode": "any",
+                    }
+                    for c in batch
+                },
+                {"llm_calls": 1, "llm_tokens": 10},
+            ),
+        )
+        rec = {
+            "media_id": "m1",
+            "permalink": "https://x/1",
+            "caption": "댓글에 자료 남겨주세요",
+            "timestamp": "2026-07-01T00:00:00+0000",
+            "comments_count": 30,
+            "probed": 10,
+            "trigger": "자료",
+            "signal": True,
+            "content_score": 0.8,
+            "offer": {"text": "자료 보내드려요", "url": "https://a.b/c", "hits": 8},
+            "gate": None,
+            "grade": "auto_draft",
+            "score": 0.72,
+            "confirm_required": False,
+            "keyword_hits": {"자료": 9},
+        }
+        conn = _conn(_ws(_user()), mock_token=True)
+        job = _job(conn, estimated_seconds=10, stage_data={"media": [], "recoveries": [rec]})
+        status, _runs = _drive(job, MagicMock())
+        assert status == DMMigrationJob.Status.READY, status
+        cand = job.candidates.get()
+        assert "[링크]" not in cand.draft_opening_message
+        assert cand.draft_opening_message == "자료는 아래 링크를 눌러 받아가세요"
+
+    @pytest.mark.django_db
+    def test_repair_command_fixes_live_campaigns(self, monkeypatch):
+        """살아있는 캠페인도 고친다 — 이미 나가고 있는 문구가 문제였다."""
+        from django.core.management import call_command
+
+        from apps.integrations.models import AutoDMCampaign
+        from apps.integrations.test_dm_migration import _conn, _user, _ws
+
+        conn = _conn(_ws(_user()), mock_token=True)
+        camp = AutoDMCampaign.objects.create(
+            ig_connection=conn,
+            name="이전됨",
+            trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
+            media_id="m1",
+            status=AutoDMCampaign.Status.ACTIVE,
+            opening_message_template="아래 [링크]를 눌러 받아가세요",
+            reward_message_template="보상은 [링크]에서",
+            public_reply_templates=["DM 확인! [링크]"],
+            link_buttons=[{"url": "https://a.b/c", "label": "받기"}],
+        )
+        call_command("dm_migration_fix_link_placeholder")  # 미리보기 — 쓰지 않는다
+        camp.refresh_from_db()
+        assert "[링크]" in camp.opening_message_template
+
+        call_command("dm_migration_fix_link_placeholder", "--apply")
+        camp.refresh_from_db()
+        assert camp.opening_message_template == "아래 링크를 눌러 받아가세요"
+        assert camp.reward_message_template == "보상은 링크에서"
+        assert camp.public_reply_templates == ["DM 확인! 링크"]
+
+    @pytest.mark.django_db
+    def test_candidates_only_leaves_live_campaigns_alone(self):
+        from django.core.management import call_command
+
+        from apps.integrations.models import AutoDMCampaign
+        from apps.integrations.test_dm_migration import _conn, _user, _ws
+
+        conn = _conn(_ws(_user()), mock_token=True)
+        camp = AutoDMCampaign.objects.create(
+            ig_connection=conn,
+            name="이전됨",
+            trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA,
+            media_id="m1",
+            status=AutoDMCampaign.Status.ACTIVE,
+            opening_message_template="아래 [링크]를 눌러",
+        )
+        call_command("dm_migration_fix_link_placeholder", "--candidates-only", "--apply")
+        camp.refresh_from_db()
+        assert camp.opening_message_template == "아래 [링크]를 눌러"
+
+
+# ── 11. 판정용 표시 ──
 class TestIsWrapped:
     def test_detects_both_kinds(self):
         assert links.is_wrapped(INPOCK) is True

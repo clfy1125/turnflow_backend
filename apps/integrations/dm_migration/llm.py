@@ -29,7 +29,7 @@ from apps.ai_jobs.services.llm_client import call_llm_with_usage
 from apps.ai_jobs.services.model_router import resolve_model
 from apps.ai_jobs.services.parsers import extract_json
 
-from .analyze import fit_dm_text
+from .analyze import fit_dm_text, unwrap_link_placeholder
 
 logger = logging.getLogger(__name__)
 
@@ -190,7 +190,7 @@ def fallback_draft(c: dict) -> dict:
         "keywords": (c.get("keywords") or [kw])[:5],
         "keyword_mode": "any",
         "public_reply_draft": c.get("owner_reply_top") or "DM 보내드렸어요! 확인 부탁드려요 :)",
-        "first_dm_draft": f"안녕하세요! 요청하신 {kw} 안내드려요. 아래 [링크] 를 확인해주세요 😊",
+        "first_dm_draft": f"안녕하세요! 요청하신 {kw} 안내드려요. 아래 링크를 확인해주세요 😊",
         "followup_candidates": list((c.get("other_templates") or [])[:2]),
         "confidence": c.get("confidence", 0.6),
     }
@@ -286,6 +286,15 @@ def _enforce_length(out: dict, candidates: list[dict]) -> None:
     for mid, draft in out.items():
         c = by_id.get(mid, {})
         has_button = bool(c.get("has_button"))
+        # `[링크]` 자리표시자의 대괄호를 뗀다 — 치환하는 곳이 없어서 그 글자가 그대로
+        # 발송됐다(analyze.unwrap_link_placeholder 참조). 길이 검사 **전에** 해야
+        # 한도 계산이 실제 발송 문구와 같아진다.
+        for key in ("first_dm_draft", "public_reply_draft"):
+            if draft.get(key):
+                draft[key] = unwrap_link_placeholder(draft[key])
+        draft["followup_candidates"] = [
+            unwrap_link_placeholder(x) for x in (draft.get("followup_candidates") or [])
+        ]
         _, over = fit_dm_text(draft.get("first_dm_draft") or "", has_button=has_button)
         if not over:
             continue

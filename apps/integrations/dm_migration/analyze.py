@@ -600,6 +600,27 @@ def extract_dm_content(msg: dict) -> dict:
 
 _URL_TAIL = ").,\"'」』】]>;:!?"
 
+# LLM 초안은 URL 을 상상하지 않도록 `[링크]` 자리표시자로 쓰게 되어 있다(llm.py 프롬프트).
+# ⚠️ 그런데 **치환하는 곳이 어디에도 없었다.** 발송 경로(`AutoDMCampaign.get_opening_message`)
+#    는 템플릿을 그대로 내보내므로 수신자가 "[링크]" 라는 **글자를 그대로 봤다**
+#    (실측 2026-08-19: prod 후보 1,829건 · active 캠페인 42개 · 실제 발송 2건 모두 읽음).
+_LINK_PLACEHOLDER_RE = re.compile(r"[\[〔【]\s*(?:링크|link|url|링크주소)\s*[\]〕】]", re.I)
+
+
+def unwrap_link_placeholder(text: str) -> str:
+    """``[링크]`` → ``링크`` — **대괄호만** 뗀다.
+
+    왜 이 방식인가(다른 두 안을 버린 이유):
+      · URL 을 본문에 박기 → 래퍼 URL 이 90자여서 문장 중간에 들어가면 읽을 수 없고
+        640자 한도를 잡아먹는다. 링크는 이미 **버튼**이 나른다.
+      · ``버튼`` 으로 바꾸기 → 조사가 깨진다. `링크` 는 종성이 없고 `버튼` 은 있어서
+        "[링크]를 눌러" 가 "버튼**를** 눌러" 가 된다(를→을, 로→으로, 가→이 …).
+    ``링크`` 는 조사가 그대로 맞고, 버튼이 아래 붙으므로 "아래 링크를 눌러" 가 사실이다.
+    """
+    if not text:
+        return text
+    return _LINK_PLACEHOLDER_RE.sub("링크", text)
+
 
 def find_urls(text: str) -> list[str]:
     """본문에서 **http(s) 절대 URL 만** 뽑는다 (문장부호 꼬리 제거·순서 유지·중복 제거).
