@@ -34,6 +34,7 @@ from .analyze import (
     EMOJI_TOKEN,
     caption_keywords,
     comment_shape,
+    content_match,
     fingerprint,
     is_personal_dm,
     normalize_comment,
@@ -108,6 +109,10 @@ class PostRecovery:
     drops: list = field(default_factory=list)
     samples: list = field(default_factory=list)  # 근거 원문(7일 후 파기)
     keyword_hits: dict = field(default_factory=dict)
+    # 캡션 ↔ 복원된 DM 이 **같은 이야기인가** — 겹친 고유 낱말.
+    # 이미 있던 analyze.content_match 를 AI 대조 전처리에만 쓰고 **등급에는 안 썼다.**
+    # 그게 구멍이었다(2026-08-18 사장님 검수 13건 전수).
+    content_match: list = field(default_factory=list)
     # ── 캐시용: 어디까지 팠나 + 다음 실행에 물려줄 조회 대상 ──
     # 두 축(댓글·대화)을 다 소진했는지 남긴다(CLAUDE.md §1 '소진의 기준'). 조회 풀은
     # 끝까지 파서 얻은 캠페인 시기 댓글러라 **가장 비싼 재작업(200페이지)을 없애준다.**
@@ -214,6 +219,21 @@ class PostRecovery:
             and self.probed >= MIN_PROBED_FOR_AUTO
             and self.content_score > WEAK_SUPPORT_CONTENT_MIN
             and int(offer.get("hits") or 0) >= C.required_hits(gap_med, MIN_SUPPORT_HITS)
+        ):
+            return "auto_draft", ""
+        # 자동채택 ⑤ — **캡션이 주겠다고 한 것과 DM 이 준 것이 같다.**
+        # 사장님이 검수 13건을 눈으로 보고 8건을 "실제로 DM 캠페인도 맞고 내용도 일치함"
+        # 이라고 지적한 데서 나왔다(2026-08-18). 아쉬운 8건과 잘 걸른 3건을 가른 것이
+        # 정확히 이 신호였다 —
+        #   살릴 것: 캡션 "'파도' 검색하면"      ↔ DM "파도와 연인 프롬프트 전달드립니다"
+        #   버릴 것: 캡션 "캡컷 편집 효과 4가지" ↔ DM "Higgsfield X Claude 링크"
+        # 내용이 일치하면 **인원·간격 요구를 완화**한다(간격은 7일 창 안이기만 하면 된다).
+        # 지지 3명 하한은 유지한다 — 1명짜리는 남의 게시물 DM 이 흘러든 것이 86% 였다.
+        if (
+            has_text
+            and int(offer.get("hits") or 0) >= MIN_SUPPORT_HITS
+            and self.content_match
+            and C.gap_confidence(gap_med) > 0
         ):
             return "auto_draft", ""
         if s >= GRADE_REVIEW:
@@ -842,6 +862,11 @@ def recover_post(
 
     best_offer, best_gate = _best_slots(out.probed)
     out.offer, out.gate = best_offer, best_gate
+    # 캡션 ↔ DM 일치 — 등급 판정(자동채택 ⑤)이 쓴다. 여기서만 캡션을 온전히 볼 수 있다.
+    if best_offer and (best_offer.get("text") or "").strip():
+        out.content_match = content_match(
+            media.get("caption") or "", best_offer["text"], out.trigger
+        )
 
     drops: Counter = Counter()
     for p in (best_offer, best_gate):

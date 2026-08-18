@@ -211,6 +211,8 @@ def regrade(recoveries: list[dict]) -> int:
             gate=rec.get("gate"),
             is_campaign_signal=bool(rec.get("signal")),
             content_score=float(rec.get("content_score") or 0.0),
+            # ⚠️ 빼먹으면 재채점에서 자동채택 ⑤(내용 일치)가 조용히 안 걸린다.
+            content_match=list(rec.get("content_match") or []),
         )
         grade, reason = r.verdict()
         if rec.get("grade") != grade:

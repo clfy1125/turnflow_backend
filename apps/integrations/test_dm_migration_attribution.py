@@ -789,3 +789,139 @@ class TestCommentSideScoring:
             media, [{"text": "ai"} for _ in range(50)], owner_replies=["보내드렸어요"]
         )
         assert v.score <= 1.0
+
+
+# ══════════════ 9. 캡션 ↔ DM 내용 일치 (2026-08-18 사장님 검수 13건) ══════════════
+#
+# 사장님이 @reels_drgn 검수 13건을 눈으로 보고 8건을 "실제로 DM 캠페인도 맞고 내용도
+# 일치함" 이라고 지적했다. 아쉬운 8건과 잘 걸른 3건을 가른 것이 정확히 이 신호였다.
+# analyze.content_match 는 이미 있었지만 **AI 대조 전처리에만 쓰이고 등급에는 안 썼다.**
+
+
+class TestContentMatchGate:
+    def _rec(self, *, caption, dm, hits, probed, gap, trigger=None, content=0.45):
+        from apps.integrations.dm_migration.analyze import content_match
+        from apps.integrations.dm_migration.recover import PostRecovery
+
+        r = PostRecovery(
+            media_id="m1",
+            probed=probed,
+            content_score=content,
+            is_campaign_signal=True,
+            trigger=trigger,
+        )
+        r.offer = {
+            "text": dm,
+            "url": "https://ex.co/a",
+            "hits": hits,
+            "ratio": round(hits / probed, 3),
+            "score": 0.1,
+            "gap_median": gap,
+            "auto_hits": 0,
+        }
+        r.content_match = content_match(caption, dm, trigger)
+        return r
+
+    def test_matching_dm_survives_a_three_day_gap(self):
+        """실측 #6 재현: 캡션 "'파도' 검색하면" ↔ DM "파도와 연인 프롬프트".
+
+        간격 71.9시간(3일)이라 곡선 문은 9명을 요구하는데 3명뿐이다. 그래도 내용이
+        일치하므로 살린다 — 사장님이 "확실한 신호들이 있는데" 라고 지적한 건들이다.
+        """
+        r = self._rec(
+            caption="쓰나미 연인 영상 제작법 🌊 해당 프롬프트는 프로필 링크에서 “파도” 검색하면 얻을 수 있습니다!",
+            dm="파도와 연인 프롬프트 전달드립니다! https://notion.site/abc",
+            hits=3,
+            probed=10,
+            gap=int(71.9 * 3600),
+            trigger="파도",
+            content=0.90,
+        )
+        assert r.content_match, r.content_match
+        assert r.grade == "auto_draft", (r.grade, r.reject_reason)
+
+    def test_mismatching_dm_is_still_held(self):
+        """실측 #10 재현: 캡션 "캡컷 편집 효과" ↔ DM "Higgsfield X Claude 링크".
+
+        사장님이 "잘 걸렀고, DM 캠페인이 아니야" 라고 확인한 건이다.
+        """
+        # 간격을 페이서 문(1시간) 밖에 둬서 일치문만 시험한다. 곡선 문은 3.5시간에
+        # 5명을 요구하므로 3명으로는 안 열린다 → 남는 것은 일치문 하나뿐이다.
+        r = self._rec(
+            caption="모르면 손해보는 캡컷 편집 효과 4가지 5탄 ‼️ 스마트폰으로도 쉽게 영상 제작 해봐요!",
+            dm="Higgsfield X Claude 링크 및 세팅 가이드 전달드립니다! 감사합니다!",
+            hits=3,
+            probed=10,
+            gap=int(3.5 * 3600),
+            content=0.65,
+        )
+        assert not r.content_match, r.content_match
+        assert r.grade != "auto_draft", r.grade
+
+    def test_match_does_not_rescue_a_single_supporter(self):
+        """1명짜리는 내용이 맞아도 안 살린다 — 남의 게시물 DM 이 흘러든 것이 86% 였다."""
+        r = self._rec(
+            caption="Meshy AI 진짜 이게 되네.. 써보고 싶으면 댓글에 Meshy 남겨줘",
+            dm="Meshy AI 링크 전달드립니다!",
+            hits=1,
+            probed=10,
+            gap=30,
+            trigger="meshy",
+        )
+        assert r.content_match
+        assert r.grade != "auto_draft"
+
+    def test_match_respects_the_seven_day_window(self):
+        """8일 밖은 내용이 맞아도 이 댓글의 응답이 아니다."""
+        r = self._rec(
+            caption="Higgsfield AI 로 할리우드급 영화 만드는 법",
+            dm="higgsfield ai 링크 보냅니다!",
+            hits=9,
+            probed=20,
+            gap=8 * 86400,
+            trigger="higgsfield",
+            content=0.90,
+        )
+        assert r.content_match
+        assert r.grade != "auto_draft"
+
+    def test_regrade_carries_the_match(self):
+        """★ 재채점이 content_match 를 안 물고 가면 이 문이 조용히 안 걸린다."""
+        rec = {
+            "media_id": "m1",
+            "probed": 10,
+            "signal": True,
+            "content_score": 0.45,
+            "grade": "needs_review",
+            "score": 0.1,
+            "content_match": ["파도"],
+            "offer": {
+                "text": "파도와 연인 프롬프트",
+                "url": "https://x",
+                "hits": 3,
+                "ratio": 0.3,
+                "score": 0.1,
+                "gap_median": int(71.9 * 3600),
+                "auto_hits": 0,
+            },
+            "gate": None,
+        }
+        attribute.regrade([rec])
+        assert rec["grade"] == "auto_draft", rec["grade"]
+
+    def test_owner_label_still_governs_thin_support(self):
+        """★ 이 문은 지지 3명 하한을 지키므로 사장님 라벨 컷을 흔들지 않는다.
+
+        @highestlevel33 의 제외 127건은 대부분 지지 1~2명이라 이 문에 안 걸린다
+        (시뮬레이션 확인: 제외 127 → 127 그대로).
+        """
+        for hits in (1, 2):
+            r = self._rec(
+                caption="AI 자료 정리해뒀어요",
+                dm="AI 자료 보내드립니다",
+                hits=hits,
+                probed=40,
+                gap=30,
+                content=0.10,
+            )
+            assert r.grade != "auto_draft", (hits, r.grade)

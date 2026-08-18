@@ -228,6 +228,8 @@ def _recovery_to_dict(r, media: dict) -> dict:
         "drops": r.drops,
         "samples": r.samples,
         "keyword_hits": r.keyword_hits,
+        # 캡션↔DM 일치 낱말 — 자동채택 ⑤ 가 쓴다. 재개·재채점에서도 있어야 한다.
+        "content_match": r.content_match,
     }
 
 
