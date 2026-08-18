@@ -25,7 +25,32 @@ from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 
 from apps.integrations.dm_migration import attribute
+from apps.integrations.dm_migration.analyze import content_match
 from apps.integrations.models import DMCampaignCandidate, DMMigrationJob
+
+
+def _backfill_content_match(sd: dict, recs: list) -> int:
+    """옛 기록에 없는 ``content_match`` 를 **저장된 캡션·DM 으로** 계산해 채운다.
+
+    자동채택 ⑤(캡션↔DM 일치)는 2026-08-18 에 생겼다. 그 전 실행에는 이 값이 없어서 문이
+    조용히 안 열린다 — 그러면 계정마다 몇십 분짜리 재실행을 해야 소급된다.
+    캡션은 ``stage_data["media"]`` 에 전문이 있고 DM 문구는 offer 에 있으니, 여기서
+    **추가 호출 없이** 계산할 수 있다. 이미 값이 있는 기록은 건드리지 않는다.
+    """
+    media = {m.get("id"): (m.get("caption") or "") for m in (sd.get("media") or [])}
+    n = 0
+    for r in recs:
+        if r.get("content_match"):
+            continue
+        text = ((r.get("offer") or {}).get("text") or "").strip()
+        if not text:
+            continue
+        cap = media.get(r.get("media_id")) or r.get("caption") or ""
+        m = content_match(cap, text, r.get("trigger"))
+        if m:
+            r["content_match"] = m
+            n += 1
+    return n
 
 
 class Command(BaseCommand):
@@ -54,6 +79,9 @@ class Command(BaseCommand):
             )
 
         before = Counter(r.get("grade") for r in recs)
+        filled = _backfill_content_match(sd, recs)
+        if filled:
+            self.stdout.write(f"  캡션↔DM 일치 계산 {filled}건 (옛 기록에 없던 값 — 호출 0)")
         # regrade 는 recs 를 그 자리에서 고친다. 미리보기여도 DB 에 쓰지 않으므로 안전하다.
         changed = attribute.regrade(recs)
         after = Counter(r.get("grade") for r in recs)

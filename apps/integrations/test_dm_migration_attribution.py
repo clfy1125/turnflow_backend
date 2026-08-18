@@ -653,6 +653,67 @@ class TestRegradeCommand:
         with pytest.raises(CommandError, match="recoveries"):
             call_command("dm_migration_regrade", str(job.id))
 
+    def test_regrade_backfills_the_match_from_stored_caption(self, db):
+        """★ 옛 실행에도 소급돼야 한다 — 없으면 계정마다 재실행을 해야 한다.
+
+        캡션은 stage_data["media"] 에 전문이 있고 DM 문구는 offer 에 있으니 추가 호출 없이
+        계산된다. 2026-08-18 이전 실행에는 content_match 가 아예 없다.
+        """
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from apps.integrations.models import DMCampaignCandidate, DMMigrationJob
+        from apps.integrations.test_dm_migration import _conn, _job, _user, _ws
+
+        conn = _conn(_ws(_user()))
+        job = _job(conn, status=DMMigrationJob.Status.READY)
+        job.stage_data = {
+            "media": [
+                {
+                    "id": "m-wave",
+                    "caption": "쓰나미 연인 영상 제작법 🌊 프로필 링크에서 “파도” 검색하면 얻을 수 있습니다",
+                }
+            ],
+            "recoveries": [
+                {
+                    "media_id": "m-wave",
+                    "probed": 10,
+                    "signal": True,
+                    "content_score": 0.45,
+                    "grade": "needs_review",
+                    "score": 0.1,
+                    "trigger": "파도",
+                    # content_match 없음 — 옛 실행
+                    "offer": {
+                        "text": "파도와 연인 프롬프트 전달드립니다!",
+                        "url": "https://x",
+                        "hits": 3,
+                        "ratio": 0.3,
+                        "score": 0.1,
+                        "gap_median": int(71.9 * 3600),
+                        "auto_hits": 0,
+                    },
+                    "gate": None,
+                }
+            ],
+        }
+        job.save(update_fields=["stage_data"])
+        cand = DMCampaignCandidate.objects.create(
+            job=job,
+            ig_connection=conn,
+            band=DMCampaignCandidate.Band.NEEDS_REVIEW,
+            media_id="m-wave",
+            confirm_required=True,
+        )
+        out = StringIO()
+        call_command("dm_migration_regrade", str(job.id), "--apply", stdout=out)
+        cand.refresh_from_db()
+        job.refresh_from_db()
+        assert "캡션↔DM 일치 계산 1건" in out.getvalue(), out.getvalue()
+        assert job.stage_data["recoveries"][0]["content_match"] == ["파도"]
+        assert cand.band == "auto_draft"
+
 
 # ══════════════ 8. 간격은 컷이 아니라 곡선 (2026-08-18 사장님 검수) ══════════════
 #
