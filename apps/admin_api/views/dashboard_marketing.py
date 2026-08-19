@@ -746,7 +746,9 @@ def _trends(start, end, visit_rows: list[tuple] | None = None) -> dict:
     - dm_delivered: SentDMLog status in (delivered, read), created_at
     - page_views: PageView.viewed_at
     - page_clicks: BlockClick.clicked_at
-    - visits: LandingVisit.created_at (세션 단위 행 수 — kpis.visits 와 동일)
+    - visits(MKT-18): 그 버킷의 **고유 방문자 수**(distinct visitor_id). 세션 행 수가
+      아니다 — 세션은 ``kpis.visits`` 가 따로 들고 있다. 한 화면의 방문 관련 숫자를
+      전부 사람 단위로 맞추기 위한 것(퍼널 방문자·채널 표 visits 와 같은 정의).
     - activated(Q-1): 그 버킷에 DM 캠페인 생성 or 페이지 공개(공개 페이지 created_at 근사)한
       고유 회원 수 (**버킷 단위 user dedupe** — 주별이면 같은 주 중복 활동은 1명,
       가입 시기 무관 이벤트 기준)
@@ -756,8 +758,18 @@ def _trends(start, end, visit_rows: list[tuple] | None = None) -> dict:
     - unattributed(MKT-10 / Q-B): 귀속 기록이 없어 by_channel 에서 **제외된** 인원.
       표·퍼널과 같은 모집단을 쓰려면 추이도 빼야 한다 — 안 빼면 같은 ``other`` 키가
       카드마다 다른 인원을 뜻한다. 버킷 총량에는 **그대로 남는다**:
-      ``Σby_channel[m] + unattributed[m] == 버킷[m]`` (m = signups/activated/paid),
-      ``Σby_channel.visits == 버킷 visits``(방문은 공백 개념 없음 — 등식 그대로).
+      ``Σby_channel[m] + unattributed[m] == 버킷[m]`` (m = signups/activated/paid).
+      ⚠️ **visits 만 등식이 아니라 부등식이다** (MKT-18 이후):
+      ``Σby_channel.visits >= 버킷 visits`` — 같은 방문자가 한 버킷 안에서 두 채널로
+      들어오면 양쪽 집합에 각각 들어간다(각 값은 그 자체로 정확한 고유 방문자 수).
+      채널 표의 ``Σsources.visits >= other.visits``(MKT-8)와 같은 성질이다.
+      prod 실측(2026-08-19, 30일): 29버킷 중 2버킷에서 발생(29 vs 28, 20 vs 19).
+    - totals(MKT-18 ②): 기간 전체 합계 ``{visits, signups, activated, paid}``.
+      **버킷을 더해 만들 수 없어서** 서버가 준다 — 사람 단위 지표는 같은 사람이 다른
+      버킷에 다시 들어가므로 버킷 합 > 실제 인원이다(prod 실측 30일: 버킷 합 694 vs
+      실제 509). ``totals.visits`` 는 ``_visit_counts`` 의 고유 방문자와 **같은 집합**이라
+      퍼널 ``head[0].count`` 와 항상 일치한다 — 화면 두 곳이 맞물리는 지점이라
+      이 항등을 깨지 말 것.
     """
     tz = timezone.get_current_timezone()
     granularity = _trends_granularity(start, end)
@@ -826,18 +838,26 @@ def _trends(start, end, visit_rows: list[tuple] | None = None) -> dict:
         )
     )
 
-    # visits — 총량(세션) + 행 키 분해 {(버킷, row_key): n}. 채널별 성과 표와 같은
+    # visits — 버킷별 **고유 방문자 집합** + 행 키 분해 {(버킷, row_key): 방문자 집합}.
+    # 합산(Counter)이 아니라 집합인 이유는 MKT-18: 세션 행 수를 세면 재방문이 그대로
+    # 더해져 퍼널 방문자(사람)와 한 화면에서 어긋난다. 채널별 성과 표와 같은
     # _resolve_row_key 를 쓰므로 그래프의 층과 표의 행이 정확히 대응한다 (MKT-2).
-    visits: Counter = Counter()
-    visits_by_bucket_row: Counter = Counter()
+    visitors_by_bucket: dict = defaultdict(set)
+    visitors_by_bucket_row: dict = defaultdict(set)
+    # 기간 전체 고유 방문자 — totals.visits. **created 의 None 판정보다 앞에서** 담는다:
+    # _visit_counts 는 같은 queryset 을 필터 없이 distinct 하므로, 여기서만 걸러내면
+    # totals.visits != 퍼널 head[0].count 가 될 수 있다 (지금은 created_at 이 NOT NULL
+    # auto_now_add 라 실제로 갈리지 않지만, 항등을 컬럼 제약에 기대게 두지 않는다).
+    visitors_all: set = set()
     link_index = _link_index(MarketingChannelLink.objects.all())
-    for _vid, src, med, camp, content, referrer, channel, created in visit_rows:
+    for vid, src, med, camp, content, referrer, channel, created in visit_rows:
+        visitors_all.add(vid)
         if created is None:
             continue
         bucket = _bk(timezone.localtime(created, tz).date())
         row_key, _source = _resolve_row_key(src, med, camp, content, referrer, channel, link_index)
-        visits[bucket] += 1
-        visits_by_bucket_row[(bucket, row_key)] += 1
+        visitors_by_bucket[bucket].add(vid)
+        visitors_by_bucket_row[(bucket, row_key)].add(vid)
 
     # 유저 행 귀속 맵 — 관련 유저만 조회 (signups + activated + paid)
     involved = {uid for uid, _b in signup_rows} | set(first_paid_map)
@@ -862,12 +882,13 @@ def _trends(start, end, visit_rows: list[tuple] | None = None) -> dict:
 
     # (버킷, row_key) 슬라이스 집계. 귀속 기록 없는 회원(row_key=None)은 by_channel 에서
     # 빼고 버킷의 unattributed 로 모은다 (MKT-10 을 추이에도 적용 — Q-B).
-    # 항등: Σby_channel[m] + unattributed[m] == 버킷 총량[m] (m = signups/activated/paid),
-    #       Σby_channel.visits == 버킷 visits (방문은 행 자체로 판정 — 공백 개념 없음).
+    # 항등: Σby_channel[m] + unattributed[m] == 버킷 총량[m] (m = signups/activated/paid).
+    # visits 는 공백 개념이 없는 대신 **부등식**이다 — Σby_channel.visits >= 버킷 visits
+    # (한 방문자가 같은 버킷에서 두 채널로 들어오면 양쪽 집합에 각각 들어간다 — MKT-18).
     slice_key = defaultdict(lambda: {"visits": 0, "signups": 0, "activated": 0, "paid": 0})
     unattributed: dict = defaultdict(_empty_trend_gap)
-    for (bucket, row_key), n in visits_by_bucket_row.items():
-        slice_key[(bucket, row_key)]["visits"] += n
+    for (bucket, row_key), vids in visitors_by_bucket_row.items():
+        slice_key[(bucket, row_key)]["visits"] += len(vids)
 
     def _put(bucket, uid, metric: str) -> None:
         row_key = _trend_row_key_of(uid, attr_row, referral_users)
@@ -902,14 +923,26 @@ def _trends(start, end, visit_rows: list[tuple] | None = None) -> dict:
                 "dm_delivered": dm_delivered.get(cur, 0),
                 "page_views": page_views.get(cur, 0),
                 "page_clicks": page_clicks.get(cur, 0),
-                "visits": visits.get(cur, 0),
+                "visits": len(visitors_by_bucket.get(cur, ())),
                 "activated": len(activated_by_bucket.get(cur, ())),
                 "by_channel": by_channel_by_bucket.get(cur, {}),
                 "unattributed": unattributed.get(cur) or _empty_trend_gap(),
             }
         )
         cur = _bucket_next(cur, granularity)
-    return {"granularity": granularity, "buckets": buckets}
+
+    # MKT-18 ②: 카드 헤더용 기간 전체 합계. 버킷 합으로는 만들 수 없다(위 도크스트링).
+    # signups/paid 는 사람당 1버킷이라 버킷 합과 같지만, 정의를 한곳에 두려고 함께 담는다.
+    activated_all: set = set()
+    for users in activated_by_bucket.values():
+        activated_all |= users
+    totals = {
+        "visits": len(visitors_all),
+        "signups": len(signup_rows),
+        "activated": len(activated_all),
+        "paid": len(first_paid_map),
+    }
+    return {"granularity": granularity, "buckets": buckets, "totals": totals}
 
 
 def _visit_rows(start, end) -> list[tuple]:
@@ -1845,6 +1878,15 @@ def _attribution_gap(flags: tuple) -> dict:
     ``since`` = SignupAttribution 최초 기록 시각(전 기간) — 그 이전 가입은 애초에 기록이
     없으므로 "계측 도입 이전 가입 포함"을 화면에서 덧붙일 수 있다.
 
+    ``visits_since`` = LandingVisit 최초 기록 시각(전 기간) — **``since`` 와 다른 값이고,
+    서로 대용할 수 없다** (MKT-17). 방문 비콘(랜딩 스니펫)과 가입 귀속은 배포 시점이
+    다르다: prod 실측 2026-08-19 기준 ``since``=2026-07-16, ``visits_since``=2026-07-22 로
+    6일 차이다. 퍼널의 **방문자 노드와 가입 전환율 분모가 이 시각 이후만 관측**되므로,
+    선택 기간의 시작이 이보다 이르면 그 비율은 분자(기간 전체 가입)와 분모(관측 구간
+    방문)가 다른 기간을 세는 **과대평가**다 — 프론트가 그 판정을 하려면 이 값이 필요하다.
+    (분모를 잘라 다시 계산하지 않는 이유: 분자도 같이 잘라야 하고 그러면 사실상
+    ``visits_since`` 부터의 새 기간이 된다.)
+
     ⚠️ **제휴코드 사용자는 공백이 아니다** — 귀속 행이 없어도 코드 자체가 유입 경로라
     코드 행에 집계된다. 여기서 세면 rows 합과 이 값이 겹쳐 항등이 깨진다.
     코드를 집계에서 뺐어도(MKT-15) 마찬가지다 — 그 사람들은 other/excluded_code 로
@@ -1856,13 +1898,16 @@ def _attribution_gap(flags: tuple) -> dict:
     unattributed = sum(
         1 for row in flag_rows if row[0] not in attr_row and row[0] not in referral_users
     )
-    since = None
+    since = visits_since = None
     if ATTRIBUTION_AVAILABLE:
         since = SignupAttribution.objects.aggregate(m=Min("created_at"))["m"]
+        # created_at 은 db_index=True — 전 기간 MIN 이어도 인덱스 스캔 1회다.
+        visits_since = LandingVisit.objects.aggregate(m=Min("created_at"))["m"]
     return {
         "signups_unattributed": unattributed,
         "share": _rate(unattributed, total),
         "since": since,
+        "visits_since": visits_since,
     }
 
 
@@ -3772,8 +3817,16 @@ KPI(기간 비교), 가입 코호트 퍼널, 채널별 성과, 업셀 후보, �
   각 버킷 = `{date(로컬 YYYY-MM-DD), signups, paid, dm_delivered, page_views, page_clicks, visits}`.
   signups=User.date_joined, paid=유저별 첫 PAID paid_at(KPI first-paid 재사용),
   dm_delivered=SentDMLog(delivered/read), page_views=PageView, page_clicks=BlockClick,
-  visits=LandingVisit **행 수(세션 단위)** — 트래픽 볼륨 차트용이라 퍼널/채널의 고유 방문자와
-  단위가 다름 (어트리뷰션 미탑재 시 0). 지표별 1쿼리(TruncDate group-by, Asia/Seoul).
+  visits=그 버킷의 **고유 방문자 수**(distinct visitor_id — MKT-18). 화면의 방문 관련 숫자를
+  전부 사람 단위로 맞춘 것이라 퍼널 방문자·`channels.rows[].visits` 와 같은 정의입니다
+  (세션 행 수가 필요하면 `kpis.visits`). 어트리뷰션 미탑재 시 0.
+  지표별 1쿼리(TruncDate group-by, Asia/Seoul).
+- **`trends.totals`(MKT-18 ②)**: 카드 헤더용 **기간 전체 합계** `{visits, signups, activated, paid}`.
+  ⚠️ **버킷을 더해 헤더를 만들지 마세요** — 사람 단위라 같은 사람이 다른 버킷에 다시 들어갑니다
+  (prod 실측 2026-08-19 30일: 버킷 합 694 vs 실제 509). `totals.visits` 는 퍼널
+  `head[0].count`(방문자)와 **항상 같은 값**입니다. `totals.activated` 만 퍼널 `activation` 노드와
+  정의가 다릅니다 — 퍼널은 '이 기간에 가입한' 회원의 현재까지 도달, 이쪽은 가입 시기와 무관한
+  '이 기간의 활성화 이벤트'입니다.
 - **퍼널 = 가입 코호트(signup_cohort), 분기 구조**: `date_joined ∈ 기간` 유저가 "현재까지"
   단계에 도달했는지 기준 (기간-활동 카운트는 모집단 혼합으로 100% 초과 전환율 가능 → 배제).
   visit 만 기간-이벤트이며 **고유 방문자(distinct visitor_id) 단위** — 재방문 세션은 1명으로
@@ -3855,8 +3908,9 @@ KPI(기간 비교), 가입 코호트 퍼널, 채널별 성과, 업셀 후보, �
   별도 컬럼 제공.
 - **`channels.rows[].visits` = 고유 방문자(distinct visitor_id)**: 채널/캠페인 행의 `visits`
   와 퍼널 head 의 visit 노드는 전부 **사람(브라우저) 단위** — 같은 방문자의 재방문 세션은
-  1로 집계됩니다. `signup_rate = signups / 고유 방문자`. 세션(이벤트) 수가 필요하면
-  `kpis.visits` / `trends.buckets[].visits` 를 사용하세요. 한 방문자가 여러 채널로 유입되면
+  1로 집계됩니다. `signup_rate = signups / 고유 방문자`. **`trends.buckets[].visits` 도 MKT-18
+  이후 같은 사람 단위입니다** — 화면에서 방문을 세는 곳은 전부 사람이고, 세션(이벤트) 수는
+  `kpis.visits` 하나뿐입니다. 한 방문자가 여러 채널로 유입되면
   채널별로 각각 1씩 잡히므로 채널 합계 ≥ 전체 고유 방문자일 수 있습니다.
 - **`channels.rows[].campaigns`(N-2)**: 채널 하위 (utm_campaign × utm_content) 조합별 분해 —
   채널 행과 동일 축(visits/signups/ig_connected/dm_campaign/page_created/page_published/
@@ -3884,14 +3938,16 @@ KPI(기간 비교), 가입 코호트 퍼널, 채널별 성과, 업셀 후보, �
 - **`trends.buckets[].activated` + `by_channel`(Q-1)**: activated = 그날 DM 캠페인 생성
   or 페이지 공개한 고유 회원 수(일별 dedupe). by_channel = 채널 키 →
   `{visits, signups, activated, paid}` — 귀속은 채널별 성과 표와 동일 규칙
-  (저장 채널 + referral 오버라이드), visits 만 방문 자체의 저장 채널(세션 단위).
-  전부 0인 채널은 생략. 주별 합산은 프론트에서.
+  (저장 채널 + referral 오버라이드), visits 만 방문 자체의 저장 채널
+  (**MKT-18 이후 고유 방문자 수**). 전부 0인 채널은 생략. 주별 합산은 프론트에서.
 - **`trends.buckets[].unattributed`(MKT-10 / Q-B)**: 귀속 기록이 없어 `by_channel` 에서
   **제외된** 인원 `{signups, activated, paid}`(항상 존재, 0 포함). 채널별 성과 표
   (`channels.attribution_gap`)·퍼널 채널 variant 와 **같은 모집단**을 쓰기 위한 것 —
   안 빼면 같은 `other` 키가 표·퍼널 vs 추이에서 다른 인원을 뜻합니다.
-  항등: `Σby_channel[m] + unattributed[m] == 버킷[m]`(m = signups/activated/paid),
-  `Σby_channel.visits == 버킷 visits`(방문은 행 자체로 판정 — 공백 개념 없음).
+  항등: `Σby_channel[m] + unattributed[m] == 버킷[m]`(m = signups/activated/paid).
+  `visits` 는 공백 개념이 없는 대신 **부등식**입니다 — `Σby_channel.visits >= 버킷 visits`
+  (한 방문자가 같은 버킷에서 두 채널로 들어오면 양쪽에 각각 1로 잡힙니다 — MKT-18.
+  `channels` 표의 `Σsources.visits >= other.visits` 와 같은 성질).
 - **`cohorts`(Q-2, 기간 필터 무관)**: `subscription`(첫 결제 월 × M+1..M+5 유료 유지율 —
   시점별로 일별 스냅샷 우선, 없으면 현재 상태 역산 근사 → 하나라도 근사면
   `basis="approx"`) + `usage`(가입 주(월요일) × W+1..W+5 기능 사용률 — 이벤트 로그
@@ -4181,10 +4237,13 @@ curl -H "Authorization: Bearer <staff_token>" \\
                                 "dm_delivered": 340,
                                 "page_views": 210,
                                 "page_clicks": 45,
+                                # MKT-18: 고유 방문자 수 (세션 행 수 아님)
                                 "visits": 180,
                                 "activated": 6,
                                 # MKT-2: 키 = channels.rows[].key (other / 링크 pk / 제휴코드)
                                 "by_channel": {
+                                    # visits 합 140+45=185 >= 버킷 180 — 같은 방문자가 이
+                                    # 버킷에서 두 채널로 들어오면 양쪽에 각각 1 (MKT-18)
                                     "other": {
                                         "visits": 140,
                                         "signups": 7,
@@ -4192,7 +4251,7 @@ curl -H "Authorization: Bearer <staff_token>" \\
                                         "paid": 1,
                                     },
                                     "41": {
-                                        "visits": 40,
+                                        "visits": 45,
                                         "signups": 3,
                                         "activated": 2,
                                         "paid": 1,
@@ -4235,6 +4294,16 @@ curl -H "Authorization: Bearer <staff_token>" \\
                                 },
                             },
                         ],
+                        # MKT-18 ②: 카드 헤더용 기간 전체 합계. **버킷 합이 아니다** —
+                        # visits 180+205=385 인데 실제 인원은 342 (재방문자 43명이 두 버킷에
+                        # 각각 잡혀 있다). activated 도 6+4=10 vs 실제 9.
+                        # visits 는 funnel.variants.*.head[0].count 와 항상 같은 값이다.
+                        "totals": {
+                            "visits": 342,
+                            "signups": 21,
+                            "activated": 9,
+                            "paid": 2,
+                        },
                     },
                     "cohorts": {
                         "subscription": {

@@ -418,9 +418,19 @@ class _AttributionGapSerializer(serializers.Serializer):
     )
     since = serializers.DateTimeField(
         allow_null=True,
-        help_text="계측 최초 기록 시각(전 기간 SignupAttribution 최솟값). 이 시각 이전 가입은 "
-        "애초에 기록이 없으므로 화면에 '계측 도입 이전 가입 포함'을 덧붙일 수 있다. "
-        "어트리뷰션 미탑재면 null",
+        help_text="**가입 귀속** 계측 최초 기록 시각(전 기간 SignupAttribution 최솟값). "
+        "이 시각 이전 가입은 애초에 기록이 없으므로 화면에 '계측 도입 이전 가입 포함'을 "
+        "덧붙일 수 있다. 어트리뷰션 미탑재면 null. "
+        "⚠️ **방문 계측 시작과 다른 값이다 — visits_since 를 쓸 것**",
+    )
+    visits_since = serializers.DateTimeField(
+        allow_null=True,
+        help_text="MKT-17 — **방문 계측** 최초 기록 시각(전 기간 LandingVisit.created_at "
+        "최솟값). 랜딩 스니펫이 붙은 시점이라 `since`(가입 귀속 시작)와 다르다"
+        "(prod 실측 2026-08-19 기준 since=2026-07-16 / visits_since=2026-07-22, 6일 차이). "
+        "선택 기간의 시작이 이 시각보다 이르면 `funnel.*.head[0].count`(방문자)와 "
+        "signup 노드 `rate` 는 **부분만 관측된 분모**로 만든 값이라 실제보다 크다 — "
+        "프론트가 그 판정을 하는 데 쓴다. 어트리뷰션 미탑재면 null",
     )
 
 
@@ -1012,11 +1022,15 @@ class _TrendChannelSliceSerializer(serializers.Serializer):
     오버라이드) — visits 만 방문 자체의 저장 채널.
 
     ⚠️ 합계 규칙 (MKT-10 / Q-B): 사람 단위 3지표는 귀속 기록 없는 인원이 빠져 있어
-    ``Σ(채널) + bucket.unattributed[m] == 버킷[m]``. visits 만 ``Σ(채널) == 버킷 visits``.
+    ``Σ(채널) + bucket.unattributed[m] == 버킷[m]``.
+    ``visits`` 는 MKT-18 이후 **부등식**이다 — ``Σ(채널) >= 버킷 visits`` (한 방문자가
+    같은 버킷에서 두 채널로 들어오면 양쪽에 각각 잡힌다. 채널 표의
+    ``Σsources.visits >= other.visits`` 와 같은 성질).
     """
 
     visits = serializers.IntegerField(
-        help_text="이 채널 방문 수 (세션 단위 — 버킷 visits 와 동단위)"
+        help_text="이 채널의 **고유 방문자 수** (MKT-18 — 버킷 visits 와 동단위인 사람 수). "
+        "합은 버킷 visits 보다 클 수 있다(클래스 도크스트링 참고)"
     )
     signups = serializers.IntegerField(help_text="이 채널 귀속 가입 수")
     activated = serializers.IntegerField(
@@ -1057,8 +1071,10 @@ class _TrendBucketSerializer(serializers.Serializer):
     page_views = serializers.IntegerField(help_text="PageView.viewed_at TruncDate")
     page_clicks = serializers.IntegerField(help_text="BlockClick.clicked_at TruncDate")
     visits = serializers.IntegerField(
-        help_text="LandingVisit.created_at TruncDate — **행 수(세션 단위)**, 퍼널/채널의 "
-        "고유 방문자와 단위 다름. 어트리뷰션 미탑재 시 0"
+        help_text="MKT-18 — 이 버킷의 **고유 방문자 수**(distinct visitor_id). 퍼널 방문자·"
+        "채널 표 visits 와 같은 사람 단위다(세션 행 수는 `kpis.visits` 가 따로 들고 있다). "
+        "⚠️ **버킷을 더해도 기간 인원이 되지 않는다** — 같은 사람이 다른 날 다시 오면 두 "
+        "버킷에 각각 들어간다. 카드 헤더는 `trends.totals` 를 쓸 것. 어트리뷰션 미탑재 시 0"
     )
     activated = serializers.IntegerField(
         help_text="Q-1 — 그 버킷에 DM 캠페인 생성 or 페이지 공개(공개 페이지 created_at 근사)한 "
@@ -1079,6 +1095,28 @@ class _TrendBucketSerializer(serializers.Serializer):
     )
 
 
+class _TrendTotalsSerializer(serializers.Serializer):
+    """MKT-18 ② — 추이 카드 헤더용 **기간 전체** 합계.
+
+    프론트가 버킷을 더해 만들 수 없어서 서버가 준다: 사람 단위 지표는 같은 사람이 다른
+    버킷에 다시 들어가므로 **버킷 합 > 실제 인원**이다 (prod 실측 2026-08-19 30일 기준
+    버킷 합 694 vs 실제 509). signups/paid 는 사람당 버킷이 하나라 결과적으로 버킷 합과
+    같지만, 헤더가 지표마다 다른 출처를 쓰지 않도록 네 값을 함께 담는다.
+    """
+
+    visits = serializers.IntegerField(
+        help_text="기간 전체 고유 방문자 수. **`funnel.variants.*.head[0].count`(퍼널 방문자)와 "
+        "항상 같은 값**(같은 집합을 센다) — 화면 두 곳이 맞물리는 지점이다"
+    )
+    signups = serializers.IntegerField(help_text="기간 전체 가입 수")
+    activated = serializers.IntegerField(
+        help_text="기간 전체 활성화 고유 회원 수 (버킷 단위 dedupe 를 기간 전체로 확장). "
+        "⚠️ 퍼널 `activation` 노드와는 정의가 다르다 — 퍼널은 **이 기간에 가입한** 회원의 "
+        "현재까지 도달이고, 이쪽은 가입 시기와 무관한 **이 기간의 활성화 이벤트**다"
+    )
+    paid = serializers.IntegerField(help_text="기간 전체 첫 결제(PAID) 발생 회원 수")
+
+
 class _TrendsSerializer(serializers.Serializer):
     """추이 블록 — current 기간 전체를 로컬 날짜 기준 zero-fill (항상 포함)."""
 
@@ -1090,6 +1128,9 @@ class _TrendsSerializer(serializers.Serializer):
     buckets = _TrendBucketSerializer(
         many=True,
         help_text="버킷 시작일 오름차순 제로필. 마지막 버킷은 진행 중(미완결)일 수 있음",
+    )
+    totals = _TrendTotalsSerializer(
+        help_text="MKT-18 ② — 카드 헤더용 기간 전체 합계. **버킷을 더해 만들지 말 것**"
     )
 
 

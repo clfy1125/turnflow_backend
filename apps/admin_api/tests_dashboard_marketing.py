@@ -1004,6 +1004,8 @@ class TestTrends:
         }
         # unattributed 는 빈 버킷에도 항상 존재 (프론트가 존재 여부로 분기하지 않게)
         assert b["unattributed"] == {"signups": 0, "activated": 0, "paid": 0}
+        # MKT-18 ②: 헤더용 기간 전체 합계 (항상 존재)
+        assert set(trends["totals"]) == {"visits", "signups", "activated", "paid"}
 
     def test_trends_buckets_zero_filled_length_equals_day_count(self, staff_client, clean_slate):
         # 커스텀 6/1~6/30 = 30일 → 30 버킷 (전부 zero-fill 포함)
@@ -1033,6 +1035,128 @@ class TestTrends:
         assert bucket["signups"] == n
         # 총합도 N (다른 날은 0)
         assert sum(b["signups"] for b in res.data["trends"]["buckets"]) == n
+
+
+# ─── MKT-18: 추이 visits 사람 단위 + totals ────────────────────────────
+
+
+@pytest.mark.skipif(not HAS_ANALYTICS, reason="analytics 앱 미탑재")
+class TestTrendsVisitUnit:
+    """MKT-18 — 추이의 방문 숫자가 세션이 아니라 사람이어야 한다.
+
+    사고: 같은 화면에서 퍼널 `방문자`(사람) 옆에 추이 `방문`(세션)이 나란히 있어
+    받는 사람이 어느 쪽이 방문자인지 알 수 없었다.
+    """
+
+    def _visit(self, vid, when, **kw):
+        """LandingVisit 1건 — created_at 은 auto_now_add 라 생성 후 갱신해야 한다."""
+        v = LandingVisit.objects.create(visitor_id=vid, channel=kw.pop("channel", "direct"), **kw)
+        LandingVisit.objects.filter(pk=v.pk).update(created_at=when)
+        return v
+
+    def test_bucket_visits_are_unique_visitors_not_sessions(self, staff_client, clean_slate):
+        tz = timezone.get_current_timezone()
+        day = timezone.make_aware(timezone.datetime(2026, 6, 15, 10, 0, 0), tz)
+        vid = uuid.uuid4()
+        for _ in range(3):  # 같은 사람이 하루에 3세션
+            self._visit(vid, day)
+        self._visit(uuid.uuid4(), day)  # 다른 사람 1세션
+
+        start, end = "2026-06-01", "2026-06-30"
+        cache.delete(f"admin:dash:mkt:custom:{start}:{end}")
+        res = staff_client.get(URL, {"start": start, "end": end})
+        bucket = next(b for b in res.data["trends"]["buckets"] if b["date"] == "2026-06-15")
+        # 4세션이지만 사람은 2명 — 예전 구현은 4를 줬다
+        assert bucket["visits"] == 2
+        assert sum(s["visits"] for s in bucket["by_channel"].values()) == 2
+
+    def test_totals_visits_equals_funnel_visitor_node(self, staff_client, clean_slate):
+        """`totals.visits` == 퍼널 head[0].count — 화면 두 곳이 맞물리는 항등."""
+        tz = timezone.get_current_timezone()
+        d1 = timezone.make_aware(timezone.datetime(2026, 6, 10, 10, 0, 0), tz)
+        d2 = timezone.make_aware(timezone.datetime(2026, 6, 20, 10, 0, 0), tz)
+        repeat = uuid.uuid4()
+        self._visit(repeat, d1)  # 같은 사람이
+        self._visit(repeat, d2)  # 다른 날 재방문 → 두 버킷에 각각 1
+        self._visit(uuid.uuid4(), d1)
+
+        start, end = "2026-06-01", "2026-06-30"
+        cache.delete(f"admin:dash:mkt:custom:{start}:{end}")
+        res = staff_client.get(URL, {"start": start, "end": end})
+        trends = res.data["trends"]
+        bucket_sum = sum(b["visits"] for b in trends["buckets"])
+
+        # 버킷 합(3)은 실제 인원(2)보다 크다 — 프론트가 헤더를 버킷 합으로 만들 수 없는 이유
+        assert bucket_sum == 3
+        assert trends["totals"]["visits"] == 2
+        assert trends["totals"]["visits"] == _node(res, "visit")["count"]
+
+    def test_totals_signups_and_paid_match_bucket_sum(self, staff_client, clean_slate):
+        """사람당 버킷이 하나인 지표(signups)는 버킷 합 == totals."""
+        tz = timezone.get_current_timezone()
+        for day in (10, 20):
+            _mk_user(joined=timezone.make_aware(timezone.datetime(2026, 6, day, 10, 0, 0), tz))
+
+        start, end = "2026-06-01", "2026-06-30"
+        cache.delete(f"admin:dash:mkt:custom:{start}:{end}")
+        res = staff_client.get(URL, {"start": start, "end": end})
+        trends = res.data["trends"]
+        assert trends["totals"]["signups"] == 2
+        assert sum(b["signups"] for b in trends["buckets"]) == trends["totals"]["signups"]
+
+
+# ─── MKT-17: 방문 계측 시작 시각 ───────────────────────────────────────
+
+
+@pytest.mark.skipif(not HAS_ANALYTICS, reason="analytics 앱 미탑재")
+class TestVisitsSince:
+    """MKT-17 ① — 방문 계측 시작 시각을 응답에 실어 준다.
+
+    prod 실측(2026-08-19): LandingVisit 최초 = 7/22, SignupAttribution 최초 = 7/16.
+    이 6일 차이 때문에 `attribution_gap.since` 를 방문 계측 시작으로 쓸 수 없다 —
+    전체 기간 탭의 가입 전환율이 149일치 가입 ÷ 28일치 방문으로 과대평가됐다.
+    """
+
+    def test_visits_since_is_min_landing_visit_created_at(self, staff_client, clean_slate):
+        # visits_since 는 **전 기간 MIN** 이라 clean_slate 의 '창 밖으로 밀기'로는 부족하다
+        # (밀어낸 400일 전 행이 그대로 최솟값이 된다) — 이 테이블만 비운다(트랜잭션 롤백).
+        LandingVisit.objects.all().delete()
+        tz = timezone.get_current_timezone()
+        first = timezone.make_aware(timezone.datetime(2026, 6, 5, 9, 0, 0), tz)
+        later = timezone.make_aware(timezone.datetime(2026, 6, 25, 9, 0, 0), tz)
+        for when in (later, first):  # 삽입 순서와 무관하게 최솟값이어야 한다
+            v = LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="direct")
+            LandingVisit.objects.filter(pk=v.pk).update(created_at=when)
+
+        res = staff_client.get(URL, {"period": "all"})
+        gap = res.data["channels"]["attribution_gap"]
+        assert datetime.fromisoformat(str(gap["visits_since"])) == first
+
+    def test_visits_since_is_period_independent_and_distinct_from_since(
+        self, staff_client, clean_slate
+    ):
+        """기간 파라미터와 무관한 전 기간 최솟값 + `since` 와 다른 값."""
+        # 둘 다 전 기간 MIN 이라 잔존행을 비워야 값이 결정적이다 (위 테스트와 같은 이유)
+        LandingVisit.objects.all().delete()
+        SignupAttribution.objects.all().delete()
+        tz = timezone.get_current_timezone()
+        visit_at = timezone.make_aware(timezone.datetime(2026, 6, 20, 9, 0, 0), tz)
+        signup_at = timezone.make_aware(timezone.datetime(2026, 6, 5, 9, 0, 0), tz)
+        v = LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="direct")
+        LandingVisit.objects.filter(pk=v.pk).update(created_at=visit_at)
+        u = _mk_user(joined=signup_at)
+        attr = SignupAttribution.objects.create(user=u, channel="direct", signup_kind="email")
+        SignupAttribution.objects.filter(pk=attr.pk).update(created_at=signup_at)
+
+        gap_all = staff_client.get(URL, {"period": "all"}).data["channels"]["attribution_gap"]
+        assert datetime.fromisoformat(str(gap_all["visits_since"])) == visit_at
+        # 방문 계측 시작(6/20)과 가입 귀속 시작(6/5)은 다른 값 — 대용 불가 (MKT-17 의 근거)
+        assert datetime.fromisoformat(str(gap_all["since"])) == signup_at
+        assert gap_all["visits_since"] != gap_all["since"]
+
+        # 7d 창에는 두 행 다 없지만 값은 그대로 (전 기간 최솟값)
+        gap_7d = staff_client.get(URL, {"period": "7d"}).data["channels"]["attribution_gap"]
+        assert datetime.fromisoformat(str(gap_7d["visits_since"])) == visit_at
 
 
 # ─── 커스텀 날짜 범위 ────────────────────────────────────────────────
