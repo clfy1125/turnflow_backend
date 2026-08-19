@@ -58,6 +58,7 @@
 - [ADMIN_SNAPSHOT_ROSTER_RESPONSE.md](frontend/ADMIN_SNAPSHOT_ROSTER_RESPONSE.md) — 18차 회신(SNAP-1/2) · 전체 현황 타일 → 회원 명단(`/admin/snapshot/paying|trial/`, 타일-명단 항등·id 집합 캐시)
 
 **기타**
+- [NATIVE_APP_CORS_RESPONSE.md](frontend/NATIVE_APP_CORS_RESPONSE.md) — 네이티브 앱(Capacitor) origin CORS 허용 회신. `https://localhost`(Android)·`capacitor://localhost`(iOS)를 **env 아닌 코드**(`NATIVE_APP_CORS_ORIGINS`)로 합류 — 앱 상수라 환경마다 다를 이유가 없고 env 는 DR/새 환경에서 조용히 빠진다. `capacitor://` 는 정규식 불필요(정확 일치로 매칭됨, 실측). ⚠️ IG `return_to` 상속에서는 **의도적 제외** · 프론트가 곧 만날 것 = **CS 워커 staging↔prod 짝 어긋남으로 인한 401**
 - [INSTA_REPORT_FRONTEND.md](frontend/INSTA_REPORT_FRONTEND.md) — 인스타 성장 리포트(프로 전용·월1회)
 - [SIGNUP_ATTRIBUTION_FRONTEND.md](frontend/SIGNUP_ATTRIBUTION_FRONTEND.md) — 방문→가입 채널 귀속
 - [AI_PAGE_GENERATION_GUIDE.md](frontend/AI_PAGE_GENERATION_GUIDE.md) — AI 페이지 생성 4단계

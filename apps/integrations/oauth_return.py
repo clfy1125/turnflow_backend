@@ -74,14 +74,27 @@ def allowed_origins() -> list[str]:
 
     `IG_OAUTH_RETURN_TO_ORIGINS` 가 비어 있으면 `CORS_ALLOWED_ORIGINS` 를 따른다 —
     이미 "우리가 신뢰하는 프론트" 목록이므로 별도 관리 부담을 만들지 않는다.
+
+    **단, 네이티브 앱 origin(`NATIVE_APP_CORS_ORIGINS`)은 이 폴백에서 제외한다.**
+    CORS 허용은 "이 origin 의 JS 에게 응답 본문을 보여줘도 된다"는 뜻이지만,
+    `return_to`/postMessage 는 "OAuth 결과를 이 주소로 넘긴다"는 훨씬 강한 권한이다.
+    `https://localhost` 를 CORS 에 넣은 것(= 앱을 붙이려고)이 리다이렉트 대상 허용까지
+    **조용히** 늘리면 안 된다. 앱에서 IG 연동을 붙이는 시점에 `IG_OAUTH_RETURN_TO_ORIGINS`
+    로 **의도적으로** 넣을 것(그때는 커스텀 스킴/App Link 설계가 함께 필요하다).
     """
     raw = list(getattr(settings, "IG_OAUTH_RETURN_TO_ORIGINS", None) or [])
+    excluded: set[str] = set()
     if not raw:
         raw = list(getattr(settings, "CORS_ALLOWED_ORIGINS", None) or [])
+        for item in getattr(settings, "NATIVE_APP_CORS_ORIGINS", None) or []:
+            # 정규화해서 비교한다 — `https://localhost:443` 같은 표기 차이로 새지 않게.
+            o = normalize_origin(item)
+            if o:
+                excluded.add(o)
     out: list[str] = []
     for item in raw:
         o = normalize_origin(item)
-        if o and o not in out:
+        if o and o not in out and o not in excluded:
             out.append(o)
     return out
 

@@ -22,6 +22,11 @@ CORS_ALLOWED_ORIGINS = config(
     default="http://localhost:3000,http://localhost:8000",
     cast=lambda v: [s.strip() for s in v.split(",")],
 )
+# 네이티브 앱(Capacitor) origin 은 env 가 아니라 코드로 합류시킨다 — 근거는
+# base.py 의 NATIVE_APP_CORS_ORIGINS 주석. prod.py 와 동일하게 유지할 것.
+for _o in NATIVE_APP_CORS_ORIGINS:
+    if _o not in CORS_ALLOWED_ORIGINS:
+        CORS_ALLOWED_ORIGINS.append(_o)
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_HEADERS = [
     "accept",

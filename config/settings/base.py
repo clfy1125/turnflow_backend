@@ -1158,6 +1158,33 @@ _csrf_env = config("CSRF_TRUSTED_ORIGINS", default="")
 CSRF_TRUSTED_ORIGINS = [o.strip() for o in _csrf_env.split(",") if o.strip()]
 
 # ─────────────────────────────────────────────────────────────
+# 네이티브 앱(Capacitor) origin — CORS 허용목록에 **코드로** 합류시킨다
+# 상세: docs/frontend/NATIVE_APP_CORS_RESPONSE.md
+# ─────────────────────────────────────────────────────────────
+# Capacitor 앱은 웹뷰 안에서 "로컬 서버가 서빙하는 페이지"로 돌아간다 → 브라우저와 똑같이
+# `Origin` 헤더를 붙여 우리 API 를 부르는데, 그 origin 이 우리 도메인이 아니다:
+#   · Android = `https://localhost`      (Capacitor 6 기본 androidScheme='https')
+#   · iOS     = `capacitor://localhost`  (기본 iosScheme='capacitor')
+# 허용하지 않으면 preflight 응답에 `Access-Control-*` 가 하나도 붙지 않아 **앱의 모든 API
+# 호출이 막힌다**(엔드포인트 단위가 아니라 origin 단위로 전멸).
+#
+# ⚠️ 왜 `.env` 의 CORS_ALLOWED_ORIGINS 가 아니라 여기(코드)인가:
+#    이 두 값은 **앱 바이너리에 박히는 상수**라 환경마다 다를 이유가 없다. 반면 env 로 두면
+#    새 환경·DR 복구본·prod .env 재작성에서 조용히 빠지고, 그 사실이 "앱이 통째로 안 됨"
+#    으로 배포 후에야 드러난다. 코드에 두면 dev/prod/DR 이 자동으로 같아진다.
+#    (되돌려야 하면 `NATIVE_APP_CORS_ORIGINS=` 를 빈 값으로 두면 전부 빠진다.)
+# ⚠️ `capacitor://` 는 비표준 스킴이지만 `CORS_ALLOWED_ORIGIN_REGEXES` 가 필요 없다 —
+#    django-cors-headers(4.3.1) 는 허용목록을 `urlsplit` 의 scheme+netloc 로 비교하므로
+#    임의 스킴도 문자열 그대로 매칭된다(시스템 체크 E013/E014 도 통과. 컨테이너 실측 확인).
+# ⚠️ 여기에 값을 추가해도 IG OAuth 의 `return_to`/postMessage 허용목록에는 **들어가지 않는다**
+#    (apps/integrations/oauth_return.py 에서 명시적으로 제외). 이유는 그 파일 주석 참고.
+NATIVE_APP_CORS_ORIGINS = config(
+    "NATIVE_APP_CORS_ORIGINS",
+    default="https://localhost,capacitor://localhost",
+    cast=lambda v: [s.strip() for s in v.split(",") if s.strip()],
+)
+
+# ─────────────────────────────────────────────────────────────
 # DR (Disaster Recovery) — active_site 락 / 헬스 / 외부 스케줄러
 # 상세: docs/ops/DR_IMPLEMENTATION_PLAN.md
 # ─────────────────────────────────────────────────────────────
