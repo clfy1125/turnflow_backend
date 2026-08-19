@@ -89,11 +89,20 @@ class _FunnelNodeSerializer(serializers.Serializer):
     )
     label = serializers.CharField(help_text="한국어 고정 라벨 (예: 방문자/가입/IG 연동/…)")
     count = serializers.IntegerField(
+        allow_null=True,
         help_text="노드 도달 수. visit 만 기간-이벤트이며 **고유 방문자**(distinct visitor_id, "
-        "세션 수 아님 — 세션은 kpis.visits), 나머지는 가입 코호트의 '현재까지' 도달"
+        "세션 수 아님 — 세션은 kpis.visits), 나머지는 가입 코호트의 '현재까지' 도달. "
+        "⚠️ **MKT-17 ②: `visit` 노드만 null 이 될 수 있다** — 선택 기간의 시작이 "
+        "`channels.attribution_gap.visits_since`(방문 계측 시작)보다 이르면 그 기간의 "
+        "방문자는 부분만 관측된 값이라 숫자 대신 null 을 준다(previous·delta_pct 도 함께 "
+        "null). 다른 노드의 count 는 항상 숫자다 — 특히 `signup` 의 count 는 방문 계측과 "
+        "무관하게 정확하므로 그대로 나간다",
     )
     rate = serializers.FloatField(
-        allow_null=True, help_text="rate_of 노드 대비 전환율 (0~1, 분모 0 → null)"
+        allow_null=True,
+        help_text="rate_of 노드 대비 전환율 (0~1, 분모 0 → null). "
+        "MKT-17 ②: `signup` 노드의 rate 는 분모가 방문자라 위 조건에서 **null** 이 된다 "
+        "(분자·분모가 다른 기간을 세는 과대평가 방지)",
     )
     rate_of = serializers.CharField(
         allow_null=True, help_text="분모가 되는 노드 key (화살표 위 % 표기용) 또는 null"
@@ -1106,7 +1115,12 @@ class _TrendTotalsSerializer(serializers.Serializer):
 
     visits = serializers.IntegerField(
         help_text="기간 전체 고유 방문자 수. **`funnel.variants.*.head[0].count`(퍼널 방문자)와 "
-        "항상 같은 값**(같은 집합을 센다) — 화면 두 곳이 맞물리는 지점이다"
+        "같은 값**(같은 집합을 센다) — 화면 두 곳이 맞물리는 지점이다. "
+        "⚠️ **예외: MKT-17 ② 억제 중에는 퍼널 쪽만 null 이고 이 값은 숫자로 남는다** "
+        "(선택 기간 시작 < `attribution_gap.visits_since`). 퍼널이 지우는 것은 '기간 전체 "
+        "방문자'라는 주장이고, 추이는 날짜축이 있어 계측 이전 구간이 0 으로 그려져 부분 "
+        "관측임이 화면에 드러나기 때문이다. 두 카드의 방문자 숫자를 대조하는 로직이 있다면 "
+        "억제 구간을 예외 처리할 것"
     )
     signups = serializers.IntegerField(help_text="기간 전체 가입 수")
     activated = serializers.IntegerField(

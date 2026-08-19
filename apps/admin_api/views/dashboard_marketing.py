@@ -768,8 +768,12 @@ def _trends(start, end, visit_rows: list[tuple] | None = None) -> dict:
       **버킷을 더해 만들 수 없어서** 서버가 준다 — 사람 단위 지표는 같은 사람이 다른
       버킷에 다시 들어가므로 버킷 합 > 실제 인원이다(prod 실측 30일: 버킷 합 694 vs
       실제 509). ``totals.visits`` 는 ``_visit_counts`` 의 고유 방문자와 **같은 집합**이라
-      퍼널 ``head[0].count`` 와 항상 일치한다 — 화면 두 곳이 맞물리는 지점이라
-      이 항등을 깨지 말 것.
+      퍼널 ``head[0].count`` 와 같은 값이다 — 화면 두 곳이 맞물리는 지점이라
+      이 계산을 갈라놓지 말 것.
+      ⚠️ 단, **MKT-17 ② 억제 중에는 퍼널 쪽만 null 이 되고 여기는 숫자가 남는다**
+      (`_visits_partially_observed`). 의도된 비대칭이다: 퍼널이 지우는 것은 '기간 전체
+      방문자'라는 **주장**이고, 추이는 날짜축이 있어 관측 시작 이전 구간이 0 으로 그려져
+      부분 관측임이 화면에 드러난다. 값 자체는 둘 다 같은 집합을 센 것이라 여전히 맞다.
     """
     tz = timezone.get_current_timezone()
     granularity = _trends_granularity(start, end)
@@ -985,6 +989,39 @@ def _visit_counts(start, end) -> tuple[int, int]:
     return qs.count(), qs.order_by().values("visitor_id").distinct().count()
 
 
+def _visits_measurement_start():
+    """방문 계측이 시작된 시각 = 전 기간 ``MIN(LandingVisit.created_at)`` (MKT-17).
+
+    **이 값의 단일 소스**다 — 응답의 ``attribution_gap.visits_since`` 와 퍼널 방문자
+    억제 판정(:func:`_visits_partially_observed`)이 같은 값을 봐야 "빈칸인데 기준 시각은
+    다른 날"이 되지 않는다. ``created_at`` 은 db_index=True 라 인덱스 스캔 1회.
+
+    None = 어트리뷰션 미탑재 이거나 방문 행이 아예 없음(계측 시작 시각을 알 수 없음).
+    """
+    if not ATTRIBUTION_AVAILABLE:
+        return None
+    return LandingVisit.objects.aggregate(m=Min("created_at"))["m"]
+
+
+def _visits_partially_observed(start, visits_since) -> bool:
+    """선택 기간의 방문자가 **부분만 관측**됐는가 (MKT-17 ② 억제 조건).
+
+    선택 기간이 방문 계측 시작보다 이르면, 그 기간의 '방문자'는 기간 전체가 아니라
+    ``visits_since`` 이후만 센 값이다. 그 수로 만든 가입 전환율은 분자(기간 전체 가입)와
+    분모(관측 구간 방문)가 다른 기간을 세므로 **실제보다 크다** — prod 실측 2026-08-19
+    전체 기간 탭 32.2% = 가입 164명(149일치) ÷ 방문자 509명(28일치).
+
+    ⚠️ **"며칠까지는 봐준다" 식의 허용 오차를 넣지 말 것** (어드민 21차 명시 요청).
+    오늘 기준 30일 창의 시작(7/20)이 visits_since(7/22)보다 이틀 이를 뿐이라 30일 탭도
+    빈칸이 되지만, 8/22 부터는 창이 7/23 에서 시작해 **저절로 풀린다**. 사흘 뒤 사라질
+    문제를 위해 예외를 만들면 나중에 그 코드를 지울 이유를 아는 사람이 없어진다.
+
+    visits_since 가 None 이면 억제하지 않는다 — 계측 시작 시각을 모르는데 값을 지우면
+    "데이터가 없다"와 "기준을 모른다"가 화면에서 같아진다 (미탑재 시 0 강등 계약 유지).
+    """
+    return visits_since is not None and start < visits_since
+
+
 # ── KPI ──────────────────────────────────────────────────────────────
 
 
@@ -1105,6 +1142,7 @@ def _build_funnel_variant(
     visitors: int,
     prev_counts: dict | None = None,
     prev_visitors: int | None = None,
+    visits_partial: bool = False,
 ) -> dict:
     """counts(+visitors) → {head, branches, activation, activation_overlap, conversion}.
 
@@ -1126,6 +1164,15 @@ def _build_funnel_variant(
 
     MKT-1(R-8): prev_counts/prev_visitors 를 주면 4개 노드(visit/signup/activation/
     conversion) 모두 previous·delta_pct 가 채워진다. prev 가 없으면(period=all) 전부 null.
+
+    MKT-17 ②: ``visits_partial=True``(선택 기간이 방문 계측 시작보다 이름)이면
+    **방문에 기대는 값만** null 로 내린다 — ``head[0]``(방문자)의
+    count/previous/delta_pct 와 ``head[1]``(가입)의 **rate**.
+    ``head[1].count``(가입자 수)는 **숫자 그대로 둔다**: 가입은 방문 계측과 무관하게
+    정확히 아는 값이고 잘못된 것은 분모뿐이다. activation·conversion 노드도 분모가
+    signups/activated 라 방문과 무관하므로 건드리지 않는다.
+    (previous/delta_pct 를 함께 null 로 하는 것은 선택이 아니라 필수다 — count 가 null 인데
+    delta 를 계산하면 TypeError 이고, 값을 안 밝힌 대상의 증감률은 의미도 없다.)
     """
     signups = counts["signups"]
     ig = counts["ig_connected"]
@@ -1176,6 +1223,10 @@ def _build_funnel_variant(
             prev_counts["signups"] if prev_counts is not None else None,
         ),
     ]
+    if visits_partial:
+        # MKT-17 ②: 부분만 관측된 분모로 만든 값은 숫자가 아니라 '없음'이 맞다.
+        head[0].update({"count": None, "previous": None, "delta_pct": None})
+        head[1]["rate"] = None
     branches = [
         {
             "key": "dm",
@@ -1276,6 +1327,7 @@ def _funnel(
     prev_visitors_all: int | None = None,
     prev_channel_map: dict | None = None,
     codes: frozenset = frozenset(),
+    visits_partial: bool = False,
 ) -> dict:
     """가입 코호트 분기 퍼널 — variants.all + 채널별 variant (드롭다운용, 미리 계산).
 
@@ -1303,8 +1355,12 @@ def _funnel(
 
     has_prev = prev_all_counts is not None
     available_channels = [{"value": "all", "label": "전체 채널"}]
+    # MKT-17 ②: 억제는 **전 variant 공통**이다 — 계측 시작은 채널별로 다르지 않고,
+    # 한 드롭다운 안에서 어떤 채널만 숫자가 보이면 그 채널만 정확한 것처럼 읽힌다.
     variants = {
-        "all": _build_funnel_variant(all_counts, visitors_all, prev_all_counts, prev_visitors_all)
+        "all": _build_funnel_variant(
+            all_counts, visitors_all, prev_all_counts, prev_visitors_all, visits_partial
+        )
     }
     # 저장 링크만 캡 대상 (other/제휴코드는 개수가 유계이고 운영상 항상 필요)
     link_seen = 0
@@ -1321,7 +1377,9 @@ def _funnel(
             prev_counts, prev_visitors = (prev_channel_map or {}).get(
                 key, (_EMPTY_FUNNEL_COUNTS, 0)
             )
-        variants[key] = _build_funnel_variant(counts, visitors, prev_counts, prev_visitors)
+        variants[key] = _build_funnel_variant(
+            counts, visitors, prev_counts, prev_visitors, visits_partial
+        )
 
     return {
         "semantics": "signup_cohort",
@@ -1898,11 +1956,12 @@ def _attribution_gap(flags: tuple) -> dict:
     unattributed = sum(
         1 for row in flag_rows if row[0] not in attr_row and row[0] not in referral_users
     )
-    since = visits_since = None
+    since = None
     if ATTRIBUTION_AVAILABLE:
         since = SignupAttribution.objects.aggregate(m=Min("created_at"))["m"]
-        # created_at 은 db_index=True — 전 기간 MIN 이어도 인덱스 스캔 1회다.
-        visits_since = LandingVisit.objects.aggregate(m=Min("created_at"))["m"]
+    # 퍼널 방문자 억제 판정과 **같은 함수**를 쓴다 — 화면의 빈칸과 여기 기준 시각이
+    # 어긋나면 "왜 빈칸인지"를 대조할 수단이 없어진다.
+    visits_since = _visits_measurement_start()
     return {
         "signups_unattributed": unattributed,
         "share": _rate(unattributed, total),
@@ -3824,9 +3883,22 @@ KPI(기간 비교), 가입 코호트 퍼널, 채널별 성과, 업셀 후보, �
 - **`trends.totals`(MKT-18 ②)**: 카드 헤더용 **기간 전체 합계** `{visits, signups, activated, paid}`.
   ⚠️ **버킷을 더해 헤더를 만들지 마세요** — 사람 단위라 같은 사람이 다른 버킷에 다시 들어갑니다
   (prod 실측 2026-08-19 30일: 버킷 합 694 vs 실제 509). `totals.visits` 는 퍼널
-  `head[0].count`(방문자)와 **항상 같은 값**입니다. `totals.activated` 만 퍼널 `activation` 노드와
+  `head[0].count`(방문자)와 같은 값입니다 — **단 MKT-17 ② 억제 중에는 퍼널 쪽만 null 이 되고
+  이 값은 숫자로 남습니다**(아래 항목 참고). `totals.activated` 만 퍼널 `activation` 노드와
   정의가 다릅니다 — 퍼널은 '이 기간에 가입한' 회원의 현재까지 도달, 이쪽은 가입 시기와 무관한
   '이 기간의 활성화 이벤트'입니다.
+- **방문 계측 이전이 섞인 기간의 억제 (MKT-17 ②)**: 선택 기간의 시작이
+  `channels.attribution_gap.visits_since`(방문 계측 시작 = 전 기간 `MIN(LandingVisit.created_at)`)
+  보다 **이르면**, 그 기간의 '방문자'는 기간 전체가 아니라 계측 시작 이후만 센 값입니다.
+  그 분모로 만든 가입 전환율은 분자(기간 전체 가입)와 기간이 달라 **실제보다 큽니다**
+  (prod 2026-08-19 전체 기간 탭 32.2% = 가입 164명(149일치) ÷ 방문자 509명(28일치)).
+  그래서 **모든 variant** 에서 아래 두 값을 `null` 로 내립니다:
+  `funnel.variants[*].head[0]` 의 `count`·`previous`·`delta_pct`(방문자) 와
+  `funnel.variants[*].head[1].rate`(가입 전환율).
+  `head[1].count`(가입자 수)는 **숫자 그대로**입니다 — 가입은 방문 계측과 무관하게 정확히 아는
+  값이고 잘못된 것은 분모뿐입니다. `activation`·`conversion` 노드도 분모가 signups/activated 라
+  영향받지 않습니다. 허용 오차(며칠까지는 통과) 같은 예외는 **없습니다** — 창이 계측 시작을
+  완전히 덮으면 저절로 다시 숫자가 나옵니다.
 - **퍼널 = 가입 코호트(signup_cohort), 분기 구조**: `date_joined ∈ 기간` 유저가 "현재까지"
   단계에 도달했는지 기준 (기간-활동 카운트는 모집단 혼합으로 100% 초과 전환율 가능 → 배제).
   visit 만 기간-이벤트이며 **고유 방문자(distinct visitor_id) 단위** — 재방문 세션은 1명으로
@@ -4297,7 +4369,8 @@ curl -H "Authorization: Bearer <staff_token>" \\
                         # MKT-18 ②: 카드 헤더용 기간 전체 합계. **버킷 합이 아니다** —
                         # visits 180+205=385 인데 실제 인원은 342 (재방문자 43명이 두 버킷에
                         # 각각 잡혀 있다). activated 도 6+4=10 vs 실제 9.
-                        # visits 는 funnel.variants.*.head[0].count 와 항상 같은 값이다.
+                        # visits 는 funnel.variants.*.head[0].count 와 같은 값이다
+                        # (단 MKT-17 ② 억제 중에는 퍼널 쪽만 null — 여기는 숫자로 남는다).
                         "totals": {
                             "visits": 342,
                             "signups": 21,
@@ -4792,6 +4865,9 @@ curl -H "Authorization: Bearer <staff_token>" \\
         visit_rows = _visit_rows(*cur)
         channel_variants = _funnel_channel_variants(cohort_flags, visit_rows)
         referral_code_keys = frozenset(ReferralCode.objects.values_list("code", flat=True))
+        # MKT-17 ②: 선택 기간이 방문 계측 시작보다 이르면 퍼널의 방문자·가입 전환율을
+        # 억제한다 (부분 관측 분모 → 과대평가). 판정은 current 구간의 **시작**만 본다.
+        visits_partial = _visits_partially_observed(cur[0], _visits_measurement_start())
 
         # MKT-1(R-8): 퍼널 노드가 자기 증감을 들도록 직전 기간 코호트를 한 번 더 집계한다.
         # period=all 은 prev 자체가 없어(R-1) 계산도 하지 않는다 → 전 노드 previous=null.
@@ -4827,6 +4903,7 @@ curl -H "Authorization: Bearer <staff_token>" \\
                 prev_visitors,
                 prev_channel_map,
                 referral_code_keys,
+                visits_partial,
             ),
             "trends": _trends(*cur, visit_rows=visit_rows),
             "channels": _channels(*cur, flags=cohort_flags, visit_rows=visit_rows),

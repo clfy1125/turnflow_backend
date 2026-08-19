@@ -1159,6 +1159,115 @@ class TestVisitsSince:
         assert datetime.fromisoformat(str(gap_7d["visits_since"])) == visit_at
 
 
+# ─── MKT-17 ②: 계측 이전이 섞인 기간의 방문자·전환율 억제 ──────────────
+
+
+@pytest.mark.skipif(not HAS_ANALYTICS, reason="analytics 앱 미탑재")
+class TestVisitsPartiallyObservedSuppression:
+    """MKT-17 ② — 부분만 관측된 분모로 만든 값은 숫자가 아니라 '없음'이 맞다.
+
+    사고: 전체 기간 탭의 가입 전환율 32.2% 가 가입 164명(149일치) ÷ 방문자 509명(28일치)
+    였다. 외주 마케팅 파트너가 이걸 서비스 전체 전환율로 읽는다.
+    """
+
+    def _seed_visit(self, when):
+        v = LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="direct")
+        LandingVisit.objects.filter(pk=v.pk).update(created_at=when)
+        return v
+
+    def _get(self, staff_client, start, end):
+        cache.delete(f"admin:dash:mkt:custom:{start}:{end}")
+        return staff_client.get(URL, {"start": start, "end": end})
+
+    def test_suppressed_when_period_starts_before_measurement(self, staff_client, clean_slate):
+        LandingVisit.objects.all().delete()
+        tz = timezone.get_current_timezone()
+        # 계측 시작 6/10, 조회 기간은 6/01 부터 — 앞 9일이 미관측
+        self._seed_visit(timezone.make_aware(timezone.datetime(2026, 6, 10, 9, 0, 0), tz))
+        _mk_user(joined=timezone.make_aware(timezone.datetime(2026, 6, 3, 9, 0, 0), tz))
+
+        res = self._get(staff_client, "2026-06-01", "2026-06-30")
+        head = res.data["funnel"]["variants"]["all"]["head"]
+        visit, signup = head[0], head[1]
+
+        assert visit["key"] == "visit" and signup["key"] == "signup"
+        # 방문자: 값·증감 전부 없음 (증감만 남기면 지운 값의 변화율이 화면에 남는다)
+        assert visit["count"] is None
+        assert visit["previous"] is None
+        assert visit["delta_pct"] is None
+        # 가입 전환율(분모=방문자)도 없음
+        assert signup["rate"] is None
+        # ⚠️ 가입자 수는 그대로 숫자 — 방문 계측과 무관하게 정확히 아는 값이다
+        assert signup["count"] == 1
+
+    def test_not_suppressed_when_period_fully_after_measurement(self, staff_client, clean_slate):
+        LandingVisit.objects.all().delete()
+        tz = timezone.get_current_timezone()
+        # 계측 시작 6/01, 조회 기간은 6/10 부터 — 창 전체가 관측 구간 안
+        self._seed_visit(timezone.make_aware(timezone.datetime(2026, 6, 1, 9, 0, 0), tz))
+        self._seed_visit(timezone.make_aware(timezone.datetime(2026, 6, 15, 9, 0, 0), tz))
+        _mk_user(joined=timezone.make_aware(timezone.datetime(2026, 6, 12, 9, 0, 0), tz))
+
+        res = self._get(staff_client, "2026-06-10", "2026-06-30")
+        head = res.data["funnel"]["variants"]["all"]["head"]
+        assert head[0]["count"] == 1  # 6/15 방문 1명 (6/1 은 창 밖)
+        assert head[1]["rate"] == 1.0  # 가입 1 ÷ 방문자 1
+
+    def test_suppression_applies_to_every_channel_variant(self, staff_client, clean_slate):
+        """채널을 골라도 빈칸이어야 한다 — 어떤 채널만 숫자면 그 채널만 정확해 보인다."""
+        LandingVisit.objects.all().delete()
+        tz = timezone.get_current_timezone()
+        utm = {"utm_source": "meta", "utm_medium": "cpc", "utm_campaign": "fn"}
+        _mk_link("억제 확인용", source="meta", medium="cpc", campaign="fn")
+        v = LandingVisit.objects.create(visitor_id=uuid.uuid4(), channel="meta_ads", **utm)
+        LandingVisit.objects.filter(pk=v.pk).update(
+            created_at=timezone.make_aware(timezone.datetime(2026, 6, 10, 9, 0, 0), tz)
+        )
+        u = _mk_user(joined=timezone.make_aware(timezone.datetime(2026, 6, 12, 9, 0, 0), tz))
+        SignupAttribution.objects.create(user=u, channel="meta_ads", signup_kind="email", **utm)
+
+        res = self._get(staff_client, "2026-06-01", "2026-06-30")
+        variants = res.data["funnel"]["variants"]
+        assert len(variants) > 1  # 채널 variant 가 실제로 생겼는지 (빈 단언 방지)
+        for key, variant in variants.items():
+            assert variant["head"][0]["count"] is None, f"{key} 의 방문자가 안 지워졌다"
+            assert variant["head"][1]["rate"] is None, f"{key} 의 전환율이 안 지워졌다"
+
+    def test_activation_and_conversion_nodes_untouched(self, staff_client, clean_slate):
+        """방문과 무관한 노드(분모=signups/activated)는 건드리지 않는다."""
+        LandingVisit.objects.all().delete()
+        tz = timezone.get_current_timezone()
+        self._seed_visit(timezone.make_aware(timezone.datetime(2026, 6, 10, 9, 0, 0), tz))
+        u = _mk_user(joined=timezone.make_aware(timezone.datetime(2026, 6, 12, 9, 0, 0), tz))
+        _mk_page(u, public=True)  # 활성화
+
+        res = self._get(staff_client, "2026-06-01", "2026-06-30")
+        variant = res.data["funnel"]["variants"]["all"]
+        assert variant["activation"]["count"] == 1
+        assert variant["activation"]["rate"] == 1.0  # 활성화 1 ÷ 가입 1
+        assert variant["conversion"]["count"] is not None
+
+    def test_trends_totals_keeps_number_while_funnel_is_null(self, staff_client, clean_slate):
+        """의도된 비대칭 — 추이는 날짜축이 있어 미관측 구간이 0 으로 드러난다."""
+        LandingVisit.objects.all().delete()
+        tz = timezone.get_current_timezone()
+        self._seed_visit(timezone.make_aware(timezone.datetime(2026, 6, 10, 9, 0, 0), tz))
+
+        res = self._get(staff_client, "2026-06-01", "2026-06-30")
+        assert res.data["funnel"]["variants"]["all"]["head"][0]["count"] is None
+        assert res.data["trends"]["totals"]["visits"] == 1
+
+    def test_no_suppression_when_measurement_start_unknown(self, staff_client, clean_slate):
+        """방문 행이 하나도 없으면 억제하지 않는다 — '없음'과 '기준 미상'을 섞지 않는다."""
+        LandingVisit.objects.all().delete()
+        tz = timezone.get_current_timezone()
+        _mk_user(joined=timezone.make_aware(timezone.datetime(2026, 6, 12, 9, 0, 0), tz))
+
+        res = self._get(staff_client, "2026-06-01", "2026-06-30")
+        assert res.data["channels"]["attribution_gap"]["visits_since"] is None
+        assert res.data["funnel"]["variants"]["all"]["head"][0]["count"] == 0
+
+
 # ─── 커스텀 날짜 범위 ────────────────────────────────────────────────
 
 
