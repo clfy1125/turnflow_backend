@@ -392,16 +392,37 @@ SIMPLE_JWT = {
 #    env 만 True" — prod.py 에서 기본값을 올리지 않는 것은 이 순서를 강제하기 위함이다.
 ADMIN_MFA_ENFORCED = config("ADMIN_MFA_ENFORCED", default=False, cast=bool)
 
+# 신규 기기 이메일 승인 코드 — **기본 False(끔)**. 2026-08-20 제품 결정.
+#
+# 관리자는 3명뿐이고 전원 인증앱 등록이 끝났다. 그 상태에서 이메일 코드는 보안을 거의
+# 더하지 못하면서(어차피 비밀번호+TOTP 를 이미 통과해야 한다) 실패 지점만 늘렸다 —
+# 실제로 prod 에서 신뢰 등록에 실패한 기기 행이 5개 쌓였고, 그 기기들은 로그인할 때마다
+# 새 메일 코드를 받아야 했다. 메일 지연·옛 코드 오입력이 그대로 로그인 실패가 되고,
+# challenge 시도 5회를 태워 처음부터 다시 하게 만든다.
+#
+# 켜면 종전 동작(신규 기기 = 메일 코드 1회)으로 그대로 돌아간다. 관리자가 늘거나 외부
+# 접속을 열게 되면 그때 env 로 되살릴 것.
+ADMIN_MFA_EMAIL_DEVICE_CODE_ENABLED = config(
+    "ADMIN_MFA_EMAIL_DEVICE_CODE_ENABLED", default=False, cast=bool
+)
+
+# TOTP 허용 드리프트(스텝, 1스텝=30초). 2 = 앞뒤 60초.
+# 1(±30초)은 폰 시계가 조금만 어긋나거나 코드를 옮겨 적는 사이 창이 넘어가면 그대로
+# "코드가 올바르지 않습니다" 가 된다 — 사람 눈에는 맞는 코드라 원인을 못 찾는다.
+# 재사용 방지는 창 크기와 무관하게 last_step 이 담당하므로, 넓혀도 1회용 성질은 그대로다.
+ADMIN_TOTP_DRIFT_STEPS = config("ADMIN_TOTP_DRIFT_STEPS", default=2, cast=int)
+
 # 어드민 토큰 수명. 일반 사용자(access 1일/refresh 7일)보다 짧다 — 어드민 토큰 하나가
 # 전 회원 데이터를 연다.
 ADMIN_ACCESS_TOKEN_LIFETIME = timedelta(
     hours=config("ADMIN_ACCESS_TOKEN_HOURS", default=2, cast=int)
 )
-# 비신뢰 기기 = 이메일 승인 없이 들어온 임시 세션.
+# 비신뢰 기기 = "이 기기를 기억하기" 를 끄고 들어온 임시 세션
+# (이메일 승인이 켜져 있던 시절에는 "메일 코드를 통과하지 않은 기기" 였다).
 ADMIN_REFRESH_TOKEN_LIFETIME = timedelta(
     hours=config("ADMIN_REFRESH_TOKEN_HOURS", default=12, cast=int)
 )
-# 신뢰 기기 = 이메일 코드 1회를 통과해 등록된 기기 (프론트 Q3 수락).
+# 신뢰 기기 = "이 기기를 기억하기" 로 등록된 기기 (프론트 Q3 수락).
 # 12시간이면 하루 1~2회 인증앱을 다시 꺼내야 해서 폰 WebView 에서 체감이 특히 나쁘다.
 # 신뢰 등록 자체가 이미 2요소를 통과한 기기이고 보안 화면에서 즉시 해제할 수 있으므로,
 # 약하게 가져가는 것은 refresh 수명뿐이고 access 는 그대로 2시간이다(권한 회수는 2시간 내 반영).

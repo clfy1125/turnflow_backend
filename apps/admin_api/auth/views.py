@@ -88,8 +88,10 @@ class AdminLoginView(GenericAPIView):
 - `device_label` (선택, 100자): 보안 화면 기기 목록에 표시할 이름
 
 ## 비즈니스 로직
-- **신규 기기**(`device_verification_required: true`)에는 이메일로 6자리 승인 코드를 함께
-  보냅니다. 2단계에서 인증앱 코드와 **둘 다** 필요합니다.
+- **2단계는 인증앱 코드 하나로 끝납니다.** 신규 기기 이메일 승인은 2026-08-20 부로 꺼져
+  있어(`ADMIN_MFA_EMAIL_DEVICE_CODE_ENABLED=false`) `device_verification_required` 는
+  **항상 false**, `methods` 에 `email` 이 들어가지 않습니다. 프론트는 이 필드를 계속 보고
+  분기하면 됩니다 — 다시 켜지면 값만 바뀝니다(계약 변경 없음).
 - **인증앱 미등록 계정**은 403 `mfa_setup_required` + `setup_token` 을 받습니다 →
   `POST /admin/auth/mfa/setup/` 으로 등록 화면을 띄우세요.
 - **마케팅 전용 계정**(`admin_role="marketing_viewer"`)은 2단계가 없습니다 —
@@ -268,14 +270,15 @@ class AdminMfaVerifyView(GenericAPIView):
 - `challenge` (필수): 1단계 응답값 (TTL 300초)
 - `code` (택1): 인증앱 6자리
 - `backup_code` (택1): 백업코드 `ABCD-EFGH-JKLM` (하이픈·대소문자 무관). `code` 대신 사용
-- `email_code` (조건부 필수): 1단계가 `device_verification_required: true` 였다면 필수
+- `email_code` (현재 미사용): 이메일 기기 승인이 꺼져 있어 보내도 무시됩니다. 1단계의
+  `device_verification_required` 가 true 로 바뀌면 그때만 필수가 됩니다.
 - `remember_device` (선택, 기본 false): 이 기기를 신뢰 등록
 
 ## 비즈니스 로직
 - **어드민 토큰의 수명**: access 2시간 / refresh 12시간. `remember_device: true` 로 신뢰
   등록한 기기는 **refresh 7일**입니다.
-- 신뢰 등록된 기기는 다음 로그인부터 이메일 코드를 건너뜁니다.
-- 인증앱 코드는 **1회용**입니다 — 같은 30초 창의 코드를 다시 넣으면 실패합니다(재사용 방지).
+- 인증앱 코드는 **1회용**입니다 — 같은 창의 코드를 다시 넣으면 실패합니다(재사용 방지).
+  현재 시각 기준 **앞뒤 60초**(±2스텝)까지 인정하므로 폰 시계가 조금 어긋나도 통과합니다.
 - 백업코드는 소모됩니다. 남은 개수는 `GET /admin/auth/mfa/status/` 에서 확인하세요.
 - 성공 시 `admin` 필드로 `GET /admin/me/` 와 동일한 신원을 함께 내려줍니다.
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import uuid
 
+from django.conf import settings
 from django.utils import timezone
 
 from apps.admin_api.models import AdminDevice
@@ -50,7 +51,17 @@ def get_or_create_device(user, device_id: str, label: str = "") -> tuple[AdminDe
 
 
 def needs_email_verification(device: AdminDevice) -> bool:
-    """이 기기가 이메일 코드를 받아야 하는가 — 신뢰 등록 전이거나 해제된 기기."""
+    """이 기기가 이메일 코드를 받아야 하는가 — **판정 단일 소스**.
+
+    로그인(2단계)과 인증앱 등록(setup/confirm)이 같은 답을 써야 한다. 한쪽만 끄면
+    "로그인은 코드를 안 묻는데 등록은 묻는" 상태가 되고, 등록 화면에는 그 입력칸이
+    안 떠서 재등록이 통째로 막힌다(실제로 그 사고가 한 번 있었다 — useAdminAuth.ts 주석).
+
+    ``ADMIN_MFA_EMAIL_DEVICE_CODE_ENABLED`` 가 꺼져 있으면(기본) 항상 False —
+    2단계는 인증앱 코드 하나로 끝난다. 근거는 settings/base.py 의 그 플래그 주석.
+    """
+    if not settings.ADMIN_MFA_EMAIL_DEVICE_CODE_ENABLED:
+        return False
     return not device.is_trusted
 
 

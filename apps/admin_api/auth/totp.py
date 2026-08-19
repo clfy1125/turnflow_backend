@@ -35,9 +35,22 @@ logger = logging.getLogger(__name__)
 # TOTP 표준 파라미터 (인증앱 기본값과 일치해야 QR 스캔 한 번으로 끝난다).
 TOTP_STEP_SECONDS = 30
 TOTP_DIGITS = 6
-# 앞뒤 1스텝(±30초)까지 허용 — 폰 시계 오차와 입력 시간을 흡수한다. 2 이상은 재사용 창을
-# 불필요하게 넓힌다.
-TOTP_DRIFT_STEPS = 1
+# 허용 드리프트 기본값 (스텝). 실제 값은 :func:`_drift_steps` 가 settings 에서 읽는다.
+TOTP_DRIFT_STEPS = 2
+
+
+def _drift_steps() -> int:
+    """허용 드리프트(스텝) — 기본 2 = ±60초.
+
+    **import 시점이 아니라 호출 시점에 읽는다.** 모듈 상단에서 settings 를 만지면
+    앱 로딩 순서에 따라 ``ImproperlyConfigured`` 가 나고, 테스트에서 값을 바꿔 끼울 수도 없다.
+
+    창을 넓혀도 재사용은 ``last_step`` 이 막으므로 코드의 1회용 성질은 그대로다 —
+    넓어지는 것은 "몇 초 전 코드까지 인정하는가" 뿐이다. 폰 시계 오차와 "읽고 옮겨 적는
+    시간"이 여기에 흡수된다(±30초는 그 둘을 합치면 자주 모자란다).
+    """
+    return max(0, int(getattr(settings, "ADMIN_TOTP_DRIFT_STEPS", TOTP_DRIFT_STEPS)))
+
 
 # 백업코드: base32 12자 = 60비트. 오프라인 대입이 불가능한 수준이라 sha256 으로 충분하고,
 # 해시 인덱스 조회 1회로 검증한다(느린 해시를 10개 순회하면 로그인이 1초씩 늦어진다).
@@ -87,9 +100,9 @@ def _current_step(at: float | None = None) -> int:
 def _verify_with_secret(device: AdminMFADevice, secret: str, code: str) -> bool:
     """주어진 시드로 코드 검증 + 재사용 방지. 성공하면 ``last_step`` 을 전진시킨다.
 
-    드리프트 창(±1스텝) 안의 스텝을 하나씩 확인한다. **어느 스텝이 맞았는지 알아야 한다** —
-    그 값을 ``last_step`` 에 넣어야 같은 코드의 재사용이 막힌다. "맞았다"만 알고 현재
-    스텝을 저장하면 창 경계에서 한 번 더 통과한다.
+    드리프트 창(:func:`_drift_steps`) 안의 스텝을 하나씩 확인한다. **어느 스텝이 맞았는지
+    알아야 한다** — 그 값을 ``last_step`` 에 넣어야 같은 코드의 재사용이 막힌다. "맞았다"만
+    알고 현재 스텝을 저장하면 창 경계에서 한 번 더 통과한다.
 
     ``last_step`` 은 절대 시간 기반이라 시드가 바뀌어도(재등록) 그대로 유효하다 —
     초기화하면 재등록 직후에 옛 코드 재사용 창이 열린다.
@@ -103,10 +116,11 @@ def _verify_with_secret(device: AdminMFADevice, secret: str, code: str) -> bool:
 
     totp = pyotp.TOTP(secret, digits=TOTP_DIGITS, interval=TOTP_STEP_SECONDS)
     now_step = _current_step()
+    drift = _drift_steps()
 
     with transaction.atomic():
         locked = AdminMFADevice.objects.select_for_update().get(pk=device.pk)
-        for offset in range(-TOTP_DRIFT_STEPS, TOTP_DRIFT_STEPS + 1):
+        for offset in range(-drift, drift + 1):
             step = now_step + offset
             expected = totp.at(step * TOTP_STEP_SECONDS)
             if not hmac.compare_digest(expected, code):

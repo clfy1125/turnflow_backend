@@ -4,7 +4,8 @@
 
 1. **최초 등록** — 아직 어드민 토큰이 없다(2단계를 통과해야 나오는데 등록이 안 돼 있다).
    1단계 로그인이 403 `mfa_setup_required` 와 함께 준 `setup_token` 으로 인증한다.
-   신규 기기라면 이메일 코드까지 요구한다 — 그래야 **비밀번호 하나로 등록이 끝나지 않는다.**
+   (이메일 기기 승인이 켜져 있으면 여기에 메일 코드가 더 붙는다 — 지금은 꺼져 있어
+   `setup_token` 하나로 등록한다. :func:`apps.admin_api.auth.devices.needs_email_verification`)
 2. **재등록** — 폰을 바꾼 경우. 어드민 토큰 + 비밀번호 + **현재 인증앱 코드**를 요구한다.
    탈취된 access 토큰만으로 인증앱을 공격자 폰으로 옮길 수 있으면 2단계가 무의미해진다.
 
@@ -264,7 +265,8 @@ class AdminMfaConfirmView(GenericAPIView):
 ## 요청 필드
 - `setup_token` (필수): `setup` 응답값
 - `code` (필수): 새로 등록한 인증앱의 6자리
-- `email_code` (조건부 필수): `setup` 이 `device_verification_required: true` 였다면 필수
+- `email_code` (현재 미사용): `setup` 이 `device_verification_required: true` 를 준 경우에만
+  필수. 이메일 기기 승인이 꺼져 있는 동안에는 항상 false 이므로 보내지 않아도 됩니다.
 
 ## 응답 데이터
 - `backup_codes`: 10개. **이 응답에서만 1회 노출됩니다** — 서버는 해시만 보관하므로 다시 볼 수
@@ -273,7 +275,7 @@ class AdminMfaConfirmView(GenericAPIView):
 - `admin`: `GET /admin/me/` 와 동일 스키마
 
 ## 비즈니스 로직
-- 이메일 코드까지 통과한 기기는 **자동으로 신뢰 등록**됩니다(다음 로그인부터 메일 생략).
+- 등록을 마친 기기는 **자동으로 신뢰 등록**됩니다(refresh 7일).
 - 재등록이면 **기존 백업코드는 전부 폐기**되고 새로 10개가 나갑니다.
 
 ## 주의사항
@@ -535,7 +537,7 @@ class AdminDeviceRevokeView(APIView):
 - 해제된 기기는 **다음 토큰 갱신부터 막힙니다**(`/admin/auth/refresh/` → 401 `device_revoked`).
 - 이미 발급된 access 토큰은 만료(최대 2시간)까지 유효합니다. 즉시 끊어야 하는 상황이라면
   기기 문제가 아니라 계정 문제이므로 계정 비활성화를 쓰세요.
-- 다음 로그인 때 그 기기는 신규 기기로 취급되어 이메일 승인 코드를 다시 요구합니다.
+- 다음 로그인 때 그 기기는 신규 기기로 취급됩니다(비밀번호 + 인증앱을 다시 통과해야 합니다).
 
 ## 주의사항
 - `is_current: true` 인 기기를 해제하면 **본인이 로그아웃**됩니다 — 확인 모달을 띄우세요.

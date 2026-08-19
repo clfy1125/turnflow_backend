@@ -28,12 +28,7 @@ from django.utils import timezone
 
 from apps.admin_api.auth import totp as totp_service
 from apps.admin_api.auth.tokens import issue_admin_tokens
-from apps.admin_api.models import (
-    AdminActionLog,
-    AdminBackupCode,
-    AdminDevice,
-    AdminMFADevice,
-)
+from apps.admin_api.models import AdminActionLog, AdminBackupCode, AdminDevice, AdminMFADevice
 from apps.admin_api.roles import ROLE_MARKETING_VIEWER
 from apps.authentication.tokens import AppRefreshToken
 from apps.emails.models import EmailToken, EmailTokenPurpose
@@ -118,6 +113,17 @@ def client() -> Client:
     return Client()
 
 
+@pytest.fixture
+def email_gate_on(settings):
+    """신규 기기 이메일 승인을 **켠 상태**로 만드는 픽스처.
+
+    2026-08-20 부터 기본값이 꺼짐이라, 이메일 경로를 검증하는 테스트는 스스로 켜야 한다.
+    (기능을 지우지 않고 플래그로 남긴 이유는 settings/base.py 의 그 플래그 주석 참고.)
+    """
+    settings.ADMIN_MFA_EMAIL_DEVICE_CODE_ENABLED = True
+    return settings
+
+
 # ── 1단계 로그인 ──────────────────────────────────────────────────────────
 
 
@@ -159,7 +165,7 @@ class TestAdminLogin:
         assert "email" not in body["methods"]
         assert "tokens" not in body
 
-    def test_new_device_requires_email_code(self, client):
+    def test_new_device_requires_email_code_when_gate_on(self, client, email_gate_on):
         user = _mk_staff()
         _enroll(user)
         code, body = _post(
@@ -171,6 +177,23 @@ class TestAdminLogin:
         assert body["email_masked"]
         # 메일 코드가 실제로 발급됐다
         assert _latest_email_code(user)
+
+    def test_new_device_needs_totp_only_by_default(self, client):
+        """기본값(이메일 승인 꺼짐) — 처음 보는 기기여도 인증앱 코드 하나로 끝난다.
+
+        관리자 3명 전원이 인증앱을 등록한 뒤로 이메일 코드는 보안을 더하지 못하면서
+        실패 지점만 늘렸다(prod 에서 신뢰 등록 실패 기기 행이 5개 쌓였다).
+        """
+        user = _mk_staff()
+        _enroll(user)
+        code, body = _post(
+            client, LOGIN_URL, {"email": user.email, "password": PASSWORD, "device_id": "brand-new"}
+        )
+        assert code == 200
+        assert body["device_verification_required"] is False
+        assert "email" not in body["methods"]
+        # 메일을 아예 발급하지 않는다 — 발송 실패·지연이 로그인을 막을 여지 자체를 없앤다.
+        assert not _latest_email_code(user)
 
     def test_missing_device_id_is_issued_by_server(self, client):
         user = _mk_staff()
@@ -272,7 +295,7 @@ class TestAdminMfaVerify:
         assert code == 400
         assert _detail_code(body) == "challenge_expired"
 
-    def test_new_device_requires_email_code_too(self, client):
+    def test_new_device_requires_email_code_too_when_gate_on(self, client, email_gate_on):
         user = _mk_staff()
         secret = _enroll(user)
         challenge = self._start(client, user, device_id="fresh-device")
@@ -281,7 +304,35 @@ class TestAdminMfaVerify:
         assert code == 400
         assert _detail_code(body) == "invalid_email_code"
 
-    def test_new_device_with_email_code_and_remember_becomes_trusted(self, client):
+    def test_new_device_passes_with_totp_only_by_default(self, client):
+        """기본값 — 처음 보는 기기에서 인증앱 코드만으로 토큰이 나온다."""
+        user = _mk_staff()
+        secret = _enroll(user)
+        challenge = self._start(client, user, device_id="fresh-device")
+        code, body = _post(
+            client,
+            VERIFY_URL,
+            {"challenge": challenge, "code": _code(secret), "remember_device": True},
+        )
+        assert code == 200, body
+        assert body["tokens"]["access"]
+        assert body["device_trusted"] is True
+
+    def test_totp_accepts_one_minute_of_clock_drift(self, client):
+        """폰 시계가 1분 어긋나도 통과한다 — ±30초는 사람이 옮겨 적는 시간까지 합치면 모자란다."""
+        user = _mk_staff()
+        secret = _enroll(user)
+        _trust(user)
+        for offset in (-2, 2):
+            challenge = self._start(client, user)
+            code, body = _post(
+                client,
+                VERIFY_URL,
+                {"challenge": challenge, "code": _code(secret, offset_steps=offset)},
+            )
+            assert code == 200, (offset, body)
+
+    def test_new_device_with_email_code_and_remember_becomes_trusted(self, client, email_gate_on):
         user = _mk_staff()
         secret = _enroll(user)
         challenge = self._start(client, user, device_id="fresh-device")
@@ -331,7 +382,11 @@ class TestAdminMfaVerify:
 @pytest.mark.django_db
 class TestAdminMfaEnrollment:
     def test_bootstrap_flow_end_to_end(self, client):
-        """미등록 계정: 로그인 403 → setup → confirm → 토큰 + 백업코드 10개."""
+        """미등록 계정: 로그인 403 → setup → confirm → 토큰 + 백업코드 10개.
+
+        이메일 승인이 꺼진 기본값이므로 ``email_code`` 없이 끝나야 한다 — 로그인과 등록이
+        같은 판정(:func:`devices.needs_email_verification`)을 쓰는지 확인하는 자리다.
+        """
         user = _mk_staff()
         _, login_body = _post(
             client, LOGIN_URL, {"email": user.email, "password": PASSWORD, "device_id": DEVICE}
@@ -342,16 +397,12 @@ class TestAdminMfaEnrollment:
         assert code == 200, setup
         assert setup["secret"] and setup["otpauth_url"].startswith("otpauth://totp/")
         assert setup["qr_svg"].lstrip().startswith("<")
-        assert setup["device_verification_required"] is True
+        assert setup["device_verification_required"] is False
 
         code, body = _post(
             client,
             CONFIRM_URL,
-            {
-                "setup_token": setup["setup_token"],
-                "code": _code(setup["secret"]),
-                "email_code": _latest_email_code(user),
-            },
+            {"setup_token": setup["setup_token"], "code": _code(setup["secret"])},
         )
         assert code == 200, body
         assert len(body["backup_codes"]) == 10
@@ -610,8 +661,13 @@ class TestAdminMfaManagement:
         device.refresh_from_db()
         assert device.revoked_at is None
 
-    def test_revoked_device_is_new_again_on_next_login(self, client):
-        """해제는 다음 로그인 한 번으로 무효화되면 안 된다 — 이메일 승인을 다시 받아야 한다."""
+    def test_revoked_device_is_new_again_on_next_login(self, client, email_gate_on):
+        """해제는 다음 로그인 한 번으로 무효화되면 안 된다 — 이메일 승인을 다시 받아야 한다.
+
+        (이메일 승인이 꺼진 기본값에서는 이 신호가 없다. 해제의 실효는 그때도 남는다 —
+        :func:`devices.get_or_create_device` 가 회수 상태를 되살리지 않고, 갱신은
+        :func:`devices.find_live_device` 가 막는다. 그 두 개는 아래 테스트들이 지킨다.)
+        """
         user = _mk_staff()
         _enroll(user)
         device = _trust(user)

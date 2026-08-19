@@ -2,6 +2,32 @@
 
 전달: 백엔드 → 어드민 콘솔팀 · **v2 (2026-08-16)** · v1 대비 변경점은 §8
 상태: **백엔드 구현 완료 · dev 반영됨 · prod 배포 대기** (롤아웃 §7)
+
+> ### ⚠️ v2.1 (2026-08-20) — 신규 기기 **이메일 승인 코드를 껐습니다**
+>
+> **계약은 그대로입니다. 프론트 수정 필요 없습니다.** 서버가 내리는 값만 바뀝니다:
+>
+> - `POST /admin/auth/login/` → `device_verification_required` 는 **항상 `false`**,
+>   `methods` 에 `"email"` 이 들어가지 않고 `email_masked` 는 빈 문자열입니다.
+> - `POST /admin/auth/mfa/verify/` → `email_code` 는 **보내도 무시**됩니다.
+>   2단계는 인증앱 6자리(또는 백업코드) 하나로 끝납니다.
+> - `POST /admin/auth/mfa/setup/` → `device_verification_required` 도 항상 `false` 이므로
+>   `confirm` 에 `email_code` 가 필요 없습니다.
+> - 이미 `device_verification_required` 를 보고 분기하고 있으면 메일 입력칸이 저절로
+>   사라집니다. **하드코딩으로 칸을 띄우고 있었다면 그 분기만 확인하세요.**
+>
+> **왜**: 관리자 3명 전원이 인증앱 등록을 마친 상태에서 이메일 코드는 보안을 사실상 더하지
+> 못하면서(어차피 비밀번호 + TOTP 를 통과해야 한다) 실패 지점만 늘렸습니다. prod 에서
+> 신뢰 등록에 실패한 기기 행이 5개 쌓였고, 그 기기들은 로그인할 때마다 새 메일 코드를
+> 요구받았습니다 — 메일 지연·옛 코드 오입력이 그대로 로그인 실패가 되고 challenge
+> 시도 5회를 태워 처음부터 다시 하게 만들었습니다.
+>
+> 되살릴 수 있습니다(`ADMIN_MFA_EMAIL_DEVICE_CODE_ENABLED=true`). 관리자가 늘거나 외부
+> 접속을 열 때 재검토합니다.
+>
+> **함께 바뀐 것** — TOTP 허용 오차가 ±30초 → **±60초**(`ADMIN_TOTP_DRIFT_STEPS=2`)입니다.
+> 폰 시계가 조금 어긋나거나 코드를 옮겨 적다 창이 넘어가도 통과합니다. 코드가 1회용인
+> 성질(재사용 차단)은 그대로입니다.
 회신 문서: `ADMIN_AUTH_MFA_RESPONSE.md` (Q1~Q5 답변)
 대상: `10_turnflow_admin`(웹) · `11_turnflow_admin_app`(웹을 띄우는 안드로이드 셸)
 
