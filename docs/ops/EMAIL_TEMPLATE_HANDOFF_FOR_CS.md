@@ -138,7 +138,7 @@ __BODY__
 | 변수 | 기본값 |
 |---|---|
 | `{{ service_name }}` | `TurnFlow` |
-| `{{ support_email }}` | `contact@turnflow.link` |
+| `{{ support_email }}` | `contact@clfy.ai.kr` |
 | `{{ brand_url }}` | `https://turnflow.link` |
 | `{{ logo_url }}` | `https://media.turnflow.clfy.ai.kr/branding/email-logo.png` |
 | `{{ company_name }}` | `주식회사 씨엘에프와이 (CLFY Co., Ltd.)` |

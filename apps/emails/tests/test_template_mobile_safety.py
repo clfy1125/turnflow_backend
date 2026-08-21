@@ -114,7 +114,7 @@ class TestPlainTextFallback:
         text = _strip_html(_render(DEFAULTS["payment_success"]["html_body"]))
         assert "9,900원" in text
         assert "2026-07-10" in text
-        assert "contact@turnflow.link" in text
+        assert "contact@clfy.ai.kr" in text
 
     def test_detail_rows_do_not_run_together(self):
         text = _strip_html(_render(DEFAULTS["payment_success"]["html_body"]))

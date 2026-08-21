@@ -537,7 +537,7 @@ SAMPLE_CONTEXT: dict[str, str] = {
     "full_name": "김턴플",
     "email": "user@example.com",
     "service_name": "TurnFlow",
-    "support_email": "contact@turnflow.link",
+    "support_email": "contact@clfy.ai.kr",
     "dashboard_url": "https://app.turnflow.link/dashboard",
     "docs_url": "https://turnflow.link/docs",
     "billing_url": "https://app.turnflow.link/billing",

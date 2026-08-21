@@ -160,7 +160,11 @@ def _pending_log():
 @pytest.mark.django_db
 def test_send_email_sync_marks_sent(monkeypatch, settings):
     settings.EMAIL_FROM_NAME = "TurnFlow"
-    settings.SUPPORT_EMAIL = "contact@turnflow.link"
+    # 문의 주소는 발신 도메인과 **다르다** (문의=clfy.ai.kr, 발신=turnflow.link).
+    # 일부러 다른 도메인으로 두고 단언한다 — 누가 발신 주소를 SUPPORT_EMAIL 로
+    # 배선하면 SPF/DKIM 정렬이 깨져 전체 메일이 스팸행이 되는데, clfy.ai.kr 에는
+    # SPF·DMARC·Cloudflare DKIM 이 없다. 그 사고를 여기서 잡는다.
+    settings.SUPPORT_EMAIL = "contact@clfy.ai.kr"
     log = _pending_log()
 
     mock_send = MagicMock(return_value="cf_provider_id")
@@ -174,9 +178,10 @@ def test_send_email_sync_marks_sent(monkeypatch, settings):
     assert out.attempts == 1
     kwargs = mock_send.call_args.kwargs
     assert kwargs["to_email"] == "user@example.com"
+    # 발신은 Cloudflare 에 온보딩된 turnflow.link 로 고정, Reply-To 만 문의 주소.
     assert kwargs["from_email"] == "contact@turnflow.link"
     assert kwargs["from_name"] == "TurnFlow"
-    assert kwargs["reply_to"] == "contact@turnflow.link"
+    assert kwargs["reply_to"] == "contact@clfy.ai.kr"
 
 
 @pytest.mark.django_db

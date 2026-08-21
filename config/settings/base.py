@@ -1055,7 +1055,13 @@ AI_IMAGE_VLM_MODEL = config("AI_IMAGE_VLM_MODEL", default="gemma-4")
 
 # Service metadata (used as default email template variables)
 SERVICE_NAME = config("SERVICE_NAME", default="TurnFlow")
-SUPPORT_EMAIL = config("SUPPORT_EMAIL", default="contact@turnflow.link")
+# 사용자에게 보여주는 문의 주소 + 메일 Reply-To.
+# ⚠️ EMAIL_FROM_ADDRESS(발신)와 **다른 도메인이어도 문제없다** — Reply-To 는 SPF/DKIM
+#    정렬 대상이 아니다. 반대로 발신 주소를 clfy.ai.kr 로 바꾸면 안 된다:
+#    clfy.ai.kr 에는 SPF·DMARC·Cloudflare DKIM 이 없고(MX 는 larksuite 수신 전용),
+#    turnflow.link 만 Cloudflare 발송용으로 온보딩돼 있다(2026-08-21 실측).
+#    바꾸면 전체 메일이 정렬 실패로 스팸행이 된다.
+SUPPORT_EMAIL = config("SUPPORT_EMAIL", default="contact@clfy.ai.kr")
 
 # Brand / company metadata (email footer, receipts). See rag-docs 01-service-overview.
 BRAND_URL = config("BRAND_URL", default="https://turnflow.link")
