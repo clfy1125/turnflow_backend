@@ -117,6 +117,83 @@ def send_password_reset_email(user_id: int) -> None:
         logger.error("password_reset template missing")
 
 
+@shared_task(name="emails.send_account_deletion_email")
+def send_account_deletion_email(user_id: int, request_ip: str | None = None) -> None:
+    """웹 단독 탈퇴 ① — 이메일 소유 증명 링크.
+
+    ``is_active=True`` 로 좁히는 이유: 이미 탈퇴 유예 중(비활성)인 계정에 삭제 링크를
+    또 보내면 안 된다. 판정은 account_deletion.request_deletion 이 먼저 하지만,
+    태스크가 큐에서 늦게 실행되는 사이 상태가 바뀔 수 있어 여기서도 막는다.
+    """
+    from apps.authentication.account_deletion import GRACE_DAYS, REQUEST_TTL_MINUTES
+
+    try:
+        user = User.objects.get(pk=user_id, is_active=True)
+    except User.DoesNotExist:
+        return
+
+    _, raw_token = EmailToken.issue(
+        user=user,
+        purpose=EmailTokenPurpose.ACCOUNT_DELETE,
+        ttl_minutes=REQUEST_TTL_MINUTES,
+        request_ip=request_ip,
+    )
+    ctx = _user_context(user)
+    ctx.update(
+        {
+            # 이 URL 은 앱이 아니라 **공개 웹페이지**여야 한다 — Google Play 정책상
+            # 앱으로 돌려보내면 안 된다. ACCOUNT_DELETION_URL 이 그 페이지다.
+            "delete_url": f"{settings.ACCOUNT_DELETION_URL}?token={raw_token}",
+            "expires_minutes": REQUEST_TTL_MINUTES,
+            "grace_days": GRACE_DAYS,
+            "request_ip": request_ip or "-",
+        }
+    )
+    from .constants import TEMPLATE_ACCOUNT_DELETION_VERIFY
+
+    try:
+        send_email(TEMPLATE_ACCOUNT_DELETION_VERIFY, user.email, ctx, user=user)
+    except EmailTemplateMissing:
+        logger.error("account_deletion_verify template missing — run seed_email_templates")
+
+
+@shared_task(name="emails.send_account_deletion_confirmed_email")
+def send_account_deletion_confirmed_email(user_id: int) -> None:
+    """웹 단독 탈퇴 ② — 접수 영수증 + 복구 링크.
+
+    ``is_active`` 로 좁히지 않는다. 이 메일은 **비활성화된 뒤에** 나가기 때문이다.
+    (여기에 is_active=True 를 걸면 메일이 영구히 발송되지 않는다)
+    """
+    from apps.authentication.account_deletion import GRACE_DAYS, RESTORE_TTL_MINUTES
+
+    try:
+        user = User.objects.get(pk=user_id)
+    except User.DoesNotExist:
+        return
+    if not user.deletion_scheduled_at:
+        return
+
+    _, raw_token = EmailToken.issue(
+        user=user,
+        purpose=EmailTokenPurpose.ACCOUNT_RESTORE,
+        ttl_minutes=RESTORE_TTL_MINUTES,
+    )
+    ctx = _user_context(user)
+    ctx.update(
+        {
+            "purge_date": timezone.localdate(user.deletion_scheduled_at).isoformat(),
+            "grace_days": GRACE_DAYS,
+            "restore_url": f"{settings.ACCOUNT_DELETION_URL}/restore?token={raw_token}",
+        }
+    )
+    from .constants import TEMPLATE_ACCOUNT_DELETION_CONFIRMED
+
+    try:
+        send_email(TEMPLATE_ACCOUNT_DELETION_CONFIRMED, user.email, ctx, user=user)
+    except EmailTemplateMissing:
+        logger.error("account_deletion_confirmed template missing — run seed_email_templates")
+
+
 def _payment_context(user, extra: dict) -> dict:
     """Base user context + billing-provided fields. `extra` values must be
     JSON-serializable (they cross the Celery boundary from billing)."""

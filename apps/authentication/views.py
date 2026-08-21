@@ -38,6 +38,48 @@ def _diagnose_login_failure(email, password):
     return "원인 불명 (자격증명은 유효해 보이나 authenticate가 None 반환)"
 
 
+def _pending_deletion_response(email, password):
+    """탈퇴 유예 중인 계정의 로그인 시도면 복구 안내 응답을, 아니면 None 을 준다.
+
+    ⚠️ **비밀번호가 맞을 때만** 이 응답을 준다. 그러지 않으면 임의의 이메일로
+    "그 계정은 탈퇴 진행 중"이라는 정보를 캐낼 수 있다(열거 취약점). 비밀번호를
+    아는 사람은 이미 계정 주인이거나 자격증명을 가진 자이므로 추가 노출이 없다.
+
+    소셜 로그인 전용 계정은 사용 가능한 비밀번호가 없어 여기서 걸리지 않는다 —
+    그쪽은 GoogleLoginView 가 같은 판정을 한다.
+    """
+    if not email or not password:
+        return None
+    user = User.objects.filter(email__iexact=email).first()
+    if user is None or not user.is_pending_deletion:
+        return None
+    if not user.check_password(password):
+        return None
+
+    return Response(
+        {
+            "success": False,
+            "error": {
+                "code": status.HTTP_409_CONFLICT,
+                "message": (
+                    "이 계정은 회원탈퇴가 접수되어 이용이 중단되었습니다. "
+                    "탈퇴 접수 메일의 '탈퇴 취소' 링크로 복구할 수 있습니다."
+                ),
+                "details": {
+                    "code": "account_deletion_pending",
+                    "purge_at": (
+                        user.deletion_scheduled_at.isoformat()
+                        if user.deletion_scheduled_at
+                        else None
+                    ),
+                    "support_email": settings.SUPPORT_EMAIL,
+                },
+            },
+        },
+        status=status.HTTP_409_CONFLICT,
+    )
+
+
 def _debug_log_login(request, email, response, reason, user=None):
     """개발 서버(DEBUG=True)에서만 로그인 시도의 응답 내용을 로깅한다.
 
@@ -308,6 +350,14 @@ class LoginView(generics.GenericAPIView):
         user = authenticate(request, username=email, password=password)
 
         if user is None:
+            # 탈퇴 유예 중인 계정은 is_active=False 라 authenticate() 가 None 을 준다.
+            # 그대로 두면 "비밀번호가 틀렸다"로 보여 **복구 경로가 사라진다** —
+            # 복구 메일을 잃은 사용자에게 이 로그인 시도가 유일한 창구다.
+            pending = _pending_deletion_response(email, password)
+            if pending is not None:
+                _debug_log_login(request, email, pending, reason="탈퇴 유예 중 계정")
+                return pending
+
             response = Response(
                 {"error": "Invalid credentials"}, status=status.HTTP_401_UNAUTHORIZED
             )
@@ -997,6 +1047,34 @@ curl -X POST http://localhost:8000/api/v1/auth/google/ \\
                 "marketing_opt_in_at": timezone.now() if marketing_opt_in else None,
             },
         )
+
+        # 탈퇴 유예 중인 계정 — get_or_create 가 기존 계정을 그대로 찾아오므로 여기서
+        # 막지 않으면 **is_active=False 인 계정에 JWT 가 발급된다**(로그인 우회).
+        # 자동 복구도 하지 않는다: 탈퇴 취소는 사용자가 의식적으로 선택해야 한다.
+        # 구글이 이메일 소유를 확인해 준 상태라 이 안내는 정보 노출이 아니다.
+        if not created and user.is_pending_deletion:
+            return Response(
+                {
+                    "success": False,
+                    "error": {
+                        "code": status.HTTP_409_CONFLICT,
+                        "message": (
+                            "이 계정은 회원탈퇴가 접수되어 이용이 중단되었습니다. "
+                            "탈퇴 접수 메일의 '탈퇴 취소' 링크로 복구할 수 있습니다."
+                        ),
+                        "details": {
+                            "code": "account_deletion_pending",
+                            "purge_at": (
+                                user.deletion_scheduled_at.isoformat()
+                                if user.deletion_scheduled_at
+                                else None
+                            ),
+                            "support_email": settings.SUPPORT_EMAIL,
+                        },
+                    },
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
 
         if created:
             user.set_unusable_password()

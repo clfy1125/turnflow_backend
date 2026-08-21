@@ -52,6 +52,26 @@ class User(AbstractUser):
     marketing_opt_in_at = models.DateTimeField(
         null=True, blank=True, verbose_name="마케팅 수신 동의 시각"
     )
+
+    # ── 회원탈퇴 유예 (Google Play 계정 삭제 정책 / 개인정보보호법 §21) ──────────────
+    # 웹 단독 탈퇴(`turnflow.link/delete-account`)는 즉시 하드 삭제가 아니라
+    #   ① 즉시 비활성화(is_active=False) + 구독 해지  ② `deletion_scheduled_at` 후 영구 파기
+    # 2단으로 처리한다. 유예를 두는 이유가 두 개다:
+    #   - 개인정보보호법 §21① "지체 없이 파기" 를 지키면서 오탈퇴를 되돌릴 창구가 필요하다.
+    #     (유예 목적·기간을 고지하고 취소 경로를 실제로 제공해야 '지연'이 아닌 '유예'로 방어된다)
+    #   - 탈퇴 자체가 메일함 접근만으로 가능하므로, 메일함 탈취 시 복구 경로가 된다.
+    # ⚠️ 이 필드가 채워진 계정은 `is_active=False` 라 `authenticate()` 가 None 을 준다.
+    #    LoginView 가 그 상태를 구분해 복구 안내를 내려준다 — 안 하면 "비밀번호 틀림"으로 보인다.
+    deletion_requested_at = models.DateTimeField(
+        null=True, blank=True, verbose_name="탈퇴 확정 시각"
+    )
+    deletion_scheduled_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="영구 삭제 예정 시각",
+        help_text="이 시각이 지나면 authentication.purge_deleted_accounts 가 하드 삭제한다",
+    )
+
     username = None  # Remove username field
 
     # Override username to use email
@@ -73,3 +93,8 @@ class User(AbstractUser):
     def display_name(self):
         """Return full name if available, otherwise email"""
         return self.full_name if self.full_name else self.email
+
+    @property
+    def is_pending_deletion(self) -> bool:
+        """탈퇴 확정됐으나 아직 영구 파기 전(유예 중)인가."""
+        return self.deletion_scheduled_at is not None

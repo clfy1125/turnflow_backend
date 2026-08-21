@@ -145,3 +145,84 @@ def cleanup_unverified_accounts() -> dict:
             logger.exception("cleanup_unverified_accounts: telegram 알림 실패")
 
     return summary
+
+
+@shared_task(name="authentication.purge_deleted_accounts")
+def purge_deleted_accounts() -> dict:
+    """탈퇴 유예가 만료된 계정을 하드 삭제한다 (웹 단독 탈퇴 ④).
+
+    ``deletion_scheduled_at <= now`` 인 계정만 대상이다. 그 필드는
+    `account_deletion.confirm_deletion` 만 채우고, 사용자가 복구하면 지워진다.
+
+    ⚠️ 위 cleanup_unverified_accounts 와 달리 **기능 플래그·dry-run 이 없다.**
+    의도된 차이다 — 이건 사용자가 명시적으로 요청하고 동의한 삭제이고, 실행되지
+    않으면 "7일 후 삭제한다"는 고지를 우리가 어기는 것이 된다. 안전장치는
+    유예 기간과 복구 경로 쪽에 이미 있다.
+
+    반환: {"candidates", "deleted", "skipped", "failed"}
+    멱등: 삭제된 계정은 다음 차수에 조회되지 않는다.
+    """
+    from .account_deletion import purge_user
+
+    User = get_user_model()
+    now = timezone.now()
+
+    candidates = list(
+        User.objects.filter(
+            deletion_scheduled_at__isnull=False,
+            deletion_scheduled_at__lte=now,
+        ).order_by("deletion_scheduled_at")[:_MAX_BATCH]
+    )
+
+    deleted = skipped = failed = 0
+    for user in candidates:
+        user_id, user_email = user.pk, user.email
+
+        # 운영자 계정은 이 경로로 사라지면 안 된다. request_deletion 이 이미 막지만,
+        # 권한이 나중에 부여된 계정이 있을 수 있어 파기 직전에 한 번 더 본다.
+        if user.is_staff or user.is_superuser:
+            skipped += 1
+            logger.error(
+                "purge_deleted_accounts: 운영자 계정이 파기 대기 중 — 건너뜀 user=%s", user_id
+            )
+            continue
+
+        try:
+            with transaction.atomic():
+                purge_user(user)
+            deleted += 1
+            logger.info("purge_deleted_accounts: 파기 완료 user=%s", user_id)
+        except ProtectedError:
+            # purge_user 가 Workspace 를 먼저 지우므로 정상 경로에서는 나오지 않는다.
+            # 나온다면 새 PROTECT FK 가 생긴 것 → purge_user 에 추가해야 한다.
+            failed += 1
+            logger.exception(
+                "purge_deleted_accounts: PROTECT FK 로 파기 실패 — purge_user 수정 필요 user=%s",
+                user_id,
+            )
+        except Exception:
+            failed += 1
+            logger.exception("purge_deleted_accounts: 파기 중 오류 user=%s (%s)", user_id, user_email)
+
+    summary = {
+        "candidates": len(candidates),
+        "deleted": deleted,
+        "skipped": skipped,
+        "failed": failed,
+    }
+    log_fn = logger.error if (failed or skipped) else logger.info
+    log_fn("purge_deleted_accounts: %s", summary)
+
+    if deleted or failed or skipped:
+        try:
+            from apps.core.telegram import send_telegram_notification
+
+            icon = "🔴" if (failed or skipped) else "🧹"
+            send_telegram_notification(
+                f"{icon} *TurnFlow* 탈퇴 계정 파기: "
+                f"삭제 {deleted} / 건너뜀 {skipped} / 실패 {failed} (후보 {len(candidates)})"
+            )
+        except Exception:
+            logger.exception("purge_deleted_accounts: telegram 알림 실패")
+
+    return summary

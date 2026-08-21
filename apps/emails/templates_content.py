@@ -18,6 +18,8 @@ Brand palette (from turnflow.link):
 from __future__ import annotations
 
 from apps.emails.constants import (
+    TEMPLATE_ACCOUNT_DELETION_CONFIRMED,
+    TEMPLATE_ACCOUNT_DELETION_VERIFY,
     TEMPLATE_ADMIN_DEVICE_CODE,
     TEMPLATE_CONSENT_MISSING_DOWNGRADE,
     TEMPLATE_CONVERSION_CONSENT,
@@ -184,6 +186,65 @@ DEFAULTS: dict[str, dict[str, str]] = {
 <p style="font-size:13px;color:#9ca3af;margin:0;">본인이 요청한 것이 아니라면 이 메일을 무시해 주세요.</p>
 """,
             preheader="{{ service_name }} 이메일 인증 코드 {{ verification_code }}",
+        ),
+    },
+    # 웹 단독 탈퇴 ①: 이메일 소유 증명. 이 메일 자체로는 아무것도 삭제되지 않는다 —
+    # 링크를 눌러 최종 확인 화면에서 동의해야 확정된다. 오요청자를 안심시키는 문구가 필수.
+    TEMPLATE_ACCOUNT_DELETION_VERIFY: {
+        "subject": "[{{ service_name }}] 회원탈퇴 요청 확인",
+        "html_body": _wrap(
+            """
+<p style="font-size:18px;font-weight:700;color:#111827;margin:0 0 4px;">회원탈퇴를 진행하시겠어요?</p>
+<p style="margin:0 0 4px;color:#4b5563;">안녕하세요, <strong>{{ full_name }}</strong>님.</p>
+<p style="margin:0;color:#4b5563;"><strong>{{ email }}</strong> 계정의 회원탈퇴 요청을 받았습니다. 아래 버튼을 눌러 삭제되는 항목을 확인하고 최종 동의해 주세요. (유효시간 {{ expires_minutes }}분)</p>
+"""
+            + _btn("{{ delete_url }}", "탈퇴 진행하기")
+            + """
+<p style="font-size:13px;color:#9ca3af;margin:0 0 8px;">버튼이 동작하지 않으면 아래 주소를 브라우저에 붙여넣으세요.<br><span style="word-break:break-all;color:#7C3AED;">{{ delete_url }}</span></p>
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:6px 0 2px;border-collapse:collapse;border:1px solid #fde2e4;border-radius:12px;background:#fff5f6;">
+  <tr><td style="padding:14px 18px;color:#9f1239;font-size:13px;line-height:1.7;word-break:keep-all;">
+    <strong>이 메일만으로는 계정이 삭제되지 않습니다.</strong><br>
+    최종 동의 후 계정이 즉시 이용 중단되고, <strong>{{ grace_days }}일</strong> 뒤 영구 삭제됩니다. 그 전까지는 복구할 수 있습니다.
+  </td></tr>
+</table>
+<p style="font-size:13px;color:#9ca3af;margin:10px 0 0;">본인이 요청하지 않았다면 이 메일을 무시하세요. 계정은 그대로 유지됩니다. (요청 IP {{ request_ip }})</p>
+<p style="font-size:13px;color:#9ca3af;margin:6px 0 0;">문의: {{ support_email }}</p>
+""",
+            preheader="{{ service_name }} 회원탈퇴 요청 확인 — 이 메일만으로는 삭제되지 않습니다",
+        ),
+    },
+    # 웹 단독 탈퇴 ②: 접수 영수증 + 복구 링크. 유예를 법적으로 '유예'로 만들려면
+    # 취소 경로가 실제로 제공돼야 한다 — 그 경로가 이 메일이다.
+    TEMPLATE_ACCOUNT_DELETION_CONFIRMED: {
+        "subject": "[{{ service_name }}] 회원탈퇴가 접수되었습니다",
+        "html_body": _wrap(
+            """
+<p style="font-size:18px;font-weight:700;color:#111827;margin:0 0 4px;">회원탈퇴가 접수되었습니다</p>
+<p style="margin:0 0 4px;color:#4b5563;">안녕하세요, <strong>{{ full_name }}</strong>님.</p>
+<p style="margin:0;color:#4b5563;"><strong>{{ email }}</strong> 계정의 이용이 즉시 중단되었고, 유료 구독이 있었다면 함께 해지되었습니다.</p>
+"""
+            + _detail_rows(
+                [
+                    ("영구 삭제 예정일", "{{ purge_date }}"),
+                    ("복구 가능 기간", "{{ grace_days }}일"),
+                ]
+            )
+            + """
+<p style="margin:14px 0 0;color:#4b5563;">실수로 탈퇴하셨다면 아래 버튼으로 되돌릴 수 있습니다.</p>
+"""
+            + _btn("{{ restore_url }}", "탈퇴 취소하고 계정 복구")
+            + """
+<p style="font-size:13px;color:#9ca3af;margin:0 0 8px;">버튼이 동작하지 않으면 아래 주소를 브라우저에 붙여넣으세요.<br><span style="word-break:break-all;color:#7C3AED;">{{ restore_url }}</span></p>
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:6px 0 2px;border-collapse:collapse;border:1px solid #eef0f3;border-radius:12px;background:#f9fafb;">
+  <tr><td style="padding:14px 18px;color:#4b5563;font-size:13px;line-height:1.7;word-break:keep-all;">
+    <strong>복구해도 유료 구독은 되살아나지 않습니다.</strong><br>
+    등록된 카드 정보는 탈퇴 접수 시 이미 삭제되었습니다. 계속 이용하시려면 복구 후 결제 수단을 다시 등록해 주세요.
+  </td></tr>
+</table>
+<p style="font-size:13px;color:#9ca3af;margin:10px 0 0;">전자상거래법·전자금융거래법 등 법령에 따라 보존 의무가 있는 결제·거래 기록은 정해진 기간 동안 보관되며, 이 기록은 보관 목적 외로 이용되지 않습니다. 자세한 내용은 개인정보처리방침을 참고해 주세요.</p>
+<p style="font-size:13px;color:#9ca3af;margin:6px 0 0;">문의: {{ support_email }}</p>
+""",
+            preheader="{{ service_name }} 회원탈퇴 접수 — {{ purge_date }} 영구 삭제 예정",
         ),
     },
     TEMPLATE_PASSWORD_RESET: {
@@ -520,6 +581,11 @@ SAMPLE_CONTEXT: dict[str, str] = {
     "device_code": "482913",
     "device_label": "이재원 MacBook",
     "request_ip": "121.130.44.14",
+    # 회원탈퇴 (웹 단독 — turnflow.link/delete-account)
+    "delete_url": "https://turnflow.link/delete-account?token=sample",
+    "restore_url": "https://turnflow.link/delete-account/restore?token=sample",
+    "purge_date": "2026-08-28",
+    "grace_days": "7",
     # company footer
     "company_name": "주식회사 씨엘에프와이 (CLFY Co., Ltd.)",
     "company_ceo": "김시현",

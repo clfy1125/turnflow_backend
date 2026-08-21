@@ -69,6 +69,11 @@ class EmailTokenPurpose(models.TextChoices):
     # 어드민 2단계 로그인 — 신규 기기 승인. opaque token 은 쓰지 않고 6자리 code 만 쓴다
     # (메일 링크 클릭으로 승인되면 메일함 접근만으로 기기가 등록된다).
     ADMIN_DEVICE = "admin_device", "Admin Device Approval"
+    # 웹 단독 회원탈퇴(turnflow.link/delete-account) — Google Play 계정 삭제 정책.
+    # 로그인 없이 메일 소유 증명만으로 진행되므로 TTL 을 짧게 두고 단일사용을 지킨다.
+    ACCOUNT_DELETE = "account_delete", "Account Deletion"
+    # 탈퇴 유예 중 복구용. 확정 메일에 실어 보내며, 로그인 경로와 함께 두 갈래 복구창이 된다.
+    ACCOUNT_RESTORE = "account_restore", "Account Deletion Cancel"
 
 
 class EmailToken(models.Model):
@@ -152,6 +157,28 @@ class EmailToken(models.Model):
         if row:
             row.mark_used()
         return row
+
+    @classmethod
+    def peek(cls, *, raw_token: str, purpose: str) -> EmailToken | None:
+        """살아있는 토큰을 **소비하지 않고** 조회한다.
+
+        메일 링크를 눌러 확인 화면을 띄우는 단계에서 필요하다. 여기서 consume 하면
+        화면만 보고 취소한 사용자의 토큰이 타 버려서 다시 메일을 받아야 한다.
+        (메일 클라이언트·보안 스캐너가 링크를 선점 조회하는 경우도 같은 사고가 된다)
+
+        ⚠️ 실제 파괴적 동작 직전에는 반드시 `consume()` 을 호출해 단일사용을 지킬 것.
+        """
+        return (
+            cls.objects.filter(
+                purpose=purpose,
+                token_hash=cls.hash_token(raw_token),
+                used_at__isnull=True,
+                expires_at__gt=timezone.now(),
+            )
+            .select_related("user")
+            .order_by("-created_at")
+            .first()
+        )
 
 
 class EmailStatus(models.TextChoices):

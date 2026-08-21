@@ -24,6 +24,9 @@ TEMPLATE_CONVERSION_CONSENT = "conversion_consent"
 TEMPLATE_CONSENT_MISSING_DOWNGRADE = "consent_missing_downgrade"
 # 어드민 2단계 로그인 — 신규 기기 승인 코드 (일반 회원에게는 발송되지 않는다).
 TEMPLATE_ADMIN_DEVICE_CODE = "admin_device_code"
+# 웹 단독 회원탈퇴 (turnflow.link/delete-account) — Google Play 계정 삭제 정책.
+TEMPLATE_ACCOUNT_DELETION_VERIFY = "account_deletion_verify"
+TEMPLATE_ACCOUNT_DELETION_CONFIRMED = "account_deletion_confirmed"
 
 TEMPLATE_KEYS = [
     TEMPLATE_EMAIL_VERIFICATION,
@@ -40,6 +43,8 @@ TEMPLATE_KEYS = [
     TEMPLATE_CONVERSION_CONSENT,
     TEMPLATE_CONSENT_MISSING_DOWNGRADE,
     TEMPLATE_ADMIN_DEVICE_CODE,
+    TEMPLATE_ACCOUNT_DELETION_VERIFY,
+    TEMPLATE_ACCOUNT_DELETION_CONFIRMED,
 ]
 
 TEMPLATE_CHOICES = [(k, k) for k in TEMPLATE_KEYS]
@@ -169,6 +174,25 @@ AVAILABLE_VARIABLES: dict[str, dict[str, str]] = {
         "expires_minutes": "코드 유효 시간(분)",
         "device_label": "로그인을 시도한 기기 표시명 (비어 있을 수 있음)",
         "request_ip": "로그인을 시도한 IP",
+        "service_name": "서비스명",
+        "support_email": "고객센터 이메일",
+    },
+    TEMPLATE_ACCOUNT_DELETION_VERIFY: {
+        "full_name": "수신자 이름",
+        "email": "수신자 이메일",
+        "delete_url": "탈퇴 최종 확인 페이지 URL (token 쿼리 포함)",
+        "expires_minutes": "링크 유효 시간(분)",
+        "grace_days": "탈퇴 확정 후 영구 삭제까지의 유예 일수",
+        "request_ip": "탈퇴를 요청한 IP",
+        "service_name": "서비스명",
+        "support_email": "고객센터 이메일",
+    },
+    TEMPLATE_ACCOUNT_DELETION_CONFIRMED: {
+        "full_name": "수신자 이름",
+        "email": "수신자 이메일",
+        "purge_date": "영구 삭제 예정일 (YYYY-MM-DD)",
+        "grace_days": "영구 삭제까지 남은 유예 일수",
+        "restore_url": "탈퇴를 취소하고 계정을 복구하는 URL (token 쿼리 포함)",
         "service_name": "서비스명",
         "support_email": "고객센터 이메일",
     },

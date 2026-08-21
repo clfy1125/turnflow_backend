@@ -40,18 +40,25 @@ def test_body_cell_carries_keep_all_guard(key: str):
     assert html.count("word-break:keep-all") >= 3, f"{key}: keep-all guard missing/weakened"
 
 
+# `word-break:break-all` 이 허용되는 유일한 맥락 = 버튼이 안 눌릴 때를 위해 그대로
+# 노출하는 **raw URL**. ASCII 전용이라 한글처럼 글자 단위로 쌓일 수 없다.
+# CODE_CHIP_VARS 와 같은 이유로 정규식(`.*_url`)이 아니라 명시적 목록으로 둔다 —
+# 느슨하게 열면 한글 문구 옆에 붙은 break-all 을 놓치고, 그게 이 가드가 막으려는 것이다.
+RAW_URL_VARS = ("reset_url", "delete_url", "restore_url")
+
+
 @pytest.mark.parametrize("key", ALL_KEYS)
 def test_no_break_word_on_korean_text(key: str):
     """`overflow-wrap:break-word` cancels keep-all and re-enables per-glyph breaks.
 
-    The single legitimate exception is the raw reset URL, which is ASCII-only and
-    therefore cannot stack per Korean character.
+    The single legitimate exception is a raw URL, which is ASCII-only and therefore
+    cannot stack per Korean character.
     """
     html = DEFAULTS[key]["html_body"]
     assert "overflow-wrap" not in html, f"{key}: overflow-wrap defeats keep-all"
     for m in re.finditer(r"word-break:break-all", html):
         window = html[max(0, m.start() - 400) : m.end() + 200]
-        assert "{{ reset_url }}" in window or "reset_url" in window, (
+        assert any(v in window for v in RAW_URL_VARS), (
             f"{key}: word-break:break-all outside the raw-URL block — "
             "Korean text there will stack one character per line"
         )

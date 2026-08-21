@@ -259,6 +259,13 @@ REST_FRAMEWORK = {
         "email_send": config("THROTTLE_EMAIL_SEND", default="5/hour"),
         "password_reset": config("THROTTLE_PASSWORD_RESET", default="10/hour"),
         "password_reset_confirm": config("THROTTLE_PASSWORD_RESET_CONFIRM", default="10/min"),
+        # ── 웹 단독 회원탈퇴 (turnflow.link/delete-account) ──
+        # 로그인 없이 임의 이메일로 메일을 보내는 경로라 메일 폭격 벡터다. 비밀번호
+        # 재설정과 같은 급으로 조인다. 확인/복구는 링크를 든 본인만 오므로 조금 넉넉히.
+        # ⚠️ 이 프로젝트 스로틀은 fail-open — scope 이름이 여기와 뷰에서 어긋나면
+        #    예외 없이 **조용히 꺼진다**. tests_account_deletion.py 가 이름을 못 박는다.
+        "account_deletion_request": config("THROTTLE_ACCOUNT_DELETION_REQUEST", default="5/hour"),
+        "account_deletion_confirm": config("THROTTLE_ACCOUNT_DELETION_CONFIRM", default="20/hour"),
         # ── 어드민 2단계 로그인 (docs/ops/ADMIN_AUTH_HARDENING_PLAN.md) ──
         # 일반 로그인(auth_login)보다 조인다 — 어드민 계정은 3개뿐이라 정상 트래픽이 극히 적고,
         # 뚫렸을 때 열리는 범위는 전 회원 데이터다. 6자리 코드 무차별 대입 방어가 핵심.
@@ -672,6 +679,15 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": crontab(hour=4, minute=0),  # CELERY_TIMEZONE=Asia/Seoul 기준
         "options": {"queue": "billing"},
     },
+    # 매일 KST 04:10 — 탈퇴 유예(기본 7일)가 만료된 계정 하드 삭제 (웹 단독 탈퇴 ④).
+    # cleanup-unverified-accounts 와 달리 **플래그·dry-run 이 없다** — 사용자가 요청하고
+    # 동의한 삭제이므로, 안 돌면 "7일 후 삭제한다"는 고지를 우리가 어기는 것이 된다.
+    # 실제 구동은 core.ScheduledJob(0016 시드). CELERY_BEAT_SCHEDULE 은 dev 패리티/문서용.
+    "purge-deleted-accounts": {
+        "task": "authentication.purge_deleted_accounts",
+        "schedule": crontab(hour=4, minute=10),  # CELERY_TIMEZONE=Asia/Seoul 기준
+        "options": {"queue": "billing"},
+    },
     # 매일 KST 04:30 — 만료된 댓글 관측 장부(SeenComment) 정리.
     "cleanup-comment-ledger": {
         "task": "integrations.cleanup_comment_ledger",
@@ -868,7 +884,9 @@ IG_OAUTH_RETURN_TO_ORIGINS = config(
     cast=lambda v: [s.strip() for s in v.split(",") if s.strip()],
 )
 
-# Meta App (Facebook Login for Instagram Business)
+# Meta App — Instagram Business Login 용 폴백 자격증명.
+# ⚠️ 우리는 Facebook Login for Business 를 쓰지 않는다(instagram.com/oauth/authorize 방식).
+# INSTAGRAM_APP_ID/SECRET 이 없을 때만 이 값이 쓰인다 (apps/integrations/services.py 참고).
 META_APP_ID = config("META_APP_ID", default="")
 META_APP_SECRET = config("META_APP_SECRET", default="")
 
@@ -1057,6 +1075,20 @@ COMPANY_PHONE = config("COMPANY_PHONE", default="070-8098-7102")
 # Email token lifetimes
 EMAIL_VERIFICATION_TTL_MINUTES = config("EMAIL_VERIFICATION_TTL_MINUTES", default=30, cast=int)
 PASSWORD_RESET_TTL_MINUTES = config("PASSWORD_RESET_TTL_MINUTES", default=60, cast=int)
+
+# ── 웹 단독 회원탈퇴 (Google Play 계정 삭제 정책) ─────────────────────────────
+# 공개 탈퇴 페이지의 절대 URL. **앱이 아니라 웹페이지여야 한다** — 정책이
+# "앱을 다시 설치하거나 앱으로 돌아가지 않고도" 요청을 시작할 수 있어야 한다고 요구한다.
+# 탈퇴 메일의 링크가 이 값을 기준으로 만들어지므로 FRONTEND_URL 과 별도로 둔다
+# (탈퇴 페이지는 Cloudflare Worker 가 서빙하고 앱 배포와 무관하게 살아 있어야 한다).
+ACCOUNT_DELETION_URL = config(
+    "ACCOUNT_DELETION_URL", default="https://turnflow.link/delete-account"
+)
+# 탈퇴 확정 → 영구 파기까지의 유예. 이 기간의 법적 정당화는
+# authentication.models.User.deletion_scheduled_at 주석 참고.
+ACCOUNT_DELETION_GRACE_DAYS = config("ACCOUNT_DELETION_GRACE_DAYS", default=7, cast=int)
+# 탈퇴 인증 메일 링크의 유효시간(분).
+ACCOUNT_DELETION_TTL_MINUTES = config("ACCOUNT_DELETION_TTL_MINUTES", default=30, cast=int)
 
 # 미인증 계정 정리(authentication.cleanup_unverified_accounts) — 비가역 삭제이므로 안전 기본값.
 # ENABLED=False 면 태스크가 아무것도 하지 않음. DRY_RUN=True 면 후보만 로그로 남기고 삭제하지 않음.
