@@ -27,7 +27,8 @@
 
 **결제·구독**
 - [TOSS_BILLING_FRONTEND.md](frontend/TOSS_BILLING_FRONTEND.md) — 토스 빌링 연동(카드등록 → prepare/confirm, 체험·해지·카드변경)
-- [EXTRA_IG_ACCOUNT_TRIAL_FRONTEND.md](frontend/EXTRA_IG_ACCOUNT_TRIAL_FRONTEND.md) — ⭐ 체험 중 추가 IG 계정 **0원 즉시 추가**(체험 400 폐지 + `trial` 플래그) · 견적 400 사유 노출 요청
+- [EXTRA_IG_ACCOUNT_TRIAL_FRONTEND.md](frontend/EXTRA_IG_ACCOUNT_TRIAL_FRONTEND.md) — ⭐ **v2** · 체험 중 추가 IG 계정 **0원 즉시 추가**(체험 400 폐지 + `trial` 플래그) · 견적 400 사유 노출 요청 · dev 테스트 카드 실측표 · **체험 중 상한 없음 = 의도된 결정**
+- [EXTRA_IG_ACCOUNT_TRIAL_RESPONSE.md](frontend/EXTRA_IG_ACCOUNT_TRIAL_RESPONSE.md) — 위 문서에 대한 프론트 회신 답변(에러 두 포맷 동시 송출로 수정·배포, 상한 감수 결정, 400 문구 전문)
 - [CANCEL_RETENTION_FRONTEND.md](frontend/CANCEL_RETENTION_FRONTEND.md) — 해지 리텐션(일시정지·50% 할인·윈백)
 - [REFERRAL_COUPON_FRONTEND.md](frontend/REFERRAL_COUPON_FRONTEND.md) — 쿠폰/제휴코드(무카드 redeem 폐지 + 결제 전 미리보기)
 - [PAYMENT_CONSENT_HANDOVER.md](frontend/PAYMENT_CONSENT_HANDOVER.md) — ⭐ **프론트 전달본** — 2차 동의 폐기 결정 + 붙일 API 2개 + dev 테스트 계정 5개

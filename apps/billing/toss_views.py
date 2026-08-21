@@ -44,11 +44,25 @@ logger = logging.getLogger(__name__)
 
 
 def _flow_error_response(e: BillingFlowError) -> Response:
+    """BillingFlowError → 응답. `detail` 과 CLAUDE.md §6 통일 포맷을 **함께** 싣는다.
+
+    이 함수는 DRF 예외 핸들러를 거치지 않고 Response 를 직접 만들기 때문에, 오래도록
+    `{"detail": ...}` 단독으로 나갔다 — §6 위반이었고 실제로 함정이었다:
+    프론트가 문서에 적힌 envelope(`error.message`)만 읽도록 구현하면 정책 거절 사유가
+    빈 문자열이 되어 "빨간 박스 안에 아무 글자도 없는" 화면이 된다
+    (2026-08-21 프론트 회신 §1 — 시리얼라이저 ValidationError 는 envelope, 여기는 detail).
+
+    `detail` 은 기존 프론트·앱이 읽고 있으므로 **영구 유지**한다. 지우면 결제 화면의
+    에러 문구가 한 번에 사라진다. 2xx(202 결제확인중)에는 error 를 싣지 않는다.
+    """
     body = {"detail": e.detail, **e.extra}
     if isinstance(e, ChargePendingError):
         body["payment"] = PaymentHistorySerializer(e.payment).data
     if isinstance(e, ChargeDeclinedError):
         body["payment"] = PaymentHistorySerializer(e.payment).data
+    if e.status_code >= 400:
+        body.setdefault("success", False)
+        body.setdefault("error", {"code": e.status_code, "message": e.detail})
     return Response(body, status=e.status_code)
 
 
@@ -440,8 +454,25 @@ class TossDevIssueView(APIView):
 그 외 환경에서는 404를 반환합니다. **운영 배포 시 반드시 비활성.**
 
 ## 테스트 카드
-토스 테스트 키에서는 카드번호 **앞 6자리(BIN)만 유효**하면 등록됩니다.
-예: `4330121111111111` / 유효기간 미래 아무 값 / 생년월일 `900101`
+토스 테스트 키에서는 카드번호 **앞 6자리(BIN)만 유효**하면 등록됩니다. 단 "유효"는
+**토스가 인식하는 실제 발급사 BIN**이라는 뜻이라, 아무 숫자나 되는 게 아닙니다.
+
+**2026-08-21 실측으로 통과 확인된 카드번호** (앞 6자리가 핵심):
+
+| 카드번호 | BIN |
+|---|---|
+| `3562951111111111` | 356295 |
+| `3562961111111111` | 356296 |
+| `3562971111111111` | 356297 |
+| `9490011111111111` | 949001 |
+
+유효기간 `12` / `30`, 생년월일 `900101`.
+
+⚠️ **예전에 이 문서가 예시로 쓰던 `433012…` 는 이제 `NOT_SUPPORTED_CARD_TYPE` 로 실패합니다.**
+같이 확인해 본 433012·402841·542208·552046·435760·356355·424321·519014·400200·456524·
+431196·465817 전부 실패 — 토스 테스트 환경의 BIN 표가 바뀐 것으로 보입니다. 위 표가 막히면
+`TossBillingClient.issue_billing_key_by_card` 를 후보 BIN 으로 돌려 다시 찾으세요
+(테스트키 확인 후 실행할 것 — 라이브 키로는 절대 금지).
 
 ## 요청/응답
 `plan_name`, `referral_code`, `extra_ig_accounts` 의미는 confirm API와 동일합니다.
@@ -574,7 +605,7 @@ const res = await fetch('/api/v1/billing/extra-accounts/', {
                                 "plan": {"name": "pro"},
                             },
                             "payment": {"amount": 9900, "status": "paid"},
-                            "next_renewal_amount": 29700,
+                            "next_renewal_amount": 34700,
                             "effective_at": None,
                         },
                     ),
@@ -610,7 +641,7 @@ const res = await fetch('/api/v1/billing/extra-accounts/', {
                                 "plan": {"name": "pro"},
                             },
                             "payment": None,
-                            "next_renewal_amount": 9900,
+                            "next_renewal_amount": 14900,
                             "effective_at": "2026-08-09T00:00:00+09:00",
                         },
                     ),
@@ -624,7 +655,7 @@ const res = await fetch('/api/v1/billing/extra-accounts/', {
                                 "plan": {"name": "pro"},
                             },
                             "payment": None,
-                            "next_renewal_amount": 29700,
+                            "next_renewal_amount": 34700,
                             "effective_at": None,
                         },
                     ),
@@ -746,7 +777,7 @@ const q = await (await fetch('/api/v1/billing/extra-accounts/preview/', {
                                 },
                             },
                             "effective_at": None,
-                            "next_renewal_amount": 35700,
+                            "next_renewal_amount": 34700,
                             "unit_price": 9900,
                         },
                     ),
@@ -784,7 +815,7 @@ const q = await (await fetch('/api/v1/billing/extra-accounts/preview/', {
                                 "proration": None,
                             },
                             "effective_at": None,
-                            "next_renewal_amount": 25800,
+                            "next_renewal_amount": 24800,
                             "unit_price": 9900,
                         },
                     ),

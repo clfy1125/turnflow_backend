@@ -851,3 +851,26 @@ class TestProrationPreview:
 
         # 견적은 부작용 없음 — PENDING 결제 미생성
         assert PaymentHistory.objects.filter(user=user, status=PaymentStatus.PENDING).count() == 0
+
+    def test_policy_rejection_carries_both_error_formats(self, user, toss):
+        """정책 거절 400 은 `detail` 과 §6 envelope 를 **동시에** 실어야 한다.
+
+        `_flow_error_response` 는 DRF 예외 핸들러를 안 거쳐서 오래도록 detail 단독이었다 —
+        문서의 envelope 만 보고 구현한 프론트는 사유가 빈 문자열이 됐다(2026-08-21 회신 §1).
+        """
+        _make_active_pro(user, toss)
+        client = APIClient()
+        client.force_authenticate(user=user)
+
+        # 동일 값 재요청(예약 없음) = 정책 거절 400
+        r = client.post(reverse("billing:extra-accounts"), {"count": 0}, format="json")
+        assert r.status_code == 400
+        assert r.data["detail"]  # 기존 프론트·앱이 읽는 자리 — 영구 유지
+        assert r.data["success"] is False
+        assert r.data["error"]["code"] == 400
+        assert r.data["error"]["message"] == r.data["detail"]
+
+        # 시리얼라이저 ValidationError 는 원래부터 envelope — 두 경로가 같은 자리를 채운다
+        r2 = client.post(reverse("billing:extra-accounts"), {"count": 999}, format="json")
+        assert r2.status_code == 400
+        assert r2.data["error"]["message"]
