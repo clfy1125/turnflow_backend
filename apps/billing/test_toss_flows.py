@@ -361,7 +361,7 @@ class TestChangePlan:
 @pytest.mark.django_db
 class TestExtraAccounts:
     def _pro_user(self, user, toss):
-        """ACTIVE 프로 (트라이얼 우회 즉시 과금) — 추가계정 변경은 TRIALING 차단이므로."""
+        """ACTIVE 프로 (트라이얼 우회 즉시 과금) — 유료 상태의 비례 청구를 검증하려면 필요."""
         sub = ensure_subscription(user)
         sub.trial_used_at = timezone.now()
         sub.save(update_fields=["trial_used_at"])
@@ -384,11 +384,69 @@ class TestExtraAccounts:
         # 다음 갱신은 계정 전체가 합산된 전액
         assert sub.renewal_amount == sub.monthly_amount_snapshot + 9900 * 2
 
-    def test_trialing_blocks_extra_accounts(self, user, toss):
+    def test_trialing_increase_is_free_and_immediate(self, user, toss):
+        """체험 중 증가 = 0원 즉시 반영 (2026-08-21 제품 결정).
+
+        예전엔 400 으로 통째로 막았다 — 체험자가 계정을 늘릴 방법이 없어 막혔다.
+        """
         confirm_billing(user, auth_key="ak1", plan_name="pro")  # TRIALING
-        with pytest.raises(BillingFlowError) as e:
-            change_extra_accounts(user, 1)
-        assert "체험" in e.value.detail
+        toss.charges.clear()
+
+        result = change_extra_accounts(user, 1)
+
+        sub = result["subscription"]
+        assert sub.status == SubscriptionStatus.TRIALING  # 체험은 그대로 유지
+        assert sub.extra_ig_accounts == 1  # 즉시 반영 = 계정을 바로 연동할 수 있다
+        assert toss.charges == []  # ★ 토스 승인 호출 자체가 없어야 한다
+        assert result["payment"] is None
+        assert result["effective_at"] is None
+        assert "체험" in result["detail"]
+        # 첫 결제(=체험 종료 시) 금액에는 합산돼 있어야 한다
+        assert sub.renewal_amount == sub.monthly_amount_snapshot + 9900
+
+    def test_trialing_increase_charged_at_first_renewal(self, user, toss):
+        """체험 중 0원으로 늘린 계정이 체험 종료 첫 결제에 합산 청구되는지 (핵심 회귀)."""
+        confirm_billing(user, auth_key="ak1", plan_name="pro")  # TRIALING
+        change_extra_accounts(user, 1)
+        sub = ensure_subscription(user)
+        base = sub.monthly_amount_snapshot
+
+        # 체험 만료 → 갱신 태스크가 첫 과금
+        sub.current_period_end = timezone.now() - timedelta(minutes=1)
+        sub.save(update_fields=["current_period_end"])
+        toss.charges.clear()
+        tasks.charge_subscription_renewal(str(sub.id))
+
+        assert len(toss.charges) == 1
+        assert toss.charges[0]["amount"] == base + 9900  # 플랜가 + 추가 1계정
+        sub.refresh_from_db()
+        assert sub.status == SubscriptionStatus.ACTIVE
+        assert sub.extra_ig_accounts == 1
+
+    def test_trialing_preview_reports_zero_with_trial_flag(self, user, toss):
+        """견적도 같은 판정 — trial=True · 0원 · proration=None (실행과 동일 계산)."""
+        confirm_billing(user, auth_key="ak1", plan_name="pro")  # TRIALING
+
+        quote = toss_flows.preview_change_extra_accounts(user, 1)
+
+        assert quote["direction"] == "increase"
+        assert quote["delta"] == 1
+        assert quote["trial"] is True
+        assert quote["immediate_charge"]["amount"] == 0
+        # 무과금인데 '잔여일 비례' 내역이 붙으면 화면이 일할 계산을 보여주게 된다
+        assert quote["immediate_charge"]["proration"] is None
+        sub = ensure_subscription(user)
+        assert quote["next_renewal_amount"] == sub.monthly_amount_snapshot + 9900
+
+    def test_paid_preview_keeps_trial_false_and_proration(self, user, toss):
+        """유료(ACTIVE)는 종전 그대로 — 비례 청구 + trial=False (회귀 방지)."""
+        self._pro_user(user, toss)
+
+        quote = toss_flows.preview_change_extra_accounts(user, 1)
+
+        assert quote["trial"] is False
+        assert quote["immediate_charge"]["amount"] > 0
+        assert quote["immediate_charge"]["proration"]["units"] == 1
 
     def test_increase_declined_does_not_change_count(self, user, toss):
         self._pro_user(user, toss)

@@ -517,6 +517,10 @@ class ExtraAccountsView(APIView):
   결제 성공 시에만 슬롯이 늘어나며, 이후 매월 갱신 금액에 계정 전체가 합산됩니다.
   잔여 비례액이 0이면 `payment`가 null이며 무과금으로 즉시 적용됩니다.
   대기 중이던 축소 예약이 있으면 함께 해제됩니다.
+- **증가 — 무료 체험(`status="trialing"`) 중**: **오늘 청구 0원**(`payment: null`)으로
+  슬롯이 즉시 늘어납니다. 늘어난 금액은 **체험 종료일의 첫 결제부터** 총액에 합산돼
+  청구됩니다(`next_renewal_amount` 가 그 금액). 체험 기간에 비례 청구하지 않습니다.
+  견적 API의 `trial: true` 로 이 경우를 미리 판별하세요.
 - **감소**: 무과금·무환불이며 **즉시 반영되지 않습니다.** `pending_extra_ig_accounts`로
   **예약**만 하고, **다음 갱신일부터** 낮아진 슬롯/금액이 적용됩니다(이번 주기는 그대로 사용).
   초과 여부로 거부하지 않습니다. 갱신 시 허용량이 줄어 활성 계정이 초과되면 그 시점에
@@ -545,11 +549,15 @@ const res = await fetch('/api/v1/billing/extra-accounts/', {
 ## 에러
 | 코드 | 원인 |
 |------|------|
-| 400 | 프로 플랜 아님, 카드 미등록, 동일 값(예약 없음), 미납/해지예약 상태 |
+| 400 | 프로 플랜 아님, 카드 미등록, 동일 값(예약 없음), 미납/해지예약/일시정지 상태 |
 | 401 | 토큰 없음/만료 |
 | 402 | 증가분 결제 거절 |
 | 202 | 결제 결과 확인 중 |
 | 502 | 토스 API 통신 오류 |
+
+> 무료 체험(`trialing`)은 **더 이상 400이 아닙니다** (2026-08-21). 예전엔
+> `무료 체험 중에는 추가 계정을 변경할 수 없습니다` 로 거절했는데, 체험자가 계정을
+> 늘릴 방법이 없어 막히는 사고가 있었습니다. 이제 0원으로 즉시 반영됩니다.
         """,
         request=ExtraAccountsRequestSerializer,
         responses={
@@ -567,6 +575,25 @@ const res = await fetch('/api/v1/billing/extra-accounts/', {
                             },
                             "payment": {"amount": 9900, "status": "paid"},
                             "next_renewal_amount": 29700,
+                            "effective_at": None,
+                        },
+                    ),
+                    OpenApiExample(
+                        "체험 중 추가 (증가 — 0원, 즉시 반영)",
+                        value={
+                            "detail": (
+                                "추가 IG 계정이 1개로 즉시 반영되었습니다. 무료 체험 중이라 "
+                                "지금 결제되는 금액은 없고, 체험이 끝나는 날 첫 결제부터 "
+                                "합산된 금액이 청구됩니다."
+                            ),
+                            "subscription": {
+                                "status": "trialing",
+                                "extra_ig_accounts": 1,
+                                "pending_extra_ig_accounts": None,
+                                "plan": {"name": "pro"},
+                            },
+                            "payment": None,
+                            "next_renewal_amount": 24800,
                             "effective_at": None,
                         },
                     ),
@@ -661,10 +688,17 @@ class ExtraAccountsPreviewView(APIView):
 |------|------|
 | `direction` | `increase`(즉시 비례 청구) / `decrease`(무과금) / `noop`(동일) |
 | `delta` | 목표 − 현재 (증감분) |
+| `trial` | **`true`면 무료 체험 중** → 증가도 오늘 청구 0원. 문구 분기용 (아래 참조) |
 | `immediate_charge.amount` | **지금 즉시 청구될 금액(원, 세포함)**. 0이면 무과금 즉시 적용 |
-| `immediate_charge.proration` | 증가 시 계산 내역: `remaining_days`, `unit_price`(9900), `units`(delta), `full_amount`, `net` |
-| `next_renewal_amount` | 변경 후 **다음 정기 갱신 예정 총액(전액)** |
+| `immediate_charge.proration` | 증가 시 계산 내역: `remaining_days`, `unit_price`(9900), `units`(delta), `full_amount`, `net`. **체험 중 증가는 `null`** (일할 계산이 없음) |
+| `next_renewal_amount` | 변경 후 **다음 정기 갱신 예정 총액(전액)**. 체험 중이면 = **체험 종료일 첫 결제액** |
 | `unit_price` | 추가 계정 단가(원/월) — **하드코딩 대신 이 값을 사용하세요** |
+
+### `trial` 를 별도 필드로 내려주는 이유
+`immediate_charge.amount === 0` 만 보면 두 경우를 구별할 수 없습니다 —
+① 체험 중이라 무과금 ② 유료지만 갱신일이 오늘이라 잔여 비례액이 0.
+①은 "체험 중에는 결제 없이 바로 사용", ②는 "오늘 0원 결제"로 **문구가 달라야** 하므로
+`trial` 로 분기하세요.
 
 ## 프론트엔드 통합 (2단계: 견적 → 확정)
 ```typescript
@@ -680,8 +714,12 @@ const q = await (await fetch('/api/v1/billing/extra-accounts/preview/', {
 ## 에러
 | 코드 | 원인 |
 |------|------|
-| 400 | 프로 아님·카드 미등록·체험/미납/해지 상태 |
+| 400 | 프로 아님·카드 미등록·미납(past_due)·해지예약(cancelled)·일시정지(paused) |
 | 401 | 토큰 없음/만료 |
+
+> **무료 체험(`trialing`)은 2026-08-21 부터 400이 아닙니다.** 정상 견적이 내려오고
+> `trial: true` · `immediate_charge.amount: 0` 입니다. 이 400을 "일시 오류"로 처리하던
+> 화면이 있으면 함께 고쳐 주세요 — 그게 체험자가 계정을 못 늘리던 원인이었습니다.
         """,
         request=ExtraAccountsRequestSerializer,
         responses={
@@ -693,6 +731,7 @@ const q = await (await fetch('/api/v1/billing/extra-accounts/preview/', {
                         value={
                             "direction": "increase",
                             "delta": 2,
+                            "trial": False,
                             "immediate_charge": {
                                 "amount": 7920,
                                 "currency": "KRW",
@@ -712,10 +751,32 @@ const q = await (await fetch('/api/v1/billing/extra-accounts/preview/', {
                         },
                     ),
                     OpenApiExample(
+                        "체험 중 증가 견적 (0→1, 오늘 0원)",
+                        value={
+                            "direction": "increase",
+                            "delta": 1,
+                            "trial": True,
+                            "immediate_charge": {
+                                "amount": 0,
+                                "currency": "KRW",
+                                "description": (
+                                    "무료 체험 중이라 추가 계정 1개는 지금 결제 없이 바로 "
+                                    "사용할 수 있습니다. 체험이 끝나는 날 첫 결제부터 "
+                                    "합산된 금액이 청구됩니다."
+                                ),
+                                "proration": None,
+                            },
+                            "effective_at": None,
+                            "next_renewal_amount": 24800,
+                            "unit_price": 9900,
+                        },
+                    ),
+                    OpenApiExample(
                         "감소 견적 (2→1, 무과금)",
                         value={
                             "direction": "decrease",
                             "delta": -1,
+                            "trial": False,
                             "immediate_charge": {
                                 "amount": 0,
                                 "currency": "KRW",

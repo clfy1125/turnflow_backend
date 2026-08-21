@@ -155,7 +155,19 @@ def compute_upgrade_charge(
 
 
 def compute_extra_accounts_charge(sub: UserSubscription, delta: int, now=None) -> int:
-    """추가 계정 증가분(delta>0)의 잔여일 일할 청구액 (floor)."""
+    """추가 계정 증가분(delta>0)의 잔여일 일할 청구액 (floor).
+
+    ★ 체험(TRIALING) 중에는 **항상 0** (2026-08-21 제품 결정).
+      체험은 무과금 기간인데 `current_period_end`(=체험 종료일) 잔여일로 비례 청구하면
+      "무료 체험"에 6,900원쯤을 받게 된다. 그래서 예전엔 체험 중 추가 계정을 통째로
+      막아뒀는데(400), 그 결과 프로 체험자가 계정을 못 늘리고 막히는 사고가 났다
+      (prod suecap1@gmail.com — 3분간 8회 시도 후 CS 티켓).
+      → 체험 중에는 **0원으로 즉시 늘려 주고**, 첫 결제(체험 종료 시
+        process_due_renewals → tasks._renewal_amount_for)부터 총액에 합산해 청구한다.
+      preview 와 실행이 이 함수를 공유하므로 견적=실청구가 그대로 유지된다.
+    """
+    if sub.status == SubscriptionStatus.TRIALING:
+        return 0
     ratio = proration_ratio(sub, now)
     return _prorate(EXTRA_IG_ACCOUNT_PRICE * delta, ratio, mode="floor")
 
@@ -1076,9 +1088,12 @@ def change_extra_accounts(user, new_count: int) -> dict:
 
     - 증가: 증가분 × 9,900원을 현재 주기 잔여일만큼 비례 즉시 청구 → 성공 시 즉시 반영.
       대기 중이던 축소 예약이 있으면 함께 해제된다.
+      **체험(TRIALING) 중이면 청구 0원**으로 즉시 반영하고, 체험 종료 후 첫 결제부터
+      총액에 합산해 청구한다(compute_extra_accounts_charge 주석 참조).
     - 감소: **즉시 반영/거부 없음.** 다음 갱신 시점에 적용되도록 `pending_extra_ig_accounts`
       로 예약만 한다(이번 주기는 그대로 사용). 갱신 때 허용량이 줄어 활성 계정이 초과되면
       그 시점에 자동 비활성 + 재선택 유도(billing.tasks._enforce_ig_activation_after_renewal).
+      체험 중이라도 같다 — 체험 종료 = 첫 결제 시점이 곧 '다음 갱신'이다.
     - 현재 적용값과 동일한 요청: 축소 예약이 있으면 예약 취소, 없으면 400.
     """
     sub = ensure_subscription(user)
@@ -1087,10 +1102,6 @@ def change_extra_accounts(user, new_count: int) -> dict:
         raise BillingFlowError("추가 IG 계정은 프로 플랜 전용입니다.")
     if not sub.has_billing_key:
         raise BillingFlowError("결제 카드가 등록되어 있지 않습니다.")
-    if sub.status == SubscriptionStatus.TRIALING:
-        raise BillingFlowError(
-            "무료 체험 중에는 추가 계정을 변경할 수 없습니다. 체험 종료 후 이용해주세요."
-        )
     if sub.status == SubscriptionStatus.PAST_DUE:
         raise BillingFlowError(
             "미납 상태에서는 추가 계정을 구매할 수 없습니다. 결제 수단을 확인해주세요."
@@ -1122,6 +1133,7 @@ def change_extra_accounts(user, new_count: int) -> dict:
     # ── 증가: 즉시 비례 청구 + 즉시 반영 (있던 축소 예약도 해제) ──
     if delta > 0:
         payment = None
+        in_trial = sub.status == SubscriptionStatus.TRIALING
         amount = compute_extra_accounts_charge(sub, delta, now=timezone.now())
         if amount > 0:
             payment = charge_prorated(
@@ -1132,11 +1144,24 @@ def change_extra_accounts(user, new_count: int) -> dict:
             )
         _apply_extra_state(sub.pk, new_count)  # extra_ig_accounts=new_count, pending 해제
         sub.refresh_from_db()
-        logger.info("추가 IG 계정 증가: user=%s %+d → %d (즉시 반영)", user.email, delta, new_count)
+        logger.info(
+            "추가 IG 계정 증가: user=%s %+d → %d (즉시 반영, 청구=%d원%s)",
+            user.email,
+            delta,
+            new_count,
+            amount,
+            ", 체험중 무과금" if in_trial else "",
+        )
         return {
             "subscription": sub,
             "payment": payment,
-            "detail": f"추가 IG 계정이 {new_count}개로 즉시 반영되었습니다.",
+            "detail": (
+                f"추가 IG 계정이 {new_count}개로 즉시 반영되었습니다. "
+                "무료 체험 중이라 지금 결제되는 금액은 없고, 체험이 끝나는 날 첫 결제부터 "
+                "합산된 금액이 청구됩니다."
+                if in_trial
+                else f"추가 IG 계정이 {new_count}개로 즉시 반영되었습니다."
+            ),
             "effective_at": None,
         }
 
@@ -1272,7 +1297,7 @@ def preview_change_plan(user, plan_name: str, extra_ig_accounts: int = 0, now=No
 def preview_change_extra_accounts(user, count: int, now=None) -> dict:
     """change_extra_accounts 의 부작용 없는 견적. 실행과 동일 가드·계산.
 
-    반환 dict: direction(increase|decrease|noop), delta, immediate_charge{...},
+    반환 dict: direction(increase|decrease|noop), delta, trial, immediate_charge{...},
     effective_at, next_renewal_amount, unit_price.
     """
     now = now or timezone.now()
@@ -1282,10 +1307,6 @@ def preview_change_extra_accounts(user, count: int, now=None) -> dict:
         raise BillingFlowError("추가 IG 계정은 프로 플랜 전용입니다.")
     if not sub.has_billing_key:
         raise BillingFlowError("결제 카드가 등록되어 있지 않습니다.")
-    if sub.status == SubscriptionStatus.TRIALING:
-        raise BillingFlowError(
-            "무료 체험 중에는 추가 계정을 변경할 수 없습니다. 체험 종료 후 이용해주세요."
-        )
     if sub.status == SubscriptionStatus.PAST_DUE:
         raise BillingFlowError(
             "미납 상태에서는 추가 계정을 구매할 수 없습니다. 결제 수단을 확인해주세요."
@@ -1296,6 +1317,10 @@ def preview_change_extra_accounts(user, count: int, now=None) -> dict:
         raise BillingFlowError("일시정지 중인 구독입니다. 정지를 해제한 후 이용해주세요.")
 
     delta = count - sub.extra_ig_accounts
+    # 체험 중이면 즉시 청구가 0원이다 — 프론트가 "오늘 0원 결제"가 아니라 "체험 중 무과금"
+    # 문구를 고를 수 있도록 판정 결과를 그대로 내려준다(금액 0 만 보고 추론하게 하면
+    # '잔여 0일이라 0원'인 경우와 구별할 수 없다).
+    in_trial = sub.status == SubscriptionStatus.TRIALING
     # 목표 count 기준 다음 갱신액 (대기 예약 상태와 무관하게 결정적으로 계산).
     base = sub.pending_amount_snapshot if sub.pending_plan_id else sub.monthly_amount_snapshot
     if base is None:
@@ -1307,6 +1332,7 @@ def preview_change_extra_accounts(user, count: int, now=None) -> dict:
         return {
             "direction": "noop",
             "delta": 0,
+            "trial": in_trial,
             "immediate_charge": {**zero, "description": "현재 설정과 동일합니다."},
             "effective_at": None,
             "next_renewal_amount": sub.renewal_amount,
@@ -1316,6 +1342,7 @@ def preview_change_extra_accounts(user, count: int, now=None) -> dict:
         return {
             "direction": "decrease",
             "delta": delta,
+            "trial": in_trial,
             "immediate_charge": {
                 **zero,
                 "description": "추가 계정 축소는 무과금 — 다음 갱신부터 낮은 금액으로 청구됩니다.",
@@ -1327,9 +1354,28 @@ def preview_change_extra_accounts(user, count: int, now=None) -> dict:
 
     net = compute_extra_accounts_charge(sub, delta, now=now)
     remaining = _remaining_days(sub, now)
+    if in_trial:
+        # 체험 중 증가 — 오늘 청구 0원. proration 은 None: 체험 기간을 '잔여일 비례'로
+        # 설명하면 무과금인데도 일할 계산이 있는 것처럼 보인다.
+        return {
+            "direction": "increase",
+            "delta": delta,
+            "trial": True,
+            "immediate_charge": {
+                **zero,
+                "description": (
+                    f"무료 체험 중이라 추가 계정 {delta}개는 지금 결제 없이 바로 사용할 수 "
+                    "있습니다. 체험이 끝나는 날 첫 결제부터 합산된 금액이 청구됩니다."
+                ),
+            },
+            "effective_at": None,
+            "next_renewal_amount": next_renewal_amount,
+            "unit_price": EXTRA_IG_ACCOUNT_PRICE,
+        }
     return {
         "direction": "increase",
         "delta": delta,
+        "trial": False,
         "immediate_charge": {
             "amount": net,
             "currency": "KRW",
