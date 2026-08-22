@@ -72,7 +72,8 @@ done
 
 echo "==> 6/6 recreate workers (celery_beat RETIRED — 외부 cron→/internal/scheduler/tick 으로 이관, DR §6)"
 # celery_beat 는 profiles:[fallback] 라 평상시 기동 안 함(이중 발사 방지). 긴급 폴백만 수동 기동.
-APP_IMAGE="$IMAGE" $COMPOSE up -d --no-deps celery_dm celery_followup celery_default celery_billing celery_ai
+# celery_ai 는 6c 에서 따로 — DM 캠페인 이전 분석이 최대 수십분~2시간이라 무조건 재생성하면 죽는다.
+APP_IMAGE="$IMAGE" $COMPOSE up -d --no-deps celery_dm celery_followup celery_default celery_billing
 
 # ── celery_reports (2026-08-05 추가) ──────────────────────────────────────────
 # 왜 따로 두는가: 리포트 1건이 13~18분이다. 다른 워커처럼 무조건 재생성하면 진행 중인
@@ -120,6 +121,38 @@ if [ "${_rq}" = "0" ] && [ "${_ract}" = "0" ]; then
 else
   echo "    ⏸ SKIPPED — 진행 중 리포트 보호. 완료 후 아래를 직접 실행하세요:"
   echo "       APP_IMAGE=$IMAGE $COMPOSE up -d --no-deps celery_reports"
+fi
+
+# ── celery_ai (2026-08-22 추가) ───────────────────────────────────────────────
+# 왜 따로 두는가: ai_jobs 큐에는 **DM 캠페인 이전 분석**이 올라온다. 발신함 색인만 실측
+# 122분·1,577페이지이고, 죽으면 **자동 재개가 없다** — 스테일 스위퍼가 2시간 뒤에야
+# FAILED("분석이 중단되었습니다") 로 확정하므로 사용자는 그때까지 스피너만 본다.
+# 2026-08-22 배포 직전에 실제로 진행 중 잡(@glowsumm__, 색인 단계)을 만나 이 블록을 넣었다.
+#
+# 짧은 태스크(스팸필터 3~7초)는 warm shutdown 이 흡수하므로 큐 길이는 보지 않는다.
+# **활성 태스크에 dm_migration 이 있을 때만** 건너뛴다.
+echo "==> 6c/6 recreate celery_ai (진행 중 DM이전 분석이 없을 때만)"
+# ⚠️ 6b 와 동일하게 이 블록은 **전부 non-fatal** 이어야 한다(`set -euo pipefail` 아래다).
+#    특히 `grep -c` 는 0건이면 exit 1 이라 `|| true` 없이는 정상 상황에서만 즉사한다.
+_ai_cid="$($COMPOSE ps -q celery_ai 2>/dev/null | head -1 || true)"
+if [ -z "${_ai_cid}" ]; then
+  _aiact='?'   # 컨테이너를 못 찾음 = 확인 불가
+else
+  _aiact_raw="$(docker exec "${_ai_cid}" \
+                 celery -A config inspect active -t 10 2>/dev/null || true)"
+  if [ -z "${_aiact_raw}" ]; then
+    _aiact='?'
+  else
+    _aiact="$(printf '%s' "${_aiact_raw}" | grep -c 'dm_migration' || true)"
+    [ -n "${_aiact}" ] || _aiact='?'
+  fi
+fi
+echo "    ai_jobs 진행중 DM이전=${_aiact}"
+if [ "${_aiact}" = "0" ]; then
+  APP_IMAGE="$IMAGE" $COMPOSE up -d --no-deps celery_ai
+else
+  echo "    ⏸ SKIPPED — 진행 중 DM이전 분석 보호. 완료 후 아래를 직접 실행하세요:"
+  echo "       APP_IMAGE=$IMAGE $COMPOSE up -d --no-deps celery_ai"
 fi
 
 echo "==> done. running images:"
