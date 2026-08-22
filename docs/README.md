@@ -45,6 +45,7 @@
 **DM 캠페인**
 - [DM_QUEUE_STATE_FRONTEND.md](frontend/DM_QUEUE_STATE_FRONTEND.md) — 순차 발송 큐 현황(게이지·ETA·사람 단위 `people`)
 - [DM_RECOVERY_FRONTEND.md](frontend/DM_RECOVERY_FRONTEND.md) — 실패 DM 복구(재댓글 방식)
+- [CAMPAIGN_RESUME_REVIVE_FRONTEND.md](frontend/CAMPAIGN_RESUME_REVIVE_FRONTEND.md) — 재개 시 정지 중 밀린 DM 자동 재발송(`revive_queued`)
 - [CAMPAIGN_TIMESERIES_FRONTEND.md](frontend/CAMPAIGN_TIMESERIES_FRONTEND.md) — 신규 요청자 시계열
 - [DM_CAMPAIGN_DUPLICATE_PREVENTION_FRONTEND.md](frontend/DM_CAMPAIGN_DUPLICATE_PREVENTION_FRONTEND.md) — 게시물당 활성 캠페인 1개(409)
 - [DM_CAMPAIGN_MIGRATION_FRONTEND.md](frontend/DM_CAMPAIGN_MIGRATION_FRONTEND.md) — 타 툴에서 캠페인 이전

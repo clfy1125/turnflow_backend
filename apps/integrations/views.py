@@ -3999,9 +3999,10 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         self._guard_update_active_conflict(campaign, serializer.validated_data)
         before = (campaign.media_id, campaign.trigger_type)
+        previous_status = campaign.status
         serializer.save()
         self._backfill_permalink_if_media_changed(campaign, before)
-        return Response(serializer.data)
+        return Response(self._with_revive_queued(serializer.data, campaign, previous_status))
 
     @extend_schema(
         summary="캠페인 부분 수정",
@@ -4039,9 +4040,23 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         self._guard_update_active_conflict(campaign, serializer.validated_data)
         before = (campaign.media_id, campaign.trigger_type)
+        previous_status = campaign.status
         serializer.save()
         self._backfill_permalink_if_media_changed(campaign, before)
-        return Response(serializer.data)
+        return Response(self._with_revive_queued(serializer.data, campaign, previous_status))
+
+    def _with_revive_queued(self, data, campaign, previous_status):
+        """수정으로 캠페인이 다시 켜졌으면(비활성→active) 밀린 DM 을 되살리고 건수를 동봉.
+
+        프론트는 `POST .../resume/` 대신 `PATCH {status: "active"}` 로 재개하기도 하므로
+        재개 경로를 한 곳으로 몰지 않고 여기에도 붙인다(단일 진입점은 모델 메서드 쪽).
+        상태가 그대로거나 원래 active 였으면 0 이라 흔한 문구 수정 PATCH 에는 영향이 없다.
+        """
+        campaign.refresh_from_db()
+        revive_queued = campaign.enqueue_paused_backlog_revive(previous_status=previous_status)
+        out = dict(data)
+        out["revive_queued"] = revive_queued
+        return out
 
     def _backfill_permalink_if_media_changed(self, campaign, before) -> None:
         """수정으로 게시물이 바뀌었으면 permalink·썸네일을 다시 백필한다 (best-effort).
@@ -4117,6 +4132,10 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         summary="캠페인 일시정지",
         description=(
             "활성 상태의 캠페인을 일시정지합니다.\n\n"
+            "정지 시점에 발송 대기(큐)에 남아 있던 DM 은 **발송되지 않고 스킵**됩니다. "
+            "이 건들은 버려지지 않고, 나중에 `POST .../resume/` 로 재개하면 "
+            "**메시징 창(댓글 7일 / DM 24시간)이 남아 있는 한 자동으로 다시 큐에 들어갑니다** "
+            "(재개 응답의 `revive_queued`). 즉 정지는 '취소'가 아니라 '보류'입니다.\n\n"
             "응답은 **목록 항목과 동일한 형태(통계 enrichment 포함)** 의 갱신된 캠페인 객체라,"
             " 인라인 토글 후 해당 1건만 교체하면 됩니다."
         ),
@@ -4143,7 +4162,17 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
             "**중복 방지**: 재개하려는 게시물(`media_id`)에 이미 다른 활성 캠페인이 있으면 "
             "**HTTP 409** 로 거부됩니다(`error.details.code='duplicate_active_campaign'`). "
             "기존 활성 캠페인을 먼저 일시정지/종료하세요.\n\n"
-            "응답은 **목록 항목과 동일한 형태(통계 enrichment 포함)** 의 갱신된 캠페인 객체입니다."
+            "**밀린 DM 자동 재발송(2026-08-22~)**: 일시정지 동안 발송되지 못한 DM 은 "
+            "재개 시 **자동으로 발송 큐에 되돌아갑니다**. 응답의 `revive_queued` 가 그 건수이니 "
+            '0 보다 크면 "밀려 있던 N건도 순차 발송됩니다" 안내를 띄워주세요.\n\n'
+            "- 대상은 **정지 때문에 스킵된 건**만이며, 인스타 메시징 창(댓글 7일 / DM 24시간)이 "
+            "남은 건에 한합니다. 창이 지난 건은 어차피 Meta 가 거부하므로 되살리지 않습니다.\n"
+            "- 되살림은 비동기(Celery)이고 발송은 페이서가 분산합니다(평균 5초 간격) — "
+            "재개 직후 한꺼번에 나가지 않습니다.\n"
+            "- 같은 DM 로그를 제자리에서 되살리므로(동일 idempotency_key) **재개를 여러 번 "
+            "눌러도 중복 발송되지 않습니다**.\n\n"
+            "응답은 **목록 항목과 동일한 형태(통계 enrichment 포함)** 의 갱신된 캠페인 객체 + "
+            "`revive_queued` 입니다."
         ),
         responses={
             200: AutoDMCampaignListSerializer,
@@ -4158,8 +4187,9 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
     )
     @action(detail=True, methods=["post"])
     def resume(self, request, pk=None):
-        """캠페인 재개 (과거가 된 종료 예약은 해제)"""
+        """캠페인 재개 (과거가 된 종료 예약은 해제 + 정지 중 밀린 DM 되살림)"""
         campaign = self.get_object()
+        previous_status = campaign.status
         # 소프트 비활성 계정의 캠페인은 재개 불가 (계정 활성화가 선행돼야 함)
         if not campaign.ig_connection.is_active:
             return Response(
@@ -4178,8 +4208,11 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         # (schedule 액션의 activate 분기와 동일하게 정리)
         campaign.ended_at = None
         campaign.save()
-        serializer = self.get_serializer(campaign)
-        return Response(serializer.data)
+        # 정지 동안 스킵된 DM 되살림 — 재개는 "이어서 보내달라"는 뜻이다.
+        revive_queued = campaign.enqueue_paused_backlog_revive(previous_status=previous_status)
+        data = dict(self.get_serializer(campaign).data)
+        data["revive_queued"] = revive_queued
+        return Response(data)
 
     @extend_schema(
         summary="실패한 DM 재발송 (프리미엄)",
@@ -4298,7 +4331,11 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
             '(예: `?source=dm_migration&status=inactive` + `{"all": true}` = 불러온 캠페인 전부 켜기).\n\n'
             "**중복 방지**: 같은 게시물(`media_id`)에 이미 다른 활성 캠페인이 있는 건은 재개되지 않고 "
             "`failed` 에 `reason='duplicate_active_campaign'` 으로 담깁니다(전체 실패가 아니라 건별 격리). "
-            '프론트는 이 사유를 받아 "이미 활성 캠페인이 있어 재개하지 못했습니다" 안내를 보여주세요.'
+            '프론트는 이 사유를 받아 "이미 활성 캠페인이 있어 재개하지 못했습니다" 안내를 보여주세요.\n\n'
+            "**밀린 DM 자동 재발송**: 단건 `resume` 과 동일하게, 정지 동안 발송되지 못한 DM 을 "
+            "발송 큐로 되돌립니다. 응답의 `revive_queued` 는 **대상 캠페인 전체 합계**입니다 "
+            "(정지 때문에 스킵됐고 메시징 창이 남은 건만). 여러 캠페인을 한 번에 켜면 그만큼의 "
+            "DM 이 실제로 나가므로, 큰 값이면 확인 문구를 띄우는 것을 권합니다."
         ),
         request=CampaignBulkActionRequestSerializer,
         responses={
@@ -4401,6 +4438,7 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         }
 
         succeeded, failed = [], []
+        revive_queued = 0
         now = timezone.now()
         for cid in ids:
             campaign = owned.get(cid)
@@ -4426,6 +4464,7 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
                         if conflict is not None:
                             failed.append({"id": cid, "reason": "duplicate_active_campaign"})
                             continue
+                    previous_status = campaign.status
                     campaign.status = AutoDMCampaign.Status.ACTIVE
                     if campaign.scheduled_end_at and campaign.scheduled_end_at <= now:
                         campaign.scheduled_end_at = None
@@ -4433,13 +4472,20 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
                     campaign.save(
                         update_fields=["status", "scheduled_end_at", "ended_at", "updated_at"]
                     )
+                    # 단건 resume 과 동일 규칙 — 정지 중 밀린 DM 되살림(건별 집계).
+                    revive_queued += campaign.enqueue_paused_backlog_revive(
+                        previous_status=previous_status
+                    )
                 elif op == "delete":
                     campaign.delete()
                 succeeded.append(cid)
             except Exception as exc:  # noqa: BLE001 — 건별 격리, 사유를 응답에 담는다
                 failed.append({"id": cid, "reason": str(exc)[:200]})
 
-        return Response({"succeeded": succeeded, "failed": failed})
+        payload = {"succeeded": succeeded, "failed": failed}
+        if op == "resume":
+            payload["revive_queued"] = revive_queued
+        return Response(payload)
 
     @extend_schema(
         summary="캠페인 복사 (비활성 복사본 생성)",
@@ -4585,6 +4631,7 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         campaign.scheduled_start_at = data.get("scheduled_start_at")
         campaign.scheduled_end_at = data.get("scheduled_end_at")
         update_fields = ["scheduled_start_at", "scheduled_end_at", "updated_at"]
+        previous_status = campaign.status
 
         if data.get("activate", True):
             # 중복 방지: 활성화와 함께 예약하는 경우, 같은 게시물에 이미 다른 활성 캠페인이 있으면 409
@@ -4598,7 +4645,12 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
                 update_fields.append("started_at")
 
         campaign.save(update_fields=update_fields)
-        return Response(AutoDMCampaignSerializer(campaign).data)
+        # 예약과 함께 활성화(activate)하는 것도 재개다 — 정지 중 밀린 DM 을 되살린다.
+        data_out = dict(AutoDMCampaignSerializer(campaign).data)
+        data_out["revive_queued"] = campaign.enqueue_paused_backlog_revive(
+            previous_status=previous_status
+        )
+        return Response(data_out)
 
     @extend_schema(
         summary="캠페인 발송 로그 조회",

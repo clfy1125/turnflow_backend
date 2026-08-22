@@ -557,10 +557,14 @@ class AdminCampaignResumeView(APIView):
 ## 비즈니스 로직
 - 현재 상태가 `paused` 가 아니면 409 를 반환합니다.
 - 성공 시 status=active 로 저장하고 `campaign.resume` 감사 로그를 남깁니다.
+- **정지 동안 발송되지 못한 DM 을 자동으로 발송 큐에 되돌립니다**(사용자 재개와 동일 규칙).
+  응답의 `revive_queued` 가 그 건수 — 메시징 창(댓글 7일 / DM 24h)이 남은 건만 대상입니다.
 - 본문(request body) 없음.
 
 ## 주의사항
 - completed/inactive 상태에서는 재개할 수 없습니다 (409).
+- `revive_queued` 가 크면 그만큼의 DM 이 실제로 발송됩니다(페이서가 분산). 사용자 동의 없이
+  대량 재개를 누르지 말 것.
         """,
         request=None,
         responses={
@@ -608,6 +612,8 @@ class AdminCampaignResumeView(APIView):
         before = campaign.status
         campaign.status = AutoDMCampaign.Status.ACTIVE
         campaign.save(update_fields=["status", "updated_at"])
+        # 정지 중 밀린 DM 되살림 — 사용자 resume 과 같은 단일 진입점을 쓴다.
+        revive_queued = campaign.enqueue_paused_backlog_revive(previous_status=before)
 
         log_admin_action(
             request=request,
@@ -615,14 +621,24 @@ class AdminCampaignResumeView(APIView):
             target_type="campaign",
             target_id=campaign.pk,
             target_repr=campaign.name,
-            changes={"status": {"before": before, "after": campaign.status}},
+            changes={
+                "status": {"before": before, "after": campaign.status},
+                "revive_queued": revive_queued,
+            },
         )
         logger.info(
-            "[admin-auto-dm] req=%s campaign resumed id=%s",
+            "[admin-auto-dm] req=%s campaign resumed id=%s revive_queued=%s",
             getattr(request, "id", ""),
             campaign.pk,
+            revive_queued,
         )
-        return Response({"id": str(campaign.id), "status": campaign.status})
+        return Response(
+            {
+                "id": str(campaign.id),
+                "status": campaign.status,
+                "revive_queued": revive_queued,
+            }
+        )
 
 
 class AdminCampaignQueueStateView(APIView):

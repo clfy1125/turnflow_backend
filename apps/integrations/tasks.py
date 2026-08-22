@@ -1707,7 +1707,9 @@ def send_dm_task(self, log_id: str):
     # PAUSED/COMPLETED/INACTIVE 면 발송하지 않고 SKIPPED 로 종결한다(REVIVABLE → 재개 시 되살림).
     # (이전엔 예약 창만 봐서 일시중지해도 기존 백로그가 계속 나가는 버그가 있었다.)
     if not campaign.is_active():
-        log.mark_skipped(f"Campaign not active (status={campaign.status})")
+        # 문구는 상수 — 재개 시 되살림(SentDMLog.revivable_paused_logs)이 이 접두사로
+        # "정지 때문에 스킵된 건"을 골라낸다. 리터럴로 바꾸면 되살림이 조용히 0건이 된다.
+        log.mark_skipped(f"{SentDMLog.SKIP_REASON_CAMPAIGN_INACTIVE} (status={campaign.status})")
         return {"status": "skipped", "reason": "campaign_not_active"}
 
     # ★ 계정 소프트 비활성 가드: is_active=False 계정은 발송에서 제외(캠페인이 우연히
@@ -4313,6 +4315,56 @@ def revive_failed_token_logs(ig_connection_id: str):
             ig_connection_id,
         )
     return {"revived": revived, "scanned": scanned}
+
+
+@shared_task(name="integrations.revive_paused_skipped_logs")
+def revive_paused_skipped_logs(campaign_id: str, limit: int | None = None):
+    """캠페인 재개 후, **정지 때문에** 스킵됐던 DM 을 윈도우 내라면 발송 큐로 되돌린다.
+
+    호출: ``AutoDMCampaign.enqueue_paused_backlog_revive()`` (재개 경로 전부).
+    대상 판정은 ``SentDMLog.revivable_paused_logs()`` 단일 소스를 따른다 — 여기서 조건을
+    다시 쓰면 뷰가 알려준 예상 건수와 실제 되살린 수가 어긋난다.
+
+    제자리 되살림(``SentDMLog.revive``)이라 같은 idempotency_key 를 재사용 → 중복 발송 불가.
+    되살린 뒤 사용자가 곧바로 다시 정지하면 send_dm_task 의 상태 가드가 다시 SKIPPED 로
+    종결하므로(그리고 그 건은 다음 재개에 또 대상이 되므로) 어느 순서로 눌러도 안전하다.
+    """
+    limit = limit or AutoDMCampaign.RESUME_REVIVE_MAX
+    campaign = AutoDMCampaign.objects.filter(id=campaign_id).first()
+    if campaign is None:
+        return {"revived": 0, "scanned": 0, "reason": "campaign_not_found"}
+    # 태스크가 큐에서 대기하는 동안 사용자가 다시 정지했을 수 있다 — 되살려도 즉시 재스킵되니
+    # 로그만 더럽히지 않고 그만둔다(다음 재개에 다시 대상이 된다).
+    if not campaign.is_active():
+        return {"revived": 0, "scanned": 0, "reason": "campaign_not_active"}
+
+    logs = list(SentDMLog.revivable_paused_logs(campaign)[: limit + 1])
+    truncated = len(logs) > limit
+    logs = logs[:limit]
+
+    revived = 0
+    for log in logs:
+        try:
+            if log.revive(reason="campaign_resumed"):
+                revived += 1
+        except Exception:
+            logger.exception("revive_paused_skipped_logs: revive 실패 log=%s", log.id)
+
+    if truncated:
+        # 상한으로 잘렸으면 조용히 넘기지 않는다 — 남은 건은 다음 재개/프리미엄 retry-failed 몫.
+        logger.warning(
+            "revive_paused_skipped_logs: 상한(%s) 초과 — campaign=%s 남은 건은 되살리지 않음",
+            limit,
+            campaign_id,
+        )
+    if revived:
+        logger.info(
+            "revive_paused_skipped_logs: revived %s/%s logs for campaign=%s",
+            revived,
+            len(logs),
+            campaign_id,
+        )
+    return {"revived": revived, "scanned": len(logs), "truncated": truncated}
 
 
 def _build_token_refresh_summary(*, checked: int, succeeded: list, failed: list) -> str:

@@ -731,6 +731,14 @@ class CampaignBulkActionResponseSerializer(serializers.Serializer):
 
     succeeded = serializers.ListField(child=serializers.UUIDField())
     failed = CampaignBulkFailureSerializer(many=True)
+    revive_queued = serializers.IntegerField(
+        required=False,
+        help_text=(
+            "**일괄 재개(bulk-resume)에만 포함**. 정지 동안 발송되지 못해 스킵됐던 DM 중 "
+            "발송 큐로 되돌린 건수의 합계(대상 캠페인 전체). 메시징 창(댓글 7일 / DM 24h)이 "
+            "남은 건만 대상이며, 실제 발송은 페이서가 분산한다."
+        ),
+    )
 
 
 class AutoDMCampaignCreateSerializer(serializers.Serializer):

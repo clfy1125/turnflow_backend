@@ -1004,6 +1004,49 @@ class AutoDMCampaign(models.Model):
         """캠페인이 활성 상태인지 확인 (status 만 본다 — 예약 창은 is_runnable_now 참고)"""
         return self.status == self.Status.ACTIVE
 
+    # 재개 시 한 번에 되살릴 최대 건수. 페이서가 평균 5초 간격으로 빼가므로 1000건이면
+    # 약 1시간 반 분량이고, 레이트 가버너의 시간당 상한이 그 위에서 다시 잡아준다.
+    RESUME_REVIVE_MAX = 1000
+
+    def enqueue_paused_backlog_revive(self, *, previous_status=None) -> int:
+        """정지 동안 스킵된 DM 을 재개 시 발송 큐로 되돌린다 — **모든 활성화 경로의 단일 진입점**.
+
+        정지는 "지금은 보내지 마"라는 뜻이지 "이 사람들을 버려"라는 뜻이 아니다. 그런데
+        ``resume`` 은 status 만 ACTIVE 로 올렸을 뿐이라, 정지 중 큐에서 빠져나온 건들은
+        SKIPPED 로 종결된 채 영구 미발송으로 남았다(2026-08-22 prod: 소급 발송으로
+        238건이 쌓인 직후 정지 → 191명이 재개 뒤에도 못 받음). 그래서 재개하는 모든 경로가
+        이 메서드를 부른다: 단건/일괄 resume · PATCH 로 status=active · schedule(activate)
+        · 어드민 재개.
+
+        Returns:
+            되살림 예상 건수(응답에 그대로 담아 사용자에게 알려줄 값). 0 이면 태스크를
+            띄우지 않는다.
+
+        주의:
+            - **전이(transition)일 때만 동작한다.** ``previous_status`` 가 이미 ACTIVE 면
+              0 — 활성 캠페인은 문구 수정 PATCH 가 잦아서, 전이 검사 없이 붙이면 편집마다
+              백로그 스캔이 돈다.
+            - 실제 되살림은 Celery(``integrations.revive_paused_skipped_logs``)가 한다.
+              1000건이면 row 당 save 2회 + 브로커 publish 1회라 뷰에서 동기로 돌릴 양이
+              아니다. 예상 건수만 COUNT 1회로 즉시 준다.
+            - 되살림은 ``SentDMLog.revive()`` 의 제자리 전이라 **같은 idempotency_key 를
+              재사용** → 재개를 두 번 눌러도 중복 발송이 되지 않는다(이미 QUEUED 인 건은
+              REVIVABLE 이 아니라 대상에서 빠진다).
+        """
+        if self.status != self.Status.ACTIVE:
+            return 0
+        if previous_status == self.Status.ACTIVE:
+            return 0
+
+        pending = SentDMLog.revivable_paused_logs(self).count()
+        if not pending:
+            return 0
+
+        from .tasks import revive_paused_skipped_logs
+
+        revive_paused_skipped_logs.delay(str(self.id))
+        return min(pending, self.RESUME_REVIVE_MAX)
+
     # 썸네일 동기화 연속 실패 상한. 삭제된 게시물/회수된 토큰은 몇 번을 더 시도해도 낫지 않으므로
     # 이 횟수를 넘으면 주기 스위퍼 후보에서 제외한다(게시물이 바뀌면 카운터가 0 으로 리셋됨).
     THUMBNAIL_MAX_SYNC_ATTEMPTS = 5
@@ -1599,6 +1642,12 @@ class SentDMLog(models.Model):
         Status.SKIPPED,
     )
 
+    # 캠페인이 정지/종료 상태여서 스킵된 건의 error_message 접두사 — **단일 소스**.
+    # send_dm_task 의 상태 가드가 이 접두사로 기록하고, 재개 시 되살림
+    # (revivable_paused_logs)이 같은 접두사로 대상을 고른다. 문구를 리터럴로 복제하면
+    # 한쪽만 바뀌었을 때 되살림이 조용히 0건이 된다 — 반드시 이 상수를 쓸 것.
+    SKIP_REASON_CAMPAIGN_INACTIVE = "Campaign not active"
+
     class Meta:
         db_table = "sent_dm_logs"
         verbose_name = "Sent DM Log"
@@ -1802,6 +1851,37 @@ class SentDMLog(models.Model):
         from datetime import timedelta
 
         return timedelta(days=7) if self.comment_id else timedelta(hours=24)
+
+    @classmethod
+    def revivable_paused_logs(cls, campaign, *, now=None):
+        """**캠페인 정지 때문에** 스킵됐고 메시징 윈도우가 남은 로그 (오래된 순).
+
+        재개 시 자동 되살림의 **대상 판정 단일 소스** — 뷰(사용자/어드민)·태스크·테스트가
+        모두 이 쿼리를 쓴다. 조건을 복제하면 "응답에 알려준 예상 건수"와 "실제 되살린 수"가
+        어긋난다.
+
+        - 윈도우는 row 마다 다르다(Private Reply 댓글 7일 / user_id DM 24h) → SQL 에서 갈라
+          센다. 경계는 ``revive()`` 와 동일(age >= window 면 제외).
+        - 정지 외 스킵(월 한도·셀프 수신·계정 비활성·예약창 밖)은 **대상이 아니다**. 재개와
+          인과가 없고, 되살려도 send_dm_task 의 같은 가드에 다시 걸려 로그만 늘어난다.
+          (월 한도 건은 업그레이드 후 프리미엄 ``retry-failed`` 가 담당한다.)
+        - 오래된 순 = 윈도우가 먼저 닫히는 건 우선. 상한을 걸어 자를 때도 손실이 최소가 된다.
+        """
+        from datetime import timedelta
+
+        now = now or timezone.now()
+        return (
+            cls.objects.filter(
+                campaign=campaign,
+                status=cls.Status.SKIPPED,
+                error_message__startswith=cls.SKIP_REASON_CAMPAIGN_INACTIVE,
+            )
+            .filter(
+                models.Q(comment_id__gt="", created_at__gt=now - timedelta(days=7))
+                | models.Q(comment_id="", created_at__gt=now - timedelta(hours=24))
+            )
+            .order_by("created_at")
+        )
 
     def revive(self, reason: str = "", enqueue: bool = True) -> bool:
         """실패 종결 로그를 '제자리에서' QUEUED 로 되살림 (P1 — 무손실 하드닝).
