@@ -3584,6 +3584,128 @@ def maintain_partitions():
 # ===== 공개 답글 + Follow-gate =====
 
 
+# ═══════════════════ 공개 답글 서킷브레이커 (2026-08-24 재설계) ═══════════════════
+# 목적은 **인스타 제재(Action Block) 확산 차단** 하나다. 제재 중에 계속 답글을 시도하면
+# 차단 기간이 연장되므로 스스로 멈춘다.
+#
+# 옛 판정(절대 3건 · 계정 전체 · 영구에러 전부)이 만든 사고 — prod CS #c13711f0 (@manjzangi):
+#   영구에러 203건이 **전부 code=100/subcode=33**("댓글이 존재하지 않음" = 댓글러가 자기 댓글을
+#   지운 것)이었는데, 그걸 제재로 오인해 **20번** 발동하며 캠페인 공개답글을 최대 6개씩 껐다.
+#   Action Block(code=1)·토큰만료(190)는 **0건**. 발송량이 많을수록(9,820건 계정) 10분에 댓글
+#   3개가 지워지는 건 일상이라, 헤비 유저는 사실상 **반드시** 걸리는 구조였다. 사용자에게는
+#   알림도 없어서 "중간중간 대댓글이 풀린다"로만 보였다.
+#
+# 그래서 세 가지를 바꿨다:
+#   1) **제재성 코드만 센다** — 100(댓글 삭제·잘못된 파라미터·7일 초과)은 사용자 행동/데이터
+#      문제이지 제재가 아니다. 영구 종결은 그대로 하되(재시도 무의미) 서킷은 건드리지 않는다.
+#   2) **비율 판정** — 시도 대비 제재성 실패가 과반일 때만. 성공이 섞여 있으면 계정은 멀쩡하다.
+#   3) **범위 축소** — 게시물(캠페인) 단위로 끈다. 단 Action Block 은 계정 단위 제재라
+#      code=1 일 때만 계정 전체를 끈다(다른 캠페인이 계속 두드려 차단을 연장하는 것 방지).
+CB_WINDOW_MINUTES = 10
+CB_MIN_ERRORS = 3  # 노이즈 방어 최소 건수 (비율과 AND 조건)
+CB_ERROR_RATIO = 0.5  # 시도 대비 제재성 실패 비율
+CB_TRIGGER_CODES = (1, 190, 200, 10)  # Action Block / 토큰만료 / 권한·정책
+CB_ACCOUNT_WIDE_CODES = (1,)  # 계정 단위 제재 = Action Block 만
+
+
+def _cb_countable(ev: dict, feature: str) -> bool:
+    """이 verification_log 엔트리가 서킷 카운트 대상인지 (제재성 영구에러인가)."""
+    if (ev or {}).get("result") != "abandoned_permanent":
+        return False
+    # 레거시 엔트리(feature 키 없음)는 public_reply 로 간주
+    if (ev or {}).get("feature", "public_reply") != feature:
+        return False
+    try:
+        return int(ev.get("code")) in CB_TRIGGER_CODES
+    except (TypeError, ValueError):
+        return False  # code 미기록 = 판정 불가 → 세지 않는다(과잉 차단 방지)
+
+
+def _cb_attempt(ev: dict, feature: str) -> bool:
+    """분모 — **제재 상태를 말해주는** 시도 1건: 성공 + 제재성 영구실패.
+
+    데이터 문제(code=100: 댓글 삭제·7일 초과)는 분자에서 뺀 것과 같은 이유로 **분모에서도**
+    뺀다. 계정이 멀쩡한지 제재 중인지에 대해 아무 정보가 없는 이벤트라, 분모에 넣으면
+    댓글이 많이 지워지는 계정에서 진짜 Action Block 신호가 희석돼 서킷이 늦게 열린다.
+    """
+    if (ev or {}).get("feature", "public_reply") != feature:
+        return False
+    if (ev or {}).get("result") == "posted":
+        return True
+    return _cb_countable(ev, feature)
+
+
+def _public_reply_circuit_breaker(log, *, feature: str, code: int | None) -> dict:
+    """제재성 영구에러가 몰릴 때만 공개답글/복구답글 플래그를 자동 OFF.
+
+    Returns: {"tripped": bool, ...} — 호출부는 non-fatal 로 감싼다.
+    """
+    if code not in CB_TRIGGER_CODES:
+        # 댓글 삭제(100/33) 등 — 제재가 아니므로 서킷을 건드리지 않는다.
+        return {"tripped": False, "reason": f"code {code} not restriction-like"}
+
+    campaign = log.campaign
+    ig_conn = campaign.ig_connection
+    account_wide = code in CB_ACCOUNT_WIDE_CODES
+    cutoff = timezone.now() - timedelta(minutes=CB_WINDOW_MINUTES)
+
+    scope_logs = SentDMLog.objects.filter(created_at__gte=cutoff)
+    scope_logs = (
+        scope_logs.filter(campaign__ig_connection=ig_conn)
+        if account_wide
+        else scope_logs.filter(campaign=campaign)
+    )
+
+    errors = attempts = 0
+    for rl in scope_logs.only("verification_log"):
+        evs = rl.verification_log or []
+        if any(_cb_countable(ev, feature) for ev in evs):
+            errors += 1
+        if any(_cb_attempt(ev, feature) for ev in evs):
+            attempts += 1
+
+    attempts = max(attempts, errors)  # 방어 — 분모가 분자보다 작을 수 없다
+    ratio = (errors / attempts) if attempts else 1.0
+    if errors < CB_MIN_ERRORS or ratio < CB_ERROR_RATIO:
+        return {"tripped": False, "errors": errors, "attempts": attempts, "ratio": round(ratio, 2)}
+
+    flag = "recovery_reply_enabled" if feature == "recovery" else "public_reply_enabled"
+    qs = AutoDMCampaign.objects.filter(**{flag: True})
+    qs = qs.filter(ig_connection=ig_conn) if account_wide else qs.filter(id=campaign.id)
+    affected = qs.update(**{flag: False})
+
+    logger.warning(
+        "Circuit breaker (%s) tripped for %s: %s/%s restriction-like permanent errors "
+        "(code=%s, ratio=%.2f) in %smin → disabled %s on %s campaign(s) [scope=%s]. "
+        "Manual re-enable required after Meta restriction clears.",
+        feature,
+        ig_conn.username,
+        errors,
+        attempts,
+        code,
+        ratio,
+        CB_WINDOW_MINUTES,
+        flag,
+        affected,
+        "account" if account_wide else "campaign",
+    )
+    log.append_verification_log(
+        {
+            "path": "public_reply",
+            "result": "circuit_breaker_tripped",
+            "feature": feature,
+            "recent_permanent": errors,
+            "recent_attempts": attempts,
+            "ratio": round(ratio, 2),
+            "trigger_code": code,
+            "scope": "account" if account_wide else "campaign",
+            "affected_campaigns": affected,
+            "ig_account": ig_conn.username,
+        }
+    )
+    return {"tripped": True, "errors": errors, "attempts": attempts, "affected": affected}
+
+
 @shared_task(bind=True, max_retries=10)
 def post_public_reply(self, log_id: str, recovery: bool = False):
     """
@@ -3700,53 +3822,8 @@ def post_public_reply(self, log_id: str, recovery: bool = False):
             }
         )
 
-        # ===== Circuit Breaker (feature 별로 분리) =====
-        # 같은 IG 계정에서 10분 안에 같은 feature 영구 에러 3건 이상 누적되면
-        # → 그 feature 의 플래그를 계정 전체에서 자동 OFF.
-        # 인스타 Action Block (code=1) 이 걸리면 계속 시도할수록 차단 기간이 연장되므로,
-        # 자동 OFF 로 추가 시도를 막아 차단이 빨리 풀리게 한다.
-        # ★ 복구(recovery) 답글은 별도 서킷 — 비팔로워(스팸성) 대상이라 영구에러가 잦은데,
-        #   공유 서킷이면 정상 성공답글(public_reply)까지 꺼버리므로 feature 로 분리한다.
         try:
-            ig_conn = log.campaign.ig_connection
-            cutoff = timezone.now() - timedelta(minutes=10)
-            recent_logs = SentDMLog.objects.filter(
-                campaign__ig_connection=ig_conn,
-                created_at__gte=cutoff,
-            ).only("verification_log")
-            permanent_count = sum(
-                1
-                for rl in recent_logs
-                if any(
-                    (ev or {}).get("result") == "abandoned_permanent"
-                    # 레거시 엔트리(feature 키 없음)는 public_reply 로 간주
-                    and (ev or {}).get("feature", "public_reply") == feature
-                    for ev in (rl.verification_log or [])
-                )
-            )
-            CB_THRESHOLD = 3
-            if permanent_count >= CB_THRESHOLD:
-                flag = "recovery_reply_enabled" if recovery else "public_reply_enabled"
-                affected = AutoDMCampaign.objects.filter(
-                    ig_connection=ig_conn,
-                    **{flag: True},
-                ).update(**{flag: False})
-                logger.warning(
-                    f"Circuit breaker ({feature}) tripped for {ig_conn.username}: "
-                    f"{permanent_count} permanent errors in 10min "
-                    f"→ disabled {flag} on {affected} campaign(s). "
-                    f"Manual re-enable required after Meta restriction clears."
-                )
-                log.append_verification_log(
-                    {
-                        "path": "public_reply",
-                        "result": "circuit_breaker_tripped",
-                        "feature": feature,
-                        "recent_permanent": permanent_count,
-                        "affected_campaigns": affected,
-                        "ig_account": ig_conn.username,
-                    }
-                )
+            _public_reply_circuit_breaker(log, feature=feature, code=e.code)
         except Exception:
             logger.exception("circuit breaker check failed (non-fatal)")
 
