@@ -14,6 +14,7 @@ from rest_framework.throttling import ScopedRateThrottle
 
 from .serializers import (
     AuthResponseSerializer,
+    GoogleAuthResponseSerializer,
     GoogleLoginSerializer,
     UserRegistrationSerializer,
     UserSerializer,
@@ -872,9 +873,26 @@ class GoogleLoginView(generics.GenericAPIView):
 
 ## 응답 데이터
 - `user`: 사용자 정보 (id, email, full_name, date_joined, last_login)
+- `is_new_user`: **이번 요청으로 계정이 새로 만들어졌는가** (boolean)
 - `tokens`: JWT 토큰
   - `access`: 액세스 토큰 (유효기간: 1시간)
   - `refresh`: 리프레시 토큰 (유효기간: 7일)
+
+### `is_new_user` 를 쓰는 이유 (광고 전환 계측)
+구글은 **가입과 로그인이 같은 엔드포인트**라, 이 값이 없으면 프론트가 신규 가입을 구별할
+수 없어 `date_joined` 가 최근인지로 추정해야 했습니다. 추정이 빗나가면 Meta 픽셀
+`CompleteRegistration` 이 **누락되거나 중복 발사**되어 광고 최적화가 잘못된 전환을
+학습합니다. 가입 전환 이벤트(픽셀/CAPI)는 반드시 이 값으로 분기하세요.
+
+```javascript
+const data = await res.json();
+if (data.is_new_user) {
+  fbq('track', 'CompleteRegistration', {}, { eventID: String(data.user.id) });
+}
+```
+
+`eventID` 는 서버 CAPI 와 **같은 값**이어야 중복 제거됩니다 — 규약은
+`docs/frontend/UTM_ATTRIBUTION_FIX.md` §3-2.
 
 ## 계정 연동 규칙
 - **신규 유저**: Google 이메일로 계정 자동 생성 (비밀번호 없음 → 일반 로그인 불가)
@@ -921,11 +939,11 @@ curl -X POST http://localhost:8000/api/v1/auth/google/ \\
         ],
         responses={
             200: OpenApiResponse(
-                response=AuthResponseSerializer,
+                response=GoogleAuthResponseSerializer,
                 description="로그인 성공 — 사용자 정보와 JWT 토큰 반환",
                 examples=[
                     OpenApiExample(
-                        "성공 응답",
+                        "신규 가입 (계정이 이번에 생성됨)",
                         value={
                             "user": {
                                 "id": 1,
@@ -934,6 +952,24 @@ curl -X POST http://localhost:8000/api/v1/auth/google/ \\
                                 "date_joined": "2026-03-16T12:00:00Z",
                                 "last_login": "2026-03-16T12:00:00Z",
                             },
+                            "is_new_user": True,
+                            "tokens": {
+                                "access": "eyJ...",
+                                "refresh": "eyJ...",
+                            },
+                        },
+                    ),
+                    OpenApiExample(
+                        "기존 계정 로그인 (가입 전환 이벤트를 쏘면 안 됨)",
+                        value={
+                            "user": {
+                                "id": 1,
+                                "email": "user@gmail.com",
+                                "full_name": "홍길동",
+                                "date_joined": "2026-03-16T12:00:00Z",
+                                "last_login": "2026-08-25T09:21:00Z",
+                            },
+                            "is_new_user": False,
                             "tokens": {
                                 "access": "eyJ...",
                                 "refresh": "eyJ...",
@@ -1104,6 +1140,16 @@ curl -X POST http://localhost:8000/api/v1/auth/google/ \\
         return Response(
             {
                 "user": UserSerializer(user).data,
+                # ⭐ 이 응답 하나로 '신규 가입'과 '기존 로그인'이 갈린다 (2026-08-25).
+                # 구글은 가입과 로그인이 **같은 엔드포인트**라 프론트가 구별할 방법이
+                # 없었고, `date_joined` 가 10분 이내인지로 추정(휴리스틱)하고 있었다.
+                # 그 추정이 틀리면 Meta 픽셀 CompleteRegistration 이 누락되거나(가입인데
+                # 로그인으로 봄) 중복 발사된다(재로그인을 가입으로 봄) → 광고 최적화가
+                # 잘못된 전환 신호를 학습한다. 서버는 `created` 로 이미 알고 있으므로
+                # 추정할 이유가 없다.
+                # ⚠️ 이 값은 **가입 시점 attribution 저장 여부와 같은 조건**이다
+                #    (capture_signup_attribution 도 `if created:` 안에서만 돈다).
+                "is_new_user": created,
                 "tokens": {
                     "refresh": str(refresh),
                     "access": str(refresh.access_token),

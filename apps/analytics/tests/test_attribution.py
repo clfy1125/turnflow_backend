@@ -141,11 +141,62 @@ class TestEmailRegisterAttribution:
 
 @pytest.mark.django_db
 class TestGoogleSignupAttribution:
-    def _mock_google(self, monkeypatch, email):
+    def _mock_google(self, monkeypatch, email, email_verified=True):
+        """구글 토큰 검증 대역.
+
+        ``email_verified`` 를 반드시 실어야 한다 — 미확인 토큰으로 **기존 계정**에
+        로그인하면 뷰가 403(GOOGLE_EMAIL_UNVERIFIED)으로 막는다. 그 게이트가 나중에
+        추가되면서 '재로그인' 테스트가 무관한 이유로 깨져 있었다.
+        """
+
         def _fake_verify(token, request, client_id):
-            return {"iss": "accounts.google.com", "email": email, "name": "구글 가입자"}
+            return {
+                "iss": "accounts.google.com",
+                "email": email,
+                "email_verified": email_verified,
+                "name": "구글 가입자",
+            }
 
         monkeypatch.setattr("google.oauth2.id_token.verify_oauth2_token", _fake_verify)
+
+    def test_response_flags_new_signup_vs_existing_login(self, client, monkeypatch):
+        """가입/로그인이 같은 엔드포인트라 서버가 구분해 줘야 한다 (2026-08-25).
+
+        프론트가 ``date_joined`` 10분 휴리스틱으로 추정하던 것을 대체한다 —
+        추정이 빗나가면 Meta 픽셀 CompleteRegistration 이 누락되거나 중복 발사된다.
+        """
+        email = f"google-{uuid.uuid4().hex[:12]}@test.com"
+        self._mock_google(monkeypatch, email)
+
+        first = client.post(GOOGLE_URL, {"token": "fake"}, format="json")
+        assert first.status_code == 200
+        assert first.data["is_new_user"] is True
+
+        again = client.post(GOOGLE_URL, {"token": "fake"}, format="json")
+        assert again.status_code == 200
+        # ★ 재로그인은 가입이 아니다 — True 로 새면 전환이 2배로 집계된다
+        assert again.data["is_new_user"] is False
+
+    def test_is_new_user_matches_attribution_capture(self, client, monkeypatch):
+        """``is_new_user`` 는 attribution 저장 조건과 **같은 분기**여야 한다.
+
+        둘이 어긋나면 "가입 전환은 쐈는데 귀속 행이 없는" 유저가 생겨 채널 성과가
+        영구히 어긋난다 (뷰의 ``if created:`` 한 곳이 둘 다를 관장한다).
+        """
+        email = f"google-{uuid.uuid4().hex[:12]}@test.com"
+        self._mock_google(monkeypatch, email)
+
+        res = client.post(
+            GOOGLE_URL,
+            {"token": "fake", "attribution": _attr()},
+            format="json",
+        )
+        assert res.data["is_new_user"] is True
+        assert SignupAttribution.objects.filter(user__email=email).count() == 1
+
+        res2 = client.post(GOOGLE_URL, {"token": "fake"}, format="json")
+        assert res2.data["is_new_user"] is False
+        assert SignupAttribution.objects.filter(user__email=email).count() == 1
 
     def test_new_google_user_captures_attribution(self, client, monkeypatch):
         email = f"google-{uuid.uuid4().hex[:12]}@test.com"

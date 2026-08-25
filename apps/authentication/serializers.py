@@ -154,6 +154,23 @@ class AuthResponseSerializer(serializers.Serializer):
     tokens = TokenSerializer()
 
 
+class GoogleAuthResponseSerializer(AuthResponseSerializer):
+    """Google 로그인 응답 — 가입/로그인이 **같은 엔드포인트**라 구분 플래그가 붙는다.
+
+    ``is_new_user`` 를 login/register 의 공용 응답(AuthResponseSerializer)에 넣지 않는
+    이유: 그 두 엔드포인트는 이 필드를 반환하지 않으므로 스키마에 넣으면 문서가 거짓이
+    된다 (register 는 항상 신규, login 은 항상 기존이라 애초에 필요도 없다).
+    """
+
+    is_new_user = serializers.BooleanField(
+        help_text=(
+            "이번 요청으로 계정이 새로 생성되었는가. "
+            "Meta 픽셀 CompleteRegistration 등 **가입 전환 이벤트는 반드시 이 값으로 분기**할 것 "
+            "— date_joined 로 추정하면 누락/중복 발사된다."
+        )
+    )
+
+
 class AccountDeleteSerializer(serializers.Serializer):
     """회원 탈퇴 요청 시리얼라이저. 비밀번호 확인 필수."""
 
