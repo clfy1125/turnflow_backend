@@ -142,6 +142,33 @@ REFERRER_CHANNEL_MAP = {
 # 자기 도메인 리퍼러(랜딩↔앱 내부 이동)는 유입 신호가 아니므로 빈 리퍼러 취급
 _OWN_DOMAINS_BASE = ("turnflow.link",)
 
+# ⭐ OAuth/인증 제공자 리다이렉트 도메인 — **유입 신호가 아니다** (2026-08-25).
+#
+# 웹 구글 로그인은 accounts.google.com 으로 전체 페이지를 떠났다가 /login 으로 돌아온다.
+# 그 순간 document.referrer 가 "https://accounts.google.com/" 이 되는데, 이 도메인은
+# REFERRER_CHANNEL_MAP 의 "google.com" 에 suffix 매칭되어 **search_organic(자연 검색)**
+# 으로 분류됐다. prod 실측: 가입 귀속 160건 중 105건이 이 경로였고, 대시보드의
+# "검색 유입 가입 77건" 중 실제 검색은 5건뿐이었다 (나머지는 전부 로그인 잔상).
+#
+# 로그인 왕복은 "어디서 왔는가"에 대해 아무것도 말해주지 않으므로 자기 도메인과 똑같이
+# 빈 리퍼러로 취급한다 → 신호 없음 = direct("출처 미상").
+#
+# ⚠️ 채널은 방문/가입 **저장 시점**에 확정되므로 이 목록 변경은 소급되지 않는다.
+#    과거 행 교정은 `manage.py fix_auth_referrer_channels` 를 쓸 것.
+# ⚠️ facebook.com 은 넣지 않는다 — FB 로그인을 쓰지 않고, 호스트만으로는 OAuth 왕복과
+#    정상적인 페이스북 유입을 구분할 수 없어 진짜 유입까지 버리게 된다.
+AUTH_REDIRECT_DOMAINS = frozenset(
+    {
+        "accounts.google.com",
+        "appleid.apple.com",
+        "nid.naver.com",
+        "kauth.kakao.com",
+        "accounts.kakao.com",
+        "login.microsoftonline.com",
+        "login.live.com",
+    }
+)
+
 
 def _own_domains() -> set[str]:
     """자기 도메인 집합 — 고정 도메인 + FRONTEND_URL 호스트 (설정 변경 대응 위해 호출 시 계산)."""
@@ -157,13 +184,20 @@ def _own_domains() -> set[str]:
 
 
 def _referrer_domain(referrer: str) -> str:
-    """리퍼러 URL → 도메인 (www./포트 제거). 자기 도메인/파싱 불가는 빈 문자열."""
+    """리퍼러 URL → 도메인 (www./포트 제거). 자기 도메인/인증 리다이렉트/파싱 불가는 빈 문자열.
+
+    ``AUTH_REDIRECT_DOMAINS`` 를 여기서 거르는 이유: 이 함수가 리퍼러→채널의 **유일한
+    입구**라 한 곳만 막으면 파생 경로 전체가 함께 막힌다. suffix 루프보다 앞에 두어야
+    accounts.google.com 이 google.com 에 잡히기 전에 탈락한다.
+    """
     if not referrer:
         return ""
     try:
         domain = urlparse(referrer).netloc.lower()
         domain = domain.split(":")[0].removeprefix("www.")
         if not domain:
+            return ""
+        if domain in AUTH_REDIRECT_DOMAINS:
             return ""
         for own in _own_domains():
             if domain == own or domain.endswith("." + own):
@@ -181,8 +215,8 @@ def derive_channel(utm_source: str, utm_medium: str, referrer: str) -> str:
       2. utm_source ∈ UTM_SOURCE_MAP → 매핑 채널
       3. utm_medium ∈ PAID_MEDIUMS (미매핑 source) → paid_other
       4. utm_source 가 비어있지 않음 → other_campaign
-      5. 리퍼러 도메인 suffix 매칭 (www. 제거, 자기 도메인은 빈 값 취급);
-         미매칭 외부 도메인 → other_referral
+      5. 리퍼러 도메인 suffix 매칭 (www. 제거, 자기 도메인 + **인증 리다이렉트 도메인**
+         (AUTH_REDIRECT_DOMAINS)은 빈 값 취급); 미매칭 외부 도메인 → other_referral
       6. 아무 신호 없음 → direct
     """
     # 한글 별칭 매칭은 NFC 표준형에서만 성립한다(NFD 로 온 "메타"는 다른 문자열) →

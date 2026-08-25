@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from apps.analytics.channels import (
+    AUTH_REDIRECT_DOMAINS,
     CH_BLOG,
     CH_DIRECT,
     CH_FB_ORGANIC,
@@ -113,6 +114,33 @@ class TestDeriveChannelReferrer:
     def test_lookalike_domain_not_false_positive(self):
         # "notgoogle.com" 이 google.com 으로 매칭되면 안 됨 (suffix 는 '.' 경계)
         assert derive_channel("", "", "https://notgoogle.com/") == CH_OTHER_REF
+
+
+class TestAuthRedirectReferrer:
+    """OAuth 왕복 리퍼러는 유입 신호가 아니다 (2026-08-25).
+
+    prod 사고: 웹 구글 로그인이 accounts.google.com 으로 전체 페이지를 떠났다가 /login 으로
+    돌아오면서 referrer 가 accounts.google.com 이 됐고, 이것이 google.com suffix 에 잡혀
+    **search_organic** 으로 분류됐다. 가입 귀속 160건 중 105건이 이 경로였다.
+    """
+
+    @pytest.mark.parametrize("domain", sorted(AUTH_REDIRECT_DOMAINS))
+    def test_every_auth_domain_is_direct(self, domain):
+        assert derive_channel("", "", f"https://{domain}/") == CH_DIRECT
+
+    def test_google_oauth_referrer_is_not_search(self):
+        # ★ 이 한 줄이 회귀 방지의 핵심 — 되돌리면 '검색' 줄이 다시 부풀어 오른다
+        assert derive_channel("", "", "https://accounts.google.com/") != CH_SEARCH
+        assert derive_channel("", "", "https://accounts.google.com/") == CH_DIRECT
+
+    def test_real_google_search_still_counts(self):
+        # 인증 도메인만 빼는 것이지 구글 검색 유입을 버리는 게 아니다
+        assert derive_channel("", "", "https://www.google.com/") == CH_SEARCH
+        assert derive_channel("", "", "https://google.co.kr/search?q=turnflow") == CH_SEARCH
+
+    def test_utm_survives_auth_referrer(self):
+        # 프론트 가드가 붙어 UTM 이 살아남은 뒤에도 채널은 UTM 이 이긴다
+        assert derive_channel("meta", "cpc", "https://accounts.google.com/") == CH_META_ADS
 
 
 class TestDeriveChannelFallback:

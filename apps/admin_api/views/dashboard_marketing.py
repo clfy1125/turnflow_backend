@@ -52,6 +52,7 @@ import logging
 import re
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
+from typing import NamedTuple
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
@@ -365,12 +366,45 @@ def _is_biolink(source: str, medium: str, referrer: str) -> bool:
     )
 
 
+class _LinkMatch(NamedTuple):
+    """저장 링크 조회 결과. ``found=False`` 와 ``pk=None`` 을 반드시 구분할 것.
+
+    found=False        → 저장된 적 없는 조합 (unsaved_utm)
+    found=True, pk=int → 그 링크 행
+    found=True, pk=None→ 저장은 됐지만 집계 제외된 링크 (MKT-12, excluded_link)
+    """
+
+    found: bool
+    pk: int | None
+
+
+class _LinkIndex(NamedTuple):
+    """저장 링크 매칭 인덱스 — 4-튜플 정확일치 + 캠페인 단위 와일드카드.
+
+    ``exact``    : {(source, medium, campaign, content): pk | None}
+    ``campaign`` : {(source, medium, campaign): pk | None} — **utm_content 를 비워 저장한
+                   링크만** 등재된다. 그 빈 값이 "콘텐츠 지정 안 함 = 전부"라는 뜻이다.
+    """
+
+    exact: dict
+    campaign: dict
+
+    def match(self, key: tuple) -> _LinkMatch:
+        """4-튜플 → _LinkMatch. 정확일치가 항상 이기고, 없을 때만 캠페인 와일드카드."""
+        if key in self.exact:
+            return _LinkMatch(True, self.exact[key])
+        campaign_key = key[:3]
+        if campaign_key in self.campaign:
+            return _LinkMatch(True, self.campaign[campaign_key])
+        return _LinkMatch(False, None)
+
+
 def _resolve_row_key(source, medium, campaign, content, referrer, channel, link_index) -> tuple:
     """유입 1건 → (row_key, source_key). source_key 는 other 행일 때만 non-null.
 
     판정 순서 (앞이 이김):
       1. 바이오링크 경유          → other / biolink
-      2. UTM 있음 + 저장 링크 일치 → 그 링크 행
+      2. UTM 있음 + 저장 링크 일치 → 그 링크 행 (4-튜플 정확일치 → 캠페인 와일드카드)
       2b. 그 링크가 집계 제외      → other / excluded_link  (MKT-12 — 행은 없애고 인원은 흡수)
       3. UTM 있음 + 미매칭        → other / unsaved_utm  ("링크를 저장 안 하고 쓰는 중" 신호)
       4. UTM 없음                → other / 저장된 파생 채널(리퍼러 추정)
@@ -385,21 +419,19 @@ def _resolve_row_key(source, medium, campaign, content, referrer, channel, link_
         return OTHER_ROW_KEY, SOURCE_BIOLINK
     key = _utm_key(source, medium, campaign, content)
     if any(key):
-        link_pk = link_index.get(key)
-        if link_pk is not None:
-            return str(link_pk), None
-        # MKT-12: 값이 None 이면서 키가 있는 경우 = **저장은 됐지만 집계 제외된 링크**.
-        # 없는 키(get→None)와 구분해야 하므로 `in` 으로 다시 본다.
-        if key in link_index:
+        hit = link_index.match(key)
+        if not hit.found:
+            return OTHER_ROW_KEY, SOURCE_UNSAVED_UTM
+        if hit.pk is None:
             return OTHER_ROW_KEY, SOURCE_EXCLUDED_LINK
-        return OTHER_ROW_KEY, SOURCE_UNSAVED_UTM
+        return str(hit.pk), None
     if not channel or channel == "unknown":
         return OTHER_ROW_KEY, SOURCE_DIRECT
     return OTHER_ROW_KEY, channel
 
 
-def _link_index(links) -> dict:
-    """[MarketingChannelLink] → {4-튜플: pk | None}. ``None`` = **집계 제외된 링크**(MKT-12).
+def _link_index(links) -> _LinkIndex:
+    """[MarketingChannelLink] → :class:`_LinkIndex` (4-튜플 정확일치 + 캠페인 와일드카드).
 
     키를 지우지 않고 None 을 넣는 이유: 지우면 그 유입이 '저장 안 된 링크(UTM)'로 흘러가
     라벨이 거짓이 되고 combos 의 "이 조합으로 링크 저장"이 중복 400 을 낸다. 키를 남겨
@@ -409,14 +441,30 @@ def _link_index(links) -> dict:
     저장 시 중복 조합은 시리얼라이저가 400 으로 막지만(serializers.marketing) 그 검증
     이전 데이터가 있을 수 있고, 활성 링크를 우선하지 않으면 **동일 조합의 다른 링크를
     제외했을 때 살아있는 링크의 행이 0 이 되는** 놀라운 동작이 된다.
+
+    ⭐ **캠페인 와일드카드 (2026-08-25)** — ``utm_content`` 를 비워 저장한 링크는 같은
+    (source, medium, campaign) 의 **모든 utm_content** 를 흡수한다.
+
+    광고 플랫폼은 소재(광고) 단위로 ``utm_content`` 를 자동으로 붙인다. prod 실측:
+    2026-08-25 부터 메타가 ``utm_content=120251297076190315`` 같은 광고 ID 를 붙이기
+    시작했고, 저장 링크는 content='' 라 4-튜플이 어긋나 **하루 94명이 전부 '저장 안 된
+    링크(UTM)'** 로 떨어졌다 — 링크 행은 27 에서 멈춘 채였다. 소재를 추가할 때마다
+    사람이 링크를 새로 저장해야 한다면 그 표는 구조적으로 항상 뒤처진다.
+
+    ⚠️ 정확일치가 **항상 먼저** 이긴다 — 소재별로 링크를 따로 저장한 경우 그 링크가
+       와일드카드에 먹히면 안 된다. 와일드카드는 정확일치가 없을 때의 폴백이다.
+    ⚠️ (source, medium, campaign) 이 **전부 비면 등재하지 않는다** — 전부 빈 링크가 임의의
+       UTM 을 빨아들이는 것을 막는다.
     """
-    index: dict = {}
+    exact: dict = {}
+    campaign: dict = {}
     for link in sorted(links, key=lambda x: (x.excluded_from_stats, x.created_at, x.pk)):
-        index.setdefault(
-            _utm_key(link.utm_source, link.utm_medium, link.utm_campaign, link.utm_content),
-            None if link.excluded_from_stats else link.pk,
-        )
-    return index
+        key = _utm_key(link.utm_source, link.utm_medium, link.utm_campaign, link.utm_content)
+        pk = None if link.excluded_from_stats else link.pk
+        exact.setdefault(key, pk)
+        if not key[3] and any(key[:3]):
+            campaign.setdefault(key[:3], pk)
+    return _LinkIndex(exact, campaign)
 
 
 def _source_label(key: str) -> str:
@@ -1613,7 +1661,7 @@ def _perf_payload(slot: dict, visits: int | None) -> dict:
     }
 
 
-def _visitors_by_bucket(visit_rows: list[tuple], link_index: dict) -> tuple[dict, dict]:
+def _visitors_by_bucket(visit_rows: list[tuple], link_index: _LinkIndex) -> tuple[dict, dict]:
     """방문 원본 행 → ({row_key: 방문자 집합}, {source_key: 방문자 집합}).
 
     합산이 아니라 **집합**이라 각 버킷의 고유 방문자 수가 정확하다. 대신 한 방문자가
@@ -1632,7 +1680,9 @@ def _visitors_by_bucket(visit_rows: list[tuple], link_index: dict) -> tuple[dict
     return by_row, by_source
 
 
-def _unsaved_utm_combos(visit_rows: list[tuple], link_index: dict, signups_by_combo: dict) -> tuple:
+def _unsaved_utm_combos(
+    visit_rows: list[tuple], link_index: _LinkIndex, signups_by_combo: dict
+) -> tuple:
     """'저장 안 된 링크(UTM)' 조합 목록 (MKT-5) — (combos, truncated).
 
     합계만 있으면 "저장 안 된 링크로 40명 들어왔다"에서 끝나고 할 수 있는 일이 없다.
