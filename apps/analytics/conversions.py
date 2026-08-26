@@ -102,12 +102,28 @@ def track_purchase(payment, request=None) -> None:
     """Purchase — ``event_id = str(payment.id)`` (PaymentHistory UUID).
 
     ⚠️ 프론트 픽셀이 쓰는 값과 같다 (배포본 확인: ``{eventID: e.id}``).
-    ⚠️ **월 갱신 결제에서는 부르지 않는다** (2026-08-26 제품 결정). 광고 최적화는 "이
-       광고가 유료 고객을 만들었나"를 보는 것이라 첫 결제가 신호이고, 갱신까지 보내면
-       같은 사람을 매달 다시 세어 ROAS 가 부풀려진다. 갱신 경로는 브라우저도 없어
-       IP/UA 가 비고 매칭 품질도 낮다.
+
+    ⭐ **사용자의 첫 유료 결제 1건만 발사한다** (2026-08-26 제품 결정). 광고 최적화는
+    "이 광고가 유료 고객을 만들었나"를 보는 것이라 첫 결제가 신호이고, 매달 갱신까지
+    보내면 같은 사람을 반복 계상해 ROAS 가 부풀려진다.
+
+    ⚠️⚠️ **"첫 결제"를 호출 지점으로 판별하면 틀린다.** 초판이 그 실수를 했다 —
+    ``charge_now``(즉시 과금) 경로에서만 부르고 갱신 태스크에서는 안 불렀는데, **체험으로
+    시작한 사용자의 첫 유료 결제는 체험 종료 후 '갱신' 주문으로 들어온다**(prod 실측:
+    user 54·70 은 init 주문이 없고 갱신 1건이 그들의 첫 결제였다). 그래서 가장 중요한
+    전환인 **체험→유료**가 서버에서 통째로 빠져 있었다.
+    → 판별은 ``PaymentHistory.is_initial_payment`` (= 그 사용자의 가장 이른 유료 결제)
+      **단일 소스**에 맡기고, 발사 지점은 첫 결제·갱신 양쪽에 둔다. 2회차 이후 갱신과
+      업그레이드 비례배분은 이 판정에서 자연히 걸러진다.
     """
     try:
+        if not payment.is_initial_payment:
+            logger.info(
+                "meta_capi Purchase 생략(첫 결제 아님): payment=%s user=%s",
+                payment.id,
+                payment.user_id,
+            )
+            return
         user = payment.user
         dispatch_meta_capi(
             event_name=EVENT_PURCHASE,

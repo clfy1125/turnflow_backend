@@ -713,6 +713,37 @@ class PaymentHistory(models.Model):
     def __str__(self):
         return f"{self.user.email} - {self.amount}원 ({self.status})"
 
+    @classmethod
+    def first_paid_id_for(cls, user_id):
+        """그 사용자의 **첫 유료 결제** pk (없으면 None) — 광고 전환 신호의 기준.
+
+        ⭐ "첫 결제"를 order_id 패턴(``-init-``)으로 판별하면 **틀린다** (2026-08-26 실측).
+        체험으로 시작한 사용자는 카드 등록 시 과금이 0원이고, 실제 첫 과금은 체험 종료 후
+        **갱신 주문**(``-YYYYMMDD-a0``)으로 들어온다. prod 실측에서 user 54·70 은 init 주문이
+        아예 없고 갱신 패턴 1건이 전부인데 그게 그들의 첫 유료 결제였다.
+
+        즉 판별 기준은 주문 종류가 아니라 **"이 사용자의 가장 이른 유료 결제인가"** 다.
+        업그레이드 비례배분·추가계정 과금은 이미 첫 결제가 있는 사용자에게만 생기므로
+        자연히 제외된다. 0원 결제(체험 중 추가계정)는 ``amount__gt=0`` 으로 제외된다.
+        """
+        return (
+            cls.objects.filter(user_id=user_id, status=PaymentStatus.PAID, amount__gt=0)
+            .order_by("paid_at", "created_at")
+            .values_list("id", flat=True)
+            .first()
+        )
+
+    @property
+    def is_initial_payment(self) -> bool:
+        """이 결제가 사용자의 첫 유료 결제인가 (Meta Purchase 발사 기준).
+
+        ⚠️ 목록 직렬화에서 행마다 호출하면 N+1 이다 — 시리얼라이저는
+        ``first_paid_id_for`` 를 사용자당 1회만 부르고 메모한다.
+        """
+        if self.status != PaymentStatus.PAID or (self.amount or 0) <= 0:
+            return False
+        return self.first_paid_id_for(self.user_id) == self.id
+
 
 # ──────────────────────────────────────────────
 # 결제 전 고지·동의 기록 (전자상거래법 §13②⑥)

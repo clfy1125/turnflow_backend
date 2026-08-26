@@ -306,6 +306,14 @@ class RetentionOfferApplyResponseSerializer(serializers.Serializer):
 class PaymentHistorySerializer(serializers.ModelSerializer):
     """결제 내역 조회용"""
 
+    is_initial_payment = serializers.SerializerMethodField(
+        help_text=(
+            "이 결제가 해당 회원의 **첫 유료 결제**인가. Meta 픽셀 Purchase 는 이 값이 "
+            "true 인 건만 발사해야 한다 — 갱신까지 쏘면 같은 고객을 매달 반복 계상해 "
+            "ROAS 가 부풀려진다. 서버 CAPI 도 같은 기준으로 보낸다."
+        )
+    )
+
     class Meta:
         model = None  # set below
         fields = [
@@ -320,9 +328,27 @@ class PaymentHistorySerializer(serializers.ModelSerializer):
             "card_number_masked",
             "failure_code",
             "failure_message",
+            "is_initial_payment",
             "paid_at",
             "created_at",
         ]
+
+    def get_is_initial_payment(self, obj) -> bool:
+        """첫 유료 결제 여부.
+
+        ⚠️ 주문번호 패턴(``-init-``)으로 판별하면 **틀린다** — 체험으로 시작한 회원의 첫
+        과금은 체험 종료 후 '갱신' 주문으로 들어온다 (PaymentHistory.first_paid_id_for
+        docstring 참고). 판정은 모델의 단일 소스에 맡긴다.
+
+        ⚠️ N+1 방지 — 사용자당 1회만 조회하고 컨텍스트에 메모한다. 목록 응답에서 행마다
+        쿼리하면 결제 20건에 20쿼리가 된다.
+        """
+        if obj.status != "paid" or (obj.amount or 0) <= 0:
+            return False
+        memo = self.context.setdefault("_first_paid_ids", {})
+        if obj.user_id not in memo:
+            memo[obj.user_id] = type(obj).first_paid_id_for(obj.user_id)
+        return memo[obj.user_id] == obj.id
 
 
 # ──────────────────────────────────────────────

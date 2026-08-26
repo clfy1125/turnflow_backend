@@ -188,4 +188,167 @@ d.is_new_user !== false && zr(d.user, {definite: d.is_new_user === true})
 
 ---
 
+---
+
+# 회신 반영 (2026-08-26 저녁) — 질문 2건 답변 + 백엔드 정정 1건
+
+회신 감사합니다. **§2 StartTrial 지적이 맞고 제가 틀렸습니다.** 그리고 그쪽 질문 덕분에
+서버에서 **더 큰 결함**을 찾았습니다.
+
+## A. 정정 — StartTrial 은 이미 발사 중입니다
+
+`index-CSK7HEJl.js` 만 grep 하고 *"호출부 0곳"* 이라고 단정한 것이 제 오류였습니다.
+지연 로드 청크를 확인했습니다:
+
+```bash
+$ grep -o 'TossBillingSuccessPage-[A-Za-z0-9_-]*\.js' index-CSK7HEJl.js
+TossBillingSuccessPage-BhDNdWsS.js
+
+$ grep -oE '.{80}scenario==="trial".{140}' TossBillingSuccessPage-BhDNdWsS.js
+… t.data.scenario==="trial" && Y((l=t.data.subscription)==null?void 0:l.id) …
+```
+
+확인했습니다. **§2 요청은 취소합니다 — 프론트 작업 없습니다.**
+
+> 교훈: Vite/Rollup SPA 는 라우트가 코드 스플리팅되므로 **엔트리 번들만 보면 안 됩니다.**
+> 앞으로 번들 검증할 때 청크까지 따라가겠습니다.
+
+## B. 답변 ① `track_trial_started` 발사 시점 → **프론트와 완전히 같은 지점**
+
+```python
+# apps/billing/toss_flows.py — confirm_billing
+if scenario == "trial":
+    ...
+    track_trial_started(sub, request=request)
+```
+
+`POST /billing/toss/confirm/` 의 `scenario == "trial"` 분기입니다. **프론트의
+`t.data.scenario==="trial"` 와 같은 조건, 같은 순간**입니다.
+
+| scenario | 브라우저 | 서버 | 결과 |
+|---|---|---|---|
+| `trial` | ✅ | ✅ | **정상 짝 — 중복은 event_id 로 제거** |
+| `attach_only` | ❌ | ❌ | **양쪽 다 안 쏨** — 커버리지 공백 없음 |
+| `charge_now` | ❌ | ❌ | Purchase 로 처리 |
+| `card_change` | ❌ | ❌ | — |
+
+**`attach_only` 는 서버도 안 쏩니다.** 우려하신 "서버만 집계" 상황은 발생하지 않습니다.
+
+**무카드 체험 비중도 재봤습니다** (prod 실측):
+
+| | |
+|---|---|
+| 체험 중 | **55명** |
+| 카드 있음 (= `trial` 경로, 양쪽 커버) | **52명 (95%)** |
+| 카드 없음 (어드민 수동 부여 — `confirm` 을 안 지남) | **3명 (5%)** |
+
+무카드 3명은 광고 전환이 아니라 어드민이 수동 부여한 계정이라 **양쪽 다 안 쏘는 게 맞습니다.**
+→ `attach_only` 추가 발사는 불필요합니다.
+
+## C. 답변 ② 갱신 결제 구분 → **필드 추가했습니다. 그리고 제 구현이 틀렸었습니다**
+
+### 먼저, 제가 틀린 부분
+
+§4-4 에서 *"첫 결제만 보낸다"* 고 썼는데, **구현은 `charge_now`(즉시 과금) 경로에서만
+발사**하고 있었습니다. 그런데 prod 를 보니:
+
+```
+★첫결제  user=54   renewal   14900원  tfsub-67142901e1-20260809-a0
+★첫결제  user=70   renewal   15900원  tfsub-039a09a58a-20260818-a0
+★첫결제  user=73   init       5900원  tfsub-cf9559d1bf-init-1ce20228
+  갱신    user=73   up         9994원  tfsub-cf9559d1bf-up-pro-0-20260819
+  갱신    user=73   renewal   14900원  tfsub-cf9559d1bf-20260819-a0
+```
+
+**체험으로 시작한 사용자의 첫 유료 결제는 `init` 이 아니라 '갱신' 주문입니다.**
+카드 등록 시엔 0원이고, 실제 첫 과금은 체험 종료 후 `process_due_renewals` 가 하기 때문입니다.
+
+→ 제 구현은 **가장 중요한 전환인 체험→유료를 통째로 놓치고 있었습니다.**
+(user 54·70 이 정확히 그 케이스 — 전체 유료 고객 5명 중 2명)
+
+### 고친 방식 — 호출 지점이 아니라 "첫 결제인가"로 판정
+
+```python
+# 발사 지점을 첫 결제·갱신 양쪽에 두고, 판정은 한 곳에 맡긴다
+def track_purchase(payment, request=None):
+    if not payment.is_initial_payment:   # ← 단일 소스
+        return
+    ...
+```
+
+`is_initial_payment` = **그 사용자의 가장 이른 유료 결제**(`status=paid` & `amount>0`).
+주문번호 패턴을 안 봅니다. 업그레이드 비례배분·2회차 이후 갱신·0원 결제는 자연히 걸러집니다.
+
+### 프론트가 쓸 필드 — `is_initial_payment`
+
+**요청하신 플래그를 결제 내역 응답에 추가했습니다.**
+
+```jsonc
+// GET /api/v1/billing/payments/ (결제 내역)
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "amount": 14900,
+  "status": "paid",
+  "is_initial_payment": true,     // ← 신규
+  "toss_order_id": "tfsub-...-20260809-a0",
+  "paid_at": "2026-08-09T14:01:00+09:00"
+}
+```
+
+```js
+// 프론트 권장 변경
+if (p.status === 'paid' && p.amount > 0 && p.is_initial_payment) {
+  fbq('track', 'Purchase', { value: p.amount, currency: 'KRW' }, { eventID: p.id });
+}
+```
+
+⚠️ **`toss_order_id` 에 `-init-` 이 있는지로 판별하지 마세요.** 위 표대로 체험자는 그 패턴이
+없습니다. 서버가 계산한 `is_initial_payment` 를 그대로 쓰시면 서버 CAPI 와 정확히 일치합니다.
+
+> N+1 걱정 없이 쓰셔도 됩니다 — 목록 응답에서 사용자당 1쿼리만 돌게 메모해 뒀습니다.
+
+### 부수 효과 — 갱신 Purchase 지연 발사 문제도 해결됩니다
+
+회신에 *"서버 cron 자동결제는 다음 접속 시 결제내역을 훑어 후행 발사"* 라고 하셨는데,
+그 경로엔 다른 함정도 있습니다: **Meta 는 `event_time` 이 7일보다 오래되면 거부**합니다.
+브라우저 픽셀은 발사 시각으로 스탬프되니 10일 전 갱신이 '오늘 전환'으로 잡힙니다.
+첫 결제만 쏘도록 맞추면 이 문제도 같이 사라집니다.
+
+## D. 나머지 회신 항목 — 전부 확인했습니다
+
+| 항목 | 결과 |
+|---|---|
+| §3-1 `CompleteRegistration` = `String(user.id)` | ✅ 서버 동일 |
+| §3-2 `Purchase` = `payment.id`(UUID) | ✅ 서버 동일 |
+| §3-3 `is_new_user` 폴백 유지 | ✅ 좋습니다 — 구 백엔드 대비가 맞습니다 |
+| §4-2 길이 상한 500/200/300 | ✅ 동일 |
+| `status==='paid' && amount>0` 만 발사 | ✅ 서버도 같은 조건 |
+| `value` 를 서버 `payment.amount` 로 | ✅ 정확합니다 (할인·그랜드파더링·비례배분 때문에 필수) |
+| `tf_fbpx_reg` / `tf_fbpx_paid_ids` 중복 방지 | 👍 서버는 `event_id` 로 Meta 가 합치므로 이중 방어가 됩니다 |
+
+## E. 현재 상태 — 켜져 있습니다 (검증 모드)
+
+말씀대로 프론트가 먼저 배포돼 있어 순서 위험이 없으므로 **켰습니다.**
+
+```
+META_CAPI_ENABLED         = True
+META_CAPI_DATASET_ID      = 1057766930068893
+META_CAPI_TEST_EVENT_CODE = TEST67446    ← [이벤트 테스트] 탭에만 감
+```
+
+3종 전송해서 Meta 응답 `events_received: 1`, `messages: []` 확인했습니다.
+Celery 끝단(0.39초)까지 성공했습니다.
+
+**대행사가 [이벤트 테스트] 탭에서 "서버(Server)" 출처를 확인하면 테스트 코드를 비우고
+실집계로 전환합니다.**
+
+## F. 프론트 남은 작업 — 1건
+
+- [ ] **Purchase 발사 조건에 `is_initial_payment` 추가** (§C)
+      → 갱신분이 브라우저만 집계돼 ROAS 가 부풀는 문제가 사라집니다
+
+그 외에는 없습니다. §2 는 취소, §3 은 전부 일치 확인했습니다.
+
+---
+
 관련 문서: [UTM_ATTRIBUTION_FIX.md](./UTM_ATTRIBUTION_FIX.md) (대시보드 귀속 — **별건, 이미 완료**)

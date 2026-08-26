@@ -437,6 +437,16 @@ def _finalize_renewal_success(sub_id, payment_id, toss_payment: dict) -> None:
         payment.amount,
         payment.toss_order_id,
     )
+    # Meta 전환 API — Purchase.
+    # ⭐ 갱신 경로에서도 부르는 이유: **체험으로 시작한 사용자의 첫 유료 결제가 바로 여기**다
+    #    (카드 등록 시엔 0원, 실제 첫 과금은 체험 종료 후 갱신 주문). 여기서 안 부르면
+    #    가장 중요한 전환인 체험→유료가 서버에서 통째로 빠진다(prod 실측으로 확인).
+    #    2회차 이후 갱신은 track_purchase 안의 is_initial_payment 판정이 걸러낸다 —
+    #    호출 지점으로 첫 결제를 가리려 하지 말 것.
+    # ⚠️ 갱신은 브라우저가 없어 IP/UA 가 비고, fbc/fbp 는 가입 시점에 저장해 둔 값을 쓴다.
+    from apps.analytics.conversions import track_purchase
+
+    track_purchase(payment)
     # 실제로 기간이 연장된 경우에만 1회 안내 (웹훅/reconcile 중복 호출 시 재발송 방지)
     if did_apply:
         payment_success_email(sub, payment)
