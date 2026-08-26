@@ -165,6 +165,33 @@ class SignupAttribution(models.Model):
     signup_kind = models.CharField(
         max_length=10, choices=SignupKind.choices, verbose_name="가입 경로"
     )
+    # ── Meta 광고 매칭 파라미터 (CAPI 전용, 2026-08-26) ──────────────────
+    # 프론트가 랜딩 진입 시점에 수집해 tf_attribution 에 함께 담아 보낸다. **광고 클릭
+    # 그 순간에만 얻을 수 있는 값**이라(특히 fbc) 가입 시점에 저장해 두지 않으면 영영 없다.
+    # 길이 상한은 프론트 tracking 모듈의 절단 규칙과 동일하게 맞춘다 —
+    # 한쪽만 짧으면 값이 잘려 Meta 매칭이 조용히 실패한다.
+    # ⚠️ 이 셋은 CAPI 로 보낼 때 **평문**이어야 한다 (해시하면 Meta 가 매칭에 못 쓴다).
+    fbclid = models.CharField(
+        max_length=500,
+        blank=True,
+        default="",
+        verbose_name="fbclid",
+        help_text="광고 클릭 시 URL 에 붙는 Meta 클릭 ID.",
+    )
+    fbp = models.CharField(
+        max_length=200,
+        blank=True,
+        default="",
+        verbose_name="_fbp 쿠키",
+        help_text="Meta 픽셀이 브라우저에 심는 식별자.",
+    )
+    fbc = models.CharField(
+        max_length=300,
+        blank=True,
+        default="",
+        verbose_name="_fbc 쿠키",
+        help_text="fbclid 로부터 픽셀이 만든 값 (fb.1.<ts>.<fbclid>).",
+    )
     created_at = models.DateTimeField(auto_now_add=True, db_index=True, verbose_name="가입 일시")
 
     class Meta:

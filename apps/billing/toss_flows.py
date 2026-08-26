@@ -633,8 +633,12 @@ def confirm_billing(
     plan_name: str | None = None,
     referral_code: str | None = None,
     extra_ig_accounts: int = 0,
+    request=None,
 ) -> dict:
     """빌링키 발급/부착 + 시나리오 실행. 뷰와 dev 헬퍼가 공유.
+
+    ``request`` 는 **선택**이며 Meta 전환 API 의 IP/UA 매칭에만 쓴다(없어도 전송은 된다).
+    원본 IP 는 DB 에 저장하지 않고 전송 인자로만 흘려보낸다 — analytics.conversions 참고.
 
     Returns: {subscription, payment, first_charge_at, detail, scenario}
     Raises: BillingFlowError (하위: ChargeDeclinedError, ChargePendingError)
@@ -805,6 +809,10 @@ def confirm_billing(
             sub.current_period_end.isoformat(),
             referral.code if referral else "-",
         )
+        # Meta 전환 API — StartTrial. 실패해도 체험은 이미 시작됐다(예외를 안 던진다).
+        from apps.analytics.conversions import track_trial_started
+
+        track_trial_started(sub, request=request)
         return {
             "subscription": sub,
             "payment": None,
@@ -885,6 +893,12 @@ def confirm_billing(
 
     sub.refresh_from_db()
     logger.info("첫 결제 완료: user=%s plan=%s amount=%d", user.email, new_plan.name, amount)
+    # Meta 전환 API — Purchase. **첫 결제 경로에서만** 부른다.
+    # 월 갱신(tasks.process_due_renewals)에서는 의도적으로 부르지 않는다 — 같은 사람을
+    # 매달 다시 세면 ROAS 가 부풀려진다 (analytics/conversions.track_purchase docstring).
+    from apps.analytics.conversions import track_purchase
+
+    track_purchase(payment, request=request)
     # 첫 결제 완료 안내 메일 (best-effort)
     try:
         from .tasks import payment_success_email

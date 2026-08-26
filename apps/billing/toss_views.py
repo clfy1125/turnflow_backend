@@ -324,6 +324,8 @@ if (res.status === 200) {
                 plan_name=data.get("plan_name"),
                 referral_code=data.get("referral_code") or None,
                 extra_ig_accounts=data.get("extra_ig_accounts") or 0,
+                # Meta 전환 API 의 IP/UA 매칭용 (저장하지 않고 전송 인자로만 쓴다)
+                request=request,
             )
         except BillingFlowError as e:
             return _flow_error_response(e)
@@ -521,6 +523,7 @@ class TossDevIssueView(APIView):
                 plan_name=data.get("plan_name"),
                 referral_code=data.get("referral_code") or None,
                 extra_ig_accounts=data.get("extra_ig_accounts") or 0,
+                request=request,
             )
         except BillingFlowError as e:
             return _flow_error_response(e)

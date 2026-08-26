@@ -56,6 +56,11 @@ def capture_signup_attribution(user, payload, signup_kind: str) -> None:
         utm_content = _utm("utm_content")
         referrer = _s("referrer", 500)
         landing_path = _s("landing_path", 300)
+        # Meta 광고 매칭 파라미터 — 광고 클릭 순간에만 얻을 수 있어 여기서 안 받으면 영영 없다.
+        # UTM 과 달리 **정규화하지 않는다**: Meta 가 준 값을 글자 그대로 되돌려줘야 매칭된다.
+        fbclid = _s("fbclid", 500)
+        fbp = _s("fbp", 200)
+        fbc = _s("fbc", 300)
 
         # 페이로드가 있으면 방문 기록과 동일한 derive_channel 로 파생, 없으면 unknown
         channel = derive_channel(utm_source, utm_medium, referrer) if data else CH_UNKNOWN
@@ -72,6 +77,9 @@ def capture_signup_attribution(user, payload, signup_kind: str) -> None:
                 "landing_path": landing_path,
                 "channel": channel,
                 "signup_kind": signup_kind,
+                "fbclid": fbclid,
+                "fbp": fbp,
+                "fbc": fbc,
             },
         )
     except Exception:

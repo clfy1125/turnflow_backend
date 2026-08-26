@@ -82,6 +82,12 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
         from apps.analytics.attribution import capture_signup_attribution
 
         capture_signup_attribution(user, attribution, signup_kind="email")
+
+        # Meta 전환 API — attribution **저장 뒤에** 불러야 fbc/fbp 를 함께 실어 보낸다.
+        # 순서를 바꾸면 매칭 파라미터가 빈 채로 나간다(전송은 되지만 매칭률이 떨어진다).
+        from apps.analytics.conversions import track_signup
+
+        track_signup(user, request=self.context.get("request"))
         return user
 
 

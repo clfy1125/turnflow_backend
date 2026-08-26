@@ -1120,6 +1120,25 @@ TRACK_VISIT_MAX_WRITES_PER_VISITOR_HOUR = config(
 )
 
 # ─────────────────────────────────────────────────────────────
+# Meta 전환 API (CAPI) — apps.analytics.meta_capi
+# ─────────────────────────────────────────────────────────────
+# 서버에서 Meta 로 전환 이벤트를 직접 보낸다. 브라우저 픽셀이 광고차단·iOS·인앱브라우저
+# 탈출로 끊길 때의 보완재다. **우리 대시보드 숫자와는 무관**하고 Meta 최적화 전용.
+#
+# ⚠️ 기본 False — **토큰 없이는 어차피 no-op** 이지만(meta_capi.is_enabled), 플래그를
+#    따로 둬서 토큰이 들어간 뒤에도 켜는 시점을 사람이 정하게 한다. 프론트의 event_id
+#    배포보다 서버가 먼저 켜지면 그 기간 전환이 **2배로 집계**된다.
+META_CAPI_ENABLED = config("META_CAPI_ENABLED", default=False, cast=bool)
+META_CAPI_DATASET_ID = config("META_CAPI_DATASET_ID", default="")
+# ⚠️ 절대 코드/레포에 넣지 말 것. 로그에도 남기지 않는다(요청 URL 아닌 본문으로 전송).
+META_CAPI_ACCESS_TOKEN = config("META_CAPI_ACCESS_TOKEN", default="")
+META_CAPI_API_VERSION = config("META_CAPI_API_VERSION", default="v23.0")
+META_CAPI_TIMEOUT = config("META_CAPI_TIMEOUT", default=10.0, cast=float)
+# 값이 있으면 모든 이벤트가 [이벤트 테스트] 탭으로만 가고 **실집계에는 안 들어간다**.
+# 검증이 끝나면 반드시 비울 것 — 안 비우면 실제 전환이 하나도 집계되지 않는다.
+META_CAPI_TEST_EVENT_CODE = config("META_CAPI_TEST_EVENT_CODE", default="")
+
+# ─────────────────────────────────────────────────────────────
 # 인스타 성장 리포트 (apps.insta_reports — 프로 전용, IG 계정당 월 1회)
 # ─────────────────────────────────────────────────────────────
 # 리포트 1건 실비 $0.4~0.6 · 소요 13~18분. 구성 요소:

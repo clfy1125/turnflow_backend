@@ -1121,6 +1121,13 @@ curl -X POST http://localhost:8000/api/v1/auth/google/ \\
             capture_signup_attribution(
                 user, serializer.validated_data.get("attribution"), signup_kind="google"
             )
+
+            # Meta 전환 API — attribution **저장 뒤에** 불러야 fbc/fbp 를 함께 실어 보낸다.
+            # ⚠️ `if created:` 안에 두는 것이 핵심이다 — 밖으로 빼면 재로그인마다
+            #    CompleteRegistration 이 발사돼 전환이 부풀려진다(is_new_user 와 같은 분기).
+            from apps.analytics.conversions import track_signup
+
+            track_signup(user, request=request)
         else:
             updates = []
             if name and not user.full_name:
