@@ -18,7 +18,8 @@ from datetime import datetime, timedelta
 from celery import shared_task
 from django.conf import settings
 from django.db import IntegrityError, transaction
-from django.db.models import Q
+from django.db.models import F, Q, Value
+from django.db.models.functions import Greatest
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
@@ -712,7 +713,14 @@ def _confirm_delivered_via_conv(log, campaign, tag: str) -> dict:
     사설답장(댓글당 1회·비멱등)의 500-but-delivered / 2534023("이미 답글") 오탐을 '도착'으로
     승격하는 단일 지점 — 재시도 전 재확인 게이트와 except 블록의 recent=True 처리가 공유한다.
     (성공 ack 유실로 message_id 를 못 받았어도, 실제 도착이 확인되면 도착으로 집계한다.)
+
+    ⚠️ 이미 도착으로 확정된 로그면 **아무것도 하지 않는다.** 뒤늦은 증거로 먼저 승격된
+       (:func:`promote_late_proof_delivered`) 로그에 이 경로가 다시 들어오면
+       ``mark_accepted`` 가 status 를 ACCEPTED 로 되돌리고 ``increment_sent`` 가 같은 발송을
+       두 번 세기 때문이다.
     """
+    if log.is_delivered():
+        return {"status": "delivered", "via": log.verified_via or "", "already": True}
     log.mark_accepted(message_id="", api_response={"verify_via": tag, "recent": True})
     if log.parent_log_id is None:
         campaign.increment_sent()
@@ -723,6 +731,95 @@ def _confirm_delivered_via_conv(log, campaign, tag: str) -> dict:
     #   빠져 있어서 "DM 은 갔는데 게시물에 대댓글이 없는" 상태가 만들어졌다.
     queued_reply = _maybe_enqueue_public_reply(log, campaign)
     return {"status": "delivered", "via": f"{tag}_conv_api", "public_reply_queued": queued_reply}
+
+
+# ===== 뒤늦은 도착 증거 승격 (성공 ack 유실 구제) =====
+#
+# 사설답장(첫 DM)은 '댓글당 1회'라 비멱등이다. 1차 POST 가 **실제로 도착했는데** Meta 가
+# 500/타임아웃을 반환하면(성공 ack 유실) message_id 를 못 받고, 재시도는 2534023("이미 답글")
+# 을 받아 도착한 DM 이 '도착 미확인'으로 남는다. 재시도 직전 Conversations 재확인 게이트가
+# 이걸 잡게 되어 있지만, 백오프가 짧으면 인덱싱 전이라 not-found 가 돌아온다(prod 실측:
+# 2026-08-10~08-28 6건 재발). 그 뒤에는 **자동으로 다시 확인해 주는 경로가 없었다** —
+# verify_dm_delivery 는 `ACCEPTED + message_id` 만 보고, 이 건들은 정의상 message_id 가 없다.
+#
+# 그래서 "나중에 도착 증거가 오면 그때 승격한다"를 두 곳에 붙인다:
+#   1) echo 웹훅 — Meta 가 실제 배달된 메시지의 is_echo 를 몇 초 안에 보낸다(prod 실측 12초).
+#      mid 로도 ACCEPTED 로도 매칭되지 않던 그 echo 를 여기서 쓴다.
+#   2) 팔로우게이트 버튼 탭 — 탭할 버튼이 그 DM 안에 있으므로 탭 자체가 도착의 증거다.
+#
+# 승격은 **실패/대기 → 도착 한 방향뿐**이라 도착을 실패로 되돌리는 일은 없다.
+
+# 승격 대상 상태. 공통 조건은 "POST 는 했는데 성공 ack(message_id)를 못 받았다" 다.
+#   QUEUED / RATE_LIMITED : 재시도 대기 중 (아직 종결 전) — 승격하면 예약된 재시도가
+#                           send_dm_task 진입 가드(QUEUED/SUBMITTING 만 통과)에 걸려
+#                           **재POST 자체가 사라진다** = 2534023 을 애초에 만들지 않는다.
+#   FAILED_NO_TRACE       : 이미 '도착 미확인'으로 종결됨.
+# ⚠️ SUBMITTING 은 **의도적으로 제외한다.** POST 가 in-flight 인 동안 승격하면 그 응답 처리
+#    (mark_accepted / _confirm_delivered_via_conv)가 status 를 ACCEPTED 로 되돌리고
+#    total_sent 를 두 번 센다. 그 창은 몇 초뿐이고 reconcile_stuck_submitting 이 담당한다.
+LATE_PROOF_PROMOTABLE_STATUSES = (
+    SentDMLog.Status.QUEUED,
+    SentDMLog.Status.RATE_LIMITED,
+    SentDMLog.Status.FAILED_NO_TRACE,
+)
+
+
+def promote_late_proof_delivered(
+    log_id, *, path: str, reason: str, via: str, mid: str = ""
+) -> bool:
+    """뒤늦게 도착이 증명된 '증거 없는 발송'을 도착으로 승격 (실패/대기 → 도착 한 방향).
+
+    카운터 보정이 상태에 따라 다르다 — 여기가 그 분기의 단일 지점이다:
+      - FAILED_NO_TRACE 였으면 종결 시 ``increment_unconfirmed`` 가 이미 올라갔으므로
+        ``total_unconfirmed -= 1`` 을 함께 내린다(``backfill_no_trace_delivered`` 와 같은 산술).
+      - QUEUED/RATE_LIMITED 는 아직 아무 카운터도 안 올라갔으므로 내리지 않는다.
+        (그냥 내리면 미확인 카운터가 음수로 흐른다 — Greatest 로 바닥도 막는다.)
+    child(reward·재안내) 로그는 애초에 캠페인 카운트에서 제외되므로 건드리지 않는다.
+
+    Returns: 승격했으면 True. 대상이 아니거나 이미 다른 경로가 정리했으면 False.
+    """
+    with transaction.atomic():
+        log = (
+            SentDMLog.objects.select_for_update()
+            .select_related("campaign")
+            .filter(pk=log_id)
+            .first()
+        )
+        if log is None:
+            return False
+        # message_id 가 있으면 정상 ack 를 받은 발송이다 — 이 구제 경로의 대상이 아니다
+        # (mid 기반 echo/verify 매칭이 담당한다).
+        if log.meta_message_id or log.status not in LATE_PROOF_PROMOTABLE_STATUSES:
+            return False
+
+        campaign = log.campaign
+        was_unconfirmed = log.status == SentDMLog.Status.FAILED_NO_TRACE
+        log.append_verification_log(
+            {"path": path, "result": "late_proof_delivered", "reason": reason, "from": log.status}
+        )
+        # 예약을 비워 requeue/reconcile 스위퍼가 이 행을 다시 집지 않게 한다.
+        log.next_retry_at = None
+        log.save(update_fields=["next_retry_at"])
+        log.mark_delivered(via=via, mid=mid)
+
+        if log.parent_log_id is None:
+            updates = {"total_sent": F("total_sent") + 1, "updated_at": timezone.now()}
+            if was_unconfirmed:
+                updates["total_unconfirmed"] = Greatest(F("total_unconfirmed") - 1, Value(0))
+            AutoDMCampaign.objects.filter(pk=log.campaign_id).update(**updates)
+
+    # 트랜잭션 밖에서 — 커밋 전에 태스크가 발사되면 워커가 옛 상태를 본다.
+    _flip_recovery_on_success(log, campaign)
+    # 도착이 확정됐으면 정상 성공과 동일하게 공개 답글도 게시한다(게시물의 '사회적 증거').
+    # 조건·상한·중복 방어는 _maybe_enqueue_public_reply / post_public_reply 가 그대로 판정한다.
+    _maybe_enqueue_public_reply(log, campaign)
+    logger.info(
+        "late-proof delivered: log=%s path=%s from=%s",
+        log.id,
+        path,
+        "failed_no_trace" if was_unconfirmed else "waiting",
+    )
+    return True
 
 
 # ===== 진입점 =====
@@ -4622,6 +4719,22 @@ def process_follow_gate_postback(
             "recipient_account_id": recipient_account_id,
         }
 
+    # ★ 이 탭 자체가 '오프닝 DM 이 도착했다'는 증거다 — 탭할 버튼이 그 DM 안에 있으므로.
+    #   성공 ack 유실(500-but-delivered)로 message_id 없이 실패·대기로 남은 오프닝을 여기서
+    #   도착으로 승격한다. Graph 호출 0회이고, 아래 게이트 처리보다 **앞에** 두는 이유는
+    #   이미 PASSED 인 재탭(early return)에서도 정정이 일어나야 하기 때문이다.
+    #   (verified_via 는 backfill_no_trace_delivered 의 tier1 과 같은 관례로 conv_api 를 쓴다 —
+    #    실제 근거는 verification_log 의 path=gate_tap 에 남는다. 새 choice 를 만들면
+    #    마이그레이션이 필요한데 판정 품질에는 아무 차이가 없다.)
+    if not opening.meta_message_id and opening.status in LATE_PROOF_PROMOTABLE_STATUSES:
+        promote_late_proof_delivered(
+            opening.pk,
+            path="gate_tap",
+            reason="follow-gate button tap proves the opening DM was received",
+            via=SentDMLog.VerifiedVia.CONV_API,
+        )
+        opening.refresh_from_db()
+
     # 이미 게이트 통과한 opening 이면 추가 처리 안 함.
     # ★ 단, '통과했는데 reward 가 창 미개방으로 실패해 있는' 경우는 예외 — 지금 이 탭이
     #   창을 열어주므로 되살려 재발송한다(2026-08-07). 통과 여부만 보고 돌려보내던 탓에
@@ -5040,7 +5153,64 @@ def _apply_echo_delivered(*, mid: str, page_ig_user_id: str, recipient_user_id: 
             log.append_verification_log({"path": "echo", "result": "matched", "mid": mid})
             log.mark_delivered(via=SentDMLog.VerifiedVia.ECHO, mid=mid)
             matched += 1
-    return matched
+    if matched:
+        return matched
+    # 어느 mid 에도, 어느 ACCEPTED 에도 안 붙는 echo = **우리가 보냈는데 message_id 를 못 받은
+    # 발송**의 증거다(성공 ack 유실). 그 발송을 찾아 도착으로 승격한다.
+    return _rescue_echo_without_mid(
+        mid=mid, page_ig_user_id=page_ig_user_id, recipient_user_id=recipient_user_id
+    )
+
+
+# echo 는 발송 몇 초 안에 온다(prod 실측 12초) — 창을 넓힐 이유가 없다. 넓히면 "사장님이
+# 인스타 앱에서 같은 사람에게 직접 보낸 DM"의 echo 가 우리 실패 로그에 붙을 위험만 커진다.
+ECHO_LATE_PROOF_WINDOW = timedelta(minutes=15)
+
+
+def _rescue_echo_without_mid(*, mid: str, page_ig_user_id: str, recipient_user_id: str) -> int:
+    """mid·ACCEPTED 어느 쪽으로도 매칭되지 않은 echo → 성공 ack 유실 발송을 도착 승격.
+
+    후보를 좁히는 조건 (하나라도 빠지면 안 보낸 DM 을 '보냈다'고 표시할 수 있다):
+      - 같은 IG 계정 · 같은 수신자
+      - ``meta_message_id`` 공란 (ack 를 못 받은 발송만)
+      - ``submitted_at`` 이 있고 최근 :data:`ECHO_LATE_PROOF_WINDOW` 안 — **POST 를 실제로
+        한 적이 있다**는 증거. 이게 없으면 아직 큐에만 있는(=미발송) 행이 딸려 들어와,
+        예약된 재시도가 진입 가드에 걸려 **영구 미발송**이 된다.
+      - ``retry_count > 0`` — 이미 결론이 안 난 시도가 한 번 있었다는 뜻(`_defer_or_fail` 이
+        증가시킨다). 첫 POST 가 아직 진행 중인 행을 배제하는 두 번째 자물쇠다.
+      - 상태가 :data:`LATE_PROOF_PROMOTABLE_STATUSES`
+    가장 최근 시도 1건만 승격한다(echo 1건 = 발송 1건).
+
+    남는 오차: 사장님이 인스타 앱에서 **같은 수신자에게 15분 안에 직접 DM** 을 보내면 그
+    echo 가 이 후보에 붙을 수 있다. 창을 짧게 잡아 노출을 줄였고, 기존 ACCEPTED 폴백도 같은
+    성질의 근사를 이미 쓰고 있다(무손실 우선 = 도착을 놓치는 쪽보다 낫다).
+    """
+    if not (recipient_user_id and page_ig_user_id):
+        return 0
+    candidate_id = (
+        SentDMLog.objects.filter(
+            recipient_user_id=recipient_user_id,
+            campaign__ig_connection__external_account_id=page_ig_user_id,
+            status__in=LATE_PROOF_PROMOTABLE_STATUSES,
+            meta_message_id="",
+            submitted_at__isnull=False,
+            submitted_at__gte=timezone.now() - ECHO_LATE_PROOF_WINDOW,
+            retry_count__gt=0,
+        )
+        .order_by("-submitted_at")
+        .values_list("pk", flat=True)
+        .first()
+    )
+    if candidate_id is None:
+        return 0
+    promoted = promote_late_proof_delivered(
+        candidate_id,
+        path="echo_no_mid",
+        reason=f"echo webhook for a send whose success ack was lost (mid={mid})",
+        via=SentDMLog.VerifiedVia.ECHO,
+        mid=mid,
+    )
+    return 1 if promoted else 0
 
 
 def _apply_read(*, mid: str) -> int:
