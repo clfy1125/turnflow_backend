@@ -126,6 +126,7 @@ class IGAccountConnectionSerializer(serializers.ModelSerializer):
             "is_active",
             "last_verified_at",
             "error_message",
+            "reconnect_reason",
             "is_expired",
             "created_at",
             "updated_at",
@@ -144,6 +145,7 @@ class IGAccountConnectionSerializer(serializers.ModelSerializer):
             "is_active",
             "last_verified_at",
             "error_message",
+            "reconnect_reason",
             "created_at",
             "updated_at",
         ]

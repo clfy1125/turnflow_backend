@@ -185,3 +185,45 @@ if (body.success) applyHealth(body.data);  // 재구독 직후의 최신 헬스�
 
 - 상대 계정 이메일은 **마스킹**되어 `message` 안에만 담긴다(별도 구조화 필드 없음).
 - 전용 모달로 안내 — **업그레이드/구매 CTA 아님**. "기존 워크스페이스에서 연결 해제 후 다시 시도"만.
+
+---
+
+## 부록 C. `reconnect_reason` — 토큰 사망 자동 감지 (2026-08-31, 마이그 integrations0053)
+
+### 왜 생겼나
+
+토큰이 죽어도(사용자 비밀번호 변경·Meta 보안 세션 초기화·IG 계정 체크포인트) 우리 DB 는
+`status=active` 로 남아 있었다. 사용자 화면엔 **"연결됨"으로 보이는데 실제로는 죽은 연결**이
+무기한 지속됐고, 서버는 매시간 같은 계정을 다시 발견해 운영 알림만 반복 발사했다
+(2026-08-31 prod 실측 6계정, 일주일 이상).
+
+이제 주기 점검이 **연속 3회**(설정 `IG_TOKEN_DEAD_STRIKES`, 1시간 주기 → 최소 3시간) Meta 로부터
+"이 토큰 죽었다"(OAuth code 190 등)를 명시적으로 받으면 `status=error` 로 확정한다.
+중간에 한 번이라도 살아나면 카운터는 0 으로 초기화되고, 네트워크·5xx·판정불가는 세지 않는다.
+
+### 프론트가 쓸 값 — 연동 목록/상세 응답에 추가된 필드
+
+```json
+{
+  "id": "uuid",
+  "username": "myshop",
+  "status": "error",
+  "reconnect_reason": "token_invalidated",
+  "error_message": "token dead confirmed (token_invalidated, code=190, ...)"
+}
+```
+
+| `reconnect_reason` | 뜻 | 사용자에게 안내할 것 |
+|---|---|---|
+| `token_invalidated` | 비밀번호 변경 / Meta 보안 세션 초기화 | **재연동**하면 바로 복구된다 |
+| `account_checkpoint` | 인스타그램이 계정에 본인확인을 걸었다 | 먼저 instagram.com 로그인 후 지시 이행 → 그다음 재연동. **재연동만 안내하면 무한 실패** |
+| `app_removed` | 사용자가 IG 설정에서 앱 권한을 회수했다 | 재연동 |
+| `reconnect_required` | 그 외 | 재연동 |
+| `""` (빈 값) | 정상 | 아무것도 띄우지 않음 |
+
+- 팝업 조건은 **`status === "error"`** + `reconnect_reason` 으로 문구 분기.
+- ⚠️ **`error_message` 를 화면에 노출하지 말 것** — Meta 영문 원문 + 내부 진단 문자열이다.
+  사용자 문구는 `reconnect_reason` 으로 프론트가 만든다.
+- 재연동에 성공하면 서버가 `status=active` · `reconnect_reason=""` 로 되돌린다(스트라이크도 초기화).
+- 이 연동은 **플랜 허용량을 차지하지 않는다**(허용량은 `status=active AND is_active=True` 만
+  센다) → 무료 플랜(1계정)도 재연동할 칸이 비어 있다. 업셀 CTA 를 띄우지 말 것.

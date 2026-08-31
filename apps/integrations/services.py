@@ -255,10 +255,17 @@ class InstagramOAuthService:
         """라이브 GET /me 로 액세스 토큰 생사를 판정한다 (verify-before-brick 과 동일 기준).
 
         Returns:
-            {"valid": True|False|None, "error_code": int|None}
+            {"valid": True|False|None, "error_code": int|None, "error_message": str}
             - True : /me 2xx (살아있음)
             - False: /me 4xx + OAuth 사망 에러코드 (진짜 죽음)
             - None : 네트워크/타임아웃/5xx/애매 (판정 불가 — 보수적으로 살아있다 취급 X, 미확인)
+
+        ``error_message`` 는 Meta 응답 본문의 ``error.message`` 원문(영문)이다. 사망 사유를
+        갈라야 하는 호출부(:mod:`apps.integrations.token_health`)가 쓴다 — Meta 는 code 190
+        하나로 "비밀번호 변경/보안 세션 초기화" 와 "계정 체크포인트" 를 모두 표현하므로
+        코드만으론 사용자에게 무슨 안내를 할지 정할 수 없다. 본문에는 토큰이 실려오지
+        않지만 방어적으로 :func:`scrub_secrets` 를 통과시킨다.
+        ⚠️ 이 문장을 **사용자 화면에 그대로 노출하지 말 것** (영문 원문).
         """
         try:
             resp = get_http_session().get(
@@ -267,21 +274,24 @@ class InstagramOAuthService:
                 timeout=10,
             )
         except requests.RequestException:
-            return {"valid": None, "error_code": None}
+            return {"valid": None, "error_code": None, "error_message": ""}
 
         if resp.ok:
-            return {"valid": True, "error_code": None}
+            return {"valid": True, "error_code": None, "error_message": ""}
 
         code = None
+        detail = ""
         if resp.status_code in (400, 401, 403):
             try:
-                code = ((resp.json() or {}).get("error", {}) or {}).get("code")
+                err = (resp.json() or {}).get("error", {}) or {}
             except ValueError:
-                code = None
+                err = {}
+            code = err.get("code")
+            detail = scrub_secrets(err.get("message") or "")
             if code in cls.OAUTH_DEAD_ERROR_CODES:
-                return {"valid": False, "error_code": code}
+                return {"valid": False, "error_code": code, "error_message": detail}
         # 그 외 4xx/5xx/애매 → 판정 불가
-        return {"valid": None, "error_code": code}
+        return {"valid": None, "error_code": code, "error_message": detail}
 
     @classmethod
     def subscribe_to_webhooks(

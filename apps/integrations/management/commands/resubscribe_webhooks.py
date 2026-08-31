@@ -29,6 +29,8 @@ class Command(BaseCommand):
             self.style.SUCCESS(
                 f"checked={res['checked']} ok={res['ok']} "
                 f"resubscribed={res['resubscribed']} failed={res['failed']} "
+                f"token_dead_confirmed={res['token_dead_confirmed']} "
+                f"token_dead_pending={res['token_dead_pending']} "
                 f"skipped_expired={res['skipped_expired']}"
             )
         )

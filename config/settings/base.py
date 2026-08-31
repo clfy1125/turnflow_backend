@@ -1181,6 +1181,20 @@ INSTA_REPORT_FAKE_DELAY_SECONDS = config("INSTA_REPORT_FAKE_DELAY_SECONDS", defa
 # Instagram comments 웹훅이 유실되면 트리거 댓글이 누락되므로, 시간당 댓글 edge 를 재조회해
 # 누락 DM 을 보정한다. 본문은 저장 안 하고 comment_id 최소 장부(SeenComment)만 TTL 보관.
 # 발송량은 기존 rate_governor 가 throttle 하므로 폴링 측 추가 제한 불필요.
+# ===== IG 토큰 사망 확정 (apps.integrations.token_health) =====
+# 주기 점검이 "Meta 가 OAuth 사망 코드(190 등)를 **명시적으로** 줬다" 를 연속 몇 번 확인하면
+# status=error 로 확정할지. 웹훅 점검이 1시간 주기이므로 3 = 최소 3시간 연속 사망.
+# 중간에 한 번이라도 살아나면 0 으로 초기화되고, 애매한 실패(네트워크·5xx)는 세지 않는다.
+# 1 로 내리면 즉시 확정(권장하지 않음 — Meta 순간 장애로 남의 연결을 죽인다).
+IG_TOKEN_DEAD_STRIKES = config("IG_TOKEN_DEAD_STRIKES", default=3, cast=int)
+
+# 웹훅 점검에서 '원인 미확정 실패'(토큰은 살아있는데 호출 실패 / 판정 불가)가 점검 대상의
+# 이 비율 이상일 때만 Telegram 을 발사한다 — Meta 장애/우리 장애 신호로만 쓰기 위한 임계.
+# 죽은 토큰은 이 버킷에 들어가지 않으므로(token_dead_* 로 분리) 상시 스팸이 되지 않는다.
+WEBHOOK_CHECK_FAILURE_ALERT_RATIO = config(
+    "WEBHOOK_CHECK_FAILURE_ALERT_RATIO", default=0.1, cast=float
+)
+
 MISSED_COMMENT_POLL_ENABLED = config("MISSED_COMMENT_POLL_ENABLED", default=True, cast=bool)
 MISSED_COMMENT_LEDGER_TTL_DAYS = config("MISSED_COMMENT_LEDGER_TTL_DAYS", default=10, cast=int)
 PRIVATE_REPLY_WINDOW_DAYS = config("PRIVATE_REPLY_WINDOW_DAYS", default=7, cast=int)

@@ -73,14 +73,27 @@ def _subscribed_field_names(sub_response: dict) -> set:
 def resubscribe_active_connections(check_only: bool = False) -> dict:
     """ACTIVE IG 연동 계정들의 웹훅 구독을 점검하고 필수 필드 누락 시 재구독.
 
-    멱등·계정별 best-effort(한 계정 실패해도 나머지 진행). check_only=True 면 조회만.
+    멱등·계정별 best-effort(한 계정 실패해도 나머지 진행). check_only=True 면 조회만
+    (스트라이크 누적·status 변경도 하지 않는다).
+
+    ★ 실패는 두 종류로 갈라 센다 (2026-08-31). 예전엔 뭉쳐서 ``failed`` 하나였고, 그 안에
+    자기회복 불가능한 '죽은 토큰' 이 섞여 있어서 **매시간 같은 계정을 다시 발견하고 알림을
+    영구 반복**했다:
+      - ``token_dead_*``  : Meta 가 OAuth 사망 코드를 명시적으로 준 것 →
+                            token_health 가 연속 N회 확인 후 status=error 로 확정 → 모수에서 빠짐
+      - ``failed``        : 토큰은 살아있는데 웹훅 API 호출이 실패 / 판정 불가(네트워크·5xx)
     """
+    from .token_health import CONFIRMED_DEAD, STRIKE, clear_token_strikes, probe_and_record
+
     summary = {
         "checked": 0,
         "ok": 0,
         "resubscribed": 0,
         "failed": 0,
+        "token_dead_confirmed": 0,
+        "token_dead_pending": 0,
         "skipped_expired": 0,
+        "dead_accounts": [],
         "details": [],
     }
     now = timezone.now()
@@ -101,6 +114,9 @@ def resubscribe_active_connections(check_only: bool = False) -> dict:
             missing = [f for f in REQUIRED_WEBHOOK_FIELDS if f not in _subscribed_field_names(sub)]
             if not missing:
                 summary["ok"] += 1
+                # 구독 조회 성공 = 토큰 살아있음이 증명됨 → 누적 스트라이크 해제.
+                if not check_only:
+                    clear_token_strikes(conn)
                 continue
             if check_only:
                 summary["details"].append(f"{igid}: missing={missing} (check-only)")
@@ -114,29 +130,118 @@ def resubscribe_active_connections(check_only: bool = False) -> dict:
             summary["details"].append(f"{igid}: resubscribed (was missing {missing})")
             logger.info("resubscribed webhooks ig=%s missing=%s", igid, missing)
         except Exception as e:  # noqa: BLE001 — 계정별 best-effort
-            summary["failed"] += 1
-            summary["details"].append(f"{igid}: ERROR {e!r}")
-            logger.warning("resubscribe webhooks failed ig=%s: %s", igid, e)
+            # 토큰이 죽어서 실패한 것인지 라이브 /me 로 재확인 (verify-before-brick).
+            # 에러 본문은 raise_for_status_clean 이 지우므로(상태코드만 남는다) 여기서
+            # 다시 물어보는 것이 사유를 아는 유일한 방법이다.
+            try:
+                probe = probe_and_record(conn, source="webhook_check", record=not check_only)
+            except Exception:  # noqa: BLE001 — 진단 실패가 점검 루프를 깨지 않게
+                logger.exception("token probe 실패 ig=%s (non-fatal)", igid)
+                probe = None
+
+            verdict = (probe or {}).get("verdict")
+            if verdict == CONFIRMED_DEAD:
+                summary["token_dead_confirmed"] += 1
+                summary["dead_accounts"].append(
+                    {
+                        "ig_user_id": igid,
+                        "username": probe["username"],
+                        "reason": probe["reason"],
+                        "error_code": probe["error_code"],
+                        "strikes": probe["strikes"],
+                    }
+                )
+                summary["details"].append(
+                    f"{igid}: TOKEN DEAD confirmed (reason={probe['reason']} "
+                    f"code={probe['error_code']} strikes={probe['strikes']})"
+                )
+            elif verdict == STRIKE:
+                summary["token_dead_pending"] += 1
+                summary["details"].append(
+                    f"{igid}: token dead strike {probe['strikes']}/{probe['threshold']} "
+                    f"(reason={probe['reason']})"
+                )
+            else:
+                summary["failed"] += 1
+                summary["details"].append(f"{igid}: ERROR {e!r}")
+                logger.warning("resubscribe webhooks failed ig=%s: %s", igid, e)
     return summary
+
+
+def _should_alert_webhook_check(result: dict) -> bool:
+    """웹훅 점검 결과가 **상태 변화**인가 — 알림 발사 여부 단일 판정.
+
+    예전 조건은 ``resubscribed or failed`` 였다. ``failed`` 에 자기회복 불가능한 죽은 토큰이
+    섞여 있어 **1시간마다 같은 내용이 영구 반복**됐고(2026-08-31 조사: 일주일 이상 `실패 6`),
+    그 결과 정작 중요한 `재구독 N`(= Meta auto-disable 로 캠페인이 무음이 되는 신호)이
+    묻혔다. 이제 알리는 경우는 셋뿐:
+
+      1. 실제 재구독이 일어남 — 이 잡의 존재 이유
+      2. 토큰 사망이 이번에 **확정됨** — 계정당 딱 1회(다음 실행부터 모수에서 빠진다)
+      3. 애매한 실패가 전체의 임계 비율 이상 — Meta 장애/우리 장애 신호
+
+    스트라이크 누적 중(``token_dead_pending``)은 알리지 않는다. 확정 전까지 조용한 것이
+    "3번 확인 후 처리" 의 요점이다.
+    """
+    if result.get("resubscribed") or result.get("token_dead_confirmed"):
+        return True
+    checked = result.get("checked") or 0
+    failed = result.get("failed") or 0
+    if not checked or not failed:
+        return False
+    ratio = getattr(settings, "WEBHOOK_CHECK_FAILURE_ALERT_RATIO", 0.1)
+    try:
+        ratio = float(ratio)
+    except (TypeError, ValueError):
+        ratio = 0.1
+    return (failed / checked) >= ratio
+
+
+def _build_webhook_check_summary(result: dict) -> str:
+    """Telegram 문구 — 계정·사유를 담는다.
+
+    예전엔 숫자만 보냈다. 그래서 `실패 6` 이 일주일 넘게 오는 동안 어느 계정이 왜 실패하는지
+    알 수 없었고(로그에도 상태코드만 남는다), 원인 규명을 위해 prod 에 붙어야 했다.
+    """
+    lines = [
+        f"🔔 *IG 웹훅 구독 점검* — 재구독 {result.get('resubscribed', 0)} · "
+        f"정상 {result.get('ok', 0)}/{result.get('checked', 0)}"
+    ]
+    dead = result.get("dead_accounts") or []
+    if dead:
+        lines.append("")
+        lines.append(f"🔌 *토큰 사망 확정 {len(dead)}건* (재연동 안내 필요)")
+        for d in dead[:20]:
+            lines.append(f"• @{d['username']} — `{d['reason']}` (code={d['error_code']})")
+        if len(dead) > 20:
+            lines.append(f"… 외 {len(dead) - 20}개")
+    pending = result.get("token_dead_pending", 0)
+    if pending:
+        lines.append(f"⏳ 사망 확인 누적 중: {pending}건 (임계 도달 시 확정)")
+    failed = result.get("failed", 0)
+    if failed:
+        lines.append(f"❓ 원인 미확정 실패: {failed}건 (토큰은 살아있음/판정 불가)")
+    return "\n".join(lines)
 
 
 @shared_task
 def resubscribe_all_webhooks(check_only: bool = False) -> dict:
-    """주기(beat)/DR 훅. 활성 사이트에서만 실제 구독 변경. 재구독/실패 시 Telegram 경고."""
+    """주기(beat)/DR 훅. 활성 사이트에서만 실제 구독 변경.
+
+    Telegram 은 **상태 변화**(재구독 발생 / 토큰 사망 확정 / 대량 실패)일 때만 발사한다
+    — 판정은 :func:`_should_alert_webhook_check`.
+    """
     from apps.core.site_control import is_active_site
 
     if not is_active_site():
         logger.info("resubscribe_all_webhooks: passive site — skip")
         return {"skipped": "passive_site"}
     result = resubscribe_active_connections(check_only=check_only)
-    if result.get("resubscribed") or result.get("failed"):
+    if _should_alert_webhook_check(result):
         try:
             from apps.core.telegram import send_telegram_notification
 
-            send_telegram_notification(
-                "🔔 IG 웹훅 구독 점검: 재구독 %s · 실패 %s · 정상 %s/%s"
-                % (result["resubscribed"], result["failed"], result["ok"], result["checked"])
-            )
+            send_telegram_notification(_build_webhook_check_summary(result))
         except Exception:
             logger.exception("resubscribe_all_webhooks telegram 알림 실패 (non-fatal)")
     return result
@@ -4459,6 +4564,8 @@ def refresh_ig_tokens_pending_expiry(self):
     """
     from apps.core.telegram import send_telegram_notification
 
+    from .token_health import CONFIRMED_DEAD, STRIKE, clear_token_strikes, probe_and_record
+
     cutoff = timezone.now() + timedelta(days=14)
     candidates = list(
         IGAccountConnection.objects.filter(
@@ -4470,6 +4577,8 @@ def refresh_ig_tokens_pending_expiry(self):
 
     succeeded: list[dict] = []
     failed: list[dict] = []
+    dead_confirmed: list[dict] = []
+    dead_pending = 0
 
     for conn in candidates:
         try:
@@ -4505,12 +4614,51 @@ def refresh_ig_tokens_pending_expiry(self):
                 conn.username,
                 conn.token_expires_at,
             )
+            # 갱신 성공 = 토큰 살아있음 → 누적된 사망 스트라이크 해제.
+            clear_token_strikes(conn)
             # ★ P2: 토큰 복구 직후, 토큰 만료로 종결된(FAILED_TOKEN) 건을 윈도우 내라면 되살림.
             # 배포·일시 토큰오류로 죽었던 발송이 토큰 복구와 동시에 자동 재발송된다.
             revive_failed_token_logs.delay(str(conn.id))
         except Exception as e:
             # H-9: 예외 문자열에 토큰 URL 이 섞일 수 있으므로 로그·DB 저장 전 마스킹.
             safe_err = scrub_secrets(str(e))
+
+            # ★ 웹훅 점검과 **같은 판정**(token_health)을 쓴다 (2026-08-31).
+            # 예전엔 여기서 error_message 만 쓰고 status 는 active 로 남겨서, 토큰이 죽은
+            # 계정이 D-14 창에 영구히 머물며 6시간마다 실패 요약을 다시 발사했다
+            # (웹훅 점검의 1시간 알림과 겹치는 **두 번째 알림 스트림**).
+            try:
+                probe = probe_and_record(conn, source="token_refresh")
+            except Exception:  # noqa: BLE001 — 진단 실패가 갱신 루프를 깨지 않게
+                logger.exception("token probe 실패 conn=%s (non-fatal)", conn.id)
+                probe = None
+
+            verdict = (probe or {}).get("verdict")
+            if verdict == CONFIRMED_DEAD:
+                dead_confirmed.append(
+                    {
+                        "id": str(conn.id),
+                        "username": probe["username"],
+                        "reason": probe["reason"],
+                        "error_code": probe["error_code"],
+                    }
+                )
+                logger.warning(
+                    "IG token refresh failed & token dead confirmed: conn=%s reason=%s",
+                    conn.id,
+                    probe["reason"],
+                )
+                continue
+            if verdict == STRIKE:
+                dead_pending += 1
+                logger.info(
+                    "IG token refresh failed, dead strike %s/%s: conn=%s",
+                    probe["strikes"],
+                    probe["threshold"],
+                    conn.id,
+                )
+                continue
+
             logger.exception("IG token refresh failed: conn=%s err=%s", conn.id, safe_err)
             try:
                 conn.error_message = f"refresh failed: {safe_err}"[:500]
@@ -4525,11 +4673,15 @@ def refresh_ig_tokens_pending_expiry(self):
                 }
             )
 
-    # 6h 주기로 자주 도므로, 처리할 후보가 없으면 Telegram 알림을 생략(노이즈 방지).
-    # 후보가 있었던 실행(성공/실패 포함)만 요약 push.
-    if candidates:
+    # 6h 주기로 자주 도므로 노이즈를 막는다 — **결과가 있었던 실행만** 요약 push.
+    # 스트라이크 누적만 있었던 실행은 조용히 넘긴다(확정 전까지 침묵 = "3번 확인 후 처리").
+    if succeeded or failed or dead_confirmed:
         message = _build_token_refresh_summary(
-            checked=len(candidates), succeeded=succeeded, failed=failed
+            checked=len(candidates),
+            succeeded=succeeded,
+            failed=failed,
+            dead_confirmed=dead_confirmed,
+            dead_pending=dead_pending,
         )
         send_telegram_notification(message)
 
@@ -4537,6 +4689,8 @@ def refresh_ig_tokens_pending_expiry(self):
         "checked": len(candidates),
         "succeeded": len(succeeded),
         "failed": len(failed),
+        "token_dead_confirmed": len(dead_confirmed),
+        "token_dead_pending": dead_pending,
     }
 
 
@@ -4624,8 +4778,16 @@ def revive_paused_skipped_logs(campaign_id: str, limit: int | None = None):
     return {"revived": revived, "scanned": len(logs), "truncated": truncated}
 
 
-def _build_token_refresh_summary(*, checked: int, succeeded: list, failed: list) -> str:
+def _build_token_refresh_summary(
+    *,
+    checked: int,
+    succeeded: list,
+    failed: list,
+    dead_confirmed: list | None = None,
+    dead_pending: int = 0,
+) -> str:
     """Telegram Markdown 요약 메시지 빌드."""
+    dead_confirmed = dead_confirmed or []
     now_kst = timezone.localtime().strftime("%Y-%m-%d %H:%M KST")
     lines = [
         f"🔄 *IG Token Refresh* — {now_kst}",
@@ -4634,6 +4796,10 @@ def _build_token_refresh_summary(*, checked: int, succeeded: list, failed: list)
         f"✅ 성공: *{len(succeeded)}*",
         f"❌ 실패: *{len(failed)}*",
     ]
+    if dead_confirmed:
+        lines.append(f"🔌 토큰 사망 확정: *{len(dead_confirmed)}* (재연동 안내 필요)")
+    if dead_pending:
+        lines.append(f"⏳ 사망 확인 누적 중: *{dead_pending}*")
     if succeeded:
         lines.append("")
         lines.append("*Refreshed*")
@@ -4641,9 +4807,16 @@ def _build_token_refresh_summary(*, checked: int, succeeded: list, failed: list)
             lines.append(f"• @{s['username']} → 다음 만료 `{s['new_expires_at']}`")
         if len(succeeded) > 20:
             lines.append(f"… 외 {len(succeeded) - 20}개")
+    if dead_confirmed:
+        lines.append("")
+        lines.append("*Token Dead* (status=error 확정 — 사용자 재연동 필요)")
+        for d in dead_confirmed[:20]:
+            lines.append(f"• @{d['username']} — `{d['reason']}` (code={d['error_code']})")
+        if len(dead_confirmed) > 20:
+            lines.append(f"… 외 {len(dead_confirmed) - 20}개")
     if failed:
         lines.append("")
-        lines.append("*Failed* (재OAuth 안내 필요)")
+        lines.append("*Failed* (원인 미확정 — 토큰은 살아있음/판정 불가)")
         for f in failed[:20]:
             lines.append(f"• @{f['username']} — `{f['error']}`")
         if len(failed) > 20:

@@ -120,6 +120,36 @@ class IGAccountConnection(models.Model):
     last_verified_at = models.DateTimeField(null=True, blank=True, verbose_name="Last Verified At")
     error_message = models.TextField(blank=True, verbose_name="Last Error Message")
 
+    # ===== 토큰 사망 스트라이크 (2026-08-31) =====
+    # 주기 점검이 "Meta 가 code 190 을 명시적으로 줬다" 를 연속 N회(IG_TOKEN_DEAD_STRIKES,
+    # 기본 3) 확인해야 status=error 로 확정한다. 판정·누적은 token_health.probe_and_record
+    # 단일 소스. 살아있음이 확인되면 0 으로 초기화되므로 "연속" N회가 필요하다.
+    # ⚠️ 이 카운터가 없던 시절엔 매시간 죽은 토큰을 다시 발견하고 텔레그램을 재발사했다.
+    token_dead_strikes = models.PositiveSmallIntegerField(
+        default=0,
+        verbose_name="토큰 사망 연속 확인 횟수",
+        help_text="임계 도달 시 status=error 확정. 토큰이 살아있으면 0 으로 초기화.",
+    )
+    token_dead_first_seen_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="토큰 사망 최초 감지 시각",
+        help_text="첫 스트라이크 시각. '언제부터 죽어있나' 진단용.",
+    )
+    # 사용자 대면 재연동 사유 머신 키 — 프론트 팝업 문구의 근거.
+    # error_message(Meta 영문 원문)를 화면에 그대로 노출하지 않기 위한 분리.
+    reconnect_reason = models.CharField(
+        max_length=32,
+        blank=True,
+        default="",
+        verbose_name="재연동 필요 사유",
+        help_text=(
+            "token_invalidated(비밀번호 변경·보안 세션 초기화) / "
+            "account_checkpoint(인스타그램에서 본인확인 필요) / "
+            "app_removed(앱 권한 회수) / reconnect_required(기타). 빈 값 = 정상."
+        ),
+    )
+
     # 소프트 활성 플래그 — status(토큰/연결 건강)와 별개로 "사용자가 이 계정을 기능에 쓸지" 의사.
     # False 면 연결·토큰은 보존하되 DM/인사이트/스팸필터 등 계정 기반 기능에서 전부 제외.
     # 플랜 허용량이 줄어 활성 계정이 초과되면 자동/수동으로 False 로 내림(하드 연결해제 아님).

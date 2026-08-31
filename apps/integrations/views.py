@@ -713,6 +713,11 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 connection.status = IGAccountConnection.Status.ACTIVE
                 connection.last_verified_at = timezone.now()
                 connection.error_message = ""
+                # 새 토큰을 받았으므로 이전 사망 흔적을 전부 지운다 — 안 지우면 재연동한
+                # 계정이 스트라이크를 이어받아 다음 사망 확정이 부당하게 빨라진다.
+                connection.token_dead_strikes = 0
+                connection.token_dead_first_seen_at = None
+                connection.reconnect_reason = ""
                 # 재연결 시 소프트 비활성 자동 복구 — 단, 활성 슬롯이 남을 때만.
                 # disconnect→재연결(REVOKED)은 활성 카운트에서 빠져 있어 슬롯이 남으므로
                 # 항상 되살아난다. 활성 계정 재선택(activation choice)으로 의도적으로 꺼둔
