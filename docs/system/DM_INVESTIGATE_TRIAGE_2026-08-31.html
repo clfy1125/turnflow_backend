@@ -99,7 +99,8 @@
   <span><i style="background:var(--amber)"></i>자동 처리(⚪) 324</span>
   <span><i style="background:var(--red)"></i>조사 필요(🔴) 20</span>
 </div>
-<p class="quiet">※ “자동 처리”의 대부분은 상대방 사정입니다 — 받는 사람을 찾을 수 없음 207명, 상대가 대화방을 지움 35명, 캠페인 일시정지 중 17명.</p>
+<p class="quiet">※ “자동 처리”의 내역 — <b>발송 전에 댓글이 지워짐 207명</b>(⚠️ 종전 “받는 사람을 찾을 수 없음”. 원인이 뒤집혔습니다 → <b>9장</b>),
+   상대가 대화방을 지움 35명, 캠페인 일시정지 중 17명.</p>
 
 <h2>2. 20건은 네 가지뿐입니다</h2>
 
@@ -354,6 +355,78 @@
 
 <p class="quiet">기간을 21일로 넓히면 29건입니다(추가된 9건도 위 네 갈래에 그대로 들어갑니다).
 사람 단위로는 14일 “발송 안 됨” 280명 중 조사 필요 19명 / 자동 처리 261명입니다.</p>
+
+<h2>9. 추가 조사 — “계정을 삭제했다” 는 틀렸습니다 (2026-08-31 저녁)</h2>
+
+<div class="card">
+  <p>위 표에서 ⚪ 로 내려가 있던 <b>가장 큰 실패 버킷</b>(`100/2534014`, 한 캠페인 77건)을
+     다시 파봤습니다. “19시간에 77명이 계정을 지웠다”는 것이 말이 안 된다는 지적에서 출발했고,
+     결론은 <b>지적이 맞았습니다.</b></p>
+
+  <h3>실패는 수신자의 속성이 아니라 <u>우리 발송 지연의 함수</u>였습니다</h3>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>발송 지연</th><th class="num">총 건수</th><th class="num">실패</th><th class="num">실패율</th><th>내역</th></tr></thead>
+    <tbody>
+      <tr><td><b>0–10초</b></td><td class="num">2,766</td><td class="num">7</td><td class="num"><b>0.25%</b></td><td>2534014 <b>0건</b> (7건은 전부 2534001=대화방 삭제)</td></tr>
+      <tr><td>10–60초</td><td class="num">945</td><td class="num">45</td><td class="num">4.76%</td><td>2534014 39 · 2534066 5</td></tr>
+      <tr><td>1–3분</td><td class="num">66</td><td class="num">6</td><td class="num">9.09%</td><td>2534014 6</td></tr>
+      <tr><td>3–10분</td><td class="num">255</td><td class="num">23</td><td class="num">9.02%</td><td>2534014 23</td></tr>
+      <tr><td>10분+</td><td class="num">153</td><td class="num">10</td><td class="num">6.54%</td><td>2534014 10</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p><b>즉시 보내면 이 오류는 한 건도 나오지 않습니다.</b> 같은 계정의 다른 캠페인(5,922건)도
+     완전히 같은 패턴이었습니다 — 0–10초 0건, 10–60초 6.95%, <b>10분+ 15.24%</b>.</p>
+
+  <h3>같은 시간대 1:1 비교 — 완전히 갈립니다</h3>
+  <p>08–09시 창에서 실패 8건 / 성공 8건을 뽑아 그 댓글을 Graph 로 직접 조회했습니다
+     (같은 게시물·같은 시각·같은 문구 “블로그”):</p>
+  <div class="split">
+    <div class="node red"><b>실패 8건 → 댓글 8/8 사라짐</b></div>
+    <div class="node green"><b>성공 8건 → 댓글 8/8 살아있음</b> (8시간 뒤에도)</div>
+  </div>
+  <p style="margin-top:12px">그리고 실패자 중 <b>4명은 나중에 다시 댓글을 달아 DM 을 정상 수신</b>했습니다 —
+     계정이 살아 있다는 직접 증거입니다.</p>
+
+  <h3>왜 08–09시에 몰렸나</h3>
+  <p>그 시간대에 <b>발송 대기가 폭발</b>했습니다. 시간대별 지연:</p>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>시각</th><th class="num">발송량</th><th class="num">지연 중앙값</th><th class="num">지연 p90</th><th class="num">2534014 실패율</th></tr></thead>
+    <tbody>
+      <tr><td>00–07시</td><td class="num">81–372</td><td class="num">0초</td><td class="num">~40초</td><td class="num">0–1%</td></tr>
+      <tr><td><b>08시</b></td><td class="num">586</td><td class="num"><b>29초</b></td><td class="num"><b>11.6분</b></td><td class="num"><b>3.41%</b></td></tr>
+      <tr><td><b>09시</b></td><td class="num">456</td><td class="num"><b>5.6분</b></td><td class="num"><b>11.2분</b></td><td class="num"><b>5.92%</b></td></tr>
+      <tr><td>10–17시</td><td class="num">90–318</td><td class="num">0초</td><td class="num">15–235초</td><td class="num">0.5–2%</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>원인은 <b>Instagram 의 시간당 한도</b>입니다. 비공개 답장은 계정당 시간당 약 750건이 상한이고,
+     우리 페이서는 그 아래(3–7초 간격 ≈ 720건/시간)로 균등 발송합니다. 08시에 댓글이
+     <b>586건/시간</b>으로, 그것도 분 단위로 몰려 들어오면서(추정 분당 20건 vs 처리 능력 분당 12건)
+     대기줄이 분당 8건씩 쌓였습니다. 처리 능력을 분당 20건으로 올리려면 시간당 1,200건 =
+     <b>Meta 한도의 1.6배</b>라, 계정 차단(action block) 위험을 감수해야 합니다.</p>
+  <p class="why">그래서 릴스가 터지는 순간에는 지연이 <b>물리적으로 불가피</b>하고, 그동안 사라지는
+     댓글 몇 %는 구조적으로 놓칩니다. 댓글이 없어지면 비공개 답장 경로 자체가 사라지고,
+     상대가 먼저 DM 을 보낸 적이 없어 24시간 창도 없기 때문에 <b>되살릴 방법이 없습니다.</b></p>
+
+  <h3>고친 것 / 남은 것</h3>
+  <ul>
+    <li><b>[완료] 라벨 교정</b> — “받는 사람을 찾을 수 없음 · 계정을 지웠거나 차단”
+        → <b>“발송 전에 댓글이 지워짐”</b>. 원인·조치문도 지연 근거와 함께 다시 썼습니다.
+        머신 키(<code>recipient_not_found</code>)는 프론트 저장 필터·SQL 이 물고 있어 그대로 뒀습니다.</li>
+    <li><b>[완료] 2534066 설명 보강</b> — 이 번호도 ‘게시물 차단’과 ‘발송 전 댓글 삭제’ 두 뜻이
+        섞여 있음을 조치문에 담아, 운영자가 화면에서 가를 수 있게 했습니다.</li>
+    <li><b>[남음] 유저 문구</b> — 유저 콘솔은 아직 “수신자 계정이 삭제·비활성화…”로 안내합니다.
+        새 사유 키 <code>comment_deleted</code> 신설이 필요하고 프론트 문구가 있어야 합니다
+        (준비되면 서버는 1줄 변경). 계약서: <code>docs/frontend/DM_USER_COPY_MAPPING.md</code> §U2-③</li>
+    <li><b>[남음] 지연을 지표로</b> — 캠페인 상세에 “발송 지연 p90”과 “지연 때문에 놓친 건수”가
+        없습니다. 지금은 이 숫자가 어디에도 없어서 “계정 삭제 77명”으로 읽힙니다.</li>
+    <li><b>[검토] 버스트 완화</b> — 백로그가 깊을 때만 발송 간격을 조이기(시간당 740 백스톱 유지).
+        개선 폭은 20–30% 수준이고, 한도가 벽이라 완전 해결은 아닙니다.</li>
+  </ul>
+</div>
 
 <footer>
   조사 방법: 실서버 읽기 전용 조회(<span class="mono">docker exec … manage.py shell</span>) +
