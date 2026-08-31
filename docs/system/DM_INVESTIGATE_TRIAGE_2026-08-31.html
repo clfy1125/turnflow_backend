@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>어드민 '조사 필요' 로그 원인 조사 (2026-08-31)</title>
+<style>
+  :root{
+    --bg:#f7f7f8; --panel:#fff; --ink:#1c1c1e; --muted:#6b6b73; --line:#e3e3e8;
+    --red:#c8342b; --red-bg:#fdecea; --amber:#a06400; --amber-bg:#fff5e0;
+    --green:#1c7a4a; --green-bg:#e8f6ee; --blue:#2b5fc8; --blue-bg:#eaf0fd;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#141416; --panel:#1d1d20; --ink:#ececef; --muted:#9a9aa3; --line:#2e2e34;
+      --red:#ff7a70; --red-bg:#3a1f1d; --amber:#e8b25a; --amber-bg:#332617;
+      --green:#6fd3a0; --green-bg:#16301f; --blue:#8bb0ff; --blue-bg:#1b2440;
+    }
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; padding:32px 20px 80px; background:var(--bg); color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Malgun Gothic","Apple SD Gothic Neo",sans-serif;
+    line-height:1.75; word-break:keep-all; overflow-wrap:break-word;
+  }
+  .wrap{max-width:940px; margin:0 auto}
+  header.top{border-bottom:2px solid var(--ink); padding-bottom:16px; margin-bottom:28px}
+  h1{font-size:1.6rem; margin:0 0 6px; letter-spacing:-.02em}
+  .sub{color:var(--muted); font-size:.9rem; margin:0}
+  h2{font-size:1.18rem; margin:44px 0 12px; padding-left:11px; border-left:4px solid var(--ink)}
+  h3{font-size:1rem; margin:22px 0 8px}
+  p{margin:10px 0}
+  .card{background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:18px 20px; margin:14px 0}
+  .lead{background:var(--panel); border:1px solid var(--line); border-left:5px solid var(--blue);
+        border-radius:10px; padding:18px 20px; font-size:1.02rem}
+  .lead strong{color:var(--blue)}
+  .badge{display:inline-block; font-size:.76rem; font-weight:700; padding:2px 9px; border-radius:999px; white-space:nowrap}
+  .b-red{background:var(--red-bg); color:var(--red)}
+  .b-amber{background:var(--amber-bg); color:var(--amber)}
+  .b-green{background:var(--green-bg); color:var(--green)}
+  .b-gray{background:var(--line); color:var(--muted)}
+  .scroll{overflow-x:auto; -webkit-overflow-scrolling:touch; margin:14px 0}
+  table{border-collapse:collapse; width:100%; min-width:600px; font-size:.9rem; background:var(--panel)}
+  th,td{border:1px solid var(--line); padding:9px 11px; text-align:left; vertical-align:top}
+  th{background:var(--bg); font-weight:700; font-size:.84rem; color:var(--muted)}
+  td.num,th.num{text-align:right; font-variant-numeric:tabular-nums}
+  code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:.88em}
+  code{background:var(--line); padding:1px 5px; border-radius:4px}
+  .bar{display:flex; height:26px; border-radius:6px; overflow:hidden; border:1px solid var(--line); margin:12px 0 6px}
+  .bar span{display:block}
+  .legend{display:flex; flex-wrap:wrap; gap:14px; font-size:.82rem; color:var(--muted)}
+  .legend i{display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px}
+  .split{display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:14px}
+  .kpi{background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px}
+  .kpi .n{font-size:1.7rem; font-weight:800; letter-spacing:-.03em; display:block}
+  .kpi .l{font-size:.82rem; color:var(--muted)}
+  .flow{border:1px dashed var(--line); border-radius:10px; padding:16px; background:var(--panel)}
+  .node{border:1px solid var(--line); border-radius:8px; padding:10px 12px; background:var(--bg); font-size:.9rem}
+  .node.red{border-color:var(--red); background:var(--red-bg)}
+  .node.green{border-color:var(--green); background:var(--green-bg)}
+  .arrow{text-align:center; color:var(--muted); font-size:1.1rem; margin:6px 0}
+  ul,ol{padding-left:22px; margin:10px 0}
+  li{margin:6px 0}
+  .why{border-left:3px solid var(--line); padding:2px 0 2px 14px; color:var(--muted); font-size:.92rem}
+  footer{margin-top:56px; padding-top:16px; border-top:1px solid var(--line); color:var(--muted); font-size:.82rem}
+  .quiet{color:var(--muted); font-size:.86rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <h1>어드민 “조사 필요” 로그 — 원인 조사 결과</h1>
+  <p class="sub">실서버 실측 · 2026-08-31 15:42 KST 기준 · 대상 기간 최근 14일(08-17 이후), 대조군 21일·30일</p>
+</header>
+
+<div class="lead">
+  <strong>한 줄 결론.</strong> 장애는 없습니다. 14일간 “조사 필요” 20건은 전체 DM 의 0.03% 이고,
+  <strong>그중 진짜로 새로 조사할 건은 1건뿐</strong>입니다. 나머지 19건은
+  <em>우리가 이미 원인을 아는 일들이 화면에서 🔴 로 잘못 묶여 있는 것</em>입니다.
+  즉 지금 고쳐야 할 것은 “발송”이 아니라 <strong>분류와 알림</strong>입니다.
+</div>
+
+<h2>1. 먼저 규모 감각</h2>
+
+<div class="split">
+  <div class="kpi"><span class="n">76,487</span><span class="l">최근 30일 DM 발송 로그 전체</span></div>
+  <div class="kpi"><span class="n">76,143</span><span class="l">그중 성공(도착·읽음) — 99.55%</span></div>
+  <div class="kpi"><span class="n">20건 / 19명</span><span class="l">최근 14일 “조사 필요”</span></div>
+</div>
+
+<div class="bar" aria-hidden="true">
+  <span style="width:99.55%; background:var(--green)"></span>
+  <span style="width:0.42%; background:var(--amber)"></span>
+  <span style="width:0.03%; background:var(--red)"></span>
+</div>
+<div class="legend">
+  <span><i style="background:var(--green)"></i>성공 76,143</span>
+  <span><i style="background:var(--amber)"></i>자동 처리(⚪) 324</span>
+  <span><i style="background:var(--red)"></i>조사 필요(🔴) 20</span>
+</div>
+<p class="quiet">※ “자동 처리”의 대부분은 상대방 사정입니다 — 받는 사람을 찾을 수 없음 207명, 상대가 대화방을 지움 35명, 캠페인 일시정지 중 17명.</p>
+
+<h2>2. 20건은 네 가지뿐입니다</h2>
+
+<div class="scroll">
+<table>
+  <thead>
+    <tr>
+      <th>화면에 뜨는 문구</th><th class="num">건수</th><th>실제로 무슨 일인가</th><th>우리가 할 수 있나</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><b>이 게시물만 자동 DM 이 막힘</b><br><span class="mono quiet">200 / 2534066</span></td>
+      <td class="num">12</td>
+      <td><b>전혀 다른 두 가지가 섞여 있습니다.</b><br>
+          ① 게시물 1개가 정말 Meta 에 막힘 (3건)<br>
+          ② 댓글 작성자가 DM 받기 전에 <b>댓글을 지움</b> (9건)</td>
+      <td><span class="badge b-amber">부분 가능</span><br><span class="quiet">막힌 것은 못 풀지만, 둘을 갈라내고 자동 정지·안내는 가능</span></td>
+    </tr>
+    <tr>
+      <td><b>인스타가 ‘대화창 밖’이라며 거부</b><br><span class="mono quiet">10 / 2534022</span></td>
+      <td class="num">5</td>
+      <td>팔로우게이트에서 상대가 버튼을 눌렀는데, Meta 가 그 탭을 “대화창이 열렸다”로 인정하지 않음 → 보상 DM 거부</td>
+      <td><span class="badge b-amber">발송은 불가</span><br><span class="quiet">“다시 눌러달라”고 알려줄 길은 만들 수 있음</span></td>
+    </tr>
+    <tr>
+      <td><b>Instagram 이 이유를 알려주지 않음</b><br><span class="mono quiet">-1 / 2534023</span></td>
+      <td class="num">2</td>
+      <td><b>문구가 틀렸습니다.</b> 실제 사유는 “그 댓글에 이미 답글이 있음”이고,<br><b>대부분 DM 은 실제로 도착했습니다</b></td>
+      <td><span class="badge b-green">가능</span><br><span class="quiet">분류 수정 + 도착으로 정정</span></td>
+    </tr>
+    <tr>
+      <td><b>이 사람·이 게시물 권한 문제</b><br><span class="mono quiet">200 (세부번호 없음)</span></td>
+      <td class="num">1</td>
+      <td>“계정 소유자가 DM 접근을 껐다”는 응답. 표본이 1건이라 <b>우리 고객 설정인지 수신자 쪽인지 갈리지 않음</b></td>
+      <td><span class="badge b-gray">관측 필요</span></td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h2>3. 가장 중요한 것 — <span class="mono">2534066</span> 은 뜻이 두 개입니다</h2>
+
+<p>이게 이번 조사의 핵심입니다. 같은 오류번호인데 <b>조치가 정반대</b>인 두 상황이 한 라벨로 묶여 있어,
+운영자가 열어봐도 대부분 할 일이 없습니다.</p>
+
+<div class="split">
+  <div class="flow">
+    <div class="node red"><b>(a) 진짜 게시물 차단</b> — 3건 (누적 96건)</div>
+    <div class="arrow">↓ 어떻게 아는가</div>
+    <div class="node">그 캠페인은 <b>96번 시도해서 성공이 0건</b>.<br>
+      같은 계정의 다른 9개 캠페인은 <b>524건 전부 성공</b>.</div>
+    <div class="arrow">↓ 원인 (2026-07-24 규명 완료)</div>
+    <div class="node">그 릴스를 <b>7/2–7/8 타사 DM 툴로 대량 발송</b> →
+      Meta 가 7/9경 <b>그 게시물만</b> 메시징 차단 →
+      우리는 7/16 에 <b>이미 막힌 게시물을 인수</b>.</div>
+    <div class="arrow">↓ 지금 상태</div>
+    <div class="node red"><b>6주째 캠페인이 켜져 있습니다.</b> 댓글이 달릴 때마다 실패가 쌓이고,
+      고객은 그 96명이 아무것도 못 받은 걸 화면으로 알 수 없습니다.</div>
+  </div>
+
+  <div class="flow">
+    <div class="node green"><b>(b) 댓글이 사라진 경합</b> — 9건</div>
+    <div class="arrow">↓ 어떻게 아는가</div>
+    <div class="node">실패한 댓글 ID 를 Graph 로 직접 조회 → <b>7건이 “존재하지 않음”</b>
+      <span class="mono quiet">(code 100 / subcode 33)</span></div>
+    <div class="arrow">↓ 결정적 대조</div>
+    <div class="node">같은 게시물에서 <b>같은 시각에 수천 건이 정상 발송</b> 중.<br>
+      예: 한 캠페인 5,958건 중 실패 5건, 첫 실패 뒤에도 4,684건 성공.</div>
+    <div class="arrow">↓ 결론</div>
+    <div class="node green"><b>게시물이 막힌 게 아니라 그 댓글이 지워진 것.</b>
+      조치할 것이 없는 정상 상황입니다(⚪ 로 내려야 함).</div>
+  </div>
+</div>
+
+<div class="card">
+  <h3>가르는 방법 (구현 난이도 낮음)</h3>
+  <p>실패했을 때 <code>GET /{comment_id}</code> 를 <b>한 번</b> 호출합니다. 월 35건 수준이라 API 부담은 없습니다.</p>
+  <ul>
+    <li>응답이 <b>404</b> → “댓글이 삭제됨” <span class="badge b-green">⚪ 자동 처리</span></li>
+    <li>댓글이 <b>살아있음</b> → 그 게시물의 실패 카운터를 올리고, <b>성공 0 + N회 실패</b>가 되면 “게시물 차단” <span class="badge b-red">🔴 조사 필요</span> + 캠페인 자동 일시정지 + 고객 안내</li>
+  </ul>
+  <p class="why">주의: 성공한 건의 댓글도 나중에 지워집니다(받고 나서 지우는 사람이 많음).
+    그래서 “지금 404 다”만으로 단정하면 안 되고, <b>발송 시각 주변에 성공이 있었는지</b>를 같이 봐야 합니다.</p>
+</div>
+
+<h2>4. <span class="mono">2534022</span> — 5명이 보상 DM 을 못 받았습니다</h2>
+
+<div class="card">
+  <p>구조부터 이해가 필요합니다.</p>
+  <ul>
+    <li><b>댓글은 24시간 대화창을 열지 않습니다.</b> 댓글은 “비공개 답장 1회 권한”(7일)일 뿐입니다.</li>
+    <li>그래서 <b>첫 DM(오프닝)은 늘 잘 갑니다</b> — 댓글 권한으로 보내니까요.</li>
+    <li><b>보상 DM 은 24시간 창이 필요</b>하고, 그 창을 여는 건 <b>상대가 버튼을 누른 행위</b> 하나뿐입니다.</li>
+    <li>Meta 가 그 탭을 간헐적으로 “우리(비즈니스)가 보낸 것”으로 잘못 기록합니다 → 창이 안 열림 → 보상 DM 거부.</li>
+  </ul>
+  <p>실측 5건: 2건은 오프닝 도착 <b>0–2분</b> 뒤 탭인데 거부, 3건은 <b>16시간–2일</b> 뒤 탭. 탭 자체가 창을 열어야 하므로 경과 시간과 무관하게 같은 원인입니다.
+     자동 재시도(20초·1분·3분)를 전부 소진했고, <b>재탭이 없어 되살림도 발동하지 않았습니다.</b></p>
+  <p class="why">규모: 30일 보상 DM 30,523건 중 5건(0.016%). 2026-08-07 패치 직후엔 0건이었으니 “다시 조금 생긴” 상태입니다.</p>
+  <p><b>남은 빈틈은 “다시 눌러달라고 알려줄 방법이 없다”는 것.</b> 창이 닫혀 DM 은 못 보내지만
+     <b>댓글 API 는 살아 있으므로</b>, 기존 ‘실패 DM 복구’(공개 대댓글로 유도)를 보상 DM 실패에도 붙이는 것이 유일한 자력 복구 경로입니다.</p>
+</div>
+
+<h2>5. <span class="mono">-1 / 2534023</span> — 화면 문구가 틀렸고, DM 은 갔습니다</h2>
+
+<div class="card">
+  <h3>결함 ① 문구가 틀렸다</h3>
+  <p>사전에 <code>(100, 2534023)</code> 만 등록돼 있어서, 같은 사유가 코드 <code>-1</code> 로 오면
+     “Instagram 이 이유를 알려주지 않음”으로 떨어집니다. 실측 6건 전부 이 경로였습니다.
+     실제 원문은 <b>“답글을 달려는 댓글에 이미 답글이 있습니다”</b>(http 500)입니다.</p>
+
+  <h3>결함 ② 실패가 아니라 성공이었다</h3>
+  <p>6건 중 <b>3건은 같은 사람에게 0–3분 뒤 보상 DM 이 도착 완료</b>였습니다.
+     보상 DM 은 <b>상대가 오프닝 DM 의 버튼을 눌러야만</b> 나갑니다 →
+     <b>오프닝이 도착했다는 증거</b>입니다.</p>
+  <div class="flow">
+    <div class="node">1차 발송 → 실제로 도착</div>
+    <div class="arrow">↓</div>
+    <div class="node">그런데 Meta 가 <b>500 에러</b>를 반환 (성공 응답 유실)</div>
+    <div class="arrow">↓</div>
+    <div class="node">우리가 재시도 → Meta: “이 댓글엔 이미 답글이 있다”(2534023)</div>
+    <div class="arrow">↓</div>
+    <div class="node red">도착한 DM 이 <b>“도착 미확인”</b> 으로 기록됨</div>
+  </div>
+  <p>이걸 잡는 장치는 이미 있습니다(재시도 전에 Conversations API 로 확인). 다만 재시도가 너무 빨라
+     그 조회가 아직 “없음”을 반환하고, <b>그 뒤 다시 확인해 주는 자동 경로가 없습니다</b> —
+     자동 재검증은 <code>message_id</code> 가 있는 건만 보는데, 이 건들은 정의상 <code>message_id</code> 가 없습니다.</p>
+  <p>현재 실서버 잔여 27건(7월 미확정 21 + 신규 6) 중 <b>3건은 API 호출 0회로 즉시 도착 정정 가능</b>합니다.</p>
+</div>
+
+<h2>6. 그래서 무엇을 할까 (우선순위)</h2>
+
+<div class="scroll">
+<table>
+  <thead><tr><th class="num">#</th><th>할 일</th><th>왜</th><th>드는 노력</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td>
+      <td><b>도착 확정 3건을 ‘도착’으로 정정</b><br><span class="quiet">이미 있는 커맨드 실행 (기본 dry-run)</span></td>
+      <td>실제로 배달된 DM 이 실패로 계상돼 도착률을 깎고 있음</td>
+      <td><span class="badge b-green">즉시 · API 0회</span></td></tr>
+    <tr><td class="num">2</td>
+      <td><b>차단된 게시물 캠페인 정지 안내(CS)</b><br><span class="quiet">yeonhada__ / 캠페인 c24acc61</span></td>
+      <td>6주간 96명이 아무것도 못 받았고 고객은 모름. 게시물 차단은 해제 불가 → 새 게시물로 이동해야 함</td>
+      <td><span class="badge b-green">오늘</span></td></tr>
+    <tr><td class="num">3</td>
+      <td><b>“죽은 캠페인” 자동 감지</b><br><span class="quiet">실패 N회 + 성공 0 → 자동 일시정지 + 고객 알림</span></td>
+      <td>지금은 영원히 켜진 채로 실패만 쌓임. 전 서비스에 해당 캠페인이 <b>1개뿐</b>이라 오탐 위험 거의 없음</td>
+      <td><span class="badge b-amber">1–2일</span></td></tr>
+    <tr><td class="num">4</td>
+      <td><b>2534066 두 갈래 분리</b><br><span class="quiet">댓글 삭제(⚪) vs 게시물 차단(🔴)</span></td>
+      <td>이것만으로 🔴 의 절반 이상이 사라짐 → 운영자 헛수고 제거</td>
+      <td><span class="badge b-amber">반나절</span></td></tr>
+    <tr><td class="num">5</td>
+      <td><b>도착 증거가 늦게 와도 받아먹기</b> <span class="badge b-green">✔ 완료</span><br>
+        <span class="quiet">아래 7장 참고</span></td>
+      <td>5장의 버킷이 <b>자동으로 사라짐</b>(사람이 손댈 일이 없어짐)</td>
+      <td><span class="badge b-green">패치됨</span></td></tr>
+    <tr><td class="num">6</td>
+      <td><b>보상 DM 실패 시 “버튼 다시 눌러주세요” 대댓글</b></td>
+      <td>4장의 유일한 자력 복구 경로. 지금은 조용히 유실</td>
+      <td><span class="badge b-gray">검토</span></td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="card">
+  <h3>우리가 조치할 수 없는 것 (솔직하게)</h3>
+  <ul>
+    <li><b>게시물 단위 메시징 차단 해제</b> — Meta 가 문서화하지 않았고 해제 API 도 없습니다. 시간이 지나 풀린 사례는 있지만 보장되지 않습니다.</li>
+    <li><b>버튼 탭 창 오귀속</b> — 우리 웹훅은 “상대가 보냄”으로 오는데 Meta 의 Conversations API 는 “우리가 보냄”이라고 합니다. Meta 내부 불일치라 우리가 못 막습니다.</li>
+    <li><b>댓글 삭제 경합</b> — 발송 전에 매번 댓글 존재를 확인하면 발송 건당 API 1회가 추가돼 비효율입니다(월 7만 건 규모).</li>
+  </ul>
+</div>
+
+<h2>7. 무엇을 고쳤나 (2026-08-31 패치)</h2>
+
+<div class="card">
+  <p>5장의 “도착했는데 실패로 기록되는” 문제를 <b>증거가 오는 두 시점에서</b> 받아먹도록 고쳤습니다.
+     추가 API 호출은 <b>0회</b>입니다 — 이미 우리에게 오고 있던 신호를 버리고 있었을 뿐입니다.</p>
+
+  <h3>① 에코 웹훅을 버리지 않는다</h3>
+  <p>Meta 는 실제로 배달된 메시지의 <code>is_echo</code> 웹훅을 몇 초 안에 보냅니다.
+     <b>실측: 문제의 08-28 건은 로그 생성 12초 뒤 에코가 실제로 도착해 있었습니다</b>(EventInbox 2건).
+     그런데 매칭 규칙이 “<code>message_id</code> 일치” 또는 “그 수신자의 <code>ACCEPTED</code> 로그”뿐이라,
+     <b>message_id 를 못 받은 바로 그 발송</b>에는 붙을 곳이 없어 그냥 버려졌습니다.</p>
+  <p>이제 어디에도 안 붙는 에코는 “우리가 보냈는데 응답을 못 받은 발송”의 증거로 씁니다.
+     안 보낸 DM 을 ‘보냈다’고 표시하지 않도록 자물쇠를 넷 걸었습니다 —
+     같은 계정·같은 수신자 / <code>message_id</code> 공란 / <b>15분 안에 실제로 POST 한 적 있음</b> /
+     <b>이미 결론 안 난 시도가 1회 이상</b>.</p>
+  <p class="why">부수 효과가 하나 더 있습니다: 재시도 대기 중인 건이 승격되면
+     예약된 재시도가 발송 진입 가드에 걸려 <b>재발송 자체가 사라집니다</b> →
+     “이미 답글”(2534023) 오류를 <b>애초에 만들지 않습니다</b>.</p>
+
+  <h3>② 버튼 탭도 증거로 쓴다</h3>
+  <p>팔로우게이트 버튼은 <b>그 DM 안에</b> 있습니다. 탭이 왔다는 건 DM 이 도착했다는 뜻입니다.
+     이제 탭을 처리할 때 오프닝 로그가 “증거 없는 실패·대기”면 도착으로 정정합니다.
+     이미 통과(PASSED)한 재탭에서도 정정되도록 <b>게이트 처리보다 앞에</b> 뒀습니다.</p>
+
+  <h3>같이 막은 이중 계상</h3>
+  <p>승격 뒤 기존 Conversations 승격 경로가 또 들어오면 상태를 <code>ACCEPTED</code> 로 되돌리고
+     발송 수를 두 번 셀 수 있었습니다 → 이미 도착한 로그면 아무것도 하지 않도록 가드를 넣었습니다.
+     통계 보정(발송 +1 / 미확인 −1)도 <b>이전 상태에 따라 달라</b> 한 곳에서만 판단하게 모았습니다.</p>
+
+  <h3>검증</h3>
+  <ul>
+    <li>새 테스트 17건. 그중 <b>동작 7건은 패치 전 코드에서 실패</b>함을 확인했습니다
+        (테스트가 실제로 이 결함을 잡는지 먼저 검증 — 통과만 보고 넘기지 않았습니다).</li>
+    <li>가드 10건은 패치 전후 모두 통과 — <b>안 보낸 DM 은 절대 승격되지 않습니다</b>
+        (미발송·창 밖·발송 중·다른 계정·창 만료 실패).</li>
+    <li>관련 회귀 <b>683건 통과</b>(integrations + admin_api 전체).</li>
+  </ul>
+  <p class="quiet">⚠️ 아직 실서버 배포는 안 했습니다. 배포 시 <b>celery 워커 재시작 필수</b>(dev·prod 모두
+     워커는 코드를 자동 리로드하지 않습니다). 이미 쌓인 27건은 배포와 별개로
+     1번 조치(정정 커맨드)로 처리해야 합니다 — 패치는 <b>앞으로</b>를 막습니다.</p>
+</div>
+
+<h2>8. 한 가지 더 — 고객에게는 아무 안내도 안 갑니다</h2>
+<div class="card">
+  <p>“조사 필요(🔴)”로 분류된 건은 설계상 <b>자동 안내가 없습니다</b>(원인이 확정되지 않았으니 안내 문구를 정할 수 없다는 이유).
+     결과적으로 위 3장·4장 — <b>고객이 손해를 보고 있는데 그 사실을 모르는</b> 두 경우 — 에도 아무 알림이 없습니다.</p>
+  <p>3번·6번 조치가 사실상 “이 침묵을 깨는 일”입니다.</p>
+</div>
+
+<h2>부록. 계정별 실측 내역 (14일)</h2>
+
+<div class="scroll">
+<table>
+  <thead><tr><th>사유</th><th>계정</th><th class="num">건수</th><th>비고</th></tr></thead>
+  <tbody>
+    <tr><td rowspan="4">이 게시물만 막힘<br><span class="mono quiet">2534066</span></td>
+        <td class="mono">use.ai.likejimin</td><td class="num">6</td><td>댓글 삭제 (같은 기간 15,000건 이상 정상 발송)</td></tr>
+    <tr><td class="mono">yeonhada__</td><td class="num">3</td><td><b>진짜 게시물 차단</b> (누적 96건 · 성공 0)</td></tr>
+    <tr><td class="mono">manjzangi</td><td class="num">2</td><td>댓글 삭제 (Graph 조회로 확인)</td></tr>
+    <tr><td class="mono">highestlevel33</td><td class="num">1</td><td>댓글 살아있음 → 순간 글리치 (직후 63건 성공)</td></tr>
+
+    <tr><td rowspan="5">대화창 밖 거부<br><span class="mono quiet">2534022</span></td>
+        <td class="mono">12_26__yul</td><td class="num">1</td><td>오프닝 도착 같은 분에 탭 → 거부</td></tr>
+    <tr><td class="mono">analzdo291</td><td class="num">1</td><td>오프닝 2분 뒤 탭 → 거부</td></tr>
+    <tr><td class="mono">pure_skin2856</td><td class="num">1</td><td>16시간 뒤 탭</td></tr>
+    <tr><td class="mono">manjzangi</td><td class="num">1</td><td>2일 뒤 탭</td></tr>
+    <tr><td class="mono">real.ryuah90</td><td class="num">1</td><td>2일 뒤 탭</td></tr>
+
+    <tr><td rowspan="2">이유 없음(실은 ‘이미 답글’)<br><span class="mono quiet">-1 / 2534023</span></td>
+        <td class="mono">mini_ai_</td><td class="num">1</td><td>보상 DM 도착 확인 → <b>실제 도착</b></td></tr>
+    <tr><td class="mono">manjzangi</td><td class="num">1</td><td>보상 DM 도착 확인 → <b>실제 도착</b></td></tr>
+
+    <tr><td>권한 문제<br><span class="mono quiet">200</span></td>
+        <td class="mono">jageum_master</td><td class="num">1</td><td>표본 1건, 이후 시도 없음 → 관측 필요</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p class="quiet">기간을 21일로 넓히면 29건입니다(추가된 9건도 위 네 갈래에 그대로 들어갑니다).
+사람 단위로는 14일 “발송 안 됨” 280명 중 조사 필요 19명 / 자동 처리 261명입니다.</p>
+
+<footer>
+  조사 방법: 실서버 읽기 전용 조회(<span class="mono">docker exec … manage.py shell</span>) +
+  실패 댓글·게시물에 대한 Graph 읽기 조회 약 30회. DB 변경 없음.<br>
+  근거가 되는 코드: <span class="mono">apps/admin_api/dm_error_catalog.py</span> (분류 사전) ·
+  <span class="mono">apps/integrations/tasks.py</span> (재검증·재시도) ·
+  <span class="mono">apps/integrations/management/commands/backfill_no_trace_delivered.py</span> (도착 정정).<br>
+  이전 규명 기록: 2026-07-24 (게시물 차단 원인) · 2026-07-30 (도착 오분류 백필) · 2026-08-07 (버튼 탭 오귀속).
+</footer>
+
+</div>
+</body>
+</html>
