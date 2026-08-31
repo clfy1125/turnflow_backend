@@ -940,8 +940,14 @@ DM_ACTION_BLOCK_BASE_COOLDOWN_HOURS = config(
 )
 DM_ACTION_BLOCK_MAX_COOLDOWN_DAYS = config("DM_ACTION_BLOCK_MAX_COOLDOWN_DAYS", default=7, cast=int)
 
-# P10 — 동일 수신자(같은 캠페인) 쿨다운 초. 단시간 다중 댓글/답장 시 한 번만 발송(계정 보호).
+# P10 — 동일 수신자(같은 캠페인) 쿨다운 초. 단시간 다중 댓글/답장 시 도배를 막는다(계정 보호).
 DM_RECIPIENT_COOLDOWN_SECONDS = config("DM_RECIPIENT_COOLDOWN_SECONDS", default=300, cast=int)
+# P10-b (2026-08-31) — 쿨다운 창 안에서 허용할 **루트 DM 통수**와 발송 간 **최소 간격**.
+#   판정 단일 소스 = tasks._recipient_cooldown_skip_reason (세 손잡이의 의미는 그쪽 docstring).
+#   MAX=1 로 되돌리면 완화 전(창 안 1통) 동작으로 즉시 복귀한다 — 코드 변경 없이 env + 재시작.
+#   MIN_GAP 은 개수와 무관하게 항상 적용된다(개수 상한만으론 "10초 안에 3연발"을 못 막는다).
+DM_RECIPIENT_MAX_PER_COOLDOWN = config("DM_RECIPIENT_MAX_PER_COOLDOWN", default=3, cast=int)
+DM_RECIPIENT_MIN_GAP_SECONDS = config("DM_RECIPIENT_MIN_GAP_SECONDS", default=60, cast=int)
 
 # P7 — 백로그 경고 임계. window 만료 임박 판정 시간 / 가장 오래된 QUEUED 경고 시간.
 DM_BACKLOG_RISK_HOURS = config("DM_BACKLOG_RISK_HOURS", default=6, cast=int)

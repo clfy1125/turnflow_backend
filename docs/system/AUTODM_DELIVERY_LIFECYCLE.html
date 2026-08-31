@@ -710,7 +710,7 @@
         <tr><td><b>P7</b></td><td><b>백로그 모니터링</b> <code>GET .../admin/auto-dm/backlog/</code> + <code>dm_backlog_alert</code>(30분 Telegram)</td><td>적체→<b>윈도우 만료 손실(E1)</b> 가시화</td></tr>
         <tr><td><b>P8</b></td><td>거버너 <b>fail-closed</b> — <code>AppConfig.ready()</code>가 센티넬(<code>dmrate:alive</code>)을 심고, 소멸=Redis flush 로 보아 그 시각까지 차단. 콜드스타트(배포)는 안 막힘. <b>v3.10.1</b>: <code>rehydrate_from_db()</code>가 <code>SentDMLog.submitted_at</code>에서 카운터 재구성 + <code>reset_until</code> 삭제(동결 즉시 해제), <code>dr_catchup</code> STEP0 / <code>worker_ready</code>에서 호출</td><td>Redis 리셋 후 <b>과발송→밴</b>(E3)</td></tr>
         <tr><td><b>P9</b></td><td><code>dead_letter_alerter</code>·<code>dm_backlog_alert</code>·Action Block 트립 <b>Telegram</b> 표준화</td><td>장애 인지 지연(G1)</td></tr>
-        <tr><td><b>P10</b></td><td>동일 수신자 쿨다운 60s→<b>설정화</b>(<code>DM_RECIPIENT_COOLDOWN_SECONDS</code>, 기본 300s)</td><td>도배·계정 보호(B4)</td></tr>
+        <tr><td><b>P10</b></td><td>동일 수신자 쿨다운 60s→<b>설정화</b>(<code>DM_RECIPIENT_COOLDOWN_SECONDS</code>, 기본 300s). <b>v2(2026-08-31)</b>: 세 손잡이로 분해 — ①통수 모수를 '살아있는 루트 DM'으로 좁힘(<code>MAX_PER_COOLDOWN</code>=3, 실패·reward 제외) ②개수와 무관한 최소 간격(<code>MIN_GAP_SECONDS</code>=60) ③완화는 같은 게시물 안에서만(<code>SentDMLog.media_id</code>, 마이그 0052). 순수 완화 — <code>MAX_PER_COOLDOWN=1</code> 로 즉시 롤백</td><td>도배·계정 보호(B4)</td></tr>
         <tr><td><b>P11</b></td><td><code>AutoDMCampaignSerializer.miss_recovery</code> — any_media/story_reply 위험 경고 노출(프론트 고지)</td><td>보정 불가 트리거 <b>위험고지</b>(A1·any_media)</td></tr>
         <tr><td><b>P12</b></td><td><b>code 1/2 "error-but-delivered" 중복 방지</b>(커밋 d03a101) — P6의 검증-후-재발송을 Meta code 1/2까지 확장. recent=True→도착확정, code 1/2 None→<b>defer</b>(무손실, anomaly와 비대칭), False→defer. rate-limit <code>{4,17,32,368,613}</code>은 검증 제외(§5.1·§8.2)</td><td>오프닝 DM <b>2개 중복 발송</b>(2026-07-01 실측)</td></tr>
         <tr><td><b>P13</b></td><td><b>웹훅 구독 재구독 자동화</b>(커밋 e538a9b·986be99) — Meta auto-disable 로 댓글 웹훅 무음이 되는 것을 <code>resubscribe_all_webhooks</code>(Beat 6h·<code>ScheduledJob</code> 시드) + DR startup + <code>manage.py resubscribe_webhooks</code>로 복구(§8.5)</td><td>엣지 장애/DR 후 <b>캠페인 무음 정지</b></td></tr>
@@ -723,6 +723,8 @@
       <span class="state s-gray"><code>DM_ACTION_BLOCK_BASE_COOLDOWN_HOURS</code><small>24</small></span>
       <span class="state s-gray"><code>DM_ACTION_BLOCK_MAX_COOLDOWN_DAYS</code><small>7</small></span>
       <span class="state s-gray"><code>DM_RECIPIENT_COOLDOWN_SECONDS</code><small>300</small></span>
+      <span class="state s-gray"><code>DM_RECIPIENT_MAX_PER_COOLDOWN</code><small>3</small></span>
+      <span class="state s-gray"><code>DM_RECIPIENT_MIN_GAP_SECONDS</code><small>60</small></span>
       <span class="state s-gray"><code>DM_BACKLOG_RISK_HOURS</code><small>6</small></span>
       <span class="state s-gray"><code>DM_BACKLOG_OLDEST_ALERT_HOURS</code><small>2</small></span>
     </div>

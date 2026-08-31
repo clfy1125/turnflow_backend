@@ -635,6 +635,86 @@ def _recipient_match_q(*, user_id: str = "", username: str = ""):
     return q
 
 
+def _recipient_cooldown_skip_reason(*, campaign, match_q, media_id: str = "") -> str | None:
+    """동일 수신자(같은 캠페인) 도배 방지 판정의 **단일 소스**. 스킵 사유 또는 None.
+
+    두 호출부(댓글 / 스토리 답장)가 공유한다 — 조건을 복제하면 한쪽만 고쳐졌을 때
+    같은 사람이 경로에 따라 다른 수의 DM 을 받는다.
+
+    v2 (2026-08-31) — 종전 "창 안에 로그가 하나라도 있으면 차단"(`.exists()`)을 세 개의
+    독립된 손잡이로 분해했다. 종전엔 완화 폭을 키우는 순간 (a)실패 재시도가 창 안에서
+    N배로 늘고, (b)게이트 캠페인은 opening+reward 가 통수를 먹어 완화가 반만 되고,
+    (c)개수만 늘리면 몇 초 안에 N연발이 나가고, (d)any_media 캠페인에서 게시물마다
+    같은 문구가 나가는 네 가지 문제가 동시에 생긴다.
+
+    손잡이 1 — **통수 모수를 좁힌다** (`LIVE_SEND_STATUSES` + 루트 DM 만).
+        실패·스킵·미게시 복구대기는 통수를 소진하지 않는다(대신 아래 (B)가 통째로 차단).
+        reward·재안내(자식 DM)도 세지 않는다 → 게이트/비게이트 캠페인이 같게 동작한다.
+    손잡이 2 — **최소 간격**(`DM_RECIPIENT_MIN_GAP_SECONDS`)은 상태와 무관하게 항상.
+        "5분에 3통" 만 두면 "10초에 3연발" 이 허용된다 — 봇 지문·유저 체감 도배의 실체는
+        개수보다 간격이다.
+    손잡이 3 — **게시물 범위**. 완화는 *같은 게시물* 안에서만. 다른 게시물 건이 창 안에
+        있거나 게시물을 모르면(`media_id` 결측) 허용량이 1로 떨어진다 → any_media 캠페인의
+        게시물 팬아웃은 종전대로 1통.
+
+    ★ 이 판정은 **순수 완화**다 — 종전에 통과했던 건을 새로 막는 분기는 없다.
+      (종전 = 창 안 로그 존재 → 차단. 지금 = 비-live 로그 존재 → 차단(B, 동일) /
+       live 로그는 간격·허용량 안에서만 통과.) 그래서 롤아웃 리스크가 '더 나가는' 쪽에만 있다.
+
+    ⚠️ 게시된 복구 안내(`recovery_reply_id` 있는 RECOVERY_PENDING)는 모수에서 제외한다 —
+      "숨김함 수락 후 재댓글"은 정상 흐름이고, 그 재댓글이 쿨다운에 막히면 복구가 죽는다.
+      미게시 pending 은 제외하지 않는다: 채널이 계속 닫힌 유저의 재댓글마다 실패가 반복돼
+      페이서를 갉아먹고 실패통계를 부풀린다(v1 주석의 사고 이력).
+    """
+    if match_q is None:
+        return None  # 수신자 키를 하나도 모르면 매칭 불가 — 종전과 동일하게 통과
+
+    cooldown_s = getattr(settings, "DM_RECIPIENT_COOLDOWN_SECONDS", 300)
+    if cooldown_s <= 0:
+        return None
+    max_per_window = max(1, getattr(settings, "DM_RECIPIENT_MAX_PER_COOLDOWN", 1))
+    min_gap_s = getattr(settings, "DM_RECIPIENT_MIN_GAP_SECONDS", 0)
+
+    now = timezone.now()
+    window = (
+        SentDMLog.objects.filter(
+            match_q,
+            campaign=campaign,
+            created_at__gte=now - timedelta(seconds=cooldown_s),
+        )
+        # 게시된 복구 안내만 면제 (위 ⚠️ 참고)
+        .exclude(Q(status=SentDMLog.Status.RECOVERY_PENDING) & ~Q(recovery_reply_id=""))
+    )
+
+    # (A) 손잡이 2 — 최소 간격. 성공/실패 무관 '직전 발송'과의 거리만 본다.
+    if min_gap_s > 0 and window.filter(created_at__gte=now - timedelta(seconds=min_gap_s)).exists():
+        return f"recipient_cooldown_min_gap_{min_gap_s}s"
+
+    # (B) 실패·스킵·미게시 복구대기가 창 안에 있으면 종전과 동일하게 전체 차단.
+    #     완화분이 '실패 N회' 로 소비되는 것을 막는 지점 (손잡이 1의 뒷면).
+    if window.exclude(status__in=SentDMLog.LIVE_SEND_STATUSES).exists():
+        return f"recipient_cooldown_recent_failure_{cooldown_s}s"
+
+    # (C) 손잡이 1 — 살아있는 **루트** DM 만 통수로 센다 (reward/재안내 자식 제외).
+    live_media = list(
+        window.filter(
+            status__in=SentDMLog.LIVE_SEND_STATUSES,
+            dm_kind__in=(SentDMLog.DMKind.OPENING, SentDMLog.DMKind.STANDALONE),
+            parent_log__isnull=True,
+        ).values_list("media_id", flat=True)
+    )
+    if not live_media:
+        return None
+
+    # (D) 손잡이 3 — 게시물 범위. 창 안 전부가 '이번과 같은 게시물' 일 때만 완화한다.
+    this_media = str(media_id or "").strip()
+    same_media_only = bool(this_media) and all(str(m or "") == this_media for m in live_media)
+    allowance = max_per_window if same_media_only else 1
+    if len(live_media) >= allowance:
+        return f"recipient_cooldown_max_{allowance}_per_{cooldown_s}s"
+    return None
+
+
 def _flip_recovery_on_success(log, campaign) -> int:
     """어떤 발송이든 같은 (캠페인, 수신자)로 ACCEPTED 되면, 그 수신자의 이전
     RECOVERY_PENDING opening 들을 RECOVERY_DELIVERED(성공·종결)로 승격한다.
@@ -1035,6 +1115,7 @@ def process_comment_and_send_dm(self, webhook_payload: dict):
                     from_user_id=from_user_id or from_username,
                     from_username=from_username,
                     webhook_payload=webhook_payload,
+                    media_id=canonical_media_id,
                 )
             )
 
@@ -1406,19 +1487,23 @@ def _enqueue_send_dm_for_story_reply(
             "reason": "self_story_reply",
         }
 
-    # 수신자 쿨다운 (동일 사용자가 연속 답장하는 케이스 방어; DM_RECIPIENT_COOLDOWN_SECONDS)
-    cooldown_s = getattr(settings, "DM_RECIPIENT_COOLDOWN_SECONDS", 300)
-    cooldown_cutoff = timezone.now() - timedelta(seconds=cooldown_s)
-    recent = SentDMLog.objects.filter(
+    # 수신자 쿨다운 (동일 사용자가 연속 답장하는 케이스 방어) — 판정은 댓글 경로와 같은
+    # _recipient_cooldown_skip_reason.
+    # ★ 스토리 답장은 media_id 를 넘기지 않는다 = 손잡이 3의 허용량이 1로 떨어져 **종전 동작
+    #   그대로**(창 안 1통)다. 의도된 선택: 완화 요청은 댓글 캠페인 대상이고, 스토리 답장은
+    #   이미 열린 대화창(SEND_API)이라 연속 답장에 매번 자동 DM 이 붙으면 대화가 망가진다.
+    #   스토리에도 완화가 필요해지면 story_id 를 media_id 로 넘기면 된다.
+    # ★ 매칭은 종전대로 recipient_user_id 정확일치 — 스토리 답장은 웹훅(IGSID)으로만 들어와
+    #   username 키공간이 없다. 여기서 _recipient_match_q 로 넓히면 차단만 늘어난다.
+    _cooldown_reason = _recipient_cooldown_skip_reason(
         campaign=campaign,
-        recipient_user_id=sender_user_id,
-        created_at__gte=cooldown_cutoff,
-    ).exists()
-    if recent:
+        match_q=Q(recipient_user_id=sender_user_id),
+    )
+    if _cooldown_reason:
         return {
             "campaign_id": str(campaign.id),
             "status": "skipped",
-            "reason": f"recipient_cooldown_{cooldown_s}s",
+            "reason": _cooldown_reason,
         }
 
     idempotency_key = InstagramMessagingService.build_idempotency_key(
@@ -1607,6 +1692,7 @@ def _enqueue_send_dm(
     from_user_id: str,
     from_username: str,
     webhook_payload: dict,
+    media_id: str = "",
 ) -> dict:
     """SentDMLog 행을 멱등하게 INSERT하고 send_dm_task 큐 등록.
 
@@ -1614,6 +1700,10 @@ def _enqueue_send_dm(
       - opening DM 본문 = campaign.get_opening_message() (follow_gate 안내 자동 첨부)
       - dm_kind = OPENING(gate 사용 시) / STANDALONE
       - gate_status = PENDING(gate 사용 시) / NONE
+
+    ``media_id`` = 트리거가 된 게시물. 동일 수신자 쿨다운의 **게시물 범위** 판정에 쓰이고
+    로그에도 저장된다. 넘기지 않으면 쿨다운 완화가 적용되지 않아 창 안 1통으로 떨어진다
+    (캠페인의 media_id 로 대체 불가 — any_media 캠페인은 그 값이 비어 있다).
     """
     ig_conn = campaign.ig_connection
 
@@ -1644,34 +1734,33 @@ def _enqueue_send_dm(
             "reason": "self_comment",
         }
 
-    # ★ 동일 수신자 쿨다운(DM_RECIPIENT_COOLDOWN_SECONDS): 같은 사람이 단시간에 여러 댓글 달면
-    # idempotency_key 는 comment_id 별로 다르므로 중복 방지 안 됨 → 별도 가드(계정 보호).
-    # 예외(좁게): **안내 댓글이 실제 게시된**(recovery_reply_id 있음) RECOVERY_PENDING 만
-    # 쿨다운 모수에서 제외 — 복구 안내("수락 후 다시 댓글")를 보고 사용자가 5분 내에 재댓글을
-    # 다는 것이 정상 흐름이므로. 미게시 pending(중복 실패의 silent 전이)까지 면제하면 채널이
-    # 계속 닫힌 유저의 재댓글마다 실패 시도가 무한 반복된다(페이서 소모·실패통계 증폭) —
-    # 게시된 안내는 수신자당 1회뿐이라 면제도 실질 1건으로 캡된다.
-    cooldown_s = getattr(settings, "DM_RECIPIENT_COOLDOWN_SECONDS", 300)
-    cooldown_cutoff = timezone.now() - timedelta(seconds=cooldown_s)
+    # ★ 동일 수신자 쿨다운: 같은 사람이 단시간에 여러 댓글 달면 idempotency_key 는 comment_id
+    # 별로 다르므로 중복 방지가 안 된다 → 별도 가드(계정 보호). 판정은 전부
+    # _recipient_cooldown_skip_reason 에 있다(세 손잡이의 근거는 그쪽 docstring).
     # 매칭은 _recipient_match_q — recipient 키 이원화(웹훅 IGSID / 폴링·from 결측 username 폴백)를
     # 넘어야 한다. recipient_user_id 정확일치만 보면 같은 사람의 로그가 IGSID/username 두 키공간에
     # 갈려(예: c1 은 웹훅 IGSID 발송, c2 는 폴링 username 발송) 서로의 최근 발송을 못 봐 쿨다운이
     # 우회된다(_flip_recovery_on_success / _maybe_route_recovery_recomment 와 동일 헬퍼로 통일).
-    _cooldown_match_q = _recipient_match_q(user_id=from_user_id, username=from_username)
-    recent_to_same_recipient = _cooldown_match_q is not None and (
-        SentDMLog.objects.filter(
-            _cooldown_match_q,
-            campaign=campaign,
-            created_at__gte=cooldown_cutoff,
-        )
-        .exclude(Q(status=SentDMLog.Status.RECOVERY_PENDING) & ~Q(recovery_reply_id=""))
-        .exists()
+    _cooldown_reason = _recipient_cooldown_skip_reason(
+        campaign=campaign,
+        match_q=_recipient_match_q(user_id=from_user_id, username=from_username),
+        media_id=media_id,
     )
-    if recent_to_same_recipient:
+    if _cooldown_reason:
+        # 쿨다운 스킵은 SentDMLog 행을 만들지 않아 DB 에 흔적이 안 남는다 → 이 로그가 유일한
+        # 관측 지점이다(완화 전후 비교·"정당한 발송을 막고 있나" 판정). 지우지 말 것.
+        logger.info(
+            "recipient_cooldown_skip campaign=%s media=%s recipient=%s/%s reason=%s",
+            campaign.id,
+            media_id or "-",
+            from_user_id or "-",
+            from_username or "-",
+            _cooldown_reason,
+        )
         return {
             "campaign_id": str(campaign.id),
             "status": "skipped",
-            "reason": f"recipient_cooldown_{cooldown_s}s",
+            "reason": _cooldown_reason,
         }
 
     # ★ 한 댓글 = 비공개답글(Private Reply) 1회 (Meta 제약). 다른 캠페인이 같은 댓글에 이미
@@ -1679,20 +1768,10 @@ def _enqueue_send_dm(
     #   캠페인 1개' 가드가 우회돼 같은 게시물에 활성 캠페인이 2개로 새는 경우에도, code 1
     #   ("이미 답글 있음") 무한 재시도로 백로그가 부풀지 않게 하는 최종 안전망이다.
     #   실패(failed_*)·skipped·recovery_pending 로그는 슬롯을 점유하지 않으므로(재시도 여지)
-    #   점유 상태에서 제외한다.
+    #   점유 상태에서 제외한다 — 판정 집합은 SentDMLog.LIVE_SEND_STATUSES(쿨다운 모수와 공유).
     if comment_id:
-        _slot_occupying = (
-            SentDMLog.Status.QUEUED,
-            SentDMLog.Status.SUBMITTING,
-            SentDMLog.Status.PENDING,
-            SentDMLog.Status.SENT,
-            SentDMLog.Status.ACCEPTED,
-            SentDMLog.Status.DELIVERED,
-            SentDMLog.Status.READ,
-            SentDMLog.Status.RECOVERY_DELIVERED,
-        )
         already_claimed = (
-            SentDMLog.objects.filter(comment_id=comment_id, status__in=_slot_occupying)
+            SentDMLog.objects.filter(comment_id=comment_id, status__in=SentDMLog.LIVE_SEND_STATUSES)
             .exclude(campaign=campaign)
             .exists()
         )
@@ -1729,6 +1808,7 @@ def _enqueue_send_dm(
         campaign=campaign,
         comment_id=comment_id,
         comment_text=comment_text,
+        media_id=str(media_id or ""),
         recipient_user_id=from_user_id,
         recipient_username=from_username,
         message_sent=message_body,
@@ -3210,6 +3290,7 @@ def _poll_one_media(conn: IGAccountConnection, media_id: str, now) -> dict:
                     from_user_id=recipient_key,
                     from_username=uname,
                     webhook_payload=enq_payload,
+                    media_id=media_id,
                 )
                 any_enqueued = True
 
@@ -3482,6 +3563,7 @@ def backfill_campaign_comments(self, campaign_id: str):
                         "comment_id": cid,
                         "comment_ts": c.get("timestamp"),
                     },
+                    media_id=camp.media_id,
                 )
                 status = res.get("status")
                 if status == "enqueued":
@@ -4195,6 +4277,7 @@ def _maybe_route_recovery_recomment(
                 "pending_log_id": str(pending.id),
                 "comment_id": comment_id,
             },
+            media_id=media_id,
         )
         if res.get("status") == "enqueued":
             pending.append_verification_log(

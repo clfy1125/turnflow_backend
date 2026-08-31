@@ -1632,6 +1632,22 @@ class SentDMLog(models.Model):
         Status.RECOVERY_DELIVERED,  # 복구 경로로 실제 재전송+접수됨 = 사용자에게 도착 보고 가능
     )
 
+    # "실제로 나갔거나 나가는 중" 인 상태 — **단일 소스**.
+    # 두 가드가 공유한다: ①한 댓글 = 비공개답글 1회 슬롯 점유 판정, ②동일 수신자 쿨다운의
+    # 통수 모수. 실패(failed_*)·skipped·recovery_pending 은 슬롯을 점유하지도, 통수를
+    # 소진하지도 않는다(재시도 여지가 있고, 완화분이 '실패 N회' 로 소비되면 안 되므로).
+    # ⚠️ 리터럴로 복제하지 말 것 — 한쪽만 바뀌면 두 가드의 판정이 조용히 갈린다.
+    LIVE_SEND_STATUSES = (
+        Status.QUEUED,
+        Status.SUBMITTING,
+        Status.PENDING,
+        Status.SENT,
+        Status.ACCEPTED,
+        Status.DELIVERED,
+        Status.READ,
+        Status.RECOVERY_DELIVERED,
+    )
+
     # 되살릴 수 있는 종결 상태 (P1 — 무손실 하드닝):
     # 토큰 만료(일시적, 재연동/갱신으로 해소)·스케줄 스킵(창이 다시 열림)은 '일시적 원인'이라
     # 같은 row 를 QUEUED 로 되돌려 재발송할 수 있다(같은 idempotency_key 재사용 → 중복 INSERT 불가).
@@ -1681,6 +1697,14 @@ class SentDMLog(models.Model):
     # 댓글 정보
     comment_id = models.CharField(max_length=255, verbose_name="댓글 ID", db_index=True)
     comment_text = models.TextField(blank=True, verbose_name="댓글 내용")
+
+    # 트리거가 된 게시물 ID. 캠페인의 media_id 로는 대체 불가 — any_media 캠페인은
+    # media_id 가 비어 있고, 바로 그 캠페인이 "한 사람이 여러 게시물에 댓글" 케이스를 만든다.
+    # 용도: 동일 수신자 쿨다운의 **게시물 범위** 판정(같은 게시물 안에서만 완화).
+    # 비어 있으면(구 데이터·미지) 완화하지 않고 창 안 1통으로 떨어진다 — 보수적 폴백.
+    media_id = models.CharField(
+        max_length=255, blank=True, default="", verbose_name="트리거 게시물 ID"
+    )
 
     # 수신자 정보
     recipient_user_id = models.CharField(max_length=255, verbose_name="수신자 Instagram ID")

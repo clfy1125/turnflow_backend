@@ -159,7 +159,7 @@
 - 발송 전 가드(순서대로):
   1. `is_runnable_now() == False` → `skip = outside_schedule_window` (TOCTOU 안전망, 로그도 안 남김).
   2. self-comment → `skip = self_comment`.
-  3. 같은 캠페인+수신자로 **60초 내** 발송 로그 존재 → `skip = recipient_cooldown_60s` (같은 사람의 단시간 다중 댓글 차단. `idempotency_key`는 comment_id별로 달라 이걸로는 못 막으므로 별도 가드).
+  3. 동일 수신자 쿨다운 → `skip = recipient_cooldown_*` (같은 사람의 단시간 다중 댓글 차단. `idempotency_key`는 comment_id별로 달라 이걸로는 못 막으므로 별도 가드). 판정 단일 소스 = `_recipient_cooldown_skip_reason` — 자세한 규칙은 §2.4.1.
   4. `idempotency_key` 계산.
   5. follow-gate 사용 캠페인이면 `dm_kind=OPENING / gate_status=PENDING`, 아니면 `STANDALONE / NONE`.
   6. `transaction.atomic` 안에서 **`SentDMLog(status=QUEUED)` INSERT** → IntegrityError(중복 `idempotency_key`)면 `duplicate` 반환.
@@ -168,6 +168,31 @@
 > **v3.9 변경**: 계정 거버너/페이싱 평가는 **enqueue가 아니라 `send_dm_task` 단일 지점**으로 이동했다. 과거엔 초과 시 `SentDMLog(SKIPPED)`로 **드랍**했지만, 이제는 항상 `QUEUED`로 적재하고 발송 직전에 초과 판정되면 **defer**한다(드랍 없음).
 >
 > **v4.3~ 변경**: 캠페인별 시간당 한도(`max_sends_per_hour` / `can_send_more()` 게이트)는 **완전히 제거**됐다(필드·DB 컬럼 삭제). 발송 속도는 계정 단위 스무스 페이서(`dm_pacer`)가 담당하며, `can_send_more()`는 "캠페인 활성 여부"만 반환하는 표시용으로만 남았다(발송 경로는 이 값을 보지 않음).
+
+### 2.4.1 동일 수신자 쿨다운 v2 — 세 손잡이 (2026-08-31)
+
+스코프는 **(캠페인 × 수신자)** 다 — 계정/워크스페이스 단위가 아니라서, 같은 사람이 서로 다른 캠페인에 걸리면 이 가드와 무관하게 각각 받는다. 판정 단일 소스 = `_recipient_cooldown_skip_reason` (댓글 경로와 스토리 답장 경로가 공유).
+
+v1 은 "창(`DM_RECIPIENT_COOLDOWN_SECONDS`=300s) 안에 로그가 하나라도 있으면 차단"(`.exists()`)이었다. 여기서 허용 통수만 늘리면 네 가지가 동시에 깨진다 — ①실패 재시도가 창 안에서 N배, ②게이트 캠페인은 opening+reward 가 통수를 먹어 완화가 반만, ③개수만 늘리면 "10초 안에 N연발", ④`any_media` 캠페인이 게시물마다 같은 문구 발송. 그래서 손잡이를 셋으로 분리했다.
+
+| 손잡이 | 설정 | 기본 | 규칙 |
+|---|---|---|---|
+| 1. 통수 모수 | `DM_RECIPIENT_MAX_PER_COOLDOWN` | 3 | `SentDMLog.LIVE_SEND_STATUSES` **이고** 루트 DM(`dm_kind ∈ {opening, standalone}` + `parent_log is null`)만 센다. reward·재안내는 통수를 먹지 않는다 |
+| 2. 최소 간격 | `DM_RECIPIENT_MIN_GAP_SECONDS` | 60 | 상태·개수와 무관하게 직전 로그와의 거리만 본다. 도배의 실체는 개수보다 간격 |
+| 3. 게시물 범위 | (설정 없음) | — | 완화는 *같은 게시물* 안에서만. 창 안에 다른 게시물 건이 있거나 `media_id` 결측이면 허용량이 **1** 로 떨어진다 |
+
+판정 순서와 스킵 사유(`reason`):
+
+1. `recipient_cooldown_min_gap_{N}s` — 손잡이 2.
+2. `recipient_cooldown_recent_failure_{N}s` — 창 안에 `LIVE_SEND_STATUSES` 아닌 로그(실패·skipped·**미게시** `recovery_pending`)가 있으면 **전체 차단**(= v1 과 동일). 완화분이 "실패 N회"로 소비되는 것을 막는 지점.
+3. `recipient_cooldown_max_{allowance}_per_{N}s` — 손잡이 1·3.
+
+- **게시된 복구 안내**(`recovery_reply_id` 있는 `recovery_pending`)는 모수에서 제외한다(v1 예외 유지) — "숨김함 수락 후 재댓글"이 정상 흐름이라 여기서 막히면 복구가 죽는다. 미게시 pending 은 제외하지 않는다(채널이 계속 닫힌 유저의 재댓글마다 실패 반복 → 페이서 소모·실패통계 증폭).
+- ★ **순수 완화**다 — v1 에서 통과했던 건을 새로 막는 분기가 없다. `DM_RECIPIENT_MAX_PER_COOLDOWN=1` 로 두면 v1 과 동일 동작(코드 변경 없이 env + 재시작으로 즉시 롤백). 회귀 방어는 `test_recipient_cooldown.py::TestNoNewBlocking`.
+- **스토리 답장 경로는 종전 그대로**(창 안 1통). `media_id` 를 넘기지 않아 손잡이 3이 허용량을 1로 떨어뜨린다 — 의도된 선택(이미 열린 대화창이라 연속 답장마다 자동 DM 이 붙으면 대화가 망가진다). 완화하려면 `story_id` 를 `media_id` 로 넘기면 된다.
+- `SentDMLog.media_id`(마이그 0052) = 손잡이 3의 판정 근거. 캠페인의 `media_id` 로 대체 불가 — `any_media` 캠페인은 그 값이 비어 있고, 바로 그 캠페인이 "한 사람이 여러 게시물에 댓글" 케이스를 만든다. 배포 직후 몇 분간은 창 안 구 데이터가 `media_id=""` 라 완화가 적용되지 않는다(보수적 폴백, 자동 해소).
+- ⚠️ **쿨다운 스킵은 `SentDMLog` 행을 만들지 않아 DB 에 흔적이 없다** — 유일한 관측 지점이 `logger.info("recipient_cooldown_skip ...")` 다. 완화 전후 비교·"정당한 발송을 막고 있나" 판정이 이 로그에 달려 있으므로 지우지 말 것.
+- 과금·통계 영향 없음: 월 한도는 **(캠페인 × 수신자) 고유쌍**(`billing.dm_limits`)이고 캠페인 통계도 사람 단위(`campaign_stats.unique_targets`)라, 같은 사람에게 3통이 나가도 각각 1로 잡힌다. 이벤트 단위 `gauge` 만 올라간다.
 
 ---
 
@@ -418,7 +443,7 @@ SUBMITTING ──분류된 비재시도 실패──▶ FAILED_TOKEN / FAILED_WI
 - **v3.10 (P3)**: `_verify_webhook_signature`로 앱 시크릿 HMAC-SHA256 검증 추가. `WEBHOOK_HMAC_ENFORCED=True`면 불일치 403, False(기본)면 경고만(롤아웃 관측). `get_instagram_app_secret()` 재사용.
 
 ### 8.4 기타
-- comments 경로는 `EventInbox` 멱등성을 쓰지 않음 — 중복 방어는 `idempotency_key` UNIQUE + parent/self skip + 쿨다운(`DM_RECIPIENT_COOLDOWN_SECONDS`, 기본 300s) 조합에 의존.
+- comments 경로는 `EventInbox` 멱등성을 쓰지 않음 — 중복 방어는 `idempotency_key` UNIQUE + parent/self skip + 동일 수신자 쿨다운(§2.4.1) 조합에 의존.
 - 스팸 게이트가 `media_id`로 캠페인 1건만 찾으므로 `any_media`/`next_media` 트리거엔 누락될 수 있음(§2.2).
 - `mentions`/`messaging_postbacks`(changes 내) 필드는 현재 미처리(로깅만).
 - **`ANY_MEDIA`/`STORY_REPLY`는 댓글 누락 보정(§9) 대상이 아님** — 전자는 폴링 비용, 후자는 댓글이 아니라 messages 이벤트(재조회할 소스 없음). 웹훅 유실 시 보정망이 없어 **프론트 위험고지**로 대응(§11 P11 `miss_recovery` 필드).
@@ -519,7 +544,7 @@ SUBMITTING ──분류된 비재시도 실패──▶ FAILED_TOKEN / FAILED_WI
 | **P7** | **백로그 모니터링** `GET .../admin/auto-dm/backlog/`(QUEUED 적체·윈도우 임박·throughput/inflow·상위 계정) + `dm_backlog_alert`(30분 Telegram) | 유입>처리량 적체로 인한 **윈도우 만료 손실(E1)** 가시화 |
 | **P8** | 거버너 **fail-closed** — `AppConfig.ready()`가 센티넬(`dmrate:alive`)을 심고, check 에서 센티넬 소멸=Redis flush 로 보아 그 시각까지 차단(`dmrate:reset_until`). 콜드스타트(배포)는 ready 가 재시드해 안 막힘. **v3.10.1: `rehydrate_from_db()`**가 `SentDMLog.submitted_at`에서 카운터 재구성 + `reset_until` 삭제로 **동결 즉시 해제**(dr_catchup STEP0 / worker_ready) → 1h 강제 동결 불필요(§8.1b) | Redis 리셋 후 **순간 과발송→밴**(E3) |
 | **P9** | `dead_letter_alerter`·`dm_backlog_alert`·Action Block 트립 **Telegram** 표준화 | 장애 인지 지연(G1) |
-| **P10** | 동일 수신자 쿨다운 60s→**설정화**(`DM_RECIPIENT_COOLDOWN_SECONDS`, 기본 300s) | 도배·계정 보호(B4) |
+| **P10** | 동일 수신자 쿨다운 60s→**설정화**(`DM_RECIPIENT_COOLDOWN_SECONDS`, 기본 300s). v2(2026-08-31)에서 **세 손잡이**로 분해 — 통수/최소간격/게시물범위(§2.4.1) | 도배·계정 보호(B4) |
 | **P11** | `AutoDMCampaignSerializer.miss_recovery` — any_media/story_reply 는 `auto_recovery_supported=False`+경고 문구 노출(프론트 고지) | 보정 불가 트리거 **위험고지**(A1·any_media) |
 | **P12** | **code 1/2 "error-but-delivered" 중복 방지**(커밋 d03a101) — P6의 검증-후-재발송을 Meta code 1/2까지 확장. recent=True→도착확정, code 1/2 None→**defer**(무손실, anomaly와 비대칭), False→defer. rate-limit `{4,17,32,368,613}`은 검증 제외(§5.1·§8.2) | 오프닝 DM **2개 중복 발송**(2026-07-01 실측) |
 | **P13** | **웹훅 구독 재구독 자동화**(커밋 e538a9b·986be99) — Meta auto-disable 로 댓글 웹훅 무음이 되는 것을 `resubscribe_all_webhooks`(Beat 6h·`ScheduledJob` 시드) + DR startup + `manage.py resubscribe_webhooks`로 복구(§8.5) | 엣지 장애/DR 후 **캠페인 무음 정지** |
@@ -531,6 +556,8 @@ SUBMITTING ──분류된 비재시도 실패──▶ FAILED_TOKEN / FAILED_WI
 | `DM_ACTION_BLOCK_BASE_COOLDOWN_HOURS` | 24 | P4 |
 | `DM_ACTION_BLOCK_MAX_COOLDOWN_DAYS` | 7 | P4 |
 | `DM_RECIPIENT_COOLDOWN_SECONDS` | 300 | P10 |
+| `DM_RECIPIENT_MAX_PER_COOLDOWN` | 3 | P10 v2 (1=완화 전 동작) |
+| `DM_RECIPIENT_MIN_GAP_SECONDS` | 60 | P10 v2 |
 | `DM_BACKLOG_RISK_HOURS` | 6 | P7 |
 | `DM_BACKLOG_OLDEST_ALERT_HOURS` | 2 | P7 |
 
