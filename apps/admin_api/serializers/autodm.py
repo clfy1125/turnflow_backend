@@ -571,13 +571,43 @@ class AdminDMLogDetailSerializer(serializers.ModelSerializer):
 
         `description` 은 뺀다 — cause+next_step 합본이라 어드민이 두 줄로 나눠 그리는
         구조에서 중복이고, 지우는 쪽이 "어느 필드가 정본인가"를 헷갈리지 않게 한다.
+
+        ★ v4.6 — 계정 단위 발송 정지도 함께 넘긴다. 이걸 빼면 정지 중 계정의 대기 건에서
+        어드민은 "발송 순서를 기다리고 있어요", 고객 화면은 "계정 제한으로 일시 중지"가
+        떠서 위 '사본 금지' 원칙이 인자 누락으로 무력화된다(CS 응대 중 오판의 씨앗).
         """
         from apps.integrations.dm_frontend_actions import build_frontend_action
 
         action = build_frontend_action(
-            obj.status, obj.error_subcode, obj.error_code, obj.error_message
+            obj.status,
+            obj.error_subcode,
+            obj.error_code,
+            obj.error_message,
+            account_send_paused=self._account_send_paused(obj),
         )
         return {k: v for k, v in action.items() if k != "description"}
+
+    def _account_send_paused(self, obj: SentDMLog) -> bool:
+        """계정 단위 발송 정지 여부 — 계정당 1회만 조회하고 컨텍스트에 메모(N+1 방지).
+
+        유저용 ``SentDMLogSerializer._account_send_paused`` 와 같은 판정
+        (:func:`apps.integrations.rate_governor.account_send_paused`)을 쓴다.
+        """
+        try:
+            ext = str(obj.campaign.ig_connection.external_account_id or "")
+        except Exception:  # noqa: BLE001
+            return False
+        if not ext:
+            return False
+        memo = self.context.setdefault("_account_send_paused", {})
+        if ext not in memo:
+            from apps.integrations.rate_governor import account_send_paused
+
+            try:
+                memo[ext] = account_send_paused(ext)
+            except Exception:  # noqa: BLE001
+                memo[ext] = False
+        return memo[ext]
 
 
 # ===== DM 수신자(사람) 단위 롤업 =====

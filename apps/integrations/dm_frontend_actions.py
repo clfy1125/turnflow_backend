@@ -48,6 +48,7 @@ from .dm_user_reasons import (
     S_OTHER,
     S_OUTSIDE_SCHEDULE,
     S_SELF_RECIPIENT,
+    U_ACCOUNT_SEND_PAUSED,
     U_ALREADY_REPLIED,
     U_CONNECTION_LOST,
     U_DELIVERY_UNCONFIRMED,
@@ -159,6 +160,17 @@ _USER_COPY: dict[str, dict] = {
         "발송이 완료되지 않았어요",
         "인스타그램 서버 오류로 발송이 완료되지 않았어요.",
         "같은 캠페인에서 반복해서 발생한다면 문의해 주세요. 확인해 드릴게요.",
+    ),
+    # U9 — 계정 단위 발송 정지. U8(개별 요청 지연)과 **반드시 구분**해야 한다:
+    # U8 은 "이 건이 몇 초 늦다", U9 는 "이 계정의 모든 발송이 멈췄다" 다.
+    # ⚠️ 정지 기간을 문구에 숫자로 박지 말 것 — 반복 제한 시 쿨다운이 배로 늘어난다
+    #    (24h → 48h → … 최대 7d, `rate_governor._ACTION_BLOCK_*`). 남은 시간은
+    #    queue-state 의 `action_block_cooldown_seconds` 가 실시간으로 준다.
+    U_ACCOUNT_SEND_PAUSED: _copy(
+        "인스타그램 계정 제한으로 발송이 일시 중지되었어요",
+        "인스타그램이 이 계정의 메시지 발송을 일시적으로 제한했어요. 제한 중에 발송을 계속 시도하면 제한 기간이 오히려 길어질 수 있어서, 제한이 "
+        "풀릴 때까지 발송을 멈추고 순서를 보관하고 있어요. 발송 실패가 아니라 대기 상태예요.",
+        "제한이 해제되면 보관된 순서대로 자동으로 발송돼요. 따로 하실 일은 없어요.",
     ),
     # ── 건너뜀 10종 ──
     S_MONTHLY_DM_LIMIT: _copy(
@@ -282,6 +294,10 @@ _WAIT_STATUSES = ("accepted", "queued", "submitting", "pending", "rate_limited")
 #   영향 범위가 사실상 없고, 프론트가 배지를 user_reason 으로 옮기면(UC-6) 해소된다.
 _SEVERITY_BY_USER_REASON: dict[str, str] = {
     S_OTHER: "warning",
+    # U9 — status 는 queued(info·파란색)지만 계정이 멈춰 있는 건 "정상"이 아니다.
+    # 목록 배지와 어긋나지 않는다: queued 의 `status_group` 은 waiting 이고 프론트는
+    # waiting 을 amber 로 그리므로, 여기서 warning 을 주면 배지와 헤더가 **오히려 일치**한다.
+    U_ACCOUNT_SEND_PAUSED: "warning",
 }
 
 
@@ -329,6 +345,7 @@ def build_frontend_action(
     error_subcode: str = "",
     error_code: str = "",
     error_message: str = "",
+    account_send_paused: bool = False,
 ) -> dict:
     """로그 1건 → 프론트 표시 가이드.
 
@@ -338,6 +355,10 @@ def build_frontend_action(
         error_code: ``SentDMLog.error_code`` — **v4 신규**. 없으면 status 만으로 폴백하므로
             같은 status 안의 갈래(예: 100/2534014 수신자 없음 vs 100 일반)를 구분하지 못한다.
         error_message: 건너뜀(skipped) 사유 판정용 원문.
+        account_send_paused: 이 로그의 IG 계정이 계정 단위 발송 정지 중인가 (v4.6 신규).
+            로그 필드로는 알 수 없어(정지는 계정 상태) **호출부가 주입**한다 —
+            :meth:`apps.integrations.serializers.SentDMLogSerializer.get_frontend_action`
+            가 요청당 1회 조회해 캐싱한다.
 
     Returns:
         {
@@ -353,7 +374,9 @@ def build_frontend_action(
         }
     """
     status = str(status or "").strip()
-    user_reason = user_reason_for(status, error_code, error_subcode, error_message)
+    user_reason = user_reason_for(
+        status, error_code, error_subcode, error_message, account_send_paused
+    )
 
     if user_reason == NO_REASON:
         copy = _NON_ERROR_COPY.get(status)

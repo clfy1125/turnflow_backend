@@ -1469,12 +1469,44 @@ class SentDMLogSerializer(serializers.ModelSerializer):
         ★ error_code 를 반드시 함께 넘긴다 — 이게 없으면 같은 status 안의 갈래를 가르지
         못한다(예: 100/2534014 '수신자 없음' 과 100 일반 '대상 없음·만료'가 둘 다
         failed_param 이라 한 문구로 뭉쳐졌다).
+
+        ★ v4.6 — 계정 단위 발송 정지(`account_send_paused`)를 함께 넘긴다. 정지는 로그가
+        아니라 **계정의 현재 상태**라 로그 필드만 보면 알 수 없고, 그래서 정지 중 대기 건이
+        "발송 순서를 기다리고 있어요"(정상 톤)로 보였다.
         """
         from .dm_frontend_actions import build_frontend_action
 
         return build_frontend_action(
-            obj.status, obj.error_subcode, obj.error_code, obj.error_message
+            obj.status,
+            obj.error_subcode,
+            obj.error_code,
+            obj.error_message,
+            account_send_paused=self._account_send_paused(obj),
         )
+
+    def _account_send_paused(self, obj) -> bool:
+        """이 로그의 IG 계정이 발송 정지 중인가 — **계정당 1회만** 조회하고 메모한다.
+
+        목록 20건이면 캐시 조회도 20번이 되고, 캐시 miss 시엔 `DMAccountBlock` DB 폴백까지
+        행마다 돈다. 계정 단위 사실이므로 external_account_id 로 메모하면 요청당 1회다.
+
+        ⚠️ 판정 실패는 fail-open(정지 아님) — 표시용 부가 정보가 목록 응답을 깨뜨리면 안 된다.
+        """
+        try:
+            ext = str(obj.campaign.ig_connection.external_account_id or "")
+        except Exception:  # noqa: BLE001 — 조인 실패(고아 로그 등)
+            return False
+        if not ext:
+            return False
+        memo = self.context.setdefault("_account_send_paused", {})
+        if ext not in memo:
+            from .rate_governor import account_send_paused
+
+            try:
+                memo[ext] = account_send_paused(ext)
+            except Exception:  # noqa: BLE001
+                memo[ext] = False
+        return memo[ext]
 
     @extend_schema_field(serializers.BooleanField(allow_null=True))
     def get_follow_passed(self, obj):
@@ -1865,6 +1897,33 @@ class DMQueuePacingSerializer(serializers.Serializer):
     )
 
 
+class DMQueueWindowRiskSerializer(serializers.Serializer):
+    """재개 시점에 메시징 창이 닫혀 있을 대기 건 (v4.6).
+
+    계정 정지(Action Block) 중에 "제한이 풀리면 N명에게 보냅니다" 라고 쓰려면 그 N 이
+    **실제로 나갈 수 있는 수**여야 한다. 자료가 담긴 2번째 DM(게이트 리워드)의 창은 24h 인데
+    기본 쿨다운도 24h 라, 정지 시작 시점에 대기 중이던 리워드는 재개 시각과 만료 시각이
+    사실상 같아진다(prod 실측 0.6초 차이로 종결). 그래서 화면이 빼고 말할 수 있게 노출한다.
+    """
+
+    people = serializers.IntegerField(
+        help_text=(
+            "창이 닫혀 첫 DM 을 못 받게 될 사람 수. `people.waiting` 과 **같은 모수**(루트 DM)라 "
+            "`people.waiting - waiting_window_risk.people` 이 '실제로 보낼 수 있는 사람 수'다"
+        )
+    )
+    events = serializers.IntegerField(help_text="창이 닫힐 대기 이벤트 총수 (첫 DM + 2번째 DM)")
+    followup_events = serializers.IntegerField(
+        help_text=(
+            "그중 **2번째 DM**(자료·게이트 리워드). 창이 24h 라 정지 초반에 대기하던 건은 "
+            "구조적으로 여기 잡힌다 — `people` 에는 포함되지 않는다(사람 축이 루트 DM 기준)"
+        )
+    )
+    horizon_s = serializers.IntegerField(
+        help_text="판정 기준이 된 재개까지 남은 초 (= action_block_cooldown_seconds)"
+    )
+
+
 class DMQueueStateSerializer(serializers.Serializer):
     """DM 순차 발송 큐 현황 (게이지 + ETA) 응답 — v4.3 페이서 기반."""
 
@@ -1898,6 +1957,13 @@ class DMQueueStateSerializer(serializers.Serializer):
     )
     action_block_cooldown_seconds = serializers.IntegerField(
         help_text="Action Block 쿨다운 잔여 초 (0=해당 없음)"
+    )
+    waiting_window_risk = DMQueueWindowRiskSerializer(
+        help_text=(
+            "재개 시점에 이미 인스타그램 메시징 창이 닫혀 있을 대기 건. "
+            "'제한이 풀리면 N명에게 보냅니다' 같은 문구를 쓸 때 `people.waiting` 에서 "
+            "이 값(`people`)을 빼야 지킬 수 있는 약속이 된다"
+        )
     )
 
     eta_seconds = serializers.FloatField(

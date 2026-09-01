@@ -108,6 +108,19 @@ def action_block_cooldown_remaining(ig_account_id: str) -> int:
     return remaining if remaining > 0 else 0
 
 
+def account_send_paused(ig_account_id: str) -> bool:
+    """이 IG 계정의 DM 발송이 **계정 단위로 정지 중**인가 (표시 계층용 단일 판정).
+
+    ``_rate_defer`` 의 1번 게이트와 같은 사실을 본다 — 즉 "지금 이 계정의 대기 건은
+    Meta 로 나가지 않는다". 화면 문구(`user_reason=account_send_paused`)와 큐 현황
+    (`blocking_reason=action_block_cooldown`)이 **같은 근거**를 쓰게 하려고 여기 둔다.
+    임계값·키를 호출부에서 복제하면 화면과 실제 동작이 갈린다.
+
+    주의: 정지 판정은 **계정 상태**라 로그 단위로 캐싱하면 안 된다(요청당 1회면 충분).
+    """
+    return action_block_cooldown_remaining(ig_account_id) > 0
+
+
 def trip_action_block(ig_account_id: str, base_hours: int = None, max_days: int = None) -> int:
     """Action Block 감지 시 계정 쿨다운 설정(에스컬레이팅).
 

@@ -48,6 +48,7 @@ U_ALREADY_REPLIED = "already_replied"  # U6 이미 답장 있음
 U_DELIVERY_UNCONFIRMED = "delivery_unconfirmed"  # U7 도착 미확인
 U_SEND_DELAYED = "send_delayed"  # U8-지연 (아직 발송될 수 있음)
 U_SEND_INCOMPLETE = "send_incomplete"  # U8-종결 (사유 미확인)
+U_ACCOUNT_SEND_PAUSED = "account_send_paused"  # U9 계정 전체 발송 정지 (인스타그램 계정 제한)
 
 # 건너뜀(skipped) 8종 — 키는 admin 사전과 **같은 문자열**을 쓴다.
 # 어드민 `?error_reason=` 드릴다운과 네임스페이스를 공유하기 위함이며, 이 문구들을
@@ -130,6 +131,21 @@ _SKIPPED_NEEDLES: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 SKIPPED_STATUS = "skipped"
 
+# ── 계정 전체 발송 정지(U9) 가 덮어쓰는 status ──────────────────────────
+# 인스타그램이 계정 단위로 발송을 제한하면(:func:`apps.integrations.rate_governor.
+# trip_action_block`) 그 계정의 **모든 대기 건**이 쿨다운 만료까지 멈춘다. 그런데 로그에는
+# 아무 표식이 남지 않는다 — `_rate_defer` 가 status=queued + next_retry_at 만 갱신하기
+# 때문이다. 그래서 화면은 "발송 순서를 기다리고 있어요"(파란 정상 톤)로 떴고, 8/26 CS 에서
+# 고객은 그걸 보고 **"댓글이 씹혔다"** 고 판단했다(20분 통화로 해소).
+#
+# 정지 여부는 로그가 아니라 **계정의 현재 상태**라, 쓰기 경로에 표식을 남기는 대신
+# 읽는 시점에 판정해 덮는다. 그래서 (a) 마이그레이션이 필요 없고 (b) 쿨다운이 풀리면
+# 표식이 저절로 사라지며 (c) 이미 적체된 과거 로그에도 소급 적용된다.
+#
+# ⚠️ 종결 status 는 여기 넣지 말 것 — 이미 확정된 실패를 "정지 중"으로 덮으면 사용자가
+#    기다리면 갈 거라고 오해한다.
+_ACCOUNT_PAUSED_STATUSES = frozenset({"queued", "submitting", "pending", "rate_limited"})
+
 
 def _norm(value) -> str:
     return str(value or "").strip()
@@ -145,17 +161,33 @@ def skipped_user_reason(error_message: str) -> str:
 
 
 def user_reason_for(
-    status: str, error_code: str = "", error_subcode: str = "", error_message: str = ""
+    status: str,
+    error_code: str = "",
+    error_subcode: str = "",
+    error_message: str = "",
+    account_send_paused: bool = False,
 ) -> str:
     """(status, code, subcode, message) → `user_reason`. 오류가 아니면 빈 문자열.
 
     우선순위를 바꿀 때는 admin 사전(`dm_error_catalog`)과 함께 봐야 한다 — 갈리면 같은
     로그에 대해 어드민과 유저 화면이 다른 사유를 말하게 된다
     (``tests_dm_user_copy.py::TestAdminCatalogParity`` 가 전 조합을 대조한다).
+
+    Args:
+        account_send_paused: 이 로그가 속한 IG 계정이 **계정 단위 발송 정지** 중인가
+            (:func:`apps.integrations.rate_governor.account_send_paused`). 대기 status
+            에서만 U9 로 덮는다 — `_ACCOUNT_PAUSED_STATUSES` 주석 참고.
+            로그 필드가 아니라 계정의 현재 상태이므로 **호출부가 주입**한다.
     """
     status = _norm(status)
     code = _norm(error_code)
     subcode = _norm(error_subcode)
+
+    # ★ 계정 전체 정지가 개별 사유보다 우선한다 — 대기 중인 건에 한해.
+    #   `rate_limited`(613/4 → U8 지연)도 여기서 덮는다. "이 요청 하나가 늦다"와
+    #   "계정 전체가 멈췄다"는 사용자에게 전혀 다른 사건이고, 후자가 지배적 사실이다.
+    if account_send_paused and status in _ACCOUNT_PAUSED_STATUSES:
+        return U_ACCOUNT_SEND_PAUSED
 
     if status == SKIPPED_STATUS:
         return skipped_user_reason(error_message)

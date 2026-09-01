@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import time as _time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from django.conf import settings
 from django.db.models import Count, Max, Min, Q
@@ -31,6 +31,51 @@ _HARD_FAILED = [
     SentDMLog.Status.FAILED_PARAM,
     SentDMLog.Status.FAILED,  # legacy
 ]
+
+
+def waiting_window_risk(waiting_qs, horizon_seconds: float) -> dict:
+    """``horizon_seconds`` 뒤에 재개했을 때 **이미 메시징 창이 닫혀 있을** 대기 건 수.
+
+    왜 필요한가 (2026-08-26 CS #66027015):
+      계정 정지 중 화면에 "제한이 풀리면 47명에게 순서대로 발송합니다" 라고 쓰려면 그 47이
+      **실제로 나갈 수 있는 수**여야 한다. 그런데 게이트 리워드(자료가 담긴 2번째 DM)의 창은
+      **24h** 이고 기본 쿨다운도 **24h** 라, 정지가 걸리는 순간 대기 중이던 리워드는 재개
+      시각과 만료 시각이 **같아진다** — 실측(prod): 만료 ``18:08:15.536`` vs 재개
+      ``18:08:16.131``, 0.6초 차이로 종결. 우연이 아니라 구조다.
+      이 값을 빼고 숫자를 노출하면 화면이 "보내겠다"고 약속한 뒤 조용히 실패한다.
+
+    판정은 ``send_dm_task`` 진입부 age 가드와 같은 규칙(``_messaging_window``)을 쓴다.
+    ``created_at + window <= now + horizon`` 이면 위험.
+
+    ★ ``people`` 은 ``people.waiting`` 과 **같은 모수**(루트 DM = 오프닝/단독,
+    :data:`campaign_stats.ROOT_DM_Q`)로 센다. 그래야 ``people.waiting - risk.people`` 이
+    성립한다. 후속 DM(리워드)은 애초에 ``people`` 블록에 들어가지 않으므로 섞으면 뺄셈이
+    음수로 갈 수도 있는 엉터리가 된다 — 대신 ``followup_events`` 로 따로 낸다.
+
+    한계(의도적): 게이트 재탭 복구분의 창 재개(``_window_anchor``)는 반영하지 않는다 —
+    verification_log 를 행마다 파싱해야 해서 목록 응답에 넣기엔 비싸다. 그래서 이 값은
+    **위험을 과대평가**할 수 있다(재탭으로 살아날 건까지 셈). 과소평가보다 안전한 방향이다.
+    """
+    from django.utils import timezone as _tz
+
+    from .campaign_stats import ROOT_DM_Q
+    from .tasks import COMMENT_MESSAGING_WINDOW, USER_ID_MESSAGING_WINDOW
+
+    horizon = _tz.now() + timedelta(seconds=max(0.0, horizon_seconds))
+    # created_at <= horizon - window  ⇔  created_at + window <= horizon
+    expired_q = (Q(comment_id="") & Q(created_at__lte=horizon - USER_ID_MESSAGING_WINDOW)) | (
+        ~Q(comment_id="") & Q(created_at__lte=horizon - COMMENT_MESSAGING_WINDOW)
+    )
+    risky = waiting_qs.filter(expired_q)
+    root_risky = risky.filter(ROOT_DM_Q)
+    return {
+        # people.waiting 에서 그대로 뺄 수 있는 수 (같은 모수 = 루트 DM)
+        "people": root_risky.values("recipient_user_id").distinct().count(),
+        "events": risky.count(),
+        # 자료가 담긴 2번째 DM — 창이 24h 라 정지 초기 건은 구조적으로 여기 잡힌다.
+        "followup_events": risky.exclude(ROOT_DM_Q).count(),
+        "horizon_s": int(max(0.0, horizon_seconds)),
+    }
 
 
 def build_queue_state_payload(ig_conn, campaign=None) -> dict:
@@ -149,6 +194,11 @@ def build_queue_state_payload(ig_conn, campaign=None) -> dict:
         "ahead_of_this_campaign": ahead,
         "blocking_reason": blocking_reason,
         "action_block_cooldown_seconds": int(ab_remaining),
+        # 재개 시점에 이미 창이 닫혀 있을 대기 건 — "N명에게 발송합니다" 문구의 안전장치.
+        # people.waiting 에서 이만큼 빼야 지킬 수 있는 약속이 된다.
+        "waiting_window_risk": waiting_window_risk(
+            scope_qs.filter(status=SentDMLog.Status.QUEUED), ab_remaining
+        ),
         "eta_seconds": eta_seconds,
         "eta_finish_at": eta_finish_at,
         "eta_is_estimate": bool(is_estimate),

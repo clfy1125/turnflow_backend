@@ -205,7 +205,7 @@ class DMVerificationViewSet(viewsets.ViewSet):
     def list(self, request):
         qs = SentDMLog.objects.filter(
             campaign__ig_connection__workspace_id__in=_user_workspaces(request)
-        ).select_related("campaign")
+        ).select_related("campaign__ig_connection")
 
         campaign_id = request.query_params.get("campaign_id")
         status_filter = request.query_params.get("status")
@@ -1238,7 +1238,7 @@ class DMVerificationViewSet(viewsets.ViewSet):
 
         qs = SentDMLog.objects.filter(
             campaign__ig_connection__workspace_id__in=_user_workspaces(request)
-        ).select_related("campaign")
+        ).select_related("campaign__ig_connection")
 
         if message_id:
             log = qs.filter(Q(meta_message_id=message_id) | Q(echo_mid=message_id)).first()

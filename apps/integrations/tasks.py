@@ -336,13 +336,19 @@ GATE_REPAIR_PATH = "gate_reward_repair"
 # ===== 발송 속도 제어 / defer 헬퍼 (item 1·2) =====
 
 
+# 메시징 윈도우 — 발송 가능 기간. 표시 계층(queue_state.waiting_window_risk)이 같은 값을
+# 써야 "몇 명이 창을 넘길지" 예고가 실제 종결과 어긋나지 않는다. 복제하지 말고 import 할 것.
+COMMENT_MESSAGING_WINDOW = timedelta(days=7)  # 댓글 Private Reply
+USER_ID_MESSAGING_WINDOW = timedelta(hours=24)  # user_id DM (story 답장 · 게이트 리워드)
+
+
 def _messaging_window(log) -> timedelta:
     """이 로그가 발송 가능한 메시징 윈도우.
 
     comment Private Reply 는 7일, user_id DM(story/reward) 는 24h.
     rate-limit/transient 로 계속 defer 되더라도 이 윈도우가 지나면 graceful 종결한다.
     """
-    return timedelta(days=7) if log.comment_id else timedelta(hours=24)
+    return COMMENT_MESSAGING_WINDOW if log.comment_id else USER_ID_MESSAGING_WINDOW
 
 
 def _window_anchor(log):
