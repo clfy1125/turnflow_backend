@@ -30,6 +30,12 @@ repo1-retention-diff=6
 # full 2개가 커버하는 구간만 WAL 보관(약 2주 rewind), 그 이전 WAL 은 backup 종료 시 expire 가 자동 삭제.
 repo1-retention-archive=2
 repo1-retention-archive-type=full
+# ★ 기본 1분에서 올림 — 이걸 안 올리면 R2 응답이 느려진 날 expire 의 **WAL 삭제 단계**가
+# read 타임아웃으로 abort 하고, 그러면 베이스 백업이 사라진 구간의 WAL 이 영구 잔존한다
+# (복구엔 못 쓰는데 용량만 먹는다). 2026-08-24·08-31 full 이 연달아 이 지점에서 죽어
+# 6.4GB 가 쌓였고, backup 이 rc≠0 이 되면서 뒤따르는 `check` 까지 2주간 건너뛰어졌다.
+# 옵션명 주의: `repo1-storage-timeout` 은 존재하지 않는다(2.57 실측). io-timeout 이 맞다.
+io-timeout=300
 process-max=4
 compress-type=zst
 compress-level=3
