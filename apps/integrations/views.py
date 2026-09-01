@@ -459,12 +459,9 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 "account_type": "BUSINESS",
                 "token_expires_at": "2026-04-10T12:14:35.576386+09:00",
                 "scopes": [
-                    "pages_show_list",
-                    "pages_read_engagement",
-                    "instagram_basic",
-                    "instagram_manage_comments",
-                    "instagram_manage_messages",
-                    "business_management"
+                    "instagram_business_basic",
+                    "instagram_business_manage_comments",
+                    "instagram_business_manage_messages"
                 ],
                 "status": "active",
                 "last_verified_at": "2026-02-09T12:14:35.603024+09:00",
@@ -1012,7 +1009,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                         "data": media_data.get("data", []),
                     },
                     "api_info": {
-                        "graph_api_version": InstagramOAuthService.FACEBOOK_VERSION,
+                        "graph_api_base": InstagramOAuthService.GRAPH_API_BASE,
                         "scopes_used": connection.scopes,
                     },
                 }
@@ -3844,7 +3841,7 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
 
         ## 주의사항
         - Workspace에 활성화된 Instagram 연결이 있어야 함
-        - Meta에서 `instagram_manage_messages` 권한 승인 필요
+        - Meta에서 `instagram_business_manage_messages` 권한 승인 필요
         - Webhook 설정이 완료되어 있어야 함
         """,
         request=AutoDMCampaignCreateSerializer,
@@ -4683,7 +4680,7 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
     def logs(self, request, pk=None):
         """캠페인의 발송 로그 조회 (기본: opening/standalone 만 = 1 흐름당 1 row)"""
         campaign = self.get_object()
-        logs = campaign.dm_logs.all().order_by("-created_at")
+        logs = campaign.dm_logs.select_related("campaign__ig_connection").order_by("-created_at")
 
         include_children = str(request.query_params.get("include_children", "")).lower() in (
             "1",
