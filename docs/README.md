@@ -44,6 +44,7 @@
 
 **DM 캠페인**
 - [DM_QUEUE_STATE_FRONTEND.md](frontend/DM_QUEUE_STATE_FRONTEND.md) — 순차 발송 큐 현황(게이지·ETA·사람 단위 `people`)
+- [DM_ACCOUNT_PAUSE_RESPONSE.md](frontend/DM_ACCOUNT_PAUSE_RESPONSE.md) — 계정 제한 발송 정지 표시(`user_reason=account_send_paused`) + `waiting_window_risk` + dev 재현 커맨드
 - [DM_RECOVERY_FRONTEND.md](frontend/DM_RECOVERY_FRONTEND.md) — 실패 DM 복구(재댓글 방식)
 - [CAMPAIGN_RESUME_REVIVE_FRONTEND.md](frontend/CAMPAIGN_RESUME_REVIVE_FRONTEND.md) — 재개 시 정지 중 밀린 DM 자동 재발송(`revive_queued`)
 - [CAMPAIGN_TIMESERIES_FRONTEND.md](frontend/CAMPAIGN_TIMESERIES_FRONTEND.md) — 신규 요청자 시계열
@@ -79,6 +80,7 @@
 - [SECURITY_AUDIT_2026-06.md](ops/SECURITY_AUDIT_2026-06.md) — 애플리케이션 취약점 감사(미해결 포함)
 - [ADMIN_AUTH_HARDENING_PLAN.md](ops/ADMIN_AUTH_HARDENING_PLAN.md) — 🟡 **계획(미구현)** · 어드민 계정 3인 분리 + 어드민 전용 JWT(TOTP 2요소) + Django admin 세션 MFA. 지문은 서버가 검증 불가 → 실선택지는 TOTP/이메일/패스키
 - [DR_IMPLEMENTATION_PLAN.md](ops/DR_IMPLEMENTATION_PLAN.md) — 재해복구 설계·결정 로그
+- [META_INSIGHTS_APP_REVIEW_PLAN.md](ops/META_INSIGHTS_APP_REVIEW_PLAN.md) — 🟡 **계획(보류)** · `instagram_business_manage_insights` 앱 심사 신청. ⚠️ **Step 0 먼저**: Meta 문서가 IG Login 에서 이 스코프의 존재를 서로 다르게 적고 있어 미확인이면 계획 전체가 무효 · 데모 계정 **팔로워 100+** 필수(미만이면 지표가 빈다)
 - [INSTAGRAM_OAUTH_FLOW.md](ops/INSTAGRAM_OAUTH_FLOW.md) · [INSTAGRAM_TEST_GUIDE.md](ops/INSTAGRAM_TEST_GUIDE.md)
 - [CLOUDFLARE_TUNNEL_SETUP.md](ops/CLOUDFLARE_TUNNEL_SETUP.md) — dev 공개(`dev-api.turnflow.link`)
 - [EMAIL_TEMPLATE_HANDOFF_FOR_CS.md](ops/EMAIL_TEMPLATE_HANDOFF_FOR_CS.md)
@@ -92,6 +94,7 @@
 - [DM_ERROR_POLICY_PLAN.md](system/DM_ERROR_POLICY_PLAN.md) (+ `DM_ERROR_POLICY_MATRIX.html`) — DM 오류 2분류 정책
 - [AD_COMMENT_WEBHOOK_EVIDENCE.md](system/AD_COMMENT_WEBHOOK_EVIDENCE.md) — 광고 댓글 웹훅 실측 근거(코드가 참조)
 - [DM_MIGRATION_LINK_UNWRAP.md](system/DM_MIGRATION_LINK_UNWRAP.md) — 이전 시 타사 래퍼 링크(매니챗·인포크·소셜비즈·리틀리)를 원본으로 되돌리기. 실측·소급 명령·새 도구 추가법
+- [AI_CAMPAIGN_ASSIST_ADOPTION_2026-08.md](system/AI_CAMPAIGN_ASSIST_ADOPTION_2026-08.md) — AI 캠페인 초안(ai-suggest) 실사용 조사(2026-08, prod 실측). 무수정 채택 0%지만 11개 중 4개만 수정·편집 95초 / 수정은 게이트문구(50% 교체)·링크URL(84% 교체) 두 곳에 집중 / 원인은 프롬프트 상투구 지시 + 프론트 맥락 미전달(업종·목표·톤 0%, link_url 16%) / **example.com 자리표시자가 실DM 53건에 발송됨**
 - [SERVICE_DIFFERENTIATION.md](system/SERVICE_DIFFERENTIATION.md) — 서비스 차별점(세일즈)
 
 ## archive/ — 완료·대체됨

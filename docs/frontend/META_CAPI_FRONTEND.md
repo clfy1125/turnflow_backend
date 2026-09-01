@@ -18,7 +18,11 @@
   }
 ```
 
-`is_initial_payment` 는 **오늘 배포한 신규 필드**입니다. `GET /api/v1/billing/payments/` 응답에 실려 갑니다.
+`is_initial_payment` 는 **오늘 배포한 신규 필드**입니다. `GET /api/v1/billing/payments/history/` 응답에 실려 갑니다.
+
+> ⚠️ 초판에 `GET /api/v1/billing/payments/` 로 적었던 것은 **오기**입니다(그 경로는 404).
+> 실제 경로는 `/billing/payments/history/` (`PaymentHistoryView`) 하나뿐이고, 프론트가
+> 이미 쓰고 있는 그 경로가 맞습니다. 2026-08-26 프론트 지적으로 정정.
 
 ```jsonc
 {
