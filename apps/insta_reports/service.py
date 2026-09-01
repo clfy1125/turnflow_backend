@@ -208,10 +208,13 @@ def generate(report) -> dict:
             official_doc = json.loads(
                 (config.RAW_DIR / f"{username}.json").read_text(encoding="utf-8")
             )
+            # Graph `media_url` 이 빈 릴스의 영상 URL 은 Apify 응답에서 가져온다
+            # (media.py 상단 주의사항 — 안 넘기면 결손분이 그대로 유실된다).
             media_stats = media.download_for_run(
                 official_doc,
                 m,
                 sample,
+                apify_doc=_read_apify_doc(username),
                 on_progress=lambda d, n: _tick(
                     report, ReportStage.PREPARING, d, n, f"영상 준비 {d}/{n}"
                 ),
@@ -355,7 +358,18 @@ def _collect(report, connection, username: str, *, fake: bool) -> dict:
             fallback_profile_url=connection.profile_picture_url or "",
         )
     except collect_official.CollectError as e:
-        code = ReportErrorCode.TOKEN_INVALID if e.token_invalid else ReportErrorCode.NO_POSTS
+        # 세 갈래를 구별한다 — 안내 문구가 갈리기 때문.
+        #   token     → "연결이 만료됐어요, 다시 연결해 주세요"  (재연동해야 풀린다)
+        #   transient → "일시적인 오류예요, 잠시 후 다시 시도"    (그냥 다시 누르면 된다)
+        #   그 외      → "게시물을 찾지 못했어요"                  (계정에 게시물이 없다)
+        # 예전에는 token 이 아니면 전부 NO_POSTS 라, Graph 일시 오류가 "게시물 없음"으로
+        # 나가거나 400 이 통째로 TOKEN_INVALID 로 나갔다(collect_official 상단 주의사항).
+        if e.token_invalid:
+            code = ReportErrorCode.TOKEN_INVALID
+        elif e.transient:
+            code = ReportErrorCode.INTERNAL
+        else:
+            code = ReportErrorCode.NO_POSTS
         raise ReportFailure(code, str(e)) from e
     except Exception as e:  # noqa: BLE001
         raise ReportFailure(ReportErrorCode.INTERNAL, f"{type(e).__name__}: {e}") from e
@@ -381,7 +395,22 @@ def _collect(report, connection, username: str, *, fake: bool) -> dict:
     #    액터가 공개 프로필 그리드만 훑어 그리드에 없는 릴스가 빠지고, 조회수 있는 릴스가
     #    5개 미만이면 리포트가 통째로 실패한다(@yeonhada__ 실측: Graph 39개 vs Apify 3개).
     #    조회수는 Graph 인사이트로 대체 불가(지표 29종 전부 403 — 앱 권한 미승인, 재확인 완료).
-    reel_urls = _reel_permalinks(username)
+    reel_urls = _reel_permalinks(_read_official_doc(username))
+
+    # ── 릴스 부족은 **조회수 수집 전에** 판정한다 ────────────────────────
+    # 조회수를 받을 수 있는 최대치가 곧 이 개수다. 5개 미만이면 뒤 게이트
+    # (`metrics.insufficient`)에서 탈락이 확정이므로 Apify 를 부를 이유가 없다.
+    # 이 판정이 없던 동안 릴스 0개 계정이 프로필 URL 폴백으로 넘어가 그리드를 긁고
+    # `VIEWS_UNAVAILABLE`("조회수 정보를 가져오지 못했어요 — 잠시 후 다시 시도")로 끝났다.
+    # 사용자에겐 우리 쪽 일시 장애로 읽혀 재시도 루프가 됐다(@searchforwork__: 게시물
+    # 1개·릴스 0개인데 1시간 반 동안 4회). 사유를 맞추면 안내도 맞는다.
+    if len(reel_urls) < config.MIN_REELS_FOR_REPORT:
+        raise ReportFailure(
+            ReportErrorCode.NOT_ENOUGH_REELS,
+            f"릴스 {len(reel_urls)}개 < {config.MIN_REELS_FOR_REPORT} "
+            f"(조회수 수집 전 판정 · 수집 게시물 {summary.get('post_count')}개)",
+        )
+
     try:
         apify_summary = collect_apify.collect(
             username,
@@ -395,23 +424,53 @@ def _collect(report, connection, username: str, *, fake: bool) -> dict:
     except Exception as e:  # noqa: BLE001
         raise ReportFailure(ReportErrorCode.VIEWS_UNAVAILABLE, f"{type(e).__name__}: {e}") from e
 
+    # 송수신 개수를 남긴다 — 이게 없으면 "조회수 있는 릴스 4개 < 5" 가 계정 사정인지
+    # 수집 누락인지 사후에 가릴 수 없다(2026-09-01: Apify API 를 직접 뒤져서야 확인했다).
+    logger.info(
+        "insta_report: apify 송신 %s개 → 수신 %s개 (영상 %s · 조회수 있음 %s) report=%s",
+        len(reel_urls),
+        apify_summary.get("count"),
+        apify_summary.get("videos"),
+        apify_summary.get("videos_with_views"),
+        report.id,
+    )
     return {**summary, "apify": apify_summary}
 
 
-def _reel_permalinks(username: str) -> list[str]:
-    """공식 수집 결과에서 릴스 permalink 만 뽑는다 (Apify 에 직접 넘길 대상).
-
-    릴스만 넘기는 이유: 조회수가 필요한 건 릴스뿐이고(지표·분포·벤치마크 전부 릴스 기준),
-    좋아요·댓글 수는 Graph 가 이미 정확히 준다. 항목 수가 줄어 Apify 비용도 낮아진다.
-    """
+def _read_apify_doc(username: str) -> dict:
+    """조회수 수집 결과를 다시 읽는다(영상·썸네일 URL 폴백용). 없으면 빈 dict."""
     try:
-        doc = json.loads((config.RAW_DIR / f"{username}.json").read_text(encoding="utf-8"))
+        return json.loads((config.APIFY_DIR / f"{username}.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return []
+        return {}
+
+
+def _read_official_doc(username: str) -> dict:
+    """공식 수집 산출물(방금 collect_official 이 쓴 파일)."""
+    try:
+        return json.loads((config.RAW_DIR / f"{username}.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        raise ReportFailure(
+            ReportErrorCode.INTERNAL, f"수집 결과 읽기 실패: {type(e).__name__}"
+        ) from e
+
+
+def _reel_permalinks(doc: dict) -> list[str]:
+    """공식 수집 결과에서 조회수를 받아야 할 게시물 permalink (Apify 에 직접 넘길 대상).
+
+    영상만 넘기는 이유: 조회수가 필요한 건 영상뿐이고(지표·분포·벤치마크 전부 릴스 기준),
+    좋아요·댓글 수는 Graph 가 이미 정확히 준다. 항목 수가 줄어 Apify 비용도 낮아진다.
+
+    ⚠️ 판정을 `media_product_type == "REELS"` **단독으로 하지 말 것.** 진입 게이트가 세는
+    것은 `media_type == "VIDEO"`(normalize 가 "reel" 로 변환)이므로, REELS 로만 좁히면
+    피드 동영상·IGTV 가 조회수 수집에서 빠져 **게이트가 세는 분자만 줄어든다**. 두 조건을
+    OR 로 묶어 세는 쪽과 받는 쪽을 일치시킨다.
+    """
     return [
         p["permalink"]
         for p in (doc.get("posts") or [])
-        if p.get("permalink") and p.get("media_product_type") == "REELS"
+        if p.get("permalink")
+        and (p.get("media_product_type") == "REELS" or p.get("media_type") == "VIDEO")
     ]
 
 

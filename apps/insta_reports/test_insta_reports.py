@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 import uuid
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 from django.contrib.auth import get_user_model
@@ -832,6 +833,308 @@ class TestSamplerRunsBeforeDownload:
         assert "썸네일 파일 없음" in out["failures"]["SC1"]
 
 
+class TestApifyVideoUrlFallback:
+    """Graph `media_url` 이 비면 Apify `videoUrl` 로 내려받는다.
+
+    2026-09-01 prod 실측 결함: Graph `/media` 가 릴스의 `media_url` 을 광범위하게 비워서
+    보낸다(@berryi___ 16/16 · @kkuru_studio 12/13 · @57_bubu 19/30). `media.download_for_run`
+    이 `media_url` 없는 건을 조용히 건너뛰어 **영상 분석 표본이 50~80% 사라지고**, 전멸한
+    계정은 `EXTRACT_FAILED`("성공 0 / 실패 16")로 리포트가 죽었다. 실패 사유를 "서명 URL
+    만료 추정"으로 적어 둬서 원인이 한 달간 안 보였다 — 만료가 아니라 URL 이 없던 것이다.
+    조회수 때문에 이미 받아 둔 Apify 응답에 `videoUrl` 이 100% 들어 있었다.
+    """
+
+    def _sample_and_official(self, n=3, *, graph_url=True):
+        sample = {"videos": [{"shortcode": f"SC{i}"} for i in range(n)], "light_images": []}
+        official = {
+            "posts": [
+                {
+                    "permalink": f"https://www.instagram.com/reel/SC{i}/",
+                    "media_type": "VIDEO",
+                    # ← prod 에서 실제로 이렇게 비어 온다
+                    "media_url": (
+                        f"https://scontent.cdninstagram.com/v/SC{i}.mp4" if graph_url else None
+                    ),
+                    "thumbnail_url": f"https://scontent.cdninstagram.com/v/SC{i}.jpg",
+                }
+                for i in range(n)
+            ]
+        }
+        return sample, official
+
+    def _apify_doc(self, n=3):
+        return {
+            "posts": [
+                {
+                    "shortCode": f"SC{i}",
+                    "url": f"https://www.instagram.com/reel/SC{i}/",
+                    "videoUrl": f"https://scontent-yyz1-1.cdninstagram.com/o1/SC{i}.mp4",
+                    "displayUrl": f"https://scontent-yyz1-1.cdninstagram.com/v/SC{i}.jpg",
+                }
+                for i in range(n)
+            ]
+        }
+
+    def _run(self, tmp_path, monkeypatch, *, graph_url, apify_doc):
+        from .pipeline import config, media
+
+        config.bind_run(tmp_path)
+        sample, official = self._sample_and_official(graph_url=graph_url)
+        urls = []
+
+        def fake_download(url, dest, min_bytes, kind):
+            urls.append((kind, url))
+            return "error:Blocked"  # 네트워크 안 탄다
+
+        monkeypatch.setattr(media, "_download", fake_download)
+        stats = media.download_for_run(
+            official, {"top_posts": [], "low_posts": []}, sample, apify_doc=apify_doc
+        )
+        return stats, urls
+
+    def test_graph_url_missing_falls_back_to_apify(self, tmp_path, monkeypatch):
+        stats, urls = self._run(tmp_path, monkeypatch, graph_url=False, apify_doc=self._apify_doc())
+        video_urls = [u for kind, u in urls if kind == "video"]
+        assert len(video_urls) == 3, f"3개 전부 Apify URL 로 내려받아야 한다: {stats}"
+        assert all("/o1/" in u for u in video_urls), video_urls
+        assert stats["video_url_apify"] == 3
+        assert stats["video_url_graph"] == 0
+        assert stats["video_url_missing"] == 0
+
+    def test_graph_url_wins_when_present(self, tmp_path, monkeypatch):
+        """Graph 가 주면 Graph 를 쓴다 — 폴백은 결손분만 메운다."""
+        stats, urls = self._run(tmp_path, monkeypatch, graph_url=True, apify_doc=self._apify_doc())
+        assert all("/v/SC" in u for kind, u in urls if kind == "video")
+        assert stats["video_url_graph"] == 3
+        assert stats["video_url_apify"] == 0
+
+    def test_missing_is_counted_not_swallowed(self, tmp_path, monkeypatch):
+        """폴백도 없으면 **집계에 남는다** — 예전엔 총합이 안 맞아도 아무도 몰랐다."""
+        stats, urls = self._run(tmp_path, monkeypatch, graph_url=False, apify_doc=None)
+        assert [u for kind, u in urls if kind == "video"] == []
+        assert stats["video_url_missing"] == 3, stats
+        assert stats["video_url_graph"] + stats["video_url_apify"] == 0
+        # 썸네일은 영상 shortcode 로도 필요하니 job 3개가 남는다(렌더는 살아 있다).
+        assert stats["jobs"] == 3, stats
+
+    def test_thumbnail_falls_back_to_display_url(self, tmp_path, monkeypatch):
+        from .pipeline import config, media
+
+        config.bind_run(tmp_path)
+        official = {
+            "posts": [
+                {
+                    "permalink": "https://www.instagram.com/reel/SC0/",
+                    "media_type": "VIDEO",
+                    "media_url": None,
+                    "thumbnail_url": None,  # Graph 가 둘 다 비웠다
+                }
+            ]
+        }
+        urls = []
+        monkeypatch.setattr(
+            media, "_download", lambda url, d, m, kind: urls.append((kind, url)) or "skip"
+        )
+        media.download_for_run(
+            official,
+            {"top_posts": [{"shortcode": "SC0"}], "low_posts": []},
+            {"videos": [], "light_images": []},
+            apify_doc=self._apify_doc(1),
+        )
+        assert [u for kind, u in urls if kind == "thumb"] == [
+            "https://scontent-yyz1-1.cdninstagram.com/v/SC0.jpg"
+        ]
+
+    def test_apify_url_host_passes_allowlist(self):
+        """폴백 URL 이 SSRF 허용 목록을 통과해야 폴백이 의미가 있다."""
+        from .pipeline import media
+
+        assert media._url_allowed("https://scontent-yyz1-1.cdninstagram.com/o1/x.mp4")
+
+
+class TestReelGateRunsBeforeApify:
+    """릴스 부족은 **조회수 수집 전에** 판정한다.
+
+    2026-09-01 prod 실측 결함: 릴스 0개인 계정이 게이트를 통과해 Apify 프로필 URL 폴백으로
+    그리드를 긁고 `VIEWS_UNAVAILABLE`("조회수 정보를 가져오지 못했어요 — 잠시 후 다시
+    시도")로 끝났다. 우리 쪽 일시 장애로 읽혀 @searchforwork__ 사용자는 게시물 1개(이미지)
+    계정으로 1시간 반 동안 4회 재시도했다. 사유가 맞으면 안내도 맞는다.
+    """
+
+    def _doc(self, reels=0, images=0):
+        posts = [
+            {
+                "permalink": f"https://www.instagram.com/reel/R{i}/",
+                "media_type": "VIDEO",
+                "media_product_type": "REELS",
+            }
+            for i in range(reels)
+        ]
+        posts += [
+            {
+                "permalink": f"https://www.instagram.com/p/I{i}/",
+                "media_type": "IMAGE",
+                "media_product_type": "FEED",
+            }
+            for i in range(images)
+        ]
+        return {"posts": posts}
+
+    def test_feed_videos_are_sent_for_views_too(self):
+        """게이트가 세는 것(media_type==VIDEO)과 조회수를 받는 대상을 일치시킨다.
+
+        REELS 로만 좁히면 피드 동영상·IGTV 가 조회수 수집에서 빠져 분자만 줄어든다.
+        """
+        from .service import _reel_permalinks
+
+        doc = {
+            "posts": [
+                {
+                    "permalink": "https://www.instagram.com/reel/A/",
+                    "media_type": "VIDEO",
+                    "media_product_type": "REELS",
+                },
+                {  # 옛 피드 동영상 — 예전엔 통째로 빠졌다
+                    "permalink": "https://www.instagram.com/p/B/",
+                    "media_type": "VIDEO",
+                    "media_product_type": "FEED",
+                },
+                {
+                    "permalink": "https://www.instagram.com/p/C/",
+                    "media_type": "IMAGE",
+                    "media_product_type": "FEED",
+                },
+            ]
+        }
+        assert _reel_permalinks(doc) == [
+            "https://www.instagram.com/reel/A/",
+            "https://www.instagram.com/p/B/",
+        ]
+
+    @pytest.mark.parametrize("reels", [0, 1, 4])
+    def test_not_enough_reels_skips_apify_entirely(self, reels, tmp_path, monkeypatch):
+        """릴스 5개 미만이면 Apify 를 부르지 않고 NOT_ENOUGH_REELS 로 끝난다."""
+        import json
+
+        from .models import ReportErrorCode
+        from .pipeline import collect_apify, config
+        from .service import ReportFailure, _collect
+
+        config.bind_run(tmp_path)
+        (config.RAW_DIR / "acct.json").write_text(
+            json.dumps(self._doc(reels=reels, images=20)), encoding="utf-8"
+        )
+        monkeypatch.setattr(
+            "apps.insta_reports.pipeline.collect_official.collect",
+            lambda *a, **k: {"post_count": reels + 20, "followers_count": 100},
+        )
+        monkeypatch.setattr("apps.insta_reports.ig_profile.apply_meta", lambda *a, **k: None)
+
+        called = []
+        monkeypatch.setattr(
+            collect_apify, "collect", lambda *a, **k: called.append(1) or {"count": 0}
+        )
+
+        report = SimpleNamespace(
+            id="r1",
+            followers_snapshot=None,
+            media_count_snapshot=None,
+            ig_name="",
+            progress=0,
+            save=lambda **kw: None,
+            set_stage=lambda *a, **kw: None,
+        )
+        conn = SimpleNamespace(access_token="tok", external_account_id="1", profile_picture_url="")
+        with pytest.raises(ReportFailure) as exc:
+            _collect(report, conn, "acct", fake=False)
+        assert exc.value.code == ReportErrorCode.NOT_ENOUGH_REELS
+        assert f"릴스 {reels}개" in exc.value.detail
+        assert called == [], "릴스가 부족한데 Apify 를 불렀다(비용·오진단)"
+
+    def test_enough_reels_proceeds_to_apify(self, tmp_path, monkeypatch):
+        import json
+
+        from .pipeline import collect_apify, config
+        from .service import _collect
+
+        config.bind_run(tmp_path)
+        (config.RAW_DIR / "acct.json").write_text(json.dumps(self._doc(reels=5)), encoding="utf-8")
+        monkeypatch.setattr(
+            "apps.insta_reports.pipeline.collect_official.collect",
+            lambda *a, **k: {"post_count": 5, "followers_count": 100},
+        )
+        monkeypatch.setattr("apps.insta_reports.ig_profile.apply_meta", lambda *a, **k: None)
+        sent = {}
+
+        def fake_apify(username, *, permalinks=None, on_tick=None, **k):
+            sent["n"] = len(permalinks or [])
+            return {"count": 5, "videos": 5, "videos_with_views": 5}
+
+        monkeypatch.setattr(collect_apify, "collect", fake_apify)
+
+        report = SimpleNamespace(
+            id="r2",
+            followers_snapshot=None,
+            media_count_snapshot=None,
+            ig_name="",
+            progress=0,
+            save=lambda **kw: None,
+            set_stage=lambda *a, **kw: None,
+        )
+        conn = SimpleNamespace(access_token="tok", external_account_id="1", profile_picture_url="")
+        out = _collect(report, conn, "acct", fake=False)
+        assert sent["n"] == 5, "릴스 5개를 그대로 넘겨야 한다"
+        assert out["apify"]["videos_with_views"] == 5
+
+
+class TestGraphErrorClassification:
+    """Graph 400 을 토큰 만료로 단정하지 않는다.
+
+    2026-09-01 prod 실측 결함: `token_invalid = status in (400, 401, 403)` 때문에 멀쩡한
+    계정에 "연결이 만료됐어요, 다시 연결해 주세요" 가 나갔다. @jjurimam 은 21:15 에
+    TOKEN_INVALID 로 실패하고 **7분 뒤 재시도로 성공**했고, @color_gongbang 도 5분 뒤
+    성공했다. 진짜 만료는 Meta 가 `code=190` 으로 알려 준다.
+    """
+
+    def test_expired_token_is_token_invalid(self):
+        from .pipeline.collect_official import classify_graph_error
+
+        assert classify_graph_error(400, {"code": 190}) == "token"
+        assert classify_graph_error(400, {"code": 102}) == "token"
+        assert classify_graph_error(400, {"code": 190, "error_subcode": 463}) == "token"
+
+    def test_transient_and_rate_limit_are_not_token_invalid(self):
+        from .pipeline.collect_official import classify_graph_error
+
+        for err in ({"code": 1}, {"code": 2}, {"code": 4}, {"code": 17}, {"code": 32}):
+            assert classify_graph_error(400, err) == "transient", err
+
+    def test_unknown_400_defaults_to_transient(self):
+        """코드가 없거나 모르는 400 → 재시도 안내. 잘못된 재연동 요구보다 손실이 작다."""
+        from .pipeline.collect_official import classify_graph_error
+
+        assert classify_graph_error(400, {}) == "transient"
+        assert classify_graph_error(500, {}) == "transient"
+        assert classify_graph_error(429, {}) == "transient"
+
+    def test_permission_and_auth_status_are_token_invalid(self):
+        from .pipeline.collect_official import classify_graph_error
+
+        assert classify_graph_error(403, {}) == "token"
+        assert classify_graph_error(401, {}) == "token"
+        assert classify_graph_error(400, {"code": 10}) == "token"
+        assert classify_graph_error(400, {"code": 200}) == "token"
+
+    def test_field_ladder_keeps_media_url_one_rung_longer(self):
+        """MIN 으로 곧장 떨어지면 media_url 이 빠져 영상 분석이 전멸한다."""
+        from .pipeline import collect_official as co
+
+        assert co.FIELD_LADDER[1] is co.MEDIA_FIELDS_MID
+        assert "media_url" in co.MEDIA_FIELDS_MID
+        assert "like_count" in co.MEDIA_FIELDS_MID
+        assert "children" not in co.MEDIA_FIELDS_MID
+
+
 class TestRunDirVisibleInWorkerThreads:
     """런 디렉터리는 **워커 스레드에서도** 보여야 한다.
 
@@ -1196,34 +1499,43 @@ class TestApifyGetsExplicitPermalinks:
         ca.collect("someone", permalinks=[])
         assert captured["directUrls"] == ["https://www.instagram.com/someone/"]
 
-    def test_service_extracts_reels_only(self, tmp_path):
-        import json
+    def test_service_extracts_videos_for_views(self, tmp_path):
+        """조회수를 받을 대상 = 릴스 **+ 피드 동영상**.
 
+        2026-09-01 변경: REELS 로만 좁히면 진입 게이트가 세는 `media_type==VIDEO` 와
+        분모·분자가 어긋나 피드 동영상이 조회수 없이 탈락한다(service._reel_permalinks 주석).
+        """
         from . import service
+
+        doc = {
+            "posts": [
+                {"permalink": "u/reel/A/", "media_product_type": "REELS"},
+                {"permalink": "u/p/B/", "media_product_type": "FEED"},  # 이미지 — 제외
+                {"media_product_type": "REELS"},  # permalink 없음 — 제외
+                {"permalink": "u/reel/C/", "media_product_type": "REELS"},
+                {  # 옛 피드 동영상 — 이제 포함한다
+                    "permalink": "u/p/D/",
+                    "media_product_type": "FEED",
+                    "media_type": "VIDEO",
+                },
+            ]
+        }
+        assert service._reel_permalinks(doc) == ["u/reel/A/", "u/reel/C/", "u/p/D/"]
+
+    def test_missing_raw_file_is_internal_not_silent_empty(self, tmp_path):
+        """수집 산출물을 못 읽으면 **조용히 0개**가 아니라 INTERNAL 로 올린다.
+
+        빈 리스트를 반환하면 새 릴스 게이트가 이를 "릴스 0개"로 오인해
+        NOT_ENOUGH_REELS(사용자 귀책)로 안내한다 — 실제로는 우리 쪽 오류다.
+        """
+        from . import service
+        from .models import ReportErrorCode
         from .pipeline import config
 
         config.bind_run(tmp_path)
-        (config.RAW_DIR / "acct.json").write_text(
-            json.dumps(
-                {
-                    "posts": [
-                        {"permalink": "u/reel/A/", "media_product_type": "REELS"},
-                        {"permalink": "u/p/B/", "media_product_type": "FEED"},
-                        {"media_product_type": "REELS"},  # permalink 없음
-                        {"permalink": "u/reel/C/", "media_product_type": "REELS"},
-                    ]
-                }
-            ),
-            encoding="utf-8",
-        )
-        assert service._reel_permalinks("acct") == ["u/reel/A/", "u/reel/C/"]
-
-    def test_missing_raw_file_returns_empty(self, tmp_path):
-        from . import service
-        from .pipeline import config
-
-        config.bind_run(tmp_path)
-        assert service._reel_permalinks("nope") == []
+        with pytest.raises(service.ReportFailure) as exc:
+            service._read_official_doc("nope")
+        assert exc.value.code == ReportErrorCode.INTERNAL
 
 
 class TestEngagementRateIsReadable:

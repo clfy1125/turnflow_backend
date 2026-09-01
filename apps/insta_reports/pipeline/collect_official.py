@@ -34,7 +34,15 @@ MEDIA_FIELDS_RICH = (
     "comments_count,like_count,media_url,thumbnail_url,"
     "children{media_type,media_url,thumbnail_url,permalink}"
 )
+# 중간 단계 — `children{...}` 만 거부되는 계정이 있어 한 칸 두고 내려간다.
+# MIN 으로 곧장 떨어지면 media_url·thumbnail_url·like_count 가 통째로 빠져 영상
+# 다운로드가 전멸하고(→ EXTRACT_FAILED) 참여율이 0 이 된다.
+MEDIA_FIELDS_MID = (
+    "id,timestamp,media_type,media_product_type,caption,permalink,"
+    "comments_count,like_count,media_url,thumbnail_url"
+)
 MEDIA_FIELDS_MIN = "id,timestamp,media_type,media_product_type,caption,permalink,comments_count"
+FIELD_LADDER = (MEDIA_FIELDS_RICH, MEDIA_FIELDS_MID, MEDIA_FIELDS_MIN)
 
 ACCOUNT_FIELDS = (
     "user_id,username,name,account_type,media_count,"
@@ -59,11 +67,56 @@ MAX_COMMENT_REQUESTS = 80
 
 
 class CollectError(RuntimeError):
-    """수집 불가 — 토큰 만료/권한/네트워크. 잡은 실패하되 이용 횟수는 차감하지 않는다."""
+    """수집 불가 — 토큰 만료/권한/네트워크. 잡은 실패하되 이용 횟수는 차감하지 않는다.
 
-    def __init__(self, message: str, *, token_invalid: bool = False):
+    ``token_invalid`` 는 **"재연동해야 풀린다"** 는 뜻이고 ``transient`` 는 **"그냥 다시
+    누르면 된다"** 는 뜻이다. 둘을 섞으면 안내 문구가 통째로 틀린다(아래 표 참고).
+    """
+
+    def __init__(self, message: str, *, token_invalid: bool = False, transient: bool = False):
         super().__init__(message)
         self.token_invalid = token_invalid
+        self.transient = transient
+
+
+# ── Graph 오류 분류 ─────────────────────────────────────────────────
+# ⚠️ **상태코드만으로 판정하지 말 것.** `400 → 토큰 만료` 로 단정했던 탓에 멀쩡한 계정에
+#    재연동을 요구했다(2026-09-01 prod 실측: @jjurimam 21:15 TOKEN_INVALID → **7분 뒤
+#    재시도 성공**, @color_gongbang 19:18 → **5분 뒤 성공**. 두 계정 모두 지금도 정상).
+#    Meta 는 진짜 만료를 `code=190` 으로 확실히 알려 주고, 그 외 400 은 일시 오류·
+#    레이트리밋이 대부분이다.
+TOKEN_DEAD_CODES = {102, 190}  # 세션 무효 / 액세스 토큰 만료·폐기
+TOKEN_DEAD_SUBCODES = {458, 459, 460, 463, 464, 467, 492}  # 앱 미승인·비번 변경·만료 등
+PERMISSION_CODES = {10}  # 권한 미승인 — 재연동(스코프 재동의)으로 풀린다
+RATE_LIMIT_CODES = {4, 17, 32, 613}
+TRANSIENT_CODES = {1, 2}  # "unexpected error" — Meta 쪽 일시 장애
+
+
+def graph_error(response) -> dict:
+    """응답 본문의 ``error`` 객체. 파싱 실패 시 빈 dict.
+
+    ⚠️ 이걸 버리면 사후 원인 규명이 불가능해진다 — 로그에 code/subcode 를 꼭 남길 것.
+    """
+    try:
+        return ((response.json() or {}).get("error")) or {}
+    except ValueError:
+        return {}
+
+
+def classify_graph_error(status: int, err: dict) -> str:
+    """``"token"``(재연동 필요) | ``"transient"``(재시도하면 됨) 판정."""
+    code, sub = err.get("code"), err.get("error_subcode")
+    if code in TOKEN_DEAD_CODES or sub in TOKEN_DEAD_SUBCODES:
+        return "token"
+    if code in PERMISSION_CODES or (isinstance(code, int) and 200 <= code < 300):
+        return "token"
+    if code in RATE_LIMIT_CODES or code in TRANSIENT_CODES:
+        return "transient"
+    if status in (401, 403):
+        return "token"
+    # 코드가 없거나 모르는 400/5xx/429 → 일시 오류로 본다. 재시도가 실제로 통했고,
+    # 잘못된 재연동 안내보다 "잠시 후 다시" 가 손실이 작다.
+    return "transient"
 
 
 def fetch_account_meta(ig_user_id: str, token: str) -> dict:
@@ -86,8 +139,14 @@ def fetch_account_meta(ig_user_id: str, token: str) -> dict:
             return {}
         if r.ok:
             return r.json() or {}
+        err = graph_error(r)
         logger.info(
-            "insta_report: account meta rejected %s (fields=%s…)", r.status_code, fields[:40]
+            "insta_report: account meta rejected %s code=%s subcode=%s (fields=%s…) %s",
+            r.status_code,
+            err.get("code"),
+            err.get("error_subcode"),
+            fields[:40],
+            str(err.get("message"))[:160],
         )
     return {}
 
@@ -98,23 +157,47 @@ def fetch_media(ig_user_id: str, token: str, target: int = TARGET_POSTS) -> tupl
     like_count/media_url 등이 거부되는 계정이 있어(권한·미디어 종류) 1회는 축소 필드로 재시도한다.
     """
     posts: list[dict] = []
-    after, fields, used_fallback = None, MEDIA_FIELDS_RICH, False
+    after, rung = None, 0
     url = f"{GRAPH}/{ig_user_id}/media"
     while len(posts) < target:
-        params = {"fields": fields, "limit": min(50, target - len(posts)), "access_token": token}
+        params = {
+            "fields": FIELD_LADDER[rung],
+            "limit": min(50, target - len(posts)),
+            "access_token": token,
+        }
         if after:
             params["after"] = after
         try:
             r = requests.get(url, params=params, timeout=30)
         except requests.RequestException as e:
-            raise CollectError(f"미디어 목록 조회 실패: {type(e).__name__}") from e
+            raise CollectError(f"미디어 목록 조회 실패: {type(e).__name__}", transient=True) from e
         if not r.ok:
-            if not used_fallback:
-                used_fallback, fields = True, MEDIA_FIELDS_MIN
+            err = graph_error(r)
+            if rung + 1 < len(FIELD_LADDER):
+                rung += 1
+                logger.info(
+                    "insta_report: media fields 축소 재시도 (%s단계) — %s code=%s subcode=%s",
+                    rung,
+                    r.status_code,
+                    err.get("code"),
+                    err.get("error_subcode"),
+                )
                 continue
-            token_invalid = r.status_code in (400, 401, 403)
+            kind = classify_graph_error(r.status_code, err)
+            logger.warning(
+                "insta_report: media 조회 실패 %s code=%s subcode=%s type=%s → %s · %s",
+                r.status_code,
+                err.get("code"),
+                err.get("error_subcode"),
+                err.get("type"),
+                kind,
+                str(err.get("message"))[:200],
+            )
             raise CollectError(
-                f"미디어 목록 조회 실패 {r.status_code}", token_invalid=token_invalid
+                f"미디어 목록 조회 실패 {r.status_code} "
+                f"code={err.get('code')} subcode={err.get('error_subcode')}",
+                token_invalid=(kind == "token"),
+                transient=(kind == "transient"),
             )
         body = r.json() or {}
         data = body.get("data") or []
@@ -124,7 +207,12 @@ def fetch_media(ig_user_id: str, token: str, target: int = TARGET_POSTS) -> tupl
         if not after or not data:
             break
         time.sleep(0.3)  # 레이트리밋 여유
-    return posts[:target], used_fallback
+    if rung:
+        logger.warning(
+            "insta_report: media 축소 필드로 수집됨 (%s단계) — 영상·썸네일 URL 결손 가능",
+            rung,
+        )
+    return posts[:target], rung > 0
 
 
 def fetch_comments_for_post(media_id: str, token: str, want: int) -> list[dict]:
