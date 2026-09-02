@@ -5429,7 +5429,7 @@ class SpamFilterViewSet(viewsets.ViewSet):
         except IGAccountConnection.DoesNotExist:
             raise NotFound(
                 detail="Instagram 계정을 찾을 수 없습니다. 올바른 ig_connection_id를 사용하세요."
-            )
+            ) from None
 
         # 워크스페이스 멤버십 확인
         if not ig_connection.workspace.memberships.filter(user=self.request.user).exists():
