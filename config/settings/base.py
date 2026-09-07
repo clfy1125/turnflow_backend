@@ -510,6 +510,18 @@ CELERY_TASK_ROUTES = {
 # NOTE: 토스는 PG측 스케줄러가 없다 — 갱신 과금의 주체는 process_due_renewals.
 #       만료 처리 계열은 매시간 실행해 단일 실행 누락/지연 위험을 줄인다.
 #       각 태스크는 멱등하다 (중복 과금 방지: 결정적 orderId + Idempotency-Key).
+# ── 게시물 '연령 제한' 라이브 점검 (기본 OFF) ─────────────────────────
+# 인스타가 검색엔진 크롤러 UA 에게만 SSR 본문을 주기 때문에, 공개 페이지 조회로 제한 여부를
+# 판별하려면 크롤러 UA 를 써야 한다. 이는 인스타 약관의 자동 수집 금지에 저촉될 수 있고
+# prod IP 차단 위험이 있어 **기본 비활성**이다.
+#   False → history/runtime(우리 DB) 신호만으로 판정. 외부 호출 0.
+#   True  → 캠페인 생성·점검 버튼 같은 **사용자 요청 1회**에 한해 공개 페이지를 조회.
+# 배치 스위퍼는 이 값과 무관하게 절대 라이브 조회를 하지 않는다.
+# 상세: apps/integrations/ig_content_restriction.py 모듈 docstring
+IG_RESTRICTION_LIVE_CHECK_ENABLED = config(
+    "IG_RESTRICTION_LIVE_CHECK_ENABLED", default=False, cast=bool
+)
+
 CELERY_BEAT_SCHEDULE = {
     # ── 토스 빌링 갱신 파이프라인 ──
     "process-due-renewals": {
@@ -724,6 +736,18 @@ CELERY_BEAT_SCHEDULE = {
     # (근거는 apps/integrations/media_thumbnail.py docstring). 생성/게시물변경 훅 + 목록조회
     # 기회 발행이 1차, 이 스위퍼가 최종 안전망.
     # 실제 구동은 core.ScheduledJob(0013 시드). CELERY_BEAT_SCHEDULE 은 dev 패리티/문서용.
+    "dm-sweep-restricted-campaigns": {
+        # 제한된 게시물의 active 캠페인 자동 정지 (외부 호출 0 — DB 신호만).
+        # 실패가 무한히 쌓이는 것을 막는 것이 목적이라 1시간이면 충분하다
+        # (폴러가 1시간 주기이므로 그보다 자주 돌 이유가 없다).
+        #
+        # ⚠️ prod 는 이 표가 아니라 core.ScheduledJob DB 행으로 돈다(CF tick).
+        #    실제 시드는 core 마이그레이션 0017 이며 **enabled=False 로 시작**한다 —
+        #    고객 캠페인 status 를 바꾸는 쓰기 잡이라 사람이 확인 후 켠다.
+        #    이 항목은 dev 패리티/문서용이다.
+        "task": "integrations.sweep_restricted_campaigns",
+        "schedule": 3600.0,
+    },
     "dm-sweep-campaign-thumbnails": {
         "task": "integrations.sweep_missing_campaign_thumbnails",
         "schedule": 60 * 60 * 6,  # 6시간

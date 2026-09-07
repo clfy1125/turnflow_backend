@@ -1020,6 +1020,30 @@ class AutoDMCampaign(models.Model):
         help_text="{scanned, enqueued, skipped, capped, floor, finished_at} — 프론트 표시용.",
     )
 
+    # ── 시스템 자동 정지 (게시물 제한 감지) ─────────────────────────────
+    # 사용자가 직접 누른 일시정지와 **구분**하기 위해 별도 필드로 둔다. status 만으로는
+    # "왜 멈췄나"를 알 수 없어 프론트가 "인스타가 막았다"와 "내가 껐다"를 못 가른다.
+    # 판정·정지 주체는 `integrations.sweep_restricted_campaigns` 하나뿐이다.
+    auto_paused_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="시스템 자동 정지 시각",
+        help_text=(
+            "게시물이 인스타그램에 의해 제한돼 시스템이 캠페인을 멈춘 시각. "
+            "사용자가 직접 재개하면 비운다."
+        ),
+    )
+    auto_paused_reason = models.CharField(
+        max_length=50,
+        blank=True,
+        default="",
+        verbose_name="시스템 자동 정지 사유",
+        help_text=(
+            "머신 키. 현재는 'post_restricted' 하나 — "
+            "apps.integrations.dm_user_reasons 의 U_POST_RESTRICTED 와 같은 네임스페이스."
+        ),
+    )
+
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="생성일시")
     updated_at = models.DateTimeField(auto_now=True, verbose_name="수정일시")
@@ -1029,6 +1053,11 @@ class AutoDMCampaign(models.Model):
     def __str__(self):
         target = self.media_id or self.trigger_type
         return f"{self.name} ({target})"
+
+    def clear_auto_pause(self) -> None:
+        """사용자가 직접 재개할 때 시스템 정지 표식을 지운다 (저장은 호출자 책임)."""
+        self.auto_paused_at = None
+        self.auto_paused_reason = ""
 
     def is_active(self) -> bool:
         """캠페인이 활성 상태인지 확인 (status 만 본다 — 예약 창은 is_runnable_now 참고)"""

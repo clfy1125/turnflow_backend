@@ -49,6 +49,46 @@ class DuplicateActiveCampaignError(APIException):
         )
 
 
+class RestrictedMediaError(APIException):
+    """게시물이 인스타그램에 의해 '연령 제한(제한 콘텐츠)'으로 분류돼 자동 DM 이 불가능할 때.
+
+    HTTP 409 Conflict 로 응답한다(:class:`DuplicateActiveCampaignError` 와 같은 계열 —
+    "지금 이 상태로는 만들 수 없다"는 충돌이지 입력 오류가 아니다). 프론트는 다음으로 분기한다:
+
+        - HTTP status == 409
+        - ``error.details.code == "media_content_restricted"``
+
+    판정 근거(``restriction``)를 detail 에 그대로 실어, 프론트가 "왜 막혔는지"와
+    "무엇을 하면 되는지"를 함께 보여줄 수 있게 한다. 판정 로직은
+    :mod:`apps.integrations.ig_content_restriction` 가 단일 소스다.
+
+    ⚠️ 이 예외는 **확정(restricted)** 일 때만 던진다. 의심(suspected)은 생성을 막지 않고
+    경고만 내려보낸다 — 오탐으로 정상 캠페인 생성을 막는 쪽이 더 큰 손해다.
+    """
+
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = "이 게시물은 인스타그램에서 자동 DM 발송이 제한되어 있습니다."
+    default_code = "media_content_restricted"
+
+    @classmethod
+    def for_verdict(cls, verdict, *, permalink: str = "") -> "RestrictedMediaError":
+        """:class:`~apps.integrations.ig_content_restriction.RestrictionVerdict` 로 예외 생성."""
+        return cls(
+            {
+                "message": (
+                    "이 게시물은 인스타그램이 '연령 제한 콘텐츠'로 분류해 "
+                    "댓글 자동 DM을 보낼 수 없습니다. 인스타그램 계정 상태에서 이의를 제기하거나, "
+                    "다른 게시물로 캠페인을 만들어 주세요. "
+                    "(재연결·권한 재승인으로는 해결되지 않습니다)"
+                ),
+                "code": cls.default_code,
+                "media_id": verdict.media_id,
+                "permalink": permalink,
+                "restriction": verdict.as_dict(),
+            }
+        )
+
+
 class PlanLimitExceededError(Exception):
     """
     Exception raised when plan usage limit is exceeded

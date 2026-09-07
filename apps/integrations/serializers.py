@@ -429,6 +429,10 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
             "updated_at",
             "started_at",
             "ended_at",
+            # 시스템 자동 정지(게시물 제한) 표식 — 사용자가 직접 누른 일시정지와 구분한다.
+            # 프론트는 status=paused 만으로는 "왜 멈췄나"를 알 수 없다.
+            "auto_paused_at",
+            "auto_paused_reason",
         ]
         read_only_fields = [
             "id",
@@ -454,6 +458,10 @@ class AutoDMCampaignSerializer(serializers.ModelSerializer):
             "updated_at",
             "started_at",
             "ended_at",
+            # 시스템 자동 정지(게시물 제한) 표식 — 사용자가 직접 누른 일시정지와 구분한다.
+            # 프론트는 status=paused 만으로는 "왜 멈췄나"를 알 수 없다.
+            "auto_paused_at",
+            "auto_paused_reason",
         ]
 
     def get_recovery_reply_available(self, obj) -> bool:

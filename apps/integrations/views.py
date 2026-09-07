@@ -30,7 +30,7 @@ from apps.ai_jobs.serializers import (
     DmOpeningDiversifyJobSerializer,
     DmOpeningDiversifyRequestSerializer,
 )
-from apps.core.exceptions import DuplicateActiveCampaignError
+from apps.core.exceptions import DuplicateActiveCampaignError, RestrictedMediaError
 from apps.core.throttling import AI_GENERATE_THROTTLES
 from apps.workspace.models import Workspace
 
@@ -2259,6 +2259,36 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         if conflict is not None:
             raise DuplicateActiveCampaignError.for_conflict(conflict, (media_id or "").strip())
 
+    def _inspect_media_restriction(self, *, media_id, permalink="", allow_live=False):
+        """게시물의 '연령 제한' 여부를 판정한다 (판정 로직은 ig_content_restriction 단일 소스).
+
+        판정 실패는 예외를 밖으로 내지 않는다 — 점검이 캠페인 생성을 막아선 안 된다(fail-open).
+        """
+        from .ig_content_restriction import RestrictionVerdict, inspect_media
+
+        try:
+            return inspect_media(media_id or "", permalink=permalink, allow_live=allow_live)
+        except Exception:  # noqa: BLE001 — 판정 실패는 '모름'일 뿐
+            logger.exception("게시물 제한 판정 실패: media_id=%s", media_id)
+            return RestrictionVerdict(media_id=media_id or "")
+
+    def _assert_media_not_restricted(self, *, media_id, permalink="", allow_live=False):
+        """인스타가 제한한 게시물이면 409 로 차단.
+
+        ⚠️ **확정(restricted)** 일 때만 막는다. 의심(suspected)은 통과시킨다 — 오탐으로
+        정상 캠페인을 못 만들게 하는 쪽이 손해가 크다. 의심은 조회 API 로만 노출한다.
+        """
+        from .ig_content_restriction import STATE_RESTRICTED
+
+        if not (media_id or "").strip():
+            return None
+        verdict = self._inspect_media_restriction(
+            media_id=media_id, permalink=permalink, allow_live=allow_live
+        )
+        if verdict.state == STATE_RESTRICTED:
+            raise RestrictedMediaError.for_verdict(verdict, permalink=permalink)
+        return verdict
+
     def _guard_activation_conflict(self, campaign, *, media_id=None, trigger_type=None):
         """기존 캠페인을 ACTIVE 로 만들/유지할 때 중복 차단.
 
@@ -3930,6 +3960,18 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
+        # ⚠️ 게이트 순서 — 제한 검사가 **중복 검사보다 먼저**다.
+        # 게시물이 죽었는데 "이미 활성 캠페인이 있습니다"만 알려주면, 사용자가 기존 캠페인을
+        # 정지하고 다시 시도했다가 그제서야 제한을 만난다(왕복 2회). 더 근본적인 사유를 먼저 준다.
+        # 게시물 제한 게이트: 인스타가 '연령 제한 콘텐츠'로 분류한 게시물이면 409.
+        # 그 게시물에서는 댓글 웹훅도 안 오고 비공개 답장도 거부되므로 캠페인을 만들어도
+        # 한 건도 못 나간다(조사: docs/system/DM_2534066_MEDIA_BLOCK_CENSUS_2026-09-07.md).
+        self._assert_media_not_restricted(
+            media_id=serializer.validated_data.get("media_id", ""),
+            permalink=serializer.validated_data.get("media_url", "") or "",
+            allow_live=True,
+        )
+
         # 중복 방지: 같은 게시물에 이미 활성 캠페인이 있으면 409 로 차단.
         # 생성 캠페인은 항상 ACTIVE 로 시작하므로 status gate 없이 항상 검사한다.
         self._assert_no_active_media_conflict(
@@ -4203,6 +4245,9 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         # 중복 방지: 재개하려는 게시물에 이미 다른 활성 캠페인이 있으면 409 (저장 전, status 변경 전 차단)
         self._guard_activation_conflict(campaign)
         campaign.status = AutoDMCampaign.Status.ACTIVE
+        # 사용자가 직접 재개했다 → 시스템 자동 정지 표식 해제.
+        # 지우지 않으면 스위퍼가 "이미 처리함"으로 보고 영영 다시 안 멈춘다.
+        campaign.clear_auto_pause()
         # 종료 예약이 이미 지났으면 즉시 재종료되지 않도록 해제
         if campaign.scheduled_end_at and campaign.scheduled_end_at <= timezone.now():
             campaign.scheduled_end_at = None
@@ -4468,11 +4513,19 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
                             continue
                     previous_status = campaign.status
                     campaign.status = AutoDMCampaign.Status.ACTIVE
+                    campaign.clear_auto_pause()  # 단건 resume 과 동일 규칙
                     if campaign.scheduled_end_at and campaign.scheduled_end_at <= now:
                         campaign.scheduled_end_at = None
                     campaign.ended_at = None
                     campaign.save(
-                        update_fields=["status", "scheduled_end_at", "ended_at", "updated_at"]
+                        update_fields=[
+                            "status",
+                            "scheduled_end_at",
+                            "ended_at",
+                            "auto_paused_at",
+                            "auto_paused_reason",
+                            "updated_at",
+                        ]
                     )
                     # 단건 resume 과 동일 규칙 — 정지 중 밀린 DM 되살림(건별 집계).
                     revive_queued += campaign.enqueue_paused_backlog_revive(
@@ -4546,6 +4599,13 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         source = self.get_object()  # 테넌시/권한 + 404 자동 처리
         in_ser = AutoDMCampaignCopySerializer(data=request.data)
         in_ser.is_valid(raise_exception=True)
+        # 죽은 게시물에 복사본을 만들면 실패만 쌓인다 — 실서버 CS #6d5b14ce 가 정확히 이 경로였다
+        # (이미 막힌 릴스에 캠페인을 복사해 42건을 더 태움).
+        self._assert_media_not_restricted(
+            media_id=source.media_id,
+            permalink=source.media_url or "",
+            allow_live=True,
+        )
         new_campaign = source.copy(new_name=in_ser.validated_data.get("name") or None)
         # 복사본은 media_id 를 그대로 물려받지만 media_url 은 원본이 비어 있으면 같이 빈다 →
         # 어드민 게시물 링크용 permalink 를 여기서도 백필한다.
@@ -4555,6 +4615,237 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         return Response(
             AutoDMCampaignSerializer(new_campaign).data,
             status=status.HTTP_201_CREATED,
+        )
+
+    # ── 게시물 제한 점검 ────────────────────────────────────────────────
+    @extend_schema(
+        summary="게시물 자동 DM 가능 여부 점검 (캠페인 생성 전)",
+        description="""
+        ## 목적
+        캠페인을 만들기 **전에** 그 게시물로 자동 DM을 보낼 수 있는지 확인합니다.
+
+        인스타그램이 게시물 하나를 **'연령 제한 콘텐츠'** 로 분류하면 그 게시물에서만
+        (1) 로그아웃/10대에게 노출 차단 (2) **댓글 웹훅 미전송** (3) **비공개 답장 거부**가
+        동시에 일어납니다. 이 상태에서는 캠페인을 만들어도 **한 건도 발송되지 않습니다.**
+        재연결/권한 재승인으로는 풀리지 않습니다(토큰 문제가 아님).
+
+        > 2026-09-04 부터 발생한 현상이며 우리 서비스만의 문제가 아닙니다.
+        > 상세: docs/system/DM_2534066_MEDIA_BLOCK_CENSUS_2026-09-07.md
+
+        ## 동작
+        세 가지 신호를 합쳐 판정합니다. 대부분 우리 DB 조회라 인스타 API 쿼터를 쓰지 않습니다
+        (live 만 예외 - 서버 설정이 켜져 있을 때만 공개 페이지를 1회 조회).
+
+        | 신호 | 언제 잡히나 | 비용 |
+        |---|---|---|
+        | history | 그 게시물에 **과거 실패 이력**이 있을 때 (재사용/복사 차단) | 0 |
+        | runtime | 캠페인 운영 중 **웹훅이 끊기고 연속 실패**할 때 | 0 |
+        | live | 즉시 (새 게시물도 판별) - **서버 설정 OFF 면 건너뜀** | HTTP 1회 |
+
+        ## 인증
+        JWT 필요. workspace_id 의 멤버여야 합니다.
+
+        ## 응답 state 값과 프론트 처리
+
+        | state | 뜻 | 화면 처리 |
+        |---|---|---|
+        | ok | 이상 없음 | 그대로 진행 |
+        | restricted | **제한 확정.** 캠페인 생성 시 **409** 로 거부됨 | 생성 버튼 비활성 + 안내 |
+        | suspected | 제한 의심 (웹훅 침묵 + 연속 실패) | **생성 허용**. 경고 배너만 |
+        | unknown | 판정 불가 (이력 없음 / 점검 실패) | 아무 것도 표시하지 않음 |
+
+        blocking=true 면 생성이 막힙니다. **unknown 은 정상으로 취급하세요** - 새 게시물은
+        대부분 이력이 없어 unknown 입니다.
+
+        ## 사용 예시
+        ```javascript
+        const url = `/api/v1/integrations/auto-dm-campaigns/inspect-media/`
+          + `?workspace_id=${wsId}&media_id=${mediaId}`
+          + `&permalink=${encodeURIComponent(permalink)}`;
+        const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+        const { data } = await r.json();
+        if (data.restriction.state === "restricted") {
+          showBlockingNotice(data.restriction.user_message);
+        }
+        ```
+
+        ## 응답 예시
+        ```json
+        {
+          "success": true,
+          "data": {
+            "media_id": "18302724844305013",
+            "permalink": "https://www.instagram.com/reel/Dc8dtWQpB10/",
+            "can_create_campaign": false,
+            "restriction": {
+              "state": "restricted",
+              "source": "history",
+              "user_reason": "post_restricted",
+              "blocking": true,
+              "user_message": "이 게시물은 인스타그램이 연령 제한 콘텐츠로 분류해 ...",
+              "how_to_check": "시크릿 창(로그아웃)에서 게시물 링크를 열어보세요. ...",
+              "next_steps": ["다른 게시물로 캠페인을 만드세요.", "..."],
+              "evidence": {
+                "history": {"failures": 96, "successes_after_first_failure": 0},
+                "runtime": {"failures_2534066": 92, "successes": 0},
+                "live": {},
+                "live_check_enabled": false
+              }
+            }
+          }
+        }
+        ```
+        """,
+        parameters=[
+            OpenApiParameter(
+                name="workspace_id",
+                required=True,
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description="워크스페이스 UUID",
+            ),
+            OpenApiParameter(
+                name="media_id",
+                required=True,
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description="점검할 Instagram 게시물 ID",
+            ),
+            OpenApiParameter(
+                name="permalink",
+                required=False,
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description=(
+                    "게시물 permalink. 주면 live 검사에 사용됩니다"
+                    "(서버 설정이 켜져 있을 때만). 없으면 DB 신호만으로 판정합니다."
+                ),
+            ),
+        ],
+        responses={
+            200: OpenApiResponse(description="점검 결과 (제한이어도 200 — report-only)"),
+            400: OpenApiResponse(description="workspace_id 또는 media_id 누락"),
+            401: OpenApiResponse(description="인증 필요"),
+            403: OpenApiResponse(description="해당 워크스페이스 멤버가 아님"),
+            404: OpenApiResponse(description="워크스페이스를 찾을 수 없음"),
+            500: OpenApiResponse(description="서버 오류"),
+        },
+        tags=["Auto DM"],
+    )
+    @action(detail=False, methods=["get"], url_path="inspect-media")
+    def inspect_media_endpoint(self, request):
+        """캠페인 생성 전 게시물 점검 (report-only, 항상 200)"""
+        workspace_id = request.query_params.get("workspace_id")
+        media_id = (request.query_params.get("media_id") or "").strip()
+        permalink = (request.query_params.get("permalink") or "").strip()
+        if not workspace_id or not media_id:
+            return Response(
+                {"error": "workspace_id and media_id are required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            workspace = Workspace.objects.get(id=workspace_id)
+        except (Workspace.DoesNotExist, DjangoValidationError, ValueError):
+            return Response({"error": "Workspace not found"}, status=status.HTTP_404_NOT_FOUND)
+        if not workspace.memberships.filter(user=request.user).exists():
+            return Response(
+                {"error": "You are not a member of this workspace"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        from .ig_content_restriction import restriction_payload
+
+        verdict = self._inspect_media_restriction(
+            media_id=media_id, permalink=permalink, allow_live=True
+        )
+        return Response(
+            {
+                "success": True,
+                "data": {
+                    "media_id": media_id,
+                    "permalink": permalink,
+                    "can_create_campaign": not verdict.blocking,
+                    "restriction": restriction_payload(verdict),
+                },
+            }
+        )
+
+    @extend_schema(
+        summary="캠페인 점검 (게시물 제한·이상징후)",
+        description="""
+        ## 목적
+        **이미 만든 캠페인**이 정상 발송 가능한 상태인지 점검합니다. 캠페인 상세 화면의
+        "점검하기" 버튼과, 발송 실패가 쌓였을 때 원인을 보여주는 배너에 사용하세요.
+
+        판정 기준과 state 값은 GET /auto-dm-campaigns/inspect-media/ 와 동일합니다.
+
+        ## 동작
+        - **report-only** 입니다. 이 API 는 캠페인 상태를 바꾸지 않습니다.
+        - 자동 정지는 서버 배치(integrations.sweep_restricted_campaigns)가 별도로 수행하며,
+          정지되면 캠페인 status 가 paused 로 바뀝니다.
+
+        ## 응답 추가 필드
+        | 필드 | 설명 |
+        |---|---|
+        | campaign.status | 현재 캠페인 상태 |
+        | campaign.auto_paused | 이 제한 때문에 정지된 상태로 보이는지 |
+        | stats.opening_success / opening_failed_2534066 | 오프닝 DM 성공/제한실패 건수 |
+
+        ## 사용 예시
+        ```javascript
+        const r = await fetch(`/api/v1/integrations/auto-dm-campaigns/${id}/inspect/`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const { data } = await r.json();
+        if (data.restriction.blocking) showBanner(data.restriction);
+        ```
+        """,
+        responses={
+            200: OpenApiResponse(description="점검 결과"),
+            401: OpenApiResponse(description="인증 필요"),
+            404: OpenApiResponse(description="캠페인을 찾을 수 없음"),
+            500: OpenApiResponse(description="서버 오류"),
+        },
+        tags=["Auto DM"],
+    )
+    @action(detail=True, methods=["get"], url_path="inspect")
+    def inspect(self, request, pk=None):
+        """캠페인 점검 (report-only, 상태 변경 없음)"""
+        campaign = self.get_object()
+
+        from .ig_content_restriction import restriction_payload
+
+        verdict = self._inspect_media_restriction(
+            media_id=campaign.media_id,
+            permalink=campaign.media_url or "",
+            allow_live=True,
+        )
+        logs = SentDMLog.objects.filter(campaign=campaign, dm_kind=SentDMLog.DMKind.OPENING)
+        return Response(
+            {
+                "success": True,
+                "data": {
+                    "campaign": {
+                        "id": str(campaign.id),
+                        "name": campaign.name,
+                        "status": campaign.status,
+                        "media_id": campaign.media_id,
+                        "permalink": campaign.media_url or "",
+                        "auto_paused": campaign.auto_paused_at is not None,
+                        "auto_paused_at": (
+                            campaign.auto_paused_at.isoformat() if campaign.auto_paused_at else None
+                        ),
+                        "auto_paused_reason": campaign.auto_paused_reason or "",
+                    },
+                    "stats": {
+                        "opening_success": logs.filter(
+                            status__in=SentDMLog.DELIVERED_STATUSES
+                        ).count(),
+                        "opening_failed_2534066": logs.filter(error_subcode="2534066").count(),
+                    },
+                    "restriction": restriction_payload(verdict),
+                },
+            }
         )
 
     @extend_schema(
@@ -4640,8 +4931,9 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
             # (status 변경 전 검사 — 이미 같은 게시물을 활성 점유 중이면 슬롯 무변경으로 통과).
             self._guard_activation_conflict(campaign)
             campaign.status = AutoDMCampaign.Status.ACTIVE
+            campaign.clear_auto_pause()  # 단건 resume 과 동일 규칙
             campaign.ended_at = None
-            update_fields += ["status", "ended_at"]
+            update_fields += ["status", "ended_at", "auto_paused_at", "auto_paused_reason"]
             if campaign.started_at is None:
                 campaign.started_at = timezone.now()
                 update_fields.append("started_at")

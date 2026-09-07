@@ -5683,3 +5683,95 @@ def prewarm_dm_migration(connection_id: str):
     run_dm_migration_job.delay(str(job.id))
     logger.info("prewarm_dm_migration: 잡 %s 시작 (connection=%s)", job.id, connection_id)
     return str(job.id)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 게시물 제한(연령 제한 콘텐츠) 감지 → 캠페인 자동 정지
+# ─────────────────────────────────────────────────────────────────────
+@shared_task(name="integrations.sweep_restricted_campaigns")
+def sweep_restricted_campaigns(limit: int = 300, dry_run: bool = False) -> dict:
+    """인스타가 제한한 게시물의 active 캠페인을 찾아 자동 정지한다.
+
+    왜 필요한가 (2026-09-07 조사)
+    ──────────────────────────────────────────────────────────────────
+    게시물이 '연령 제한 콘텐츠'로 분류되면 그 게시물의 댓글 웹훅이 끊기고 비공개 답장이
+    거부된다. 캠페인을 켜둔 채로 두면 폴러가 매시간 새 댓글러를 찾아 시도하고 전부
+    실패해서 **실패만 무한히 쌓인다.** 실서버에서 한 고객은 257명, 다른 고객은 96명이
+    이렇게 쌓였고 그동안 아무 알림도 못 받았다.
+
+    판정은 :mod:`apps.integrations.ig_content_restriction` 이 단일 소스다. 여기서는
+    **정지 여부만** 결정한다.
+
+    안전장치
+    ──────────────────────────────────────────────────────────────────
+    - ``restricted``(확정) 또는 ``suspected``(의심)일 때만 정지한다. ``unknown`` 은 건드리지 않는다.
+    - 이미 ``auto_paused_at`` 이 찍힌 캠페인은 **다시 손대지 않는다** — 사용자가 재개했다면
+      그 뜻을 존중한다(재개 시 ``clear_auto_pause()`` 로 표식이 지워지므로 다시 대상이 된다).
+    - ``live`` 검사는 쓰지 않는다(대량 스크래핑 금지). DB 신호만으로 판정한다.
+    - 건별 예외를 삼켜 한 행이 스윕 전체를 멈추지 않게 한다.
+    """
+    from .ig_content_restriction import STATE_RESTRICTED, STATE_SUSPECTED, inspect_media
+
+    qs = (
+        AutoDMCampaign.objects.filter(
+            status=AutoDMCampaign.Status.ACTIVE,
+            auto_paused_at__isnull=True,
+        )
+        .exclude(media_id="")
+        .order_by("-created_at")[:limit]
+    )
+
+    scanned = paused = 0
+    details: list[dict] = []
+    for campaign in qs:
+        scanned += 1
+        try:
+            # allow_live=False — 배치에서는 외부 조회를 하지 않는다.
+            verdict = inspect_media(campaign.media_id, allow_live=False)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "sweep_restricted_campaigns: 판정 실패 campaign=%s media=%s",
+                campaign.id,
+                campaign.media_id,
+            )
+            continue
+
+        if verdict.state not in (STATE_RESTRICTED, STATE_SUSPECTED):
+            continue
+
+        row = {
+            "campaign_id": str(campaign.id),
+            "campaign_name": campaign.name,
+            "media_id": campaign.media_id,
+            "username": campaign.ig_connection.username,
+            "state": verdict.state,
+            "source": verdict.source,
+        }
+        details.append(row)
+        if dry_run:
+            continue
+
+        try:
+            now = timezone.now()
+            campaign.status = AutoDMCampaign.Status.PAUSED
+            campaign.auto_paused_at = now
+            campaign.auto_paused_reason = verdict.user_reason or "post_restricted"
+            campaign.save(
+                update_fields=["status", "auto_paused_at", "auto_paused_reason", "updated_at"]
+            )
+            paused += 1
+            logger.warning(
+                "게시물 제한으로 캠페인 자동 정지: campaign=%s(%s) media=%s state=%s source=%s",
+                campaign.id,
+                campaign.name,
+                campaign.media_id,
+                verdict.state,
+                verdict.source,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("sweep_restricted_campaigns: 정지 실패 campaign=%s", campaign.id)
+
+    result = {"scanned": scanned, "paused": paused, "dry_run": dry_run, "details": details}
+    if details:
+        logger.warning("sweep_restricted_campaigns 결과: %s", result)
+    return result
