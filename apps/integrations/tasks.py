@@ -18,7 +18,7 @@ from datetime import datetime, timedelta
 from celery import shared_task
 from django.conf import settings
 from django.db import IntegrityError, transaction
-from django.db.models import F, Q, Value
+from django.db.models import Count, F, Q, Value
 from django.db.models.functions import Greatest
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
@@ -5710,14 +5710,39 @@ def sweep_restricted_campaigns(limit: int = 300, dry_run: bool = False) -> dict:
     - ``live`` 검사는 쓰지 않는다(대량 스크래핑 금지). DB 신호만으로 판정한다.
     - 건별 예외를 삼켜 한 행이 스윕 전체를 멈추지 않게 한다.
     """
-    from .ig_content_restriction import STATE_RESTRICTED, STATE_SUSPECTED, inspect_media
+    from .ig_content_restriction import (
+        HISTORY_MIN_FAILURES,
+        RUNTIME_MIN_FAILURES,
+        STATE_RESTRICTED,
+        STATE_SUSPECTED,
+        inspect_media,
+    )
 
+    # ⚠️ 활성 캠페인 전부를 판정하면 안 된다(실측 424개 → 판정당 ~6쿼리 = 2,500쿼리/시간).
+    # 그렇다고 `[:limit]` 로 최신순 N개만 자르면 **오래된 캠페인이 영영 스윕되지 않는다**
+    # (2026-09-07 배포 dry-run 에서 424개 중 300개만 scanned 로 잡혀 발견).
+    #
+    # 두 신호 모두 그 media 에 2534066 이 최소 min(3, 5)=3건은 있어야 성립하므로,
+    # **실패 이력이 있는 media 로 후보를 좁히면 결과가 같으면서 집합이 작아진다**(실측 21개).
+    # 그래서 limit 은 후보 집합에만 걸리고, 사실상 잘릴 일이 없다.
+    min_fail = min(HISTORY_MIN_FAILURES, RUNTIME_MIN_FAILURES)
+    candidate_media = [
+        row["media_id"]
+        for row in (
+            SentDMLog.objects.filter(error_subcode="2534066")
+            .exclude(media_id="")
+            .values("media_id")
+            .annotate(n=Count("id"))
+            .filter(n__gte=min_fail)
+        )
+    ]
     qs = (
         AutoDMCampaign.objects.filter(
             status=AutoDMCampaign.Status.ACTIVE,
             auto_paused_at__isnull=True,
+            media_id__in=candidate_media,
         )
-        .exclude(media_id="")
+        .select_related("ig_connection")
         .order_by("-created_at")[:limit]
     )
 
@@ -5771,7 +5796,13 @@ def sweep_restricted_campaigns(limit: int = 300, dry_run: bool = False) -> dict:
         except Exception:  # noqa: BLE001
             logger.exception("sweep_restricted_campaigns: 정지 실패 campaign=%s", campaign.id)
 
-    result = {"scanned": scanned, "paused": paused, "dry_run": dry_run, "details": details}
+    result = {
+        "candidate_media": len(candidate_media),
+        "scanned": scanned,
+        "paused": paused,
+        "dry_run": dry_run,
+        "details": details,
+    }
     if details:
         logger.warning("sweep_restricted_campaigns 결과: %s", result)
     return result
