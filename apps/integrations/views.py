@@ -2307,6 +2307,14 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         )
         if already_occupying:
             return
+        # 제한된 게시물을 '활성'으로 올리는 것을 막는다 — 복사·생성이 아니라 **여기가**
+        # 실제 발송이 시작되는 지점이다(2026-09-08 프론트 B5). 이 헬퍼는 재개·PATCH status=active
+        # ·schedule(activate) 이 공유하는 단일 초크포인트다.
+        self._assert_media_not_restricted(
+            media_id=target_media,
+            permalink=campaign.media_url or "",
+            allow_live=True,
+        )
         self._assert_no_active_media_conflict(
             ig_connection_id=campaign.ig_connection_id,
             media_id=target_media,
@@ -2394,6 +2402,12 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
             raw = params.get(bool_field)
             if raw is not None and raw != "":
                 qs = qs.filter(**{bool_field: self._parse_bool(raw, bool_field)})
+
+        # facet: 시스템 자동 정지만 보기 (?auto_paused=true).
+        # 컬럼이 nullable datetime 이라 위 루프의 단순 등호 필터로는 안 되고 isnull 로 가른다.
+        raw_ap = params.get("auto_paused")
+        if raw_ap is not None and raw_ap != "":
+            qs = qs.filter(auto_paused_at__isnull=not self._parse_bool(raw_ap, "auto_paused"))
 
         # 생성일 범위 필터 (created_after / created_before, 둘 다 경계 포함)
         created_after = params.get("created_after")
@@ -4511,6 +4525,16 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
                         if conflict is not None:
                             failed.append({"id": cid, "reason": "duplicate_active_campaign"})
                             continue
+                    # 일괄 재개는 _guard_activation_conflict 를 쓰지 않으므로 제한 검사를
+                    # 여기서 직접 한다(건별 실패로 기록하고 나머지는 계속 진행).
+                    try:
+                        self._assert_media_not_restricted(
+                            media_id=campaign.media_id,
+                            permalink=campaign.media_url or "",
+                        )
+                    except RestrictedMediaError:
+                        failed.append({"id": cid, "reason": "media_content_restricted"})
+                        continue
                     previous_status = campaign.status
                     campaign.status = AutoDMCampaign.Status.ACTIVE
                     campaign.clear_auto_pause()  # 단건 resume 과 동일 규칙
@@ -4599,13 +4623,10 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         source = self.get_object()  # 테넌시/권한 + 404 자동 처리
         in_ser = AutoDMCampaignCopySerializer(data=request.data)
         in_ser.is_valid(raise_exception=True)
-        # 죽은 게시물에 복사본을 만들면 실패만 쌓인다 — 실서버 CS #6d5b14ce 가 정확히 이 경로였다
-        # (이미 막힌 릴스에 캠페인을 복사해 42건을 더 태움).
-        self._assert_media_not_restricted(
-            media_id=source.media_id,
-            permalink=source.media_url or "",
-            allow_live=True,
-        )
+        # ⚠️ 복사에는 제한 게이트를 걸지 않는다 (2026-09-08 제품 결정, 프론트 B5).
+        #    복사본은 항상 INACTIVE 라 그 자체로는 한 건도 발송되지 않고, 사용자가 복사한 뒤
+        #    게시물을 바꿔 쓰는 정상 흐름이 있다. 실제 피해는 '활성화'에서 나므로 게이트는
+        #    생성(항상 ACTIVE)과 활성화 경로에만 둔다 — _guard_activation_conflict 참고.
         new_campaign = source.copy(new_name=in_ser.validated_data.get("name") or None)
         # 복사본은 media_id 를 그대로 물려받지만 media_url 은 원본이 비어 있으면 같이 빈다 →
         # 어드민 게시물 링크용 permalink 를 여기서도 백필한다.
@@ -4838,10 +4859,23 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
                         "auto_paused_reason": campaign.auto_paused_reason or "",
                     },
                     "stats": {
+                        # ⚠️ *_2534066 / *_success 는 **발송 시도 횟수**다. 한 사람이 댓글을 두 번
+                        # 달면 2 로 센다. 화면에 "N명" 으로 쓰려면 아래 *_unique_users 를 쓸 것
+                        # (2026-09-08 프론트 B3).
                         "opening_success": logs.filter(
                             status__in=SentDMLog.DELIVERED_STATUSES
                         ).count(),
                         "opening_failed_2534066": logs.filter(error_subcode="2534066").count(),
+                        "opening_success_unique_users": logs.filter(
+                            status__in=SentDMLog.DELIVERED_STATUSES
+                        )
+                        .values("recipient_user_id")
+                        .distinct()
+                        .count(),
+                        "opening_failed_unique_users": logs.filter(error_subcode="2534066")
+                        .values("recipient_user_id")
+                        .distinct()
+                        .count(),
                     },
                     "restriction": restriction_payload(verdict),
                 },

@@ -636,11 +636,17 @@ def compute_campaign_enrichment(obj: AutoDMCampaign) -> dict:
 
 
 def build_counts(campaign_qs) -> dict:
-    """상태별 캠페인 개수 + total. (단일 group-by 쿼리)"""
+    """상태별 캠페인 개수 + total + auto_paused. (group-by 1회 + count 1회)
+
+    ``auto_paused`` 는 status 축과 **직교**한다 — status 는 항상 ``paused`` 지만, 사용자가
+    직접 멈춘 것과 시스템이 게시물 제한 때문에 멈춘 것을 화면에서 갈라야 한다
+    (2026-09-08 프론트 B6). ``counts["paused"]`` 의 부분집합이므로 total 에는 더하지 않는다.
+    """
     rows = campaign_qs.values("status").annotate(n=Count("id"))
     by_status = {row["status"]: row["n"] for row in rows}
     counts = {s: by_status.get(s, 0) for s in AutoDMCampaign.Status.values}
     counts["total"] = sum(by_status.values())
+    counts["auto_paused"] = campaign_qs.filter(auto_paused_at__isnull=False).count()
     return counts
 
 

@@ -100,6 +100,14 @@ RUNTIME_WINDOW = timedelta(hours=24)
 #   탐지 12/16 → 13/16 으로 오르고 오탐은 0/13 그대로였다.
 HISTORY_MIN_FAILURES = 5
 HISTORY_MIN_FAIL_AFTER_SUCCESS = 5
+# ★ 증거 유효기간. 마지막 실패가 이보다 오래됐으면 '확정' 하지 않고 unknown 으로 둔다.
+#
+# 왜 필요한가: history 는 한 번 조건을 만족하면 **영원히** restricted 다(성공이 새로 생기지
+# 않는 한). 활성화 게이트가 restricted 를 막으므로, 이게 없으면 정지된 캠페인은 인스타가
+# 제한을 풀어줘도 **영영 재개할 수 없다** — 재개해야 성공이 생기는데 성공이 없어서 못 재개하는
+# 교착이다. 증거가 낡으면 물러서고, 실제로 아직 막혀 있으면 재개 직후 실패가 다시 쌓여
+# 스위퍼가 한 시간 안에 도로 정지시킨다(자기교정).
+HISTORY_STALE_AFTER = timedelta(days=14)
 
 _CACHE_PREFIX = "ig_restrict:v1:"
 _CACHE_TTL_RESTRICTED = 6 * 3600  # 제한은 잘 안 풀린다(실측 나흘째 회복 0) — 길게
@@ -117,7 +125,11 @@ class RestrictionVerdict:
     user_reason: str = ""
     #: 판정 근거 수치 — 화면에 그대로 보여줘도 되는 값만 담는다.
     evidence: dict[str, Any] = field(default_factory=dict)
-    #: 캠페인 생성을 막아야 하는가
+    #: 캠페인 생성·활성화가 **실제로 막히는가**.
+    #:
+    #: ⚠️ 프론트 계약 — 이 값은 게이트와 정확히 일치해야 한다. 한때 ``suspected`` 에도 True 를
+    #: 넣었는데, 게이트는 ``restricted`` 만 막아서 "blocking=true 인데 201 생성됨" 이 됐다
+    #: (2026-09-08 프론트 B2 지적). 이제 ``state == restricted`` 와 동치다.
     blocking: bool = False
 
     def as_dict(self) -> dict[str, Any]:
@@ -158,11 +170,20 @@ def check_history(media_id: str) -> RestrictionVerdict:
     # 성공이 아예 없으면 전부가 '마지막 성공 이후'다.
     fail_after = n_fail if last_ok is None else fails.filter(created_at__gt=last_ok).count()
 
+    last_fail = fails.order_by("-created_at").values_list("created_at", flat=True).first()
+    stale = bool(last_fail and (timezone.now() - last_fail) > HISTORY_STALE_AFTER)
+
     v.evidence = {
         "failures": n_fail,
         "failures_after_last_success": fail_after,
         "last_success_at": last_ok.isoformat() if last_ok else None,
+        "last_failure_at": last_fail.isoformat() if last_fail else None,
+        "evidence_stale": stale,
     }
+    if stale:
+        # 증거가 낡았다 — 단정하지 않고 물러선다(위 HISTORY_STALE_AFTER 주석 참고).
+        v.source = SOURCE_HISTORY
+        return v
     if fail_after >= HISTORY_MIN_FAIL_AFTER_SUCCESS:
         v.state = STATE_RESTRICTED
         v.source = SOURCE_HISTORY
@@ -217,7 +238,8 @@ def check_runtime(media_id: str, *, window: timedelta = RUNTIME_WINDOW) -> Restr
         v.state = STATE_SUSPECTED
         v.source = SOURCE_RUNTIME
         v.user_reason = "post_restricted"
-        v.blocking = True
+        # ⚠️ blocking=False — 의심은 **막지 않는다**. 오탐으로 정상 캠페인을 막는 손해가 크다.
+        #    경고 배너만 띄우고 사용자가 진행하게 둔다(게이트도 restricted 만 본다).
     elif n_fail or n_ok:
         v.state = STATE_OK
         v.source = SOURCE_RUNTIME

@@ -70,23 +70,40 @@ class RestrictedMediaError(APIException):
     default_detail = "이 게시물은 인스타그램에서 자동 DM 발송이 제한되어 있습니다."
     default_code = "media_content_restricted"
 
+    #: ``custom_exception_handler`` 가 DRF 기본 핸들러를 **거치지 않고** 그대로 내보낼 payload.
+    #:
+    #: ⚠️ DRF 의 ``exception_handler`` 는 detail 의 모든 말단값을 ``ErrorDetail``(str 서브클래스)
+    #: 로 강제 변환한다. 그래서 detail 에 dict 를 넣으면 ``True → "True"``, ``40 → "40"``,
+    #: ``None → "None"`` 이 되어 클라이언트가 ``"False"`` 를 truthy 로 읽는다
+    #: (2026-09-08 프론트 B1 지적). 원본 타입을 지키려면 핸들러 앞단에서 직접 응답해야 한다.
+    error_payload: dict | None = None
+
     @classmethod
     def for_verdict(cls, verdict, *, permalink: str = "") -> "RestrictedMediaError":
-        """:class:`~apps.integrations.ig_content_restriction.RestrictionVerdict` 로 예외 생성."""
-        return cls(
-            {
-                "message": (
-                    "이 게시물은 인스타그램이 '연령 제한 콘텐츠'로 분류해 "
-                    "댓글 자동 DM을 보낼 수 없습니다. 인스타그램 계정 상태에서 이의를 제기하거나, "
-                    "다른 게시물로 캠페인을 만들어 주세요. "
-                    "(재연결·권한 재승인으로는 해결되지 않습니다)"
-                ),
-                "code": cls.default_code,
-                "media_id": verdict.media_id,
-                "permalink": permalink,
-                "restriction": verdict.as_dict(),
-            }
+        """:class:`~apps.integrations.ig_content_restriction.RestrictionVerdict` 로 예외 생성.
+
+        ``restriction`` 블록은 200 응답(inspect-media / {id}/inspect)과 **완전히 같은 모양**이다
+        — ``restriction_payload()`` 단일 소스를 쓰므로 user_message·how_to_check·next_steps 도
+        함께 담긴다. 프론트가 같은 컴포넌트로 렌더할 수 있다.
+        """
+        from apps.integrations.ig_content_restriction import restriction_payload
+
+        message = (
+            "이 게시물은 인스타그램이 '연령 제한 콘텐츠'로 분류해 "
+            "댓글 자동 DM을 보낼 수 없습니다. 인스타그램 계정 상태에서 이의를 제기하거나, "
+            "다른 게시물로 캠페인을 만들어 주세요. "
+            "(재연결·권한 재승인으로는 해결되지 않습니다)"
         )
+        payload = {
+            "message": message,
+            "code": cls.default_code,
+            "media_id": verdict.media_id,
+            "permalink": permalink,
+            "restriction": restriction_payload(verdict),
+        }
+        exc = cls({"message": message, "code": cls.default_code})
+        exc.error_payload = payload
+        return exc
 
 
 class PlanLimitExceededError(Exception):
@@ -149,6 +166,23 @@ def custom_exception_handler(exc, context):
                 },
             },
             status=status.HTTP_429_TOO_MANY_REQUESTS,
+        )
+
+    # ── 게시물 제한(409) — DRF 기본 핸들러를 거치지 않는다 ─────────────────────────
+    # 기본 핸들러는 detail 의 말단값을 전부 ErrorDetail(str) 로 바꿔서 bool/int/None 이
+    # 문자열이 된다(RestrictedMediaError.error_payload 주석 참고). 판정 근거를 원본 타입으로
+    # 내보내야 하므로 여기서 직접 응답을 만든다.
+    if isinstance(exc, RestrictedMediaError) and exc.error_payload is not None:
+        return Response(
+            {
+                "success": False,
+                "error": {
+                    "code": exc.status_code,
+                    "message": exc.error_payload["message"],
+                    "details": exc.error_payload,
+                },
+            },
+            status=exc.status_code,
         )
 
     # Call REST framework's default exception handler first

@@ -1,6 +1,6 @@
 # 게시물 제한 점검 · 캠페인 자동 정지 — 프론트엔드 연동 가이드
 
-작성 2026-09-07 · 백엔드 구현 완료(마이그레이션 `integrations 0054`) · 대상: 프론트엔드 개발자
+작성 2026-09-07 · **개정 2026-09-08 (프론트 확인요청 6건 반영 — 아래 §0-1)** · 대상: 프론트엔드 개발자
 
 관련 문서
 - 원인 조사 원본: `../system/DM_2534066_MEDIA_BLOCK_CENSUS_2026-09-07.md`
@@ -9,10 +9,29 @@
 
 ---
 
+## 0-1. 2026-09-08 변경 — 프론트 확인요청 6건 반영
+
+프론트에서 올려주신 B1~B6 전부 실제 결함이 맞았습니다. **6건 모두 백엔드에서 고쳤습니다.**
+
+| # | 지적 | 조치 | 프론트가 할 일 |
+|---|---|---|---|
+| **B5** | 제한 게시물의 **복사**가 409로 막힘 | ✅ **복사 허용.** 게이트를 **활성화 시점**으로 옮김 | 복사 버튼 **잠그지 마세요** |
+| **B1** | 409의 `restriction` 값이 파이썬 문자열(`"True"`, `"None"`) | ✅ 200과 **완전히 같은 직렬화**. `user_message`·`how_to_check`·`next_steps`도 포함 | **정규화 함수 제거하세요** |
+| **B2** | `suspected`인데 `can_create_campaign:false`·`blocking:true` | ✅ `blocking`은 이제 `state==restricted`와 **동치**. suspected → `can_create_campaign:true` | 두 필드 **써도 됩니다** |
+| **B3** | 실패 수가 시도 횟수라 "명"으로 못 씀 | ✅ `opening_failed_unique_users`·`opening_success_unique_users` 추가 | **"N명" 표기 가능** |
+| **B4** | 임계치가 뭔지 | ✅ 아래 §11에 규칙 전체 명시 | CS 답변에 사용 |
+| **B6** | `?auto_paused=true` 무시됨, 개수 없음 | ✅ 필터 동작 + `summary.counts.auto_paused` 추가 | **개수 표기 가능**, 목록 조회 1회 절약 |
+
+그리고 지적해 주신 문서 오류(§9 표의 `…002` 행)도 고쳤습니다. 제한 검사가 중복 검사보다 앞이 맞습니다.
+
+**활성화 게이트가 새로 생겼습니다 — 아래 §4-1을 꼭 보세요.**
+
+---
+
 ## 0. 3줄 요약
 
 1. **캠페인 만들기 전** `GET /auto-dm-campaigns/inspect-media/` 로 그 게시물이 쓸 수 있는지 확인하세요.
-2. 그래도 막힌 게시물로 생성/복사를 시도하면 **HTTP 409 `media_content_restricted`** 가 옵니다. 이 코드로 분기하세요.
+2. 막힌 게시물을 **생성하거나 활성화**하면 **HTTP 409 `media_content_restricted`** 가 옵니다. **복사는 막지 않습니다.**
 3. 서버가 이상징후를 감지하면 캠페인을 **자동 정지**합니다. 목록/상세 응답의 **`auto_paused_at`** 이 채워져 있으면 "인스타그램 제한으로 멈춤" 배지를 띄우세요.
 
 ---
@@ -171,7 +190,12 @@ GET /api/v1/integrations/auto-dm-campaigns/{id}/inspect/
       "auto_paused_at": "2026-09-07T09:00:00+00:00",
       "auto_paused_reason": "post_restricted"
     },
-    "stats": { "opening_success": 20, "opening_failed_2534066": 96 },
+    "stats": {
+      "opening_success": 20,
+      "opening_failed_2534066": 96,
+      "opening_success_unique_users": 20,
+      "opening_failed_unique_users": 74
+    },
     "restriction": { "state": "restricted", "...": "위와 동일 구조" }
   }
 }
@@ -185,10 +209,14 @@ GET /api/v1/integrations/auto-dm-campaigns/{id}/inspect/
 
 점검 API를 건너뛰거나, 점검 후 시간이 지나 상태가 바뀐 경우 서버가 최종적으로 막습니다.
 
-| 엔드포인트 | 게이트 |
-|---|---|
-| `POST /auto-dm-campaigns/?workspace_id=…` | ✅ |
-| `POST /auto-dm-campaigns/{id}/copy/` | ✅ |
+| 엔드포인트 | 게이트 | 비고 |
+|---|---|---|
+| `POST /auto-dm-campaigns/?workspace_id=…` | ✅ | 생성 캠페인은 항상 ACTIVE 로 시작 |
+| `POST /auto-dm-campaigns/{id}/resume/` | ✅ | **신규(09-08)** |
+| `PATCH /auto-dm-campaigns/{id}/` `status=active` | ✅ | **신규(09-08)** |
+| `POST /auto-dm-campaigns/{id}/schedule/` `activate=true` | ✅ | **신규(09-08)** |
+| `POST /auto-dm-campaigns/bulk/` `op=resume` | ✅ | **신규(09-08)** — 건별 `failed[].reason` |
+| `POST /auto-dm-campaigns/{id}/copy/` | ❌ **막지 않음** | 복사본은 INACTIVE — 발송 0건 |
 
 ### 409 응답
 
@@ -227,6 +255,29 @@ if (res.status === 409) {
 }
 ```
 
+### 4-1. 복사는 허용, **활성화**에서 막습니다 (2026-09-08 변경)
+
+복사본은 항상 `INACTIVE` 로 생기므로 그 자체로는 한 건도 발송되지 않습니다. 복사해서 게시물을
+바꿔 쓰는 정상 흐름을 막지 않기 위해 **복사 게이트를 뺐습니다.**
+
+대신 실제로 발송이 시작되는 **활성화 지점**을 막습니다.
+
+```
+복사        → 201 (INACTIVE)          막지 않음
+게시물 교체  → 200                     막지 않음
+활성화      → 409 (제한 게시물 그대로면)  ← 여기서 막힘
+```
+
+**일괄 재개(`bulk` `op=resume`)** 는 409 를 내지 않고 건별로 실패를 담습니다.
+
+```json
+{ "failed": [{ "id": "…", "reason": "media_content_restricted" }] }
+```
+
+> **증거 유효기간** — 마지막 실패가 **14일** 넘게 지났으면 `restricted` 로 단정하지 않고
+> `unknown` 을 돌려줍니다. 인스타가 제한을 풀어줬을 수 있는데 재개를 영구히 막으면 빠져나올
+> 길이 없기 때문입니다. 실제로 아직 막혀 있으면 재개 직후 실패가 다시 쌓여 자동 정지됩니다.
+
 ### 게이트 순서 — 제한 검사가 **먼저**입니다
 
 한 게시물이 "제한됨 + 이미 활성 캠페인 있음" 둘 다인 경우 **`media_content_restricted` 가 먼저** 나옵니다.
@@ -260,11 +311,32 @@ function pauseBadge(campaign) {
 
 `status: "paused"` 만 보고 "사용자가 껐구나"로 처리하면 **왜 멈췄는지 영영 안 보입니다.** 실제 CS의 절반이 여기서 발생했습니다.
 
+### 자동 정지된 것만 조회 · 개수 세기 (2026-09-08 추가, B6)
+
+```
+GET /auto-dm-campaigns/?ig_connection_id=...&auto_paused=true    # 자동 정지된 것만
+GET /auto-dm-campaigns/?ig_connection_id=...&auto_paused=false   # 사용자가 직접 멈춘 것만
+GET /auto-dm-campaigns/summary/?workspace_id=...                 # counts.auto_paused
+```
+
+`summary` 응답의 `counts` 에 `auto_paused` 가 들어갑니다. **`paused` 의 부분집합**이라
+`total` 에는 더해지지 않습니다.
+
+```json
+{ "counts": { "active": 3, "paused": 5, "completed": 2, "inactive": 0,
+              "total": 10, "auto_paused": 3 } }
+```
+
+이제 `?status=paused&page_size=100` 을 받아 세실 필요 없이 **"3개가 멈춰 있습니다"** 라고
+바로 쓰실 수 있습니다.
+
 ### 재개하면 표식이 지워집니다
 
 사용자가 재개하면(`POST .../resume/`, 일괄 재개, `POST .../schedule/` 의 `activate=true`) 서버가 `auto_paused_at` 을 `null` 로 만듭니다. 프론트는 별도 처리가 필요 없습니다.
 
-> 다만 게시물이 여전히 제한 상태면 **다음 배치에서 다시 정지됩니다.** 재개 버튼 옆에 "게시물 제한이 풀리지 않았다면 다시 정지됩니다" 안내를 넣어 주세요.
+> ⚠️ **2026-09-08 변경** — 게시물이 여전히 제한 상태면 재개 자체가 **409 로 거부**됩니다(§4-1).
+> 재개 버튼은 그대로 두시고, 409 가 오면 제한 모달을 띄우시면 됩니다.
+> 마지막 실패가 14일 넘게 지났으면 재개가 허용되며, 아직 막혀 있다면 곧 다시 자동 정지됩니다.
 
 ---
 
@@ -357,7 +429,10 @@ ig_connection_id  14004ce9-97f0-4fcf-9afb-81653914a41d   (@restriction_demo)
 | `17900000000000007` | `restricted` | **409 `media_content_restricted`** ← 이걸로 모달 확인 |
 | `17900000000000008` | `suspected` | **201 생성됨** (경고만 뜨고 통과) |
 
-> ⚠️ `17900000000000002`(제한 확정 캠페인의 media)로 생성하면 **`duplicate_active_campaign`** 이 나옵니다 — 그 게시물엔 이미 활성 캠페인이 있기 때문입니다. **제한 409 를 보려면 `…007` 을 쓰세요.**
+> ⚠️ **정정(09-08)** — `17900000000000002` 로 생성하면 **`media_content_restricted`** 가 나옵니다.
+> 제한 검사가 중복 검사보다 **앞**이라 그렇습니다(§4 게이트 순서). 이전 문서에 `duplicate_active_campaign`
+> 이라고 적혀 있던 것은 오류입니다 — 지적 감사합니다.
+> `duplicate_active_campaign` 만 따로 보시려면 **제한이 없는** `…001` 에 활성 캠페인이 있는 상태로 생성해 보세요.
 
 ### 바로 붙여넣을 수 있는 호출
 
@@ -392,6 +467,41 @@ docker compose exec -T web python manage.py shell < scripts/seed_dev_restriction
 ```
 
 **주의** — 화면에서 캠페인을 재개하면 `auto_paused_at` 이 지워져서 🔴 배지가 사라집니다(의도된 동작). 배지를 다시 보려면 시드를 재실행하세요.
+
+---
+
+## 11. 판정 임계치 — CS 답변용 (B4 답변)
+
+`apps/integrations/ig_content_restriction.py` 의 실제 규칙입니다. **화면에 숫자를 쓰지는
+마세요**(인스타 정책이라 언제든 바뀝니다). CS가 "몇 번 더 실패하면 막히나요" 를 받았을 때
+근거로만 쓰세요.
+
+### 축은 "총 실패 수"가 아니라 **"마지막 성공 이후 실패 수"** 입니다
+
+관찰하신 게 정확합니다. 성공이 섞인 게시물은 실패 16건이어도 `ok` 입니다.
+
+| 판정 | 조건 | 화면 |
+|---|---|---|
+| `restricted` | 총 실패 **5건 이상** **그리고** 마지막 성공 이후 실패 **5건 이상** | 🔴 차단 |
+| `suspected` | 최근 24시간 실패 **3건 이상** **그리고** 그 24시간 성공 **0건** | 🟡 경고만 |
+| `ok` | 위 어디에도 안 걸림 (최근에 성공한 이력이 있음) | 표시 없음 |
+| `unknown` | 판정할 이력이 없음, **또는 마지막 실패가 14일 초과** | 표시 없음 |
+
+**왜 이렇게 나눴나** — 소급발송(백필)은 실패와 성공을 뒤섞어 남깁니다. "첫 실패 이후 성공이
+몇 건인가" 로 보면 실서버에서 확실히 죽은 게시물 2개가 정상으로 빠져나갔습니다. 기준을
+"마지막 성공 이후" 로 바꾸니 실측 탐지율이 올랐고 오탐은 0을 유지했습니다.
+
+`suspected` 임계(3)가 `restricted` 임계(5)보다 **낮은 것은 의도**입니다. 같으면 확정이 항상
+먼저 떠서 조기경보가 뜰 틈이 없습니다.
+
+### CS 답변 예시
+
+> "이 게시물은 마지막으로 정상 발송된 뒤 실패가 5회 이상 연속돼서 자동으로 막아둔 상태입니다.
+> 인스타그램이 게시물을 제한하면 저희가 댓글 정보를 아예 못 받아서, 몇 번을 더 시도해도
+> 결과가 같습니다. 새 게시물로 캠페인을 만드시는 게 가장 빠릅니다."
+
+**근거 수치는 응답에 그대로 옵니다** — `restriction.evidence.history` 의
+`failures` / `failures_after_last_success` / `last_success_at` / `last_failure_at` / `evidence_stale`.
 
 ---
 

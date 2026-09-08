@@ -173,7 +173,8 @@ class TestRuntimeSignal:
         v = icr.check_runtime(mid)
         assert v.state == icr.STATE_SUSPECTED
         assert v.source == icr.SOURCE_RUNTIME
-        assert v.blocking is True
+        # B2(2026-09-08) — 의심은 생성·활성화를 막지 않는다. blocking 은 게이트와 동치다.
+        assert v.blocking is False
         assert v.evidence["poll_only_comments_after_last_webhook"] == 6
 
     def test_성공이_섞여_있으면_의심하지_않음(self, conn):
@@ -309,14 +310,44 @@ class TestCreateAndCopyGate:
         )
         assert r.status_code == 201
 
-    def test_죽은_게시물엔_복사도_막힌다(self, client, conn):
-        """실서버 CS #6d5b14ce — 이미 막힌 릴스에 복사본을 만들어 42건을 더 태웠다."""
+    def test_죽은_게시물이어도_복사는_허용된다(self, client, conn):
+        """복사본은 INACTIVE 라 한 건도 안 나간다 — 게시물을 바꿔 쓰는 정상 흐름을 막지 않는다.
+
+        2026-09-08 제품 결정(프론트 B5). 실제 피해는 '활성화'에서 나므로 게이트는 거기 둔다.
+        """
         mid = _media()
         src = _campaign(conn, mid, status=AutoDMCampaign.Status.PAUSED)
         for _ in range(icr.HISTORY_MIN_FAILURES):
             _log(src, mid, status=SentDMLog.Status.FAILED_NO_TRACE, subcode=SUB)
 
         r = client.post(f"/api/v1/integrations/auto-dm-campaigns/{src.id}/copy/", {}, format="json")
+        assert r.status_code == 201
+        assert r.json()["status"] == AutoDMCampaign.Status.INACTIVE
+
+    def test_제한된_게시물은_재개가_막힌다(self, client, conn):
+        """실서버 CS #6d5b14ce — 막힌 릴스를 다시 켜면 실패만 쌓인다."""
+        mid = _media()
+        c = _campaign(conn, mid, status=AutoDMCampaign.Status.PAUSED)
+        for _ in range(icr.HISTORY_MIN_FAILURES):
+            _log(c, mid, status=SentDMLog.Status.FAILED_NO_TRACE, subcode=SUB)
+
+        r = client.post(f"/api/v1/integrations/auto-dm-campaigns/{c.id}/resume/")
+        assert r.status_code == 409
+        assert r.json()["error"]["details"]["code"] == "media_content_restricted"
+        c.refresh_from_db()
+        assert c.status == AutoDMCampaign.Status.PAUSED
+
+    def test_제한된_게시물은_PATCH_활성화도_막힌다(self, client, conn):
+        mid = _media()
+        c = _campaign(conn, mid, status=AutoDMCampaign.Status.PAUSED)
+        for _ in range(icr.HISTORY_MIN_FAILURES):
+            _log(c, mid, status=SentDMLog.Status.FAILED_NO_TRACE, subcode=SUB)
+
+        r = client.patch(
+            f"/api/v1/integrations/auto-dm-campaigns/{c.id}/",
+            {"status": AutoDMCampaign.Status.ACTIVE},
+            format="json",
+        )
         assert r.status_code == 409
         assert r.json()["error"]["details"]["code"] == "media_content_restricted"
 
@@ -349,7 +380,10 @@ class TestCreateAndCopyGate:
                 when=now - timedelta(hours=2),
             )
         assert icr.check_history(mid).state == icr.STATE_OK
-        assert icr.inspect_media(mid).state == icr.STATE_SUSPECTED
+        v = icr.inspect_media(mid)
+        assert v.state == icr.STATE_SUSPECTED
+        # B2 — blocking 은 게이트와 동치여야 한다. 의심은 막지 않으므로 False.
+        assert v.blocking is False
 
         r = client.post(
             f"/api/v1/integrations/auto-dm-campaigns/?workspace_id={workspace.id}",
@@ -482,3 +516,170 @@ class TestResumeClearsMark:
         assert c.status == AutoDMCampaign.Status.ACTIVE
         assert c.auto_paused_at is None
         assert c.auto_paused_reason == ""
+
+
+# ── 9. 프론트 계약 (2026-09-08 B1·B2·B3·B6) ───────────────────────────
+@pytest.mark.django_db
+class TestFrontendContract:
+    def test_409_payload_는_원본_타입을_지킨다(self, client, conn, workspace):
+        """B1 — DRF 기본 핸들러는 detail 말단값을 전부 문자열로 바꾼다. 우회했는지 확인."""
+        mid = _media()
+        dead = _campaign(conn, mid, status=AutoDMCampaign.Status.PAUSED)
+        for _ in range(icr.HISTORY_MIN_FAILURES):
+            _log(dead, mid, status=SentDMLog.Status.FAILED_NO_TRACE, subcode=SUB)
+
+        r = client.post(
+            f"/api/v1/integrations/auto-dm-campaigns/?workspace_id={workspace.id}",
+            {
+                "ig_connection_id": str(conn.id),
+                "name": "타입 확인",
+                "media_id": mid,
+                "message_template": "안녕하세요",
+            },
+            format="json",
+        )
+        assert r.status_code == 409
+        rest = r.json()["error"]["details"]["restriction"]
+        assert rest["blocking"] is True, "bool 이어야 한다 (문자열 'True' 아님)"
+        assert isinstance(rest["evidence"]["history"]["failures"], int)
+        assert rest["evidence"]["history"]["last_success_at"] is None
+        assert rest["evidence"]["live_check_enabled"] is False
+        # 200 응답과 같은 블록이어야 한다 — 안내 문구도 함께 온다
+        assert rest["user_message"]
+        assert rest["how_to_check"]
+        assert isinstance(rest["next_steps"], list) and rest["next_steps"]
+
+    def test_can_create_campaign_이_실제_게이트와_일치한다(self, client, conn, workspace):
+        """B2 — suspected 는 실제로 201 로 생성되므로 can_create_campaign 도 true 여야 한다."""
+        mid = _media()
+        holder = _campaign(conn, _media(), status=AutoDMCampaign.Status.PAUSED)
+        n = icr.HISTORY_MIN_FAILURES - 1
+        for _ in range(n):
+            log = _log(holder, mid, status=SentDMLog.Status.FAILED_NO_TRACE, subcode=SUB)
+            SentDMLog.objects.filter(pk=log.pk).update(media_id=mid)
+        assert icr.inspect_media(mid).state == icr.STATE_SUSPECTED
+
+        r = client.get(
+            "/api/v1/integrations/auto-dm-campaigns/inspect-media/"
+            f"?workspace_id={workspace.id}&media_id={mid}"
+        )
+        d = r.json()["data"]
+        assert d["restriction"]["state"] == icr.STATE_SUSPECTED
+        assert d["can_create_campaign"] is True
+        assert d["restriction"]["blocking"] is False
+
+        # 실제 생성도 통과해야 한다 (계약 일치 확인)
+        r2 = client.post(
+            f"/api/v1/integrations/auto-dm-campaigns/?workspace_id={workspace.id}",
+            {
+                "ig_connection_id": str(conn.id),
+                "name": "의심 통과",
+                "media_id": mid,
+                "message_template": "안녕하세요",
+            },
+            format="json",
+        )
+        assert r2.status_code == 201
+
+    def test_inspect_stats_에_고유_사용자_수가_있다(self, client, conn):
+        """B3 — 한 사람이 두 번 실패해도 '명' 은 1 이어야 한다."""
+        mid = _media()
+        c = _campaign(conn, mid)
+        dup_user = f"u_{uuid.uuid4().hex[:12]}"
+        for _ in range(4):
+            SentDMLog.objects.create(
+                campaign=c,
+                media_id=mid,
+                comment_id=f"c_{uuid.uuid4().hex[:12]}",
+                recipient_user_id=dup_user,  # 같은 사람이 여러 번
+                idempotency_key=uuid.uuid4().hex,
+                status=SentDMLog.Status.FAILED_NO_TRACE,
+                error_subcode=SUB,
+                dm_kind=SentDMLog.DMKind.OPENING,
+            )
+        _log(c, mid, status=SentDMLog.Status.FAILED_NO_TRACE, subcode=SUB)  # 다른 사람 1명
+
+        r = client.get(f"/api/v1/integrations/auto-dm-campaigns/{c.id}/inspect/")
+        st = r.json()["data"]["stats"]
+        assert st["opening_failed_2534066"] == 5, "시도 횟수"
+        assert st["opening_failed_unique_users"] == 2, "사람 수"
+
+    def test_auto_paused_필터와_counts(self, client, conn, workspace):
+        """B6 — ?auto_paused=true 필터 + summary counts.auto_paused."""
+        normal = _campaign(conn, _media(), status=AutoDMCampaign.Status.PAUSED)
+        auto = _campaign(conn, _media(), status=AutoDMCampaign.Status.PAUSED)
+        auto.auto_paused_at = timezone.now()
+        auto.auto_paused_reason = "post_restricted"
+        auto.save()
+
+        r = client.get(
+            f"/api/v1/integrations/auto-dm-campaigns/?ig_connection_id={conn.id}&auto_paused=true"
+        )
+        assert r.status_code == 200
+        j = r.json()
+        rows = j if isinstance(j, list) else j.get("results", [])
+        ids = {row["id"] for row in rows}
+        assert str(auto.id) in ids
+        assert str(normal.id) not in ids
+
+        r2 = client.get(
+            f"/api/v1/integrations/auto-dm-campaigns/?ig_connection_id={conn.id}&auto_paused=false"
+        )
+        j2 = r2.json()
+        rows2 = j2 if isinstance(j2, list) else j2.get("results", [])
+        ids2 = {row["id"] for row in rows2}
+        assert str(normal.id) in ids2
+        assert str(auto.id) not in ids2
+
+        r3 = client.get(
+            f"/api/v1/integrations/auto-dm-campaigns/summary/"
+            f"?workspace_id={workspace.id}&ig_connection_id={conn.id}"
+        )
+        assert r3.status_code == 200
+        counts = r3.json()["counts"]
+        assert counts["auto_paused"] == 1
+        assert counts["paused"] == 2, "auto_paused 는 paused 의 부분집합"
+
+
+# ── 10. 증거 유효기간 (영구 잠금 방지) ─────────────────────────────────
+@pytest.mark.django_db
+class TestStaleEvidence:
+    def test_오래된_실패_이력은_확정하지_않는다(self, conn):
+        """활성화 게이트가 restricted 를 막으므로, 낡은 증거로 영구 잠기면 안 된다."""
+        mid = _media()
+        c = _campaign(conn, mid, status=AutoDMCampaign.Status.PAUSED)
+        old = timezone.now() - icr.HISTORY_STALE_AFTER - timedelta(days=1)
+        for _ in range(icr.HISTORY_MIN_FAILURES + 5):
+            _log(c, mid, status=SentDMLog.Status.FAILED_NO_TRACE, subcode=SUB, when=old)
+
+        v = icr.check_history(mid)
+        assert v.state == icr.STATE_UNKNOWN
+        assert v.evidence["evidence_stale"] is True
+        assert icr.inspect_media(mid).blocking is False
+
+    def test_최근_실패는_그대로_확정한다(self, conn):
+        mid = _media()
+        c = _campaign(conn, mid, status=AutoDMCampaign.Status.PAUSED)
+        recent = timezone.now() - timedelta(days=1)
+        for _ in range(icr.HISTORY_MIN_FAILURES):
+            _log(c, mid, status=SentDMLog.Status.FAILED_NO_TRACE, subcode=SUB, when=recent)
+
+        v = icr.check_history(mid)
+        assert v.state == icr.STATE_RESTRICTED
+        assert v.evidence["evidence_stale"] is False
+
+    def test_낡은_증거면_재개가_다시_열린다(self, client, conn):
+        mid = _media()
+        c = _campaign(conn, mid, status=AutoDMCampaign.Status.PAUSED)
+        old = timezone.now() - icr.HISTORY_STALE_AFTER - timedelta(days=1)
+        for _ in range(icr.HISTORY_MIN_FAILURES + 5):
+            _log(c, mid, status=SentDMLog.Status.FAILED_NO_TRACE, subcode=SUB, when=old)
+        c.auto_paused_at = old
+        c.auto_paused_reason = "post_restricted"
+        c.save()
+
+        r = client.post(f"/api/v1/integrations/auto-dm-campaigns/{c.id}/resume/")
+        assert r.status_code == 200
+        c.refresh_from_db()
+        assert c.status == AutoDMCampaign.Status.ACTIVE
+        assert c.auto_paused_at is None
