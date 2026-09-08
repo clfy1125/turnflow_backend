@@ -215,7 +215,7 @@ GET /api/v1/integrations/auto-dm-campaigns/{id}/inspect/
 | `POST /auto-dm-campaigns/{id}/resume/` | ✅ | **신규(09-08)** |
 | `PATCH /auto-dm-campaigns/{id}/` `status=active` | ✅ | **신규(09-08)** |
 | `POST /auto-dm-campaigns/{id}/schedule/` `activate=true` | ✅ | **신규(09-08)** |
-| `POST /auto-dm-campaigns/bulk/` `op=resume` | ✅ | **신규(09-08)** — 건별 `failed[].reason` |
+| `POST /auto-dm-campaigns/bulk-resume/` | ✅ | **신규(09-08)** — 409 아니고 건별 `failed[].reason` |
 | `POST /auto-dm-campaigns/{id}/copy/` | ❌ **막지 않음** | 복사본은 INACTIVE — 발송 0건 |
 
 ### 409 응답
@@ -268,7 +268,7 @@ if (res.status === 409) {
 활성화      → 409 (제한 게시물 그대로면)  ← 여기서 막힘
 ```
 
-**일괄 재개(`bulk` `op=resume`)** 는 409 를 내지 않고 건별로 실패를 담습니다.
+**일괄 재개(`POST /auto-dm-campaigns/bulk-resume/`)** 는 409 를 내지 않고 건별로 실패를 담습니다.
 
 ```json
 { "failed": [{ "id": "…", "reason": "media_content_restricted" }] }

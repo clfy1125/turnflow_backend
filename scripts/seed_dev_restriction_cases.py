@@ -10,11 +10,18 @@
 캠페인 5개 + 이력 없는 media 1개 → inspect 결과가 각각 다르게 나온다
 
   1. [ok]         정상 발송 캠페인            → 배지 없음
-  2. [restricted] 제한 확정 (활성)            → 🔴 배너, 복사 시 409
-  3. [restricted] 제한 확정 + 자동정지됨       → 🔴 "인스타그램 제한으로 자동 정지됨" 배지
-  4. [suspected]  제한 의심 (조기경보)         → 🟡 경고 배너, 생성은 허용
+  2. [restricted] 제한 확정 (활성)            → 🔴 배너. **복사는 201** (2026-09-08 변경)
+  3. [restricted] 제한 확정 + 자동정지됨       → 🔴 "자동 정지됨" 배지. **재개 누르면 409**
+  4. [suspected]  제한 의심 (조기경보)         → 🟡 경고 배너, 생성·활성화 모두 허용
   5. [ok]         실패가 섞였지만 최근 성공     → 배지 없음 (오탐 확인용)
   6. [unknown]    이력 없는 media (캠페인 없음) → 아무 것도 안 뜸
+  7. [restricted] 제한 확정 + 사용자가 정지      → 🔴 배너. **재개 409** — 활성화 게이트 확인용
+  8. [unknown]    제한이었지만 마지막 실패 20일 전 → 배지 없음. **재개 200** — 증거 유효기간(14일) 확인용
+
+  + 캠페인 없는 media 2개 — 생성 게이트 확인용
+      …007 = restricted (생성 409)  /  …008 = suspected (생성 201, 경고만)
+
+★ 09-08 확인 포인트 — 복사(#2)는 통과하고 재개(#3·#7)가 막히는지, #8 이 풀려 있는지.
 
 멱등: 다시 돌리면 같은 상태로 덮어쓴다(기존 캠페인·로그 삭제 후 재생성).
 
@@ -200,6 +207,32 @@ add_logs(c5, status=FAIL, count=6, when=now - timedelta(days=2), subcode=SUB)
 add_logs(c5, status=OKS, count=20, when=now - timedelta(hours=3))  # 마지막이 성공
 made.append(("ok 기대 (오탐 아님)", c5))
 
+# ── 5-6. [restricted] 제한 확정 · 사용자가 직접 정지 (활성화 게이트 확인용) ──
+# c3 와 다른 점: auto_paused_at 이 비어 있다. 자동정지가 아니어도 재개는 막혀야 한다.
+m9 = "17900000000000009"
+c6 = make_campaign(
+    "제한 확정 · 수동 정지 (재개하면 409)",
+    m9,
+    status=AutoDMCampaign.Status.PAUSED,
+    permalink=PERMALINK.format(n="RS09"),
+)
+add_seen(m9, SeenComment.Source.POLL, 18, now - timedelta(hours=7))
+add_logs(c6, status=FAIL, count=18, when=now - timedelta(hours=7), subcode=SUB)
+made.append(("restricted 기대 (재개 409)", c6))
+
+# ── 5-7. [unknown] 제한이었지만 증거가 낡음 (14일 초과 → 재개 허용) ──────
+# 인스타가 제한을 풀어줬을 수 있으므로 영구히 막지 않는다. 재개하면 200 이어야 한다.
+m10 = "17900000000000010"
+c7 = make_campaign(
+    "옛날에 제한 · 증거 만료 (재개하면 200)",
+    m10,
+    status=AutoDMCampaign.Status.PAUSED,
+    permalink=PERMALINK.format(n="OLD10"),
+)
+add_seen(m10, SeenComment.Source.POLL, 20, now - timedelta(days=20))
+add_logs(c7, status=FAIL, count=20, when=now - timedelta(days=20), subcode=SUB)
+made.append(("unknown 기대 (증거 만료)", c7))
+
 # ── 5-6. 게이트 전용 media (캠페인 없음 — 중복 게이트에 안 걸리게) ──────
 # 캠페인 생성 게이트를 시험하려면 그 media 에 **활성 캠페인이 없어야** 한다
 # (있으면 중복 게이트가 먼저 409 를 낸다). 로그는 c1 에 붙이되 media_id 만 따로 준다.
@@ -257,9 +290,19 @@ print(
     f'"media_id":"{m7}","message_template":"안녕"}}   → 409 media_content_restricted'
 )
 print(f'      media_id="{m8}" 로 생성하면 201 — suspected 는 통과(경고만)')
-print(f"      POST /api/v1/integrations/auto-dm-campaigns/{c2.id}/copy/   → 409 (복사 차단)")
+print("\n  [3-1] ★ 2026-09-08 변경 — 복사는 허용, 활성화에서 막는다")
+print(f"      POST .../auto-dm-campaigns/{c2.id}/copy/     → 201 (복사 허용)")
+print(f"      POST .../auto-dm-campaigns/{c6.id}/resume/   → 409 (재개 차단)")
+print(f"      POST .../auto-dm-campaigns/{c3.id}/resume/   → 409 (자동정지분도 동일)")
+print(f"      POST .../auto-dm-campaigns/{c7.id}/resume/   → 200 (증거 14일 만료)")
+print(f'      POST .../auto-dm-campaigns/bulk-resume/  {{"ids":["{c6.id}"]}}')
+print('           → 200 이지만 failed[].reason == "media_content_restricted"')
 print("\n  [4] 자동정지 배지")
 print(f"      GET /api/v1/integrations/auto-dm-campaigns/?workspace_id={ws.id}")
 print(f"      → id={c3.id} 행에 auto_paused_at 이 채워져 있음")
+print(f"      GET .../auto-dm-campaigns/?workspace_id={ws.id}&auto_paused=true")
+print("      → 위 1건만 나온다 (auto_paused=false 면 나머지 전부)")
+print(f"      GET .../auto-dm-campaigns/summary/?workspace_id={ws.id}")
+print("      → counts.auto_paused == 1  (paused 의 부분집합, total 에 더하지 않음)")
 print("\n  [5] 생성 성공 (정상 경로)")
 print(f'      media_id="{m6}" 로 생성하면 201 (이력 없는 새 게시물)')
