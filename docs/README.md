@@ -49,6 +49,9 @@
 - [CAMPAIGN_RESUME_REVIVE_FRONTEND.md](frontend/CAMPAIGN_RESUME_REVIVE_FRONTEND.md) — 재개 시 정지 중 밀린 DM 자동 재발송(`revive_queued`)
 - [CAMPAIGN_TIMESERIES_FRONTEND.md](frontend/CAMPAIGN_TIMESERIES_FRONTEND.md) — 신규 요청자 시계열
 - [DM_CAMPAIGN_DUPLICATE_PREVENTION_FRONTEND.md](frontend/DM_CAMPAIGN_DUPLICATE_PREVENTION_FRONTEND.md) — 게시물당 활성 캠페인 1개(409)
+- [CAMPAIGN_RESTRICTION_CHECK_FRONTEND.md](frontend/CAMPAIGN_RESTRICTION_CHECK_FRONTEND.md) — 게시물 '연령 제한' 점검 API 계약. 생성·**활성화** 409 `media_content_restricted` (복사는 허용) + 자동정지 `auto_paused_at`
+- [CAMPAIGN_RESTRICTION_CHECK_RESPONSE.md](frontend/CAMPAIGN_RESTRICTION_CHECK_RESPONSE.md) — 위 API 확인요청 6건(B1~B6) 회신. ★ 복사 허용·활성화 게이트·증거 유효기간 14일
+- [IG_AGE_RESTRICTION_CREATOR_GUIDE.md](frontend/IG_AGE_RESTRICTION_CREATOR_GUIDE.md) — 연령 제한을 피하는 게시물 작성요령(고객 안내용) + 감지 레시피
 - [DM_CAMPAIGN_MIGRATION_FRONTEND.md](frontend/DM_CAMPAIGN_MIGRATION_FRONTEND.md) — 타 툴에서 캠페인 이전
 - [DM_MIGRATION_VISIBLE_BANDS_2026-08-18.md](frontend/DM_MIGRATION_VISIBLE_BANDS_2026-08-18.md) — ⚠️ 후보는 `auto_draft` 만 내려간다(검수필요는 DB 에만). 밴드 탭·`confirm-link` 는 렌더 안 됨
 - [DM_CAMPAIGN_THUMBNAIL_FRONTEND.md](frontend/DM_CAMPAIGN_THUMBNAIL_FRONTEND.md) — 썸네일 재호스팅
