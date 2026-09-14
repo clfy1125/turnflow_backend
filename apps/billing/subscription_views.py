@@ -1454,9 +1454,8 @@ class IGAccountActivationView(APIView):
     def _state(self, user) -> dict:
         from apps.integrations.models import IGAccountConnection
 
-        allowance = get_ig_account_allowance(user)
-        is_unlimited = allowance < 0
-        max_ig = 999999 if is_unlimited else allowance
+        from .subscription_utils import ig_activation_state
+
         sub = ensure_subscription(user)
 
         owned = list(
@@ -1465,21 +1464,16 @@ class IGAccountActivationView(APIView):
             .select_related("workspace")
             .order_by("created_at")
         )
-        total = len(owned)
-        active = sum(1 for c in owned if c.is_active)
 
-        # 재선택 다이얼로그 트리거:
-        #  (1) 활성 > 허용량 — 다운그레이드/축소로 초과된 경우
-        #  (2) 연동 ≥1 인데 활성 0 — 전부 비활성이면 기능이 전면 정지된 상태.
-        #      disconnect→재연결이 is_active 를 못 살리던 버그의 안전망(이미 이 상태에
-        #      빠진 사용자를 재선택으로 구제). 신규 로직(콜백 자동 복구) 배포 후에도
-        #      과거 잔존 케이스를 계속 커버한다.
-        #  (3) 명시적 리뷰 플래그
-        needs = (
-            (not is_unlimited and active > max_ig)
-            or (not is_unlimited and total >= 1 and active == 0)
-            or bool(sub.ig_activation_review_needed)
-        )
+        # 재선택 다이얼로그 트리거 — 판정은 subscription_utils 단일 소스.
+        # 홈의 강제 팝업(apps.home.alerts._check_blocking)이 같은 함수를 본다. 조건을
+        # 여기 복제하면 "팝업은 떴는데 조정할 게 없다"가 생긴다.
+        state = ig_activation_state(user)
+        needs = state["needs_activation_adjustment"]
+        is_unlimited = state["is_unlimited"]
+        max_ig = state["max_ig_accounts"]
+        total = state["total_accounts"]
+        active = state["active_accounts"]
 
         # 하루 1회 제한 — 무제한 플랜/강제 조정 상황은 항상 허용
         can_change = True

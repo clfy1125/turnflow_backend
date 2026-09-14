@@ -61,6 +61,7 @@ for _auth_scope in (
     "auth_google",
     "email_verify",
     "email_send",
+    "email_change",  # 이메일 등록 신청 — email_send 와 같은 이유(테스트가 5/hour 를 금방 태운다)
     "password_reset",
     "password_reset_confirm",
     "track_visit",  # 랜딩 방문 비콘 — 스로틀 테스트는 override_settings 로 개별 활성화

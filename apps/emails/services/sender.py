@@ -96,16 +96,44 @@ def _strip_html(html: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+def _is_placeholder_email(address: str) -> bool:
+    """보낼 수 없는 자리표시 주소인가 (``…@ig.invalid``).
+
+    판정을 ``User.email_is_placeholder`` 와 같은 상수로 한다 — 두 벌로 갈리면 한쪽만
+    고쳐졌을 때 "프론트는 자리표시라는데 서버는 메일을 보내는" 상태가 된다.
+    """
+    from apps.authentication.models import PLACEHOLDER_EMAIL_DOMAIN
+
+    return (address or "").strip().lower().endswith("@" + PLACEHOLDER_EMAIL_DOMAIN)
+
+
 def send_email(
     template_key: str,
     to_email: str,
     context: dict[str, Any] | None = None,
     *,
     user=None,
-) -> EmailLog:
+) -> EmailLog | None:
     """Render a template, persist an EmailLog (status=pending), then enqueue
     the provider call on Celery.  Returns the log row immediately.
+
+    Returns ``None`` when the recipient is a placeholder address that can never
+    receive mail (Instagram-login users) — nothing is rendered, logged or queued.
     """
+    # ⭐ 자리표시 이메일에는 **보내지 않는다** (2026-09-12, 인스타 로그인 도입).
+    #    Instagram Business Login 은 이메일을 주지 않아 IG 가입자에게는
+    #    `ig_<id>@ig.invalid` 를 발급한다. 여기서 막지 않으면 체험 종료 안내·홈 알림 등
+    #    기존 메일 경로가 전부 그 주소로 시도돼 **실패 로그만 쌓이고** 운영자가 진짜
+    #    장애와 구분하지 못한다. (`.invalid` 라 바운스가 발송 도메인 평판을 깎진 않지만,
+    #    보낼 수 없는 주소로 계속 시도하는 것 자체가 잡음이다.)
+    #    → 호출부마다 조건을 달지 않고 **이 한 곳**에서 막는다. 새 메일이 추가돼도 자동 적용.
+    if _is_placeholder_email(to_email):
+        logger.info(
+            "send_email skipped — placeholder address (template=%s)",
+            template_key,
+        )
+        return None
+
     try:
         template = EmailTemplate.objects.get(key=template_key, is_active=True)
     except EmailTemplate.DoesNotExist as exc:

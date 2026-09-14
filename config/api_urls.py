@@ -19,6 +19,8 @@ urlpatterns = [
     path("", include("apps.workspace.urls")),
     path("", include("apps.billing.urls")),
     path("integrations/", include("apps.integrations.urls")),
+    # 홈 화면 알림 (현재 상태 계산 · Graph 호출 0)
+    path("home/", include("apps.home.urls", namespace="home")),
     path("pages/", include("apps.pages.urls", namespace="pages")),
     path("link/", include("apps.pages.link_urls", namespace="link")),
     path("ai/", include("apps.ai_jobs.urls", namespace="ai_jobs")),

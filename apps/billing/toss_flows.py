@@ -36,6 +36,7 @@ from .models import (
     ReferralRedemption,
     SubscriptionPlan,
     SubscriptionStatus,
+    TrialKind,
     UserSubscription,
     generate_customer_key,
 )
@@ -496,6 +497,74 @@ def _consume_referral(user, code: ReferralCode, now, trial_ends) -> ReferralRede
     )
 
 
+def extend_trial_with_referral(user, code_str: str, *, now=None) -> dict:
+    """**체험 중**에 제휴 코드를 적용해 남은 체험을 보너스 일수만큼 연장한다.
+
+    ⭐ 2026-09-12 '카드 없는 프로 30일' 도입으로 생긴 필요. 종전에는 제휴 코드가
+       ``scenario="trial"``(= 카드 등록으로 체험을 **시작**하는 순간)에만 통했다.
+       그런데 자동 지급이 켜지면 가입 직후 이미 ``TRIALING`` 이 되므로 그 시나리오에
+       영영 도달하지 못한다 → **44일 쿠폰이 통째로 죽는다.** 그래서 "시작" 대신
+       "연장" 경로를 연다.
+
+    기간 계산의 원칙: ``TRIAL_BASE_DAYS`` 를 다시 더하지 **않는다**. 기본 30일은 이미
+    부여돼 있고, 여기서 더하는 것은 ``code.trial_days`` 뿐이다(30 + 14 = 44).
+    ⚠️ 폐지된 무카드 redeem 이 저질렀던 실수는 정반대였다 — base 30일을 **빼먹고**
+       보너스만 줘서 14일짜리 체험이 나갔다. 여기서는 base 가 이미 있으므로 안전하다.
+
+    호출 측이 트랜잭션을 열고 들어와야 한다(코드 락 + 구독 갱신이 한 덩어리다).
+    Returns: {referral_code, bonus_days, trial_ends_at, total_trial_days}
+    Raises: BillingFlowError
+    """
+    now = now or timezone.now()
+
+    # ⚠️ `.get(user=user)` 로 바로 잠그면 **구독 행이 아직 없는 사용자에게 500** 이 난다.
+    #    무료 사용자는 첫 화면을 열기 전까지 행이 없을 수 있다(ensure_subscription 참고).
+    #    행을 만든 뒤 잠가야 "체험 중이 아닙니다" 라는 정직한 400 으로 떨어진다.
+    sub = ensure_subscription(user)
+    locked_sub = (
+        UserSubscription.objects.select_for_update(of=("self",))
+        .select_related("plan")
+        .get(pk=sub.pk)
+    )
+    if locked_sub.status != SubscriptionStatus.TRIALING or locked_sub.current_period_end is None:
+        raise BillingFlowError(
+            "무료 체험 중에만 제휴 코드로 기간을 연장할 수 있습니다.",
+            extra={"code": "REFERRAL_NOT_TRIALING"},
+        )
+
+    code = _validate_referral_for_trial(user, code_str)
+    if code.target_plan_id != locked_sub.plan_id:
+        raise BillingFlowError(
+            "이 제휴 코드는 현재 이용 중인 플랜에 사용할 수 없습니다.",
+            extra={"code": "REFERRAL_PLAN_MISMATCH"},
+        )
+
+    # 남은 체험 끝에 이어 붙인다 — '지금부터 N일'로 다시 잡으면 남은 기간을 빼앗는다.
+    new_ends = locked_sub.current_period_end + timedelta(days=code.trial_days)
+    locked_sub.current_period_end = new_ends
+    locked_sub.save(update_fields=["current_period_end", "updated_at"])
+
+    _consume_referral(user, code, now, new_ends)
+
+    total_days = None
+    if locked_sub.current_period_start:
+        total_days = round((new_ends - locked_sub.current_period_start).total_seconds() / 86400)
+
+    logger.info(
+        "제휴 코드로 체험 연장: user=%s code=%s +%s일 → %s",
+        user.id,
+        code.code,
+        code.trial_days,
+        new_ends.isoformat(),
+    )
+    return {
+        "referral_code": code.code,
+        "bonus_days": code.trial_days,
+        "trial_ends_at": new_ends,
+        "total_trial_days": total_days,
+    }
+
+
 # ──────────────────────────────────────────────
 # preview — 결제 **전** 고지용 견적 (부작용 없음)
 # ──────────────────────────────────────────────
@@ -561,9 +630,11 @@ def preview_subscription(
     referral = None
     bonus_days = 0
     if referral_code:
-        if scenario != "trial":
+        # confirm_billing 과 **같은 허용 범위** — 견적과 실행이 갈리면 고지가 곧 허위가 된다.
+        if scenario not in ("trial", "attach_only"):
             raise BillingFlowError(
-                "제휴 코드는 프로 플랜 최초 구독(무료 체험 시작) 시에만 사용할 수 있습니다."
+                "제휴 코드는 프로 플랜 최초 구독(무료 체험 시작) 또는 "
+                "무료 체험 중에만 사용할 수 있습니다."
             )
         referral = _validate_referral_for_trial(user, referral_code)
         bonus_days = referral.trial_days
@@ -574,8 +645,12 @@ def preview_subscription(
 
     if scenario == "attach_only":
         # 이미 체험 중 — 기간은 불변(트라이얼 적층 금지)이므로 서버가 가진 실제 값을 준다.
+        # 예외: 제휴 코드를 동봉하면 그만큼 **연장**된다(extend_trial_with_referral 와 동일 계산).
         trial_ends = sub.current_period_end
         trial_days = sub.trial_total_days
+        if bonus_days and trial_ends is not None:
+            trial_ends = trial_ends + timedelta(days=bonus_days)
+            trial_days = (trial_days or 0) + bonus_days
         first_charge_at = trial_ends
         first_charge_amount = sub.renewal_amount
         recurring_amount = sub.renewal_amount
@@ -644,6 +719,13 @@ def confirm_billing(
     Raises: BillingFlowError (하위: ChargeDeclinedError, ChargePendingError)
     """
     sub = ensure_subscription(user)
+    # ⚠️ **DB 에서 다시 읽는다.** ``ensure_subscription`` 은 ``user.subscription`` 의
+    #    **캐시된** 관련 객체를 그대로 돌려줄 수 있는데, 이 함수의 시나리오 판정
+    #    (trial / attach_only / charge_now)이 전적으로 그 값에 달려 있다. 캐시가 낡으면
+    #    **이미 체험 중인 사람이 `trial` 로 재판정돼 30일이 다시 깔리고 첫 결제가 밀린다**
+    #    (카드 없는 자동 지급 도입 후 같은 요청 안에서 구독을 먼저 만지는 경로가 생겼다).
+    #    한 번의 SELECT 로 이 오판정 계열을 통째로 없앤다.
+    sub.refresh_from_db()
     if sub.plan.name == "admin":
         raise BillingFlowError("관리자 플랜은 결제 대상이 아닙니다.")
 
@@ -684,9 +766,14 @@ def confirm_billing(
 
     referral = None
     if referral_code:
-        if scenario != "trial":
+        # ⭐ 2026-09-12: ``attach_only`` 도 허용한다. '카드 없는 프로 30일'이 켜지면
+        #    가입 직후 이미 TRIALING 이라 ``scenario="trial"`` 에 도달할 수 없고,
+        #    그대로 두면 제휴 코드가 **항상 400** 이 된다(44일 쿠폰 사망).
+        #    trial = 체험 시작 + 보너스 / attach_only = 남은 체험에 보너스 연장.
+        if scenario not in ("trial", "attach_only"):
             raise BillingFlowError(
-                "제휴 코드는 프로 플랜 최초 구독(무료 체험 시작) 시에만 사용할 수 있습니다."
+                "제휴 코드는 프로 플랜 최초 구독(무료 체험 시작) 또는 "
+                "무료 체험 중에만 사용할 수 있습니다."
             )
         referral = _validate_referral_for_trial(user, referral_code)
 
@@ -720,6 +807,7 @@ def confirm_billing(
     billing_key = issue["billingKey"]
     card_company, card_number = _card_display(issue)
     now = timezone.now()
+    referral_extension = None  # attach_only + 쿠폰일 때만 채워진다
 
     # ── 구독 반영 (락) ──
     with transaction.atomic():
@@ -750,6 +838,8 @@ def confirm_billing(
             locked.trial_used_at = now
             # T-1: 무슨 플랜 체험이었는지의 내구 기록 (plan 은 만료 시 free 로 바뀐다)
             locked.trial_plan = new_plan
+            # 카드 등록으로 시작한 체험 — 만료 시 첫 과금이 나간다 (models.TrialKind)
+            locked.trial_kind = TrialKind.CARD
             # ⚠️ T-3: cancelled_during_trial_at 은 **여기서 초기화하지 않는다**(2026-08-03).
             #    초기화하면 재체험하는 순간 과거 취소 기록이 사라져 **이미 지나간 기간의
             #    집계가 나중에 줄어든다**(7월 숫자가 8월에 바뀐다). 재체험해도 "그때 취소한
@@ -775,6 +865,7 @@ def confirm_billing(
                     "extra_ig_accounts",
                     "trial_used_at",
                     "trial_plan",
+                    "trial_kind",
                     "cancelled_at",
                     "renewal_attempts",
                     "next_billing_retry_at",
@@ -792,6 +883,10 @@ def confirm_billing(
         else:
             # attach_only / card_change / charge_now(키 먼저 저장, 과금은 아래서)
             locked.save(update_fields=key_fields + ["updated_at"])
+            if scenario == "attach_only" and referral is not None:
+                # 카드 없이 시작한 체험에 카드 + 쿠폰을 함께 붙이는 경로.
+                # 기간은 '남은 체험 끝 + 보너스' 로 이어 붙인다(extend_trial_with_referral).
+                referral_extension = extend_trial_with_referral(user, referral.code, now=now)
 
     # 이전 빌링키 정리 (best-effort — 실패해도 과금 위험 없음)
     if old_key and old_key != billing_key:
@@ -822,12 +917,19 @@ def confirm_billing(
         }
 
     if scenario == "attach_only":
+        detail = "카드가 등록되었습니다. 체험 종료 시 첫 결제가 진행됩니다."
+        if referral_extension:
+            detail = (
+                f"카드가 등록되고 제휴 코드가 적용되었습니다. "
+                f"무료 체험이 {referral_extension['bonus_days']}일 연장되었습니다."
+            )
         return {
             "subscription": sub,
             "payment": None,
             "first_charge_at": sub.current_period_end,
-            "detail": "카드가 등록되었습니다. 체험 종료 시 첫 결제가 진행됩니다.",
+            "detail": detail,
             "scenario": scenario,
+            "referral_extension": referral_extension,
         }
 
     if scenario == "card_change":

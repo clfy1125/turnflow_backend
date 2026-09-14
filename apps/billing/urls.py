@@ -5,6 +5,7 @@ Billing URL configuration
 from django.urls import path
 from rest_framework.routers import DefaultRouter
 
+from .auto_trial_views import AutoTrialGrantView
 from .consent_views import PaymentConsentCreateView, SubscriptionPreviewView
 from .payment_views import PaymentHistoryView, RefundEligibilityView, RefundPaymentView
 from .referral_views import (
@@ -56,6 +57,12 @@ urlpatterns = router.urls + [
         name="subscription-preview",
     ),
     path("billing/consents/", PaymentConsentCreateView.as_view(), name="payment-consents"),
+    # 카드 없는 프로 30일 자동 지급 (2026-09-12 전환 개선). apps/billing/auto_trial.py 단일 소스
+    path(
+        "billing/trial/auto-grant/",
+        AutoTrialGrantView.as_view(),
+        name="trial-auto-grant",
+    ),
     path("billing/cancel/", CancelSubscriptionView.as_view(), name="cancel-subscription"),
     path("billing/resume/", ResumeSubscriptionView.as_view(), name="resume-subscription"),
     # 리텐션(해지 방어)

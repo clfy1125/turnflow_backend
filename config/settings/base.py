@@ -59,6 +59,7 @@ INSTALLED_APPS = [
     "apps.admin_api",
     "apps.analytics",
     "apps.insta_reports",
+    "apps.home",
 ]
 
 MIDDLEWARE = [
@@ -255,8 +256,17 @@ REST_FRAMEWORK = {
         "auth_login": config("THROTTLE_AUTH_LOGIN", default="10/min"),
         "auth_register": config("THROTTLE_AUTH_REGISTER", default="10/hour"),
         "auth_google": config("THROTTLE_AUTH_GOOGLE", default="20/min"),
+        # 카카오도 같은 급으로 조인다 — 인가 코드는 1회용이라 대입 공격 가치는 낮지만,
+        # 이 엔드포인트가 **외부 API 2회 호출**을 유발하므로 증폭 방어가 필요하다.
+        "auth_kakao": config("THROTTLE_AUTH_KAKAO", default="20/min"),
+        # 인스타 로그인도 같은 급 — start(1콜) + 교환(외부 3콜: 코드→단기→장기→프로필)이라
+        # 증폭 배수가 카카오보다 크다. 정상 사용자는 로그인 1회에 2요청이면 끝난다.
+        "auth_instagram": config("THROTTLE_AUTH_INSTAGRAM", default="20/min"),
         "email_verify": config("THROTTLE_EMAIL_VERIFY", default="10/min"),
         "email_send": config("THROTTLE_EMAIL_SEND", default="5/hour"),
+        # 이메일 등록 신청(POST /auth/me/email/) — **임의 주소로 메일을 보내는 경로**라
+        # 메일 폭격 벡터다. 인증메일 재발송과 같은 급으로 조인다(사용자 기준).
+        "email_change": config("THROTTLE_EMAIL_CHANGE", default="5/hour"),
         "password_reset": config("THROTTLE_PASSWORD_RESET", default="10/hour"),
         "password_reset_confirm": config("THROTTLE_PASSWORD_RESET_CONFIRM", default="10/min"),
         # ── 웹 단독 회원탈퇴 (turnflow.link/delete-account) ──
@@ -279,6 +289,11 @@ REST_FRAMEWORK = {
         # 결제 진입 텔레메트리 (POST /track/checkout-event/) — 로그인 사용자 기준.
         # 유료 제한 모달을 반복적으로 마주칠 수 있어 넉넉하게.
         "checkout_event": config("THROTTLE_CHECKOUT_EVENT", default="240/hour"),
+        # 퍼널 이벤트 비콘 (POST /track/funnel-event/) — 인증되면 사용자, 아니면 IP 기준.
+        # 한 세션에서 팝업 노출/클릭/닫기가 연달아 나가고, 익명 키는 CGNAT 로 수백 명이
+        # 한 IP 를 공유한다(track_visit 와 같은 사정) → 넉넉하게. 실질 방어는 4KB 페이로드
+        # 상한과 60자 이벤트명 상한이다.
+        "funnel_event": config("THROTTLE_FUNNEL_EVENT", default="600/hour"),
         # IG 연결 헬스 진단 (GET .../health) — 요청당 Meta 라이브 2콜(/me + subscribed_apps).
         # 사용자별. 설정 화면에서 수동 새로고침을 반복해도 여유 있게.
         "ig_health": config("THROTTLE_IG_HEALTH", default="20/min"),
@@ -450,6 +465,21 @@ ADMIN_BACKUP_CODE_LOW_THRESHOLD = 3
 
 # Google OAuth
 GOOGLE_CLIENT_ID = config("GOOGLE_CLIENT_ID", default="")
+
+# ── 카카오 로그인 (apps/authentication/kakao.py) ─────────────────────────
+# 콘솔: https://developers.kakao.com/console/app/1573264
+# 값이 비면 /auth/kakao/ 는 503(KAKAO_NOT_CONFIGURED)을 낸다 — 조용히 통과시키지 않는다.
+#
+# ⚠️ authorize 의 client_id 와 토큰 교환의 client_id 는 **같은 키**여야 한다.
+#    우리는 서버가 client_secret 으로 교환하므로 REST API 키로 통일한다
+#    (JavaScript 키로 authorize 하면 시크릿이 없어 이 교환이 실패한다).
+KAKAO_REST_API_KEY = config("KAKAO_REST_API_KEY", default="")
+# 콘솔 [플랫폼 키] > [REST API 키] > 클라이언트 시크릿. 현재 '활성화 ON' 이라 **필수**다.
+# ❌ 평문 로그 금지 (지침 14).
+KAKAO_CLIENT_SECRET = config("KAKAO_CLIENT_SECRET", default="")
+# 앱 ID(숫자). 네이티브가 액세스 토큰을 직접 보낼 때 "이 토큰이 우리 앱 것인가"를
+# 확인하는 데 쓴다 = 구글 aud 검사. 비어 있으면 그 경로는 fail-closed 로 막힌다.
+KAKAO_APP_ID = config("KAKAO_APP_ID", default="")
 
 # Redis & Caching
 REDIS_HOST = config("REDIS_HOST", default="localhost")
@@ -662,6 +692,19 @@ CELERY_BEAT_SCHEDULE = {
         "task": "apps.integrations.tasks.resubscribe_all_webhooks",
         "schedule": 60 * 60,  # 1시간 (#6 — Meta auto-disable 무음창 6h→1h 축소)
     },
+    # ===== 홈 알림용 최신 게시물 사전 조회 =====
+    # 홈에서 Graph 를 직접 부르면 홈 진입 1회 = Graph 호출 1회가 되어 앱 단위 쿼터를 태운다.
+    # 여기서 계정당 시간당 1콜만 쓰고, 홈은 DB 에 적힌 값만 읽는다(core.ScheduledJob 0018 시드).
+    "integrations-refresh-latest-media": {
+        "task": "integrations.refresh_latest_media",
+        "schedule": 60 * 60,  # 1시간
+    },
+    # 홈 알림 이메일 — 멈춤 상태가 24시간 방치된 사용자에게 1통(HOME_ALERT_EMAILS_ENABLED 게이트,
+    # 기본 dormant). core.ScheduledJob 0019 시드도 enabled=False 로 들어간다.
+    "home-send-alert-emails": {
+        "task": "home.send_alert_emails",
+        "schedule": crontab(hour=10, minute=20),  # 매일 10:20 KST
+    },
     # 인프라 헬스 경고(#6): Redis noeviction freeze·브로커 큐 적체·deferred DM 밀림 5분 감시(core.ScheduledJob 0005).
     "integrations-dm-infra-health-alert": {
         "task": "apps.integrations.tasks.dm_infra_health_alert",
@@ -709,6 +752,12 @@ CELERY_BEAT_SCHEDULE = {
     "analytics-cleanup-landing-visits": {
         "task": "analytics.cleanup_landing_visits",
         "schedule": crontab(hour=3, minute=30),  # CELERY_TIMEZONE=Asia/Seoul 기준
+        "options": {"queue": "billing"},  # housekeeping 큐 (기존 관례)
+    },
+    # 매일 KST 03:40 — 보존기간(기본 180일) 초과 퍼널 이벤트(FunnelEvent) 배치 삭제.
+    "analytics-cleanup-funnel-events": {
+        "task": "analytics.cleanup_funnel_events",
+        "schedule": crontab(hour=3, minute=40),  # CELERY_TIMEZONE=Asia/Seoul 기준
         "options": {"queue": "billing"},  # housekeeping 큐 (기존 관례)
     },
     # 매일 KST 02:00 — EventInbox 일별 파티션 유지(선생성 + 보존 초과 DROP) + (옵션)SentDMLog 아카이브. (§15.8)
@@ -795,6 +844,10 @@ CELERY_BEAT_SCHEDULE = {
 # 윈백(해지 후 복귀 유도) 마케팅 메일 — 정보통신망법상 수신 동의자에게만.
 # 동의 수집 경로(가입/설정)와 문구가 준비되기 전까지 기본 False(dormant).
 WINBACK_ENABLED = config("WINBACK_ENABLED", default=False, cast=bool)
+
+# 홈 알림 이메일(연결 끊김·월 한도 소진) — 배너를 못 본 채 24시간 미접속인 사용자에게만 1통.
+# ⚠️ 기본 dormant. 켜는 순간 실사용자에게 메일이 나가므로 운영에서 사람이 명시적으로 켠다.
+HOME_ALERT_EMAILS_ENABLED = config("HOME_ALERT_EMAILS_ENABLED", default=False, cast=bool)
 WINBACK_AFTER_DAYS = config("WINBACK_AFTER_DAYS", default=30, cast=int)
 
 # ── 결제 전 고지·동의 (전자상거래법 §13②⑥ / 시행령 §20-2) ─────────────
@@ -821,6 +874,51 @@ CONVERSION_CONSENT_PATH = config("CONVERSION_CONSENT_PATH", default="/billing/co
 # (`manage.py report_consent_backlog`). 기본 False(dormant).
 CONVERSION_CONSENT_REQUIRE_ALL_TRIALS = config(
     "CONVERSION_CONSENT_REQUIRE_ALL_TRIALS", default=False, cast=bool
+)
+
+# ── 인스타그램 로그인/가입 (2026-09-12) ─────────────────────────────────────
+# 가입 + 워크스페이스 생성 + IG 연동을 **인증 한 번으로** 끝낸다(병목 진단 "두 번 인증
+# 구조 제거"). 판정·교환은 apps/authentication/instagram.py 단일 소스.
+#
+# ⚠️ 기본 False 인 이유가 정책적이다 — 2026-09-10 내부 논의: "한 번 넣으면 그걸로
+#    로그인한 사람이 한 명이라도 생기는 순간 다시는 못 뺀다." 테스트 URL 에서 먼저
+#    써 보고 켜기로 했다. 켜기 전에 반드시:
+#      1) Meta 앱 대시보드 > Instagram > Business login settings 의 **OAuth redirect URI**
+#         목록에 INSTAGRAM_LOGIN_REDIRECT_URI 를 **글자 그대로** 추가할 것
+#      2) 켠 뒤에는 되돌리기 어렵다는 점을 합의할 것
+INSTAGRAM_LOGIN_ENABLED = config("INSTAGRAM_LOGIN_ENABLED", default=False, cast=bool)
+# 인스타가 되돌려 보낼 **프론트** 라우트. 연동용 INSTAGRAM_REDIRECT_URI(=백엔드 콜백)와
+# 다른 값이다 — 로그인은 가입 화면에서 시작해 가입 화면으로 돌아와야 한다.
+# 클라이언트가 ?redirect_uri= 로 덮어쓸 수 있으나 **허용 origin 완전일치**만 통과한다.
+INSTAGRAM_LOGIN_REDIRECT_URI = config("INSTAGRAM_LOGIN_REDIRECT_URI", default="")
+
+# 퍼널 이벤트(analytics.FunnelEvent) 보존 기간. 일회성 계측이라 무기한 보관할 이유가 없고,
+# 캠페인당 수십만 행이 쌓인다. 분석이 끝난 뒤의 원장은 대시보드 집계가 대신한다.
+FUNNEL_EVENT_RETENTION_DAYS = config("FUNNEL_EVENT_RETENTION_DAYS", default=180, cast=int)
+
+# ── 카드 없는 프로 30일 자동 지급 (2026-09-10 내부 회의 결정) ───────────────
+# 판정·실행은 apps/billing/auto_trial.py 단일 소스. 여기 있는 건 운영 파라미터뿐.
+#
+# "광고 들어와서 맨 처음부터 카드 등록을 하라 하면 심리적 장벽이 생긴다. 먼저 쓰게 하고,
+#  30일 안에 옮겨둔 캠페인이 아까워서 카드를 등록하게 만든다." (2026-09-10 마케팅 회의)
+# 실측 근거: 2026-08-25~09-09 회원가입 525명 중 프로 체험 시작 26명(5.0%) —
+#            나머지 499명이 카드 요구에서 멈췄다.
+#
+# ⚠️ 프론트에도 킬스위치(autoProTrial)가 따로 있다. **둘 다 켜져야** 지급된다.
+AUTO_PRO_TRIAL_ENABLED = config("AUTO_PRO_TRIAL_ENABLED", default=True, cast=bool)
+AUTO_PRO_TRIAL_DAYS = config("AUTO_PRO_TRIAL_DAYS", default=30, cast=int)
+AUTO_PRO_TRIAL_PLAN = config("AUTO_PRO_TRIAL_PLAN", default="pro")
+# 가입 후 며칠까지 '신규'로 볼 것인가. **0 = 제한 없음**(기본).
+# 0 인 이유: 이 정책의 다른 한 축인 '프로 체험 팝업'이 **이미 가입했지만 체험을 시작하지
+# 않은 사용자**를 겨냥한다(위 499명). 창을 좁히면 그 팝업이 지급을 못 해 정책의 절반이
+# 죽는다. 실질 상한은 trial_used_at(1인 1회)이 담당한다.
+AUTO_PRO_TRIAL_SIGNUP_WINDOW_DAYS = config("AUTO_PRO_TRIAL_SIGNUP_WINDOW_DAYS", default=0, cast=int)
+# 광고 귀속(UTM/fbclid)이 있는 사용자에게만 줄지. 기본 False = **전원**.
+# ⚠️ True 로 켜기 전에 읽을 것: 인앱 브라우저(인스타/카카오)에서 UTM 이 자주 유실돼
+#    "광고 보고 들어왔는데 못 받는" 억울한 미지급이 생긴다
+#    (memory: inapp-browser-blocks-ad-funnel). 켜려면 미지급률을 먼저 측정할 것.
+AUTO_PRO_TRIAL_REQUIRE_AD_ATTRIBUTION = config(
+    "AUTO_PRO_TRIAL_REQUIRE_AD_ATTRIBUTION", default=False, cast=bool
 )
 
 # TossPayments 빌링(정기결제) 연동
@@ -1110,6 +1208,8 @@ COMPANY_PHONE = config("COMPANY_PHONE", default="070-8098-7102")
 
 # Email token lifetimes
 EMAIL_VERIFICATION_TTL_MINUTES = config("EMAIL_VERIFICATION_TTL_MINUTES", default=30, cast=int)
+# 이메일 등록(인스타 로그인 사용자) 코드 유효시간. 가입 인증과 같은 급.
+EMAIL_CHANGE_TTL_MINUTES = config("EMAIL_CHANGE_TTL_MINUTES", default=30, cast=int)
 PASSWORD_RESET_TTL_MINUTES = config("PASSWORD_RESET_TTL_MINUTES", default=60, cast=int)
 
 # ── 웹 단독 회원탈퇴 (Google Play 계정 삭제 정책) ─────────────────────────────

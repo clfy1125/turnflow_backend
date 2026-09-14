@@ -74,6 +74,10 @@ class EmailTokenPurpose(models.TextChoices):
     ACCOUNT_DELETE = "account_delete", "Account Deletion"
     # 탈퇴 유예 중 복구용. 확정 메일에 실어 보내며, 로그인 경로와 함께 두 갈래 복구창이 된다.
     ACCOUNT_RESTORE = "account_restore", "Account Deletion Cancel"
+    # 인스타 로그인 사용자의 이메일 등록. EMAIL_VERIFY 와 **따로 두는 이유**: 저쪽은
+    # "이미 내 계정에 달린 주소"를 확인하는 것이고, 이쪽은 "아직 내 계정에 없는 주소"를
+    # 소유 증명하는 것이다. 같은 purpose 를 쓰면 가입 인증 코드로 이메일을 바꿀 수 있다.
+    EMAIL_CHANGE = "email_change", "Email Registration/Change"
 
 
 class EmailToken(models.Model):

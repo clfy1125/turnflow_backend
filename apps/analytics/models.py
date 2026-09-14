@@ -34,6 +34,8 @@ class SignupKind(models.TextChoices):
 
     EMAIL = "email", "이메일 가입"
     GOOGLE = "google", "Google 가입"
+    KAKAO = "kakao", "카카오 가입"
+    INSTAGRAM = "instagram", "인스타그램 가입"
 
 
 class LandingVisit(models.Model):
@@ -386,3 +388,118 @@ class CancellationEvent(models.Model):
 
     def __str__(self) -> str:
         return f"user={self.user_id} {self.event} [{self.reason}]"
+
+
+class DeviceKind(models.TextChoices):
+    """프론트가 보고하는 기기 대분류.
+
+    ⚠️ 서버의 ``UAClass``(desktop/mobile/tablet)와 **다른 축**이다. 대행사 요청서의
+    "기기별 분리 집계"는 iOS / Android 를 갈라 봐야 하는데(인앱 브라우저의 OAuth 복귀
+    동작이 갈린다 — memory: inapp-browser-blocks-ad-funnel), User-Agent 만으로는
+    iPadOS 처럼 데스크톱을 사칭하는 경우를 못 가른다. 그래서 프론트가 직접 보고한다.
+    서버가 파생한 ``ua_class`` 는 그대로 함께 저장해 둘이 어긋나는 경우를 나중에 볼 수 있다.
+    """
+
+    IOS = "ios", "iOS"
+    ANDROID = "android", "Android"
+    PC = "pc", "PC"
+    UNKNOWN = "unknown", "알 수 없음"
+
+
+class FunnelEvent(models.Model):
+    """전환 퍼널 텔레메트리 — 프론트가 보내는 **자유 이름** 이벤트 1건당 1행.
+
+    2026-09-10 병목 진단(가입 525 → 프로 체험 26, 5.0%)의 후속. "어디서 떨어지는가"를
+    화면 단위로 재구성하기 위한 append-only 기록이다.
+
+    ⭐ ``CheckoutEvent``(결제 진입)와 따로 두는 이유: 저쪽은 **닫힌 어휘**
+       (paywall_viewed / checkout_started …)에 필드가 고정된 업무 기록이고, 마케팅
+       대시보드의 '결제 진입 경로'가 그 스키마에 직접 의존한다. 퍼널 이벤트는 캠페인마다
+       이름과 필드가 바뀌는 **일회성 계측**이라, 같은 테이블에 섞으면 대시보드가 모르는
+       event 값이 들어와 집계가 조용히 오염된다.
+
+    ⚠️ ``event`` 이름의 정본은 **프론트**(src/lib/funnelEvents.ts ``FunnelEventName``)다.
+       서버는 화이트리스트를 두지 않는다 — 두면 프론트가 이벤트를 추가할 때마다 백엔드
+       배포를 기다려야 하고, 그 사이 이벤트가 통째로 유실된다. 대신 길이를 자르고
+       스로틀로 막는다.
+
+    보존: ``FUNNEL_EVENT_RETENTION_DAYS`` (기본 180일) 경과분을
+    ``analytics.purge_funnel_events`` 가 지운다. 개인 식별자는 저장하지 않는다
+    (IP 는 해시만 — LandingVisit 과 같은 원칙).
+    """
+
+    id = models.BigAutoField(primary_key=True)
+    event = models.CharField(
+        max_length=60,
+        db_index=True,
+        verbose_name="이벤트 이름",
+        help_text="프론트 FunnelEventName 이 정본 (예: trial_popup_view, trial_started_from_popup)",
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="funnel_events",
+        verbose_name="사용자",
+        help_text="비로그인 이벤트도 받으므로 NULL 가능. 사용자 삭제 시 행은 남기고 NULL 로.",
+    )
+    visitor_id = models.UUIDField(
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="방문자 ID",
+        help_text="랜딩 스니펫의 tf_vid. LandingVisit·SignupAttribution 과 조인하는 키.",
+    )
+    path = models.CharField(max_length=300, blank=True, default="", verbose_name="발생 화면 경로")
+    payload = models.JSONField(
+        default=dict,
+        blank=True,
+        verbose_name="이벤트 필드",
+        help_text="이벤트별 자유 필드(surface, attempt, method, elapsed_sec …). 상한 4KB.",
+    )
+    device = models.CharField(
+        max_length=10,
+        choices=DeviceKind.choices,
+        default=DeviceKind.UNKNOWN,
+        db_index=True,
+        verbose_name="기기",
+    )
+    in_app = models.BooleanField(default=False, verbose_name="인앱 브라우저 여부")
+    in_app_kind = models.CharField(
+        max_length=24,
+        blank=True,
+        default="",
+        verbose_name="인앱 브라우저 종류",
+        help_text="instagram / kakaotalk / facebook / line / naver 등. 프론트 판별값.",
+    )
+    ua_class = models.CharField(
+        max_length=10,
+        choices=UAClass.choices,
+        default=UAClass.UNKNOWN,
+        verbose_name="UA 대분류(서버 파생)",
+    )
+    ip_hash = models.CharField(
+        max_length=64, blank=True, default="", verbose_name="IP 해시(SHA-256)"
+    )
+    client_ts = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="클라이언트 시각",
+        help_text="프론트가 보낸 ts. 기기 시계가 틀릴 수 있어 집계는 created_at 을 쓴다.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True, verbose_name="수신 시각")
+
+    class Meta:
+        db_table = "analytics_funnel_event"
+        verbose_name = "퍼널 이벤트"
+        verbose_name_plural = "퍼널 이벤트 목록"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["event", "created_at"]),
+            models.Index(fields=["user", "created_at"]),
+            models.Index(fields=["device", "created_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.event} user={self.user_id} @{self.created_at:%Y-%m-%d %H:%M}"

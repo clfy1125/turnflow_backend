@@ -137,6 +137,16 @@ class UserSubscriptionSerializer(serializers.ModelSerializer):
         allow_null=True,
         help_text="이번 체험의 총 일수(쿠폰 보너스 포함). 체험이 아니면 null 이거나 무의미",
     )
+    trial_last_day = serializers.DateField(
+        read_only=True,
+        allow_null=True,
+        help_text=(
+            "체험 **마지막 이용일**(KST 날짜). 체험 중이 아니면 null. "
+            "화면 문구('…까지 무료')는 이 값을 쓴다 — current_period_end 를 날짜로 찍으면 "
+            "결제가 일어나는 날까지 포함돼 하루 더 써도 되는 것처럼 보인다. "
+            "결제 전 견적(POST /billing/subscription/preview/)의 trial_last_day 와 같은 정의"
+        ),
+    )
 
     class Meta:
         model = None  # set below
@@ -157,6 +167,8 @@ class UserSubscriptionSerializer(serializers.ModelSerializer):
             "pending_plan_name",
             "ig_activation_review_needed",
             "trial_used_at",
+            "trial_kind",
+            "trial_last_day",
             "cancelled_at",
             # 유료전환 2차 동의 (전자상거래법 §13⑥)
             "conversion_consent_required",

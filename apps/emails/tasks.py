@@ -15,7 +15,10 @@ from django.utils import timezone
 from .constants import (
     TEMPLATE_CONSENT_MISSING_DOWNGRADE,
     TEMPLATE_CONVERSION_CONSENT,
+    TEMPLATE_DM_QUOTA_REACHED,
+    TEMPLATE_EMAIL_CHANGE,
     TEMPLATE_EMAIL_VERIFICATION,
+    TEMPLATE_IG_CONNECTION_LOST,
     TEMPLATE_INSTA_REPORT_READY,
     TEMPLATE_ONBOARDING_DAY_3,
     TEMPLATE_ONBOARDING_DAY_7,
@@ -57,6 +60,38 @@ def _user_context(user) -> dict:
         "docs_url": f"{settings.FRONTEND_URL}/docs",
         "joined_date": timezone.localdate(user.date_joined).isoformat(),
     }
+
+
+@shared_task(name="emails.send_email_change_code")
+def send_email_change_code(user_id: int, to_email: str, code: str, ttl_minutes: int) -> None:
+    """이메일 등록 인증 코드를 **새 주소로** 보낸다.
+
+    ⚠️ 토큰 발급은 뷰가 이미 했고(요청-응답 안에서 만료 시각을 알려 줘야 한다), 여기서는
+    **보내기만** 한다. 태스크에서 발급하면 발급과 발송 사이에 사용자가 화면을 닫았을 때
+    쓰이지 않는 토큰이 쌓이고, 무엇보다 뷰가 코드 유효시간을 응답에 실을 수 없다.
+
+    ⚠️ 코드를 인자로 받는다 — 큐에 평문 6자리가 잠시 실린다. 기존
+    ``send_admin_device_code`` 도 같은 구조이며, 코드 자체가 TTL 이 짧고 단독으로는
+    아무 권한이 없다(로그인 세션이 함께 있어야 쓸 수 있다).
+    """
+    try:
+        user = User.objects.get(pk=user_id, is_active=True)
+    except User.DoesNotExist:
+        return
+
+    ctx = _user_context(user)
+    ctx.update(
+        {
+            # 수신 주소 = 등록하려는 새 주소. _user_context 의 email(자리표시)을 덮어쓴다.
+            "email": to_email,
+            "verification_code": code,
+            "expires_minutes": ttl_minutes,
+        }
+    )
+    try:
+        send_email(TEMPLATE_EMAIL_CHANGE, to_email, ctx, user=user)
+    except EmailTemplateMissing:
+        logger.error("email_change_verify template missing — run seed_email_templates")
 
 
 @shared_task(name="emails.send_verification_email")
@@ -312,6 +347,60 @@ def send_winback_email(user_id: int) -> None:
         send_email(TEMPLATE_WINBACK, user.email, ctx, user=user)
     except EmailTemplateMissing:
         logger.error("winback template missing — run seed_email_templates")
+
+
+@shared_task(name="emails.send_ig_connection_lost_email")
+def send_ig_connection_lost_email(user_id: int, ctx: dict | None = None) -> None:
+    """인스타 연결 끊김 안내. 홈 알림(apps.home.tasks)이 24시간 미접속자에게만 호출한다.
+
+    거래성 정보(서비스 장애 고지)라 마케팅 수신동의와 무관하다.
+    """
+    try:
+        user = User.objects.get(pk=user_id, is_active=True)
+    except User.DoesNotExist:
+        return
+    base = {
+        "full_name": user.full_name or user.email.split("@")[0],
+        "service_name": settings.SERVICE_NAME,
+        "support_email": settings.SUPPORT_EMAIL,
+        "console_url": f"{settings.FRONTEND_URL}/settings/instagram",
+        "ig_username": "",
+        "since_date": "",
+    }
+    base.update(ctx or {})
+    try:
+        send_email(TEMPLATE_IG_CONNECTION_LOST, user.email, base, user=user)
+    except EmailTemplateMissing:
+        logger.error("ig_connection_lost template missing — run seed_email_templates")
+
+
+@shared_task(name="emails.send_dm_quota_reached_email")
+def send_dm_quota_reached_email(user_id: int, ctx: dict | None = None) -> None:
+    """월 DM 한도 소진 안내. 홈 알림(apps.home.tasks)이 24시간 미접속자에게만 호출한다.
+
+    ⚠️ 거래성/광고성 경계: "기능이 멈췄다 + 해결 방법"까지가 거래성이다.
+       할인·프로모션 문구를 넣는 순간 광고성이 되어 수신동의가 필요해진다.
+    """
+    try:
+        user = User.objects.get(pk=user_id, is_active=True)
+    except User.DoesNotExist:
+        return
+    base = {
+        "full_name": user.full_name or user.email.split("@")[0],
+        "service_name": settings.SERVICE_NAME,
+        "support_email": settings.SUPPORT_EMAIL,
+        "billing_url": f"{settings.FRONTEND_URL}/billing",
+        "used_str": "",
+        "limit_str": "",
+        "blocked_str": "0",
+        "resumable_str": "0",
+        "reset_date": "",
+    }
+    base.update(ctx or {})
+    try:
+        send_email(TEMPLATE_DM_QUOTA_REACHED, user.email, base, user=user)
+    except EmailTemplateMissing:
+        logger.error("dm_quota_reached template missing — run seed_email_templates")
 
 
 @shared_task(name="emails.send_welcome_email")

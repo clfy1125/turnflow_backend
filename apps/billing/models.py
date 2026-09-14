@@ -226,6 +226,27 @@ class SubscriptionStatus(models.TextChoices):
     PAUSED = "paused", "Paused"  # 리텐션 일시정지 — 잔여 유료기간 후 무과금 정지, 만료 시 자동 재개
 
 
+class TrialKind(models.TextChoices):
+    """체험이 **어떻게 시작됐는가** (2026-09-12 카드 없는 프로 30일 도입).
+
+    ⭐ ``status=TRIALING`` 만으로는 두 체험을 구분할 수 없는데, 두 체험은 만료 시
+       **완전히 다르게 끝난다**:
+      - ``card``: 빌링키 보유 → ``process_due_renewals`` 가 첫 과금을 수행(유료 전환)
+      - ``auto``: 빌링키 없음 → ``handle_trial_expiry`` 가 무료로 다운그레이드(과금 없음)
+      분기 자체는 빌링키 유무로 이미 올바르게 갈리지만(그 로직은 건드리지 않는다),
+      "이 사람은 카드를 낸 적이 없다"를 **사후에** 알아야 하는 곳이 셋 있다:
+      광고 CAPI 의 ``trial_kind`` 구분 · 어드민 코호트 · 체험 종료 유도 문구.
+      빌링키는 체험 중에 붙을 수 있으므로(attach_only) 그때 유무로는 복원할 수 없다.
+
+    ⚠️ **내구 기록** — ``trial_used_at``/``trial_plan`` 과 같이 다운그레이드에서도 지우지
+       않는다. 지우면 무료로 떨어진 사용자가 어느 경로로 체험했는지 영영 알 수 없다.
+    빈 문자열 = 이 필드 도입 이전의 체험(전부 카드 등록 체험이었다).
+    """
+
+    CARD = "card", "카드 등록 체험"
+    AUTO = "auto", "카드 없는 자동 지급 체험"
+
+
 EXTRA_IG_ACCOUNT_PRICE = 9900  # 프로 추가 IG 계정 단가 (원/월)
 
 # ── 리텐션(해지 방어) 정책 ──
@@ -372,6 +393,18 @@ class UserSubscription(models.Model):
         help_text=(
             "체험을 시작한 플랜 (카드등록 체험·쿠폰 체험 공통). plan 은 만료 시 free 로 "
             "바뀌므로 '무슨 플랜 체험이었나'의 내구 기록이 따로 필요하다."
+        ),
+    )
+    trial_kind = models.CharField(
+        max_length=10,
+        blank=True,
+        default="",
+        db_index=True,
+        choices=TrialKind.choices,
+        verbose_name="체험 시작 경로",
+        help_text=(
+            "card=카드 등록 체험 / auto=카드 없는 자동 지급 체험 / 빈 값=도입 이전. "
+            "내구 기록이라 다운그레이드해도 지우지 않는다 (TrialKind docstring 참고)."
         ),
     )
     cancelled_during_trial_at = models.DateTimeField(
@@ -576,6 +609,24 @@ class UserSubscription(models.Model):
 
         length = trial_length_days(self)
         return None if length is None else round(length)
+
+    @property
+    def trial_last_day(self):
+        """체험 **마지막 이용일** (KST 날짜). 체험 중이 아니면 None.
+
+        ⭐ ``current_period_end``(=``trial_ends_at``)는 **결제/만료가 일어나는 시각 그 자체**라
+           날짜로 찍으면 하루 더 써도 되는 것처럼 보인다. 사용자에게 보여줄 "…까지 무료"는
+           그 전날이다. 프론트가 ``trial_ends_at − 1일`` 로 역산하던 것을 서버로 올린다 —
+           역산은 타임존이 어긋나는 순간(UTC 자정 근처) 하루가 틀어지고, 그 숫자가 곧
+           **고지 문구**라서 틀리면 허위 고지가 된다.
+
+        ⚠️ 정의는 ``toss_flows.preview_subscription`` 의 ``trial_last_day`` 와 **같아야**
+           한다(카드 체험은 preview, 카드 없는 체험은 이 프로퍼티를 읽으므로 두 화면이
+           갈리면 같은 사람에게 다른 날짜가 보인다).
+        """
+        if self.status != SubscriptionStatus.TRIALING or self.current_period_end is None:
+            return None
+        return timezone.localdate(self.current_period_end) - timedelta(days=1)
 
     @property
     def conversion_consent_required(self) -> bool:

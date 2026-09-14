@@ -191,5 +191,11 @@ class TestTrackVisitThrottle:
         res = client.post(URL, _payload(), format="json", HTTP_USER_AGENT=DESKTOP_UA)
         assert res.status_code == 429
         # 표준 에러 포맷 (custom_exception_handler)
-        assert res.json()["success"] is False
-        assert res.json()["error"]["code"] == 429
+        # ⚠️ `error.code` 는 HTTP 상태(429)가 아니라 **머신 키** "RATE_LIMITED" 다.
+        #    같은 429 를 요금제 한도 초과(PLAN_LIMIT_EXCEEDED)도 쓰기 때문에 갈라 놨다 —
+        #    구분하지 않으면 프론트가 "너무 빨라요"를 "돈 내세요"로 착각해 결제 전환
+        #    분석 데이터가 오염된다(apps/core/exceptions.py 의 Throttled 분기 주석).
+        body = res.json()
+        assert body["success"] is False
+        assert body["error"]["code"] == "RATE_LIMITED"
+        assert body["error"]["details"]["code"] == "RATE_LIMITED"

@@ -1627,9 +1627,12 @@ def revive_quota_skipped_dms(user_id: str):
     from django.contrib.auth import get_user_model
     from django.core.cache import cache
 
-    from apps.integrations.models import SentDMLog
-
-    from .dm_limits import _quota_hit_cache_key, check_dm_quota
+    from .dm_limits import (
+        QUOTA_REVIVE_WINDOW_DAYS,
+        _quota_hit_cache_key,
+        check_dm_quota,
+        quota_skipped_logs,
+    )
 
     user = get_user_model().objects.filter(pk=user_id).first()
     if not user:
@@ -1652,14 +1655,12 @@ def revive_quota_skipped_dms(user_id: str):
         )
         return {"revived": 0, "reason": "still_over_limit", "used": used, "limit": limit}
 
+    # 대상 판정은 dm_limits 단일 소스 — 홈 알림의 "몇 건이 막혔나"와 같은 근거를 봐야 한다.
+    # (사유 문자열을 여기 복제하면 한쪽만 고쳐져 화면 숫자와 되살림 대상이 갈린다.)
     logs = list(
-        SentDMLog.objects.filter(
-            campaign__ig_connection__workspace__owner=user,
-            status=SentDMLog.Status.SKIPPED,
-            error_message="monthly_dm_limit_reached",
-            # 최장 윈도우(댓글 7일)를 넘은 건은 revive() 가 어차피 거른다 — 스캔 자체를 줄인다.
-            created_at__gte=timezone.now() - timedelta(days=7),
-        ).order_by("created_at")[:QUOTA_REVIVE_MAX_LOGS]
+        quota_skipped_logs(user, within_days=QUOTA_REVIVE_WINDOW_DAYS).order_by("created_at")[
+            :QUOTA_REVIVE_MAX_LOGS
+        ]
     )
     revived = 0
     for log in logs:

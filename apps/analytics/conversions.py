@@ -82,15 +82,24 @@ def track_trial_started(subscription, request=None) -> None:
 
     ⚠️ 2026-08-26 현재 **프론트 픽셀은 이 이벤트를 쏘지 않는다**(함수는 있으나 호출부
        없음). 프론트가 붙기 전까지는 서버 단독 집계이며, 붙을 때 같은 규약을 써야 한다.
+
+    ⭐ ``custom_data.trial_kind`` 로 두 체험을 구분해 보낸다 (2026-09-12):
+       ``card`` = 카드 등록 체험(만료 시 과금) / ``auto`` = 카드 없는 자동 지급(과금 없음).
+       광고 대행사가 두 경로의 유료 전환율을 따로 봐야 하는데, 이 값이 없으면 Meta 쪽에서는
+       둘이 **같은 StartTrial 로 뭉쳐** 카드 없는 체험이 전환율을 통째로 희석시킨다.
+       ⚠️ 프론트 픽셀은 카드 체험에서만 StartTrial 을 쏘므로(자동 지급은 커스텀
+          ``auto_trial_granted``), 두 소스를 합칠 때 이 필드가 유일한 구분자다.
     """
     try:
         user = subscription.user
         amount = getattr(subscription, "monthly_amount_snapshot", None)
+        trial_kind = getattr(subscription, "trial_kind", "") or ""
         dispatch_meta_capi(
             event_name=EVENT_START_TRIAL,
             event_id=str(subscription.id),
             event_time=int(timezone.now().timestamp()),
             value=int(amount) if amount else 0,
+            custom_props={"trial_kind": trial_kind} if trial_kind else None,
             **_match_params(user),
             **client_meta_from_request(request),
         )

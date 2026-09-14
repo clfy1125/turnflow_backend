@@ -206,6 +206,11 @@ class RegisterView(generics.CreateAPIView):
         return Response(
             {
                 "user": UserSerializer(user).data,
+                # 이메일 가입은 201 이면 언제나 신규다. 그래도 값을 **내려준다** —
+                # 프론트의 전환 이벤트 코드가 google/kakao 와 같은 모양을 읽을 수 있어야
+                # 가입 수단마다 분기를 두 벌 들지 않는다 (구글·카카오는 로그인/가입이
+                # 같은 엔드포인트라 이 값이 유일한 구분자다).
+                "is_new_user": True,
                 "tokens": {
                     "refresh": str(refresh),
                     "access": str(refresh.access_token),

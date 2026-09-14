@@ -2,20 +2,35 @@
 # 배포: wrangler deploy   (사전: KV 네임스페이스 생성 + 시크릿 등록 — README.md 참고)
 # 이 워커는 DR Step 2 의 tick 워커를 대체한다(tick + 회색지대 감지를 함께 수행).
 
-name = "turnflow-dr-detector"
+# ⚠️ 실제 가동 중인 워커 이름은 **turnflow-scheduler-tick** 이다(URL: turnflow-scheduler-tick.clfy1125.workers.dev).
+#    DR Step 2 의 tick 워커를 이 감지기로 "덮어써서" 대체했기 때문. 다른 이름으로 배포하면
+#    크론이 둘로 갈라져 **옛 코드가 계속 돌고 tick 이 분당 2회** 발사된다. 이름을 바꾸지 말 것.
+name = "turnflow-scheduler-tick"
 main = "detector-worker.js"
-compatibility_date = "2025-01-01"
+# ⚠️ 실가동 워커의 값과 일치시킬 것(2026-08-04 버전 기준 2026-06-27).
+#    낮추면 배포로 런타임 시맨틱이 과거로 내려간다. `wrangler versions view <id>` 로 확인.
+compatibility_date = "2026-06-27"
 
 # 매 분 실행(Cloudflare cron 최소 단위 = 1분). tick + 프로빙.
 [triggers]
 crons = ["* * * * *"]
 
-# 감지 상태(streak/since_ts/alerted) 영속용 KV. id 는 `wrangler kv namespace create DR_STATE` 결과로 교체.
+# 감지 상태(streak/since_ts/alerted/episodes) 영속용 KV.
+# ⚠️ 아래 id 는 **기존 네임스페이스 `turnflow-dr-state`** 다. 절대 새로 create 하지 말 것
+#    — 상태가 초기화돼 진행 중인 에피소드·중복경보 억제(alerted)가 풀린다.
+#    (네임스페이스 id 는 계정 자격증명 없이는 접근 불가한 식별자라 시크릿이 아니다.)
 [[kv_namespaces]]
 binding = "DR_STATE"
-id = "<KV_NAMESPACE_ID>"
+id = "9f9cdb5e295547feb1c3cada2729e332"  # turnflow-dr-state
 
-# 비밀 아님(공개돼도 무방한 임계/튜닝값). 시크릿(SCHEDULER_TICK_SECRET/TELEGRAM_*)은 `wrangler secret put` 으로.
+# 비밀 아님(공개돼도 무방한 임계/튜닝값).
+#
+# ⚠️⚠️ 배포는 반드시 **`wrangler deploy --keep-vars`** 로 할 것.
+#   실가동 워커에는 대시보드에서 넣은 `TELEGRAM_BOT_TOKEN` · `TELEGRAM_CHAT_ID` 가
+#   (시크릿이 아니라) **평문 var 로** 들어 있다. 이 파일에는 토큰을 적을 수 없으므로,
+#   --keep-vars 없이 배포하면 두 값이 삭제되고 `telegram()` 이 조용히 no-op 이 되어
+#   **DR 경보가 영구 침묵**한다(장애가 나도 아무도 모른다).
+#   SCHEDULER_TICK_SECRET 은 진짜 시크릿이라 배포와 무관하게 유지된다.
 [vars]
 ORIGIN = "https://turnflow-api.clfy.ai.kr"
 EXPECTED_ACTIVE_SITE = "colo"
@@ -26,4 +41,7 @@ WORKER_STALE_SECONDS = "600"   # 워커 heartbeat stale 경계(stall 상관 조�
 DEFERRED_AGE_SECONDS = "3600"  # deferred DM '밀린 시간' 경계
 DB_LATENCY_MS = "2000"         # DB 왕복 지연 hard-fail 경계
 PROBE_TIMEOUT_MS = "5000"      # 프로브 타임아웃
+PROBE_RETRY_DELAY_MS = "1500"  # live 프로브 재시도 간격. gunicorn 워커 재활용(--max-requests)과
+                               # 겹친 keep-alive reset 502 를 걸러내는 용도(2026-09-14 오탐).
+                               # 실장애는 재시도도 실패하므로 감지 지연은 최대 이 값 + 타임아웃.
 RECOVER_HEALTHY_POLLS = "2"    # 회복 히스테리시스(연속 healthy poll 수)

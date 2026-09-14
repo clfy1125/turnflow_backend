@@ -25,8 +25,13 @@ from rest_framework.views import APIView
 from apps.pages.stats import get_country, hash_ip
 
 from .channels import classify_ua, derive_channel
-from .models import CancellationEvent, CheckoutEvent, LandingVisit, UAClass
-from .serializers import CancellationEventSerializer, CheckoutEventSerializer, TrackVisitSerializer
+from .models import CancellationEvent, CheckoutEvent, FunnelEvent, LandingVisit, UAClass
+from .serializers import (
+    CancellationEventSerializer,
+    CheckoutEventSerializer,
+    TrackFunnelEventSerializer,
+    TrackVisitSerializer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -423,3 +428,196 @@ class TrackCancellationEventView(APIView):
                 "cancellation_event: insert failed user=%s", request.user.id, exc_info=True
             )
         return Response(status=status.HTTP_201_CREATED)
+
+
+class TrackFunnelEventView(APIView):
+    """전환 퍼널 텔레메트리 수집 — **인증 선택**(비로그인 이벤트도 받는다).
+
+    ``TrackVisitView`` 와 달리 ``authentication_classes`` 를 비우지 **않는다** —
+    로그인 사용자의 이벤트는 ``user`` 를 붙여 저장해야 "가입은 했는데 체험을 안 켠
+    사람"을 사람 단위로 셀 수 있기 때문이다. 토큰이 없거나 만료됐으면 익명으로 기록한다
+    (권한은 AllowAny).
+    """
+
+    permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "funnel_event"
+
+    @extend_schema(
+        tags=["analytics"],
+        summary="퍼널 이벤트 기록",
+        description="""
+## 개요
+전환 퍼널의 화면 단위 이벤트를 수집하는 **fire-and-forget 비콘**입니다.
+2026-09-10 병목 진단(가입 525명 → 프로 체험 26명, 5.0%)의 후속으로, "어디서
+떨어지는가"를 화면 단위로 재구성하기 위한 계측 엔드포인트입니다.
+
+## 사용 시나리오
+- 프로 체험 팝업 노출/클릭/닫기 (`trial_popup_view` / `trial_popup_click` / `trial_popup_dismiss`)
+- 팝업을 통한 체험 시작 (`trial_started_from_popup`)
+- 그 밖에 프론트가 정의하는 모든 퍼널 이벤트
+
+**이벤트 이름과 필드의 정본은 프론트**(`src/lib/funnelEvents.ts` 의 `FunnelEventName`)입니다.
+서버는 화이트리스트를 두지 않습니다 — 두면 이벤트를 하나 추가할 때마다 백엔드 배포를
+기다려야 하고, 그 사이 이벤트가 통째로 유실됩니다.
+
+## 인증
+**선택**입니다. `Authorization: Bearer <access_token>` 이 있으면 사용자와 묶어 저장하고,
+없으면 익명 이벤트로 저장합니다. 토큰이 만료돼도 401 이 아니라 익명 기록으로 넘어갑니다.
+
+## 비즈니스 로직 (silent-204)
+비콘이므로 **모든 실패 경로가 204** 입니다:
+1. 봇 User-Agent → 기록 없이 204
+2. 페이로드 검증 실패(`event` 누락, `payload` 4KB 초과 등) → 기록 없이 204
+3. DB 기록 실패 → 로그만 남기고 204
+4. 정상 → `FunnelEvent` 1행 기록 후 204
+
+유일한 비-204 는 스로틀 **429** 입니다(인증 사용자는 사용자 기준, 익명은 IP 기준. 기본 600/hour).
+
+IP 는 **SHA-256 해시만** 저장하고 원본은 저장하지 않습니다(랜딩 방문 기록과 같은 원칙).
+
+## 요청 바디 필드
+| 필드 | 필수 | 타입 | 설명 |
+|------|:----:|------|------|
+| `event` | ✅ | string(≤60) | 이벤트 이름 |
+| `payload` | 선택 | object(≤4KB) | 이벤트별 자유 필드 (`surface`, `attempt`, `method`, `elapsed_sec` …) |
+| `path` | 선택 | string(≤300) | 발생 화면 경로 (`location.pathname`) |
+| `ts` | 선택 | ISO datetime | 클라이언트 발생 시각. **집계는 서버 수신 시각을 씁니다**(기기 시계는 틀릴 수 있음) |
+| `visitor_id` | 선택 | uuid | 랜딩 스니펫의 `tf_vid`. 비로그인 이벤트를 가입과 잇는 유일한 키 |
+| `device` | 선택 | `ios` / `android` / `pc` / `unknown` | 기기 대분류 |
+| `in_app` | 선택 | bool | 인앱 브라우저 여부 |
+| `in_app_kind` | 선택 | string(≤24) | `instagram` / `kakaotalk` / `facebook` 등 |
+
+`device` 를 프론트가 보고하는 이유: 서버는 User-Agent 로 `desktop/mobile/tablet` 까지만
+가르는데, 요청서가 요구하는 "기기별 분리 집계"는 **iOS / Android 를 갈라 봐야** 합니다
+(인앱 브라우저의 OAuth 복귀 동작이 갈립니다). iPadOS 처럼 데스크톱을 사칭하는 UA 도
+있어 서버 파생만으로는 부정확합니다. 서버 파생값(`ua_class`)도 함께 저장해 둘이
+어긋나는 경우를 나중에 볼 수 있게 했습니다.
+
+## 주의사항
+- 응답은 항상 바디 없는 204 — 프론트는 응답을 검사할 필요가 없고, 실패해도 사용자
+  UX 에 어떤 에러도 표출하면 안 됩니다 (`.catch(() => {})`).
+- 보존 기간은 기본 180일입니다(`FUNNEL_EVENT_RETENTION_DAYS`). 그 이후 자동 삭제됩니다.
+- `navigator.sendBeacon` 은 `Authorization` 헤더를 붙일 수 없어 **익명**으로 기록됩니다.
+  로그인 사용자를 묶어야 하는 이벤트는 `fetch(..., { keepalive: true })` 로 보내세요.
+
+## 사용 예시
+```javascript
+fetch('/api/v1/track/funnel-event/', {
+  method: 'POST',
+  keepalive: true,
+  headers: {
+    'Content-Type': 'application/json',
+    ...(token ? { Authorization: 'Bearer ' + token } : {}),
+  },
+  body: JSON.stringify({
+    event: 'trial_popup_view',
+    payload: { surface: 'pc_modal', attempt: 1, user_id: userId, signup_at: signupAt },
+    path: location.pathname,
+    ts: new Date().toISOString(),
+    device: 'ios',
+    in_app: true,
+    in_app_kind: 'instagram',
+  }),
+}).catch(() => {});
+```
+        """,
+        request=TrackFunnelEventSerializer,
+        examples=[
+            OpenApiExample(
+                "팝업 노출",
+                request_only=True,
+                value={
+                    "event": "trial_popup_view",
+                    "payload": {
+                        "surface": "pc_modal",
+                        "attempt": 1,
+                        "user_id": 1234,
+                        "signup_at": "2026-09-09T14:22:00+09:00",
+                    },
+                    "path": "/home",
+                    "ts": "2026-09-12T10:31:00+09:00",
+                    "device": "pc",
+                    "in_app": False,
+                },
+            ),
+            OpenApiExample(
+                "팝업에서 체험 시작",
+                request_only=True,
+                value={
+                    "event": "trial_started_from_popup",
+                    "payload": {"surface": "mobile_sheet", "user_id": 1234, "elapsed_sec": 3.2},
+                    "path": "/home",
+                    "device": "ios",
+                    "in_app": True,
+                    "in_app_kind": "instagram",
+                },
+            ),
+        ],
+        responses={
+            204: OpenApiResponse(description="기록 완료(또는 조용히 스킵) — 바디 없음"),
+            400: OpenApiResponse(
+                description=(
+                    "발생하지 않음 — 잘못된 페이로드는 조용히 무시되고 204 로 응답합니다 "
+                    "(silent-204 원칙)"
+                )
+            ),
+            401: OpenApiResponse(
+                description="발생하지 않음 — 인증은 선택이며 토큰이 없으면 익명으로 기록합니다"
+            ),
+            403: OpenApiResponse(description="해당 없음"),
+            404: OpenApiResponse(description="해당 없음"),
+            429: OpenApiResponse(
+                description="스로틀 초과 (기본 600/hour). 표준 에러 포맷",
+                examples=[
+                    OpenApiExample(
+                        "스로틀 초과",
+                        value={
+                            "success": False,
+                            "error": {
+                                "code": 429,
+                                "message": "요청이 지연(throttled)되었습니다.",
+                                "details": {"detail": "Request was throttled."},
+                            },
+                        },
+                    )
+                ],
+            ),
+            500: OpenApiResponse(
+                description="서버 내부 오류 (DB 기록 실패는 내부에서 삼켜 204 — 사실상 발생하지 않음)"
+            ),
+        },
+    )
+    def post(self, request):
+        user_agent = request.META.get("HTTP_USER_AGENT", "")
+        ua_class = classify_ua(user_agent)
+        if ua_class == UAClass.BOT:
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        serializer = TrackFunnelEventSerializer(data=request.data)
+        if not serializer.is_valid():
+            logger.info("track_funnel_event: invalid payload — skipped (%s)", serializer.errors)
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        data = serializer.validated_data
+
+        user = request.user if request.user and request.user.is_authenticated else None
+        try:
+            FunnelEvent.objects.create(
+                event=data["event"],
+                user=user,
+                visitor_id=data.get("visitor_id"),
+                path=data.get("path", "") or "",
+                payload=data.get("payload") or {},
+                device=data.get("device") or "unknown",
+                in_app=bool(data.get("in_app")),
+                in_app_kind=data.get("in_app_kind", "") or "",
+                ua_class=ua_class,
+                ip_hash=hash_ip(request),
+                client_ts=data.get("ts"),
+            )
+        except Exception:
+            logger.warning(
+                "track_funnel_event: insert failed event=%s", data.get("event"), exc_info=True
+            )
+
+        return Response(status=status.HTTP_204_NO_CONTENT)

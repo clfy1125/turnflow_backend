@@ -8,7 +8,7 @@ max_length 초과(봇이 보내는 10KB utm 등)도 페이로드 전체를 inval
 
 from rest_framework import serializers
 
-from .models import CancellationEventType, CheckoutEventType
+from .models import CancellationEventType, CheckoutEventType, DeviceKind
 from .utm import UTM_MAX_LENGTH, normalize_utm_payload
 
 
@@ -120,3 +120,71 @@ class CancellationEventSerializer(serializers.Serializer):
     to_plan = serializers.CharField(
         required=False, allow_blank=True, max_length=32, help_text="이후 플랜"
     )
+
+
+# ──────────────────────────────────────────────
+# 퍼널 이벤트 (POST /api/v1/track/funnel-event/)
+# ──────────────────────────────────────────────
+
+# payload 상한 — 직렬화 후 바이트 기준. 봇/버그가 한 행에 수 MB 를 밀어 넣는 것만 막는다.
+FUNNEL_PAYLOAD_MAX_BYTES = 4096
+
+
+class TrackFunnelEventSerializer(serializers.Serializer):
+    """POST /api/v1/track/funnel-event/ 요청 바디.
+
+    ⚠️ ``event`` 이름은 **검증하지 않는다**(화이트리스트 없음). 정본은 프론트의
+    ``FunnelEventName`` 이고, 서버가 목록을 들면 프론트가 이벤트를 하나 추가할 때마다
+    백엔드 배포를 기다려야 하며 그 사이 이벤트가 통째로 유실된다.
+    대신 길이를 자르고(60자) 스로틀로 막는다.
+    """
+
+    event = serializers.CharField(
+        max_length=60,
+        help_text="이벤트 이름 (예: trial_popup_view). 프론트 FunnelEventName 이 정본",
+    )
+    payload = serializers.JSONField(
+        required=False,
+        help_text="이벤트별 자유 필드 객체 (surface, attempt, method, elapsed_sec …). 4KB 상한",
+    )
+    path = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=300,
+        help_text="발생 화면 경로 (location.pathname)",
+    )
+    ts = serializers.DateTimeField(
+        required=False,
+        allow_null=True,
+        help_text="클라이언트 발생 시각(ISO). 집계는 서버 수신 시각을 쓴다",
+    )
+    visitor_id = serializers.UUIDField(
+        required=False,
+        allow_null=True,
+        help_text="랜딩 스니펫의 tf_vid. 비로그인 이벤트를 가입과 잇는 유일한 키",
+    )
+    device = serializers.ChoiceField(
+        choices=DeviceKind.choices,
+        required=False,
+        help_text="ios | android | pc | unknown. 요청서 '기기별 분리 집계'용",
+    )
+    in_app = serializers.BooleanField(required=False, help_text="인앱 브라우저 여부")
+    in_app_kind = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=24,
+        help_text="instagram / kakaotalk / facebook 등 (프론트 판별값)",
+    )
+
+    def validate_payload(self, value):
+        if value in (None, ""):
+            return {}
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("payload 는 객체여야 합니다.")
+        import json
+
+        if len(json.dumps(value, ensure_ascii=False).encode()) > FUNNEL_PAYLOAD_MAX_BYTES:
+            raise serializers.ValidationError(
+                f"payload 가 너무 큽니다 (최대 {FUNNEL_PAYLOAD_MAX_BYTES} bytes)."
+            )
+        return value

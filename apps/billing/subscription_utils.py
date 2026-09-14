@@ -136,3 +136,43 @@ def count_active_ig_connections(user) -> int:
         status=IGAccountConnection.Status.ACTIVE,
         is_active=True,
     ).count()
+
+
+def ig_activation_state(user) -> dict:
+    """활성 IG 계정 선택이 필요한 상태인가 — **판정 단일 소스**.
+
+    ``IGAccountActivationView`` 의 다이얼로그 트리거와 홈의 강제 팝업이 같은 함수를 봐야
+    "팝업이 떴는데 화면에서는 조정할 게 없다"(또는 그 반대)가 생기지 않는다.
+
+    트리거 3가지:
+      1. 활성 > 허용량 — 다운그레이드/축소로 초과된 경우
+      2. 연동 ≥1 인데 활성 0 — 전부 비활성이면 기능이 전면 정지된 상태
+      3. 명시적 리뷰 플래그(``ig_activation_review_needed``)
+    """
+    from apps.integrations.models import IGAccountConnection
+
+    allowance = get_ig_account_allowance(user)
+    is_unlimited = allowance < 0
+    max_ig = 999999 if is_unlimited else allowance
+    sub = ensure_subscription(user)
+
+    owned = list(
+        IGAccountConnection.objects.filter(workspace__owner=user)
+        .exclude(status=IGAccountConnection.Status.REVOKED)
+        .only("id", "is_active")
+    )
+    total = len(owned)
+    active = sum(1 for c in owned if c.is_active)
+
+    needs = (
+        (not is_unlimited and active > max_ig)
+        or (not is_unlimited and total >= 1 and active == 0)
+        or bool(sub.ig_activation_review_needed)
+    )
+    return {
+        "needs_activation_adjustment": needs,
+        "max_ig_accounts": max_ig,
+        "total_accounts": total,
+        "active_accounts": active,
+        "is_unlimited": is_unlimited,
+    }

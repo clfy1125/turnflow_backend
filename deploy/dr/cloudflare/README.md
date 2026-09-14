@@ -32,6 +32,16 @@ wrangler secret put TELEGRAM_CHAT_ID
 wrangler deploy
 ```
 
+> ⚠️ **이미 가동 중인 워커를 갱신하는 경우**(= 지금 상태) 두 가지를 반드시 확인한다.
+> 1. **이름** — 실가동 워커는 `turnflow-scheduler-tick`(tick 워커를 덮어써서 대체했다).
+>    `wrangler.toml` 의 `name` 이 이것과 다르면 **새 워커가 하나 더 생겨** 옛 코드가 계속 돌고
+>    tick 이 분당 2회 발사된다.
+> 2. **KV id** — `wrangler kv namespace list` 로 기존 `DR_STATE` id 를 확인해 넣는다. 새로
+>    create 하면 상태가 초기화돼 진행 중인 에피소드·중복경보 억제(`alerted`)가 풀린다.
+>
+> 시크릿(`wrangler secret put` 으로 넣은 것)은 배포해도 유지되지만, `[vars]` 는 **toml 값으로
+> 덮어쓰인다** — 대시보드에서 임계값을 손댔다면 배포 전에 toml 에 반영할 것.
+
 확인:
 - `wrangler tail` 로그에서 매 분 실행 확인.
 - 서버 web_dashboard 액세스로그에 `POST /api/v1/internal/scheduler/tick 200` 이 계속 오는지(= tick 정상 이관).
@@ -63,4 +73,12 @@ wrangler deploy maintenance-worker.js --name turnflow-dr-maintenance \
 - 신호: S1 도달성(live), S2 앱 미준비, S3/S4 DB·Redis, migrations, S6/S7 큐적체×워커stall, S8 deferred DM, S9 WAL(경보전용).
 - 판정: `db_ok|redis_ok 단독` OR `hard≥2` OR `(큐적체 AND 워커stall)` OR `deferred 적체` → UNHEALTHY.
 - 상태기계: `HEALTHY → DEGRADED(첫 unhealthy) → SUSPECTED_DOWN(≥T_SUSPECT) → CONFIRMED_DOWN(≥T_WINDOW)`. healthy poll 2회면 회복.
+- **live 프로브는 1회 재시도 후 채점**(2026-09-14 추가). 서버 gunicorn 이 `--max-requests` 로
+  워커를 재활용(하루 8~10회)할 때 Caddy 의 keep-alive 커넥션이 reset 되어 502 한 번이 뜨는데,
+  이게 S1(HOST_DOWN)으로 채점돼 DEGRADED 오탐을 냈다. 실장애는 재시도도 실패하므로 감지는
+  `PROBE_RETRY_DELAY_MS`+타임아웃 만큼만 늦어진다.
+- **🟢 회복 경보는 🟠/🔴 가 실제로 나갔던 에피소드에만 발신**(2026-09-14 추가). DEGRADED 에는
+  경보가 없으므로, 종전엔 3분 미만 깜빡임이 "경보 없이 회복 알림만" 오는 형태가 됐다.
+  조용히 지나간 깜빡임은 KV 의 `episodes`(최근 10건: 시작·종료·klass·사유·폴수·notified)에 남는다
+  — `?debug=1` 로 조회. 종전에는 `last` 가 매분 덮어써져 사후 원인추적이 불가능했다.
 - 30분 창은 KV 의 `since_ts` 타임스탬프로 강제(워커 재시작 견딤). active_site 불일치 / passive 는 다운으로 세지 않음.

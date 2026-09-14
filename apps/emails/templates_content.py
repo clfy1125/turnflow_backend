@@ -23,7 +23,10 @@ from apps.emails.constants import (
     TEMPLATE_ADMIN_DEVICE_CODE,
     TEMPLATE_CONSENT_MISSING_DOWNGRADE,
     TEMPLATE_CONVERSION_CONSENT,
+    TEMPLATE_DM_QUOTA_REACHED,
+    TEMPLATE_EMAIL_CHANGE,
     TEMPLATE_EMAIL_VERIFICATION,
+    TEMPLATE_IG_CONNECTION_LOST,
     TEMPLATE_INSTA_REPORT_READY,
     TEMPLATE_ONBOARDING_DAY_3,
     TEMPLATE_ONBOARDING_DAY_7,
@@ -186,6 +189,31 @@ DEFAULTS: dict[str, dict[str, str]] = {
 <p style="font-size:13px;color:#9ca3af;margin:0;">본인이 요청한 것이 아니라면 이 메일을 무시해 주세요.</p>
 """,
             preheader="{{ service_name }} 이메일 인증 코드 {{ verification_code }}",
+        ),
+    },
+    # 인스타 로그인 사용자의 이메일 등록. **새 주소로** 보낸다 — 기존 주소가 자리표시라
+    # 기존 주소로 보내면 아무 데도 도착하지 않는다. 링크(클릭 인증)를 주지 않고 코드만
+    # 주는 이유: 링크를 누르면 로그인 세션이 없는 브라우저에서 열려 "누구의 이메일인지"를
+    # 알 수 없다. 앱 안에서 코드를 입력받는 편이 단순하고 안전하다.
+    TEMPLATE_EMAIL_CHANGE: {
+        "subject": "[{{ service_name }}] 이메일 등록 인증 코드",
+        "html_body": _wrap(
+            """
+<p style="font-size:18px;font-weight:700;color:#111827;margin:0 0 4px;">이 주소를 알림 메일 주소로 등록할까요?</p>
+<p style="margin:0 0 8px;color:#4b5563;">안녕하세요, <strong>{{ full_name }}</strong>님.</p>
+<p style="margin:0 0 4px;color:#4b5563;"><strong>{{ email }}</strong> 을(를) {{ service_name }} 계정의 이메일로 등록하려고 합니다.<br>아래 코드를 앱 화면에 <strong>{{ expires_minutes }}분 이내</strong>에 입력해 주세요.</p>
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-collapse:collapse;">
+  <tr><td align="center" style="padding:22px 0;">
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 auto;">
+      <tr><td align="center" bgcolor="#f5f1fe" style="padding:14px 18px;border-radius:12px;color:#6D28D9;font-size:26px;font-weight:800;letter-spacing:6px;line-height:1.3;white-space:nowrap;">{{ verification_code }}</td></tr>
+    </table>
+  </td></tr>
+</table>
+<p style="font-size:13px;color:#9ca3af;margin:0 0 6px;">등록이 끝나면 무료 체험 종료 안내, 연결 끊김 알림 등을 이 주소로 받게 됩니다.</p>
+<p style="font-size:13px;color:#9ca3af;margin:0;">본인이 요청한 것이 아니라면 이 메일을 무시해 주세요. 코드를 입력하지 않으면 아무것도 바뀌지 않습니다.</p>
+<p style="font-size:13px;color:#9ca3af;margin:6px 0 0;">문의: {{ support_email }}</p>
+""",
+            preheader="{{ service_name }} 이메일 등록 인증 코드 {{ verification_code }}",
         ),
     },
     # 웹 단독 탈퇴 ①: 이메일 소유 증명. 이 메일 자체로는 아무것도 삭제되지 않는다 —
@@ -528,6 +556,59 @@ DEFAULTS: dict[str, dict[str, str]] = {
             preheader="관리자 로그인 기기 승인 코드 {{ device_code }}",
         ),
     },
+    TEMPLATE_IG_CONNECTION_LOST: {
+        "subject": "[{{ service_name }}] 인스타그램 연결이 끊겨 자동 DM이 멈췄어요",
+        "html_body": _wrap(
+            """
+<p style="font-size:18px;font-weight:700;color:#111827;margin:0 0 4px;">자동 DM이 멈춰 있어요</p>
+<p style="margin:0 0 6px;color:#4b5563;"><strong>{{ full_name }}</strong>님, <strong>{{ ig_username }}</strong> 계정의 인스타그램 연결이 끊어졌습니다.</p>
+"""
+            + _detail_rows(
+                [
+                    ("대상 계정", "{{ ig_username }}"),
+                    ("멈춘 시점", "{{ since_date }}"),
+                ]
+            )
+            + """
+<div style="margin:16px 0;padding:14px 18px;background:#fef2f2;border:1px solid #fee2e2;border-radius:12px;color:#991b1b;font-size:13px;line-height:1.7;">
+  이 계정의 자동 DM 발송이 <strong>전부 멈춘 상태</strong>이며, 다시 연결하시기 전까지는 새로 달리는 댓글에도 발송되지 않습니다.
+</div>
+<p style="margin:0;color:#4b5563;">다시 연결하시면 <strong>댓글 작성 후 7일 이내</strong>의 건은 별도 설정 없이 자동으로 다시 발송됩니다.</p>
+"""
+            + _btn("{{ console_url }}", "인스타그램 다시 연결하기")
+            + """
+<p style="font-size:13px;color:#9ca3af;margin:0;">도움이 필요하시면 <a href="mailto:{{ support_email }}" style="color:#7C3AED;">{{ support_email }}</a>로 문의해 주세요.</p>
+""",
+            preheader="{{ ig_username }} 연결이 끊겨 자동 DM이 멈췄습니다",
+        ),
+    },
+    TEMPLATE_DM_QUOTA_REACHED: {
+        "subject": "[{{ service_name }}] 이번 달 DM 발송 한도를 모두 사용했어요",
+        "html_body": _wrap(
+            """
+<p style="font-size:18px;font-weight:700;color:#111827;margin:0 0 4px;">이번 달 발송 한도를 모두 사용했어요</p>
+<p style="margin:0 0 6px;color:#4b5563;"><strong>{{ full_name }}</strong>님, 현재 플랜의 월 발송 한도에 도달했습니다.</p>
+"""
+            + _detail_rows(
+                [
+                    ("사용량", "{{ used_str }} / {{ limit_str }}건"),
+                    ("지금 발송되지 못한 요청", "{{ blocked_str }}건"),
+                    ("한도 초기화", "{{ reset_date }}"),
+                ]
+            )
+            + """
+<div style="margin:16px 0;padding:14px 18px;background:#fff7ed;border:1px solid #fed7aa;border-radius:12px;color:#9a3412;font-size:13px;line-height:1.7;">
+  지금부터 달리는 댓글에는 자동 DM이 발송되지 않습니다. 한도는 <strong>{{ reset_date }}</strong>에 초기화됩니다.
+</div>
+<p style="margin:0;color:#4b5563;">플랜을 올리시면 <strong>아직 시간이 남은 {{ resumable_str }}건</strong>은 바로 다시 발송됩니다(댓글 작성 후 7일 이내 건).</p>
+"""
+            + _btn("{{ billing_url }}", "플랜 변경하기")
+            + """
+<p style="font-size:13px;color:#9ca3af;margin:0;">도움이 필요하시면 <a href="mailto:{{ support_email }}" style="color:#7C3AED;">{{ support_email }}</a>로 문의해 주세요.</p>
+""",
+            preheader="이번 달 DM 발송 한도 도달 — 지금부터 발송되지 않습니다",
+        ),
+    },
 }
 
 
@@ -596,4 +677,12 @@ SAMPLE_CONTEXT: dict[str, str] = {
     # 미리보기에서는 email_previews/ 에 복사된 로컬 PNG 를 참조한다.
     # 실제 발송은 settings.EMAIL_LOGO_URL(R2 공개 URL)이 주입된다.
     "logo_url": "email-logo.png",
+    # 서비스 중단 안내 (홈 알림 이메일 판)
+    "since_date": "2026-09-09",
+    "used_str": "200",
+    "limit_str": "200",
+    "blocked_str": "37",
+    "resumable_str": "31",
+    "reset_date": "2026-10-01",
+    "console_url": "https://app.turnflow.link/settings/instagram",
 }

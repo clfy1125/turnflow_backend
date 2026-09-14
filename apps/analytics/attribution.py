@@ -24,7 +24,7 @@ def capture_signup_attribution(user, payload, signup_kind: str) -> None:
 
     payload: dict | None — 프론트가 보낸 attribution 객체
       {visitor_id, utm_source, utm_medium, utm_campaign, utm_content, referrer, landing_path}
-    signup_kind: "email" | "google" (models.SignupKind)
+    signup_kind: "email" | "google" | "kakao" | "instagram" (models.SignupKind)
 
     페이로드가 아예 없으면(None/비-dict/빈 dict) channel="unknown" 으로 저장해
     "프론트 미연동 가입"과 "직접 유입(direct)"을 구분한다.

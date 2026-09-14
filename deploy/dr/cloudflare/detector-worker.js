@@ -29,6 +29,7 @@ function cfg(env) {
     deferredAge: num(env.DEFERRED_AGE_SECONDS, 3600),
     dbLatencyMax: num(env.DB_LATENCY_MS, 2000),
     probeTimeout: num(env.PROBE_TIMEOUT_MS, 5000),
+    probeRetryDelay: num(env.PROBE_RETRY_DELAY_MS, 1500), // live 프로브 재시도 간격
     recoverHysteresis: num(env.RECOVER_HEALTHY_POLLS, 2),
   };
 }
@@ -56,6 +57,27 @@ async function probe(url, opts, timeoutMs) {
   } finally {
     clearTimeout(t);
   }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * live 프로브는 **1회 재시도한 뒤에** 채점한다.
+ *
+ * 이유(2026-09-14 05:59 KST 실사례): 서버 gunicorn 은 `--max-requests 5000 --max-requests-jitter 500`
+ * 으로 워커를 재활용한다(대시보드 컨테이너 기준 하루 8~10회). 바로 앞 tick 요청이 그 카운터를 채우면
+ * 워커가 응답 직후 종료하고, Caddy 가 그 워커로 열어둔 keep-alive 커넥션을 다음 요청(= 이 프로브)에
+ * 재사용하다 `connection reset by peer` → 502 를 한 번 낸다. 실장애가 아닌데 S1(HOST_DOWN)로 채점돼
+ * DEGRADED 로 떨어졌고, 3분 안에 회복돼 🟢 회복 알림만 단독으로 나갔다.
+ *
+ * 실장애는 재시도도 실패하므로 감지가 늦어지지 않는다(최대 +probeRetryDelay +probeTimeout).
+ */
+async function probeLiveWithRetry(c) {
+  const first = await probe(`${c.origin}/api/v1/healthz/live`, { method: "GET" }, c.probeTimeout);
+  if (first.ok && first.status < 500) return { res: first, retried: false };
+  await sleep(c.probeRetryDelay);
+  const second = await probe(`${c.origin}/api/v1/healthz/live`, { method: "GET" }, c.probeTimeout);
+  return { res: second, retried: true };
 }
 
 /**
@@ -118,6 +140,31 @@ function score(liveRes, diagRes, c) {
   return { healthy: !unhealthy, klass, reasons, passive: false, diagReachable: true, walBroken };
 }
 
+// ── 에피소드 기록(최근 10건) ───────────────────────────────────────────────
+// KV 의 `last` 는 매 분 덮어써져서, 경보 없이 지나간 깜빡임의 사유가 사후에 남지 않았다
+// (2026-09-14 조사에서 caddy/gunicorn 로그로 역추적해야 했던 이유). 이 배열이 그 기록이다.
+const EPISODE_KEEP = 10;
+
+function openEpisode(s, verdict, now) {
+  const list = (s.episodes || []).slice(-(EPISODE_KEEP - 1));
+  list.push({ start_ts: now, klass: verdict.klass, reasons: (verdict.reasons || []).slice(0, 5), polls: 1 });
+  s.episodes = list;
+}
+
+function bumpEpisode(s) {
+  const cur = s.episodes && s.episodes[s.episodes.length - 1];
+  if (cur && !cur.end_ts) cur.polls = (cur.polls || 1) + 1;
+}
+
+function closeEpisode(s, now, peakState, notified) {
+  const cur = s.episodes && s.episodes[s.episodes.length - 1];
+  if (cur && !cur.end_ts) {
+    cur.end_ts = now;
+    cur.peak_state = peakState;
+    cur.notified = notified;
+  }
+}
+
 // ── 상태기계 ────────────────────────────────────────────────────────────────
 function transition(state, verdict, now, c) {
   const s = state || { state: "HEALTHY", since_ts: null, healthy_streak: 0, alerted: {} };
@@ -127,7 +174,12 @@ function transition(state, verdict, now, c) {
   if (verdict.healthy) {
     s.healthy_streak = (s.healthy_streak || 0) + 1;
     if (s.state !== "HEALTHY" && s.healthy_streak >= c.recoverHysteresis) {
-      events.push({ type: "RECOVERED", from: s.state });
+      // 회복 경보는 **경보를 실제로 보낸 에피소드에만** 보낸다. DEGRADED 에는 경보가 없으므로
+      // (🟠=3분 지속, 🔴=30분 지속) 종전엔 3분 미만 깜빡임이 🟢 회복 알림만 단독 발신해
+      // "경보도 없었는데 왜 회복 알림이 오지?" 가 됐다. 기록은 episodes 에 남는다.
+      const notify = !!(s.alerted.suspect || s.alerted.confirm);
+      closeEpisode(s, now, s.state, notify);
+      events.push({ type: "RECOVERED", from: s.state, notify });
       s.state = "HEALTHY";
       s.since_ts = null;
       s.alerted = {};
@@ -140,17 +192,22 @@ function transition(state, verdict, now, c) {
   if (!s.since_ts) s.since_ts = now;
   const sustained = now - s.since_ts;
 
-  if (s.state === "HEALTHY") s.state = "DEGRADED";
+  if (s.state === "HEALTHY") {
+    s.state = "DEGRADED";
+    openEpisode(s, verdict, now);
+  } else {
+    bumpEpisode(s);
+  }
   if (s.state === "DEGRADED" && sustained >= c.tSuspect) s.state = "SUSPECTED_DOWN";
   if (s.state === "SUSPECTED_DOWN" && sustained >= c.tWindow) s.state = "CONFIRMED_DOWN";
 
   if (s.state === "SUSPECTED_DOWN" && !s.alerted.suspect) {
     s.alerted.suspect = true;
-    events.push({ type: "SUSPECTED", sustained });
+    events.push({ type: "SUSPECTED", sustained, notify: true });
   }
   if (s.state === "CONFIRMED_DOWN" && !s.alerted.confirm) {
     s.alerted.confirm = true;
-    events.push({ type: "CONFIRMED", sustained });
+    events.push({ type: "CONFIRMED", sustained, notify: true });
   }
   return { state: s, events };
 }
@@ -193,7 +250,8 @@ async function runTick(env) {
   }
 
   // 2) 프로빙
-  const liveRes = await probe(`${c.origin}/api/v1/healthz/live`, { method: "GET" }, c.probeTimeout);
+  const live = await probeLiveWithRetry(c);
+  const liveRes = live.res;
   const diagRes = await probe(`${c.origin}/api/v1/healthz/diag`, { method: "GET", headers: { "X-Scheduler-Secret": secret } }, c.probeTimeout);
 
   // 3) 채점
@@ -208,7 +266,7 @@ async function runTick(env) {
     prev = null;
   }
   const { state, events } = transition(prev, verdict, now, c);
-  state.last = { ts: now, healthy: verdict.healthy, klass: verdict.klass, reasons: verdict.reasons };
+  state.last = { ts: now, healthy: verdict.healthy, klass: verdict.klass, reasons: verdict.reasons, live_retried: live.retried };
   try {
     await env.DR_STATE.put(KV_KEY, JSON.stringify(state), { expirationTtl: 7 * 24 * 3600 });
   } catch (_) {
@@ -216,7 +274,11 @@ async function runTick(env) {
   }
 
   // 5) 경보 + (WAL broken 은 별도 경보전용)
-  for (const ev of events) await telegram(env, alertText(ev, verdict, c));
+  for (const ev of events) {
+    // notify=false → 경보 없이 지나간 깜빡임의 회복. 알리지 않고 episodes 기록만 남긴다.
+    if (ev.notify === false) continue;
+    await telegram(env, alertText(ev, verdict, c));
+  }
   if (verdict.walBroken && (!prev || !prev.walAlerted)) {
     state.walAlerted = true;
     await telegram(env, "🟡 *DR 감지* — colo WAL 아카이빙 깨짐(경보전용, failover 트리거 아님). 백업 상태 점검 필요.");

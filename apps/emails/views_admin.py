@@ -223,6 +223,20 @@ class EmailTemplateTestSendView(generics.GenericAPIView):
         from .services.sender import send_email
 
         log = send_email(key, serializer.validated_data["to_email"], ctx, user=request.user)
+        if log is None:
+            # 발송 계층이 보낼 수 없는 주소(자리표시 `…@ig.invalid`)로 판정해 건너뛴 경우.
+            # 202 로 "보냈다"고 답하면 운영자가 수신함을 헛되이 기다린다.
+            return Response(
+                {
+                    "success": False,
+                    "error": {
+                        "code": status.HTTP_400_BAD_REQUEST,
+                        "message": "메일을 보낼 수 없는 주소입니다 (자리표시 이메일).",
+                        "details": {"code": "PLACEHOLDER_EMAIL"},
+                    },
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         return Response({"email_log_id": log.id}, status=status.HTTP_202_ACCEPTED)
 
 

@@ -2,14 +2,22 @@
 Referral API views — 쿠폰(제휴/레퍼럴 코드) 검증 및 사용 이력.
 
 1. ValidateReferralCodeView   — 코드 사전 검증 + **결제 전 미리보기** (인증 불필요)
-2. RedeemReferralCodeView     — **폐지**(항상 400). 쿠폰은 카드 등록 경로에서만 사용
+2. RedeemReferralCodeView     — **체험 중 기간 연장 전용**. 그 외는 여전히 400
 3. MyReferralRedemptionView   — 내 레퍼럴 사용 이력 조회
 
-⚠️ 쿠폰으로 트라이얼을 시작하는 경로는 **단 하나**다 —
+⚠️ 쿠폰으로 트라이얼을 **시작**하는 경로는 여전히 단 하나다 —
 ``POST /billing/toss/confirm/`` 에 ``referral_code`` 동봉
 (:func:`apps.billing.toss_flows.confirm_billing`, ``scenario="trial"``).
-여기에 두 번째 경로를 만들지 말 것: 과거 이 파일의 redeem 이 기본 체험 30일을
+여기에 "시작" 경로를 다시 만들지 말 것: 과거 이 파일의 redeem 이 기본 체험 30일을
 빼먹어 "30일 + 14일" 쿠폰이 14일로 나갔다(2026-08-04 규명).
+
+⭐ 2026-09-12 부분 부활 — **연장만**. '카드 없는 프로 30일'이 켜지면 가입 직후 이미
+   ``TRIALING`` 이라 confirm 의 ``scenario="trial"`` 에 영영 도달하지 못한다. 그대로 두면
+   제휴 코드가 항상 400 이 되어 44일 쿠폰이 통째로 죽는다. 그래서 이 뷰는 **이미 체험
+   중인 사용자의 남은 기간에 보너스 일수를 더하는 일만** 한다
+   (:func:`apps.billing.toss_flows.extend_trial_with_referral`).
+   폐지 사유였던 결함이 여기서는 구조적으로 재발하지 않는다 — **base 30일은 이미 부여돼
+   있고**, ``trial_used_at`` 도 이미 찍혀 있다(재체험 우회 구멍 없음).
 """
 
 import logging
@@ -249,95 +257,187 @@ if (data.valid) {
 
 
 class RedeemReferralCodeView(APIView):
-    """폐지됨 — 쿠폰은 카드 등록(toss confirm) 경로에서만 사용한다.
+    """제휴/레퍼럴 코드로 **진행 중인 무료 체험을 연장**한다 (카드 불필요).
 
-    ⚠️ 이 경로는 ``code.trial_days`` 만 부여하고 **기본 체험 30일(TRIAL_BASE_DAYS)을
-    가산하지 않았다**. 그래서 14일 쿠폰 사용자가 "30일 + 14일 = 44일" 대신 **14일만**
-    받는 결함이 실서비스에서 발생했다(2026-08-04 규명, HLEVEL26 17건 중 3건 피해).
+    ⚠️ 이 뷰는 트라이얼을 **시작하지 않는다**. 2026-08-04 까지 그 일을 했었고,
+    ``code.trial_days`` 만 부여하고 **기본 체험 30일(TRIAL_BASE_DAYS)을 가산하지 않아**
+    14일 쿠폰 사용자가 44일 대신 14일만 받는 결함이 실서비스에서 발생했다
+    (HLEVEL26 17건 중 3건 피해). 그래서 시작 경로는 영구 폐지다.
 
-    같은 쿠폰을 카드 등록에 동봉한 :func:`apps.billing.toss_flows.confirm_billing`
-    (``scenario="trial"``) 은 ``TRIAL_BASE_DAYS + bonus_days`` 로 44일을 정확히 줬다.
-    두 경로가 서로 다른 값을 주는 게 근본 원인이었으므로, 경로를 하나로 없앤다.
-
-    부수적으로 막히는 것: 이 경로는 ``trial_used_at`` 을 채우지 않아, 체험이 만료돼
-    free 로 강등된 뒤 카드를 등록하면 ``scenario="trial"`` 로 재판정돼 **30일 무료
-    체험이 한 번 더** 나갔다(1인 1회 원칙 우회). 경로 폐지로 이 구멍도 닫힌다.
+    2026-09-12 '카드 없는 프로 30일' 도입으로 **연장 경로만** 되살렸다. 자동 지급이
+    가입 직후 ``TRIALING`` 을 만들기 때문에 ``toss/confirm`` 의 ``scenario="trial"`` 에
+    도달할 수 없고, 그대로 두면 제휴 코드가 항상 400 이 된다.
+    폐지 사유였던 두 결함이 여기서는 재발할 수 없다:
+      - base 30일 누락 → **이미 부여된 기간에 더하기만** 한다
+      - ``trial_used_at`` 미기록으로 인한 재체험 우회 → 자동 지급이 이미 찍어 뒀다
     """
 
     permission_classes = [IsAuthenticated]
 
     @extend_schema(
         tags=["레퍼럴"],
-        summary="[폐지] 카드 없이 쿠폰 사용",
-        deprecated=True,
+        summary="제휴 코드로 무료 체험 연장",
         description="""
-## ⛔ 폐지된 엔드포인트 — 항상 400 을 반환합니다
+## 개요
+**이미 무료 체험 중인 사용자**가 제휴/레퍼럴 코드를 입력해 남은 체험 기간에
+보너스 일수를 더합니다. 카드 등록이 필요 없습니다.
 
-이 경로는 **더 이상 트라이얼을 시작하지 않습니다.** 쿠폰(제휴/레퍼럴 코드)은
-**카드 등록과 함께** 사용하세요 → `POST /billing/toss/confirm/` 에 `referral_code` 동봉.
+예: 가입 시 자동 지급된 프로 30일을 쓰는 중에 14일짜리 코드를 입력 →
+**남은 기간 끝에 14일이 이어 붙어 총 44일**이 됩니다.
 
-## 왜 폐지했는가
+## 사용 시나리오
+- 가입 직후 카드 없는 프로 30일이 켜진 사용자가 제휴 코드를 뒤늦게 입력할 때
+- 제휴 파트너 링크로 들어왔으나 코드 입력 화면을 가입 이후에 만나는 경우
 
-이 경로는 `code.trial_days` 만 부여하고 **기본 무료 체험 30일을 가산하지 않았습니다.**
-그래서 14일 쿠폰 사용자가 `30일 + 14일 = 44일` 이 아니라 **14일만** 받았습니다.
-같은 쿠폰을 카드 등록에 동봉하면 정상적으로 44일이 부여됩니다. 두 경로가 서로 다른
-값을 주는 것이 결함의 근본 원인이었으므로, 경로를 하나로 통일했습니다.
+체험을 **시작**할 때 코드를 함께 쓰려면 이 엔드포인트가 아니라
+`POST /billing/toss/confirm/` 에 `referral_code` 를 동봉하세요(카드 등록 경로).
 
-## 프론트엔드가 해야 할 일
+## 인증
+`Authorization: Bearer <access_token>` 필수. 미인증 401.
 
-1. 쿠폰 입력 → `GET /billing/referral/validate/?code=XXX` 로 검증 **및 미리보기 정보 획득**
-   - `total_trial_days` — 총 무료 일수 (예: 44). **`trial_days`(=14, 보너스분)를 그대로
-     노출하면 안 됩니다.**
-   - `first_charge_at` — 첫 결제 예정 시각 (= 무료 체험 종료 시각)
-   - `first_charge_amount` — 첫 결제 예정 금액(원)
-2. "쿠폰 적용 시 44일 무료, 2026-09-17에 14,900원 첫 결제" 를 **카드 입력 전에** 안내
-3. 카드 등록 시 `POST /billing/toss/confirm/` 에 `referral_code` 를 **함께** 전송
+## 비즈니스 로직
+1. 현재 구독이 `trialing` 이 아니면 400 `REFERRAL_NOT_TRIALING`
+2. 코드가 없거나 소진/비활성/만료면 400 (사유는 `detail`)
+3. 이미 제휴 코드를 쓴 적이 있으면 400 (1인 1회)
+4. 코드의 대상 플랜이 현재 체험 플랜과 다르면 400 `REFERRAL_PLAN_MISMATCH`
+5. 통과 → `current_period_end += code.trial_days`, 코드 사용 횟수 +1, 사용 이력 기록
 
-## 응답
+**기간은 "지금부터 N일"이 아니라 "남은 체험 끝 + N일"** 입니다 — 다시 잡으면 남은
+기간을 빼앗게 됩니다.
 
-항상 `400` + `code: "REFERRAL_REQUIRES_CARD"`.
-`detail` 은 사용자에게 그대로 보여줄 수 있는 한국어 문장입니다.
+## 요청 바디
+| 필드 | 필수 | 타입 | 설명 |
+|------|:----:|------|------|
+| `code` | ✅ | string | 제휴/레퍼럴 코드 (대소문자 무시) |
+
+## 주의사항
+- 체험이 **끝난 뒤**에는 쓸 수 없습니다(400). 만료 전에 입력해야 합니다.
+- 코드는 1인 1회입니다. 두 번째 코드는 400.
+- 연장 후 표기는 `GET /billing/my-subscription/` 의 `trial_last_day` 를 쓰세요
+  (`trial_ends_at` 을 날짜로 찍으면 하루 더 써도 되는 것처럼 보입니다).
+
+## 사용 예시
+```bash
+curl -X POST https://api.turnflow.link/api/v1/billing/referral/redeem/ \
+  -H "Authorization: Bearer $ACCESS" \
+  -H "Content-Type: application/json" \
+  -d '{"code": "HLEVEL26"}'
+```
+```json
+{
+  "success": true,
+  "referral_code": "HLEVEL26",
+  "bonus_days": 14,
+  "trial_ends_at": "2026-10-26T05:12:00Z",
+  "trial_last_day": "2026-10-25",
+  "total_trial_days": 44,
+  "detail": "제휴 코드가 적용되어 무료 체험이 14일 연장되었습니다."
+}
+```
         """,
         request=ReferralCodeRedeemRequestSerializer,
         responses={
-            400: OpenApiResponse(
-                description="폐지됨 — 카드 등록 경로를 사용해야 함",
+            200: OpenApiResponse(
+                description="연장 완료",
                 examples=[
                     OpenApiExample(
-                        "폐지 안내",
+                        "연장 성공",
                         value={
-                            "detail": (
-                                "쿠폰은 카드 등록과 함께 사용해야 합니다. "
-                                "결제 수단을 등록하면 무료 체험이 시작됩니다."
-                            ),
-                            "code": "REFERRAL_REQUIRES_CARD",
+                            "success": True,
+                            "referral_code": "HLEVEL26",
+                            "bonus_days": 14,
+                            "trial_ends_at": "2026-10-26T05:12:00Z",
+                            "trial_last_day": "2026-10-25",
+                            "total_trial_days": 44,
+                            "detail": "제휴 코드가 적용되어 무료 체험이 14일 연장되었습니다.",
+                        },
+                    )
+                ],
+            ),
+            400: OpenApiResponse(
+                description="체험 중이 아니거나 코드가 유효하지 않음",
+                examples=[
+                    OpenApiExample(
+                        "체험 중이 아님",
+                        value={
+                            "detail": "무료 체험 중에만 제휴 코드로 기간을 연장할 수 있습니다.",
+                            "code": "REFERRAL_NOT_TRIALING",
+                            "success": False,
+                            "error": {
+                                "code": 400,
+                                "message": "무료 체험 중에만 제휴 코드로 기간을 연장할 수 있습니다.",
+                                "details": {"code": "REFERRAL_NOT_TRIALING"},
+                            },
+                        },
+                    ),
+                    OpenApiExample(
+                        "이미 사용함",
+                        value={
+                            "detail": "이미 제휴/레퍼럴 코드를 사용하셨습니다.",
+                            "success": False,
+                            "error": {
+                                "code": 400,
+                                "message": "이미 제휴/레퍼럴 코드를 사용하셨습니다.",
+                                "details": {},
+                            },
                         },
                     ),
                 ],
             ),
             401: OpenApiResponse(description="인증 실패 — 토큰 없음/만료"),
+            403: OpenApiResponse(description="해당 없음"),
+            404: OpenApiResponse(description="해당 없음 — 없는 코드는 400 으로 응답합니다"),
+            500: OpenApiResponse(description="서버 오류 — X-Request-ID 와 함께 문의해 주세요"),
         },
     )
     def post(self, request):
-        """항상 400 — 쿠폰은 카드 등록 경로(toss/confirm)로만 사용한다.
+        from django.db import transaction as _tx
 
-        구독 상태를 **전혀 건드리지 않는다**(읽기조차 하지 않는다). 이 뷰가 하던
-        트라이얼 시작 로직은 통째로 제거됐다 — 살려두면 base 30일을 빼먹는 두 번째
-        경로가 다시 생긴다.
-        """
+        from .toss_flows import BillingFlowError, extend_trial_with_referral
+
+        serializer = ReferralCodeRedeemRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        code_str = _normalize_code(serializer.validated_data["code"])
+
+        try:
+            with _tx.atomic():
+                result = extend_trial_with_referral(request.user, code_str)
+        except BillingFlowError as exc:
+            payload = {"detail": exc.detail}
+            machine_code = exc.extra.get("code")
+            if machine_code:
+                payload["code"] = machine_code
+            # §6 통일 포맷을 **함께** 실어 보낸다 — 이 뷰는 DRF 예외 핸들러를 우회하므로
+            # detail 만 내면 한 URL 이 두 포맷을 내게 된다(toss_views 와 같은 함정).
+            payload["success"] = False
+            payload["error"] = {
+                "code": exc.status_code,
+                "message": exc.detail,
+                "details": {"code": machine_code} if machine_code else {},
+            }
+            return Response(payload, status=exc.status_code)
+
+        sub = request.user.subscription
+        sub.refresh_from_db()
         logger.info(
-            "폐지된 카드없는 쿠폰 경로 호출 차단: user=%s",
+            "제휴 코드 체험 연장: user=%s code=%s +%s일",
             request.user.email,
+            result["referral_code"],
+            result["bonus_days"],
         )
         return Response(
             {
+                "success": True,
+                "referral_code": result["referral_code"],
+                "bonus_days": result["bonus_days"],
+                "trial_ends_at": result["trial_ends_at"],
+                "trial_last_day": sub.trial_last_day,
+                "total_trial_days": result["total_trial_days"],
                 "detail": (
-                    "쿠폰은 카드 등록과 함께 사용해야 합니다. "
-                    "결제 수단을 등록하면 무료 체험이 시작됩니다."
+                    f"제휴 코드가 적용되어 무료 체험이 {result['bonus_days']}일 연장되었습니다."
                 ),
-                "code": "REFERRAL_REQUIRES_CARD",
             },
-            status=status.HTTP_400_BAD_REQUEST,
+            status=status.HTTP_200_OK,
         )
 
 

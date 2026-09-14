@@ -34,7 +34,7 @@ from apps.core.exceptions import DuplicateActiveCampaignError, RestrictedMediaEr
 from apps.core.throttling import AI_GENERATE_THROTTLES
 from apps.workspace.models import Workspace
 
-from . import oauth_callback_pages, oauth_return
+from . import connect_service, oauth_callback_pages, oauth_return
 from .campaign_stats import (
     TIMESERIES_RANGES,
     annotate_campaign_stats,
@@ -723,61 +723,12 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                     connection.is_active = True
                 connection.save()
 
-                # Enable webhook subscriptions for this account (per-account requirement)
-                try:
-                    subscribe_result = InstagramOAuthService.subscribe_to_webhooks(
-                        ig_user_id=instagram_account_id,
-                        access_token=access_token,
-                        fields="comments,messages",
-                    )
-                    logger.debug(
-                        f"Webhook subscription result for {instagram_account_id}: {subscribe_result}"
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to subscribe webhooks for {instagram_account_id}: {e}")
-
-                # 신규 연동/권한 추가 재연동 직후 — 메타데이터 + 모든 인사이트 자동 부트스트랩
-                # (프론트가 별도로 sync 트리거할 필요 없이 즉시 데이터 확보)
-                try:
-                    from apps.insights.tasks import bootstrap_account
-
-                    bootstrap_account.delay(str(connection.id))
-                    logger.info(f"Enqueued insights bootstrap for {connection.id}")
-                except Exception as e:
-                    logger.warning(f"Failed to enqueue insights bootstrap (non-fatal): {e}")
-
-                # 다른 서비스에서 쓰던 DM 캠페인 **선(先)분석** — 사용자가 열어보기 전에
-                # 백그라운드로 미리 돌려 캐시해 둔다(결과 재사용 7일). 분석이 계정당 수 분~
-                # 수십 분이라 요청 시점에 시작하면 그만큼 기다리게 되기 때문.
-                # 전 플랜(무료 포함). 실패해도 사용자에게 노출되지 않는다. best-effort.
-                try:
-                    from .tasks import prewarm_dm_migration
-
-                    prewarm_dm_migration.delay(str(connection.id))
-                    logger.info(f"Enqueued dm-migration prewarm for {connection.id}")
-                except Exception as e:
-                    logger.warning(f"Failed to enqueue dm-migration prewarm (non-fatal): {e}")
-
-                # 프로필 사진 캐싱 — IG CDN URL 은 서명된 일시 URL 이라 만료될 수 있으므로
-                # 연동 즉시 우리 스토리지로 사본을 끌어와서 안정 URL 확보. best-effort.
-                try:
-                    from .tasks import sync_ig_profile_picture
-
-                    sync_ig_profile_picture.delay(str(connection.id))
-                    logger.info(f"Enqueued profile picture sync for {connection.id}")
-                except Exception as e:
-                    logger.warning(f"Failed to enqueue profile sync (non-fatal): {e}")
-
-                # 재연동(토큰 교체) 직후 — 토큰 오류(FAILED_TOKEN)로 막혀 있던 발송을
-                # 메시징 윈도우 내라면 자동 되살림. 신규 연동엔 대상이 없어 no-op(안전).
-                # (기존: 자동 갱신 태스크만 revive 를 호출 → 수동 재연동으론 복구 안 됐음)
-                try:
-                    from .tasks import revive_failed_token_logs
-
-                    revive_failed_token_logs.delay(str(connection.id))
-                    logger.info(f"Enqueued failed-token revive after reconnect for {connection.id}")
-                except Exception as e:
-                    logger.warning(f"Failed to enqueue reconnect revive (non-fatal): {e}")
+                # 연동 직후 공통 후처리 — 웹훅 구독 + 백그라운드 4종.
+                # ⚠️ 여기 인라인으로 두지 말 것: 인스타 **로그인** 경로도 같은 후처리가
+                #    필요해서 connect_service 로 뽑았다. 한쪽에만 추가하면 다른 쪽은
+                #    조용히 빠진다(웹훅 미구독 = 댓글 무음, 프사 미캐싱 = 나중에 깨짐).
+                connect_service.subscribe_webhooks(instagram_account_id, access_token)
+                connect_service.post_connect_fanout(connection)
 
             # Clean up persisted state
             try:

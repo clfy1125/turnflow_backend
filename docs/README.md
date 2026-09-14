@@ -25,6 +25,8 @@
 
 작성 시점의 API 계약입니다. 구현이 바뀌면 이 문서도 갱신하세요.
 
+- [CAMPAIGN_ACTIVATION_DROPOFF_ANALYSIS_2026-09-10.md](frontend/CAMPAIGN_ACTIVATION_DROPOFF_ANALYSIS_2026-09-10.md) — **연동은 했는데 캠페인을 안 만드는 원인 분석 + 개선 아이디어**(액세스 로그 퍼널 + DB + 프론트 코드 리딩). ★모바일 21.0% vs 데스크톱 44.8% · 첫 캠페인의 55.9%가 **연동 1시간 내** · 비활성 저장버튼이 사유를 안 알려준다(`isSubmitDisabled` 7조건·안내 0개) · 모바일 저장버튼이 폼 맨 끝(sticky 아님) · **캠페인 0개 계정 460개 중 415개(90.2%)가 이미 이전 분석 완료 → 즉시 켤 초안 542건이 방치** · apply 가 INACTIVE 라 이전초안 활성률 20.3%(직접생성 84.9%)
+
 **결제·구독**
 - [TOSS_BILLING_FRONTEND.md](frontend/TOSS_BILLING_FRONTEND.md) — 토스 빌링 연동(카드등록 → prepare/confirm, 체험·해지·카드변경)
 - [EXTRA_IG_ACCOUNT_TRIAL_FRONTEND.md](frontend/EXTRA_IG_ACCOUNT_TRIAL_FRONTEND.md) — ⭐ **v2** · 체험 중 추가 IG 계정 **0원 즉시 추가**(체험 400 폐지 + `trial` 플래그) · 견적 400 사유 노출 요청 · dev 테스트 카드 실측표 · **체험 중 상한 없음 = 의도된 결정**
@@ -71,6 +73,9 @@
 - [SIGNUP_ATTRIBUTION_FRONTEND.md](frontend/SIGNUP_ATTRIBUTION_FRONTEND.md) — 방문→가입 채널 귀속
 - [AI_PAGE_GENERATION_GUIDE.md](frontend/AI_PAGE_GENERATION_GUIDE.md) — AI 페이지 생성 4단계
 - [PASSWORD_RESET_GUIDE.md](frontend/PASSWORD_RESET_GUIDE.md) — 비밀번호 재설정
+- [URGENT_CONVERSION_BACKEND_RESPONSE_3.md](frontend/URGENT_CONVERSION_BACKEND_RESPONSE_3.md) — ⭐ **3차(변경분만)**(2026-09-13). ①인스타 로그인 **dev 활성화**(Meta 앱이 dev/운영 **2개**·운영 IG App ID=36036852472566509 · `http://localhost` 는 **저장 시 조용히 사라진다**=HTTPS 전용 → `turnflowlink-dev.pages.dev` 사용, 터널 불필요) ②**계정 매칭 정책 변경** — "인스타로 가입한 계정만 인스타로 로그인". 그 IG 가 다른 계정에 연동 중이면 **409 `INSTAGRAM_ALREADY_CONNECTED_ELSEWHERE`**(+`masked_email`·`instagram_username`). 종전엔 **그 워크스페이스 owner 로 그냥 로그인**돼 대행사·직원이 주인 계정(결제 포함)에 들어갔다. 연동 해제하면 다음부터 새 계정으로 가입. 같이 고친 버그: 해제 뒤에도 옛 구글 계정으로 로그인되던 것(`instagram_user_id` 를 로그인 때 박아서)
+- [URGENT_CONVERSION_BACKEND_RESPONSE.md](frontend/URGENT_CONVERSION_BACKEND_RESPONSE.md) — ⭐ **긴급 전환 개선 회신서**(2026-09-12, 마이그 billing0026·auth0007/0008·analytics0008/0009). 병목 진단(방문 5,679 → 가입 525(9.2%) → 프로 체험 26(5.0%)) 후속 8건. **카드 없는 프로 30일** `POST /billing/trial/auto-grant/`(체험 미사용 전원·지급/미지급 둘 다 200·멱등) · `subscription.trial_last_day`(프론트 날짜 역산 제거) · `POST /track/funnel-event/` · `GET/PATCH /auth/me/popup-state/`(⚠️ 요청 경로 `users/me/…` 와 다름) · CAPI `trial_kind` · **인스타 로그인 3종**(기본 OFF·이메일 없음→자리표시) · register `is_new_user`. ⚠️ 자동 지급이 켜지면 44일 쿠폰이 통째로 죽어서 **제휴코드 연장 경로**를 같이 열었다
+- [KAKAO_LOGIN_FRONTEND.md](frontend/KAKAO_LOGIN_FRONTEND.md) — ⭐ **카카오 로그인**(2026-09-10, 마이그 auth0006·analytics0007). `POST /api/v1/auth/kakao/` — 응답은 구글과 동일(`user`/`is_new_user`/`tokens`). **JS SDK 금지**(JS 키엔 시크릿이 없어 서버 토큰교환이 깨진다) → REST API 키로 authorize 직접 리다이렉트. 이메일·닉네임 필수 동의(비즈앱). `code` 1회용 = StrictMode 이중실행 주의. **계정 매칭은 회원번호 우선** — 카카오 이메일이 바뀌어도 계정이 안 갈라진다. 오류는 detail/code + envelope **두 포맷 동시**. dev 실계정 종단간 검증 완료
 - [RATE_LIMIT_AND_GOOGLE_LOGIN_FRONTEND.md](frontend/RATE_LIMIT_AND_GOOGLE_LOGIN_FRONTEND.md) — 🔴 **429 두 종류 분기 필수**(`RATE_LIMITED` vs `PLAN_LIMIT_EXCEEDED` — 안 하면 paywall 분석 오염) + 구글 로그인 `GOOGLE_EMAIL_UNVERIFIED` 403
 - [RETIRE_OLD_API_HOST_REQUEST.md](frontend/RETIRE_OLD_API_HOST_REQUEST.md) — ✅ 회신 받음(1차) · 서버측(Pages Function)이 은퇴한 API 호스트를 호출 중 → 교체 요청
 - [RETIRE_OLD_API_HOST_ROUND2.md](frontend/RETIRE_OLD_API_HOST_ROUND2.md) — ✅ **완결(2026-08-12)** · `/media/` 저장 URL R2 이관(61행/101 URL) + 프론트 배포 반영 → 소비자 0건 확인 → DNS 삭제. 결과는 [ops/DNS_RETIRE_API_TURNFLOW.md](ops/DNS_RETIRE_API_TURNFLOW.md)
@@ -79,6 +84,7 @@
 
 - [배포방법.md](ops/배포방법.md) — **prod 배포는 여기부터**(수동 compose 금지 이유 포함)
 - [NEXT_ACTIONS_2026-08-04.md](ops/NEXT_ACTIONS_2026-08-04.md) — **현재 우선순위 로드맵**
+- [TRIAL_LENGTH_14_VS_30_ANALYSIS_2026-09-10.md](ops/TRIAL_LENGTH_14_VS_30_ANALYSIS_2026-09-10.md) — **무료체험 기간 정책용 실데이터 분석**(카드 없이 14일 vs 30일). 가입→연동→첫 DM 소요시간, 생존분석·신뢰구간 포함. ★연동은 가입 당일 아니면 영영 안 함 · 30일로 늘려 얻는 5명의 실사용은 전체의 0.06%·매출 0원 · 반대로 무상 제공 DM 물량은 2.4배 → **14일 + 조건부 연장** 권고
 - [PROD_HARDENING_2026-08-04.md](ops/PROD_HARDENING_2026-08-04.md) — 08-03~04 하드닝 실행 기록 + 사고 3건
 - [DNS_RETIRE_API_TURNFLOW.md](ops/DNS_RETIRE_API_TURNFLOW.md) — 옛 API 호스트 DNS 삭제(2026-08-12) + **복구 레시피** · 오리진 IP 직노출 제거
 - [SECURITY_AUDIT_2026-06.md](ops/SECURITY_AUDIT_2026-06.md) — 애플리케이션 취약점 감사(미해결 포함)

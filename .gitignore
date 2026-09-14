@@ -102,3 +102,7 @@ nul
 # 검수용 리포트 — 타인의 DM·댓글 원문이 그대로 들어 있다. 7일 파기 정책
 # (purge_dm_migration_raw) 대상이라 git 에 영구 보관하면 안 된다.
 /docs/reports/
+
+# wrangler 로컬 캐시 (계정 ID·이메일이 들어간다 — 커밋 금지)
+.wrangler/
+**/.wrangler/

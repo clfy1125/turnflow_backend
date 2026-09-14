@@ -3,8 +3,9 @@
 GET /billing/referral/validate/ — 총 무료 일수(base + 코드 보너스) & 결제 전 미리보기 계약.
 핵심: total_trial_days = TRIAL_BASE_DAYS + code.trial_days
       (프론트 '원래 1개월 무료 → 코드 적용 시 2개월 무료' 표기 소스)
-POST /billing/referral/redeem/ — 폐지 확인. 이 경로가 base 30일을 빼먹어 14일 쿠폰이
-      14일로 나갔다(2026-08-04). 되살아나면 여기서 잡힌다.
+POST /billing/referral/redeem/ — **연장 전용**(2026-09-12). 체험을 '시작'하는 기능은
+      영구 폐지다(이 경로가 base 30일을 빼먹어 14일 쿠폰이 14일로 나갔다, 2026-08-04).
+      시작 기능이 되살아나면 여기서 잡힌다. 연장은 base 가 이미 있어 같은 결함이 없다.
 더러운 테스트 DB 대응: 코드/이메일은 uuid 로 유일화.
 """
 
@@ -82,7 +83,11 @@ class TestReferralValidate:
 
 @pytest.mark.django_db
 class TestCardlessRedeemRetired:
-    """무카드 쿠폰 경로 폐지 — base 30일 누락 결함의 재발 방어."""
+    """무카드 쿠폰 경로 — '체험 시작'은 영구 폐지, '체험 연장'만 허용(2026-09-12).
+
+    폐지 사유였던 결함(base 30일 누락)이 연장 경로에서는 구조적으로 재발할 수 없다:
+    연장은 **이미 부여된 기간에 더하기만** 하고, ``trial_used_at`` 도 이미 찍혀 있다.
+    """
 
     @pytest.fixture
     def user(self, db):
@@ -96,13 +101,14 @@ class TestCardlessRedeemRetired:
         c.force_authenticate(user=user)
         return c
 
-    def test_redeem_always_400_with_machine_code(self, client):
+    def test_redeem_rejects_when_not_trialing(self, client):
+        """체험 중이 아니면 거절 — 이 경로로 체험을 **시작**할 수 없다."""
         code = _code(days=14)
         res = client.post(reverse("billing:referral-redeem"), {"code": code.code}, format="json")
         assert res.status_code == 400
-        assert res.json()["code"] == "REFERRAL_REQUIRES_CARD"
+        assert res.json()["code"] == "REFERRAL_NOT_TRIALING"
 
-    def test_redeem_does_not_touch_subscription_or_code(self, client, user):
+    def test_redeem_does_not_start_trial_or_burn_code(self, client, user):
         """가장 중요 — 구독을 TRIALING 으로 만들지도, 사용횟수를 태우지도 않는다."""
         code = _code(days=14)
         sub = ensure_subscription(user)
@@ -115,3 +121,46 @@ class TestCardlessRedeemRetired:
         assert sub.plan.name == "free"
         assert code.current_uses == 0
         assert not ReferralRedemption.objects.filter(user=user).exists()
+
+    def test_redeem_extends_running_trial_by_bonus_days(self, client, user):
+        """자동 지급 30일 + 코드 14일 = 44일. **30일을 다시 더하지 않는다**."""
+        from apps.billing import auto_trial
+
+        sub, reason = auto_trial.grant(user, source="test")
+        assert sub is not None, reason
+        before_end = sub.current_period_end
+        code = _code(days=14)
+
+        res = client.post(reverse("billing:referral-redeem"), {"code": code.code}, format="json")
+
+        assert res.status_code == 200, res.json()
+        body = res.json()
+        assert body["bonus_days"] == 14
+        assert body["total_trial_days"] == TRIAL_BASE_DAYS + 14
+
+        sub.refresh_from_db()
+        code.refresh_from_db()
+        # 남은 기간을 빼앗지 않고 **끝에 이어 붙인다**
+        assert sub.current_period_end == before_end + timedelta(days=14)
+        assert sub.status == SubscriptionStatus.TRIALING
+        assert code.current_uses == 1
+        assert ReferralRedemption.objects.filter(user=user).count() == 1
+        # 표기값도 같이 밀린다
+        assert body["trial_last_day"] == str(sub.trial_last_day)
+
+    def test_redeem_is_once_per_person(self, client, user):
+        from apps.billing import auto_trial
+
+        auto_trial.grant(user, source="test")
+        first, second = _code(days=14), _code(days=14)
+
+        assert (
+            client.post(
+                reverse("billing:referral-redeem"), {"code": first.code}, format="json"
+            ).status_code
+            == 200
+        )
+        res = client.post(reverse("billing:referral-redeem"), {"code": second.code}, format="json")
+        assert res.status_code == 400
+        second.refresh_from_db()
+        assert second.current_uses == 0

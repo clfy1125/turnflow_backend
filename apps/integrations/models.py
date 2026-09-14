@@ -197,6 +197,37 @@ class IGAccountConnection(models.Model):
         null=True, blank=True, verbose_name="마지막 미디어 폴링 시각"
     )
 
+    # ===== 홈 알림용 사전 계산 값 (2026-09-10) =====
+    # ⚠️ 위의 last_seen_media_* 와 **의미가 다르다**. 저건 next_media 캠페인의 baseline
+    # (한 번 찍고 고정, 웹훅 attach 때만 갱신)이고, 아래는 "지금 이 계정의 최신 게시물"이다.
+    # 홈은 Graph 를 부르면 안 되므로(앱 단위 쿼터 공유) 주기 태스크
+    # `integrations.refresh_latest_media` 가 미리 적어 둔 값을 읽는다.
+    latest_media_id = models.CharField(
+        max_length=255, blank=True, default="", verbose_name="최신 게시물 ID"
+    )
+    latest_media_at = models.DateTimeField(
+        null=True, blank=True, db_index=True, verbose_name="최신 게시물 게시 시각"
+    )
+    latest_media_permalink = models.TextField(
+        blank=True, default="", verbose_name="최신 게시물 링크"
+    )
+    latest_media_checked_at = models.DateTimeField(
+        null=True, blank=True, verbose_name="최신 게시물 확인 시각"
+    )
+
+    # 웹훅(실시간 댓글 수신) 구독 상태 — `resubscribe_all_webhooks` 가 점검하며 기록한다.
+    # None = 아직 확인 안 됨(알림 안 띄움), True = 정상, False = 재구독까지 실패.
+    webhook_healthy = models.BooleanField(
+        null=True,
+        blank=True,
+        default=None,
+        verbose_name="실시간 수신 정상 여부",
+        help_text="None=미확인 / True=정상 / False=구독 꺼짐(재구독 실패). 홈 알림 판정용.",
+    )
+    webhook_checked_at = models.DateTimeField(
+        null=True, blank=True, verbose_name="실시간 수신 확인 시각"
+    )
+
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Created At")
     updated_at = models.DateTimeField(auto_now=True, verbose_name="Updated At")

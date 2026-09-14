@@ -117,6 +117,7 @@ def resubscribe_active_connections(check_only: bool = False) -> dict:
                 # 구독 조회 성공 = 토큰 살아있음이 증명됨 → 누적 스트라이크 해제.
                 if not check_only:
                     clear_token_strikes(conn)
+                    _record_webhook_health(conn, True)
                 continue
             if check_only:
                 summary["details"].append(f"{igid}: missing={missing} (check-only)")
@@ -126,6 +127,7 @@ def resubscribe_active_connections(check_only: bool = False) -> dict:
                 access_token=token,
                 fields=",".join(REQUIRED_WEBHOOK_FIELDS),
             )
+            _record_webhook_health(conn, True)  # 재구독 성공 = 지금은 정상
             summary["resubscribed"] += 1
             summary["details"].append(f"{igid}: resubscribed (was missing {missing})")
             logger.info("resubscribed webhooks ig=%s missing=%s", igid, missing)
@@ -165,7 +167,29 @@ def resubscribe_active_connections(check_only: bool = False) -> dict:
                 summary["failed"] += 1
                 summary["details"].append(f"{igid}: ERROR {e!r}")
                 logger.warning("resubscribe webhooks failed ig=%s: %s", igid, e)
+                # 토큰은 살아있는데 웹훅 손질이 실패 = 실시간 수신이 끊긴 채로 남는다.
+                # 사용자에게 알려야 하는 유일한 웹훅 상태다(자기회복이 안 된 경우).
+                if not check_only:
+                    _record_webhook_health(conn, False)
     return summary
+
+
+def _record_webhook_health(conn, healthy: bool) -> None:
+    """웹훅 점검 결과를 연동 행에 남긴다 (홈 알림이 Graph 없이 읽기 위한 유일한 경로).
+
+    값이 그대로면 쓰지 않는다 — 1시간마다 전 계정 UPDATE 를 날릴 이유가 없다.
+    실패는 삼킨다: 기록이 점검 루프를 깨면 안 된다.
+    """
+    try:
+        now = timezone.now()
+        changed = ["webhook_checked_at"]
+        conn.webhook_checked_at = now
+        if conn.webhook_healthy is not healthy:
+            conn.webhook_healthy = healthy
+            changed.append("webhook_healthy")
+        conn.save(update_fields=changed)
+    except Exception:  # noqa: BLE001
+        logger.warning("웹훅 상태 기록 실패 ig=%s (non-fatal)", conn.external_account_id)
 
 
 def _should_alert_webhook_check(result: dict) -> bool:
@@ -2771,6 +2795,62 @@ def snapshot_baseline_for_account(ig_connection_id: str):
         ]
     )
     return {"status": "ok", "baseline_media_id": conn.last_seen_media_id}
+
+
+@shared_task(name="integrations.refresh_latest_media")
+def refresh_latest_media(limit: int = 200) -> dict:
+    """활성 IG 연동의 **최신 게시물 1건**을 DB 에 미리 적어 둔다 (홈 알림 라1 전용).
+
+    왜 미리 적는가 — 홈은 로그인한 모든 사용자의 첫 화면이고, 거기서 게시물 목록을 부르면
+    **홈 진입 1회 = Graph 호출 1회**가 된다. Graph 쿼터는 앱 단위 공유라 그 비용이 다른
+    워크스페이스의 댓글 수집·DM 발송을 굶긴다. 대신 여기서 **계정당 1시간에 1콜**만 쓴다.
+
+    - ``last_seen_media_*`` 는 건드리지 않는다. 저건 next_media 캠페인의 baseline 이라
+      의미가 다르고, 여기서 갱신하면 "다음 게시물" 판정이 깨진다.
+    - 계정별 best-effort. 한 계정이 실패해도 나머지는 진행한다.
+    """
+    from apps.core.site_control import is_active_site
+
+    if not is_active_site():
+        logger.info("refresh_latest_media: passive site — skip")
+        return {"skipped": "passive_site"}
+
+    qs = IGAccountConnection.objects.filter(
+        status=IGAccountConnection.Status.ACTIVE, is_active=True
+    ).order_by("latest_media_checked_at")[:limit]
+
+    summary = {"checked": 0, "updated": 0, "no_media": 0, "failed": 0}
+    now = timezone.now()
+    for conn in qs:
+        if not conn.external_account_id:
+            continue
+        summary["checked"] += 1
+        try:
+            media = InstagramMediaService.list_recent_media(
+                ig_user_id=conn.external_account_id,
+                access_token=conn.access_token,
+                limit=1,
+            )
+        except Exception as e:  # noqa: BLE001 - 계정별 best-effort
+            summary["failed"] += 1
+            logger.warning("refresh_latest_media 실패 ig=%s: %s", conn.external_account_id, e)
+            continue
+
+        fields = ["latest_media_checked_at"]
+        conn.latest_media_checked_at = now
+        if media:
+            latest = media[0]
+            conn.latest_media_id = str(latest.get("id") or "")
+            conn.latest_media_at = _parse_iso_timestamp(latest.get("timestamp"))
+            conn.latest_media_permalink = str(latest.get("permalink") or "")
+            fields += ["latest_media_id", "latest_media_at", "latest_media_permalink"]
+            summary["updated"] += 1
+        else:
+            summary["no_media"] += 1
+        conn.save(update_fields=fields)
+
+    logger.info("refresh_latest_media: %s", summary)
+    return summary
 
 
 @shared_task(name="integrations.backfill_campaign_media_permalink")

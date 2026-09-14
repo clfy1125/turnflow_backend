@@ -94,11 +94,22 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
 class UserSerializer(serializers.ModelSerializer):
     """Serializer for user profile"""
 
+    email_is_placeholder = serializers.BooleanField(
+        read_only=True,
+        help_text=(
+            "이메일이 **우리가 지어낸 자리표시**인가. Instagram Business Login 은 이메일을 "
+            "주지 않아 IG 가입자에게는 `ig_<id>@ig.invalid` 를 발급한다. true 면 이 사용자에게 "
+            "메일을 보낼 수 없으므로 프론트는 '알림 받을 이메일 등록' 을 유도할 것."
+        ),
+    )
+
     class Meta:
         model = User
         fields = [
             "id",
             "email",
+            "email_is_placeholder",
+            "pending_email",
             "full_name",
             "is_email_verified",
             "email_verified_at",
@@ -109,6 +120,8 @@ class UserSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = [
             "id",
+            "email_is_placeholder",
+            "pending_email",
             "is_email_verified",
             "email_verified_at",
             "date_joined",
@@ -210,3 +223,113 @@ class GoogleLoginSerializer(serializers.Serializer):
         default=False,
         help_text="선택 — 마케팅 수신 동의 (신규 가입 시에만 반영). 기본 False.",
     )
+
+
+class KakaoLoginSerializer(serializers.Serializer):
+    """카카오 로그인 요청.
+
+    두 경로 중 **하나만** 채워 보낸다:
+      · 웹 표준 경로 — ``code`` + ``redirect_uri`` (인가 코드를 서버가 교환)
+      · 네이티브 경로 — ``access_token`` (카카오 SDK 가 이미 토큰을 들고 있는 경우)
+
+    ``code`` 를 권장한다. 액세스 토큰이 브라우저를 거치지 않고, 클라이언트 시크릿이
+    서버에만 남기 때문이다.
+    """
+
+    code = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text="카카오 인가 코드. authorize 리다이렉트 쿼리스트링의 `code` 값.",
+    )
+    redirect_uri = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text=(
+            "authorize 요청에 사용한 redirect_uri 와 **완전히 동일한 값**. "
+            "code 를 보낼 때 필수 — 한 글자라도 다르면 카카오가 교환을 거절한다."
+        ),
+    )
+    access_token = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text="카카오 액세스 토큰(네이티브 SDK 경로). code 대신 보낸다.",
+    )
+    attribution = serializers.JSONField(
+        required=False,
+        help_text="선택 — 가입 유입 attribution 객체 (신규 가입 시에만 저장)",
+    )
+    marketing_opt_in = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="선택 — 마케팅 수신 동의 (신규 가입 시에만 반영). 기본 False.",
+    )
+
+    def validate(self, attrs):
+        code = (attrs.get("code") or "").strip()
+        access_token = (attrs.get("access_token") or "").strip()
+
+        if not code and not access_token:
+            raise serializers.ValidationError(
+                {"code": "code 또는 access_token 중 하나는 반드시 필요합니다."}
+            )
+        # 둘 다 오면 code 를 쓴다. 조용히 고르지 않고 거절하는 이유: 프론트가 두 경로를
+        # 섞어 보내고 있다는 뜻이라, 어느 쪽이 실제로 검증됐는지 아무도 모르게 된다.
+        if code and access_token:
+            raise serializers.ValidationError(
+                {"code": "code 와 access_token 은 동시에 보낼 수 없습니다."}
+            )
+        if code and not (attrs.get("redirect_uri") or "").strip():
+            raise serializers.ValidationError(
+                {"redirect_uri": "code 를 보낼 때는 redirect_uri 가 필수입니다."}
+            )
+
+        attrs["code"] = code
+        attrs["access_token"] = access_token
+        return attrs
+
+
+class KakaoAuthResponseSerializer(AuthResponseSerializer):
+    """카카오 로그인 응답 — 구글과 동일하게 가입/로그인이 같은 엔드포인트라 구분 플래그가 붙는다."""
+
+    is_new_user = serializers.BooleanField(
+        help_text=(
+            "이번 요청으로 계정이 새로 생성되었는가. "
+            "Meta 픽셀 CompleteRegistration 등 **가입 전환 이벤트는 반드시 이 값으로 분기**할 것."
+        )
+    )
+
+
+class InstagramLoginSerializer(serializers.Serializer):
+    """인스타그램 로그인/가입 요청 (인가 코드 교환).
+
+    ⚠️ ``redirect_uri`` 를 **받지 않는다**. ``GET /auth/instagram/start/`` 가 검증해
+    저장해 둔 값을 쓴다 — 클라이언트가 다시 보낸 값을 쓰면 authorize 때와 한 글자만
+    달라도 Meta 가 교환을 거절하는데, 그 실패는 원인을 찾기가 매우 어렵다.
+    (카카오는 프론트가 authorize 를 직접 만들어서 받을 수밖에 없지만, 인스타는 authorize
+     URL 도 우리가 만들어 주므로 서버가 양쪽 값을 모두 소유할 수 있다.)
+    """
+
+    code = serializers.CharField(
+        help_text="인스타그램 인가 코드. 콜백 쿼리스트링의 `code` 값 (1회용)."
+    )
+    state = serializers.CharField(
+        help_text="`GET /auth/instagram/start/` 에서 받은 state. **1회용·10분**."
+    )
+    attribution = serializers.JSONField(
+        required=False,
+        help_text="선택 — 가입 유입 attribution 객체 (신규 가입 시에만 저장)",
+    )
+    marketing_opt_in = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="선택 — 마케팅 수신 동의 (신규 가입 시에만 반영). 기본 False.",
+    )
+
+    def validate(self, attrs):
+        attrs["code"] = (attrs.get("code") or "").strip()
+        attrs["state"] = (attrs.get("state") or "").strip()
+        if not attrs["code"]:
+            raise serializers.ValidationError({"code": "code 는 필수입니다."})
+        if not attrs["state"]:
+            raise serializers.ValidationError({"state": "state 는 필수입니다."})
+        return attrs

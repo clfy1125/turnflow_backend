@@ -9,6 +9,8 @@ admins know what variables are safe to use.
 from __future__ import annotations
 
 TEMPLATE_EMAIL_VERIFICATION = "email_verification"
+# 인스타 로그인 사용자의 이메일 등록 인증 — **새 주소로** 보낸다(기존 주소는 자리표시라 못 보낸다)
+TEMPLATE_EMAIL_CHANGE = "email_change_verify"
 TEMPLATE_PASSWORD_RESET = "password_reset"
 TEMPLATE_WELCOME = "welcome"
 TEMPLATE_ONBOARDING_DAY_3 = "onboarding_day_3"
@@ -19,6 +21,12 @@ TEMPLATE_PAYMENT_FAILED = "payment_failed"
 TEMPLATE_PAUSE_RESUME_REMINDER = "pause_resume_reminder"
 TEMPLATE_WINBACK = "winback"
 TEMPLATE_INSTA_REPORT_READY = "insta_report_ready"
+
+# 서비스 중단 안내 (홈 알림의 이메일 판 — 배너를 못 본 채 24시간 이상 콘솔에 안 들어온 경우에만).
+# 거래성 정보(장애 고지)라 광고 수신동의가 필요 없다. ⚠️ 할인·프로모션 문구를 넣으면 광고성이
+# 되어 동의가 필요해진다 — 넣지 말 것.
+TEMPLATE_IG_CONNECTION_LOST = "ig_connection_lost"
+TEMPLATE_DM_QUOTA_REACHED = "dm_quota_reached"
 # 유료전환 2차 동의 (전자상거래법 §13⑥) — 알림용. 동의는 앱 화면에서 받는다.
 TEMPLATE_CONVERSION_CONSENT = "conversion_consent"
 TEMPLATE_CONSENT_MISSING_DOWNGRADE = "consent_missing_downgrade"
@@ -30,6 +38,7 @@ TEMPLATE_ACCOUNT_DELETION_CONFIRMED = "account_deletion_confirmed"
 
 TEMPLATE_KEYS = [
     TEMPLATE_EMAIL_VERIFICATION,
+    TEMPLATE_EMAIL_CHANGE,
     TEMPLATE_PASSWORD_RESET,
     TEMPLATE_WELCOME,
     TEMPLATE_ONBOARDING_DAY_3,
@@ -57,6 +66,14 @@ AVAILABLE_VARIABLES: dict[str, dict[str, str]] = {
         "verification_code": "6자리 숫자 인증 코드",
         "verification_url": "클릭 시 이메일을 인증하는 프론트엔드 URL",
         "expires_minutes": "코드/링크 유효 시간(분)",
+        "service_name": "서비스명 (기본: TurnFlow)",
+        "support_email": "고객센터 이메일",
+    },
+    TEMPLATE_EMAIL_CHANGE: {
+        "full_name": "수신자 이름",
+        "email": "등록하려는 **새** 이메일 주소 (수신 주소와 같다)",
+        "verification_code": "6자리 숫자 인증 코드",
+        "expires_minutes": "코드 유효 시간(분)",
         "service_name": "서비스명 (기본: TurnFlow)",
         "support_email": "고객센터 이메일",
     },

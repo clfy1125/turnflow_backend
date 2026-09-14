@@ -116,19 +116,60 @@ Instagram Business 계정의 댓글 수집/분류, 자동 DM 발송, 키워드 �
 turnflow_backend/
 ├── apps/                       # Django 앱
 │   ├── core/                   # 미들웨어(RequestID, Logging), 커스텀 예외, healthz
-│   ├── authentication/         # User(email 로그인) + JWT + Google OAuth
+│   ├── authentication/         # User(email 로그인) + JWT + Google OAuth + 카카오 로그인
+│   │                           #   kakao.py = 카카오 REST API 클라이언트(인가코드 교환·프로필),
+│   │                           #   kakao_views.py = 로그인 뷰. ⚠️ authorize·토큰교환의 client_id 는
+│   │                           #   **REST API 키로 통일**(JS 키엔 client_secret 이 없어 교환이 깨진다).
+│   │                           #   계정 매칭은 User.kakao_id 우선 → email 폴백(카카오 이메일은 가변)
+│   │                           #   instagram.py/instagram_views.py = **인스타 로그인/가입**
+│   │                           #   (가입+워크스페이스+IG연동을 인증 1회로). ⚠️ 기본 OFF
+│   │                           #   (INSTAGRAM_LOGIN_ENABLED) · IG 는 **이메일을 주지 않아**
+│   │                           #   자리표시 `ig_<id>@ig.invalid` 발급 → emails sender 가 발송 차단,
+│   │                           #   프론트는 user.email_is_placeholder 로 이메일 등록 유도.
+│   │                           #   ⭐ 매칭은 **instagram_user_id 하나뿐**(2026-09-13 정책):
+│   │                           #   "인스타로 가입한 계정만 인스타로 로그인된다". 그 IG 가 다른
+│   │                           #   계정에 연동 중이면 **409 INSTAGRAM_ALREADY_CONNECTED_ELSEWHERE**.
+│   │                           #   ⚠️ 종전엔 '그 IG 를 연동해 둔 ws.owner 로 로그인' 이었는데,
+│   │                           #   IG 를 공유하는 대행사·직원이 버튼 한 번으로 주인 계정(결제·구독
+│   │                           #   해지 포함)에 들어갔다. 되살리지 말 것. '새 계정 생성' 으로도
+│   │                           #   두지 말 것(IG 가 점유돼 있어 아무것도 못 하는 빈 계정만 남는다).
+│   │                           #   instagram_user_id 는 **가입 때 한 번만** 박는다 — 로그인 때
+│   │                           #   박으면 연동 해제 뒤에도 옛 구글 계정으로 계속 로그인된다(실제 버그)
+│   │                           #   (username 으로 찾으면 안 됨 — 핸들은 남이 이어받을 수 있다)
+│   │                           #   popup_state_views.py = 성장 팝업 노출 상태(User.popup_state JSON,
+│   │                           #   기기 간 동기화). 병합은 **최상위 키 단위**(깊은 병합 아님)
 │   ├── workspace/              # Workspace(테넌트) + Membership + permissions
 │   ├── billing/                # 요금제/구독/토스 빌링 (toss_service, toss_flows, toss_views, dm_limits) + Celery 갱신 배치
 │   │                           #   consent.py = 결제 전 고지·유료전환 2차 동의 **판정 단일 소스**
 │   │                           #   (프론트 플래그·D-14/D-3 메일·과금 차단 게이트가 공유) + consent_views.py
+│   │                           #   auto_trial.py = **카드 없는 프로 30일 자동 지급 판정·실행 단일 소스**
+│   │                           #   (+ auto_trial_views.py). status/plan/trial_used_at 을 카드 체험과
+│   │                           #   **똑같이** 쓴다 — 새 상태값을 만들면 체험을 보는 30곳을 다 고쳐야 하고
+│   │                           #   한 곳만 빠져도 카드 없는 체험자만 조용히 프로 기능을 못 쓴다.
+│   │                           #   만료는 손댈 필요 없음: 빌링키가 없어 handle_trial_expiry 가
+│   │                           #   과금 없이 무료로 내린다(process_due_renewals 는 빌링키 보유만 과금)
 │   ├── integrations/           # Instagram OAuth/토큰 암호화(encryption.py)/Webhook
 │   ├── pages/                  # 페이지/게시물/DM 관련 뷰 (multi_views, image_views, stats, aiviews)
 │   ├── ai_jobs/                # LLM 작업 큐 + services(llm_client, model_router, prompt_builder)
 │   ├── analytics/              # 랜딩 방문 추적(LandingVisit) + 가입 어트리뷰션(SignupAttribution) — POST /api/v1/track/visit/ (공개·silent 204), 채널 파생 단일 소스 channels.derive_channel()
+│   │                           #   FunnelEvent = 전환 퍼널 텔레메트리(POST /track/funnel-event/,
+│   │                           #   인증 선택·silent 204·보존 180일). ⚠️ **이벤트 이름 화이트리스트를
+│   │                           #   두지 말 것** — 정본은 프론트고, 서버가 목록을 들면 이벤트 추가마다
+│   │                           #   백엔드 배포를 기다리는 동안 이벤트가 유실된다. CheckoutEvent(닫힌
+│   │                           #   어휘·대시보드가 의존)와 **같은 테이블에 섞지 말 것**
 │   ├── insta_reports/          # 인스타 성장 리포트(프로 전용·IG 계정당 월1회) — 공개 데이터로 HTML 리포트 생성.
 │   │                           #   pipeline/(랩 이식: 수집→지표→샘플→Gemini 피처→집계→DeepSeek 합성→검증→렌더) +
 │   │                           #   quota.py + progress.py. 산출물=자기완결 HTML. 마운트: /api/v1/insta-reports/
 │   │                           #   auth/ = 어드민 2단계 로그인(TOTP) — 일반 로그인과 **분리된 관문**.
+│   ├── home/                   # 홈 화면 알림 — GET /api/v1/home/alerts/ (현재 상태 계산, 이벤트 테이블 없음).
+│   │                           #   alerts.py = **판정 단일 소스**. ⚠️ Graph 호출 0 이 계약이다
+│   │                           #   (홈은 전 사용자 첫 화면 — 여기서 Graph 를 부르면 앱 쿼터를 태워
+│   │                           #   다른 워크스페이스의 댓글 수집·DM 발송이 굶는다). Graph 가 필요한
+│   │                           #   사실은 주기잡이 미리 DB 에 적는다(integrations.refresh_latest_media
+│   │                           #   = 최신 게시물, resubscribe_all_webhooks = webhook_healthy).
+│   │                           #   닫기는 HomeAlertDismissal(대상 키 단위 — 대상이 바뀌면 다시 뜬다).
+│   │                           #   tasks.py = 이메일 판(24h 미접속 게이트) — **기본 dormant**
+│   │                           #   (HOME_ALERT_EMAILS_ENABLED=False + core 0019 enabled=False 이중 잠금)
 │   └── admin_api/              # 백오피스(어드민) 전용 API — 신원/대시보드(overview + 운영/마케팅: dashboard_ops·dashboard_marketing, 임계값=dashboard_constants.py)/회원/워크스페이스/페이지/자동DM 모니터링/레퍼럴 코드/마케팅 채널링크(marketing/channel-links — UTM 링크 서버 저장 CRUD, MarketingChannelLink·url/channel 서버 계산) (serializers/, views/ 패키지 + AdminActionLog 감사로그). 마운트: /api/v1/admin/
 │                               #   snapshot_rosters.py = 전체 현황 타일의 **모수 쿼리 단일 소스** —
 │                               #   대시보드 타일(_snapshot/_trial_now)과 명단(views/snapshot.py)이 공유해야
@@ -216,6 +257,8 @@ make init           # 빌드 + 실행 + 마이그레이션 한 번에
 - 토스페이먼츠: `TOSS_SECRET_KEY`, `TOSS_CLIENT_KEY`, `TOSS_API_BASE`, `TOSS_DEV_CARD_AUTH_ENABLED`(dev 전용 카드입력 헬퍼 — 운영 반드시 False)
 - 인스타 리포트: `APIFY_API_KEY`(공개 조회수 수집 — 인사이트 권한 미승인 대체), `GEMINI_API_KEY`(영상 피처),
   `DEEPSEEK_API_KEY`(문장 합성), `INSTA_REPORT_FAKE_MODE`(dev 전용 오프라인 모드 — 운영 반드시 False)
+- 카카오 로그인: `KAKAO_REST_API_KEY`, `KAKAO_CLIENT_SECRET`(콘솔에서 활성화 ON → 교환 시 필수),
+  `KAKAO_APP_ID`(네이티브가 보낸 액세스 토큰의 app_id 검증 = 구글 aud 대응. 비면 그 경로 fail-closed)
 - 기타: `PIXABAY_API_KEY`, `GOOGLE_CLIENT_ID`
 
 ---
@@ -252,6 +295,8 @@ make init           # 빌드 + 실행 + 마이그레이션 한 번에
 - `integrations/` → IG 연동
 - `pages/` → 페이지/게시물/DM
 - `ai/` → LLM 작업
+- `home/` → 홈 화면 알림 (alerts / alerts/dismiss)
+- `track/` → 방문·결제진입·취소·**퍼널 이벤트** 비콘 (analytics)
 - `insta-reports/` → 인스타 성장 리포트 (integrations 라우터가 `instagram` 을 ViewSet prefix 로
   쓰고 있어 `integrations/instagram/reports/` 는 pk="reports" 로 먹힌다 → 별도 prefix)
 
@@ -345,6 +390,7 @@ make test-cov                             # HTML 커버리지 리포트
   - `billing.notify_pause_resume_reminder` — 매일 09:30 KST (정지 재개 3일 전 사전 고지 메일)
   - `billing.notify_conversion_consent` — 매일 10:30 KST (유료전환 2차 동의 D-14/D-3 메일. **2026-08-10 제품 결정으로 dormant** — `CONVERSION_SECOND_CONSENT_ENABLED=False` 기본이라 즉시 no-op. core 0014 시드)
   - `billing.send_winback_emails` — 매일 10:00 KST (해지 후 복귀 유도, `WINBACK_ENABLED` 게이트·기본 dormant)
+  - `analytics.cleanup_funnel_events` — 매일 03:40 KST (보존 180일 초과 퍼널 이벤트 삭제)
   - `insta_reports.sweep_stale` — 30분 (running 에 박힌 리포트 잡 실패 확정 — 동시생성 1건 제한 해제)
   - `insta_reports.purge_caches` — 매일 04:40 KST (90일 경과 AI 캐시 정리, 리포트 파일·집계는 보관)
   - `billing.snapshot_daily_metrics` — 매일 00:20 KST (일별 구독 상태/MRR/결제 코호트 스냅샷 적재 — 어드민 유지·해지 분석 P-4, 멱등 upsert, core 0010 시드)
@@ -448,8 +494,11 @@ make test-cov                             # HTML 커버리지 리포트
 - `docs/frontend/CANCEL_RETENTION_FRONTEND.md` — 구독 해지 리텐션 플로우 백엔드 구현 응답. ①일시정지 `POST /billing/pause/`(months 1/2/3, 잔여기간 후 무과금 정지·자동재개+3일전 고지, 재개=기존 resume 재사용, status "paused"·pause_ends_at·paused_months·can_pause) ②리텐션할인 `POST /billing/retention-offer/apply/`(다음1회 50%, 1인1회·active유료, next_charge_amount 응답) ③트래킹 offer_shown/accepted/declined + offer 필드 ④윈백메일(WINBACK_ENABLED 게이트·dormant, marketing_opt_in 동의). 정책: 데이터 무기한 보존·정지 연1회·할인 1인1회. 마이그 billing0019/analytics0004/auth0004/core0009. **윈백은 2026-07-23 제품결정으로 계속 dormant 유지**(인앱 즉시 50% 할인으로 대체)
 - `docs/frontend/MARKETING_OPT_IN_FRONTEND.md` — 마케팅 수신동의(`marketing_opt_in`) 연결 응답(2026-07-23, 마이그 없음·필드는 auth0004 기존). register/GET·PATCH me/google 3경로 연결, 수신거부=`PATCH /auth/me/ {marketing_opt_in:false}` 단일 소스(별도 토큰 엔드포인트 없음), PATCH me 응답이 프로필 전체로 확장. 리텐션 확인 4건 답변(next_billing.amount=renewal_amount 할인반영·paused change-plan/extra-accounts 400·오퍼코드 신규발급·정지 게이팅 get_effective_plan 일치). "취소 시 쿠폰 메일"은 원래 없음
 - `docs/frontend/PASSWORD_RESET_GUIDE.md` — 비밀번호 재설정 플로우 프론트 가이드
+- `docs/frontend/KAKAO_LOGIN_FRONTEND.md` — **카카오 로그인**(2026-09-10, 마이그 auth0006·analytics0007). `POST /api/v1/auth/kakao/` = 인가코드(권장) 또는 액세스 토큰(네이티브) → 우리 JWT. 응답 형태·탈퇴 409·`is_new_user`·attribution·CAPI 발사 조건까지 `GoogleLoginView` 와 **의도적으로 동일**(다르면 프론트가 분기를 두 벌 든다). ⚠️ **JS SDK 경로 금지** — `Kakao.Auth.authorize()` 는 client_id 로 JS 키를 쓰는데 JS 키엔 클라이언트 시크릿이 없어 서버 토큰교환이 실패한다. **계정 매칭은 `User.kakao_id` 우선, email 폴백** — 카카오는 전화번호가 주 식별자라 이메일이 바뀌면 email 매칭만으로는 계정이 갈라진다(워크스페이스·구독 단절). 미확인 이메일(`is_email_verified=false`)로 **기존 계정 연결은 403 차단**(신규 가입은 허용) = 구글과 같은 탈취 방어. 콘솔 동의항목은 닉네임·이메일 **필수 동의**(비즈 앱이라 가능) + '값 없으면 카카오계정에서 수집'. 오류는 `detail`/`code` + §6 envelope **동시 송출**(`_error()` 헬퍼 — DRF 핸들러를 우회하는 응답이라 안 하면 한 URL 이 두 포맷을 낸다). **미구현**: 연결 해제 웹훅(카카오 콘솔이 개인정보 처리 누락 경고 중) · 네이티브 Redirect URI · OIDC(OFF, 불필요)
 - `docs/frontend/DISCONNECT_OTHER_DM_TOOLS_GUIDE.md` — 다른 DM 자동화 툴(매니챗 등) 연결 해제 안내 (댓글 fan-out·Private Reply 1회 충돌 / IG Login이라 Facebook 라우팅 불필요)
 - `docs/frontend/CONNECT_CONFLICT_WARNING_FRONTEND.md` — 다른 DM 툴 충돌 경고 배너 프론트 스펙 (연결 직후 + 대시보드 상단, 닫기 규칙)
+- `docs/frontend/URGENT_CONVERSION_BACKEND_RESPONSE.md` — **긴급 전환 개선 회신서**(2026-09-12, 마이그 billing0026·auth0007/0008·analytics0008/0009). 2026-09-10 마케팅 병목 진단(방문 5,679 → 가입 525(9.2%) → **프로 체험 26(5.0%)**)의 후속 8건. ①**카드 없는 프로 30일** `POST /billing/trial/auto-grant/` — 대상은 **체험 미사용 전원**(광고 귀속 판정·가입 창 둘 다 **기본 OFF**: 인앱 브라우저에서 UTM 이 유실돼 억울한 미지급이 나고, 팝업의 실제 타깃이 '가입했지만 체험 안 한 499명'이라 창을 좁히면 팝업이 죽는다). 지급/미지급 **둘 다 200**(에러 아님)·멱등(락 안 재검사 — 안 하면 30일이 두 번 들어간다). 판정 단일 소스 `billing/auto_trial.py` ②`UserSubscription.trial_last_day`(KST 마지막 이용일) — 프론트 `trial_ends_at−1일` 역산 제거(UTC 자정 근처에서 하루 틀어지는데 그게 곧 고지 문구다), preview 와 **같은 계산** ③`POST /track/funnel-event/` ④`GET/PATCH /auth/me/popup-state/`(⚠️ 프론트 요청 경로는 `users/me/...` 였으나 이 저장소의 '나'는 전부 `auth/me/` 아래) ⑤CAPI StartTrial `custom_data.trial_kind`(card/auto — 없으면 Meta 에서 둘이 뭉쳐 카드 없는 체험이 전환율을 희석) ⑥**인스타 로그인 3종**(§7) ⑦register 응답 `is_new_user`. **⚠️ 자동 지급이 켜지면 제휴코드가 `scenario=trial` 에 영영 도달 못 해 44일 쿠폰이 통째로 죽는다** → `attach_only` + 쿠폰 = **기간 연장** 허용(`toss_flows.extend_trial_with_referral`) + `referral/redeem` 을 **연장 전용으로 부활**(시작은 여전히 금지 — base 30일 누락 결함의 재발 방어)
+- `docs/frontend/HOME_V2_ALERTS_FRONTEND.md` — **홈 화면 알림**(2026-09-10, 마이그 home0001·integrations0055·core0018/0019). `GET /api/v1/home/alerts/` = 「지금 이 상태인가」 계산(이벤트 테이블 0, 30초 캐시, **Graph 호출 0**) + `POST .../dismiss/`(프론트 N4 대체 — 닫음을 서버 저장, 대상 키 단위라 새 게시물은 다시 뜬다). 등급 3종(critical 닫기불가 / warning / todo 닫기가능), `rank` 는 **서버가 정한다**(돈 새는 순 → 손쓸 수 있는 순 — 웹·앱이 갈리지 않게). ⚠️ 시안 ④「자동 DM N개가 멈춰 있어요」는 **뺐다** — 서버의 '조치 필요'는 캠페인이 아니라 개별 발송 미확인 건수라 잘 도는 캠페인에 '멈춤'이 붙는다. 안 만들기로 한 것 8종(체험 D-3·토큰 만료 예고·축소 예약·대기열 적체 등)은 §10 에 이유와 함께 박제 — **되살리기 전에 그 이유부터 볼 것**. 판정 단일화 2건: `subscription_utils.ig_activation_state`(강제 모달 ↔ 계정 선택 화면) · `dm_limits.quota_skipped_logs`(막힌 건수 ↔ 되살림 대상). dev 계정 4종 = `seed_home_alerts_dev`
 - `docs/frontend/DM_CAMPAIGN_MIGRATION_FRONTEND.md` — DM 캠페인 이전(매니챗 등→TurnFlow) 프론트 가이드. 연동 IG 계정의 최근 게시물·댓글·발신 DM(Conversations API) 분석→기존 DM 캠페인 추론→**비활성(INACTIVE) 초안 후보** 생성→검수·apply→활성화. `POST/GET /integrations/dm-migration/jobs/`(시작·폴링 3s·취소, 비종결1개 + **7일 캐시 재사용** + force쿨다운 **6h**·429 — 거부는 force 일 때만), `.../jobs/{id}/candidates/`(band=auto_draft/needs_review/template_only/excluded), `.../candidates/{id}/apply|dismiss/`(apply=AutoDMCampaignCreateSerializer 재사용·status=INACTIVE·활성 중복은 활성화 시점 발동). 전 플랜·v1 토큰차감 없음. 파이프라인=`apps/integrations/dm_migration/`(collect·analyze·llm·pipeline), 태스크 `integrations.run_dm_migration_job`(ai_jobs 큐, 체크포인트 재개·rate-pause)·`integrations.purge_dm_migration_raw`(원본 7일 파기+스테일 스위퍼, core 0008 시드). 자기발송 제외(SentDMLog mid/지문), Mock 픽스처+`DM_MIGRATION_FAKE_LLM`로 오프라인 e2e
 - `docs/frontend/INSTA_REPORT_FRONTEND.md` — 인스타 성장 리포트 프론트 연동 가이드(프로 전용·계정당 월1회·평균 15분·3초 폴링·10단계
   진행률 보간·HTML 인증 다운로드·완료 메일). 파이프라인 원본 실험은 `../insta_report_lab/PLAN.md`

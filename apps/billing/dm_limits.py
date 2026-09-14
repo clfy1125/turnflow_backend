@@ -92,6 +92,64 @@ def _quota_hit_cache_key(owner_id, now=None) -> str:
     return f"dmquota:hit:{owner_id}:{local:%Y%m}"
 
 
+# ── 한도로 막힌 건 ──────────────────────────────────────────────────────────
+# 한도 초과로 종결된 로그에 찍히는 사유. **문자열을 복제하지 말 것** — 되살림
+# (billing.revive_quota_skipped_dms)과 홈 알림의 "몇 건이 막혔나"가 같은 근거를 봐야 한다.
+QUOTA_SKIP_REASON = "monthly_dm_limit_reached"
+# 되살림 창의 최댓값(댓글 답장 7일). 이 밖은 revive() 가 어차피 거른다.
+QUOTA_REVIVE_WINDOW_DAYS = 7
+
+
+def quota_skipped_logs(owner, *, within_days: int | None = None):
+    """월 한도로 발송되지 못한 로그 queryset (owner 스코프).
+
+    Args:
+        within_days: 지정하면 그 기간 내 생성분만. ``QUOTA_REVIVE_WINDOW_DAYS`` 를 주면
+            "지금 결제하면 되살릴 수 있는" 모수가 된다.
+    """
+    from datetime import timedelta
+
+    from apps.integrations.models import SentDMLog
+
+    qs = SentDMLog.objects.filter(
+        campaign__ig_connection__workspace__owner=owner,
+        status=SentDMLog.Status.SKIPPED,
+        error_message=QUOTA_SKIP_REASON,
+    )
+    if within_days is not None:
+        qs = qs.filter(created_at__gte=timezone.now() - timedelta(days=within_days))
+    return qs
+
+
+def count_quota_skipped_dms(owner) -> int:
+    """이번 달 한도 때문에 **지금 발송되지 못하고 있는** 건수 (사람 단위 아님, 요청 단위).
+
+    홈 알림이 "지금 N건의 댓글에 DM 이 나가지 못하고 있어요"를 말하기 위한 숫자.
+    """
+    from apps.integrations.campaign_stats import _month_bounds
+
+    period_start, _ = _month_bounds()
+    try:
+        return quota_skipped_logs(owner).filter(created_at__gte=period_start).count()
+    except Exception:  # noqa: BLE001 - 표시용 숫자가 알림 전체를 죽이지 않게
+        logger.exception("count_quota_skipped_dms 실패 owner=%s", getattr(owner, "id", None))
+        return 0
+
+
+def count_revivable_quota_skipped_dms(owner) -> int:
+    """플랜을 올리면 **바로 다시 나갈 수 있는** 건수 (되살림 창 안).
+
+    "결제만 하면 바로 나갑니다"를 약속할 수 있는 범위. 창을 넘긴 건은 못 살리므로 제외한다.
+    """
+    try:
+        return quota_skipped_logs(owner, within_days=QUOTA_REVIVE_WINDOW_DAYS).count()
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "count_revivable_quota_skipped_dms 실패 owner=%s", getattr(owner, "id", None)
+        )
+        return 0
+
+
 def check_dm_quota(owner) -> tuple[bool, int, int]:
     """DM 발송 가능 여부. Returns (allowed, used, limit).
 

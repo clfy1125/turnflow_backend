@@ -18,6 +18,10 @@ from .deletion_views import (
     AccountDeletionRestoreView,
     AccountDeletionVerifyView,
 )
+from .email_views import EmailRegisterVerifyView, EmailRegisterView
+from .instagram_views import InstagramLoginStartView, InstagramLoginView
+from .kakao_views import KakaoLoginView
+from .popup_state_views import PopupStateView
 from .views import (
     AccountDeleteView,
     GoogleLoginView,
@@ -33,7 +37,18 @@ urlpatterns = [
     path("register/", RegisterView.as_view(), name="register"),
     path("login/", LoginView.as_view(), name="login"),
     path("google/", GoogleLoginView.as_view(), name="google-login"),
+    path("kakao/", KakaoLoginView.as_view(), name="kakao-login"),
+    # 인스타그램 로그인/가입 — 가입 + 워크스페이스 + IG 연동이 한 번에 끝난다.
+    # ⚠️ 기본 비활성(INSTAGRAM_LOGIN_ENABLED=False) — 켜기 전에 테스트 URL 에서 검증할 것.
+    path("instagram/start/", InstagramLoginStartView.as_view(), name="instagram-login-start"),
+    path("instagram/", InstagramLoginView.as_view(), name="instagram-login"),
     path("me/", MeView.as_view(), name="me"),
+    # 성장 팝업 노출 상태 (기기 간 동기화 — 프론트 요청 경로는 users/me/... 였으나
+    # 이 저장소의 "나" 리소스는 전부 auth/me/ 아래라 규칙을 맞췄다)
+    path("me/popup-state/", PopupStateView.as_view(), name="me-popup-state"),
+    # 이메일 등록·인증 (인스타 로그인 사용자 — 자리표시 이메일 계정 전용)
+    path("me/email/", EmailRegisterView.as_view(), name="me-email-register"),
+    path("me/email/verify/", EmailRegisterVerifyView.as_view(), name="me-email-verify"),
     path("me/delete/", AccountDeleteView.as_view(), name="account-delete"),
     path("token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
     # Email verification + password reset (implemented in apps.emails)

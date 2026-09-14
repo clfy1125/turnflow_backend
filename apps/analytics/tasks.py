@@ -3,6 +3,7 @@ analytics Celery tasks — 랜딩 방문 데이터 유지보수.
 
 스케줄(config/settings/base.py CELERY_BEAT_SCHEDULE):
 1. cleanup_landing_visits — 매일 KST 03:30, 보존기간(기본 180일) 초과 LandingVisit 배치 삭제.
+2. cleanup_funnel_events  — 매일 KST 03:40, 보존기간(기본 180일) 초과 FunnelEvent 배치 삭제.
 
 SignupAttribution 은 TTL 없음 (사용자당 1행 업무 기록, user 삭제 시 CASCADE).
 """
@@ -51,6 +52,37 @@ def cleanup_landing_visits() -> dict:
     return summary
 
 
+@shared_task(name="analytics.cleanup_funnel_events")
+def cleanup_funnel_events() -> dict:
+    """FUNNEL_EVENT_RETENTION_DAYS(기본 180일) 초과 FunnelEvent 배치 삭제.
+
+    LandingVisit 청소와 **같은 청크 커서 방식** — 캠페인 한 번에 수십만 행이 쌓일 수
+    있어 단일 DELETE 로 지우면 락/WAL 이 폭증한다.
+
+    반환: {"retention_days", "deleted"}
+    """
+    from .models import FunnelEvent
+
+    retention_days = settings.FUNNEL_EVENT_RETENTION_DAYS
+    cutoff = timezone.now() - timedelta(days=retention_days)
+
+    total_deleted = 0
+    while True:
+        pks = list(
+            FunnelEvent.objects.filter(created_at__lt=cutoff).values_list("pk", flat=True)[
+                :_CHUNK_SIZE
+            ]
+        )
+        if not pks:
+            break
+        deleted, _ = FunnelEvent.objects.filter(pk__in=pks).delete()
+        total_deleted += deleted
+
+    summary = {"retention_days": retention_days, "deleted": total_deleted}
+    logger.info("cleanup_funnel_events: %s", summary)
+    return summary
+
+
 # ──────────────────────────────────────────────────────────────
 # Meta 전환 API(CAPI) — 서버발 전환 이벤트
 # ──────────────────────────────────────────────────────────────
@@ -88,6 +120,7 @@ def send_meta_capi_event(
     event_source_url: str = "",
     value: int | None = None,
     currency: str = "KRW",
+    custom_props: dict | None = None,
 ) -> dict:
     """전환 이벤트 1건을 Meta 로 전송한다.
 
@@ -117,6 +150,10 @@ def send_meta_capi_event(
     custom_data = None
     if value is not None:
         custom_data = {"currency": currency, "value": str(value)}
+    if custom_props:
+        # 광고 대행사가 경로를 나눠 보기 위한 추가 속성 (예: trial_kind=card|auto).
+        # Meta 는 custom_data 안의 임의 키를 그대로 받아 준다. value/currency 는 덮지 않는다.
+        custom_data = {**(custom_data or {}), **{k: v for k, v in custom_props.items() if v}}
 
     try:
         event = meta_capi.build_event(
