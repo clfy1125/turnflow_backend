@@ -718,6 +718,16 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": 60 * 30,  # 30분
         "options": {"queue": "billing"},
     },
+    # ===== 외부 LLM 잔액 감시 =====
+    # DeepSeek 계정 잔액이 0 이 되면 AI 페이지 생성(bio_remake)이 402 로 전멸하고, 인스타
+    # 리포트는 실패하지 않고 "AI 문장 없는 템플릿 판"으로 배달된다(조용한 품질 저하).
+    # 2026-09-11 에 실제로 그렇게 3일간 아무도 몰랐다 → 임계 이하면 Telegram.
+    # ⚠️ 실구동은 core.ScheduledJob(0021 시드). 이 항목만으론 prod 에서 돌지 않는다.
+    "check-deepseek-balance": {
+        "task": "apps.core.tasks.check_deepseek_balance",
+        "schedule": 60 * 60 * 3,  # 3시간
+        "options": {"queue": "billing"},
+    },
     # ===== IG Long-lived Token 자동 갱신 =====
     # 6시간마다 — 만료까지 14일 미만 ACTIVE 연동의 token refresh + (후보 있을 때만) Telegram 요약.
     # v3.10: daily 09:00 → 6h 주기로 강화 (한 번 실패한 연동을 하루 방치하지 않도록).
@@ -1292,6 +1302,17 @@ INSTA_REPORT_DEEPSEEK_BASE = config("DEEPSEEK_BASE", default="https://api.deepse
 # deepseek-v4-pro(추론 모델)가 기본. flash 로 내리면 ~7분으로 빨라지지만 한자 혼입·용어
 # 뒤섞임이 재발한다(랩 실측) — 품질 회귀를 감수할 때만 내릴 것.
 INSTA_REPORT_SYNTH_MODEL = config("INSTA_REPORT_SYNTH_MODEL", default="deepseek-v4-pro")
+
+# ── DeepSeek 계정 잔액 감시 (apps.core.tasks.check_deepseek_balance) ──
+# 리포트 합성(위)과 AI 페이지 생성(litellm 경유)이 **같은 DeepSeek 계정**을 쓴다 — 키는
+# 둘로 나뉘어 있어도 잔액은 하나다. 그래서 이 감시 하나가 두 기능을 같이 지킨다.
+# ⚠️ 나중에 계정을 분리하면 이 감시는 backend 키 쪽만 본다(그때 litellm 키도 같이 봐야 한다).
+DEEPSEEK_API_KEY = config("DEEPSEEK_API_KEY", default="")
+# 경고 임계. 실측 소진은 리포트 1건 ≈ $0.14 + 페이지 생성분 → $10 이면 대략 1~2주 여유.
+DEEPSEEK_BALANCE_WARN_USD = config("DEEPSEEK_BALANCE_WARN_USD", default=10.0, cast=float)
+DEEPSEEK_BALANCE_CRIT_USD = config("DEEPSEEK_BALANCE_CRIT_USD", default=3.0, cast=float)
+# 같은 등급이 이어질 때 재알림 간격(시간). 낮추면 충전 전까지 매 주기 울려 경보 피로가 온다.
+DEEPSEEK_BALANCE_REPEAT_HOURS = config("DEEPSEEK_BALANCE_REPEAT_HOURS", default=24, cast=int)
 INSTA_REPORT_EXTRACT_CONCURRENCY = config("INSTA_REPORT_EXTRACT_CONCURRENCY", default=6, cast=int)
 # 개발/테스트용 오프라인 모드 — 외부 호출 0으로 합성 데이터로 전 구간 통과(프론트 통합용).
 # ⚠️ prod 에서 True 면 가짜 리포트가 발급된다. 절대 켜지 말 것.
