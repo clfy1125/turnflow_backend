@@ -553,13 +553,18 @@ class UserSubscription(models.Model):
     def has_billing_key(self) -> bool:
         return bool(self._encrypted_toss_billing_key)
 
-    @property
-    def renewal_amount(self) -> int:
+    def renewal_amount_for(self, extra_ig_accounts: int | None = None) -> int:
         """다음 갱신 청구액. 예약 플랜 > 스냅샷 > 현재 플랜가 순 + 추가 계정 가산.
 
         추가 계정 '축소'가 예약돼 있으면(pending_extra_ig_accounts) 그 값 기준으로 미리 반영.
         단, 다음 주기의 플랜이 pro 가 아니면 추가 계정 개념이 없으므로 가산하지 않는다.
         리텐션 할인이 대기 중이면 다음 1회에 한해 할인 적용(표시·청구 동일 규칙).
+
+        ``extra_ig_accounts`` 를 주면 저장값 대신 **그 개수로** 계산한다 — "지금 N개를
+        고르면 얼마인가" 를 묻는 **견적**(preview)용이다.
+        ⚠️ 견적이 이 규칙을 따로 구현하면(정가 + N×단가) 스냅샷 그랜드파더링·리텐션 할인·
+           축소 예약이 빠져 **고지 금액과 실청구가 갈린다.** 고지 금액은 그대로 동의 기록
+           (PaymentConsent.disclosed_amount)이 되므로 갈리는 순간 허위 고지가 된다.
         """
         base = (
             self.pending_amount_snapshot if self.pending_plan_id else self.monthly_amount_snapshot
@@ -571,13 +576,21 @@ class UserSubscription(models.Model):
         if next_plan and next_plan.name != "pro":
             amount = base
         else:
-            extra = (
-                self.pending_extra_ig_accounts
-                if self.pending_extra_ig_accounts is not None
-                else self.extra_ig_accounts
-            )
+            if extra_ig_accounts is not None:
+                extra = extra_ig_accounts
+            else:
+                extra = (
+                    self.pending_extra_ig_accounts
+                    if self.pending_extra_ig_accounts is not None
+                    else self.extra_ig_accounts
+                )
             amount = base + EXTRA_IG_ACCOUNT_PRICE * extra
         return apply_retention_discount(amount, pending=self.retention_discount_pending)
+
+    @property
+    def renewal_amount(self) -> int:
+        """저장된 추가 계정 수 기준 다음 갱신 청구액 (renewal_amount_for 의 기본형)."""
+        return self.renewal_amount_for()
 
     @property
     def can_pause(self) -> bool:

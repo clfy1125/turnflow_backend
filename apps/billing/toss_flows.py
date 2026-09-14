@@ -652,8 +652,12 @@ def preview_subscription(
             trial_ends = trial_ends + timedelta(days=bonus_days)
             trial_days = (trial_days or 0) + bonus_days
         first_charge_at = trial_ends
-        first_charge_amount = sub.renewal_amount
-        recurring_amount = sub.renewal_amount
+        # ⚠️ 추가 계정은 **요청받은 개수**로 계산한다(저장값이 아니라). 체험 중 카드를
+        #    등록하면서 계정 수를 함께 고르는 화면이 이 견적을 쓰는데, 저장값(보통 0)으로
+        #    계산하면 "5개 골랐는데 14,900원" 이 고지되고 그 금액이 그대로 동의 기록이 된다.
+        #    실제 청구는 confirm 이 저장한 개수로 나가므로 고지와 청구가 갈린다.
+        first_charge_amount = sub.renewal_amount_for(extra_ig_accounts)
+        recurring_amount = first_charge_amount
         is_trial = True
     elif scenario == "trial":
         trial_days = TRIAL_BASE_DAYS + bonus_days
@@ -882,7 +886,17 @@ def confirm_billing(
             _schedule_quota_skipped_revive(user)
         else:
             # attach_only / card_change / charge_now(키 먼저 저장, 과금은 아래서)
-            locked.save(update_fields=key_fields + ["updated_at"])
+            extra_fields = []
+            if scenario == "attach_only" and new_plan.name == "pro":
+                # 체험 중 카드 등록 시 **고른 계정 수를 확정**한다. 견적
+                # (preview_subscription attach_only)이 이 개수로 금액을 고지했으므로
+                # 여기서 반영하지 않으면 "5개 골랐는데 1개" + 첫 결제만 정가가 된다.
+                # 체험 중 증가분은 0원(compute_extra_accounts_charge — TRIALING → 0)이고,
+                # 체험 종료 후 첫 결제부터 총액에 합산된다(tasks._renewal_amount_for).
+                # ⚠️ 전달값을 그대로 확정한다 — scenario="trial" 분기와 같은 규칙이다.
+                locked.extra_ig_accounts = extra_ig_accounts
+                extra_fields = ["extra_ig_accounts"]
+            locked.save(update_fields=key_fields + extra_fields + ["updated_at"])
             if scenario == "attach_only" and referral is not None:
                 # 카드 없이 시작한 체험에 카드 + 쿠폰을 함께 붙이는 경로.
                 # 기간은 '남은 체험 끝 + 보너스' 로 이어 붙인다(extend_trial_with_referral).

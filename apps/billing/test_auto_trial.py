@@ -231,3 +231,84 @@ class TestTrialKindSurvivesCardAttach:
         # StartTrial 은 체험 **시작** 때 한 번만 발사된다. 카드 부착은 재발사하지 않는다
         # (재발사하면 Meta 에서 같은 사람의 체험이 두 번 집계된다).
         assert fired == []
+
+
+@pytest.mark.django_db
+class TestAttachOnlyExtraAccounts:
+    """카드 없는 체험 중 카드 등록 + 추가 계정 선택 (2026-09-14 프론트 제보).
+
+    고지 시트 금액이 그대로 동의 기록(PaymentConsent.disclosed_amount)이 된다 —
+    견적과 실청구가 갈리면 허위 고지가 된다.
+    """
+
+    def test_preview_includes_requested_extra_accounts(self):
+        from apps.billing.models import EXTRA_IG_ACCOUNT_PRICE
+        from apps.billing.toss_flows import preview_subscription
+
+        user = _user()
+        sub, reason = auto_trial.grant(user)
+        assert sub is not None, reason
+        assert sub.extra_ig_accounts == 0  # 자동 지급은 0개로 시작
+
+        quote = preview_subscription(user, plan_name="pro", extra_ig_accounts=4)
+
+        assert quote["scenario"] == "attach_only"
+        assert quote["extra_ig_accounts"] == 4
+        expected = sub.monthly_amount_snapshot + EXTRA_IG_ACCOUNT_PRICE * 4
+        # ⚠️ 저장값(0)이 아니라 **요청 개수(4)** 로 계산돼야 한다
+        assert quote["first_charge_amount"] == expected
+        assert quote["recurring_amount"] == expected
+
+    def test_confirm_persists_chosen_extra_accounts(self, monkeypatch):
+        from apps.billing.models import EXTRA_IG_ACCOUNT_PRICE
+        from apps.billing.toss_flows import confirm_billing, preview_subscription
+
+        user = _user()
+        sub, reason = auto_trial.grant(user)
+        assert sub is not None, reason
+        period_end_before = sub.current_period_end
+
+        quote = preview_subscription(user, plan_name="pro", extra_ig_accounts=4)
+
+        monkeypatch.setattr(
+            "apps.billing.toss_flows.TossBillingClient.issue_billing_key",
+            lambda auth_key, customer_key: {
+                "billingKey": "bkey_extra_test",
+                "customerKey": customer_key,
+                "card": {"company": "테스트", "number": "1234"},
+            },
+        )
+        monkeypatch.setattr(
+            "apps.analytics.conversions.track_trial_started",
+            lambda subscription, request=None: None,
+        )
+
+        result = confirm_billing(user, auth_key="auth_test", plan_name="pro", extra_ig_accounts=4)
+
+        assert result["scenario"] == "attach_only"
+        sub.refresh_from_db()
+        # 고른 개수가 실제로 확정된다
+        assert sub.extra_ig_accounts == 4
+        assert sub.has_billing_key is True
+        # 체험 기간은 불변 — 카드를 붙여도 짧아지거나 길어지지 않는다
+        assert sub.current_period_end == period_end_before
+        # 견적 = 실제 갱신 청구액
+        expected = sub.monthly_amount_snapshot + EXTRA_IG_ACCOUNT_PRICE * 4
+        assert sub.renewal_amount == expected
+        assert quote["first_charge_amount"] == expected
+
+    def test_renewal_task_charges_the_total(self):
+        """첫 결제(체험 종료)에서 합산 금액이 청구되는지 — 갱신 계산 단일 소스 확인."""
+        from apps.billing.models import EXTRA_IG_ACCOUNT_PRICE
+        from apps.billing.tasks import _renewal_amount_for
+
+        user = _user()
+        sub, _ = auto_trial.grant(user)
+        sub.extra_ig_accounts = 4
+        sub.save(update_fields=["extra_ig_accounts"])
+        sub.refresh_from_db()
+
+        # (target_plan, amount) 튜플을 돌려준다
+        target_plan, amount = _renewal_amount_for(sub)
+        assert target_plan.name == "pro"
+        assert amount == sub.monthly_amount_snapshot + EXTRA_IG_ACCOUNT_PRICE * 4
