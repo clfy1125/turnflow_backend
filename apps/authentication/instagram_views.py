@@ -105,10 +105,38 @@ Instagram Business Login 의 **authorize URL 과 state** 를 발급합니다. �
 | 이름 | 필수 | 설명 |
 |------|:----:|------|
 | `redirect_uri` | 선택 | 인스타가 되돌려 보낼 프론트 주소. 허용 origin 과 완전일치 |
+| `client` | 선택 | `app` 이면 앱에서 시작한 로그인으로 표시. 생략 시 `web` |
+
+## 앱(Capacitor)에서 쓸 때 — `client=app`
+
+앱은 OAuth 를 **시스템 브라우저**에서 진행하고 웹 콜백(`turnflow.link/auth/instagram/callback`)
+으로 돌아옵니다. 그 웹 콜백 페이지는 "이게 앱에서 시작한 로그인인지" 알아야 커스텀 스킴으로
+앱에 되돌려 줄 수 있는데, **인스타는 state 를 서버가 만들기 때문에** 프론트가 표시를 심을
+자리가 없습니다(카카오는 프론트가 state 를 만들어 자체 해결).
+
+→ `client=app` 을 주면 **state 앞에 `app_` 이 붙습니다.**
+
+```
+GET /api/v1/auth/instagram/start/?client=app
+  → { "state": "app_0lVQ3v…", "authorize_url": "…&state=app_0lVQ3v…" }
+
+GET /api/v1/auth/instagram/start/            (웹)
+  → { "state": "web_8kZp1t…", … }
+```
+
+웹 콜백 페이지는 `state.startsWith("app_")` 만 보면 됩니다.
+
+> ⚠️ **웹 state 에도 `web_` 접두어를 붙였습니다.** 앱에만 붙이면 난수가 우연히 `app_` 로
+> 시작할 때(알파벳이 `[A-Za-z0-9_-]` 라 약 1/1670만) **웹 로그인이 앱으로 튕깁니다.**
+> 양쪽에 붙이면 그 경우가 구조적으로 없습니다. `startsWith("app_")` 판정은 그대로 쓰시면 됩니다.
+
+교환(`POST /api/v1/auth/instagram/`)은 **바뀐 것이 없습니다** — 접두어가 붙은 state 를
+그대로 보내면 됩니다. 요청 origin 이 앱(`https://localhost` / `capacitor://localhost`)이어도
+무관합니다(state 는 서버가 저장해 둔 값으로 검증하고, `redirect_uri` 도 저장값을 씁니다).
 
 ## 응답
 ```json
-{ "authorize_url": "https://www.instagram.com/oauth/authorize?...", "state": "…", "mode": "production" }
+{ "authorize_url": "https://www.instagram.com/oauth/authorize?...&state=web_…", "state": "web_…", "mode": "production" }
 ```
 `mode` 는 `production` 또는 `mock`(INSTAGRAM_MOCK_MODE) 입니다.
 
@@ -128,7 +156,17 @@ curl "https://api.turnflow.link/api/v1/auth/instagram/start/?redirect_uri=https%
                 description="인스타가 되돌려 보낼 프론트 주소 (허용 origin 과 완전일치). 생략 시 서버 기본값",
                 required=False,
                 type=str,
-            )
+            ),
+            OpenApiParameter(
+                name="client",
+                description=(
+                    "`app` 이면 state 에 `app_` 접두어가 붙는다(앱에서 시작한 로그인 표시). "
+                    "생략·그 외 값은 웹(`web_` 접두어). 대소문자 무시"
+                ),
+                required=False,
+                type=str,
+                enum=["web", "app"],
+            ),
         ],
         responses={
             200: OpenApiResponse(
@@ -138,7 +176,7 @@ curl "https://api.turnflow.link/api/v1/auth/instagram/start/?redirect_uri=https%
                         "발급됨",
                         value={
                             "authorize_url": "https://www.instagram.com/oauth/authorize?client_id=...&state=...",
-                            "state": "0lVQ3v…",
+                            "state": "web_0lVQ3v…",
                             "mode": "production",
                         },
                     )
@@ -198,7 +236,8 @@ curl "https://api.turnflow.link/api/v1/auth/instagram/start/?redirect_uri=https%
         except instagram.InstagramAuthError as exc:
             return _error(exc.message, exc.code, exc.status)
 
-        state_row = instagram.create_state(redirect_uri)
+        client = instagram.normalize_client(request.query_params.get("client", ""))
+        state_row = instagram.create_state(redirect_uri, client=client)
         from apps.integrations.services import MockInstagramProvider
 
         return Response(

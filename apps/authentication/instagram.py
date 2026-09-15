@@ -36,6 +36,20 @@ from .models import PLACEHOLDER_EMAIL_DOMAIN, InstagramLoginState
 logger = logging.getLogger(__name__)
 
 STATE_TTL_MINUTES = 10
+
+# ── state 접두어 — "이 로그인을 어디서 시작했나" (2026-09-15 앱 지원) ──────────────
+# 앱(Capacitor)은 OAuth 를 **시스템 브라우저**에서 진행하고 웹 콜백(turnflow.link)으로
+# 돌아온다. 그 웹 콜백 페이지는 "이게 앱에서 시작한 로그인인지" 알아야 커스텀 스킴으로
+# 앱에 되돌려 줄 수 있는데, **인스타는 state 를 서버가 만들기 때문에** 프론트가 표시를
+# 심을 자리가 없다(카카오는 프론트가 state 를 만들어 자체 해결).
+# → 서버가 state 앞에 표시를 붙인다. 프론트는 `state.startsWith("app_")` 만 보면 된다.
+#
+# ⚠️ 웹도 접두어를 붙이는 이유: 접두어를 앱에만 붙이면 `secrets.token_urlsafe` 가
+#    우연히 "app_" 로 시작할 때(알파벳이 [A-Za-z0-9_-] 라 확률 (1/64)^4 ≈ 1/1670만)
+#    **웹 로그인이 앱으로 튕긴다.** 양쪽 다 붙이면 그 경우가 구조적으로 없다.
+STATE_PREFIX_APP = "app_"
+STATE_PREFIX_WEB = "web_"
+CLIENT_APP = "app"
 # 만료된 state 를 얼마나 오래 남겨 둘지 — 디버깅용 짧은 꼬리. start 때 같이 청소한다
 # (행이 작고 생성 빈도도 낮아 별도 beat 를 만들 이유가 없다).
 STATE_SWEEP_AFTER_HOURS = 24
@@ -122,8 +136,19 @@ def resolve_redirect_uri(requested: str) -> str:
     return validated
 
 
-def create_state(redirect_uri: str) -> InstagramLoginState:
-    """1회용 state 발급 + 오래된 행 청소."""
+def normalize_client(raw: str) -> str:
+    """``client`` 파라미터 정규화. ``app`` 외에는 전부 웹으로 본다.
+
+    대소문자를 가리지 않는다 — 오타 하나로 앱 복귀가 조용히 깨지는 것이 400 보다 나쁘다.
+    """
+    return CLIENT_APP if (raw or "").strip().lower() == CLIENT_APP else "web"
+
+
+def create_state(redirect_uri: str, client: str = "web") -> InstagramLoginState:
+    """1회용 state 발급 + 오래된 행 청소.
+
+    ``client="app"`` 이면 state 에 ``app_`` 접두어를 붙인다(위 상수 주석 참고).
+    """
     try:
         InstagramLoginState.objects.filter(
             expires_at__lt=timezone.now() - timedelta(hours=STATE_SWEEP_AFTER_HOURS)
@@ -131,8 +156,9 @@ def create_state(redirect_uri: str) -> InstagramLoginState:
     except Exception:  # noqa: BLE001
         logger.warning("instagram login state sweep failed", exc_info=True)
 
+    prefix = STATE_PREFIX_APP if client == CLIENT_APP else STATE_PREFIX_WEB
     return InstagramLoginState.objects.create(
-        state=secrets.token_urlsafe(32),
+        state=prefix + secrets.token_urlsafe(32),
         redirect_uri=redirect_uri,
         expires_at=timezone.now() + timedelta(minutes=STATE_TTL_MINUTES),
     )

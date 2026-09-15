@@ -109,6 +109,39 @@ class TestStart:
             body["authorize_url"].startswith(REDIRECT) or "instagram.com" in body["authorize_url"]
         )
 
+    def test_client_app_marks_state_with_prefix(self, enabled):
+        """앱(Capacitor)에서 시작한 로그인 표시 — 웹 콜백 페이지가 앱으로 되돌리는 근거."""
+        res = APIClient().get(reverse(START), {"client": "app"})
+        assert res.status_code == 200
+        state = res.json()["state"]
+        assert state.startswith("app_")
+        # authorize_url 에도 같은 state 가 실린다 (인스타가 그대로 되돌려 준다)
+        assert state in res.json()["authorize_url"]
+
+    def test_web_state_never_starts_with_app_prefix(self, enabled):
+        """⚠️ 앱에만 접두어를 붙이면 난수가 우연히 `app_` 로 시작할 때 웹이 앱으로 튕긴다.
+
+        양쪽에 접두어를 붙여 그 경우를 구조적으로 없앴다.
+        """
+        for params in ({}, {"client": "web"}, {"client": "쓰레기값"}):
+            state = APIClient().get(reverse(START), params).json()["state"]
+            assert state.startswith("web_"), params
+            assert not state.startswith("app_"), params
+
+    def test_client_param_is_case_insensitive(self, enabled):
+        assert APIClient().get(reverse(START), {"client": "APP"}).json()["state"].startswith("app_")
+
+    def test_app_state_is_accepted_on_exchange(self, enabled, stub_exchange):
+        """접두어가 붙은 state 로도 교환이 그대로 된다 (교환 계약 변경 없음)."""
+        stub_exchange(_profile())
+        client = APIClient()
+        state = client.get(reverse(START), {"client": "app"}).json()["state"]
+        assert state.startswith("app_")
+
+        res = client.post(reverse(LOGIN), {"code": "mock_code_x", "state": state}, format="json")
+        assert res.status_code == 200, res.json()
+        assert res.json()["is_new_user"] is True
+
     def test_rejects_redirect_uri_outside_allowlist(self, enabled):
         """오픈 리다이렉트 방어 — 임의 주소로 인가 코드를 보낼 수 없다."""
         res = APIClient().get(reverse(START), {"redirect_uri": "https://evil.example.com/cb"})
