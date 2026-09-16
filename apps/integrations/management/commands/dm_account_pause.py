@@ -23,6 +23,7 @@
     python manage.py dm_account_pause --list
     python manage.py dm_account_pause --account @use.ai.likejimin --release --flush
     python manage.py dm_account_pause --account dmdummy_pro_cool --pause --hours 21 --queue 47
+    python manage.py dm_account_pause --account dmdummy_cooldown --pause --hours 21 --trips 2
 """
 
 from __future__ import annotations
@@ -69,6 +70,25 @@ class Command(BaseCommand):
         parser.add_argument("--pause", action="store_true", help="[DEBUG 전용] 정지 주입")
         parser.add_argument("--hours", type=float, default=21.0, help="--pause 쿨다운 시간")
         parser.add_argument(
+            "--trips",
+            type=int,
+            default=0,
+            help=(
+                "[DEBUG 전용] --pause 와 함께: total_trips(누적 정지 횟수)를 이 값으로 맞춘다. "
+                "2 이상이면 화면에 '이 계정에서 N번째 제한입니다' 반복 안내가 붙는다. "
+                "0=건드리지 않음(기존 값 유지)."
+            ),
+        )
+        parser.add_argument(
+            "--fail-recheck",
+            action="store_true",
+            help=(
+                "[DEBUG 전용] 다음 recheck-send 1회를 '다시 막힘(resumed=false)' 으로 만든다. "
+                "더미 토큰은 Meta 에 닿지 않아 항상 통과하므로, 프론트가 "
+                "「아직 제한이 풀리지 않았습니다」 화면을 확인하려면 이게 필요하다. 1회용."
+            ),
+        )
+        parser.add_argument(
             "--queue",
             type=int,
             default=0,
@@ -89,7 +109,13 @@ class Command(BaseCommand):
             self._release(conn, ext, flush=opts["flush"], limit=opts["flush_limit"])
         if opts["pause"]:
             self._require_debug("--pause")
-            self._pause(conn, ext, hours=opts["hours"])
+            self._pause(conn, ext, hours=opts["hours"], trips=opts["trips"])
+        if opts["fail_recheck"]:
+            self._require_debug("--fail-recheck")
+            cache.set(f"dm:recheck:force_block:{ext}", 1, timeout=3600)
+            self.stdout.write(
+                self.style.SUCCESS("다음 recheck-send 1회는 resumed=false 로 응답합니다(1시간 내).")
+            )
         if opts["queue"]:
             self._require_debug("--queue")
             self._seed_queue(conn, opts["queue"])
@@ -145,7 +171,7 @@ class Command(BaseCommand):
             ).count()
             self.stdout.write(
                 f"  {r.external_account_id} @{getattr(conn, 'username', '?')} "
-                f"level={r.level} 남은시간={remaining / 3600:.2f}h "
+                f"level={r.level} trips={r.total_trips} 남은시간={remaining / 3600:.2f}h "
                 f"해제예정={r.cooldown_until:%Y-%m-%d %H:%M %Z} 대기={waiting}건"
             )
 
@@ -186,19 +212,26 @@ class Command(BaseCommand):
             self.style.SUCCESS(f"  재개 투입: {moved}/{total}건 (페이서가 간격을 직렬화합니다)")
         )
 
-    def _pause(self, conn, ext: str, *, hours: float):
+    def _pause(self, conn, ext: str, *, hours: float, trips: int = 0):
         until = self.now + timedelta(hours=hours)
+        defaults = {"cooldown_until": until, "level": 1, "last_tripped_at": self.now}
+        # ★ total_trips 는 실제 트립(trip_action_block)에서만 오르는 누적 카운터라, 주입으로는
+        #   자동으로 오르지 않는다. 화면의 "N번째 제한입니다" 반복 안내를 dev 에서 보려면
+        #   여기서 명시적으로 맞춰줘야 한다(운영 값을 흉내내는 것이므로 DEBUG 전용).
+        if trips > 0:
+            defaults["total_trips"] = int(trips)
         DMAccountBlock.objects.update_or_create(
             external_account_id=ext,
-            defaults={"cooldown_until": until, "level": 1, "last_tripped_at": self.now},
+            defaults=defaults,
         )
         cd_key, lvl_key = _ab_keys(ext)
         ttl = max(int(hours * 3600), 60)
         cache.set(cd_key, int(time.time()) + ttl, timeout=ttl)
         cache.set(lvl_key, 1, timeout=30 * 24 * 3600)
+        suffix = f" · total_trips={trips}" if trips > 0 else ""
         self.stdout.write(
             self.style.SUCCESS(
-                f"정지 주입: @{conn.username} {hours}h (해제 예정 {until:%m-%d %H:%M})"
+                f"정지 주입: @{conn.username} {hours}h (해제 예정 {until:%m-%d %H:%M}){suffix}"
             )
         )
 

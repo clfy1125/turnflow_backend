@@ -1651,6 +1651,17 @@ class DMVerificationViewSet(viewsets.ViewSet):
                 # 정지만 풀린 채 화면이 "확인할 수 없습니다" 가 되므로 삼키고 아래에서 판정.
                 logger.exception("recheck canary send crashed: log=%s", canary.pk)
 
+        # ── 3b) [DEBUG 전용] 재차단 시뮬레이션 ──────────────────────────────
+        # 더미 계정은 토큰이 가짜라 카나리아가 Meta 에 닿기 전에 우리 창 가드에서 종결된다.
+        # 그래서 dev 에서는 resumed=false 화면(「아직 제한이 풀리지 않았습니다」)을 띄울 방법이
+        # 없다. 이 플래그가 있으면 368 재발과 같은 상태(재트립)를 만들어 그 분기를 보게 한다.
+        # ⚠️ settings.DEBUG 게이트 — 운영에서는 이 블록이 통째로 죽어 있다.
+        if settings.DEBUG and cache.get(f"dm:recheck:force_block:{ext}"):
+            from .rate_governor import trip_action_block
+
+            trip_action_block(ext)
+            cache.delete(f"dm:recheck:force_block:{ext}")  # 1회용 — 연속 확인 시 다시 심을 것
+
         # ── 4) 판정 — 368 이면 서킷이 스스로 다시 정지시켰다 ────────────────
         after = action_block_cooldown_remaining(ext)
         resumed = after <= 0
