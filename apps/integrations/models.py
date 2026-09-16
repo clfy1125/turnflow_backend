@@ -2466,6 +2466,30 @@ class DMAccountBlock(models.Model):
     )
     level = models.IntegerField(default=0, verbose_name="에스컬레이션 레벨(반복 차단 횟수)")
     last_tripped_at = models.DateTimeField(null=True, blank=True, verbose_name="마지막 트립 시각")
+
+    # ── 차단 유발 DM 기록 (2026-09-16) ────────────────────────────────────────
+    # 프론트 요청 4번: "368 이 발생했을 때 어느 DM 이 유발했는지 나중에 찾을 수 있게".
+    # 이전에는 트립 사실만 남아서, 원인 DM 을 찾으려면 전체 로그를 훑어야 했다
+    # (2026-09-02 조사에서 3건을 겨우 복원). 트립 시점에 그 로그를 여기 박아둔다.
+    # ⚠️ FK 가 아니라 **값 복사**다 — 로그 보존정책으로 SentDMLog 가 지워져도 단서는 남아야 하고,
+    #    FK 였다면 CASCADE 로 같이 사라지거나 PROTECT 로 삭제를 막는다.
+    total_trips = models.IntegerField(
+        default=0,
+        verbose_name="누적 트립 횟수",
+        help_text=(
+            "이 계정에서 Action Block 이 발생한 총 횟수. level 은 해제 시 0 으로 내려가므로 "
+            "'재발 횟수' 표시에는 이 값을 쓴다(감사용 · 절대 감소하지 않음)."
+        ),
+    )
+    last_trip_log_id = models.UUIDField(
+        null=True, blank=True, verbose_name="마지막 트립을 유발한 SentDMLog id"
+    )
+    last_trip_campaign_id = models.UUIDField(
+        null=True, blank=True, verbose_name="마지막 트립을 유발한 캠페인 id"
+    )
+    last_trip_error = models.CharField(
+        max_length=255, blank=True, default="", verbose_name="마지막 트립 당시 Meta 오류 요약"
+    )
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:

@@ -547,6 +547,16 @@ def _defer_or_fail(log, campaign, ig_conn, exc) -> dict:
 
         cooldown = trip_action_block(str(ig_conn.external_account_id))
         if cooldown > 0:  # 새 트립일 때만(중복 트립 무시) 로그·알림
+            # ★ 유발 DM 기록 (2026-09-16 · 프론트 요청 4번): 트립 사실만 남으면 나중에
+            #   원인 DM 을 찾으려고 전체 로그를 훑어야 한다(09-02 조사에서 3건 겨우 복원).
+            from .rate_governor import record_action_block_trigger
+
+            record_action_block_trigger(
+                str(ig_conn.external_account_id),
+                log_id=log.id,
+                campaign_id=campaign.id,
+                error=f"code={getattr(exc, 'code', '')} subcode={getattr(exc, 'subcode', '')} {exc}",
+            )
             log.append_verification_log(
                 {
                     "path": "dm_send",

@@ -1964,7 +1964,32 @@ class DMQueueStateSerializer(serializers.Serializer):
         ),
     )
     action_block_cooldown_seconds = serializers.IntegerField(
-        help_text="Action Block 쿨다운 잔여 초 (0=해당 없음)"
+        help_text=(
+            "**우리 쪽** 발송 정지의 잔여 초 (0=해당 없음). "
+            "⚠️ 인스타그램 제한이 풀리는 시각이 아니다 — 우리가 Meta 를 더 자극하지 않으려고 "
+            "스스로 멈춰 두는 시간이며, 실제 인스타그램 제한은 이보다 훨씬 길 수 있다"
+        )
+    )
+    action_block_total_trips = serializers.IntegerField(
+        help_text=(
+            "이 계정에서 발송 정지가 발생한 **누적 횟수**(감소하지 않음). "
+            "'2회차면 문구를 다르게' 같은 분기에 이 값을 쓰세요. 1=이번이 처음"
+        )
+    )
+    action_block_last_tripped_at = serializers.DateTimeField(
+        allow_null=True, help_text="마지막으로 정지가 걸린 시각 (ISO8601). 이력 없으면 null"
+    )
+    action_block_trip_log_id = serializers.UUIDField(
+        allow_null=True,
+        help_text="마지막 정지를 유발한 DM 로그 id (운영 추적용). 기록 전이면 null",
+    )
+    instagram_restriction_ends_at = serializers.DateTimeField(
+        allow_null=True,
+        help_text=(
+            "인스타그램 **자체** 제한이 끝나는 시각. **항상 null 입니다** — Meta 가 이 값을 "
+            "주지 않습니다(368 응답에 만료 정보 없음). 화면에서 자동 해제를 기대하게 하는 "
+            "문구를 쓰지 마세요. 훗날 Meta 가 제공하면 여기에 채웁니다"
+        ),
     )
     waiting_window_risk = DMQueueWindowRiskSerializer(
         help_text=(
@@ -2187,4 +2212,27 @@ class CampaignTimeseriesSerializer(serializers.Serializer):
             "로그 보존정책이 과거 데이터를 잘라내지 않아 전 기간 집계가 정확한지. "
             "false 면 과거 구간이 불완전할 수 있으니 차트에 안내 배지를 권장."
         )
+    )
+
+
+class DMRecheckSendRequestSerializer(serializers.Serializer):
+    """제한 확인·재개 요청 — POST /integrations/dm-verification/recheck-send/"""
+
+    ig_connection_id = serializers.UUIDField(
+        help_text="확인할 IG 연동 UUID (요청자가 그 워크스페이스 멤버여야 함)"
+    )
+
+
+class DMRecheckSendResponseSerializer(serializers.Serializer):
+    """제한 확인·재개 응답."""
+
+    resumed = serializers.BooleanField(
+        help_text=(
+            "true=시험 발송이 통과해 대기열을 재개함 / false=다시 막혀 정지 유지. "
+            "⚠️ true 라도 '인스타그램 제한이 풀렸다'는 뜻이 아니다 — 1건이 나갔다는 뜻일 뿐이라 "
+            "화면에는 '전송을 다시 시작했습니다' 로 쓸 것"
+        )
+    )
+    queue_state = DMQueueStateSerializer(
+        help_text="갱신된 큐 현황 — GET queue-state 와 같은 스키마(같은 함수로 생성)"
     )

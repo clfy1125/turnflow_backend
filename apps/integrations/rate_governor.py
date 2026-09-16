@@ -275,10 +275,12 @@ def _persist_action_block_to_db(ig_account_id: str, until_epoch: int, level: int
     try:
         from datetime import datetime
 
+        from django.db.models import F
+
         from apps.integrations.models import DMAccountBlock
 
         now_dt = datetime.fromtimestamp(int(time.time()), tz=UTC)
-        DMAccountBlock.objects.update_or_create(
+        _, created = DMAccountBlock.objects.update_or_create(
             external_account_id=ig_account_id,
             defaults={
                 "cooldown_until": datetime.fromtimestamp(int(until_epoch), tz=UTC),
@@ -286,8 +288,101 @@ def _persist_action_block_to_db(ig_account_id: str, until_epoch: int, level: int
                 "last_tripped_at": now_dt,
             },
         )
+        # total_trips 는 해제(level=0)로 되돌아가지 않는 **누적** 값이라 defaults 에 넣지 않고
+        # 원자적으로 증가시킨다 — "이 계정에서 정지가 몇 번째인가" 표시의 유일한 근거.
+        if created:
+            DMAccountBlock.objects.filter(external_account_id=ig_account_id).update(total_trips=1)
+        else:
+            DMAccountBlock.objects.filter(external_account_id=ig_account_id).update(
+                total_trips=F("total_trips") + 1
+            )
     except Exception:  # noqa: BLE001
         logger.exception("action block DB persist failed for %s", ig_account_id)
+
+
+def record_action_block_trigger(
+    ig_account_id: str, *, log_id=None, campaign_id=None, error: str = ""
+) -> None:
+    """이번 트립을 **유발한 DM** 을 DMAccountBlock 에 남긴다 (프론트 요청 4번).
+
+    트립 사실만으로는 나중에 원인 DM 을 찾을 수 없어서, 2026-09-02 조사 때 전체 로그를
+    훑어 3건을 겨우 복원했다. 값 복사로 저장한다 — SentDMLog 가 보존정책으로 지워져도
+    단서는 남아야 하기 때문(FK 였다면 CASCADE 로 함께 사라진다).
+
+    best-effort — 실패해도 쿨다운 자체에는 영향이 없다.
+    """
+    if not ig_account_id:
+        return
+    try:
+        from apps.integrations.models import DMAccountBlock
+
+        DMAccountBlock.objects.filter(external_account_id=ig_account_id).update(
+            last_trip_log_id=log_id,
+            last_trip_campaign_id=campaign_id,
+            last_trip_error=(error or "")[:255],
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("action block trigger record failed for %s", ig_account_id)
+
+
+def release_action_block(ig_account_id: str) -> int:
+    """계정 발송 정지를 해제한다. 반환: 해제 직전 잔여 초(0이면 원래 정지 아니었음).
+
+    ⚠️ **세 곳 중 두 곳**을 여기서 처리한다(나머지 하나는 호출부 책임):
+      (a) DB ``DMAccountBlock`` — ``cooldown_until=now``, ``level=0``
+          (level 을 안 내리면 재발 시 쿨다운이 2배가 된다 — ``2**(level-1)``)
+      (b) 캐시 2키 — ``action_block_cooldown_remaining`` 의 1순위 조회라
+          DB 만 고치면 **아무 일도 일어나지 않는다**(듀얼라이트)
+      (c) 적체 로그의 ``next_retry_at`` — 쿨다운 만료 시각에 못박혀 있어서 정지만 풀면
+          그 시각까지 아무것도 안 나간다. 호출부가 따로 당겨야 한다.
+
+    ``last_tripped_at`` / ``total_trips`` 는 감사용이라 보존한다.
+    """
+    if not ig_account_id:
+        return 0
+    before = action_block_cooldown_remaining(ig_account_id)
+    try:
+        from datetime import datetime
+
+        from apps.integrations.models import DMAccountBlock
+
+        DMAccountBlock.objects.filter(external_account_id=ig_account_id).update(
+            cooldown_until=datetime.fromtimestamp(int(time.time()), tz=UTC), level=0
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("action block DB release failed for %s", ig_account_id)
+    cd_key, lvl_key = _ab_keys(ig_account_id)
+    cache.delete(cd_key)
+    cache.delete(lvl_key)
+    return int(before)
+
+
+def action_block_meta(ig_account_id: str) -> dict:
+    """표시 계층용 Action Block 부가 정보 (queue-state 가 싣는다).
+
+    ``action_block_cooldown_remaining`` 이 "지금 막혀 있나"를 답한다면, 이쪽은
+    "몇 번째인가 · 언제 걸렸나 · 무엇이 유발했나"를 답한다. 화면 문구가 재발 횟수에
+    따라 달라져야 해서 프론트가 요청했다(2026-09-16 · 요청 3번).
+    """
+    out = {
+        "action_block_total_trips": 0,
+        "action_block_last_tripped_at": None,
+        "action_block_trip_log_id": None,
+    }
+    if not ig_account_id:
+        return out
+    try:
+        from apps.integrations.models import DMAccountBlock
+
+        row = DMAccountBlock.objects.filter(external_account_id=ig_account_id).first()
+        if row is None:
+            return out
+        out["action_block_total_trips"] = int(row.total_trips or 0)
+        out["action_block_last_tripped_at"] = row.last_tripped_at
+        out["action_block_trip_log_id"] = row.last_trip_log_id
+    except Exception:  # noqa: BLE001
+        logger.exception("action block meta read failed for %s", ig_account_id)
+    return out
 
 
 def _restore_action_block_from_db(ig_account_id: str):

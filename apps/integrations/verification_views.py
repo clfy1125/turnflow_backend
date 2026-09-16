@@ -25,6 +25,7 @@ READ 의 차이를 표시하고, 실패 사유별 후속 액션(재연동/재시
 
 from __future__ import annotations
 
+import logging
 from datetime import timedelta
 
 from django.conf import settings
@@ -34,7 +35,7 @@ from django.utils import timezone
 from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import NotFound, PermissionDenied
+from rest_framework.exceptions import APIException, NotFound, PermissionDenied
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
@@ -58,15 +59,55 @@ from .dm_status_groups import (
 )
 from .models import AutoDMCampaign, IGAccountConnection, SentDMLog
 from .queue_state import build_queue_state_payload
+from .rate_governor import action_block_cooldown_remaining, release_action_block
 from .serializers import (
     DMLookupResponseSerializer,
     DMQueueStateSerializer,
+    DMRecheckSendRequestSerializer,
+    DMRecheckSendResponseSerializer,
     DMRecipientRollupSerializer,
     DMReverifyResponseSerializer,
     DMVerificationStatsSerializer,
     SentDMLogSerializer,
 )
 from .services import InstagramMessagingService
+
+logger = logging.getLogger(__name__)
+
+
+class DMRecheckCooldownError(APIException):
+    """제한 확인 연타 차단 — HTTP 429.
+
+    봉투를 ``MigrationCooldownError`` 와 **같은 모양**으로 맞춘다. 프론트가 이미
+    ``error.details.retry_after`` 로 카운트다운을 그리고 있어서, 새 모양을 만들면
+    화면 쪽에 분기가 하나 더 생긴다.
+    """
+
+    status_code = status.HTTP_429_TOO_MANY_REQUESTS
+    default_detail = "방금 확인했습니다. 잠시 후 다시 시도해주세요."
+    default_code = "dm_recheck_cooldown"
+
+    @classmethod
+    def make(cls, wait_seconds: int):
+        return cls(
+            {
+                "message": "방금 확인했습니다. 잠시 후 다시 확인해주세요.",
+                "code": cls.default_code,
+                "retry_after": max(int(wait_seconds), 1),
+            }
+        )
+
+
+class DMRecheckConflictError(APIException):
+    """확인할 상태가 아님(정지 중이 아닌 계정) — HTTP 409."""
+
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = "요청을 처리할 수 없는 상태입니다."
+    default_code = "conflict"
+
+    @classmethod
+    def make(cls, message: str, code: str):
+        return cls({"message": message, "code": code})
 
 
 def _user_workspaces(request):
@@ -1481,5 +1522,150 @@ class DMVerificationViewSet(viewsets.ViewSet):
             {
                 "version": "v3.2",
                 "checklist": SELF_CHECK_CHECKLIST,
+            }
+        )
+
+    # ===== 제한 확인 · 재개 (2026-09-16) =====
+
+    @extend_schema(
+        summary="DM 발송 정지 제한 확인·재개",
+        description="""
+        ## 목적
+        인스타그램 제한이 풀렸는지 **시험 발송 1건**으로 확인하고, 통과하면 대기열을 재개합니다.
+
+        사용자가 인스타그램 앱에서 "검토 요청"을 마친 뒤 누르는 [확인하고 재개] 버튼의 백엔드입니다.
+
+        ## 동작
+        1. 정지를 해제합니다(DB `cooldown_until`·`level=0` + 캐시 2키).
+        2. 대기열에서 **가장 오래된 1건**을 즉시 발송해 봅니다(카나리아).
+           `--flush-limit 1` 과 같은 순서라, 메시징 창 마감이 가장 임박한 건이 첫 타자가 됩니다.
+        3. 다시 막히면(Meta `code=368`) 서킷이 **스스로 다시 정지**합니다 → `resumed=false`.
+        4. 통과하면 남은 대기 건의 `next_retry_at` 을 당겨 전량 재개합니다 → `resumed=true`.
+
+        ## 중요 — `resumed=true` 는 "제한이 풀렸다"는 뜻이 **아닙니다**
+        시험 발송 1건이 통과했다는 뜻일 뿐입니다. 인스타그램 제한은 계정 단위로 훨씬 오래
+        지속될 수 있고, Meta 는 만료 시각을 알려주지 않습니다. 화면에는
+        **"DM 전송을 다시 시작했습니다"** 로 쓰고 "제한이 풀렸습니다" 로 쓰지 마세요.
+
+        ## 연타 차단
+        서버에서 계정 단위로 막습니다(기본 10분). 새로고침·다른 탭으로도 우회되지 않습니다.
+        제한 중 반복 시도는 제한 기간을 늘리기 때문입니다.
+
+        ## 요청
+        `{ "ig_connection_id": "<uuid>" }`
+
+        ## 응답
+        - `200 {"resumed": false, "queue_state": {...}}` — 다시 막힘. 정지 유지
+        - `200 {"resumed": true, "queue_state": {...}}` — 통과. 대기열 재개
+        - `409` — 정지 상태가 아닌 계정 (확인할 것이 없음)
+        - `429 {"error": {"details": {"retry_after": 600}}}` — 너무 빨리 재시도
+
+        `queue_state` 는 `GET queue-state` 와 **같은 스키마**입니다(같은 함수로 만듭니다).
+        재개 직후 배너·게이지가 폴링 주기(최대 30초)만큼 어긋나는 것을 막으려고 함께 싣습니다.
+
+        ## 인증
+        Bearer JWT + 그 계정이 속한 워크스페이스 멤버십.
+        """,
+        request=DMRecheckSendRequestSerializer,
+        responses={
+            200: DMRecheckSendResponseSerializer,
+            400: OpenApiResponse(description="ig_connection_id 누락/형식 오류"),
+            401: OpenApiResponse(description="인증 실패"),
+            403: OpenApiResponse(description="워크스페이스 멤버가 아님"),
+            404: OpenApiResponse(description="IG 연동을 찾을 수 없음"),
+            409: OpenApiResponse(description="정지 상태가 아님"),
+            429: OpenApiResponse(description="연타 차단 — retry_after 초 뒤 재시도"),
+        },
+        examples=[
+            OpenApiExample(
+                "다시 막힘",
+                value={
+                    "resumed": False,
+                    "queue_state": {"blocking_reason": "action_block_cooldown"},
+                },
+                response_only=True,
+            ),
+            OpenApiExample(
+                "통과 — 재개",
+                value={"resumed": True, "queue_state": {"blocking_reason": None}},
+                response_only=True,
+            ),
+        ],
+        tags=["DM Verification"],
+    )
+    @action(detail=False, methods=["post"], url_path="recheck-send")
+    def recheck_send(self, request):
+        serializer = DMRecheckSendRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        ig_connection_id = serializer.validated_data["ig_connection_id"]
+
+        try:
+            ig_conn = IGAccountConnection.objects.select_related("workspace").get(
+                id=ig_connection_id
+            )
+        except (IGAccountConnection.DoesNotExist, ValueError, TypeError) as e:
+            raise NotFound("IG 연동을 찾을 수 없습니다.") from e
+
+        if not ig_conn.workspace.memberships.filter(user=request.user).exists():
+            raise PermissionDenied("이 리소스가 속한 워크스페이스의 멤버가 아닙니다.")
+
+        ext = str(ig_conn.external_account_id)
+
+        # ── 1) 연타 차단 (서버 책임) ────────────────────────────────────────
+        # 프론트 disabled 로는 새로고침·다른 탭을 못 막고, 제한 중 반복 시도는 제한을 늘린다.
+        # 계정 단위 키 — 같은 워크스페이스의 다른 사용자가 눌러도 함께 막혀야 한다.
+        throttle_key = f"dm:recheck:{ext}"
+        ttl = int(getattr(settings, "DM_RECHECK_COOLDOWN_SECONDS", 600))
+        # add() 는 없을 때만 성공 → 원자적. get/set 조합은 동시 클릭에서 둘 다 통과한다.
+        if not cache.add(throttle_key, int(timezone.now().timestamp()), timeout=ttl):
+            started = cache.get(throttle_key) or int(timezone.now().timestamp())
+            elapsed = int(timezone.now().timestamp()) - int(started)
+            raise DMRecheckCooldownError.make(max(ttl - elapsed, 1))
+
+        # ── 2) 정지 상태가 아니면 거부 ──────────────────────────────────────
+        remaining = action_block_cooldown_remaining(ext)
+        if remaining <= 0:
+            cache.delete(throttle_key)  # 아무것도 안 했으니 쿨다운도 물리지 않는다
+            raise DMRecheckConflictError.make("이 계정은 발송 정지 상태가 아닙니다.", "not_paused")
+
+        # ── 3) 정지 해제 + 카나리아 1건 ────────────────────────────────────
+        release_action_block(ext)
+
+        canary = (
+            SentDMLog.objects.filter(
+                campaign__ig_connection=ig_conn, status=SentDMLog.Status.QUEUED
+            )
+            .order_by("created_at")
+            .first()
+        )
+        if canary is not None:
+            # 지금 즉시 나가도록 슬롯을 당긴 뒤 **동기 실행**한다.
+            # .delay() 로 보내면 결과를 이 요청 안에서 알 수 없어 resumed 판정이 불가능하다.
+            SentDMLog.objects.filter(pk=canary.pk).update(next_retry_at=timezone.now())
+            from .tasks import send_dm_task
+
+            try:
+                send_dm_task(str(canary.pk))
+            except Exception:  # noqa: BLE001
+                # 태스크 내부 예외는 이미 로그 상태로 기록된다. 여기서 500 을 내면
+                # 정지만 풀린 채 화면이 "확인할 수 없습니다" 가 되므로 삼키고 아래에서 판정.
+                logger.exception("recheck canary send crashed: log=%s", canary.pk)
+
+        # ── 4) 판정 — 368 이면 서킷이 스스로 다시 정지시켰다 ────────────────
+        after = action_block_cooldown_remaining(ext)
+        resumed = after <= 0
+
+        if resumed:
+            # 남은 대기 건의 next_retry_at 은 쿨다운 만료 시각에 못박혀 있다.
+            # 이걸 안 당기면 "풀었는데 왜 안 나가냐" 가 된다.
+            SentDMLog.objects.filter(
+                campaign__ig_connection=ig_conn, status=SentDMLog.Status.QUEUED
+            ).update(next_retry_at=timezone.now())
+
+        payload = build_queue_state_payload(ig_conn)
+        return Response(
+            {
+                "resumed": resumed,
+                "queue_state": DMQueueStateSerializer(payload).data,
             }
         )

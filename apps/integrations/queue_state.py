@@ -22,7 +22,11 @@ from . import dm_pacer
 from .campaign_stats import SENT_FOR_QUOTA_STATUSES as _SENT_FOR_QUOTA
 from .campaign_stats import people_rollup
 from .models import SentDMLog
-from .rate_governor import PRIVATE_REPLY_HOURLY_CAP, action_block_cooldown_remaining
+from .rate_governor import (
+    PRIVATE_REPLY_HOURLY_CAP,
+    action_block_cooldown_remaining,
+    action_block_meta,
+)
 
 # gauge.failed 용 하드 실패 (복구 대기/만료는 진행 중이라 제외 — 게이지는 '큐 진행' 관점)
 _HARD_FAILED = [
@@ -194,6 +198,15 @@ def build_queue_state_payload(ig_conn, campaign=None) -> dict:
         "ahead_of_this_campaign": ahead,
         "blocking_reason": blocking_reason,
         "action_block_cooldown_seconds": int(ab_remaining),
+        # ── 정지 이력 (2026-09-16 · 프론트 요청 3번) ────────────────────────────
+        # 화면 문구가 "몇 번째 정지인가"에 따라 달라져야 해서 싣는다.
+        # ⚠️ total_trips 를 쓸 것 — level 은 해제하면 0 으로 내려가서 재발 횟수가 아니다.
+        **action_block_meta(ext),
+        # 인스타그램 쪽 제한이 끝나는 시각 — **우리는 알 수 없다**. Meta 가 API 로 주지
+        # 않고(368 응답에 만료 정보 없음), 우리 쿨다운(24h)과 실제 제한(실측 30일)은
+        # 서로 무관한 값이다. 프론트가 "없으면 없다고만 알려달라"고 해서 명시적 null 로 둔다.
+        # 여기에 우리 쿨다운 만료를 넣으면 안 된다 — 그게 "기다리면 풀린다" 오해의 원인이었다.
+        "instagram_restriction_ends_at": None,
         # 재개 시점에 이미 창이 닫혀 있을 대기 건 — "N명에게 발송합니다" 문구의 안전장치.
         # people.waiting 에서 이만큼 빼야 지킬 수 있는 약속이 된다.
         "waiting_window_risk": waiting_window_risk(
