@@ -1176,6 +1176,46 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
             requested_ids = None
             missing_ids: list = []
 
+            # ── 더미 연결(가짜 토큰) 분기 — Meta 를 부르지 않는다 ──
+            # 이걸 안 하면 dev 시더가 만든 연결이 그대로 Graph 로 나가 400 을 받고,
+            # 우리가 그걸 500 으로 되돌린다 → 테섭에서 캠페인 만들기 흐름이 첫 화면에서 끊긴다.
+            # 판정은 MockInstagramProvider.should_use_mock 하나만 쓴다(운영은 DEBUG=False 라 절대 안 탐).
+            if MockInstagramProvider.should_use_mock(access_token):
+                ig_id = connection.external_account_id
+                if media_ids_param:
+                    requested_ids = [m.strip() for m in media_ids_param.split(",") if m.strip()][
+                        :50
+                    ]
+                    by_id = MockInstagramProvider.mock_media_by_ids(ig_id, requested_ids)
+                    items = [by_id[mid] for mid in requested_ids if mid in by_id]
+                    missing_ids = [mid for mid in requested_ids if mid not in by_id]
+                    data = {"data": items, "paging": {}}
+                else:
+                    page = MockInstagramProvider.mock_list_media_page(ig_id, limit=limit)
+                    data = {"data": page["data"], "paging": {}}
+                return Response(
+                    {
+                        "success": True,
+                        "data": data["data"],
+                        "paging": data["paging"],
+                        "count": len(data["data"]),
+                        "connection": {
+                            "id": str(connection.id),
+                            "username": connection.username,
+                            "account_id": connection.external_account_id,
+                        },
+                        "query": {
+                            "limit": limit,
+                            "after": after,
+                            "ig_connection_id": ig_connection_id,
+                            "media_ids": requested_ids,
+                            "missing_media_ids": missing_ids,
+                        },
+                        # 프론트가 "왜 좋아요 수가 매번 같지?" 로 헤매지 않도록 명시한다.
+                        "mock": True,
+                    }
+                )
+
             if media_ids_param:
                 # id 다건 조회 — 목록을 커서로 훑지 않고 Graph 배치 문법으로 한 번에 가져온다.
                 # (게시물 1건을 찾으려고 50개씩 4페이지를 순차 호출하던 프론트 우회를 없앤다)
@@ -3172,6 +3212,14 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         (마케팅 게시물은 보통 마지막 장에 혜택/가격/CTA 가 담김 → _pick_image_url 참고).
         """
         from rest_framework.exceptions import NotFound
+
+        # 더미 연결(가짜 토큰)은 Graph 를 부르지 않는다 — /media/ 와 **같은 판정**을 쓴다.
+        # 여기가 빠져 있으면 목록에선 게시물이 보이는데 고르는 순간 404 가 나서,
+        # 테섭의 캠페인 만들기 흐름이 바로 다음 단계에서 끊긴다(2026-09-21 dev).
+        if MockInstagramProvider.should_use_mock(connection.access_token):
+            return MockInstagramProvider.mock_media_context(
+                connection.external_account_id, media_id
+            )
 
         try:
             url = f"{InstagramOAuthService.GRAPH_API_BASE}/{media_id}"

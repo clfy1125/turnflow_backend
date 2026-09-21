@@ -41,12 +41,8 @@ from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 from django.utils import timezone
 
-from apps.integrations.models import (
-    AutoDMCampaign,
-    DMAccountBlock,
-    IGAccountConnection,
-    SentDMLog,
-)
+from apps.integrations.models import AutoDMCampaign, DMAccountBlock, IGAccountConnection, SentDMLog
+from apps.integrations.services import MockInstagramProvider
 from apps.workspace.models import Membership, Workspace
 
 TAG = "dmdummy"
@@ -183,7 +179,13 @@ class Command(BaseCommand):
         conn.status = status
         conn.is_active = is_active
         conn.scopes = ["instagram_business_basic", "instagram_business_manage_messages"]
-        conn.access_token = f"mock-token-{ext_id}"  # EncryptedTextField descriptor 가 암호화
+        # ⚠️ 접두어는 MockInstagramProvider.MOCK_TOKEN_PREFIX 를 쓴다 — 여기서 새 관례를
+        #    만들면 목 분기(should_use_mock)가 이 연결을 **진짜 토큰으로 오인**해 Meta 로
+        #    나가고 400 → 500 이 된다(2026-09-21 dev /media/ 사고). 옛 값 `mock-token-` 은
+        #    이미 dev DB 에 남아 있어 is_mock_token 이 함께 인식한다.
+        conn.access_token = (  # EncryptedTextField descriptor 가 암호화
+            f"{MockInstagramProvider.MOCK_TOKEN_PREFIX}{ext_id}"
+        )
         if token_days is None:
             conn.token_expires_at = self.now - timedelta(days=1)  # 만료
         else:

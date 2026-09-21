@@ -8,8 +8,9 @@ import random
 import re
 import threading
 from datetime import UTC, datetime, timedelta
+from html import escape
 from typing import Optional
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 import requests
 from django.conf import settings
@@ -537,18 +538,43 @@ class MockInstagramProvider:
             "profile_picture_url": profile_picture_url,
         }
 
+    # dev 시더들이 실제로 쓰고 있는 가짜 토큰 접두어 전부.
+    # ⚠️ 한때 `mock_token_` 하나만 봤는데, 시더마다 관례가 갈려 있어서
+    #    `dmdummy_*`(mock-token-)·`home.*`(DEVFAKE-) 연결은 **가짜인데 진짜로 취급**됐다.
+    #    그 결과 목 분기를 그냥 지나쳐 Meta 로 나가고 400 → 우리가 500 을 냈다
+    #    (2026-09-21 dev: /media/ 500, connection_health 도 같은 함정).
+    #    새 시더를 만들 때 **네 번째 관례를 만들지 말 것** — MOCK_TOKEN_PREFIX 를 쓸 것.
+    MOCK_TOKEN_PREFIXES = ("mock_token_", "mock-token-", "DEVFAKE-")
+
     @classmethod
     def is_mock_token(cls, token: str) -> bool:
-        """
-        Check if token is a mock token
+        """이 토큰이 dev 시더가 만든 가짜 토큰인가.
+
+        실제 Meta 토큰은 이 접두어들로 시작하지 않으므로(IGAA…/EAA…) 오탐이 없다.
 
         Args:
             token: Access token to check
 
         Returns:
-            True if token starts with MOCK_TOKEN_PREFIX
+            True if token starts with any known dev seeder prefix
         """
-        return token.startswith(cls.MOCK_TOKEN_PREFIX)
+        return (token or "").startswith(cls.MOCK_TOKEN_PREFIXES)
+
+    @classmethod
+    def should_use_mock(cls, token: str) -> bool:
+        """이 연결을 **Meta 호출 없이** 목으로 처리할지 — 판정 단일 소스.
+
+        두 경우를 합친다:
+          · 전역 mock 모드(``INSTAGRAM_MOCK_MODE``) — 연결 전체가 가짜인 환경
+          · 진짜 연결과 더미 연결이 **섞여 있는** dev — 토큰이 가짜인 연결만 목으로
+
+        후자가 필요한 이유: dev 에서 전역 플래그를 켜면 ``is_mock_mode()`` 하나만 보는
+        **인스타 로그인 경로**(authentication/instagram.py)까지 목으로 바뀌어, 실제
+        OAuth 시험이 불가능해진다. 더미 게시물 하나 보자고 로그인 시험을 죽일 수 없다.
+
+        ``DEBUG`` 를 함께 요구해 운영에서는 어떤 경우에도 목이 되지 않게 한다.
+        """
+        return cls.is_mock_mode() or (settings.DEBUG and cls.is_mock_token(token))
 
     # ===== DM 캠페인 이전(마이그레이션) 분석용 mock 픽스처 =====
     # 실 Graph 호출 없이 dev/CI 에서 전체 파이프라인을 돌리기 위한 결정적 합성 데이터.
@@ -664,35 +690,104 @@ class MockInstagramProvider:
             },
         ]
 
+    # 목 썸네일은 **인라인 SVG data URI** 로 만든다 — 외부 이미지 호스트에 의존하면
+    # 그 호스트가 죽거나 차단될 때 dev 화면이 통째로 깨지고, IG CDN URL 은 서명 만료라
+    # 애초에 쓸 수 없다(캠페인 썸네일 재호스팅을 도입한 이유와 같다).
+    _MOCK_THUMB_BG = ("#6366f1", "#ec4899", "#14b8a6", "#f59e0b", "#8b5cf6", "#ef4444")
+
+    @classmethod
+    def _mock_thumbnail_data_uri(cls, index: int, label: str) -> str:
+        """렌더되는 640x640 자리표시 썸네일 (네트워크 호출 0)."""
+        bg = cls._MOCK_THUMB_BG[index % len(cls._MOCK_THUMB_BG)]
+        text = escape(label)[:12]
+        svg = (
+            "<svg xmlns='http://www.w3.org/2000/svg' width='640' height='640'>"
+            f"<rect width='640' height='640' fill='{bg}'/>"
+            "<text x='320' y='300' font-family='sans-serif' font-size='56' fill='#fff' "
+            f"text-anchor='middle'>{text}</text>"
+            "<text x='320' y='380' font-family='sans-serif' font-size='40' fill='#ffffffcc' "
+            f"text-anchor='middle'>#{index}</text>"
+            "</svg>"
+        )
+        return "data:image/svg+xml;utf8," + quote(svg)
+
+    @classmethod
+    def _mock_media_item(cls, m: dict) -> dict:
+        """합성 미디어 1건 — 목록/배치조회가 **같은 모양**을 내도록 여기 하나로 만든다.
+
+        (목록과 단건이 갈리면 "목록에선 보이는데 고르면 사라지는" 화면이 나온다.)
+        """
+        is_camp = m["is_campaign"]
+        kw = cls._MOCK_KEYWORDS[m["kw_idx"]]
+        rng = cls._mock_rng(f"cnt:{m['id']}")
+        caption = (
+            f'오늘 콘텐츠 준비했어요! 궁금하면 댓글에 "{kw}" 남겨주세요 :)'
+            if is_camp
+            else "오늘의 일상 기록 📷 봐주셔서 감사해요"
+        )
+        # ⚠️ 아래 rng 호출 **순서와 단락평가(is_camp and …)** 를 바꾸지 말 것 —
+        #    결정성이 깨지면 dm_migration 목 픽스처의 결과가 통째로 달라진다.
+        comments_count = rng.randint(30, 120) if is_camp else rng.randint(0, 10)
+        media_type = "VIDEO" if is_camp and rng.random() < 0.5 else "IMAGE"
+        media_product_type = "REELS" if is_camp and rng.random() < 0.5 else "FEED"
+
+        permalink = f"https://www.instagram.com/p/{m['id']}/"
+        # 신규 필드는 **별도 시드**로 뽑는다(위 rng 시퀀스를 건드리지 않기 위해).
+        like_rng = cls._mock_rng(f"like:{m['id']}")
+        return {
+            "id": m["id"],
+            "caption": caption,
+            "timestamp": cls._mock_graph_ts(m["timestamp"]),
+            "media_type": media_type,
+            "media_product_type": media_product_type,
+            "permalink": permalink,
+            "comments_count": comments_count,
+            # 프로젝트 규약: media_url = permalink(링크용) / thumbnail_url = 렌더용 이미지
+            "media_url": permalink,
+            "thumbnail_url": cls._mock_thumbnail_data_uri(m["index"], kw if is_camp else "일상"),
+            "like_count": like_rng.randint(10, 900),
+        }
+
     @classmethod
     def mock_list_media_page(
         cls, ig_user_id: str, limit: int = 50, after: str | None = None
     ) -> dict:
         """합성 미디어 목록 1페이지 (InstagramMediaService.list_media_page 대응 mock)."""
         pool = cls._mock_campaign_media(ig_user_id)[: max(1, min(limit, cls._MOCK_MEDIA_POOL))]
-        data = []
-        for m in pool:
-            is_camp = m["is_campaign"]
-            kw = cls._MOCK_KEYWORDS[m["kw_idx"]]
-            rng = cls._mock_rng(f"cnt:{m['id']}")
-            caption = (
-                f'오늘 콘텐츠 준비했어요! 궁금하면 댓글에 "{kw}" 남겨주세요 :)'
-                if is_camp
-                else "오늘의 일상 기록 📷 봐주셔서 감사해요"
-            )
-            comments_count = rng.randint(30, 120) if is_camp else rng.randint(0, 10)
-            data.append(
-                {
-                    "id": m["id"],
-                    "caption": caption,
-                    "timestamp": cls._mock_graph_ts(m["timestamp"]),
-                    "media_type": "VIDEO" if is_camp and rng.random() < 0.5 else "IMAGE",
-                    "media_product_type": "REELS" if is_camp and rng.random() < 0.5 else "FEED",
-                    "permalink": f"https://www.instagram.com/p/{m['id']}/",
-                    "comments_count": comments_count,
-                }
-            )
-        return {"data": data, "paging_after": None}
+        return {"data": [cls._mock_media_item(m) for m in pool], "paging_after": None}
+
+    @classmethod
+    def mock_media_context(cls, ig_user_id: str, media_id: str) -> tuple:
+        """AI 초안(ai-suggest)용 게시물 컨텍스트 mock → ``(caption, image_url, media_type)``.
+
+        ``image_url`` 은 **일부러 빈 문자열**이다. 목 썸네일은 data URI 라 LLM 이 받아갈
+        수 없고, 넘기면 ``dm_assist: 이미지 다운로드 실패 → URL 패스스루`` 경고만 쌓인 채
+        쓸모없는 값이 프롬프트에 들어간다. 캡션만으로 도는 편이 결과가 정직하다.
+
+        풀에 없는 id 도 **거절하지 않는다** — 더미 연결에서는 어차피 전부 합성이고,
+        프론트가 손으로 넣은 id(``dummy-media-1`` 등)로도 흐름을 끝까지 볼 수 있어야 한다.
+        """
+        pool = {m["id"]: m for m in cls._mock_campaign_media(ig_user_id)}
+        m = pool.get(media_id)
+        if m is not None:
+            item = cls._mock_media_item(m)
+            return item["caption"], "", item["media_type"]
+
+        # 풀 밖 id — media_id 시드로 결정적 합성(재호출해도 같은 값).
+        rng = cls._mock_rng(f"ctx:{ig_user_id}:{media_id}")
+        kw = cls._MOCK_KEYWORDS[rng.randrange(len(cls._MOCK_KEYWORDS))]
+        caption = f'오늘 콘텐츠 준비했어요! 궁금하면 댓글에 "{kw}" 남겨주세요 :)'
+        return caption, "", ("VIDEO" if rng.random() < 0.5 else "IMAGE")
+
+    @classmethod
+    def mock_media_by_ids(cls, ig_user_id: str, media_ids: list) -> dict:
+        """id 다건 조회 mock (``InstagramMediaService.get_media_batch`` 대응).
+
+        풀에 없는 id 는 **빼고** 돌려준다 — 뷰가 그 차집합을 ``missing_media_ids``
+        로 내보내므로, 여기서 없는 것을 지어내면 그 신호가 죽는다.
+        """
+        pool = {m["id"]: m for m in cls._mock_campaign_media(ig_user_id)}
+        return {mid: cls._mock_media_item(pool[mid]) for mid in media_ids if mid in pool}
 
     @classmethod
     def mock_list_media_comments(cls, media_id: str, after: str | None = None) -> dict:
