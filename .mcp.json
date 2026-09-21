@@ -2,11 +2,26 @@
   "mcpServers": {
     "payapp-api": {
       "command": "npx",
-      "args": ["-y", "@payapp/payments-payapp"]
+      "args": [
+        "-y",
+        "@payapp/payments-payapp"
+      ]
     },
     "tosspayments-integration-guide": {
       "command": "npx",
-      "args": ["-y", "@tosspayments/integration-guide-mcp@latest"]
+      "args": [
+        "-y",
+        "@tosspayments/integration-guide-mcp@latest"
+      ]
+    },
+    "telegram-user": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "./telegram-mcp",
+        "telegram-user-mcp"
+      ]
     }
   }
 }

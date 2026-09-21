@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "telegram-user-mcp"
+version = "0.1.0"
+description = "내 텔레그램 계정으로 허용된 대화방만 읽고 쓰는 MCP 서버 (Telethon/MTProto)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=2.0",
+    "telethon>=1.36",
+]
+
+[project.scripts]
+telegram-user-mcp = "telegram_user_mcp.server:main"
+telegram-user-mcp-setup = "telegram_user_mcp.setup:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/telegram_user_mcp"]

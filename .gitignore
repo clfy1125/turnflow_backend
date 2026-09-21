@@ -28,6 +28,12 @@ __pycache__/
 .Python
 env/
 venv/
+.venv/
+
+# 텔레그램 유저 세션 — **비밀번호보다 강한 자격증명**(2FA 통과 상태의 계정 전체 접근권).
+# 기본 위치는 저장소 밖(~/.telegram-mcp/)이지만, 실수로 안에 만들어도 커밋되지 않게 막는다.
+*.session
+*.session-journal
 ENV/
 build/
 develop-eggs/
