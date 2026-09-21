@@ -715,10 +715,23 @@ Bearer 토큰으로 본인 인증이 완료된 상태이므로 별도 비밀번�
 없음 (빈 바디 또는 생략 가능)
 
 ## 구독 중 탈퇴 제한 (중요)
-유료 플랜을 **구독 중(active/trialing/past_due)** 인 계정은 탈퇴할 수 없습니다.
-먼저 구독을 해지해야 하며, 시도 시 **HTTP 409** + `error.details.code == "active_subscription"` 로 거부됩니다.
+**카드(빌링키)가 등록된** 유료 구독이 `active/trialing/past_due/paused` 인 계정만 탈퇴가 막힙니다.
+시도 시 **HTTP 409** + `error.details.code == "active_subscription"` 로 거부됩니다.
 (탈퇴로 계정만 삭제되면 잔여 유료기간이 환불 없이 사라지고 결제 수단이 정리되지 않기 때문입니다.)
+
+**카드 없는 무료 체험(예: 가입 시 자동 지급되는 프로 30일)은 막지 않습니다** — 정리할
+빌링키도, 환불을 따질 결제도 없어 위 두 근거가 성립하지 않습니다. 그대로 204 로 삭제됩니다.
+
+409 응답에는 `error.details.web_deletion_url` 이 함께 옵니다. 이 주소(`/delete-account`)는
+**구독을 해지하지 않아도** 탈퇴가 진행되는 공개 경로이며, 서버가 구독을 즉시 해지하고
+7일 유예 후 파기합니다. 해지를 원치 않는데 계정만 지우려는 사용자는 이쪽으로 보내세요.
+
 해지 완료(cancelled) 상태에서는 탈퇴가 가능하며, 이때 남아있던 결제 수단(빌링키)은 삭제 시 함께 정리됩니다.
+
+## 오류 응답 형태 (중요)
+이 뷰는 Response 를 직접 만들어 DRF 예외 핸들러를 거치지 않습니다. 그래서 409 는
+`detail`(문자열)과 `{success, error:{code, message, details}}` envelope 를 **동시에** 실어
+보냅니다. 둘 중 무엇을 읽어도 같은 문구가 나옵니다 — 화면에 그대로 띄우세요.
 
 ## 삭제 범위
 계정 삭제 시 아래 데이터가 **모두 영구 삭제**됩니다:
@@ -743,8 +756,18 @@ const handleDeleteAccount = async () => {
     localStorage.removeItem('refresh_token');
     router.push('/login');
   } catch (err) {
-    if (err.response?.status === 401) {
+    const st = err.response?.status;
+    const data = err.response?.data;
+    if (st === 401) {
       alert('로그인이 필요합니다.');
+      return;
+    }
+    // 401 외에도 반드시 사유를 보여준다 — generic 문구로 뭉개면 사용자는 왜 막혔는지 모른다.
+    alert(data?.detail ?? data?.error?.message ?? '잠시 후 다시 시도해 주세요.');
+    const d = data?.error?.details;
+    if (d?.code === 'active_subscription' && d?.web_deletion_url) {
+      // 구독을 해지하지 않고 계정만 지우려는 사용자를 공개 탈퇴 경로로 안내
+      window.location.href = d.web_deletion_url;
     }
   }
 };
@@ -760,7 +783,11 @@ curl -X DELETE http://localhost:8000/api/v1/auth/me/delete/ \\
 | 코드 | 원인 |
 |------|------|
 | 401 | 토큰 없음/만료 |
-| 409 | 유료 구독 중 — 먼저 구독 해지 필요 (`error.details.code == "active_subscription"`) |
+| 409 | **카드 등록된** 유료 구독 중 — 해지 후 재시도하거나 `web_deletion_url` 로 이동 (`error.details.code == "active_subscription"`) |
+
+> ⚠️ 프론트는 **401 외의 상태도 반드시 사유를 표시**해야 합니다. 409 를 generic 문구로
+> 뭉개면 사용자는 왜 막혔는지 알 수 없고, 실제로 그 때문에 원치 않는 구독 해지를 하는
+> 사고가 있었습니다(CS #247995c5). `detail` 을 그대로 띄우면 됩니다.
         """,
         request=None,
         responses={
@@ -776,6 +803,14 @@ curl -X DELETE http://localhost:8000/api/v1/auth/me/delete/ \\
 
         # 구독 중(유료·활성)이면 탈퇴를 막는다. 먼저 해지하도록 안내 —
         # 결제 정리/환불 없이 계정만 삭제되면 잔여 유료기간 손실 + 토스 빌링키 고아가 발생하므로.
+        #
+        # ⚠️ **빌링키가 없으면 막지 않는다** (2026-09-22). 위 두 이유는 카드가 등록돼
+        #    있을 때만 성립한다 — 카드 없는 프로 체험(`trial_kind="auto"`)은 정리할
+        #    빌링키도, 환불을 따질 결제도 없다. 그런데도 TRIALING 이라는 이유로 막으면
+        #    "가입 1초 뒤 자동 지급된 무료 체험" 이 탈퇴를 봉쇄한다. 실제 사고(CS
+        #    #247995c5): 카카오로 잘못 가입한 사용자가 계정을 지우려다 막혀서 **원하지도
+        #    않은 구독 해지**를 먼저 실행했고, 그 해지가 이탈 지표에까지 남았다.
+        #    (자동체험 217건 중 해지 5건인데 4건이 가입 1시간 이내였다.)
         from apps.billing.models import SubscriptionStatus, UserSubscription
 
         sub = UserSubscription.objects.filter(user=user).select_related("plan").first()
@@ -785,20 +820,29 @@ curl -X DELETE http://localhost:8000/api/v1/auth/me/delete/ \\
             SubscriptionStatus.PAST_DUE,
             SubscriptionStatus.PAUSED,  # 정지도 잔여기간/빌링키 보유 → 먼저 해지해야 탈퇴
         )
-        if sub and sub.is_paid_plan and sub.status in blocking_statuses:
+        if sub and sub.is_paid_plan and sub.status in blocking_statuses and sub.has_billing_key:
+            # 이 응답은 DRF 예외 핸들러를 거치지 않는다(Response 직접 생성) → §6 envelope 와
+            # `detail` 을 **동시에** 실어 보낸다. 프론트 탈퇴 모달이 `status===401` 만 분기하고
+            # 나머지를 통째로 generic 문구로 뭉개고 있어(2026-09-22 배포본 확인), 사유가 화면에
+            # 닿지 않으면 사용자는 영문도 모른 채 막힌다. `detail` 은 기존/신규 양쪽이 읽는다.
+            message = (
+                "구독 중에는 탈퇴할 수 없습니다. 먼저 요금제/결제 설정에서 "
+                "구독을 해지한 뒤 다시 시도해 주세요."
+            )
             return Response(
                 {
+                    "detail": message,
                     "success": False,
                     "error": {
                         "code": status.HTTP_409_CONFLICT,
-                        "message": (
-                            "구독 중에는 탈퇴할 수 없습니다. 먼저 요금제/결제 설정에서 "
-                            "구독을 해지한 뒤 다시 시도해 주세요."
-                        ),
+                        "message": message,
                         "details": {
                             "code": "active_subscription",
                             "plan": sub.plan.name,
                             "status": sub.status,
+                            # 해지하지 않고 바로 탈퇴하고 싶은 사용자를 위한 대체 경로.
+                            # 이 경로는 우리가 구독을 해지하고 7일 유예를 준다.
+                            "web_deletion_url": f"{settings.FRONTEND_URL.rstrip('/')}/delete-account",
                         },
                     },
                 },
