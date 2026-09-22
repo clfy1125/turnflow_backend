@@ -4,6 +4,7 @@ Django settings for Instagram Service Backend project.
 Base settings - shared across all environments.
 """
 
+import mimetypes
 from datetime import timedelta
 from pathlib import Path
 
@@ -160,6 +161,22 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
+
+# ⚠️ `.webp` 를 MIME 표에 직접 등록한다 — 빼면 R2 의 webp 가 전부 깨진 타입으로 나간다.
+#
+# django-storages(`storages/backends/s3.py`)는 업로드할 때 `mimetypes.guess_type(name)`
+# 으로 Content-Type 을 정하고, 못 맞히면 `application/octet-stream` 으로 폴백한다.
+# 그런데 python:3.11-slim 이미지에는 `/etc/mime.types` 가 없고 파이썬 내장표에도
+# `.webp` 가 없어서 `guess_type("x.webp") -> (None, None)` 이 된다. `.jpg`·`.png` 는
+# 내장표에 있어 멀쩡하므로 **webp 만 골라서** 깨지고, 그래서 오래 눈에 띄지 않았다.
+# (2026-09-22 실측: prod R2 의 `.webp` 397건이 전부 `application/octet-stream`.
+#  DB 의 `PageMedia.mime_type` 은 `image/webp` 로 맞게 적혀 있어 DB 만 보면 안 보인다.)
+#
+# 크로미움은 `<img>` 에서 스니핑해 그려주지만 그건 관용에 기댄 것이고, 브라우저·웹뷰마다
+# 관용의 폭이 다르다. 여기서 한 번 등록해 두면 이후 업로드는 올바른 타입으로 저장된다.
+# ⚠️ 이미 올라간 파일은 이 설정으로 안 고쳐진다 — R2 copy-object 로 재각인해야 한다.
+mimetypes.add_type("image/webp", ".webp")
+mimetypes.add_type("image/avif", ".avif")
 
 # ─────────────────────────────────────────────────────────────
 # Object Storage (Cloudflare R2, S3-compatible)
