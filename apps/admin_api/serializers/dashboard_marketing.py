@@ -1382,10 +1382,12 @@ class _SnapshotTrialNowSerializer(serializers.Serializer):
         "(재체험 시 과거 기록을 지우지 않으므로 기간 포함까지 봐야 유료 해지와 안 섞인다)"
     )
     no_card = serializers.IntegerField(
-        help_text="체험 중 + **카드 없음** + 미취소 → 과금 대상이 아니다(쿠폰 체험). "
-        "요청은 2분해였지만 이 인원이 실재하므로(prod 실측 9명) 3번째 버킷이 필요하다 — "
-        "will_charge 에 넣으면 '결제 예약'이 거짓이 되고, total 에서 빼면 체험 인원이 축소된다. "
-        "**계약: will_charge + cancelled + no_card == total**"
+        help_text="체험 중 + **카드 없음** + 미취소 → 과금 대상이 아니다. "
+        "카드 없는 프로 30일 자동 지급(billing/auto_trial.py)과 쿠폰 체험이 여기 모인다 — "
+        "자동 지급 도입 후 체험 인원의 다수라 이 값을 빼면 타일이 실제 프로 사용자보다 작아진다. "
+        "will_charge 에 넣으면 '결제 예약'이 거짓이 되므로 버킷을 갈라 둔다. "
+        "**계약: will_charge + cancelled + no_card == total** "
+        "(2026-09-23 부터 명단 `/admin/snapshot/trial/?bucket=no_card` 로 이 인원을 볼 수 있다)"
     )
 
 

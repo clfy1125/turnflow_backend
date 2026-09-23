@@ -8,13 +8,17 @@
 지켜야 할 항등 (프론트 요청서 §공통 ①):
     SNAP-1 count               == snapshot.paying.total
     SNAP-1 ?plan=X count       == snapshot.paying.by_plan[X].count
-    SNAP-2 count               == trial_now.will_charge + trial_now.cancelled
+    SNAP-2 count               == trial_now.total (= will_charge + cancelled + no_card)
     SNAP-2 ?bucket=will_charge == trial_now.will_charge
     SNAP-2 ?bucket=cancelled   == trial_now.cancelled
+    SNAP-2 ?bucket=no_card     == trial_now.no_card
 
-⚠️ ``trial_now.total`` 과는 다르다 — total 에는 ``no_card``(쿠폰 무카드 체험, prod 실측
-9명)가 포함되지만 SNAP-2 는 **카드 등록 체험자만** 담는다(프론트 정의). no_card 를 넣으면
-"체험 종료 후 결제 예정액" 열이 거짓이 된다.
+⭐ 2026-09-23 정책 변경: ``no_card``(카드 없이 프로를 쓰는 체험자)를 **명단에 포함**한다.
+종전엔 "카드 등록 체험자만"이었는데, 카드 없는 프로 30일 자동 지급(``billing/auto_trial.py``)이
+켜지면서 그쪽이 **체험 인원의 다수**가 됐다 — 빼두면 화면의 '프로 체험 인원' 이 실제 프로를
+쓰는 사람보다 한참 작아지고, 그 인원을 어드민에서 찾을 방법이 아예 없었다.
+"결제 예정액" 열이 거짓이 되는 문제는 **금액을 주지 않는 것**으로 막는다(``cancelled`` 과 동일
+취급 — :func:`apps.admin_api.views.snapshot` 의 ``expected_amount``).
 """
 
 from __future__ import annotations
@@ -30,7 +34,8 @@ PAID_EXCLUDE = ["free", "admin"]
 # 체험 버킷 (SNAP-2 ?bucket=)
 BUCKET_WILL_CHARGE = "will_charge"
 BUCKET_CANCELLED = "cancelled"
-TRIAL_BUCKETS = (BUCKET_WILL_CHARGE, BUCKET_CANCELLED)
+BUCKET_NO_CARD = "no_card"
+TRIAL_BUCKETS = (BUCKET_WILL_CHARGE, BUCKET_CANCELLED, BUCKET_NO_CARD)
 
 
 def paying_subscriptions_qs():
@@ -75,7 +80,12 @@ def trial_cancelled_qs(now):
 
 
 def trial_no_card_qs(now):
-    """체험 중 + 카드 없음 + 미취소 → 과금 대상이 아니다(쿠폰 체험). SNAP-2 **제외** 대상."""
+    """체험 중 + 카드 없음 + 미취소 → 과금 대상이 아니다.
+
+    쿠폰 체험과 **카드 없는 프로 30일 자동 지급**(``billing/auto_trial.py``)이 여기 모인다.
+    체험이 끝나면 빌링키가 없어 ``handle_trial_expiry`` 가 과금 없이 무료로 내린다 — 그래서
+    금액 열(``expected_amount``)은 주지 않는다.
+    """
     return (
         UserSubscription.objects.exclude(plan__name__in=PAID_EXCLUDE)
         .filter(current_period_end__gt=now)
@@ -84,29 +94,38 @@ def trial_no_card_qs(now):
 
 
 def trial_roster_qs(now, *, bucket: str | None = None):
-    """`프로 체험 인원` 명단의 모수 — ``will_charge ∪ cancelled`` (no_card 제외).
+    """`프로 체험 인원` 명단의 모수 — ``will_charge ∪ cancelled ∪ no_card``.
 
+    세 버킷의 합집합이 곧 ``trial_now.total`` 이다(타일 값과 같아야 하므로 하나도 빼지 않는다).
     ``bucket`` 을 주면 그 버킷만. 값 검증은 호출 측(뷰)이 화이트리스트로 한다.
     """
     will = trial_will_charge_qs(now)
     cancelled = trial_cancelled_qs(now)
+    no_card = trial_no_card_qs(now)
     if bucket == BUCKET_WILL_CHARGE:
         return will
     if bucket == BUCKET_CANCELLED:
         return cancelled
+    if bucket == BUCKET_NO_CARD:
+        return no_card
     return (
         UserSubscription.objects.exclude(plan__name__in=PAID_EXCLUDE)
         .filter(current_period_end__gt=now)
-        .filter(Q(pk__in=will.values("pk")) | Q(pk__in=cancelled.values("pk")))
+        .filter(
+            Q(pk__in=will.values("pk"))
+            | Q(pk__in=cancelled.values("pk"))
+            | Q(pk__in=no_card.values("pk"))
+        )
     )
 
 
 def bucket_of(sub) -> str:
     """행 하나의 버킷 판정 — 명단 응답의 ``bucket`` 필드.
 
-    프론트는 이 값을 그대로 신뢰한다(자체 재판정 금지). ``trial_roster_qs`` 의 두 하위
-    쿼리와 **같은 조건**이어야 한다: 상태가 TRIALING 이면 will_charge, CANCELLED 면 cancelled.
+    프론트는 이 값을 그대로 신뢰한다(자체 재판정 금지). ``trial_roster_qs`` 의 세 하위
+    쿼리와 **같은 조건**이어야 한다: TRIALING 이면 카드 유무로 will_charge / no_card 가
+    갈리고, 그 밖(CANCELLED)이면 cancelled.
     """
     if sub.status == SubscriptionStatus.TRIALING:
-        return BUCKET_WILL_CHARGE
+        return BUCKET_WILL_CHARGE if sub.billing_key_issued_at else BUCKET_NO_CARD
     return BUCKET_CANCELLED

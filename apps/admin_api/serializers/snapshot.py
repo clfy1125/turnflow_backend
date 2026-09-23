@@ -65,17 +65,21 @@ class AdminTrialMemberSerializer(serializers.Serializer):
         allow_null=True, help_text="이번 체험의 총 일수 (쿠폰 보너스 포함 — 44 등)"
     )
     bucket = serializers.CharField(
-        help_text="`will_charge`(기간말 과금 예정) / `cancelled`(체험 중 취소 — 과금 없음). "
-        "서버 판정이 정본이며 프론트에서 재판정하지 않는다"
+        help_text="`will_charge`(기간말 과금 예정) / `cancelled`(체험 중 취소 — 과금 없음) / "
+        "`no_card`(카드 없이 체험 중 — 카드 없는 프로 자동 지급·쿠폰. 기간말에 과금 없이 "
+        "무료로 내려간다). 서버 판정이 정본이며 프론트에서 재판정하지 않는다"
     )
     expected_amount = serializers.IntegerField(
         allow_null=True,
-        help_text="체험 종료 후 결제 예정액(원, 서버 계산). `cancelled` 이면 null",
+        help_text="체험 종료 후 결제 예정액(원, 서버 계산). `will_charge` 에만 값이 있고 "
+        "`cancelled` · `no_card` 는 null",
     )
     conversion_consent_required = serializers.BooleanField(
         help_text="유료전환 2차 동의 대기 중인가 (30일 초과 체험 + 미동의 + 30일 창 안). "
         "true 인데 동의가 안 들어오면 체험 종료 시 **결제되지 않고 무료 전환**된다"
     )
-    card_company = serializers.CharField(help_text="카드사 (표시용, 이미 마스킹된 값)")
+    card_company = serializers.CharField(
+        help_text="카드사 (표시용, 이미 마스킹된 값). `no_card` 는 빈 문자열"
+    )
     card_number_masked = serializers.CharField(help_text="마스킹된 카드번호 (예: 433012******123*)")
     date_joined = serializers.DateTimeField(help_text="가입일")

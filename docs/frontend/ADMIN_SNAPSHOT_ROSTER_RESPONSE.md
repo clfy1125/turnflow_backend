@@ -3,6 +3,15 @@
 작성 2026-08-10 · 백엔드 → 어드민 콘솔팀
 요청서: `10_turnflow_admin/docs/ADMIN_API_REQUESTS.md` 18차
 
+> **2026-09-23 변경 — SNAP-2 모수에 `no_card` 를 포함합니다 (breaking).**
+> 카드 없는 프로 30일 자동 지급(`billing/auto_trial.py`)이 켜지면서 **카드 없이 프로를 쓰는
+> 체험자가 체험 인원의 다수**가 됐습니다. 종전 정의("카드 등록 체험자만")로는 그 인원이
+> 타일에도 명단에도 없어서, 지금 프로를 쓰는 사람을 어드민에서 찾을 방법이 없었습니다.
+> - `count == trial_now.total` (= `will_charge + cancelled + no_card`) — 종전 2버킷 합이 아닙니다
+> - `?bucket=no_card` 추가 (400 의 `details.allowed` 도 3개로 늘었습니다)
+> - `expected_amount` 는 **`will_charge` 에만** 값이 있습니다 (`no_card` 는 `cancelled` 과 같이 `null`)
+> - 타일 값도 `trial_now.total` 로 바꿔 주세요 — 세 칩(결제 예약·취소·카드 없음)의 합이 타일입니다
+
 **표에 적힌 2건(SNAP-1, SNAP-2) 모두 구현했습니다.** 본문 개수도 2건으로 일치했습니다(누락 없음).
 공통 요청 5건(①항등 ②캐시 ③정렬 400 ④page_size ⑤권한)도 전부 반영했고, ②는 **1번안(같은 캐시를
 읽는다)** 을 택했습니다.
@@ -140,8 +149,9 @@ USR-2 회신대로 맞습니다. 이 값이 곧 **첫 결제 시각**입니다.
 
 ### `expected_amount`
 
-`renewal_amount` 서버 계산값. **`bucket=cancelled` 면 `null`** 입니다 — 취소자는 과금되지
-않으므로 금액을 주면 "결제 예정"으로 오독됩니다.
+`renewal_amount` 서버 계산값. **`bucket=will_charge` 에만 값이 있습니다.** `cancelled` 과
+`no_card` 는 `null` 입니다 — 둘 다 기간말에 과금되지 않으므로 금액을 주면 "결제 예정"으로
+오독됩니다.
 
 ### `conversion_consent_required` — 새 필드 (오늘 추가된 기능)
 
@@ -157,22 +167,29 @@ USR-2 회신대로 맞습니다. 이 값이 곧 **첫 결제 시각**입니다.
 30일 체험자는 항상 `false` 입니다(결제 화면 동의로 요건 충족).
 상세: `docs/frontend/PAYMENT_CONSENT_FRONTEND.md`
 
-### 모수 — `no_card` 제외 (요청서 정의대로)
+### 모수 — 지금 체험 중인 회원 **전원** (2026-09-23 변경)
 
 ```
-count == trial_now.will_charge + trial_now.cancelled
+count == trial_now.total == will_charge + cancelled + no_card
 ```
 
-⚠️ **`trial_now.total` 과는 다릅니다.** `total` 에는 `no_card`(쿠폰 무카드 체험, prod 실측 9명)가
-포함되지만 이 명단은 카드 등록 체험자만 담습니다. 요청서 정의와 같고, 화면에서 타일 숫자로
-`trial_now.total` 을 쓰고 있으면 명단 count 와 어긋납니다 — 타일에는
-**`will_charge + cancelled`** 를 쓰거나, `no_card` 를 별도 배지로 빼 주세요.
+세 버킷의 뜻:
+
+| 버킷 | 뜻 | 기간말 |
+|---|---|---|
+| `will_charge` | 카드 있음 · 미취소 | 과금된다 |
+| `cancelled` | 체험 중 취소 (기간 남음) | 과금 없이 무료로 |
+| `no_card` | **카드 없음** · 미취소 — 카드 없는 프로 자동 지급, 쿠폰 체험 | 과금 없이 무료로 |
+
+⚠️ 종전에는 `no_card` 를 뺐습니다("카드 등록 체험자만"). 자동 지급 도입 후 그 인원이 다수가
+되면서 정의를 바꿨습니다 — **타일 숫자도 `trial_now.total` 로 맞춰 주세요.** 금액 오독은
+`expected_amount = null` 로 막습니다.
 
 ### 필터 / 정렬
 
 | 파라미터 | 동작 |
 |---|---|
-| `?bucket=` | `will_charge` / `cancelled` (칩). 허용값 밖은 **400** |
+| `?bucket=` | `will_charge` / `cancelled` / `no_card` (칩). 허용값 밖은 **400** |
 | `?search=` | 이메일·이름 부분일치 |
 | `?ordering=` | `trial_ends_at` · `trial_started_at` · `date_joined` (± 부호). **기본 `trial_ends_at`**(종료 임박순) |
 | `?page_size=` | 기본 20, 상한 500 |
@@ -186,9 +203,10 @@ count == trial_now.will_charge + trial_now.cancelled
 ```
 SNAP-1 count                  == snapshot.paying.total
 SNAP-1 ?plan=X count          == snapshot.paying.by_plan[X].count
-SNAP-2 count                  == trial_now.will_charge + trial_now.cancelled
+SNAP-2 count                  == trial_now.total
 SNAP-2 ?bucket=will_charge    == trial_now.will_charge
 SNAP-2 ?bucket=cancelled      == trial_now.cancelled
+SNAP-2 ?bucket=no_card        == trial_now.no_card
 ```
 
 `apps/admin_api/tests_snapshot_rosters.py` 가 **대시보드 응답을 실제로 호출해서** 타일 숫자와
@@ -309,5 +327,6 @@ marketing_viewer → 403  {"error": {"details": {"code": "section_forbidden", ..
 타일 전체 클릭 영역(투명 링크 오버레이) · 하단 칩 → 필터된 명단 · **명단에 기간 컨트롤 두지
 않음**(전체 현황은 기간 무관 현재값이므로 맞습니다) · 행 전체 클릭 · 마케팅 파트너 화면 불변.
 
-`bucket` 칩(`프로 41` · `취소 3`)에 쓰실 숫자는 타일의 `trial_now.will_charge` /
-`trial_now.cancelled` 이고, 명단의 `?bucket=` count 와 정확히 같습니다.
+`bucket` 칩(`결제 예약 41` · `취소 3` · `카드 없음 9`)에 쓰실 숫자는 타일의
+`trial_now.will_charge` / `trial_now.cancelled` / `trial_now.no_card` 이고, 명단의 `?bucket=`
+count 와 정확히 같습니다.

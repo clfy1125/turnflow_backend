@@ -111,6 +111,7 @@ from apps.admin_api.roles import resolve_admin_role
 from apps.admin_api.serializers.dashboard_marketing import AdminMarketingDashboardSerializer
 from apps.admin_api.snapshot_rosters import (
     BUCKET_CANCELLED,
+    BUCKET_NO_CARD,
     BUCKET_WILL_CHARGE,
     paying_subscriptions_qs,
     trial_cancelled_qs,
@@ -3840,6 +3841,17 @@ def _roster_id_maps(now) -> dict:
         {
             str(pk): BUCKET_CANCELLED
             for pk in trial_cancelled_qs(now).values_list("pk", flat=True)[
+                : SNAPSHOT_ROSTER_ID_CACHE_MAX + 1
+            ]
+        }
+    )
+    # 카드 없는 체험(자동 지급·쿠폰)도 명단에 담는다 — 2026-09-23 부터 타일 값이
+    # `will_charge + cancelled + no_card`(= trial_now.total) 라서 여기서 빠지면 명단이
+    # 타일보다 작아진다. 금액을 주지 않는 것으로 "결제 예정액" 오독을 막는다(뷰 참조).
+    trial.update(
+        {
+            str(pk): BUCKET_NO_CARD
+            for pk in trial_no_card_qs(now).values_list("pk", flat=True)[
                 : SNAPSHOT_ROSTER_ID_CACHE_MAX + 1
             ]
         }

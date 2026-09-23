@@ -5,7 +5,7 @@
 가장 중요한 계약은 **타일 숫자와 명단 count 의 항등**이다 (요청서 §공통 ①):
     SNAP-1 count               == snapshot.paying.total
     SNAP-1 ?plan=X count       == snapshot.paying.by_plan[X].count
-    SNAP-2 count               == trial_now.will_charge + trial_now.cancelled
+    SNAP-2 count               == trial_now.total (= will_charge + cancelled + no_card)
     SNAP-2 ?bucket=Y count     == trial_now.Y
 
 주의:
@@ -272,28 +272,32 @@ class TestPayingRoster:
 
 @pytest.mark.django_db
 class TestTrialRoster:
-    def test_count_matches_will_charge_plus_cancelled(self, staff_client, clean_slate, pro_plan):
+    def test_count_matches_trial_now_total(self, staff_client, clean_slate, pro_plan):
+        """명단 count == 타일 total. **카드 없는 체험자까지 포함**한다 (2026-09-23)."""
         _mk_trial(pro_plan)  # will_charge
         _mk_trial(pro_plan)  # will_charge
         _mk_trial(pro_plan, cancelled=True)  # cancelled
-        _mk_trial(pro_plan, card=False)  # no_card → 제외
+        _mk_trial(pro_plan, card=False)  # no_card — 카드 없는 프로 자동 지급/쿠폰
 
         tile = _tile(staff_client)
         trial_now = tile["trial_now"]
         res = staff_client.get(TRIAL_URL)
         assert res.status_code == 200, res.data
-        assert res.data["count"] == trial_now["will_charge"] + trial_now["cancelled"] == 3
-        # total 은 no_card 를 포함하므로 명단 count 와 다르다 (계약 확인)
-        assert trial_now["total"] == 4
+        assert res.data["count"] == trial_now["total"] == 4
+        assert (
+            trial_now["will_charge"] + trial_now["cancelled"] + trial_now["no_card"]
+            == trial_now["total"]
+        )
         assert res.data["as_of"] == tile["as_of"]
 
     def test_bucket_filter_matches_tile(self, staff_client, clean_slate, pro_plan):
         _mk_trial(pro_plan)
         _mk_trial(pro_plan)
         _mk_trial(pro_plan, cancelled=True)
+        _mk_trial(pro_plan, card=False)
 
         trial_now = _tile(staff_client)["trial_now"]
-        for bucket in ("will_charge", "cancelled"):
+        for bucket in ("will_charge", "cancelled", "no_card"):
             res = staff_client.get(f"{TRIAL_URL}?bucket={bucket}")
             assert res.data["count"] == trial_now[bucket], bucket
             assert {r["bucket"] for r in res.data["results"]} <= {bucket}
@@ -302,7 +306,25 @@ class TestTrialRoster:
         res = staff_client.get(f"{TRIAL_URL}?bucket=nope")
         assert res.status_code == 400
         assert res.data["error"]["details"]["field"] == "bucket"
-        assert res.data["error"]["details"]["allowed"] == ["will_charge", "cancelled"]
+        assert res.data["error"]["details"]["allowed"] == [
+            "will_charge",
+            "cancelled",
+            "no_card",
+        ]
+
+    def test_no_card_row_has_no_amount_and_no_card_fields(
+        self, staff_client, clean_slate, pro_plan
+    ):
+        """카드 없는 체험자 — 명단에는 있지만 기간말 과금이 없어 금액·카드 열이 비어 있다."""
+        user, _ = _mk_trial(pro_plan, card=False)
+        res = staff_client.get(f"{TRIAL_URL}?bucket=no_card")
+        assert res.data["count"] == 1
+        row = res.data["results"][0]
+        assert row["user_id"] == user.pk
+        assert row["bucket"] == "no_card"
+        assert row["expected_amount"] is None
+        assert row["card_company"] == ""
+        assert row["card_number_masked"] == ""
 
     def test_cancelled_has_no_expected_amount(self, staff_client, clean_slate, pro_plan):
         _mk_trial(pro_plan, cancelled=True)

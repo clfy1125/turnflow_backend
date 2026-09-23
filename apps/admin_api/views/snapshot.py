@@ -39,7 +39,7 @@ from apps.admin_api.serializers.snapshot import (
     AdminTrialMemberSerializer,
 )
 from apps.admin_api.snapshot_rosters import (
-    BUCKET_CANCELLED,
+    BUCKET_WILL_CHARGE,
     TRIAL_BUCKETS,
     bucket_of,
     paying_subscriptions_qs,
@@ -366,23 +366,26 @@ class AdminTrialSnapshotView(APIView):
 마케팅 대시보드 상단 `전체 현황` 의 **`프로 체험 인원`** 타일을 구성하는 회원들의 명단입니다.
 
 ## 모수 정의
-**카드가 등록된 상태로 지금 체험 기간 중**인 회원 = `trial_now.will_charge + cancelled`.
+**지금 체험 기간 중**인 회원 전원 = `snapshot.trial_now.total`.
 ```
 will_charge  체험 중(TRIALING) + 카드 있음 + 미취소  → 기간말에 과금된다
 cancelled    체험 중 취소(기간 남음)                 → 과금 없이 free 로 내려간다
+no_card      체험 중(TRIALING) + 카드 없음 + 미취소  → 과금 없이 free 로 내려간다
 ```
-⚠️ `trial_now.no_card`(쿠폰 무카드 체험)는 **제외**합니다 — 자동 유료전환 대상이 아니라
-"결제 예정액" 열이 거짓이 되기 때문입니다. 따라서 이 명단의 `count` 는
-`snapshot.trial_now.total` 이 아니라 **`will_charge + cancelled`** 와 같습니다.
+`no_card` 는 **카드 없는 프로 30일 자동 지급**(`billing/auto_trial.py`)과 쿠폰 체험입니다.
+2026-09-23 이전에는 이 명단에서 빠져 있었지만, 자동 지급이 체험 인원의 다수가 되면서
+'지금 프로를 쓰는 사람' 을 어드민에서 찾을 수 없게 돼 포함시켰습니다. 과금이 없다는 사실은
+`expected_amount = null` 로 드러냅니다.
 
 `bucket` 판정은 15차에 정리한 서버 판정(`cancelled_during_trial_at >= current_period_start`)이
 정본입니다 — 프론트에서 재판정하지 마세요.
 
 ## 지켜지는 항등
 ```
-count                        == trial_now.will_charge + trial_now.cancelled
+count                        == trial_now.total
 ?bucket=will_charge 의 count  == trial_now.will_charge
 ?bucket=cancelled 의 count    == trial_now.cancelled
+?bucket=no_card 의 count      == trial_now.no_card
 ```
 명단은 타일을 만든 그 순간의 id→bucket 매핑을 읽으므로, 캐시 창(900초) 안에 누군가 취소해도
 `bucket` 별 부분합이 타일과 어긋나지 않습니다.
@@ -394,13 +397,14 @@ count                        == trial_now.will_charge + trial_now.cancelled
 ## 쿼리 파라미터
 | 파라미터 | 설명 |
 |---|---|
-| `bucket` | `will_charge` / `cancelled` (칩). 허용값 밖은 400 |
+| `bucket` | `will_charge` / `cancelled` / `no_card` (칩). 허용값 밖은 400 |
 | `search` | 이메일·이름 부분일치 |
 | `ordering` | 화이트리스트: `trial_ends_at` · `trial_started_at` · `date_joined` (± 부호). 기본 `trial_ends_at`(종료 임박순). **허용값 밖은 400** |
 | `page` / `page_size` | 기본 20, 상한 500 |
 
 ## 필드 주의사항
-- `expected_amount` 는 서버 계산값(`renewal_amount`). `bucket=cancelled` 면 `null` 입니다.
+- `expected_amount` 는 서버 계산값(`renewal_amount`). **`will_charge` 에만 값이 있고**
+  `cancelled` · `no_card` 는 `null` 입니다(둘 다 기간말에 과금되지 않습니다).
 - `trial_started_at` 은 **이번 체험 기간의 시작**(`current_period_start`)입니다. `trial_used_at`
   은 '1인 1회' 어뷰징 방어용 내구 필드라 재체험 이력이 섞일 수 있어 쓰지 않습니다.
 - `conversion_consent_required` (2026-08-10 추가): 30일 초과 체험(쿠폰 연장)인데 유료전환
@@ -421,7 +425,7 @@ count                        == trial_now.will_charge + trial_now.cancelled
                 name="bucket",
                 type=str,
                 location=OpenApiParameter.QUERY,
-                description="`will_charge` / `cancelled`. 허용값 밖은 400.",
+                description="`will_charge` / `cancelled` / `no_card`. 허용값 밖은 400.",
             ),
             OpenApiParameter(
                 name="search",
@@ -540,9 +544,10 @@ count                        == trial_now.will_charge + trial_now.cancelled
                     "trial_ends_at": sub.current_period_end,
                     "trial_total_days": sub.trial_total_days,
                     "bucket": row_bucket,
-                    # 취소자는 과금되지 않으므로 금액을 주지 않는다(주면 '결제 예정' 오독).
+                    # 기간말에 실제로 과금되는 버킷에만 금액을 준다 — 취소자와 카드 없는
+                    # 체험자는 과금이 없으므로 금액을 주면 '결제 예정' 으로 오독된다.
                     "expected_amount": (
-                        None if row_bucket == BUCKET_CANCELLED else sub.renewal_amount
+                        sub.renewal_amount if row_bucket == BUCKET_WILL_CHARGE else None
                     ),
                     "conversion_consent_required": sub.conversion_consent_required,
                     "card_company": sub.card_company or "",
