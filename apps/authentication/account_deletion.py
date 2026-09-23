@@ -232,6 +232,10 @@ def confirm_deletion(*, raw_token: str) -> dict:
     # DB 트랜잭션이 외부 HTTP 를 붙들게 된다.
     billing = cancel_subscription_for_deletion(user)
 
+    # IG 연동 해제도 트랜잭션 밖에서 먼저 한다 — 웹훅 구독 해제(Graph 호출)가 섞이면
+    # DB 트랜잭션이 외부 HTTP 를 붙들게 된다. 실패해도 탈퇴는 계속된다.
+    instagram = release_ig_connections(user)
+
     now = timezone.now()
     deadline = _grace_deadline(now)
 
@@ -253,10 +257,11 @@ def confirm_deletion(*, raw_token: str) -> dict:
     _blacklist_tokens(user)
 
     logger.info(
-        "account_deletion: 확정 user_id=%s purge_at=%s paid=%s",
+        "account_deletion: 확정 user_id=%s purge_at=%s paid=%s ig_released=%s",
         user.pk,
         deadline.isoformat(),
         billing.get("was_paid"),
+        instagram["released"],
     )
 
     # 접수 확인 + 복구 링크 메일 (best-effort — 실패가 탈퇴를 되돌리면 안 된다)
@@ -265,14 +270,67 @@ def confirm_deletion(*, raw_token: str) -> dict:
 
         send_account_deletion_confirmed_email.delay(user.pk)
     except Exception:  # noqa: BLE001
-        logger.warning("account_deletion: 접수 메일 enqueue 실패 user_id=%s", user.pk, exc_info=True)
+        logger.warning(
+            "account_deletion: 접수 메일 enqueue 실패 user_id=%s", user.pk, exc_info=True
+        )
 
     return {
         "email_masked": mask_email(user.email),
         "purge_at": deadline.isoformat(),
         "cancelled_subscription": billing.get("was_paid", False),
+        "instagram_disconnected": instagram["released"],
         **legal_notice(),
     }
+
+
+def release_ig_connections(user) -> dict:
+    """탈퇴 확정에 수반되는 IG 연동 해제. 요약 dict 를 돌려준다.
+
+    ⭐ **왜 유예 만료(purge)까지 미루면 안 되는가** — 우리 규칙은 "IG 계정 하나 =
+    워크스페이스 하나"이고 점유 판정이 ``status != REVOKED`` 다
+    (``IGAccountConnection.find_conflicting_connection``). 그래서 탈퇴를 확정해도
+    연동 행이 살아 있으면 **그 IG 는 유예 7일 동안 아무 데도 연결할 수 없다.**
+    계정을 갈아타려고 옛 계정을 지운 사용자가 정확히 여기에 갇힌다 — 본인은 시킨 대로
+    탈퇴까지 했는데 새 계정에서 ``ALREADY_CONNECTED_ELSEWHERE`` 만 반복해서 만난다.
+    (실제 사고 CS #baf92c82: 새 계정에서 15분간 19회 연동 시도, 전부 차단.)
+
+    ``disconnect()`` 를 쓰는 이유 — 점유만 푸는 게 아니라 **Meta 웹훅 구독까지 끊어야**
+    한다. 구독을 남기면 주인 없는 연동으로 댓글 웹훅이 계속 날아온다. 토큰도 함께
+    폐기된다.
+
+    ⚠️ **복구(restore)해도 IG 는 되살아나지 않는다.** 구독과 같은 성질이다 — 복구 화면이
+    "인스타그램은 다시 연동해야 한다"를 반드시 알려야 한다(``restore_account`` 참고).
+    되살리는 대신 점유 판정에서 유예 중 계정을 빼는 설계는 **쓰면 안 된다**: 복구 시점에
+    같은 IG 를 두 워크스페이스가 물게 되고, 그러면 댓글 하나에 DM 이 두 번 나간다.
+    """
+    from apps.integrations.models import IGAccountConnection
+
+    live = IGAccountConnection.objects.filter(workspace__owner=user).exclude(
+        status=IGAccountConnection.Status.REVOKED
+    )
+
+    released, failed = 0, 0
+    for conn in live:
+        try:
+            conn.disconnect(reason="account_deletion")
+            released += 1
+        except Exception:  # noqa: BLE001 — 연동 해제 실패가 탈퇴를 막으면 안 된다
+            failed += 1
+            logger.warning(
+                "account_deletion: IG 연동 해제 실패 user_id=%s conn_id=%s",
+                user.pk,
+                conn.pk,
+                exc_info=True,
+            )
+
+    if released or failed:
+        logger.info(
+            "account_deletion: IG 연동 해제 user_id=%s released=%s failed=%s",
+            user.pk,
+            released,
+            failed,
+        )
+    return {"released": released, "failed": failed}
 
 
 def _blacklist_tokens(user) -> None:
@@ -299,6 +357,10 @@ def restore_account(*, user) -> dict:
     ⚠️ **구독은 되살아나지 않는다.** 확정 시점에 이미 해지하고 빌링키를 지웠으므로
     복구된 계정은 무료 플랜 상태이고 카드를 다시 등록해야 한다. 이 사실을 복구
     화면·메일이 반드시 알려줘야 한다 — 안 알리면 "복구했는데 유료가 아니다"가 된다.
+
+    ⚠️ **인스타그램 연동도 되살아나지 않는다** — 같은 이유다. 확정 시점에
+    ``release_ig_connections`` 가 토큰을 폐기하고 웹훅 구독을 끊었다. 복구 후에는
+    연동을 다시 해야 하고, 그때 정지된 캠페인은 사용자가 직접 재개해야 한다.
     """
     if not user.is_pending_deletion:
         raise DeletionError("not_pending", "탈퇴 접수 상태가 아닙니다.")
@@ -308,12 +370,15 @@ def restore_account(*, user) -> dict:
         locked.is_active = True
         locked.deletion_requested_at = None
         locked.deletion_scheduled_at = None
-        locked.save(
-            update_fields=["is_active", "deletion_requested_at", "deletion_scheduled_at"]
-        )
+        locked.save(update_fields=["is_active", "deletion_requested_at", "deletion_scheduled_at"])
 
     logger.info("account_deletion: 복구 user_id=%s", user.pk)
-    return {"email_masked": mask_email(user.email), "subscription_restored": False}
+    return {
+        "email_masked": mask_email(user.email),
+        "subscription_restored": False,
+        # 확정 시점에 연동을 끊었으므로 복구해도 IG 는 비어 있다. 화면이 재연동을 안내한다.
+        "instagram_reconnect_required": True,
+    }
 
 
 def restore_by_token(*, raw_token: str) -> dict:

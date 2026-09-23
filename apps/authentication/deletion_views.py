@@ -362,7 +362,15 @@ class AccountDeletionConfirmView(APIView):
 - `email_masked`: 마스킹된 이메일
 - `purge_at`: 영구 삭제 예정 시각 (ISO8601)
 - `cancelled_subscription` (bool): 이 호출로 유료 구독을 해지했는지
+- `instagram_disconnected` (int): 이 호출로 해제한 인스타그램 연동 수
 - `grace_days`, `deleted_items`, `legal_retention`: 고지문
+
+## 인스타그램 연동은 이 시점에 해제됩니다
+유예 기간이 끝날 때까지 기다리지 않고 **확정 즉시** 연동을 끊습니다(토큰 폐기 +
+웹훅 구독 해제). 하나의 인스타그램 계정은 하나의 워크스페이스에만 연결할 수 있어서,
+연동을 남겨두면 **유예 7일 동안 그 인스타그램 계정을 어디에도 연결할 수 없기**
+때문입니다. 계정을 갈아타려고 탈퇴한 사용자가 새 계정에서 연동을 시도하면
+`ALREADY_CONNECTED_ELSEWHERE` 로 막히는 사고가 실제로 있었습니다(CS #baf92c82).
 
 ## 사용 예시
 ```bash
@@ -375,6 +383,7 @@ curl -X POST https://api.turnflow.link/api/v1/auth/deletion/confirm/ \\
   "email_masked": "us***@example.com",
   "purge_at": "2026-08-28T05:12:00Z",
   "cancelled_subscription": true,
+  "instagram_disconnected": 1,
   "grace_days": 7,
   "deleted_items": ["..."],
   "legal_retention": [{"item": "...", "basis": "...", "period": "5년"}]
@@ -435,9 +444,15 @@ class AccountDeletionRestoreView(APIView):
 응답의 `subscription_restored` 는 항상 `false` 이며, 화면에서 이 사실을 반드시
 안내해야 합니다.
 
+## ⚠️ 인스타그램 연동도 복구되지 않습니다
+같은 이유입니다 — 탈퇴 확정 시점에 토큰을 폐기하고 웹훅 구독을 끊었습니다. 복구 후
+**연동을 다시 해야 하며**, 그때 정지된 자동 DM 캠페인은 사용자가 직접 재개해야 합니다.
+응답의 `instagram_reconnect_required` 는 항상 `true` 입니다.
+
 ## 응답 필드
 - `email_masked`: 마스킹된 이메일
 - `subscription_restored` (bool): 항상 `false`
+- `instagram_reconnect_required` (bool): 항상 `true` — 재연동 안내 필요
 
 ## 다른 복구 경로
 복구 메일을 잃어버린 경우, 탈퇴한 계정으로 **로그인을 시도**하면
@@ -450,7 +465,11 @@ curl -X POST https://api.turnflow.link/api/v1/auth/deletion/restore/ \\
   -H "Content-Type: application/json" -d '{"token":"AbC..."}'
 ```
 ```json
-{ "email_masked": "us***@example.com", "subscription_restored": false }
+{
+  "email_masked": "us***@example.com",
+  "subscription_restored": false,
+  "instagram_reconnect_required": true
+}
 ```
 
 ## 에러
