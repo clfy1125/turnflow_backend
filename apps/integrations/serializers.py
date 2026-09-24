@@ -633,6 +633,33 @@ class AutoDMCampaignListSerializer(AutoDMCampaignSerializer):
         return self._enrich(obj)["last_sent_at"]
 
 
+class AutoDMCampaignListLightSerializer(AutoDMCampaignListSerializer):
+    """목록(list) 전용 — 카드가 절대 읽지 않는 대형 문구 배열을 뺀 경량 응답.
+
+    ``recovery_reply_templates`` 와 ``public_reply_templates`` 는 캠페인마다 수십 개의
+    문구가 들어가는 배열이라 **목록 응답의 62% 를 혼자 차지한다**(실측: 캠페인 52개
+    계정에서 471KB 중 128KB + 33KB). 그런데 배포된 프론트 번들 53개 청크를 전수
+    조사하면 이 두 필드는 ``CampaignEditorPageRoute`` · ``CampaignDetailPage``
+    **두 청크에만** 존재하고, 그 화면들은 목록 응답을 재활용하지 않고
+    ``GET /auto-dm-campaigns/{id}/`` 로 따로 조회한다(``fetchCampaignDetail``).
+    → 목록에서 빼도 화면이 깨지지 않는다.
+
+    ⚠️ **상세(retrieve)·pause·resume 에는 그대로 둔다.** 그쪽은 편집 화면이 값을
+    읽으므로 빼면 문구가 통째로 사라진다. 그래서 목록에만 이 경량 serializer 를 쓴다.
+
+    배경: 이 엔드포인트 하나가 24시간 API 트래픽의 49%(57.9MB / 2,806회)였고,
+    한국 사용자는 요청마다 태평양을 건너는 지연을 얹어 받고 있었다
+    (CF 가 우리 존을 LAX 에서 서빙 — 요청당 +370ms).
+    """
+
+    class Meta(AutoDMCampaignListSerializer.Meta):
+        fields = [
+            f
+            for f in AutoDMCampaignListSerializer.Meta.fields
+            if f not in ("recovery_reply_templates", "public_reply_templates")
+        ]
+
+
 class CampaignSummaryCountsSerializer(serializers.Serializer):
     """상태별 캠페인 개수."""
 

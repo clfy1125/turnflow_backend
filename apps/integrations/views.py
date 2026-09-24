@@ -55,6 +55,7 @@ from .models import (
 from .serializers import (
     AutoDMCampaignCopySerializer,
     AutoDMCampaignCreateSerializer,
+    AutoDMCampaignListLightSerializer,
     AutoDMCampaignListSerializer,
     AutoDMCampaignScheduleSerializer,
     AutoDMCampaignSerializer,
@@ -2228,7 +2229,11 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         # 목록/상세/토글 응답은 per-item 통계 enrichment 포함 serializer 사용.
         # 상세(retrieve)도 포함한다 — 프론트가 상세 화면에서 목록과 같은 통계 필드를 쓰는데
         # 예전엔 기본 serializer 라 delivered_count 등이 빠져 있었다(2026-08-05 요청).
-        if self.action in ("list", "retrieve", "pause", "resume"):
+        # 목록만은 경량판 — 카드가 안 읽는 대형 문구 배열 2개를 뺀다(응답 -62%).
+        # 상세/pause/resume 은 편집 화면이 그 값을 읽으므로 전체 필드를 유지한다.
+        if self.action == "list":
+            return AutoDMCampaignListLightSerializer
+        if self.action in ("retrieve", "pause", "resume"):
             return AutoDMCampaignListSerializer
         return AutoDMCampaignSerializer
 
@@ -3334,6 +3339,19 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         이 목록 조회가 확보를 예약하므로, 잠시 뒤 다시 조회하면 채워집니다(응답을 막지 않습니다).
         릴스/동영상은 커버 이미지, 캐러셀은 첫 슬라이드가 썸네일이 됩니다.
 
+        ## 목록에서 빠지는 필드 (2026-09-24)
+        응답 경량화를 위해 **목록 응답에만** 아래 두 필드를 넣지 않습니다. 값이 필요하면
+        상세 `GET .../auto-dm-campaigns/{id}/` 를 쓰세요(그쪽은 예전 그대로 전부 내려갑니다).
+
+        | 빠진 필드 | 어디서 받나 |
+        |---|---|
+        | `recovery_reply_templates` | 상세 조회 |
+        | `public_reply_templates` | 상세 조회 |
+
+        캠페인마다 문구가 수십 개 들어가는 배열이라 **목록 응답 용량의 62%** 를 둘이
+        차지했습니다(실측: 캠페인 52개 계정에서 471KB → 180KB). 편집·상세 화면은 원래
+        상세 조회를 따로 하므로 화면 동작에는 영향이 없습니다.
+
         ## 쿼리 파라미터
         | 파라미터 | 타입 | 설명 |
         |---|---|---|
@@ -3512,7 +3530,7 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
             ),
         ],
         responses={
-            200: AutoDMCampaignListSerializer(many=True),
+            200: AutoDMCampaignListLightSerializer(many=True),
             400: OpenApiResponse(
                 description=(
                     "잘못된 필터/정렬 값 (날짜·불리언 형식 오류, 허용되지 않은 "
