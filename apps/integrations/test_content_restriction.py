@@ -219,15 +219,58 @@ class TestLiveSignal:
         assert v.source == icr.SOURCE_LIVE
         assert v.blocking is True
 
-    def test_마커_없고_본문이_크면_정상(self, settings):
+    def test_한국어_마커도_제한_확정(self, settings):
+        """인스타는 Accept-Language 에 따라 문구를 바꾼다 — 2026-09 에 이것 때문에 전부 놓쳤다."""
         settings.IG_RESTRICTION_LIVE_CHECK_ENABLED = True
-        resp = MagicMock(status_code=200, text="y" * 950_000)
+        body = "x" * 700_000 + icr._LIVE_MARKER_KO
+        resp = MagicMock(status_code=200, text=body)
+        with patch("apps.integrations.ig_content_restriction.requests.get", return_value=resp):
+            v = icr.check_live(
+                "https://www.instagram.com/reel/KO/", media_id=_media(), use_cache=False
+            )
+        assert v.state == icr.STATE_RESTRICTED
+        assert v.blocking is True
+
+    def test_영문_대체문구도_제한_확정(self, settings):
+        settings.IG_RESTRICTION_LIVE_CHECK_ENABLED = True
+        resp = MagicMock(status_code=200, text="x" * 700_000 + icr._LIVE_MARKER_ALT)
+        with patch("apps.integrations.ig_content_restriction.requests.get", return_value=resp):
+            v = icr.check_live(
+                "https://www.instagram.com/reel/EN/", media_id=_media(), use_cache=False
+            )
+        assert v.state == icr.STATE_RESTRICTED
+
+    def test_마커_없어도_미디어_페이로드가_있으면_정상(self, settings):
+        settings.IG_RESTRICTION_LIVE_CHECK_ENABLED = True
+        resp = MagicMock(status_code=200, text="y" * 950_000 + '"media_type":2')
         with patch("apps.integrations.ig_content_restriction.requests.get", return_value=resp):
             v = icr.check_live(
                 "https://www.instagram.com/reel/B/", media_id=_media(), use_cache=False
             )
         assert v.state == icr.STATE_OK
         assert v.blocking is False
+
+    def test_본문이_작아도_미디어_페이로드가_있으면_정상(self, settings):
+        """크기 임계는 계속 밀린다 — 판정은 구조 신호가 한다(드리프트 내성)."""
+        settings.IG_RESTRICTION_LIVE_CHECK_ENABLED = True
+        resp = MagicMock(status_code=200, text="y" * 100_000 + '"like_count":3')
+        with patch("apps.integrations.ig_content_restriction.requests.get", return_value=resp):
+            v = icr.check_live(
+                "https://www.instagram.com/reel/SMALL/", media_id=_media(), use_cache=False
+            )
+        assert v.state == icr.STATE_OK
+
+    def test_마커도_미디어도_없으면_의심이지_차단은_아니다(self, settings):
+        """삭제·비공개·로그인벽도 같은 모습이라 확정하지 않는다."""
+        settings.IG_RESTRICTION_LIVE_CHECK_ENABLED = True
+        resp = MagicMock(status_code=200, text="y" * 740_000)
+        with patch("apps.integrations.ig_content_restriction.requests.get", return_value=resp):
+            v = icr.check_live(
+                "https://www.instagram.com/reel/NOPE/", media_id=_media(), use_cache=False
+            )
+        assert v.state == icr.STATE_SUSPECTED
+        assert v.blocking is False
+        assert v.evidence["has_media_payload"] is False
 
     def test_네트워크_실패는_unknown_이지_차단이_아니다(self, settings):
         settings.IG_RESTRICTION_LIVE_CHECK_ENABLED = True

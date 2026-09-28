@@ -37,6 +37,10 @@ CS 사례 대부분이 이 둘로 잡힌다(죽은 게시물에 캠페인을 **�
 - UA 없음 / ``curl/8.5`` / 자기표명 ``TurnFlowBot/1.0`` → 마커 없음, **판별 불가**
 - ``bingbot`` / ``Googlebot`` → 판별 가능. 사망 13건·정상 12건 **25/25 정확**
 
+⚠️ 응답 **언어**도 우리가 보내는 ``Accept-Language`` 를 따라간다(2026-09-29 실측). 영어 마커만
+들고 있으면 한국어 응답에서 제한을 통째로 놓치므로 ``_LIVE_MARKERS`` 로 언어별 문구를 모두 보고,
+문구가 또 바뀔 때를 대비해 언어 독립 신호 ``_LIVE_MEDIA_KEYS`` 를 함께 본다.
+
 즉 판별하려면 검색봇을 사칭해야 한다. 이는 인스타 약관의 자동 수집 금지에 저촉될 수 있고
 prod IP 차단 위험이 있다. 그래서 **기본 비활성**(``IG_RESTRICTION_LIVE_CHECK_ENABLED=False``)
 이며, 켜더라도 사용자가 명시적으로 요청한 1회 조회(캠페인 생성·점검 버튼)에만 쓴다.
@@ -73,11 +77,28 @@ SOURCE_LIVE = "live"
 SOURCE_NONE = "none"
 
 # ── live 검사 상수 ────────────────────────────────────────────────────
-# ⚠️ 이 마커는 인스타 SSR 응답 JSON 안의 문자열이다. HTML 구조가 바뀌면 깨질 수 있어
-#    바이트 임계(_LIVE_SIZE_*)와 **둘 다** 본다. 테스트가 이 상수를 고정한다.
+# ⚠️ **마커는 언어마다 다르다.** 인스타는 ``Accept-Language`` 에 따라 SSR 문구를 바꿔 준다.
+#    2026-09-29 실측: ko 요청 → "연령 제한 콘텐츠", en 요청 → "Age-restricted content".
+#    영어 마커만 들고 있던 탓에, 인스타가 한국어 SSR 을 주기 시작한 2026-09 중순부터
+#    **제한 게시물을 한 건도 못 잡았다**(09-07 에 제한 확정했던 12개 재조회 → 검출 0).
+#    그래서 (1) 언어별 마커를 모두 들고 (2) 언어와 무관한 구조 신호를 함께 본다.
 _LIVE_MARKER = '"title":"Age-restricted content"'
 _LIVE_MARKER_ALT = "This content is age-restricted based on your age or account settings."
-# 실측: 제한 페이지 699~709KB / 정상 930~952KB. 중간값 820KB 를 임계로 둔다.
+_LIVE_MARKER_KO = "연령 제한 콘텐츠"
+_LIVE_MARKER_KO_ALT = "연령이 제한된 콘텐츠입니다"
+#: 하나라도 걸리면 제한 **확정**. 새 언어를 만나면 여기에 추가하면 된다.
+_LIVE_MARKERS = (_LIVE_MARKER, _LIVE_MARKER_ALT, _LIVE_MARKER_KO, _LIVE_MARKER_KO_ALT)
+
+# ★ 언어 독립 신호 — 제한 페이지에는 **미디어 페이로드 자체가 없다.**
+#   2026-09-29 실측(제한 6 · 정상 6 × ko/en = 24건 전부 일치):
+#       제한  media_type 0   · like_count 0 · restricted_status 0  · shortcode 1개(자기 자신)
+#       정상  media_type 13  · like_count 1 · restricted_status 15 · shortcode 12~13개
+#   마커 문구가 또 바뀌어도 이 신호는 남는다. 다만 **삭제·비공개·로그인벽**도 같은 모습이라
+#   이것만으로는 확정하지 않고 ``suspected`` 로 둔다(게이트를 막지 않음).
+_LIVE_MEDIA_KEYS = ('"media_type"', '"like_count"', '"restricted_status"')
+
+# 보조 지표. 실측 임계가 계속 밀리므로(09-07 제한 699~709KB/정상 930~952KB →
+# 09-29 제한 718~749KB/정상 957~985KB) **판정에는 쓰지 않고 evidence 에만 남긴다.**
 _LIVE_SIZE_THRESHOLD = 820_000
 _LIVE_UA = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
 _LIVE_TIMEOUT = 12.0
@@ -287,28 +308,35 @@ def check_live(permalink: str, *, media_id: str = "", use_cache: bool = True) ->
 
     body = r.text
     size = len(body)
-    marked = (_LIVE_MARKER in body) or (_LIVE_MARKER_ALT in body)
+    marked = any(m in body for m in _LIVE_MARKERS)
+    has_media = any(k in body for k in _LIVE_MEDIA_KEYS)
     small = size < _LIVE_SIZE_THRESHOLD
     v.evidence = {
         "http_status": 200,
         "bytes": size,
         "marker": marked,
+        "has_media_payload": has_media,
         "below_size_threshold": small,
     }
 
     if marked:
         v.state, v.source, v.blocking = STATE_RESTRICTED, SOURCE_LIVE, True
         v.user_reason = "post_restricted"
-    elif small:
-        # 마커는 못 찾았는데 본문이 비정상적으로 작다 → 구조 변경 가능성. 단정하지 않는다.
-        v.state, v.source = STATE_UNKNOWN, SOURCE_LIVE
+    elif has_media:
+        # 미디어 페이로드가 내려왔다 = 로그아웃 사용자에게도 보이는 게시물.
+        v.state, v.source = STATE_OK, SOURCE_LIVE
+    else:
+        # 마커는 없는데 미디어 페이로드도 없다 → 제한이 유력하지만 **삭제·비공개·로그인벽**도
+        # 같은 모습이라 확정하지 않는다(blocking=False — 게이트는 restricted 만 본다).
+        v.state, v.source = STATE_SUSPECTED, SOURCE_LIVE
+        v.user_reason = "post_restricted"
         logger.warning(
-            "ig_content_restriction: 마커 없음 + 응답 과소(%s bytes) — HTML 구조 변경 의심 media=%s",
+            "ig_content_restriction: 마커 없음 + 미디어 페이로드 없음(%s bytes, small=%s) "
+            "— 마커 문구가 또 바뀌었을 수 있다. media=%s",
             size,
+            small,
             media_id,
         )
-    else:
-        v.state, v.source = STATE_OK, SOURCE_LIVE
 
     if use_cache and v.state in (STATE_OK, STATE_RESTRICTED):
         cache.set(
