@@ -381,7 +381,28 @@ export async function getServerSideProps({ params }) {
                     {"detail": "페이지를 찾을 수 없습니다."}, status=status.HTTP_404_NOT_FOUND
                 )
 
-        return Response(PagePublicSerializer(page).data)
+        response = Response(PagePublicSerializer(page).data)
+
+        # ── 엣지 캐싱 (2026-09-28) ─────────────────────────────────────────────
+        # 이 응답은 **익명 + 공개 + 활성** 일 때만 모든 방문자에게 동일하다. 소유자는
+        # 비공개/비활성 페이지도 볼 수 있으므로(위 분기), 인증 요청까지 캐시하면
+        # 남의 비공개 페이지가 CDN 을 통해 새어 나간다. 그래서 위와 같은 조건을 다시
+        # 판정해 헤더를 가른다.
+        #
+        # 왜 필요한가: 이 엔드포인트는 고객 DM 캠페인의 **착지 페이지**다. 24시간 실측에서
+        # 한 페이지가 1,078회(그중 442회가 인스타 인앱브라우저 = DM 받고 클릭한 사람)였고,
+        # 방문자는 매번 새 커넥션이라 TTFB 가 578ms~4,796ms 까지 튀었다. 여기서 클릭이 샌다.
+        #
+        # `s-maxage` 만 주고 `max-age=0` 인 이유: 브라우저는 캐시하지 않고(편집 즉시 반영),
+        # CDN 만 60초 캐시한다. 페이지 수정 후 최대 60초 지연 — 착지 페이지 성격상 허용 가능.
+        # ⚠️ CDN 캐시 동작 키는 CloudFront 캐시 정책이 정한다. 이 헤더만으로는 캐시되지 않으며,
+        #    `/api/v1/pages/@*` 캐시 동작이 **Authorization 을 캐시 키에 포함**해야 안전하다.
+        if not request.user.is_authenticated and page.is_public and page.is_active:
+            response["Cache-Control"] = "public, s-maxage=60, max-age=0"
+        else:
+            # 소유자 전용 응답 — CDN·브라우저 모두 저장 금지.
+            response["Cache-Control"] = "private, no-store"
+        return response
 
 
 # ─────────────────────────────────────────────────────────────
