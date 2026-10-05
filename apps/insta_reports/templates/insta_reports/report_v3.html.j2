@@ -266,7 +266,7 @@ footer{text-align:center;color:#6d6485;font-size:12px;margin-top:44px;padding-to
   <div class="sub">수집된 댓글 {{ cfilter.total_collected }}개 중 <b>내가 단 답글 {{ cfilter.owner_removed }}개, DM 캠페인 댓글(자동 DM을 받으려고 키워드나 이모지만 남긴 댓글) {{ cfilter.excluded_trigger + cfilter.excluded_repeat + cfilter.excluded_meaningless }}개를 뺀 {{ cstats.n_analyzed }}개</b>만 분석했어요. "댓글에 OO 남겨주세요"에 응답한 댓글은 팔로워의 진짜 생각이 아니라서 제외했어요.</div>
   {% if cstats.insufficient %}
   <div class="warnbox"><b>⚠️ 이 계정은 댓글 분석을 신뢰하기 어려워요</b><br>
-  이 아래 내용은 <b>댓글 {{ cstats.n_analyzed }}개</b>만 보고 만든 거예요. 수집된 댓글 {{ cfilter.total_collected }}개의 대부분({{ ((cfilter.excluded_trigger + cfilter.excluded_repeat + cfilter.excluded_meaningless) / cfilter.total_collected * 100) | round | int }}%)이 자동 DM을 받기 위해 키워드나 이모지만 남긴 것이어서, 팔로워의 생각을 읽어낼 만한 양이 안 됩니다({{ cstats.min_for_insight }}개 이상은 되어야 참고할 만해요).<br>
+  이 아래 내용은 <b>댓글 {{ cstats.n_analyzed }}개</b>만 보고 만든 거예요. 수집된 댓글 {{ cfilter.total_collected }}개의 대부분({{ (((cfilter.excluded_trigger + cfilter.excluded_repeat + cfilter.excluded_meaningless) / cfilter.total_collected * 100) | round | int) if cfilter.total_collected else 0 }}%)이 자동 DM을 받기 위해 키워드나 이모지만 남긴 것이어서, 팔로워의 생각을 읽어낼 만한 양이 안 됩니다({{ cstats.min_for_insight }}개 이상은 되어야 참고할 만해요).<br>
   <b>그래서 아래 비율과 인용은 "경향 참고"로만 보세요.</b> 댓글 유도 문구를 키워드 대신 "어떤 게 제일 궁금하세요?"처럼 <b>의견을 묻는 방식</b>으로 몇 편 바꿔보면, 다음 리포트에서 훨씬 정확한 팔로워 분석이 가능해져요.</div>
   {% endif %}
   {% if cstats.classify_unreliable %}

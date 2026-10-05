@@ -1928,3 +1928,148 @@ class TestConflictBaitIsRejected:
         from .pipeline.verify_v3 import CONFLICT_BAIT
 
         assert not CONFLICT_BAIT.search(text), text
+
+
+class TestRenderSurvivesEmptyAndPartialInput:
+    """렌더는 **AI 비용을 전부 쓴 뒤**의 마지막 단계다 — 여기서 죽으면 리포트 1건이 통째로 버려진다.
+
+    2026-10-05 prod 실측(30일): 실패 283건 중 `RENDER_FAILED` 65건이 전부 이 두 버그였고,
+    둘 다 S1~S7(Apify·Gemini·DeepSeek)을 다 태운 뒤 터졌다. 나머지 실패(릴스 부족·게시물
+    없음 등 218건)는 수집 전에 걸러져 비용이 0 이므로, **돈이 새던 실패는 이 65건뿐**이다.
+
+      ① `ZeroDivisionError` 44건 — 템플릿이 `/ cfilter.total_collected` 로 나눴다.
+         하필 그 식이 `{% if cstats.insufficient %}`(댓글이 적을 때) 안에 있어서,
+         **댓글 0개 계정이 분기에 들어오는 순간 반드시 죽는** 구조였다.
+      ② `UndefinedError` 19건 — LLM 이 슬롯을 통째로 빠뜨렸는데 폴백이 안 채워졌다.
+         검증은 `.get()` 으로 관대하게 읽어 **누락을 오류로 잡지 않으니** `bad_keys` 에
+         안 들어가고, 템플릿은 `slots.positioning.body` 로 직접 접근해 그 자리에서 죽었다.
+         (positioning 11 · success_formula 4 · monthly_observation 2 · low_line 1 · persona 1)
+    """
+
+    def _ratio_expr(self):
+        """템플릿에서 '제외 비율' 식 하나만 떼어낸다.
+
+        그 줄엔 `{{ cstats.n_analyzed }}` 같은 식이 여러 개 있어서, 첫 `{{` 를 집으면
+        엉뚱한 식을 검사하게 된다 → 가드 문구를 품은 식을 지목해서 꺼낸다.
+        """
+        import re
+
+        from .pipeline import config
+
+        src = (config.TEMPLATE_PATH.parent / "report_v3.html.j2").read_text(encoding="utf-8")
+        frags = [
+            f
+            for f in re.findall(r"\{\{.*?\}\}", src, re.S)
+            if "cfilter.total_collected else 0" in f
+        ]
+        assert len(frags) == 1, f"대상 식이 {len(frags)}개 — 템플릿이 바뀌었다"
+        return src, frags[0]
+
+    def test_comment_ratio_survives_zero_collected(self):
+        """댓글 0개 계정 — 옛 식은 여기서 ZeroDivisionError 였다."""
+        from jinja2 import Environment
+
+        src, frag = self._ratio_expr()
+        assert (
+            "/ cfilter.total_collected * 100) | round | int }}" not in src
+        ), "가드 없는 옛 나눗셈이 템플릿에 되살아났다 — 댓글 0개 계정이 전부 RENDER_FAILED 된다"
+        zero = {
+            "excluded_trigger": 0,
+            "excluded_repeat": 0,
+            "excluded_meaningless": 0,
+            "total_collected": 0,
+        }
+        assert Environment(autoescape=True).from_string(frag).render(cfilter=zero) == "0"
+
+    def test_comment_ratio_keeps_its_arithmetic(self):
+        """가드를 넣느라 계산이 바뀌면 안 된다 — 50/100 은 그대로 50%."""
+        from jinja2 import Environment
+
+        _src, frag = self._ratio_expr()
+        normal = {
+            "excluded_trigger": 30,
+            "excluded_repeat": 10,
+            "excluded_meaningless": 10,
+            "total_collected": 100,
+        }
+        assert Environment(autoescape=True).from_string(frag).render(cfilter=normal) == "50"
+
+    def test_template_slot_keys_all_exist_in_fallback(self, tmp_path):
+        """템플릿이 읽는 슬롯은 폴백이 전부 갖고 있어야 채울 수 있다.
+
+        템플릿에 새 `slots.X` 를 추가하고 폴백에 안 넣으면 여기서 걸린다 — 안 걸리면
+        LLM 이 X 를 빠뜨린 날 리포트가 조용히 죽는다.
+        픽스처는 손으로 쓰지 않고 **실제 지표 엔진**을 돌려 얻는다(스키마가 바뀌면 같이 깨지게).
+        """
+        import re
+
+        from .pipeline import aggregate, config, fake_mode, normalize, sampler, verify_v3
+        from .pipeline import metrics as metrics_mod
+
+        config.bind_run(tmp_path)
+        fake_mode.write_sources("slot_shape_test")
+        canon = normalize.build_canonical("slot_shape_test")
+        metrics = metrics_mod.build_metrics(canon)
+        sample = sampler.build_sample(canon)
+        agg = aggregate.build_aggregates(
+            canon, metrics, fake_mode.fake_extraction(canon, sample), sample
+        )
+
+        src = (config.TEMPLATE_PATH.parent / "report_v3.html.j2").read_text(encoding="utf-8")
+        used = set(re.findall(r"slots\.([a-z_0-9]+)", src))
+        fb = verify_v3.fallback_slots_v3(metrics, agg)
+        missing = sorted(used - set(fb))
+        assert not missing, f"폴백에 없는 슬롯: {missing}"
+
+    def test_gate_output_always_has_every_template_slot(self, tmp_path):
+        """게이트를 **통과해서 나온** slots 는 템플릿이 읽는 키를 전부 갖고 있어야 한다.
+
+        헬퍼를 직접 부르지 않고 `run_gate_v3` 로 검증한다 — 헬퍼만 테스트하면
+        호출부 배선이 빠져도 초록이 뜨고, 그게 정확히 이번 사고의 모양이다.
+        """
+        import re
+
+        from .pipeline import aggregate, config, fake_mode, normalize, sampler, verify_v3
+        from .pipeline import metrics as metrics_mod
+
+        config.bind_run(tmp_path)
+        fake_mode.write_sources("gate_shape_test")
+        canon = normalize.build_canonical("gate_shape_test")
+        metrics = metrics_mod.build_metrics(canon)
+        sample = sampler.build_sample(canon)
+        agg = aggregate.build_aggregates(
+            canon, metrics, fake_mode.fake_extraction(canon, sample), sample
+        )
+
+        # LLM 이 top3 만 주고 나머지를 통째로 빠뜨린 상황 (prod 실측 모양)
+        partial = {
+            "top3": [{"headline": f"AI{i}", "body": "x", "tone": "neutral"} for i in range(3)]
+        }
+        out, meta = verify_v3.run_gate_v3(
+            partial, metrics, agg, resynth_fn=lambda *a, **k: None, log=lambda *a: None
+        )
+
+        src = (config.TEMPLATE_PATH.parent / "report_v3.html.j2").read_text(encoding="utf-8")
+        used = set(re.findall(r"slots\.([a-z_0-9]+)", src))
+        missing = sorted(k for k in used if k not in out)
+        assert (
+            not missing
+        ), f"게이트 출력에 없는 슬롯: {missing} (템플릿이 UndefinedError 로 죽는다)"
+        assert "_fallback" not in out, "폴백 내부 플래그가 슬롯으로 새면 안 된다"
+        assert meta.get("filled_missing"), "누락 슬롯을 채웠다는 기록이 없다"
+
+    def test_filling_does_not_overwrite_ai_text(self):
+        """이미 있는 슬롯은 폴백이 덮지 않는다."""
+        from .pipeline.verify_v3 import _fill_missing_slots
+
+        fb = {
+            "_fallback": True,
+            "positioning": {"oneliner": "fb", "body": "fb"},
+            "low_line": {"text": "fb"},
+            "top3": ["fb1", "fb2", "fb3"],
+        }
+        meta = {}
+        out = _fill_missing_slots({"top3": ["AI1", "AI2", "AI3"]}, fb, meta, log=lambda *a: None)
+
+        assert out["top3"] == ["AI1", "AI2", "AI3"], "AI 문장이 폴백에 덮였다"
+        assert sorted(meta["filled_missing"]) == ["low_line", "positioning"]

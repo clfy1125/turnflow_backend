@@ -281,7 +281,18 @@ def generate(report) -> dict:
             html_path = Path(render.render_report_v3(canon, m, agg, slots))
             html = html_path.read_text(encoding="utf-8")
         except Exception as e:  # noqa: BLE001
-            raise ReportFailure(ReportErrorCode.RENDER_FAILED, f"{type(e).__name__}: {e}") from e
+            # ⚠️ 트레이스백까지 남긴다 — 렌더는 **AI 비용을 전부 쓴 뒤**의 마지막 단계라
+            #    한 번 실패가 리포트 1건을 통째로 버린다. 예외 타입·메시지만으로는
+            #    템플릿 몇 번째 줄인지 알 수 없어 재현에 며칠이 걸렸다(2026-10-05:
+            #    `ZeroDivisionError: division by zero` 44건의 출처를 찾느라 전 모듈을
+            #    훑어야 했다 — 범인은 템플릿 269행의 `/ cfilter.total_collected`).
+            #    error_message 는 내부 필드다(사용자 문구는 ReportErrorCode 매핑이 따로 쥔다).
+            import traceback
+
+            tb = traceback.format_exc()
+            raise ReportFailure(
+                ReportErrorCode.RENDER_FAILED, f"{type(e).__name__}: {e}\n{tb[-1800:]}"
+            ) from e
         if pacer:
             pacer.wait(ReportStage.RENDERING)
 

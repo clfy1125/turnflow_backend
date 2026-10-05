@@ -944,9 +944,31 @@ def _top_keys(errors: list) -> list[str]:
     return keys
 
 
+def _fill_missing_slots(cur: dict, fb_all: dict, meta: dict, log=print) -> dict:
+    """게이트 출력에 **빠진 슬롯**을 폴백으로 채운다 — 렌더러와의 계약.
+
+    ⚠️ 검증(`verify_slots_v3`)은 모든 슬롯을 `.get()` 으로 **관대하게** 읽는다. 그래서
+       LLM 이 슬롯을 통째로 빠뜨리면 오류가 **잡히지 않고**, `bad_keys` 에도 안 들어가
+       폴백 교체 대상에서 빠진다. 반면 템플릿은 `slots.positioning.body` 처럼 **직접**
+       접근하므로 그 자리에서 `UndefinedError` 로 죽는다 — 합성·검증을 다 끝내고
+       AI 비용을 전부 쓴 뒤 마지막 렌더 단계에서 터지는, 가장 비싼 실패다.
+       (2026-10-05 prod 실측 30일: RENDER_FAILED 65건 중 19건이 이 경로 —
+        positioning 11 · success_formula 4 · monthly_observation 2 · low_line 1 · persona 1)
+    여기서 한 번 채워 "게이트를 통과한 slots 는 항상 완전한 모양"을 보장한다.
+    검증은 하지 않는다 — 폴백은 코드가 결정적으로 만든 문장이다(아래 bad_keys 교체와 동일 근거).
+    """
+    missing = [k for k in fb_all if k != "_fallback" and k not in cur]
+    if missing:
+        log(f"    누락 슬롯 {missing} → 안전 문장으로 채움 (AI 문장은 유지)")
+        for k in missing:
+            cur[k] = fb_all[k]
+        meta["filled_missing"] = missing
+    return cur
+
+
 def run_gate_v3(slots: dict, metrics: dict, agg: dict, resynth_fn, log=print):
     """검증 → 실패한 슬롯만 부분 재합성 → 병합. 전체 재출력보다 빠르고 안정적."""
-    meta = {"attempts": [], "fallback_slots": [], "autofixed": []}
+    meta = {"attempts": [], "fallback_slots": [], "autofixed": [], "filled_missing": []}
     cur = slots
     fb_all = fallback_slots_v3(metrics, agg)
     for attempt in range(config.SYNTH_MAX_RETRY + 1):
@@ -955,7 +977,7 @@ def run_gate_v3(slots: dict, metrics: dict, agg: dict, resynth_fn, log=print):
         meta["attempts"].append({"n": attempt + 1, "errors": v["errors"]})
         if v["ok"]:
             log(f"    검증 통과 (시도 {attempt+1})")
-            return cur, meta
+            return _fill_missing_slots(cur, fb_all, meta, log), meta
         keys = _top_keys(v["errors"])
         log(f"    검증 실패 {len(v['errors'])}건 (시도 {attempt+1}) → {keys} 재작성 요청")
         if attempt == config.SYNTH_MAX_RETRY:
@@ -986,7 +1008,7 @@ def run_gate_v3(slots: dict, metrics: dict, agg: dict, resynth_fn, log=print):
             if k in fb_all:
                 cur[k] = fb_all[k]
         meta["fallback_slots"] = bad_keys
-        return cur, meta
+        return _fill_missing_slots(cur, fb_all, meta, log), meta
     fb_slots = fallback_slots_v3(metrics, agg)
     v = verify_slots_v3(fb_slots, metrics, agg)
     if not v["ok"]:
