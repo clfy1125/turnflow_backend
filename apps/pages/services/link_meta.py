@@ -1,7 +1,7 @@
 """
 apps/pages/services/link_meta.py
 
-외부 상품/콘텐츠 URL → 메타 정보(title / thumbnail / price / original_price) 추출.
+외부 상품/콘텐츠 URL → 메타 정보(title / thumbnail / price / original_price / currency) 추출.
 
 ■ 동기
   페이지 빌더에서 사용자가 쿠팡·오늘의집 등 파트너스/상품 링크를 붙여넣으면
@@ -13,6 +13,10 @@ apps/pages/services/link_meta.py
        - title    : og:title → twitter:title → <title>
        - thumbnail: og:image(secure) → twitter:image (절대 URL 로 정규화)
        - price    : meta(product:price 등) → JSON-LD offers → 사이트별 셀렉터 순으로 폴백
+       - currency : meta(product:price:currency → og:price:currency) → JSON-LD
+                    priceCurrency → 마이크로데이터/임베드 JSON → 사이트별 고정값.
+                    **price 를 찾았을 때만** 함께 내려준다(통화는 그 가격의 단위이므로,
+                    가격 없이 통화만 주면 프론트가 빈 입력칸에 엉뚱한 단위를 건다).
 
 ■ 보안 (SSRF 방어)
   매 요청(리다이렉트 hop 포함)마다 호스트를 DNS 로 해석해 사설/루프백/링크로컬/
@@ -24,7 +28,8 @@ apps/pages/services/link_meta.py
   같은 URL 은 Redis 에 캐싱(성공 1h / 빈 결과 5m). 호출 측 뷰에서 사용자별 throttle.
 
 ■ 응답 / 타임아웃
-  반환 dict 은 값이 있는 키만 포함(전부 optional). 가격은 콤마 없는 숫자 문자열,
+  반환 dict 은 값이 있는 키만 포함(전부 optional). 가격은 콤마 없는 숫자 문자열
+  (소수점은 보존 — "25.99" 는 "25.99" 그대로), 통화는 ISO 4217 대문자 3글자,
   썸네일은 절대 http(s) URL. 에러/차단 페이지(403/404/"just a moment" 등)는 빈 dict.
   전체 처리는 15초 안에 끝나도록 connect/read 타임아웃 + 절대 deadline 으로 제한.
 """
@@ -158,7 +163,7 @@ class LinkMetaFetchError(Exception):
 
 
 def fetch_meta(url: str) -> dict:
-    """URL → ``{title?, thumbnail?, price?, original_price?}`` (값 있는 키만).
+    """URL → ``{title?, thumbnail?, price?, original_price?, currency?}`` (값 있는 키만).
 
     실패/차단/비-HTML/빈 메타는 빈 dict 을 돌려준다 (예외를 밖으로 던지지 않음).
     """
@@ -218,6 +223,8 @@ def _fetch_coupang(url: str) -> dict:
     price = _price_to_str(data.get("price"))
     if price:
         out["price"] = price
+        # 쿠팡 파트너스 API 는 원화 금액만 돌려준다 — 추출할 통화 표기가 없으므로 고정.
+        out["currency"] = "KRW"
     original = _price_to_str(data.get("original_price"))
     if original and original != price:
         out["original_price"] = original
@@ -284,6 +291,10 @@ def _parse_html(html: str | None, base_url: str) -> dict:
     price, original = _extract_price(metas, html, base_url)
     if price:
         out["price"] = price
+        # 통화는 "이 가격의 단위" — 가격을 못 찾았으면 내려보내지 않는다.
+        currency = _extract_currency(metas, html, base_url)
+        if currency:
+            out["currency"] = currency
     if original and original != price:
         out["original_price"] = original
 
@@ -681,6 +692,134 @@ def _price_ohou(html: str) -> tuple[str | None, str | None]:
             original = m.group(1)
             break
     return price, original
+
+
+# ─────────────────────────────────────────────────────────────
+# 통화 추출 — meta → JSON-LD → 마이크로데이터/임베드 JSON → 사이트 고정값
+# ─────────────────────────────────────────────────────────────
+
+# 마이크로데이터(``<meta itemprop="priceCurrency" content="USD">``)는 <head> 가 아니라
+# 본문 상품영역에 있는 경우가 많아 head 전용 _extract_metas 로는 못 잡는다 → 전문 스캔.
+_MICRODATA_CURRENCY_RE = re.compile(
+    r'<[a-zA-Z][^>]*itemprop\s*=\s*["\']?priceCurrency["\']?[^>]*>',
+    re.IGNORECASE,
+)
+# Next.js ``__NEXT_DATA__`` 등 페이지에 박힌 JSON 상태의 통화 키 (최후 폴백).
+_EMBEDDED_CURRENCY_RE = re.compile(
+    r'"(?:price_?currency|currency_?code)"\s*:\s*"([A-Za-z]{3})"',
+    re.IGNORECASE,
+)
+
+# 해당 호스트는 원화로만 판매 — 통화 표기를 안 내보내는 사이트의 고정값.
+_SITE_CURRENCY = {"ohou.se": "KRW"}
+
+
+def _extract_currency(metas: dict, html: str, final_url: str) -> str | None:
+    """ISO 4217 대문자 3글자 통화 코드. 신뢰할 근거가 없으면 None.
+
+    프론트는 키가 없으면 KRW 로 보므로, 추측으로 채우지 않는 쪽이 안전하다
+    (틀린 통화는 "없음"보다 나쁘다 — 25.99 달러가 25.99 원으로 찍힌다).
+    """
+    for key in (
+        "product:price:currency",
+        "product:sale_price:currency",
+        "og:price:currency",
+        "og:product:price:currency",
+        "pricecurrency",  # <meta itemprop="priceCurrency"> 가 <head> 에 있는 경우
+    ):
+        currency = _clean_currency(metas.get(key))
+        if currency:
+            return currency
+
+    currency = _currency_from_jsonld(html)
+    if currency:
+        return currency
+
+    currency = _currency_from_microdata(html)
+    if currency:
+        return currency
+
+    host = (urlparse(final_url).hostname or "").lower()
+    for suffix, code in _SITE_CURRENCY.items():
+        if host == suffix or host.endswith("." + suffix):
+            return code
+    return None
+
+
+def _currency_from_jsonld(html: str) -> str | None:
+    """``offers.priceCurrency`` — **가격이 들어있는 offers** 의 통화만 채택.
+
+    (가격을 고른 노드와 통화를 고른 노드가 어긋나면 환율이 뒤바뀐 값이 나간다.)
+    """
+    for m in _LDJSON_RE.finditer(html):
+        raw = (m.group(1) or "").strip()
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            continue
+        for node in _iter_jsonld_nodes(data):
+            currency = _currency_from_offers(node.get("offers"))
+            if currency:
+                return currency
+    return None
+
+
+def _currency_from_offers(offers) -> str | None:
+    if offers is None:
+        return None
+    if isinstance(offers, list):
+        for off in offers:
+            currency = _currency_from_offers(off)
+            if currency:
+                return currency
+        return None
+    if not isinstance(offers, dict):
+        return None
+
+    price, _ = _price_from_offers(offers)
+    if not price:
+        return None  # 가격 없는 offers 의 통화는 이 응답의 가격과 무관
+
+    currency = _clean_currency(offers.get("priceCurrency"))
+    if currency:
+        return currency
+    spec = offers.get("priceSpecification")
+    if isinstance(spec, list):
+        spec = spec[0] if spec and isinstance(spec[0], dict) else None
+    if isinstance(spec, dict):
+        return _clean_currency(spec.get("priceCurrency"))
+    return None
+
+
+def _currency_from_microdata(html: str) -> str | None:
+    """본문의 ``itemprop="priceCurrency"`` → 없으면 임베드 JSON 의 통화 키."""
+    for tag in _MICRODATA_CURRENCY_RE.findall(html):
+        attrs = {
+            m.group(1).lower(): (m.group(2) if m.group(2) is not None else m.group(3))
+            for m in _ATTR_RE.finditer(tag)
+        }
+        currency = _clean_currency(attrs.get("content") or attrs.get("value"))
+        if currency:
+            return currency
+
+    m = _EMBEDDED_CURRENCY_RE.search(html)
+    if m:
+        return _clean_currency(m.group(1))
+    return None
+
+
+def _clean_currency(raw) -> str | None:
+    """통화 표기 → ISO 4217 대문자 3글자. 형식에 안 맞으면 None.
+
+    프론트는 KRW/USD 외 통화를 무시하고 사용자가 직접 고르게 하므로
+    여기서 통화 종류를 걸러내지는 않는다(EUR/JPY 도 그대로 내려간다).
+    """
+    if raw is None or isinstance(raw, bool):
+        return None
+    code = str(raw).strip().upper()
+    return code if re.fullmatch(r"[A-Z]{3}", code) else None
 
 
 def _clean_price(raw) -> str | None:

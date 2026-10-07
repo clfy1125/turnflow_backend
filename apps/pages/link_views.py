@@ -3,8 +3,8 @@ apps/pages/link_views.py
 
 POST /api/v1/link/fetch-meta/ — 외부 상품/콘텐츠 URL 메타 조회.
 
-페이지 빌더에서 사용자가 쿠팡·오늘의집 등 링크를 붙여넣으면, 프론트가 이 엔드포인트로
-title/thumbnail/price/original_price 를 받아 링크 블록 필드를 자동 채운다.
+페이지 빌더에서 사용자가 쿠팡·오늘의집·해외 상품 링크를 붙여넣으면, 프론트가 이 엔드포인트로
+title/thumbnail/price/original_price/currency 를 받아 링크 블록 필드를 자동 채운다.
 실제 추출 로직은 ``apps.pages.services.link_meta.fetch_meta`` 참조.
 """
 
@@ -45,10 +45,20 @@ class LinkMetaResponseSerializer(serializers.Serializer):
     title = serializers.CharField(required=False, help_text="제목 (og:title → <title>)")
     thumbnail = serializers.URLField(required=False, help_text="대표 이미지 절대 URL (og:image)")
     price = serializers.CharField(
-        required=False, help_text='현재가 — 콤마 없는 숫자 문자열 (예: "29900")'
+        required=False,
+        help_text='현재가 — 콤마 없는 숫자 문자열. 소수점은 보존 (예: "29900", "25.99")',
     )
     original_price = serializers.CharField(
         required=False, help_text="정가 — 콤마 없는 숫자 문자열 (할인 전, 있을 때만)"
+    )
+    currency = serializers.CharField(
+        required=False,
+        min_length=3,
+        max_length=3,
+        help_text=(
+            'price 의 통화 — ISO 4217 대문자 3글자 (예: "KRW", "USD"). '
+            "통화 근거를 못 찾았거나 price 자체가 없으면 응답에서 생략된다."
+        ),
     )
 
 
@@ -58,7 +68,7 @@ class LinkMetaResponseSerializer(serializers.Serializer):
 
 
 class LinkMetaView(APIView):
-    """외부 URL → flat 메타(title/thumbnail/price/original_price) 조회."""
+    """외부 URL → flat 메타(title/thumbnail/price/original_price/currency) 조회."""
 
     permission_classes = [IsAuthenticated]
     # 사용자당 호출 제한. rate 는 settings.REST_FRAMEWORK.DEFAULT_THROTTLE_RATES.link_meta 참조.
@@ -66,11 +76,11 @@ class LinkMetaView(APIView):
     throttle_scope = "link_meta"
 
     @extend_schema(
-        summary="외부 링크 메타 조회 (제목/이미지/가격)",
+        summary="외부 링크 메타 조회 (제목/이미지/가격/통화)",
         description="""
         ## 목적
         사용자가 페이지 빌더에서 쿠팡·오늘의집 등 외부 상품/콘텐츠 URL 을 붙여넣으면,
-        백엔드가 해당 페이지의 메타 정보(제목/대표이미지/가격/정가)를 추출해 돌려준다.
+        백엔드가 해당 페이지의 메타 정보(제목/대표이미지/가격/정가/통화)를 추출해 돌려준다.
         프론트는 이 값으로 링크 블록(single_link/group_link)의 필드를 자동 채운다.
 
         ## 인증
@@ -79,11 +89,14 @@ class LinkMetaView(APIView):
 
         ## 동작
         1. **쿠팡 도메인**(`*.coupang.com`) → 쿠팡 파트너스 Open API 로 조회(가격/이미지/상품명).
-           (쿠팡은 Akamai 가 서버 직접 fetch 를 차단 → 공식 API 만 가능. 키 미설정/mock 이면 `{}`)
+           통화는 항상 `"KRW"`. (쿠팡은 Akamai 가 서버 직접 fetch 를 차단 → 공식 API 만 가능.
+           키 미설정/mock 이면 `{}`)
         2. **그 외 사이트** → 서버가 HTML 을 직접 받아 파싱:
            - 제목: `og:title` → `twitter:title` → `<title>`
            - 이미지: `og:image`(secure) → `twitter:image` (절대 URL 로 정규화)
            - 가격: `meta(product:price 등)` → `JSON-LD offers` → 사이트별 셀렉터 순 폴백
+           - 통화: `meta product:price:currency` → `meta og:price:currency` →
+             `JSON-LD offers.priceCurrency` → 마이크로데이터/임베드 JSON → 사이트 고정값
         3. **봇 차단 사이트**(오늘의집 등, 직접 fetch 가 403): 외부 anti-bot 스크랩 서비스가
            설정돼 있으면 그쪽으로 폴백해 HTML 을 받아 동일하게 파싱. 미설정이면 `{}`.
            ⚠️ 스크랩 폴백은 **응답이 느릴 수 있음**(렌더링/우회로 최대 ~20초) — 프론트는
@@ -93,12 +106,18 @@ class LinkMetaView(APIView):
         ## 응답 (200) — flat, 모든 필드 optional
         - 못 찾은 필드는 **응답에서 생략**된다 (항상 모든 키가 오는 게 아님).
         - `price` / `original_price` 는 **콤마 없는 숫자 문자열** (예: `"29900"`).
+          **소수점은 보존**한다 — `"25.99"` 는 `"25.99"` 로 나간다(`"2599"`/`"25"` 로 바뀌지 않음).
+        - `currency` 는 **ISO 4217 대문자 3글자** (예: `"KRW"`, `"USD"`).
+          통화 근거를 못 찾았거나 `price` 자체가 없으면 **키가 생략**된다
+          (통화는 "그 가격의 단위"이므로 가격 없이 단독으로 내려보내지 않는다).
+          `KRW`/`USD` 외(`EUR`, `JPY` 등)도 그대로 내려간다 — 백엔드는 통화 종류를 거르지 않는다.
         - `thumbnail` 은 **절대 http(s) URL**.
         - **에러/차단 페이지**(403/404/"Just a moment" 등)나 비-HTML 응답, SSRF 차단,
           타임아웃 등은 **빈 객체 `{}`** 로 응답한다 (항상 HTTP 200).
 
         ```json
-        { "title": "상품명", "thumbnail": "https://.../img.jpg", "price": "29900", "original_price": "49900" }
+        { "title": "상품명", "thumbnail": "https://.../img.jpg", "price": "29900",
+          "original_price": "49900", "currency": "KRW" }
         ```
 
         ## 보안 / 제약
@@ -141,6 +160,18 @@ class LinkMetaView(APIView):
                     "thumbnail": "https://image.ohou.se/i/abc.jpg",
                     "price": "129000",
                     "original_price": "189000",
+                    "currency": "KRW",
+                },
+                response_only=True,
+            ),
+            OpenApiExample(
+                name="응답 (해외 상품 — 달러)",
+                value={
+                    "title": "Anker Power Bank 10000mAh",
+                    "thumbnail": "https://m.media-amazon.com/images/abc.jpg",
+                    "price": "25.99",
+                    "original_price": "35.99",
+                    "currency": "USD",
                 },
                 response_only=True,
             ),

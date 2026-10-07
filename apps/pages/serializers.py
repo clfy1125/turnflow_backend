@@ -28,6 +28,22 @@ from .validators import validate_block_data
                 "format": "uri",
                 "description": "[single_link 선택] 썸네일 이미지 URL",
             },
+            "price": {
+                "type": "string",
+                "description": '[상품 링크 선택] 판매가. 콤마 없는 숫자 문자열("29900", "25.99")',
+            },
+            "original_price": {
+                "type": "string",
+                "description": "[상품 링크 선택] 할인 전 정가 (취소선 표시용)",
+            },
+            "currency": {
+                "type": "string",
+                "description": (
+                    '[상품 링크 선택] price 의 통화. ISO 4217 3글자("KRW"/"USD"). '
+                    "생략 시 프론트가 KRW 로 간주 — 기존 블록 마이그레이션 불필요. "
+                    "group_link 은 항목마다 data.links[].currency 로 따로 둔다."
+                ),
+            },
             "headline": {"type": "string", "description": "[profile 필수] 한 줄 소개"},
             "subline": {"type": "string", "description": "[profile 선택] 부제목"},
             "avatar_url": {

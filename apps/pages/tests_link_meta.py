@@ -83,6 +83,10 @@ class TestCleanPrice:
             (29900, "29900"),
             ("49900.00", "49900"),
             ("12.50", "12.50"),
+            # 달러 가격: 소수점을 "2599"/"25" 로 뭉개지 않는다
+            ("25.99", "25.99"),
+            ("$25.99", "25.99"),
+            ("$1,299.99", "1299.99"),
             ("0", None),
             ("0.00", None),
             ("", None),
@@ -251,6 +255,7 @@ class TestFetchMetaGeneric:
             "thumbnail": "https://img.test/sofa.jpg",
             "price": "259000",
             "original_price": "399000",
+            "currency": "KRW",  # ohou.se 고정 통화
         }
 
     def test_error_page_title_returns_empty(self):
@@ -316,6 +321,7 @@ class TestFetchMetaCoupang:
             "thumbnail": "https://image.coupang.com/x.jpg",
             "price": "29900",
             "original_price": "49900",
+            "currency": "KRW",
         }
 
     def test_coupang_error_returns_empty(self):
@@ -333,7 +339,7 @@ class TestFetchMetaCoupang:
             return_value=fake,
         ):
             out = lm.fetch_meta("https://m.coupang.com/vp/products/9")
-        assert out == {"title": "X", "price": "1000"}
+        assert out == {"title": "X", "price": "1000", "currency": "KRW"}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -432,3 +438,139 @@ class TestScrapeFallback:
             out = lm.fetch_meta("https://ohou.se/productions/1/selling")
         direct.assert_not_called()
         assert out == {}
+
+
+# ─────────────────────────────────────────────────────────────
+# 통화 추출 (currency) — meta / JSON-LD / 마이크로데이터 / 사이트 고정값
+# ─────────────────────────────────────────────────────────────
+
+
+class TestCurrencyExtraction:
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("usd", "USD"),
+            (" KRW ", "KRW"),
+            ("Usd", "USD"),
+            ("US", None),
+            ("USDD", None),
+            ("$", None),
+            ("", None),
+            (None, None),
+            (True, None),
+            (840, None),  # ISO 숫자코드는 받지 않는다
+        ],
+    )
+    def test_clean_currency(self, raw, expected):
+        assert lm._clean_currency(raw) == expected
+
+    def test_meta_product_price_currency_first(self):
+        metas = {"product:price:currency": "usd", "og:price:currency": "KRW"}
+        assert lm._extract_currency(metas, "", "https://shop.test/p/1") == "USD"
+
+    def test_meta_og_price_currency_fallback(self):
+        metas = {"og:price:currency": "EUR"}
+        assert lm._extract_currency(metas, "", "https://shop.test/p/1") == "EUR"
+
+    def test_jsonld_price_currency(self):
+        html = """
+        <script type="application/ld+json">
+        {"@type":"Product","offers":{"@type":"Offer","price":"25.99","priceCurrency":"usd"}}
+        </script>
+        """
+        assert lm._extract_currency({}, html, "https://shop.test/p/1") == "USD"
+
+    def test_jsonld_currency_ignores_offers_without_price(self):
+        """가격 없는 offers 의 통화를 가져오면 다른 가격에 엉뚱한 단위가 붙는다."""
+        html = """
+        <script type="application/ld+json">
+        {"@graph":[{"@type":"Offer","priceCurrency":"JPY"},
+                   {"@type":"Product","offers":{"price":"25.99","priceCurrency":"USD"}}]}
+        </script>
+        """
+        assert lm._extract_currency({}, html, "https://shop.test/p/1") == "USD"
+
+    def test_jsonld_price_specification_currency(self):
+        html = """
+        <script type="application/ld+json">
+        {"@type":"Product","offers":{"@type":"Offer",
+         "priceSpecification":{"price":"12.50","priceCurrency":"gbp"}}}
+        </script>
+        """
+        assert lm._extract_currency({}, html, "https://shop.test/p/1") == "GBP"
+
+    def test_microdata_itemprop_in_body(self):
+        html = '<html><body><meta itemprop="priceCurrency" content="USD"></body></html>'
+        assert lm._extract_currency({}, html, "https://shop.test/p/1") == "USD"
+
+    def test_embedded_json_currency_code(self):
+        html = '<script>window.__NEXT_DATA__={"product":{"currencyCode":"usd"}}</script>'
+        assert lm._extract_currency({}, html, "https://shop.test/p/1") == "USD"
+
+    def test_site_fixed_currency_ohou(self):
+        assert lm._extract_currency({}, "", "https://ohou.se/productions/1/selling") == "KRW"
+
+    def test_no_evidence_returns_none(self):
+        assert lm._extract_currency({}, "<html></html>", "https://shop.test/p/1") is None
+
+
+class TestParseHtmlCurrency:
+    def test_currency_accompanies_price(self):
+        html = """
+        <html><head>
+          <meta property="og:title" content="Anker Power Bank">
+          <meta property="product:price:amount" content="25.99">
+          <meta property="product:price:currency" content="USD">
+          <meta property="product:original_price:amount" content="35.99">
+        </head></html>
+        """
+        out = lm._parse_html(html, "https://shop.test/p/1")
+        assert out["price"] == "25.99"
+        assert out["original_price"] == "35.99"
+        assert out["currency"] == "USD"
+
+    def test_currency_omitted_when_no_price(self):
+        """통화는 '그 가격의 단위' — 가격이 없으면 내려보내지 않는다."""
+        html = """
+        <html><head>
+          <meta property="og:title" content="제목만 있는 페이지">
+          <meta property="product:price:currency" content="USD">
+        </head></html>
+        """
+        out = lm._parse_html(html, "https://shop.test/p/1")
+        assert "price" not in out
+        assert "currency" not in out
+
+    def test_currency_omitted_when_unknown(self):
+        html = """
+        <html><head>
+          <meta property="og:title" content="국내 상품">
+          <meta property="product:price:amount" content="29,900">
+        </head></html>
+        """
+        out = lm._parse_html(html, "https://shop.test/p/1")
+        assert out["price"] == "29900"
+        assert "currency" not in out
+
+
+class TestCoupangCurrency:
+    def test_coupang_always_krw(self, locmem_cache, settings):
+        settings.COUPANG_MOCK_MODE = False
+        payload = {
+            "product_name": "쿠팡 상품",
+            "image_url": "https://img.coupang.com/a.jpg",
+            "price": 19900,
+            "original_price": 29900,
+        }
+        with patch.object(lm.CoupangPartnersService, "lookup_by_url", return_value=payload):
+            out = lm.fetch_meta("https://www.coupang.com/vp/products/123")
+        assert out["price"] == "19900"
+        assert out["currency"] == "KRW"
+
+    def test_coupang_no_price_no_currency(self, locmem_cache, settings):
+        settings.COUPANG_MOCK_MODE = False
+        payload = {"product_name": "쿠팡 상품", "price": 0}
+        with patch.object(lm.CoupangPartnersService, "lookup_by_url", return_value=payload):
+            out = lm.fetch_meta("https://www.coupang.com/vp/products/124")
+        assert "price" not in out
+        assert "currency" not in out

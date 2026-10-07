@@ -33,6 +33,26 @@ BLOCK_DATA_SCHEMA = {
             "format": "uri",
             "description": "[single_link 선택] 썸네일 이미지 URL",
         },
+        # ── 상품 카드(single_link / group_link) ───────
+        "price": {
+            "type": "string",
+            "description": "[상품 링크 선택] 판매가. 콤마 없는 숫자 문자열(소수점 보존)",
+            "example": "25.99",
+        },
+        "original_price": {
+            "type": "string",
+            "description": "[상품 링크 선택] 할인 전 정가 (취소선 표시용)",
+            "example": "35.99",
+        },
+        "currency": {
+            "type": "string",
+            "description": (
+                '[상품 링크 선택] price 의 통화. ISO 4217 3글자("KRW"/"USD"). '
+                "키가 없으면 프론트가 KRW 로 간주 — 기존 블록 마이그레이션 불필요. "
+                "group_link 은 항목마다 links[].currency 로 따로 둔다."
+            ),
+            "example": "USD",
+        },
         # ── profile ──────────────────────────────────
         "headline": {
             "type": "string",
