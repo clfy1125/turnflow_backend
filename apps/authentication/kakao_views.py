@@ -373,6 +373,11 @@ StrictMode 의 이중 실행에 주의하세요.
             # 신규 가입 시에만 마케팅 동의 반영 (동의 시 시각도 기록).
             marketing_opt_in=marketing_opt_in,
             marketing_opt_in_at=timezone.now() if marketing_opt_in else None,
+            # 카카오가 본인확인을 마친 번호다 — 우리 문자 인증을 또 시킬 이유가 없다.
+            # (동의항목 미승인·미동의·해외번호면 빈 문자열이 와서 아무 일도 안 일어난다)
+            phone=profile.phone,
+            phone_verified_at=timezone.now() if profile.phone else None,
+            phone_source="kakao" if profile.phone else "",
         )
         return user, True, None
 
@@ -406,5 +411,15 @@ StrictMode 의 이중 실행에 주의하세요.
             user.is_email_verified = True
             user.email_verified_at = timezone.now()
             updates += ["is_email_verified", "email_verified_at"]
+        # ⭐ 카카오 '추가 항목 동의 받기' 의 착지점 — 기존 회원이 다음 로그인에서 전화번호
+        #    제공에 동의하면 그 순간 번호가 채워진다. 문자 한 통도 쓰지 않는다.
+        # ⚠️ **이미 있는 번호를 덮어쓰지 않는다.** 우리 문자로 직접 인증한 번호(phone_source
+        #    ="sms")가 사용자가 실제로 쓰는 번호일 수 있고, 카카오계정 번호는 오래된 값일
+        #    수 있다. 바꾸고 싶으면 사용자가 설정에서 다시 인증한다.
+        if profile.phone and not user.phone:
+            user.phone = profile.phone
+            user.phone_verified_at = timezone.now()
+            user.phone_source = "kakao"
+            updates += ["phone", "phone_verified_at", "phone_source"]
         if updates:
             user.save(update_fields=updates)

@@ -61,6 +61,7 @@ INSTALLED_APPS = [
     "apps.analytics",
     "apps.insta_reports",
     "apps.home",
+    "apps.sms.apps.SmsConfig",
 ]
 
 MIDDLEWARE = [
@@ -280,6 +281,16 @@ REST_FRAMEWORK = {
         # 증폭 배수가 카카오보다 크다. 정상 사용자는 로그인 1회에 2요청이면 끝난다.
         "auth_instagram": config("THROTTLE_AUTH_INSTAGRAM", default="20/min"),
         "email_verify": config("THROTTLE_EMAIL_VERIFY", default="10/min"),
+        # ── 휴대폰 본인확인 (apps/authentication/phone_views.py) ──
+        # 문자는 **건당 돈이 나간다**. 메일 폭탄과 달리 공격의 목적이 우리 잔액을 태우는
+        # 것 자체이므로 메일(5/hour)과 같은 급으로 조인다. 정상 사용자는 가입 때 1~2회,
+        # 번호 변경 때 1회면 끝난다.
+        # ⚠️ 이 스로틀만으로는 부족하다 — 계정을 여러 개 만들면 우회된다. 번호별 쿨다운·
+        #    일일 상한·전역 상한이 phone_guard.py 에 따로 있다(그쪽이 실질 방어선).
+        "phone_send": config("THROTTLE_PHONE_SEND", default="5/hour"),
+        # 6자리 무차별 대입 방어. 시도 5회 제한(PhoneVerification.attempts)과 **별개**다 —
+        # 스로틀은 요청 속도를, 시도 횟수는 총량을 막는다. 둘 다 있어야 느린 대입도 막힌다.
+        "phone_verify": config("THROTTLE_PHONE_VERIFY", default="10/min"),
         "email_send": config("THROTTLE_EMAIL_SEND", default="5/hour"),
         # 이메일 등록 신청(POST /auth/me/email/) — **임의 주소로 메일을 보내는 경로**라
         # 메일 폭격 벡터다. 인증메일 재발송과 같은 급으로 조인다(사용자 기준).
@@ -787,6 +798,13 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": crontab(hour=3, minute=40),  # CELERY_TIMEZONE=Asia/Seoul 기준
         "options": {"queue": "billing"},  # housekeeping 큐 (기존 관례)
     },
+    # 매일 KST 03:50 — 보존기간 초과 SmsLog(수신번호 보유) + 만료 PhoneVerification 파기.
+    # 개인정보 최소 보유 원칙 — 처리방침에 고지한 기간을 코드가 강제한다.
+    "sms-purge-old-logs": {
+        "task": "sms.purge_old_logs",
+        "schedule": crontab(hour=3, minute=50),  # CELERY_TIMEZONE=Asia/Seoul 기준
+        "options": {"queue": "billing"},  # housekeeping 큐 (기존 관례)
+    },
     # 매일 KST 02:00 — EventInbox 일별 파티션 유지(선생성 + 보존 초과 DROP) + (옵션)SentDMLog 아카이브. (§15.8)
     "maintain-partitions": {
         "task": "integrations.maintain_partitions",
@@ -947,6 +965,74 @@ AUTO_PRO_TRIAL_SIGNUP_WINDOW_DAYS = config("AUTO_PRO_TRIAL_SIGNUP_WINDOW_DAYS", 
 AUTO_PRO_TRIAL_REQUIRE_AD_ATTRIBUTION = config(
     "AUTO_PRO_TRIAL_REQUIRE_AD_ATTRIBUTION", default=False, cast=bool
 )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 휴대폰 본인확인 + 문자 발송 (알리고) — 2026-10-09 카카오 알림톡 도입
+# ──────────────────────────────────────────────────────────────────────────────
+# ⭐ 왜 번호를 모으는가: 체험 종료·결제 실패·DM 중단처럼 "지금 알려야 손실을 막는" 사건의
+#    도달 수단이 메일뿐이었다. IG 가입자 349명은 자리표시 이메일이라 메일조차 못 받는다.
+#    도입 시점(2026-10-06) 기준 우리 DB 의 전화번호 보유는 **0건**이었다.
+#
+# 알리고(https://smartsms.aligo.in) — 선불 충전형. 키는 .env 에만 둔다(지침 14).
+ALIGO_API_KEY = config("ALIGO_API_KEY", default="")
+ALIGO_USER_ID = config("ALIGO_USER_ID", default="")
+# ⚠️ 발신번호 사전등록제 — 알리고 콘솔에 등록·승인된 번호가 아니면 전건 거절된다.
+ALIGO_SENDER = config("ALIGO_SENDER", default="")
+# 알리고 테스트 모드(testmode_yn=Y) — 과금·발송 없이 성공 응답만 온다. 운영은 반드시 False.
+ALIGO_TEST_MODE = config("ALIGO_TEST_MODE", default=False, cast=bool)
+# 실제 발송 대신 로그만 남긴다 (INSTAGRAM_MOCK_MODE 와 같은 규약 — 지침 5-7).
+# ⚠️ **기본값이 True 다** — 로컬·CI 에서 실수로 실문자가 나가 요금이 빠지는 일을 구조적으로
+#    막는다. 운영은 반드시 ``SMS_MOCK_MODE=False`` 를 넣어야 하고, 안 넣으면 배포 시
+#    ``apps/sms/checks.py`` 가 시끄럽게 경고한다(조용히 안 나가는 쪽이 더 위험하다).
+#    (base.py 에서는 DEBUG 를 참조할 수 없다 — DEBUG 는 local.py/prod.py 에서 정의된다)
+SMS_MOCK_MODE = config("SMS_MOCK_MODE", default=True, cast=bool)
+
+# OTP 수명·시도·재발송 — 전부 phone_guard.py 가 읽는다(판정 단일 소스).
+PHONE_VERIFY_CODE_TTL_SECONDS = config("PHONE_VERIFY_CODE_TTL_SECONDS", default=180, cast=int)
+PHONE_VERIFY_MAX_ATTEMPTS = config("PHONE_VERIFY_MAX_ATTEMPTS", default=5, cast=int)
+PHONE_VERIFY_RESEND_COOLDOWN_SECONDS = config(
+    "PHONE_VERIFY_RESEND_COOLDOWN_SECONDS", default=60, cast=int
+)
+# ── SMS 펌핑 방어 (금액 상한) ────────────────────────────────────────────────
+PHONE_VERIFY_MAX_PER_PHONE_PER_DAY = config(
+    "PHONE_VERIFY_MAX_PER_PHONE_PER_DAY", default=5, cast=int
+)
+# ⚠️ **느슨하게 잡는다.** 한국 모바일은 CGNAT 로 수백~수천 명이 한 egress IP 를 공유하고
+#    (track_visit 를 120/hour 로 둔 것과 같은 사정), 휴대폰 인증은 **가입 필수 단계**라
+#    여기서 잘못 막으면 그 캐리어 사용자 전원의 가입이 멈춘다. 일 가입이 ~100명이므로
+#    100 이면 정상 트래픽은 닿지 않으면서 단일 공격 박스는 잡힌다.
+#    실질 방어는 번호별 상한(5/일)이고, 금액 상한은 전역 캡이다.
+PHONE_VERIFY_MAX_PER_IP_PER_DAY = config("PHONE_VERIFY_MAX_PER_IP_PER_DAY", default=100, cast=int)
+# 서비스 전체 하루 발송 상한 = **최후의 금액 상한**. 0 이면 무제한(권장하지 않음).
+# 일 가입 ~100명 × 1.5회 = 150건이 정상 수요이므로 2,000 은 13배 여유다.
+PHONE_VERIFY_GLOBAL_DAILY_CAP = config("PHONE_VERIFY_GLOBAL_DAILY_CAP", default=2000, cast=int)
+
+# 개인정보 보유기간 — sms.purge_old_logs 가 강제한다.
+SMS_LOG_RETENTION_DAYS = config("SMS_LOG_RETENTION_DAYS", default=180, cast=int)
+PHONE_VERIFICATION_RETENTION_DAYS = config(
+    "PHONE_VERIFICATION_RETENTION_DAYS", default=30, cast=int
+)
+
+# ── 필수화 시점 + 기존 회원 보상 (billing/phone_reward.py 단일 소스) ──────────
+# ⭐ 이 **한 개**의 값이 두 정책을 동시에 가른다. 둘로 나누면 "인증은 필수인데 보상도
+#    받는" 신규 가입자가 생긴다.
+#      · 이 시각 **이후** 가입 → 휴대폰 인증 필수(phone_verification_required=true), 보상 없음
+#      · 그 이전 가입(기존 회원)  → 인증 선택, 번호 등록 시 **프로 체험 +7일**
+# ⚠️ 비워 두면 **아무도 필수가 아니다**(= 전원 기존 회원 취급). 프론트 배포가 끝난 뒤
+#    이 값을 넣는 것이 안전한 순서다 — 먼저 넣으면 아직 화면이 없는 신규 가입자에게
+#    required=true 가 내려가고, 프론트가 무시하면 아무 일도 안 일어나지만 지표가 오염된다.
+PHONE_REQUIRED_SINCE = config("PHONE_REQUIRED_SINCE", default="")
+PHONE_REWARD_ENABLED = config("PHONE_REWARD_ENABLED", default=True, cast=bool)
+PHONE_REWARD_TRIAL_EXTEND_DAYS = config("PHONE_REWARD_TRIAL_EXTEND_DAYS", default=7, cast=int)
+# 유료 구독자의 갱신일을 며칠 미룰 것인가. **0 = 지급 안 함**(기본).
+# ⚠️ 0 이 아닌 값은 실매출 이연이다(프로 29,000원 기준 1일 약 967원 × 유료 구독자 수).
+#    켜려면 그 금액을 먼저 계산할 것.
+PHONE_REWARD_PAID_EXTEND_DAYS = config("PHONE_REWARD_PAID_EXTEND_DAYS", default=0, cast=int)
+# 기존 회원 번호 수집 **메일** 캠페인. 기본 dormant(WINBACK_ENABLED 와 같은 규약).
+# ⚠️ 이 메일은 보상 고지가 들어가 **광고성**이라 marketing_opt_in 동의자(174명·6.6%)만
+#    대상이다 — 주력 채널은 인앱 팝업이고 이건 보조다. 켜기 전에
+#    apps/authentication/tasks.py 의 send_phone_collect_campaign docstring 을 읽을 것.
+PHONE_COLLECT_EMAIL_ENABLED = config("PHONE_COLLECT_EMAIL_ENABLED", default=False, cast=bool)
 
 # TossPayments 빌링(정기결제) 연동
 # 라이브 전환 = 키만 test_* → live_* 로 교체 (+ 개발자센터 웹훅 URL 등록)

@@ -202,7 +202,9 @@ def purge_deleted_accounts() -> dict:
             )
         except Exception:
             failed += 1
-            logger.exception("purge_deleted_accounts: 파기 중 오류 user=%s (%s)", user_id, user_email)
+            logger.exception(
+                "purge_deleted_accounts: 파기 중 오류 user=%s (%s)", user_id, user_email
+            )
 
     summary = {
         "candidates": len(candidates),
@@ -226,3 +228,63 @@ def purge_deleted_accounts() -> dict:
             logger.exception("purge_deleted_accounts: telegram 알림 실패")
 
     return summary
+
+
+@shared_task(name="authentication.send_phone_collect_campaign")
+def send_phone_collect_campaign(limit: int = 300) -> dict:
+    """기존 회원에게 "번호 등록하고 프로 체험 +N일" 메일을 보낸다.
+
+    ⚠️ **기본 dormant** (``PHONE_COLLECT_EMAIL_ENABLED=False``). 켜기 전에 읽을 것:
+
+    1. **이 메일은 광고성이다.** 보상(이익 제공) 고지가 들어가므로 정보통신망법 §50 의
+       사전 동의가 필요하다 → ``marketing_opt_in=True`` 만 대상이다. 그런데 동의자는
+       2026-10-06 실측 **174명(6.6%)** 뿐이다. 즉 이 메일로 닿을 수 있는 모수는 매우 작고,
+       **주력 채널은 인앱 팝업**이다(자사 화면 내 표시는 전자적 전송매체가 아니라 §50
+       대상이 아니다 — 프론트가 ``GET /auth/me/phone/`` 로 판단해 띄운다).
+    2. 동의 없이 전체에게 보내고 싶다면 **보상 문구를 빼고** 거래성(서비스 알림 연락처
+       등록 안내)으로 다시 써야 한다. 문구만 바꿔서 같은 템플릿을 쓰지 말 것 —
+       광고성 판정은 문구가 한다.
+    3. 자리표시 이메일(``@ig.invalid``) 349명은 애초에 메일이 안 나간다
+       (emails sender 게이트) — 그들에게는 팝업이 유일한 경로다.
+
+    중복 발송 방지: ``EmailLog`` 에 같은 template_key 행이 이미 있으면 건너뛴다
+    (별도 플래그 컬럼을 두지 않는다 — 발송 사실의 단일 소스는 EmailLog 다).
+    """
+    from apps.billing import phone_reward
+    from apps.emails.constants import TEMPLATE_PHONE_COLLECT
+    from apps.emails.models import EmailLog
+    from apps.emails.tasks import send_phone_collect_email
+
+    if not getattr(settings, "PHONE_COLLECT_EMAIL_ENABLED", False):
+        return {"enabled": False, "queued": 0}
+
+    User = get_user_model()
+    already = set(
+        EmailLog.objects.filter(template_key=TEMPLATE_PHONE_COLLECT)
+        .exclude(user_id=None)
+        .values_list("user_id", flat=True)
+    )
+    candidates = (
+        User.objects.filter(
+            is_active=True,
+            marketing_opt_in=True,
+            phone="",
+            deletion_scheduled_at__isnull=True,
+        )
+        .exclude(id__in=already)
+        .exclude(email__endswith="@ig.invalid")
+        .order_by("-date_joined")
+    )
+
+    queued = 0
+    for user in candidates.iterator():
+        if queued >= limit:
+            break
+        # 보상이 없는 사람에게 "보상 드립니다" 메일을 보내면 그대로 허위 고지다.
+        if phone_reward.preview(user).kind == phone_reward.KIND_NONE:
+            continue
+        send_phone_collect_email.delay(user.id)
+        queued += 1
+
+    logger.info("phone_collect campaign: queued=%s", queued)
+    return {"enabled": True, "queued": queued}

@@ -26,6 +26,7 @@ from .constants import (
     TEMPLATE_PAUSE_RESUME_REMINDER,
     TEMPLATE_PAYMENT_FAILED,
     TEMPLATE_PAYMENT_SUCCESS,
+    TEMPLATE_PHONE_COLLECT,
     TEMPLATE_WELCOME,
     TEMPLATE_WINBACK,
 )
@@ -347,6 +348,34 @@ def send_winback_email(user_id: int) -> None:
         send_email(TEMPLATE_WINBACK, user.email, ctx, user=user)
     except EmailTemplateMissing:
         logger.error("winback template missing — run seed_email_templates")
+
+
+@shared_task(name="emails.send_phone_collect_email")
+def send_phone_collect_email(user_id: int) -> None:
+    """휴대폰 번호 등록 유도 메일 (기존 회원 대상).
+
+    ⚠️ **광고성 정보다** — 보상(프로 체험 N일) 고지가 들어가므로 정보통신망법 §50 의
+       사전 동의가 필요하다. 동의·중복 판정은 호출 측
+       (``authentication.send_phone_collect_campaign``)이 이미 하므로 여기서는 발송만 한다.
+       ⚠️ 이 태스크를 다른 곳에서 직접 부르지 말 것 — 게이트를 건너뛰게 된다.
+    """
+    from apps.billing import phone_reward
+
+    try:
+        user = User.objects.get(pk=user_id, is_active=True)
+    except User.DoesNotExist:
+        return
+    ctx = {
+        "full_name": user.full_name or user.email.split("@")[0],
+        "service_name": settings.SERVICE_NAME,
+        "reward_days": phone_reward.trial_extend_days(),
+        "phone_url": f"{settings.FRONTEND_URL}/settings/phone",
+        "support_email": settings.SUPPORT_EMAIL,
+    }
+    try:
+        send_email(TEMPLATE_PHONE_COLLECT, user.email, ctx, user=user)
+    except EmailTemplateMissing:
+        logger.error("phone_collect template missing — run seed_email_templates")
 
 
 @shared_task(name="emails.send_ig_connection_lost_email")

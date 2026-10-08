@@ -63,6 +63,9 @@ class KakaoProfile:
     email: str
     email_verified: bool
     nickname: str
+    #: 카카오계정 전화번호를 ``01012345678`` 로 정규화한 값. 동의 안 했거나 해외번호면 빈 문자열.
+    #: ⭐ 카카오가 본인확인을 마친 번호라 우리가 따로 문자 인증을 할 필요가 없다.
+    phone: str = ""
 
 
 def _post_form(url: str, data: dict) -> dict:
@@ -216,7 +219,12 @@ def fetch_profile(access_token: str) -> KakaoProfile:
         f"{KAPI_BASE}/v2/user/me",
         access_token,
         # 필요한 필드만 요청한다 (개인정보 최소 수집 — 지침 5-6).
-        params={"property_keys": '["kakao_account.email","kakao_account.profile"]'},
+        params={
+            "property_keys": (
+                '["kakao_account.email","kakao_account.profile",'
+                '"kakao_account.phone_number"]'
+            )
+        },
     )
 
     kakao_id = data.get("id")
@@ -237,11 +245,38 @@ def fetch_profile(access_token: str) -> KakaoProfile:
     return KakaoProfile(
         kakao_id=str(kakao_id),
         email=email,
+        phone=_parse_phone(account),
         # 카카오가 "이 이메일은 본인 확인됨" 이라고 알려주는 값. 구글의 email_verified 와
         # 같은 의미이고, 같은 방식으로 **기존 계정 자동 연결의 게이트**로만 쓴다.
         email_verified=bool(account.get("is_email_verified")),
         nickname=(profile.get("nickname") or "").strip(),
     )
+
+
+def _parse_phone(account: dict) -> str:
+    """``kakao_account.phone_number`` → ``01012345678``. 못 쓰는 값이면 빈 문자열.
+
+    ⭐ **동의항목 심사를 통과한 앱에서만 내려온다.** 미동의/미승인이면 키 자체가 없거나
+       ``phone_number_needs_agreement=true`` 로 온다 → 그때는 우리 문자 인증으로 받는다.
+       즉 이 함수는 **있으면 공짜로 줍는** 경로이지 유일한 경로가 아니다.
+
+    ⚠️ 카카오는 ``"+82 10-1234-5678"`` 처럼 **국가번호 + 공백 + 하이픈** 형태로 준다.
+       해외 가입자는 ``"+1 650-..."`` 가 오는데, 알림톡·문자 모두 국내만 되므로
+       ``normalize_phone`` 이 거절하는 것을 그대로 받아 빈 문자열로 둔다.
+    ⚠️ 번호 파싱 실패가 **로그인을 깨뜨리면 안 된다** — 번호는 부가 정보다.
+    """
+    if account.get("phone_number_needs_agreement"):
+        return ""
+    raw = (account.get("phone_number") or "").strip()
+    if not raw:
+        return ""
+    from .phone import InvalidPhoneNumber, normalize_phone
+
+    try:
+        return normalize_phone(raw)
+    except InvalidPhoneNumber:
+        # 해외번호 등 — 조용히 포기한다(로그에 번호를 남기지 않는다: 개인정보).
+        return ""
 
 
 def resolve_profile(

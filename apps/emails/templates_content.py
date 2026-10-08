@@ -35,6 +35,7 @@ from apps.emails.constants import (
     TEMPLATE_PAUSE_RESUME_REMINDER,
     TEMPLATE_PAYMENT_FAILED,
     TEMPLATE_PAYMENT_SUCCESS,
+    TEMPLATE_PHONE_COLLECT,
     TEMPLATE_WELCOME,
     TEMPLATE_WINBACK,
 )
@@ -438,6 +439,30 @@ DEFAULTS: dict[str, dict[str, str]] = {
 <p style="font-size:13px;color:#9ca3af;margin:0;">더 이상 이런 안내를 원치 않으시면 <a href="mailto:{{ support_email }}" style="color:#7C3AED;">{{ support_email }}</a>로 알려주세요. 마케팅 수신에 동의하신 분께만 발송됩니다.</p>
 """,
             preheader="{{ service_name }} 캠페인 데이터가 그대로 보관돼 있어요",
+        ),
+    },
+    # ── 휴대폰 번호 수집 캠페인 (기존 회원) ──
+    # ⚠️ **광고성**이다(이익 제공 고지). marketing_opt_in 동의자에게만 — 발송 게이트는
+    #    authentication.send_phone_collect_campaign 이 판정한다.
+    TEMPLATE_PHONE_COLLECT: {
+        "subject": "{{ full_name }}님, 휴대폰 등록하고 프로 체험 {{ reward_days }}일 더 받으세요 📱",
+        "html_body": _wrap(
+            """
+<p style="font-size:18px;font-weight:700;color:#111827;margin:0 0 4px;">중요한 알림, 놓치지 마세요 📱</p>
+<p style="margin:0 0 6px;color:#4b5563;"><strong>{{ full_name }}</strong>님, 지금은 <strong>이메일로만</strong> 안내를 드리고 있어요. 휴대폰 번호를 등록하시면 아래 알림을 <strong>카카오톡으로 바로</strong> 받아보실 수 있습니다.</p>
+<div style="margin:16px 0;padding:14px 18px;background:#f5f3ff;border:1px solid #ede9fe;border-radius:12px;color:#5b21b6;font-size:13px;line-height:1.9;">
+  · 인스타그램 연결이 끊겨 자동 DM 이 멈췄을 때<br>
+  · 무료 체험이 끝나기 전<br>
+  · 결제가 실패했을 때<br>
+  · 이번 달 DM 한도를 다 썼을 때
+</div>
+<p style="margin:0 0 6px;color:#4b5563;">지금 등록하시면 <strong>프로 체험 {{ reward_days }}일</strong>을 더 드립니다. 1분이면 끝나요.</p>
+"""
+            + _btn("{{ phone_url }}", "휴대폰 등록하고 {{ reward_days }}일 더 받기")
+            + """
+<p style="font-size:13px;color:#9ca3af;margin:0;">등록한 번호는 서비스 알림과 본인확인에만 사용하며, 언제든 설정에서 삭제하실 수 있습니다. 마케팅 수신에 동의하신 분께만 발송됩니다. 수신을 원치 않으시면 <a href="mailto:{{ support_email }}" style="color:#7C3AED;">{{ support_email }}</a>로 알려주세요.</p>
+""",
+            preheader="카카오톡으로 중요한 알림을 받고 프로 체험 {{ reward_days }}일을 더 받으세요",
         ),
     },
     TEMPLATE_INSTA_REPORT_READY: {

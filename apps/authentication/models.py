@@ -154,6 +154,56 @@ class User(AbstractUser):
         help_text="이 시각이 지나면 authentication.purge_deleted_accounts 가 하드 삭제한다",
     )
 
+    # ── 휴대폰 번호 (2026-10-09, 카카오 알림톡 도입) ─────────────────────────────
+    # ⭐ **왜 모으는가**: 체험 종료·결제 실패·DM 발송 중단처럼 "지금 알려야 손실을 막는"
+    #    사건의 도달 수단이 메일뿐이었다. 그런데 IG 가입자 349명은 자리표시 이메일이라
+    #    메일조차 못 받고(email_is_placeholder), 메일 오픈율은 알림톡의 1/5 수준이다.
+    # ⭐ **저장 형식은 `01012345678` (숫자만)** — 표기가 섞이면 같은 사람이 두 번 쌓이고
+    #    알림톡 발송이 실패한다. 정규화 단일 소스는 ``apps/authentication/phone.py``.
+    #
+    # ⚠️ **unique 가 아니다.** 한 사람이 대행사용/개인용 계정을 따로 쓰는 경우가 실재하고
+    #    (IG 연동도 워크스페이스 단위다), unique 로 막으면 그 사람은 두 번째 계정을
+    #    영영 인증하지 못한다 = CS. 중복 번호로 체험을 여러 번 받는 어뷰즈가 실측되면
+    #    그때 **차단이 아니라 집계**부터 할 것 (index 는 그래서 달아 둔다).
+    phone = models.CharField(
+        max_length=20,
+        blank=True,
+        default="",
+        db_index=True,
+        verbose_name="휴대폰 번호",
+        help_text="숫자만(01012345678). 본인확인을 마친 번호만 채워진다.",
+    )
+    phone_verified_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="휴대폰 인증 시각",
+        help_text="값이 있으면 본인확인 완료. phone 이 차 있는데 이게 비면 안 된다.",
+    )
+    phone_source = models.CharField(
+        max_length=16,
+        blank=True,
+        default="",
+        verbose_name="번호 출처",
+        help_text="sms = 우리 문자 인증 / kakao = 카카오 동의항목으로 받은 본인확인 번호",
+    )
+    # ── 광고성 문자·알림톡 수신 동의 (정보통신망법 §50) ──────────────────────────
+    # ⭐ ``marketing_opt_in``(메일)과 **따로 둔다.** 법은 광고성 정보의 **전송 매체**를
+    #    특정해 동의받기를 요구한다. 몇 달 전 "마케팅 메일 수신"에 동의한 사람에게 지금
+    #    광고 알림톡을 보내면 그 동의는 문자 매체를 포함하지 않는다 → 과태료 대상이다.
+    # ⚠️ 체험 종료·결제 실패 같은 **정보성** 알림톡은 이 동의와 무관하다(수신동의 불요).
+    #    게이트를 거는 대상은 광고성(브랜드메시지·프로모션)뿐이다.
+    sms_marketing_opt_in = models.BooleanField(
+        default=False, verbose_name="광고성 문자·알림톡 수신 동의"
+    )
+    sms_marketing_opt_in_at = models.DateTimeField(
+        null=True, blank=True, verbose_name="문자 수신 동의 시각"
+    )
+    # 번호 등록 보상(기존 회원 유인 — 프로 체험 연장)을 이미 받았는가. **1인 1회**.
+    # 번호를 지웠다가 다시 등록해도 두 번 주지 않기 위해 User 에 둔다(구독 행은 갈릴 수 있다).
+    phone_reward_granted_at = models.DateTimeField(
+        null=True, blank=True, verbose_name="번호 등록 보상 지급 시각"
+    )
+
     username = None  # Remove username field
 
     # Override username to use email
@@ -190,6 +240,11 @@ class User(AbstractUser):
         준다. 프론트는 이 값이 true 면 "알림을 받을 이메일을 등록해 주세요" 를 띄운다.
         """
         return (self.email or "").endswith("@" + PLACEHOLDER_EMAIL_DOMAIN)
+
+    @property
+    def phone_verified(self) -> bool:
+        """본인확인된 휴대폰 번호를 가지고 있는가."""
+        return bool(self.phone) and self.phone_verified_at is not None
 
 
 class InstagramLoginState(models.Model):
@@ -230,3 +285,65 @@ class InstagramLoginState(models.Model):
     @property
     def is_expired(self) -> bool:
         return timezone.now() >= self.expires_at
+
+
+class PhoneVerification(models.Model):
+    """휴대폰 본인확인 1건 — 발송된 인증번호 하나에 대응하는 행.
+
+    ``emails.EmailToken`` 과 같은 자리이지만 **따로 둔다**:
+      · 저쪽은 코드를 **평문**으로 저장한다(메일함을 가진 사람만 보는 값이라 그 설계가
+        용인됐다). 문자 OTP 는 SMS 피싱·DB 열람과 직결돼 평문으로 둘 수 없다 → HMAC.
+      · 문자는 **건당 돈이 나간다.** 재발송 쿨다운·번호별 일일 상한 같은 비용 방어가
+        필요한데, 그 상태를 EmailToken 에 얹으면 메일 쪽 코드가 같이 복잡해진다.
+
+    ⚠️ **시도 횟수는 이 행에 있다.** 스로틀(요청 수 제한)만으로는 6자리 대입을 못 막는다
+       — 공격자가 분당 10회씩 느긋하게 돌리면 하루에 14,400번이다. 5회 틀리면 행 자체를
+       죽여(``invalidated_at``) 재발송을 강제한다.
+    """
+
+    PURPOSE_VERIFY = "verify"
+
+    user = models.ForeignKey(
+        "authentication.User", on_delete=models.CASCADE, related_name="phone_verifications"
+    )
+    phone = models.CharField(max_length=20, db_index=True, verbose_name="수신번호(숫자만)")
+    code_hash = models.CharField(
+        max_length=64,
+        verbose_name="인증번호 HMAC",
+        help_text="HMAC-SHA256(SECRET_KEY, '<phone>:<code>') — 평문은 어디에도 남지 않는다",
+    )
+    expires_at = models.DateTimeField(db_index=True)
+    attempts = models.PositiveSmallIntegerField(default=0, verbose_name="확인 시도 횟수")
+    verified_at = models.DateTimeField(null=True, blank=True)
+    invalidated_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="무효화 시각",
+        help_text="재발송 또는 시도 초과로 죽은 행. 만료와 달리 '다시 받아야 한다'는 뜻.",
+    )
+    request_ip = models.GenericIPAddressField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table = "phone_verifications"
+        verbose_name = "휴대폰 인증"
+        verbose_name_plural = "휴대폰 인증 목록"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["user", "verified_at"]),
+            models.Index(fields=["phone", "created_at"]),
+        ]
+
+    def __str__(self) -> str:
+        from .phone import mask_phone
+
+        return f"{self.user_id} / {mask_phone(self.phone)} / {self.created_at:%m-%d %H:%M}"
+
+    @property
+    def is_live(self) -> bool:
+        """아직 확인에 쓸 수 있는 행인가."""
+        return (
+            self.verified_at is None
+            and self.invalidated_at is None
+            and self.expires_at > timezone.now()
+        )

@@ -138,6 +138,17 @@ turnflow_backend/
 │   │                           #   (username 으로 찾으면 안 됨 — 핸들은 남이 이어받을 수 있다)
 │   │                           #   popup_state_views.py = 성장 팝업 노출 상태(User.popup_state JSON,
 │   │                           #   기기 간 동기화). 병합은 **최상위 키 단위**(깊은 병합 아님)
+│   │                           #   phone.py/phone_guard.py/phone_views.py = **휴대폰 본인확인**
+│   │                           #   (카카오 알림톡 도달용 번호 수집, 2026-10-09). 정규화 단일 소스
+│   │                           #   =phone.py(`01012345678` 숫자만 — 표기가 섞이면 같은 사람이 두 번
+│   │                           #   쌓이고 알림톡이 실패한다) · 어뷰즈 방어 단일 소스=phone_guard.py.
+│   │                           #   ⚠️ 문자는 **건당 돈**이라 위협모델이 다르다(SMS 펌핑) → 네 겹 방어:
+│   │                           #   스로틀/번호별 쿨다운·일일(DB)/IP 일일(캐시)/전역 일일(DB·금액 상한).
+│   │                           #   **번호별·전역은 DB** — 캐시만 쓰면 Redis flush 한 번에 다 열린다.
+│   │                           #   OTP 는 평문 미저장(HMAC+번호 혼합)·3분·5회. 익명 발송 경로 없음.
+│   │                           #   ⚠️ 서버는 **하드 차단하지 않는다** — `phone_verification_required`
+│   │                           #   로 판정만 내려주고 차단은 프론트. 서버가 막으면 프론트 배포가
+│   │                           #   하루만 늦어도 전 신규 가입자가 서비스에 못 들어온다
 │   ├── workspace/              # Workspace(테넌트) + Membership + permissions
 │   ├── billing/                # 요금제/구독/토스 빌링 (toss_service, toss_flows, toss_views, dm_limits) + Celery 갱신 배치
 │   │                           #   consent.py = 결제 전 고지·유료전환 2차 동의 **판정 단일 소스**
@@ -170,6 +181,11 @@ turnflow_backend/
 │   │                           #   닫기는 HomeAlertDismissal(대상 키 단위 — 대상이 바뀌면 다시 뜬다).
 │   │                           #   tasks.py = 이메일 판(24h 미접속 게이트) — **기본 dormant**
 │   │                           #   (HOME_ALERT_EMAILS_ENABLED=False + core 0019 enabled=False 이중 잠금)
+│   ├── sms/                    # 문자 발송(알리고) — aligo.py(클라이언트)·services.py(발송+SmsLog 단일
+│   │                           #   진입점)·checks.py. ⚠️ **HTTP 200 이어도 실패일 수 있다** — 알리고는
+│   │                           #   인증 실패·잔액 부족·미등록 발신번호를 전부 200+`result_code<0` 으로
+│   │                           #   준다. ⚠️ OTP 본문은 90byte(EUC-KR) 넘으면 LMS 로 승급돼 **비용 3배**
+│   │                           #   (테스트가 길이를 못 박는다). SMS_MOCK_MODE 기본 True — 운영은 False
 │   └── admin_api/              # 백오피스(어드민) 전용 API — 신원/대시보드(overview + 운영/마케팅: dashboard_ops·dashboard_marketing, 임계값=dashboard_constants.py)/회원/워크스페이스/페이지/자동DM 모니터링/레퍼럴 코드/마케팅 채널링크(marketing/channel-links — UTM 링크 서버 저장 CRUD, MarketingChannelLink·url/channel 서버 계산) (serializers/, views/ 패키지 + AdminActionLog 감사로그). 마운트: /api/v1/admin/
 │                               #   snapshot_rosters.py = 전체 현황 타일의 **모수 쿼리 단일 소스** —
 │                               #   대시보드 타일(_snapshot/_trial_now)과 명단(views/snapshot.py)이 공유해야
@@ -257,6 +273,13 @@ make init           # 빌드 + 실행 + 마이그레이션 한 번에
 - 토스페이먼츠: `TOSS_SECRET_KEY`, `TOSS_CLIENT_KEY`, `TOSS_API_BASE`, `TOSS_DEV_CARD_AUTH_ENABLED`(dev 전용 카드입력 헬퍼 — 운영 반드시 False)
 - 인스타 리포트: `APIFY_API_KEY`(공개 조회수 수집 — 인사이트 권한 미승인 대체), `GEMINI_API_KEY`(영상 피처),
   `DEEPSEEK_API_KEY`(문장 합성), `INSTA_REPORT_FAKE_MODE`(dev 전용 오프라인 모드 — 운영 반드시 False)
+- 문자/휴대폰 인증: `ALIGO_API_KEY`·`ALIGO_USER_ID`·`ALIGO_SENDER`(**사전등록된 발신번호**),
+  `SMS_MOCK_MODE`(기본 True — 운영 반드시 False, 안 넣으면 기동 시 `sms.W001` 경고),
+  `PHONE_VERIFY_*`(TTL 180s·시도 5·쿨다운 60s·번호별 5/일·IP 100/일·전역 2000/일),
+  ⭐ `PHONE_REQUIRED_SINCE`(**이 한 개**가 "신규=인증 필수·보상 없음 / 기존=선택·프로 체험 +7일"
+  을 가른다. 비우면 아무도 필수가 아님 — **프론트 배포 뒤에** 넣을 것),
+  `PHONE_REWARD_*`, `PHONE_COLLECT_EMAIL_ENABLED`(기본 dormant — 보상 고지는 **광고성**이라
+  `marketing_opt_in` 동의자 174명뿐. 주력은 인앱 팝업)
 - 카카오 로그인: `KAKAO_REST_API_KEY`, `KAKAO_CLIENT_SECRET`(콘솔에서 활성화 ON → 교환 시 필수),
   `KAKAO_APP_ID`(네이티브가 보낸 액세스 토큰의 app_id 검증 = 구글 aud 대응. 비면 그 경로 fail-closed)
 - 기타: `PIXABAY_API_KEY`, `GOOGLE_CLIENT_ID`
@@ -295,6 +318,8 @@ make init           # 빌드 + 실행 + 마이그레이션 한 번에
 - `integrations/` → IG 연동
 - `pages/` → 페이지/게시물/DM
 - `ai/` → LLM 작업
+- `auth/me/phone/` → 휴대폰 본인확인 (GET 상태·POST 발송·DELETE 삭제) + `verify/`
+- `admin/phone-collection/` → 번호 수집 현황(집계만 — **번호 원문을 내보내는 API 는 의도적으로 없다**)
 - `home/` → 홈 화면 알림 (alerts / alerts/dismiss)
 - `track/` → 방문·결제진입·취소·**퍼널 이벤트** 비콘 (analytics)
 - `insta-reports/` → 인스타 성장 리포트 (integrations 라우터가 `instagram` 을 ViewSet prefix 로
@@ -390,6 +415,7 @@ make test-cov                             # HTML 커버리지 리포트
   - `billing.notify_pause_resume_reminder` — 매일 09:30 KST (정지 재개 3일 전 사전 고지 메일)
   - `billing.notify_conversion_consent` — 매일 10:30 KST (유료전환 2차 동의 D-14/D-3 메일. **2026-08-10 제품 결정으로 dormant** — `CONVERSION_SECOND_CONSENT_ENABLED=False` 기본이라 즉시 no-op. core 0014 시드)
   - `billing.send_winback_emails` — 매일 10:00 KST (해지 후 복귀 유도, `WINBACK_ENABLED` 게이트·기본 dormant)
+  - `sms.purge_old_logs` — 매일 03:50 KST (SmsLog 180일·PhoneVerification 30일 파기 — 처리방침 고지 기간을 코드가 강제)
   - `analytics.cleanup_funnel_events` — 매일 03:40 KST (보존 180일 초과 퍼널 이벤트 삭제)
   - `insta_reports.sweep_stale` — 30분 (running 에 박힌 리포트 잡 실패 확정 — 동시생성 1건 제한 해제)
   - `insta_reports.purge_caches` — 매일 04:40 KST (90일 경과 AI 캐시 정리, 리포트 파일·집계는 보관)
@@ -500,6 +526,7 @@ make test-cov                             # HTML 커버리지 리포트
 - `docs/frontend/CONNECT_CONFLICT_WARNING_FRONTEND.md` — 다른 DM 툴 충돌 경고 배너 프론트 스펙 (연결 직후 + 대시보드 상단, 닫기 규칙)
 - `docs/frontend/URGENT_CONVERSION_BACKEND_RESPONSE.md` — **긴급 전환 개선 회신서**(2026-09-12, 마이그 billing0026·auth0007/0008·analytics0008/0009). 2026-09-10 마케팅 병목 진단(방문 5,679 → 가입 525(9.2%) → **프로 체험 26(5.0%)**)의 후속 8건. ①**카드 없는 프로 30일** `POST /billing/trial/auto-grant/` — 대상은 **체험 미사용 전원**(광고 귀속 판정·가입 창 둘 다 **기본 OFF**: 인앱 브라우저에서 UTM 이 유실돼 억울한 미지급이 나고, 팝업의 실제 타깃이 '가입했지만 체험 안 한 499명'이라 창을 좁히면 팝업이 죽는다). 지급/미지급 **둘 다 200**(에러 아님)·멱등(락 안 재검사 — 안 하면 30일이 두 번 들어간다). 판정 단일 소스 `billing/auto_trial.py` ②`UserSubscription.trial_last_day`(KST 마지막 이용일) — 프론트 `trial_ends_at−1일` 역산 제거(UTC 자정 근처에서 하루 틀어지는데 그게 곧 고지 문구다), preview 와 **같은 계산** ③`POST /track/funnel-event/` ④`GET/PATCH /auth/me/popup-state/`(⚠️ 프론트 요청 경로는 `users/me/...` 였으나 이 저장소의 '나'는 전부 `auth/me/` 아래) ⑤CAPI StartTrial `custom_data.trial_kind`(card/auto — 없으면 Meta 에서 둘이 뭉쳐 카드 없는 체험이 전환율을 희석) ⑥**인스타 로그인 3종**(§7) ⑦register 응답 `is_new_user`. **⚠️ 자동 지급이 켜지면 제휴코드가 `scenario=trial` 에 영영 도달 못 해 44일 쿠폰이 통째로 죽는다** → `attach_only` + 쿠폰 = **기간 연장** 허용(`toss_flows.extend_trial_with_referral`) + `referral/redeem` 을 **연장 전용으로 부활**(시작은 여전히 금지 — base 30일 누락 결함의 재발 방어)
 - `docs/frontend/HOME_V2_ALERTS_FRONTEND.md` — **홈 화면 알림**(2026-09-10, 마이그 home0001·integrations0055·core0018/0019). `GET /api/v1/home/alerts/` = 「지금 이 상태인가」 계산(이벤트 테이블 0, 30초 캐시, **Graph 호출 0**) + `POST .../dismiss/`(프론트 N4 대체 — 닫음을 서버 저장, 대상 키 단위라 새 게시물은 다시 뜬다). 등급 3종(critical 닫기불가 / warning / todo 닫기가능), `rank` 는 **서버가 정한다**(돈 새는 순 → 손쓸 수 있는 순 — 웹·앱이 갈리지 않게). ⚠️ 시안 ④「자동 DM N개가 멈춰 있어요」는 **뺐다** — 서버의 '조치 필요'는 캠페인이 아니라 개별 발송 미확인 건수라 잘 도는 캠페인에 '멈춤'이 붙는다. 안 만들기로 한 것 8종(체험 D-3·토큰 만료 예고·축소 예약·대기열 적체 등)은 §10 에 이유와 함께 박제 — **되살리기 전에 그 이유부터 볼 것**. 판정 단일화 2건: `subscription_utils.ig_activation_state`(강제 모달 ↔ 계정 선택 화면) · `dm_limits.quota_skipped_logs`(막힌 건수 ↔ 되살림 대상). dev 계정 4종 = `seed_home_alerts_dev`
+- `docs/frontend/PHONE_VERIFICATION_FRONTEND.md` — **휴대폰 본인확인**(2026-10-09, 마이그 auth0010·sms0001). 카카오 알림톡 도달용 번호 수집 — 도입 시점 우리 DB 의 전화번호 보유는 **0건**이었다. `GET/POST/DELETE /auth/me/phone/` + `verify/`. ⭐ **배포 순서가 핵심** — ①백엔드(`PHONE_REQUIRED_SINCE` 비움=무변화) ②프론트 ③그 값을 넣어 필수화. 거꾸로 하면 화면 없이 required 만 내려간다. ⭐ 필수/보상 판정 단일 소스 = `billing/phone_reward.py`(가입 시점 하나로 둘을 가른다 — 설정을 둘로 나누면 "필수인데 보상도 받는" 신규가 생긴다). 보상은 TRIALING→+7일 / 체험 미사용→**자동 프로 30일**(7일을 따로 주면 `trial_used_at` 이 찍혀 30일 자격이 날아간다) / 유료→기본 미지급(실매출 이연이라 env 로만). **번호당 1회**(계정 복제 차단). 광고성 동의는 `sms_marketing_opt_in` **별도 필드** — 정보통신망법 §50 은 전송 **매체별** 동의라 메일 동의로 알림톡을 못 보낸다. ⚠️ 프론트가 400 사유를 generic 으로 뭉개면 "인증번호가 안 와요" CS 가 원인 불명으로 쌓인다(QuoteGate·탈퇴 모달과 동형 함정). 법무 문안은 `docs/legal/휴대폰번호_수집_약관개정_반영문안.md`
 - `docs/frontend/DM_CAMPAIGN_MIGRATION_FRONTEND.md` — DM 캠페인 이전(매니챗 등→TurnFlow) 프론트 가이드. 연동 IG 계정의 최근 게시물·댓글·발신 DM(Conversations API) 분석→기존 DM 캠페인 추론→**비활성(INACTIVE) 초안 후보** 생성→검수·apply→활성화. `POST/GET /integrations/dm-migration/jobs/`(시작·폴링 3s·취소, 비종결1개 + **7일 캐시 재사용** + force쿨다운 **6h**·429 — 거부는 force 일 때만), `.../jobs/{id}/candidates/`(band=auto_draft/needs_review/template_only/excluded), `.../candidates/{id}/apply|dismiss/`(apply=AutoDMCampaignCreateSerializer 재사용·status=INACTIVE·활성 중복은 활성화 시점 발동). 전 플랜·v1 토큰차감 없음. 파이프라인=`apps/integrations/dm_migration/`(collect·analyze·llm·pipeline), 태스크 `integrations.run_dm_migration_job`(ai_jobs 큐, 체크포인트 재개·rate-pause)·`integrations.purge_dm_migration_raw`(원본 7일 파기+스테일 스위퍼, core 0008 시드). 자기발송 제외(SentDMLog mid/지문), Mock 픽스처+`DM_MIGRATION_FAKE_LLM`로 오프라인 e2e
 - `docs/frontend/INSTA_REPORT_FRONTEND.md` — 인스타 성장 리포트 프론트 연동 가이드(프로 전용·계정당 월1회·평균 15분·3초 폴링·10단계
   진행률 보간·HTML 인증 다운로드·완료 메일). 파이프라인 원본 실험은 `../insta_report_lab/PLAN.md`

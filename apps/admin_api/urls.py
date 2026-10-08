@@ -45,6 +45,7 @@ from apps.admin_api.views.pages import (
     AdminPageListView,
     AdminPageSubscriptionListView,
 )
+from apps.admin_api.views.phone_collection import AdminPhoneCollectionView
 from apps.admin_api.views.preferences import AdminPreferencesView
 from apps.admin_api.views.referral import (
     AdminReferralCodeDetailView,
@@ -88,6 +89,12 @@ urlpatterns = [
         "dashboard/marketing/",
         AdminMarketingDashboardView.as_view(),
         name="dashboard-marketing",
+    ),
+    # B-1. 휴대폰 번호 수집 현황 (알림톡 발송 가능 모수) — 집계만, 번호 원문 없음.
+    path(
+        "phone-collection/",
+        AdminPhoneCollectionView.as_view(),
+        name="phone-collection",
     ),
     # B-2. 전체 현황 타일 → 회원 명단 (SNAP-1/2). 최고 관리자 전용 —
     #      /admin/snapshot/** 는 RBAC 화이트리스트에 없어 marketing_viewer 는 403.

@@ -20,6 +20,12 @@ TEMPLATE_PAYMENT_SUCCESS = "payment_success"
 TEMPLATE_PAYMENT_FAILED = "payment_failed"
 TEMPLATE_PAUSE_RESUME_REMINDER = "pause_resume_reminder"
 TEMPLATE_WINBACK = "winback"
+# 기존 회원 휴대폰 번호 수집 캠페인 (2026-10-09).
+# ⚠️ **광고성 정보다** — "등록하면 프로 체험 N일" 은 이익 제공 고지라 정보통신망법
+#    §50 의 광고성 정보에 해당한다. marketing_opt_in 동의자에게만 보낼 것.
+#    동의자가 174명(6.6%)뿐이라 이 메일은 보조 채널이고, 주력은 **인앱 팝업**이다
+#    (자사 서비스 화면 내 표시는 전자적 전송매체가 아니라 §50 대상이 아니다).
+TEMPLATE_PHONE_COLLECT = "phone_collect"
 TEMPLATE_INSTA_REPORT_READY = "insta_report_ready"
 
 # 서비스 중단 안내 (홈 알림의 이메일 판 — 배너를 못 본 채 24시간 이상 콘솔에 안 들어온 경우에만).
@@ -48,6 +54,7 @@ TEMPLATE_KEYS = [
     TEMPLATE_PAYMENT_FAILED,
     TEMPLATE_PAUSE_RESUME_REMINDER,
     TEMPLATE_WINBACK,
+    TEMPLATE_PHONE_COLLECT,
     TEMPLATE_INSTA_REPORT_READY,
     TEMPLATE_CONVERSION_CONSENT,
     TEMPLATE_CONSENT_MISSING_DOWNGRADE,
@@ -151,6 +158,13 @@ AVAILABLE_VARIABLES: dict[str, dict[str, str]] = {
         "service_name": "서비스명",
         "resubscribe_url": "다시 구독하러 가는 URL (요금제/결제 페이지)",
         "billing_url": "콘솔 결제 설정 URL",
+        "support_email": "고객센터 이메일",
+    },
+    TEMPLATE_PHONE_COLLECT: {
+        "full_name": "수신자 이름",
+        "service_name": "서비스명",
+        "reward_days": "번호 등록 시 추가되는 프로 체험 일수 (예: 7)",
+        "phone_url": "번호 등록 화면 URL",
         "support_email": "고객센터 이메일",
     },
     TEMPLATE_INSTA_REPORT_READY: {

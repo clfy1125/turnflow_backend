@@ -94,6 +94,20 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
 class UserSerializer(serializers.ModelSerializer):
     """Serializer for user profile"""
 
+    phone = serializers.SerializerMethodField(
+        help_text="등록된 휴대폰 번호(`010-1234-5678` 표기). 미등록이면 빈 문자열."
+    )
+    phone_verified = serializers.BooleanField(
+        read_only=True, help_text="본인확인을 마친 번호를 가지고 있는가."
+    )
+    phone_verification_required = serializers.SerializerMethodField(
+        help_text=(
+            "지금 휴대폰 인증 화면을 **강제**해야 하는가. 정책 시행일 이후 가입자이면서 "
+            "아직 인증하지 않았으면 true. ⚠️ 프론트가 date_joined 로 자체 판정하지 말 것 "
+            "— 정책이 바뀌면 서버만 바꾼다 (판정 단일 소스 billing/phone_reward.py)."
+        )
+    )
+
     email_is_placeholder = serializers.BooleanField(
         read_only=True,
         help_text=(
@@ -117,6 +131,12 @@ class UserSerializer(serializers.ModelSerializer):
             "last_login",
             "marketing_opt_in",
             "marketing_opt_in_at",
+            "phone",
+            "phone_verified",
+            "phone_verified_at",
+            "phone_verification_required",
+            "sms_marketing_opt_in",
+            "sms_marketing_opt_in_at",
         ]
         read_only_fields = [
             "id",
@@ -126,11 +146,30 @@ class UserSerializer(serializers.ModelSerializer):
             "email_verified_at",
             "date_joined",
             "last_login",
+            # 번호 자체는 이 시리얼라이저로 못 바꾼다 — 본인확인(문자 인증)을 거쳐야 한다.
+            "phone",
+            "phone_verified",
+            "phone_verified_at",
+            "phone_verification_required",
+            "sms_marketing_opt_in_at",
             # 동의 자체(marketing_opt_in)는 이 출력용 시리얼라이저로 수정하지 않는다
             # (수정은 UserUpdateSerializer). 동의 시각은 서버가 파생하므로 항상 read-only.
             "marketing_opt_in",
             "marketing_opt_in_at",
         ]
+
+    def get_phone(self, obj) -> str:
+        """본인에게는 전체 번호를 하이픈 표기로 돌려준다 (마스킹하지 않는다 —
+        자기 번호를 확인하고 바꿀 수 있어야 한다). 남의 번호를 내보내는 경로는
+        이 시리얼라이저를 쓰지 않는다(어드민은 별도 마스킹)."""
+        from .phone import format_phone
+
+        return format_phone(obj.phone) if obj.phone else ""
+
+    def get_phone_verification_required(self, obj) -> bool:
+        from apps.billing.phone_reward import phone_verification_required
+
+        return phone_verification_required(obj)
 
 
 class UserUpdateSerializer(serializers.ModelSerializer):
@@ -138,10 +177,10 @@ class UserUpdateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = User
-        fields = ["full_name", "marketing_opt_in"]
+        fields = ["full_name", "marketing_opt_in", "sms_marketing_opt_in"]
 
     def update(self, instance, validated_data):
-        """full_name/marketing_opt_in 갱신.
+        """full_name/marketing_opt_in/sms_marketing_opt_in 갱신.
 
         marketing_opt_in 이 바뀌면 동의 시각(marketing_opt_in_at)을 서버가 파생한다:
         - False→True: 지금 시각을 동의 시각으로 기록
@@ -156,6 +195,14 @@ class UserUpdateSerializer(serializers.ModelSerializer):
                 instance.marketing_opt_in_at = timezone.now()
             elif not new_val:
                 instance.marketing_opt_in_at = None
+        # 문자·알림톡(광고성)은 **매체가 달라 별도 동의**다 — 메일 동의로 대신할 수 없다
+        # (정보통신망법 §50 은 전송 매체를 특정해 동의받기를 요구한다).
+        if "sms_marketing_opt_in" in validated_data:
+            new_val = validated_data["sms_marketing_opt_in"]
+            if new_val and not instance.sms_marketing_opt_in:
+                instance.sms_marketing_opt_in_at = timezone.now()
+            elif not new_val:
+                instance.sms_marketing_opt_in_at = None
         return super().update(instance, validated_data)
 
 

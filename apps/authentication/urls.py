@@ -21,6 +21,7 @@ from .deletion_views import (
 from .email_views import EmailRegisterVerifyView, EmailRegisterView
 from .instagram_views import InstagramLoginStartView, InstagramLoginView
 from .kakao_views import KakaoLoginView
+from .phone_views import PhoneSendCodeView, PhoneVerifyView
 from .popup_state_views import PopupStateView
 from .views import (
     AccountDeleteView,
@@ -49,6 +50,10 @@ urlpatterns = [
     # 이메일 등록·인증 (인스타 로그인 사용자 — 자리표시 이메일 계정 전용)
     path("me/email/", EmailRegisterView.as_view(), name="me-email-register"),
     path("me/email/verify/", EmailRegisterVerifyView.as_view(), name="me-email-verify"),
+    # 휴대폰 본인확인 (카카오 알림톡 도달용 번호 수집 — docs/frontend/PHONE_VERIFICATION_FRONTEND.md)
+    # POST = 인증번호 발송 / DELETE = 등록된 번호 삭제(개인정보 자기결정권)
+    path("me/phone/", PhoneSendCodeView.as_view(), name="me-phone"),
+    path("me/phone/verify/", PhoneVerifyView.as_view(), name="me-phone-verify"),
     path("me/delete/", AccountDeleteView.as_view(), name="account-delete"),
     path("token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
     # Email verification + password reset (implemented in apps.emails)

@@ -46,6 +46,13 @@ def _match_params(user) -> dict:
     얻을 수 있어서, 결제처럼 한참 뒤 일어나는 이벤트에서는 여기서 꺼내는 수밖에 없다.
     """
     params = {"email": getattr(user, "email", "") or "", "external_id": getattr(user, "id", None)}
+    # ⭐ 전화번호는 Meta 매칭 품질을 가장 크게 올리는 파라미터다(이메일과 동급 또는 그 이상).
+    #    ``hash_phone`` 은 예전부터 있었지만 **호출부가 값을 안 넘겨 항상 빈 문자열**이었다
+    #    — 2026-10-09 번호 수집이 생기면서 비로소 채워진다.
+    # ⚠️ 본인확인을 마친 번호만 보낸다. 미검증 입력값을 보내면 오매칭이 늘어 품질 점수가
+    #    오히려 떨어진다(빈 해시를 보내는 것과 같은 함정).
+    if getattr(user, "phone_verified", False):
+        params["phone"] = user.phone or ""
     try:
         attr = getattr(user, "signup_attribution", None)
         if attr is not None:
