@@ -800,6 +800,9 @@ CELERY_BEAT_SCHEDULE = {
     },
     # 하루 2회(09:10 / 18:10 KST) — 알리고 문자 잔액 감시.
     # 비면 휴대폰 인증이 막혀 **신규 가입이 전면 중단**되므로 조용히 지나가면 안 된다.
+    # ⚠️ **프로덕션은 이 표를 읽지 않는다** — celery_beat 가 fallback 프로필이라 뜨지 않고,
+    #    외부 tick 이 core.ScheduledJob 을 본다. 운영 반영은 core/0022_seed_sms_jobs.py.
+    #    (그쪽은 cron_hour 목록을 지원하지 않아 09시·18시 **두 행**으로 나눠 둔다)
     "sms-check-balance": {
         "task": "sms.check_balance",
         "schedule": crontab(hour="9,18", minute=10),  # CELERY_TIMEZONE=Asia/Seoul 기준

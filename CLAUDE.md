@@ -407,6 +407,12 @@ make test-cov                             # HTML 커버리지 리포트
 - 브로커/백엔드: Redis (`/0` DB)
 - 캐시: Redis `/1` DB (`django_redis`)
 - 태스크 등록 파일: `apps/*/tasks.py` (autodiscover)
+- ⚠️⚠️ **`CELERY_BEAT_SCHEDULE` 에 추가하는 것만으로는 프로덕션에서 영영 실행되지 않는다.**
+  prod 는 celery_beat 가 `profiles: ["fallback"]` 이라 뜨지 않고, **CF cron 워커 →
+  `POST /api/v1/internal/scheduler/tick`** 이 `core.ScheduledJob.next_due_at` 만 보고 발사한다.
+  새 주기잡은 **시드 마이그레이션을 함께** 넣을 것 (예: `core/0022_seed_sms_jobs.py`).
+  ⚠️ `ScheduledJob` 의 cron grammar 는 `cron_hour` = `*` / `*/N` / **단일 숫자**만 지원한다 —
+  `"9,18"` 같은 목록은 미지원 분기로 떨어져 **매시간** 돈다. 하루 2회는 행을 둘로 나눌 것.
 - 기존 정기 스케줄 (`CELERY_BEAT_SCHEDULE` in base.py) — billing 갱신 파이프라인:
   - `billing.process_due_renewals` — 10분 (갱신 도래 구독 과금 디스패치 — **토스 정기결제의 심장**)
   - `billing.reconcile_pending_payments` — 30분 (모호 실패 PENDING 결제 확정)
