@@ -798,6 +798,13 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": crontab(hour=3, minute=40),  # CELERY_TIMEZONE=Asia/Seoul 기준
         "options": {"queue": "billing"},  # housekeeping 큐 (기존 관례)
     },
+    # 하루 2회(09:10 / 18:10 KST) — 알리고 문자 잔액 감시.
+    # 비면 휴대폰 인증이 막혀 **신규 가입이 전면 중단**되므로 조용히 지나가면 안 된다.
+    "sms-check-balance": {
+        "task": "sms.check_balance",
+        "schedule": crontab(hour="9,18", minute=10),  # CELERY_TIMEZONE=Asia/Seoul 기준
+        "options": {"queue": "billing"},
+    },
     # 매일 KST 03:50 — 보존기간 초과 SmsLog(수신번호 보유) + 만료 PhoneVerification 파기.
     # 개인정보 최소 보유 원칙 — 처리방침에 고지한 기간을 코드가 강제한다.
     "sms-purge-old-logs": {
@@ -1006,6 +1013,15 @@ PHONE_VERIFY_MAX_PER_IP_PER_DAY = config("PHONE_VERIFY_MAX_PER_IP_PER_DAY", defa
 # 서비스 전체 하루 발송 상한 = **최후의 금액 상한**. 0 이면 무제한(권장하지 않음).
 # 일 가입 ~100명 × 1.5회 = 150건이 정상 수요이므로 2,000 은 13배 여유다.
 PHONE_VERIFY_GLOBAL_DAILY_CAP = config("PHONE_VERIFY_GLOBAL_DAILY_CAP", default=2000, cast=int)
+
+# ── 잔액 감시 (sms.check_balance) ────────────────────────────────────────────
+# ⚠️ 휴대폰 인증이 가입 필수 단계가 된 뒤로, 포인트 소진은 "문자 안 감"이 아니라
+#    **신규 가입 전면 중단**이다. 알리고 자체 알림(10,000P 미만 시 담당자 문자)이 있지만
+#    그건 **문자로 온다** — 문자가 고장난 상황에서 같은 경로로 오는 경보는 함께 죽는다.
+#    그래서 우리 경보는 Telegram 으로 따로 나간다.
+ALIGO_BALANCE_WARN_COUNT = config("ALIGO_BALANCE_WARN_COUNT", default=1000, cast=int)
+ALIGO_BALANCE_CRIT_COUNT = config("ALIGO_BALANCE_CRIT_COUNT", default=200, cast=int)
+ALIGO_BALANCE_REPEAT_HOURS = config("ALIGO_BALANCE_REPEAT_HOURS", default=24, cast=int)
 
 # 개인정보 보유기간 — sms.purge_old_logs 가 강제한다.
 SMS_LOG_RETENTION_DAYS = config("SMS_LOG_RETENTION_DAYS", default=180, cast=int)

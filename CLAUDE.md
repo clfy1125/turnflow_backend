@@ -278,6 +278,7 @@ make init           # 빌드 + 실행 + 마이그레이션 한 번에
   `PHONE_VERIFY_*`(TTL 180s·시도 5·쿨다운 60s·번호별 5/일·IP 100/일·전역 2000/일),
   ⭐ `PHONE_REQUIRED_SINCE`(**이 한 개**가 "신규=인증 필수·보상 없음 / 기존=선택·프로 체험 +7일"
   을 가른다. 비우면 아무도 필수가 아님 — **프론트 배포 뒤에** 넣을 것),
+  `ALIGO_BALANCE_*`(잔액 경보 임계),
   `PHONE_REWARD_*`, `PHONE_COLLECT_EMAIL_ENABLED`(기본 dormant — 보상 고지는 **광고성**이라
   `marketing_opt_in` 동의자 174명뿐. 주력은 인앱 팝업)
 - 카카오 로그인: `KAKAO_REST_API_KEY`, `KAKAO_CLIENT_SECRET`(콘솔에서 활성화 ON → 교환 시 필수),
@@ -415,6 +416,9 @@ make test-cov                             # HTML 커버리지 리포트
   - `billing.notify_pause_resume_reminder` — 매일 09:30 KST (정지 재개 3일 전 사전 고지 메일)
   - `billing.notify_conversion_consent` — 매일 10:30 KST (유료전환 2차 동의 D-14/D-3 메일. **2026-08-10 제품 결정으로 dormant** — `CONVERSION_SECOND_CONSENT_ENABLED=False` 기본이라 즉시 no-op. core 0014 시드)
   - `billing.send_winback_emails` — 매일 10:00 KST (해지 후 복귀 유도, `WINBACK_ENABLED` 게이트·기본 dormant)
+  - `sms.check_balance` — 09:10·18:10 KST (알리고 문자 잔액 감시 → Telegram. **포인트 소진 =
+    휴대폰 인증 불가 = 신규 가입 전면 중단**이라 조용히 지나가면 안 된다. 알리고 자체 알림은
+    **문자로 오므로** 문자가 고장난 상황에서 함께 죽는다 → 경로가 다른 Telegram 으로 따로 운다)
   - `sms.purge_old_logs` — 매일 03:50 KST (SmsLog 180일·PhoneVerification 30일 파기 — 처리방침 고지 기간을 코드가 강제)
   - `analytics.cleanup_funnel_events` — 매일 03:40 KST (보존 180일 초과 퍼널 이벤트 삭제)
   - `insta_reports.sweep_stale` — 30분 (running 에 박힌 리포트 잡 실패 확정 — 동시생성 1건 제한 해제)
