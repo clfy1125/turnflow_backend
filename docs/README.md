@@ -27,6 +27,9 @@
 
 - [CAMPAIGN_ACTIVATION_DROPOFF_ANALYSIS_2026-09-10.md](frontend/CAMPAIGN_ACTIVATION_DROPOFF_ANALYSIS_2026-09-10.md) — **연동은 했는데 캠페인을 안 만드는 원인 분석 + 개선 아이디어**(액세스 로그 퍼널 + DB + 프론트 코드 리딩). ★모바일 21.0% vs 데스크톱 44.8% · 첫 캠페인의 55.9%가 **연동 1시간 내** · 비활성 저장버튼이 사유를 안 알려준다(`isSubmitDisabled` 7조건·안내 0개) · 모바일 저장버튼이 폼 맨 끝(sticky 아님) · **캠페인 0개 계정 460개 중 415개(90.2%)가 이미 이전 분석 완료 → 즉시 켤 초안 542건이 방치** · apply 가 INACTIVE 라 이전초안 활성률 20.3%(직접생성 84.9%)
 
+- [HOME_TEST_ACCOUNTS_RESPONSE.md](frontend/HOME_TEST_ACCOUNTS_RESPONSE.md) — **홈 V2 상태별 dev 테스트 계정 43개**(H/P/I/A 코드 1:1) + 프론트가 직접 쓰는 재시드 API. ★게시물 API 500 해소(목 토큰 접두어) · 사진은 **외부 호스트 0**(data URI) · 「오류」 캠페인은 반드시 `campaign_post_restricted`(60)를 동반해 큰 카드를 밀어낸다 · 못 만든 것 = A04(실 IG user_id 필요) · A03(서버에 구글 가입 표식 필드 없음)
+- [HOME_TEST_ACCOUNTS_FOLLOWUP_RESPONSE.md](frontend/HOME_TEST_ACCOUNTS_FOLLOWUP_RESPONSE.md) — 위 문서에 대한 프론트 확인 결과 9건 회신. ★**조회(GET)만 해도 캠페인 `updated_at` 이 밀리던 운영 결함**(썸네일 백필이 update_fields 에 updated_at 을 넣고 있었다 — 사진 없는 캠페인이 '방금 수정됨'으로 목록 맨 위에) · `media_url` 은 **엔드포인트마다 뜻이 다르다**(목록=Graph CDN 이미지 / 캠페인=permalink — 1차 회신이 틀렸다) · `reason_code`·`kakao_linked_now`·팝업 `reason` 추가 · 복구 뒤 밀린 댓글은 **버튼이 아니라 1시간 배치**가 7일 창 안에서 메운다
+
 **결제·구독**
 - [TOSS_BILLING_FRONTEND.md](frontend/TOSS_BILLING_FRONTEND.md) — 토스 빌링 연동(카드등록 → prepare/confirm, 체험·해지·카드변경)
 - [EXTRA_IG_ACCOUNT_TRIAL_FRONTEND.md](frontend/EXTRA_IG_ACCOUNT_TRIAL_FRONTEND.md) — ⭐ **v2** · 체험 중 추가 IG 계정 **0원 즉시 추가**(체험 400 폐지 + `trial` 플래그) · 견적 400 사유 노출 요청 · dev 테스트 카드 실측표 · **체험 중 상한 없음 = 의도된 결정**
