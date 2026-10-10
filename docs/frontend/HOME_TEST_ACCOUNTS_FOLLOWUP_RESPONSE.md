@@ -10,7 +10,7 @@
 
 | # | 내용 | 처리 |
 |---|---|---|
-| 1 | 조회만 했는데 캠페인 `updated_at` 이 바뀜 | **고쳤습니다 · 운영 영향 있었습니다** (미배포) |
+| 1 | 조회만 했는데 캠페인 `updated_at` 이 바뀜 | **고쳤습니다 · 운영 영향 있었습니다** (배포 완료) |
 | 2 | H16 · H17 시드 값이 OpenAPI 와 다름 | **고쳤습니다 · dev 재시드 완료.** 운영에 소문자 경로는 **없습니다** |
 | 3 | 추천인 코드 `reason` 이 한국어 | **`reason_code` 추가** (5종, `reason` 은 영구 유지) |
 | 4 | 로그인 시 인증 코드를 보내는지 | **안 보냅니다** → 프론트가 한 번 부르는 게 맞습니다 |
@@ -20,8 +20,17 @@
 | 8 | `media_url` 이 이미지인가 링크인가 | **엔드포인트마다 다릅니다** — 1차 회신 §2-2 가 틀렸습니다. 목 픽스처도 운영에 맞췄습니다 |
 | 9 | 3시간 뒤 사라지는 시드 상태 | 1차 회신 §4 에 추가했습니다 |
 
-> **배포**: 1·3·5·6·8 은 운영 코드 변경이라 아직 **dev 에만** 있습니다. 운영 배포 시점은
-> 따로 알려 드리겠습니다. 2·9 는 시드·문서라 운영과 무관합니다.
+> ## ✅ 운영 배포 완료 (2026-10-11 · `9ec4c0e`)
+>
+> **1·3·5·6·8 전부 운영에 올라갔습니다.** 마이그레이션 없음, 무중단(DB·Redis 재시작 0).
+> 배포 후 15분 DM 310건 정상 발송(delivered 183 · read 92), 에러 0건.
+>
+> 운영 공개 URL 로 바로 확인하실 수 있습니다:
+> ```
+> GET https://api.turnflow.link/api/v1/billing/referral/validate/?code=NOPE0000
+> {"valid":false,"reason":"존재하지 않는 코드입니다.","reason_code":"not_found"}
+> ```
+> 2·9 는 시드·문서라 운영과 무관하고, dev 재시드도 끝나 있습니다.
 >
 > dev-api 에서 **공개 URL 로 직접 확인**했습니다 — 바로 쓰실 수 있습니다:
 > ```
@@ -200,8 +209,8 @@ POST /api/v1/auth/kakao/
 `OAUTH_AUTHORIZATION_FAILED` · `MISSING_PARAMETERS` · `INVALID_STATE` ·
 `INSTAGRAM_API_ERROR` · `PLAN_LIMIT_EXCEEDED` · `ALREADY_CONNECTED_ELSEWHERE` · `INTERNAL_ERROR`
 
-> 지금 바로 쓰실 수 있는 우회책: 배포 전이라면 `event.data.errorCode` 를 읽으시면 됩니다
-> — 그 값은 예전부터 들어 있었습니다.
+> 참고: `event.data.errorCode` 로도 같은 값을 읽을 수 있습니다 — 그 값은 예전부터 들어
+> 있었으니, 둘 중 편한 쪽을 쓰시면 됩니다.
 
 ---
 
