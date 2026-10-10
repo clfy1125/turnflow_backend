@@ -2893,7 +2893,8 @@ def backfill_campaign_media_permalink(campaign_id: str) -> dict:
         return {"status": "no_permalink"}
 
     campaign.media_url = permalink
-    campaign.save(update_fields=["media_url", "updated_at"])
+    # ⚠️ updated_at 을 **일부러 건드리지 않는다** — 이유는 _record_thumbnail_failure 위 주석.
+    campaign.save(update_fields=["media_url"])
     return {"status": "ok", "permalink": permalink}
 
 
@@ -3036,7 +3037,6 @@ def sync_campaign_thumbnail(campaign_id: str, force: bool = False) -> dict:
             "thumbnail_synced_at",
             "thumbnail_sync_attempts",
             "thumbnail_sync_error",
-            "updated_at",
         ]
     )
     return {
@@ -3047,11 +3047,25 @@ def sync_campaign_thumbnail(campaign_id: str, force: bool = False) -> dict:
     }
 
 
+# ⚠️ **시스템 백필은 ``updated_at`` 을 건드리지 않는다** (2026-10-11).
+#
+# ``updated_at`` 은 화면에 「오늘 오전 11:06 수정」으로 나가고 목록이 그 순서를 쓴다 —
+# 즉 **사용자가 마지막으로 고친 시각**이라는 뜻을 이미 갖고 있다. permalink·썸네일 백필은
+# 사용자가 손댄 적 없는 보강이라 여기에 끼면 안 된다.
+#
+# 실제 사고: 썸네일을 못 받는 캠페인(삭제된 게시물 등)은 목록 GET 마다 동기화가 예약되고,
+# 그때마다 실패 카운터 저장이 ``updated_at`` 을 밀어 올렸다. 그 결과 **조회만 했는데**
+# 그 캠페인이 "방금 수정됨"으로 목록 맨 위에 올라왔다(프론트 실측: 11:06 → 11:17).
+# 상한(THUMBNAIL_MAX_SYNC_ATTEMPTS=5)이 있어 영원히는 아니지만, 5번이면 이미 틀린 값이다.
+#
+# ``auto_now=True`` 필드는 ``update_fields`` 에 없으면 쓰이지 않는다 — 그래서 목록에서
+# 빼는 것만으로 충분하다(테스트: test_campaign_thumbnail.py).
+# 되돌리지 말 것. 사용자 편집 경로(views/serializer PATCH)는 그대로 둔다.
 def _record_thumbnail_failure(campaign, reason: str) -> dict:
     """썸네일 동기화 실패를 캠페인에 기록 (연속 실패 카운터 + 사유)."""
     campaign.thumbnail_sync_attempts = (campaign.thumbnail_sync_attempts or 0) + 1
     campaign.thumbnail_sync_error = reason
-    campaign.save(update_fields=["thumbnail_sync_attempts", "thumbnail_sync_error", "updated_at"])
+    campaign.save(update_fields=["thumbnail_sync_attempts", "thumbnail_sync_error"])
     return {
         "status": "failed",
         "campaign_id": str(campaign.id),

@@ -274,6 +274,48 @@ class TestSyncTask:
         assert c.thumbnail_url == ""
         assert c.thumbnail_sync_error == "no_source_url"
 
+    def test_backfill_does_not_touch_updated_at(self, local_storage):
+        """시스템 백필은 **'수정 시각'을 밀지 않는다**.
+
+        ``updated_at`` 은 화면에 「…에 수정」으로 나가고 목록 정렬에도 쓰인다. 썸네일을
+        못 받는 캠페인(삭제된 게시물 등)은 목록 GET 마다 동기화가 예약되므로, 여기서
+        ``updated_at`` 을 밀면 **조회만 했는데 "방금 수정됨"으로 맨 위에 올라온다**
+        (프론트 실측 2026-10-09). 성공·실패 양쪽 모두 건드리면 안 된다.
+        """
+        ws, _ = _make_ws_user()
+
+        failing = _make_campaign(_make_conn(ws))
+        before = failing.updated_at
+        assert self._run(failing, source=("", ""))["status"] == "failed"
+        failing.refresh_from_db()
+        assert failing.updated_at == before, "실패 카운터 저장이 updated_at 을 밀었다"
+        assert failing.thumbnail_sync_attempts == 1  # 저장 자체는 됐는지 확인
+
+        ok = _make_campaign(_make_conn(ws))
+        before_ok = ok.updated_at
+        assert self._run(ok)["status"] == "ok"
+        ok.refresh_from_db()
+        assert ok.updated_at == before_ok, "썸네일 저장이 updated_at 을 밀었다"
+        assert ok.thumbnail_url  # 저장 자체는 됐는지 확인
+
+    def test_permalink_backfill_does_not_touch_updated_at(self):
+        """permalink 백필도 같다 — 사용자가 손댄 적 없는 보강이다."""
+        from apps.integrations import tasks
+
+        ws, _ = _make_ws_user()
+        c = _make_campaign(_make_conn(ws), media_url="")
+        before = c.updated_at
+        with patch.object(
+            InstagramMediaService,
+            "get_media_permalink",
+            return_value="https://www.instagram.com/p/ABC123/",
+        ):
+            res = tasks.backfill_campaign_media_permalink(str(c.id))
+        assert res["status"] == "ok"
+        c.refresh_from_db()
+        assert c.media_url == "https://www.instagram.com/p/ABC123/"
+        assert c.updated_at == before, "permalink 백필이 updated_at 을 밀었다"
+
     def test_no_media_id_skipped(self):
         ws, _ = _make_ws_user()
         c = _make_campaign(

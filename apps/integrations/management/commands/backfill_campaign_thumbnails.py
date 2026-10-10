@@ -102,4 +102,5 @@ class Command(BaseCommand):
             self.stdout.write(f"  비움  {str(c.id)[:8]} {c.name[:24]} <- {c.media_url[:60]}")
             if not dry_run:
                 c.media_url = ""
-                c.save(update_fields=["media_url", "updated_at"])
+                # updated_at 제외 — 시스템 백필은 '수정 시각'을 밀지 않는다(tasks.py 주석).
+                c.save(update_fields=["media_url"])

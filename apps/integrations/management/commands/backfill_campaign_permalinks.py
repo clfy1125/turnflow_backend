@@ -83,7 +83,8 @@ class Command(BaseCommand):
             self.stdout.write(f"  OK    {str(c.id)[:8]} {c.name[:26]} -> {permalink}")
             if not opts["dry_run"]:
                 c.media_url = permalink
-                c.save(update_fields=["media_url", "updated_at"])
+                # updated_at 제외 — 시스템 백필은 '수정 시각'을 밀지 않는다(tasks.py 주석).
+                c.save(update_fields=["media_url"])
             if opts["sleep"]:
                 time.sleep(opts["sleep"])
 
