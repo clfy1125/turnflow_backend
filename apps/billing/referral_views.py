@@ -89,7 +89,8 @@ class ValidateReferralCodeView(APIView):
 | 필드 | 타입 | 설명 |
 |------|------|------|
 | `valid` | bool | 사용 가능 여부 |
-| `reason` | string | 사용 불가 사유 (valid=false일 때만) |
+| `reason` | string | 사용 불가 사유 — **한국어 고정 문장** (valid=false일 때만) |
+| `reason_code` | string | 사용 불가 사유 **머신 키** — 다국어 화면은 이 값으로 문구를 고르세요 (`not_found` · `inactive` · `not_yet_valid` · `expired` · `exhausted`) |
 | `trial_days` | int | 코드가 추가로 주는 **보너스** 일수 (valid=true) |
 | `base_trial_days` | int | 카드 등록 시 기본 무료 일수 (코드 없이도 프로 최초 구독이 받는 값, 보통 30) |
 | `total_trial_days` | int | **카드 등록 시 이 코드로 받는 총 무료 일수** = `base_trial_days + trial_days` |
@@ -112,9 +113,14 @@ if (data.valid) {
   const months = Math.round(data.total_trial_days / 30);
   showHint(`${data.plan.display_name} ${months}개월 무료 체험! (${data.total_trial_days}일)`);
 } else {
-  showError(data.reason);
+  // 다국어 화면은 reason_code 로 분기하세요. reason 은 한국어 고정 문장입니다.
+  showError(t(`referral.error.${data.reason_code}`) ?? data.reason);
 }
 ```
+
+> `reason_code` 는 **코드 자체의 상태**만 말합니다. "이 사용자가 이미 코드를 썼다"는
+> 사용자 단위 판정이라 이 엔드포인트(비인증)에서는 알 수 없고, 카드 등록
+> (`POST /billing/toss/confirm/`) 에서 400 으로 돌아옵니다.
 
 ## 에러 응답
 | 코드 | 원인 |
@@ -165,7 +171,11 @@ if (data.valid) {
                     ),
                     OpenApiExample(
                         "코드 미존재",
-                        value={"valid": False, "reason": "존재하지 않는 코드입니다."},
+                        value={
+                            "valid": False,
+                            "reason": "존재하지 않는 코드입니다.",
+                            "reason_code": "not_found",
+                        },
                     ),
                     OpenApiExample(
                         "비활성 코드",
@@ -217,11 +227,19 @@ if (data.valid) {
         try:
             code = ReferralCode.objects.select_related("target_plan").get(code=code_str)
         except ReferralCode.DoesNotExist:
-            return Response({"valid": False, "reason": "존재하지 않는 코드입니다."})
+            # ``reason`` 은 한국어 문장이라 영어 화면에 그대로 나간다 → 머신 키를 함께 준다.
+            # ⚠️ ``reason`` 은 기존 프론트가 읽으므로 **영구 유지**(지우면 문구가 사라진다).
+            return Response(
+                {
+                    "valid": False,
+                    "reason": "존재하지 않는 코드입니다.",
+                    "reason_code": ReferralCode.REASON_NOT_FOUND,
+                }
+            )
 
-        ok, reason = code.is_redeemable()
+        ok, reason_code, reason = code.redeemable_state()
         if not ok:
-            return Response({"valid": False, "reason": reason})
+            return Response({"valid": False, "reason": reason, "reason_code": reason_code})
 
         # 총 무료 일수 = 기본 체험 + 코드 보너스. 쿠폰은 카드 등록 경로에서만 쓰이므로
         # 이 값이 유일한 정답이다 (카드 없는 redeem 경로는 폐지 — 그 경로가 base 를

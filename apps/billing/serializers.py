@@ -475,7 +475,18 @@ class ReferralCodeValidateResponseSerializer(serializers.Serializer):
 
     valid = serializers.BooleanField(help_text="사용 가능 여부")
     reason = serializers.CharField(
-        required=False, allow_blank=True, help_text="사용 불가 사유 (valid=false일 때)"
+        required=False,
+        allow_blank=True,
+        help_text="사용 불가 사유 — **한국어 고정 문장** (valid=false일 때). 다국어 화면은 reason_code 사용",
+    )
+    reason_code = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        help_text=(
+            "사용 불가 사유 머신 키 (valid=false일 때): "
+            "not_found / inactive / not_yet_valid / expired / exhausted. "
+            "'이미 사용한 사용자'는 사용자 단위라 여기서 판정하지 않는다(카드 등록 시 400)."
+        ),
     )
     trial_days = serializers.IntegerField(
         required=False,

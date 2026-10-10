@@ -1175,23 +1175,43 @@ class ReferralCode(models.Model):
             self.code = self.code.strip().upper()
         super().save(*args, **kwargs)
 
-    def is_redeemable(self) -> tuple[bool, str]:
-        """현재 시점에서 사용 가능한지 + 사유 메시지.
+    # 사용 불가 사유의 **머신 키** — 화면 문구를 서버가 정하지 않기 위한 것.
+    # 한국어 문장만 내려보내면 영어 화면에 그 문장이 그대로 나간다(2026-10-09 프론트 제보).
+    # 값을 바꾸면 프론트 i18n 키가 깨진다 — 추가는 되지만 **이름 변경·삭제는 금지**.
+    REASON_NOT_FOUND = "not_found"
+    REASON_INACTIVE = "inactive"
+    REASON_NOT_YET_VALID = "not_yet_valid"
+    REASON_EXPIRED = "expired"
+    REASON_EXHAUSTED = "exhausted"
+
+    def redeemable_state(self) -> tuple[bool, str, str]:
+        """현재 시점에서 사용 가능한지 — ``(ok, reason_code, reason_message)`` **판정 단일 소스**.
 
         ⚠️ ``excluded_from_stats`` 는 **여기서 절대 보지 않는다**(MKT-14). 그 필드는 어드민
         대시보드 집계에서만 빼는 통계 전용 플래그이고, 고객의 코드 사용을 막는 스위치는
         ``is_active`` 다. 둘을 섞으면 "표에서 정리했더니 고객이 코드를 못 쓴다"가 된다.
+
+        ⚠️ 여기서 보는 것은 **코드 자체의 상태**뿐이다. "이 사용자가 이미 코드를 썼는가"
+        (``ReferralRedemption``)는 사용자 단위라 카드 등록 경로에서만 판정한다.
         """
         if not self.is_active:
-            return False, "비활성화된 코드입니다."
+            return False, self.REASON_INACTIVE, "비활성화된 코드입니다."
         now = timezone.now()
         if self.valid_from and now < self.valid_from:
-            return False, "아직 사용할 수 없는 코드입니다."
+            return False, self.REASON_NOT_YET_VALID, "아직 사용할 수 없는 코드입니다."
         if self.valid_until and now > self.valid_until:
-            return False, "유효 기간이 만료된 코드입니다."
+            return False, self.REASON_EXPIRED, "유효 기간이 만료된 코드입니다."
         if self.max_uses is not None and self.current_uses >= self.max_uses:
-            return False, "사용 횟수가 모두 소진된 코드입니다."
-        return True, ""
+            return False, self.REASON_EXHAUSTED, "사용 횟수가 모두 소진된 코드입니다."
+        return True, "", ""
+
+    def is_redeemable(self) -> tuple[bool, str]:
+        """``(ok, reason_message)`` — 기존 호출부(어드민·toss_flows)용 2-튜플 래퍼.
+
+        판정은 :meth:`redeemable_state` 하나에만 있다. 조건을 여기 복제하지 말 것.
+        """
+        ok, _code, message = self.redeemable_state()
+        return ok, message
 
 
 class ReferralRedemption(models.Model):
