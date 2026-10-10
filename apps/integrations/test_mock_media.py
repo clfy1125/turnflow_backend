@@ -73,6 +73,13 @@ class TestMockMediaShape:
                 assert f in item, f"missing {f}"
             # 썸네일은 네트워크 없이 렌더돼야 한다
             assert item["thumbnail_url"].startswith("data:image/svg+xml")
+            # ⚠️ `/media/` 응답의 media_url 은 **Graph 패스스루**라 운영에서 렌더 가능한
+            #    미디어 URL 이 온다. 목이 permalink 를 주면 프론트의 "thumbnail 없으면
+            #    media_url" 폴백이 dev 에서만 깨진 이미지로 보인다(2026-10-09 제보).
+            #    permalink 는 별도 키로 온다 — 두 값은 서로 다른 것이다.
+            assert item["media_url"].startswith("data:image/svg+xml"), item["media_url"]
+            assert item["permalink"].startswith("https://www.instagram.com/")
+            assert item["media_url"] != item["permalink"]
 
     def test_deterministic_across_calls(self):
         a = MockInstagramProvider.mock_list_media_page(self.IG, limit=5)

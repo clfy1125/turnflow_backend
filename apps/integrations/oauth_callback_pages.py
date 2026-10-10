@@ -9,10 +9,15 @@ Instagram OAuth 콜백 결과 페이지 (팝업 창에 렌더되는 사용자 �
     각 페이지의 <script> 는 `window.opener.postMessage(...)` 로 부모 창(우리 웹앱)에
     결과를 전달한다. 부모는 아래 payload 필드로 분기하므로 값을 바꾸면 프론트가 깨진다.
       - 성공: { source: 'ig-connect', type: 'INSTAGRAM_CONNECTED', success: true,  connection: {...} }
-      - 실패: { source: 'ig-connect', type: 'INSTAGRAM_ERROR',     success: false, errorCode: '...', message: '...' }
+      - 실패: { source: 'ig-connect', type: 'INSTAGRAM_ERROR',     success: false,
+                errorCode: '...', reason: '...'(errorCode 와 동일), message: '...' }
     errorCode 값(OAUTH_AUTHORIZATION_FAILED / MISSING_PARAMETERS / INVALID_STATE /
     INSTAGRAM_API_ERROR / PLAN_LIMIT_EXCEEDED / ALREADY_CONNECTED_ELSEWHERE /
     INTERNAL_ERROR)도 계약의 일부다.
+
+    `reason` 은 2026-10-11 추가된 **별칭**이다 — 같은-탭 복귀가 쿼리스트링으로 주는
+    `?ig_result=failed&reason=...` 와 키 이름을 맞추기 위한 것이라 값은 `errorCode` 와
+    항상 같다. 프론트가 PC(팝업)와 모바일(같은 탭)에서 같은 코드로 사유를 읽을 수 있다.
 
     `source: 'ig-connect'` 는 2026-08-04 추가됐다 — 프론트가 이 필드로 우리 메시지를
     식별한다(다른 확장/위젯의 postMessage 와 섞이지 않게). 기존 `type`/`success` 는
@@ -266,6 +271,11 @@ def _error_script(
         "        type: 'INSTAGRAM_ERROR',\n"
         "        success: false,\n"
         f"        errorCode: '{error_code}',\n"
+        # ⭐ `reason` 은 `errorCode` 와 **같은 값**이다. 같은-탭 복귀 경로는 쿼리스트링으로
+        #    `?ig_result=failed&reason=...` 를 주는데 팝업만 키 이름이 달라, 프론트가 PC 에서
+        #    사유를 읽지 못했다(2026-10-09 제보 — ALREADY_CONNECTED_ELSEWHERE 가 일반 실패로
+        #    뭉개졌다). ⚠️ `errorCode` 는 기존 프론트가 읽으므로 **영구 유지** — 둘 다 보낸다.
+        f"        reason: '{error_code}',\n"
         f"        message: {js_embed(message)}\n"
         "      }"
     )

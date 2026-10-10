@@ -742,8 +742,15 @@ class MockInstagramProvider:
             "media_product_type": media_product_type,
             "permalink": permalink,
             "comments_count": comments_count,
-            # 프로젝트 규약: media_url = permalink(링크용) / thumbnail_url = 렌더용 이미지
-            "media_url": permalink,
+            # ⚠️ 여기 ``media_url`` 은 **Graph 의 media_url 그대로**(= 렌더 가능한 미디어
+            #    URL)여야 한다. 한때 permalink 를 넣어 뒀는데, 그건 `AutoDMCampaign.media_url`
+            #    **컬럼**의 규약(=permalink)을 이 Graph 패스스루 응답에 잘못 적용한 것이었다.
+            #    운영은 `/media/` 응답의 media_url 을 Graph 에서 그대로 흘려보내므로 거기엔
+            #    IG CDN 이미지/영상 URL 이 들어온다. 프론트는 thumbnail_url 이 없을 때
+            #    media_url 로 폴백하는데, 목이 permalink 를 주면 **dev 에서만 깨진 이미지**가
+            #    나와 그 폴백을 시험할 수 없다(2026-10-09 프론트 제보).
+            #    permalink 는 아래 "permalink" 키로 따로 준다 — 운영과 같은 모양이다.
+            "media_url": cls._mock_thumbnail_data_uri(m["index"], kw if is_camp else "일상"),
             "thumbnail_url": cls._mock_thumbnail_data_uri(m["index"], kw if is_camp else "일상"),
             "like_count": like_rng.randint(10, 900),
         }
