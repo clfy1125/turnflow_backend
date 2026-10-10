@@ -344,6 +344,14 @@ class KakaoAuthResponseSerializer(AuthResponseSerializer):
             "Meta 픽셀 CompleteRegistration 등 **가입 전환 이벤트는 반드시 이 값으로 분기**할 것."
         )
     )
+    kakao_linked_now = serializers.BooleanField(
+        help_text=(
+            "이번 로그인에서 **기존 이메일/구글 계정에 카카오를 처음 연결**했는가. "
+            "「기존 계정에 카카오 로그인을 연결했어요」 안내는 이 값이 true 일 때만 띄울 것 — "
+            "`is_new_user=false` 만 보면 카카오로 가입한 사람의 재로그인에도 안내가 뜬다. "
+            "신규 가입(is_new_user=true)일 때는 false."
+        )
+    )
 
 
 class InstagramLoginSerializer(serializers.Serializer):

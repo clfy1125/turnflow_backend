@@ -204,6 +204,32 @@ class TestKakaoLoginExistingUser:
         existing.refresh_from_db()
         assert existing.kakao_id == "444555666"
 
+    def test_kakao_linked_now_is_true_only_at_the_moment_of_linking(self, client, monkeypatch):
+        """「기존 계정에 카카오를 연결했어요」 안내의 분기값.
+
+        ``is_new_user=False`` 만 보면 **카카오로 가입한 사람의 재로그인**에도 그 안내가
+        뜬다(2026-10-09 프론트 제보). 참이어야 하는 순간은 연결 그 한 번뿐이다.
+        """
+        email = _email()
+        User.objects.create_user(email=email, password="pw12345!")
+        _patch_resolve(monkeypatch, _profile(email, kakao_id=777888999, verified=True))
+
+        first = client.post(URL, {"access_token": "t"}, format="json")
+        second = client.post(URL, {"access_token": "t"}, format="json")
+
+        assert (first.data["is_new_user"], first.data["kakao_linked_now"]) == (False, True)
+        assert (second.data["is_new_user"], second.data["kakao_linked_now"]) == (False, False)
+
+    def test_kakao_linked_now_is_false_for_signup_and_relogin(self, client, monkeypatch):
+        """신규 가입은 '연결'이 아니다 — 그건 is_new_user 가 말한다."""
+        _patch_resolve(monkeypatch, _profile(_email(), kakao_id=123123123))
+
+        signup = client.post(URL, {"access_token": "t"}, format="json")
+        relogin = client.post(URL, {"access_token": "t"}, format="json")
+
+        assert (signup.data["is_new_user"], signup.data["kakao_linked_now"]) == (True, False)
+        assert (relogin.data["is_new_user"], relogin.data["kakao_linked_now"]) == (False, False)
+
     def test_unverified_email_cannot_link_to_existing_account(self, client, monkeypatch):
         """계정 탈취 방지 — 카카오가 소유 확인을 못 해준 이메일로 기존 계정을 열 수 없다."""
         email = _email()

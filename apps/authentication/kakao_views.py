@@ -95,6 +95,10 @@ StrictMode 의 이중 실행에 주의하세요.
 
 ### 주의사항
 - 가입/로그인이 같은 엔드포인트이므로 전환 이벤트는 응답의 `is_new_user` 로 분기하세요.
+- 「기존 계정에 카카오를 연결했어요」 안내는 **`kakao_linked_now`** 로 분기하세요.
+  `is_new_user=false` 만 보면 카카오로 가입한 사람이 재로그인할 때마다 그 안내가 뜹니다.
+  (신규 가입 → `is_new_user=true, kakao_linked_now=false` / 기존 계정에 첫 연결 →
+   `false, true` / 그냥 재로그인 → `false, false`)
 - 탈퇴 유예 중인 계정은 409 로 막히며 JWT 가 발급되지 않습니다.
 """,
         request=KakaoLoginSerializer,
@@ -131,6 +135,7 @@ StrictMode 의 이중 실행에 주의하세요.
                                 "marketing_opt_in": False,
                             },
                             "is_new_user": False,
+                            "kakao_linked_now": True,
                             "tokens": {"refresh": "eyJhbGciOi...", "access": "eyJhbGciOi..."},
                         },
                     )
@@ -310,10 +315,11 @@ StrictMode 의 이중 실행에 주의하세요.
                 status=status.HTTP_409_CONFLICT,
             )
 
+        linked_now = False
         if created:
             self._finalize_signup(user, data, request)
         else:
-            self._sync_existing_user(user, profile)
+            linked_now = self._sync_existing_user(user, profile)
 
         refresh = AppRefreshToken.for_user(user)
         return Response(
@@ -322,6 +328,10 @@ StrictMode 의 이중 실행에 주의하세요.
                 # ⭐ 가입/로그인이 같은 엔드포인트라 프론트가 구별할 방법이 이 값뿐이다.
                 #    date_joined 로 추정하면 CompleteRegistration 이 누락/중복 발사된다.
                 "is_new_user": created,
+                # ⭐ "기존 이메일 계정에 카카오를 **이번에** 붙였다" — 이때만 true.
+                #    카카오로 가입한 사람의 재로그인은 false 다(신규 가입도 false — 그건
+                #    is_new_user 가 말한다). 둘 다 false 면 그냥 평범한 재로그인이다.
+                "kakao_linked_now": linked_now,
                 "tokens": {"refresh": str(refresh), "access": str(refresh.access_token)},
             },
             status=status.HTTP_200_OK,
@@ -396,10 +406,17 @@ StrictMode 의 이중 실행에 주의하세요.
 
         track_signup(user, request=request)
 
-    def _sync_existing_user(self, user, profile):
+    def _sync_existing_user(self, user, profile) -> bool:
+        """기존 계정 동기화. **이번 로그인에서 카카오를 새로 붙였으면 True.**
+
+        이 한 번의 순간이 "기존 계정에 카카오를 연결했어요" 안내를 띄울 유일한 시점이다.
+        ``is_new_user=False`` 만 보면 **카카오로 가입한 사람이 재로그인할 때마다** 그
+        안내가 뜬다(2026-10-09 프론트 제보).
+        """
         updates = []
         # 기존 계정을 카카오에 처음 연결하는 순간 회원번호를 박아 둔다(다음부터는 ①로 매칭).
-        if user.kakao_id != profile.kakao_id:
+        linked_now = user.kakao_id != profile.kakao_id
+        if linked_now:
             user.kakao_id = profile.kakao_id
             updates.append("kakao_id")
         if profile.nickname and not user.full_name:
@@ -423,3 +440,4 @@ StrictMode 의 이중 실행에 주의하세요.
             updates += ["phone", "phone_verified_at", "phone_source"]
         if updates:
             user.save(update_fields=updates)
+        return linked_now
