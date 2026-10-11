@@ -797,6 +797,39 @@ class MockInstagramProvider:
         return {mid: cls._mock_media_item(pool[mid]) for mid in media_ids if mid in pool}
 
     @classmethod
+    def mock_list_stories(cls, ig_user_id: str) -> list:
+        """활성 스토리 목록 mock (``InstagramMediaService.list_stories`` 대응).
+
+        ⚠️ 스토리는 24시간만 살아 있다 — ``timestamp`` 를 **호출 시점 기준 상대값**으로
+        만든다. 고정 시각을 박으면 하루 뒤 "만료된 스토리"가 목록에 남아 화면이 거짓말을 한다.
+
+        ``media_url`` 은 게시물 목록과 같은 규약이다 — Graph 패스스루라 운영에선 렌더
+        가능한 CDN URL(이미지/영상)이 온다. 여기서도 렌더 가능한 값을 준다
+        (permalink 는 별도 키).
+        """
+        rng = cls._mock_rng(f"stories:{ig_user_id}")
+        now = timezone.now()
+        out = []
+        for i in range(rng.randint(2, 4)):
+            hours_ago = rng.uniform(0.5, 23.0)
+            sid = f"ms-{ig_user_id}-{i}"
+            is_video = rng.random() < 0.4
+            thumb = cls._mock_thumbnail_data_uri(i, "스토리")
+            out.append(
+                {
+                    "id": sid,
+                    "media_type": "VIDEO" if is_video else "IMAGE",
+                    "media_product_type": "STORY",
+                    "media_url": thumb,
+                    "thumbnail_url": thumb if is_video else None,
+                    "permalink": f"https://www.instagram.com/stories/{ig_user_id}/{sid}/",
+                    "timestamp": cls._mock_graph_ts(now - timedelta(hours=hours_ago)),
+                    "caption": "",
+                }
+            )
+        return out
+
+    @classmethod
     def mock_list_media_comments(cls, media_id: str, after: str | None = None) -> dict:
         """합성 댓글 1페이지 (InstagramMediaService.list_media_comments 대응 mock).
 

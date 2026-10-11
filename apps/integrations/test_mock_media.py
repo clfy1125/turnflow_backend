@@ -8,6 +8,7 @@
 
 import pytest
 from django.urls import resolve
+from django.utils import timezone
 
 from apps.integrations.services import MockInstagramProvider
 
@@ -161,3 +162,50 @@ class TestMockMediaContextForAiSuggest:
         b = MockInstagramProvider.mock_media_context(self.IG, "dummy-media-1")
         assert a == b
         assert a[0]  # 캡션이 비어 있으면 AI 초안이 무의미해진다
+
+
+class TestMockStories:
+    """스토리 목록도 목이 있어야 한다.
+
+    여기에 목 분기가 없어서 dev 시더 연결의 스토리 조회가 Meta 로 나가 400 을 받고,
+    우리가 그걸 **502** 로 되돌렸다(2026-10-11 프론트 제보). 게시물 목록이 이미 겪은
+    것과 같은 함정이라, 새 Graph 경로를 열 때마다 `should_use_mock` 을 확인할 것.
+    """
+
+    IG = "dmdummy_pro_main"
+
+    def test_has_fields_the_ui_needs(self):
+        items = MockInstagramProvider.mock_list_stories(self.IG)
+        assert items, "스토리가 0건이면 화면을 확인할 수 없다"
+        for it in items:
+            for f in (
+                "id",
+                "media_type",
+                "media_product_type",
+                "media_url",
+                "permalink",
+                "timestamp",
+                "caption",
+            ):
+                assert f in it, f"missing {f}"
+            # 게시물 목록과 같은 규약 — media_url 은 **렌더 가능한 미디어 URL**이다
+            # (운영은 Graph 패스스루라 IG CDN URL). permalink 는 별도 키.
+            assert it["media_url"].startswith("data:image/svg+xml"), it["media_url"]
+            assert it["permalink"].startswith("https://www.instagram.com/stories/")
+            assert it["media_url"] != it["permalink"]
+            assert it["media_product_type"] == "STORY"
+
+    def test_within_24h_window(self):
+        """스토리는 24시간만 산다 — 고정 시각을 박으면 하루 뒤 거짓말이 된다."""
+        from datetime import datetime
+
+        now = timezone.now()
+        for it in MockInstagramProvider.mock_list_stories(self.IG):
+            ts = datetime.strptime(it["timestamp"], "%Y-%m-%dT%H:%M:%S%z")
+            age_h = (now - ts).total_seconds() / 3600
+            assert 0 <= age_h < 24, f"{it['id']} age={age_h:.1f}h"
+
+    def test_deterministic_ids(self):
+        a = MockInstagramProvider.mock_list_stories(self.IG)
+        b = MockInstagramProvider.mock_list_stories(self.IG)
+        assert [x["id"] for x in a] == [x["id"] for x in b]

@@ -519,6 +519,9 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         # state 행은 성공 직전에 삭제되므로(아래 "Clean up persisted state") 값을 먼저 붙잡는다.
         return_to_target = getattr(state_obj, "return_to", "") or ""
         opener_origin = getattr(state_obj, "opener_origin", "") or ""
+        # 결과 페이지의 언어 — 이 HTML 은 팝업/인앱 브라우저에 **그대로 보이는 사용자 화면**이다.
+        # 기본은 ko, 영어가 더 우선인 Accept-Language 일 때만 en (oauth_callback_pages.resolve_lang).
+        page_lang = oauth_callback_pages.resolve_lang(request.headers.get("Accept-Language"))
 
         def _finish(html: str, *, result: str, reason: str = ""):
             """return_to 가 있으면 302, 없으면 기존 HTML 응답."""
@@ -533,7 +536,9 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         # Check for errors
         if error:
             return _finish(
-                oauth_callback_pages.oauth_error(error, opener_origin=opener_origin),
+                oauth_callback_pages.oauth_error(
+                    error, opener_origin=opener_origin, lang=page_lang
+                ),
                 result="failed",
                 reason="OAUTH_AUTHORIZATION_FAILED",
             )
@@ -541,12 +546,14 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
         if not code or not state:
             # state 없이는 복귀 주소를 신뢰할 수 없다 → HTML 종료(리다이렉트 금지)
             return HttpResponse(
-                oauth_callback_pages.missing_parameters(opener_origin=opener_origin)
+                oauth_callback_pages.missing_parameters(opener_origin=opener_origin, lang=page_lang)
             )
 
         # Verify state (CSRF protection) using persisted IGOAuthState
         if not state_obj or state_obj.is_expired():
-            return HttpResponse(oauth_callback_pages.invalid_state(opener_origin=opener_origin))
+            return HttpResponse(
+                oauth_callback_pages.invalid_state(opener_origin=opener_origin, lang=page_lang)
+            )
 
         try:
             workspace = state_obj.workspace
@@ -599,7 +606,9 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                 except Exception as e:
                     logger.error(f"Exception during get_account_info: {str(e)}")
                     return _finish(
-                        oauth_callback_pages.instagram_api_error(opener_origin=opener_origin),
+                        oauth_callback_pages.instagram_api_error(
+                            opener_origin=opener_origin, lang=page_lang
+                        ),
                         result="failed",
                         reason="INSTAGRAM_API_ERROR",
                     )
@@ -663,6 +672,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                                 owner_email=conflict.workspace.owner.email,
                                 username=account_info.get("username", ""),
                                 opener_origin=opener_origin,
+                                lang=page_lang,
                             ),
                             result="failed",
                             reason="ALREADY_CONNECTED_ELSEWHERE",
@@ -692,7 +702,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                         )
                         return _finish(
                             oauth_callback_pages.plan_limit_exceeded(
-                                allowance, opener_origin=opener_origin
+                                allowance, opener_origin=opener_origin, lang=page_lang
                             ),
                             result="failed",
                             reason="PLAN_LIMIT_EXCEEDED",
@@ -741,7 +751,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
             connection_data = IGAccountConnectionSerializer(connection).data
             return _finish(
                 oauth_callback_pages.connect_success(
-                    dict(connection_data), opener_origin=opener_origin
+                    dict(connection_data), opener_origin=opener_origin, lang=page_lang
                 ),
                 result="connected",
             )
@@ -761,7 +771,7 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
             )
 
             return _finish(
-                oauth_callback_pages.internal_error(opener_origin=opener_origin),
+                oauth_callback_pages.internal_error(opener_origin=opener_origin, lang=page_lang),
                 result="failed",
                 reason="INTERNAL_ERROR",
             )
@@ -1366,6 +1376,26 @@ class InstagramIntegrationViewSet(viewsets.ViewSet):
                     },
                 },
                 status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # ── 더미 연결(가짜 토큰) 분기 — 게시물 목록과 같은 이유다(views.py ~1183 참고).
+        #    이게 없어서 dev 시더 연결의 스토리 조회가 Meta 로 나가 400 → 우리가 502 를 냈다
+        #    (2026-10-11 프론트 제보). 판정은 should_use_mock 하나만 쓴다.
+        if MockInstagramProvider.should_use_mock(connection.access_token):
+            stories = MockInstagramProvider.mock_list_stories(connection.external_account_id)
+            # ⚠️ 응답 모양은 아래 실제 경로와 **글자 단위로 같아야** 한다(data/count/connection).
+            #    목과 실제가 갈리면 "dev 에선 되는데 운영에서 안 되는" 화면이 나온다.
+            return Response(
+                {
+                    "count": len(stories),
+                    "data": stories,
+                    "connection": {
+                        "id": str(connection.id),
+                        "username": connection.username,
+                        "account_id": connection.external_account_id,
+                    },
+                    "mock": True,
+                }
             )
 
         try:
