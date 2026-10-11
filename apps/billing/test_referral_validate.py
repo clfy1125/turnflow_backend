@@ -164,3 +164,91 @@ class TestCardlessRedeemRetired:
         assert res.status_code == 400
         second.refresh_from_db()
         assert second.current_uses == 0
+
+
+@pytest.mark.django_db
+class TestReferralReasonCode:
+    """사용 불가 사유의 **머신 키** — 영어 화면이 한국어 문장을 그대로 띄우지 않게.
+
+    ``validate``(비인증)와 ``redeem``(인증)이 **같은 어휘**를 써야 프론트가 분기를 한 벌만
+    든다(2026-10-11 프론트 제보). 어휘가 갈리면 한쪽 화면에만 한국어가 남는다.
+    """
+
+    @pytest.fixture
+    def user(self, db):
+        return get_user_model().objects.create_user(
+            email=f"rc-{uuid.uuid4().hex[:10]}@example.com", password="Pass1234!"
+        )
+
+    @pytest.fixture
+    def client(self, user):
+        c = APIClient()
+        c.force_authenticate(user=user)
+        return c
+
+    # (코드 팩토리 kwargs, 기대 reason_code)
+    CASES = [
+        ({"is_active": False}, "inactive"),
+        ({"valid_from": timezone.now() + timedelta(days=5)}, "not_yet_valid"),
+        ({"valid_until": timezone.now() - timedelta(days=1)}, "expired"),
+        ({"max_uses": 1, "current_uses": 1}, "exhausted"),
+    ]
+
+    @pytest.mark.parametrize("kwargs,expected", CASES)
+    def test_validate_reports_reason_code(self, db, kwargs, expected):
+        code = _code(days=14, **kwargs)
+        data = APIClient().get(reverse("billing:referral-validate"), {"code": code.code}).json()
+        assert data["valid"] is False
+        assert data["reason_code"] == expected
+        # 한국어 문장은 **영구 유지** — 지우면 기존 프론트의 문구가 사라진다
+        assert data["reason"]
+
+    def test_validate_unknown_code_is_not_found(self, db):
+        data = APIClient().get(reverse("billing:referral-validate"), {"code": "NOSUCHCODE0"}).json()
+        assert (data["valid"], data["reason_code"]) == (False, "not_found")
+
+    def test_valid_code_has_no_reason_fields(self, db):
+        code = _code(days=14)
+        data = APIClient().get(reverse("billing:referral-validate"), {"code": code.code}).json()
+        assert data["valid"] is True
+        assert "reason_code" not in data and "reason" not in data
+
+    @pytest.mark.parametrize("kwargs,expected", CASES)
+    def test_redeem_uses_the_same_vocabulary(self, client, user, kwargs, expected):
+        """redeem 400 도 validate 와 **같은 값**을 최상위·error.details 양쪽에 싣는다."""
+        from apps.billing import auto_trial
+
+        auto_trial.grant(user, source="test")  # 체험 중이라야 코드 상태까지 도달한다
+        code = _code(days=14, **kwargs)
+        res = client.post(reverse("billing:referral-redeem"), {"code": code.code}, format="json")
+        assert res.status_code == 400
+        body = res.json()
+        assert body["reason_code"] == expected
+        assert body["error"]["details"]["reason_code"] == expected
+        assert body["detail"]  # 한국어 문장도 그대로
+
+    def test_redeem_unknown_code_is_not_found(self, client, user):
+        from apps.billing import auto_trial
+
+        auto_trial.grant(user, source="test")
+        res = client.post(
+            reverse("billing:referral-redeem"), {"code": "NOSUCHCODE0"}, format="json"
+        )
+        assert res.status_code == 400
+        assert res.json()["reason_code"] == "not_found"
+
+    def test_redeem_second_code_is_already_used(self, client, user):
+        """사용자 단위 사유 — 비인증 validate 는 알 수 없고 여기서만 나온다."""
+        from apps.billing import auto_trial
+
+        auto_trial.grant(user, source="test")
+        first, second = _code(days=14), _code(days=14)
+        assert (
+            client.post(
+                reverse("billing:referral-redeem"), {"code": first.code}, format="json"
+            ).status_code
+            == 200
+        )
+        res = client.post(reverse("billing:referral-redeem"), {"code": second.code}, format="json")
+        assert res.status_code == 400
+        assert res.json()["reason_code"] == "already_used"

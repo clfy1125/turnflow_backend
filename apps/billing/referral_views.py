@@ -179,15 +179,35 @@ if (data.valid) {
                     ),
                     OpenApiExample(
                         "비활성 코드",
-                        value={"valid": False, "reason": "비활성화된 코드입니다."},
+                        value={
+                            "valid": False,
+                            "reason": "비활성화된 코드입니다.",
+                            "reason_code": "inactive",
+                        },
+                    ),
+                    OpenApiExample(
+                        "사용 시작 전",
+                        value={
+                            "valid": False,
+                            "reason": "아직 사용할 수 없는 코드입니다.",
+                            "reason_code": "not_yet_valid",
+                        },
                     ),
                     OpenApiExample(
                         "기간 만료",
-                        value={"valid": False, "reason": "유효 기간이 만료된 코드입니다."},
+                        value={
+                            "valid": False,
+                            "reason": "유효 기간이 만료된 코드입니다.",
+                            "reason_code": "expired",
+                        },
                     ),
                     OpenApiExample(
                         "사용 횟수 소진",
-                        value={"valid": False, "reason": "사용 횟수가 모두 소진된 코드입니다."},
+                        value={
+                            "valid": False,
+                            "reason": "사용 횟수가 모두 소진된 코드입니다.",
+                            "reason_code": "exhausted",
+                        },
                     ),
                 ],
             ),
@@ -314,10 +334,32 @@ class RedeemReferralCodeView(APIView):
 `Authorization: Bearer <access_token>` 필수. 미인증 401.
 
 ## 비즈니스 로직
-1. 현재 구독이 `trialing` 이 아니면 400 `REFERRAL_NOT_TRIALING`
-2. 코드가 없거나 소진/비활성/만료면 400 (사유는 `detail`)
-3. 이미 제휴 코드를 쓴 적이 있으면 400 (1인 1회)
-4. 코드의 대상 플랜이 현재 체험 플랜과 다르면 400 `REFERRAL_PLAN_MISMATCH`
+1. 현재 구독이 `trialing` 이 아니면 400 `code=REFERRAL_NOT_TRIALING`
+2. 코드가 없거나 소진/비활성/만료면 400 `reason_code=not_found|exhausted|inactive|expired|not_yet_valid`
+3. 이미 제휴 코드를 쓴 적이 있으면 400 `reason_code=already_used` (1인 1회)
+4. 코드의 대상 플랜이 현재 체험 플랜과 다르면 400 `code=REFERRAL_PLAN_MISMATCH`
+
+### 400 응답의 머신 키 (영어 화면용)
+`detail` 은 **한국어 고정 문장**입니다. 다국어 화면은 아래 키로 문구를 고르세요 —
+최상위와 `error.details` **양쪽**에 실려 나갑니다.
+
+| 키 | 값 | 뜻 |
+|---|---|---|
+| `reason_code` | `not_found` · `inactive` · `not_yet_valid` · `expired` · `exhausted` | 코드 **자체**의 상태 (`GET /billing/referral/validate/` 와 같은 어휘) |
+| `reason_code` | `already_used` | 이 **사용자**가 이미 코드를 썼다 (비인증 validate 는 알 수 없는 사유) |
+| `reason_code` | `code_required` | 코드를 안 보냈다 |
+| `code` | `REFERRAL_NOT_TRIALING` · `REFERRAL_PLAN_MISMATCH` | 코드가 아니라 **구독 상태** 때문에 막힌 경우 |
+
+```jsonc
+{ "detail": "유효 기간이 만료된 코드입니다.",
+  "reason_code": "expired",
+  "success": false,
+  "error": { "code": 400, "message": "유효 기간이 만료된 코드입니다.",
+             "details": { "reason_code": "expired" } } }
+```
+
+`POST /billing/toss/confirm/` 이 제휴 코드 때문에 400 을 낼 때도 **같은 `reason_code`** 가
+최상위와 `error.details` 에 실립니다.
 5. 통과 → `current_period_end += code.trial_days`, 코드 사용 횟수 +1, 사용 이력 기록
 
 **기간은 "지금부터 N일"이 아니라 "남은 체험 끝 + N일"** 입니다 — 다시 잡으면 남은
@@ -425,13 +467,24 @@ curl -X POST https://api.turnflow.link/api/v1/billing/referral/redeem/ \
             machine_code = exc.extra.get("code")
             if machine_code:
                 payload["code"] = machine_code
+            # 코드 자체/사용자 상태 사유 — validate 와 **같은 어휘**(not_found·expired·
+            # exhausted·inactive·not_yet_valid·already_used·code_required).
+            # 영어 화면이 detail 문장을 그대로 띄우지 않도록 머신 키를 함께 준다.
+            reason_code = exc.extra.get("reason_code")
+            if reason_code:
+                payload["reason_code"] = reason_code
             # §6 통일 포맷을 **함께** 실어 보낸다 — 이 뷰는 DRF 예외 핸들러를 우회하므로
             # detail 만 내면 한 URL 이 두 포맷을 내게 된다(toss_views 와 같은 함정).
+            details = {}
+            if machine_code:
+                details["code"] = machine_code
+            if reason_code:
+                details["reason_code"] = reason_code
             payload["success"] = False
             payload["error"] = {
                 "code": exc.status_code,
                 "message": exc.detail,
-                "details": {"code": machine_code} if machine_code else {},
+                "details": details,
             }
             return Response(payload, status=exc.status_code)
 

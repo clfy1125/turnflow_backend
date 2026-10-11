@@ -62,7 +62,11 @@ def _flow_error_response(e: BillingFlowError) -> Response:
         body["payment"] = PaymentHistorySerializer(e.payment).data
     if e.status_code >= 400:
         body.setdefault("success", False)
-        body.setdefault("error", {"code": e.status_code, "message": e.detail})
+        # extra(머신 키: reason_code·code·toss_code …)를 **최상위와 error.details 양쪽**에
+        # 싣는다. 최상위는 기존 프론트가 읽고 있어 유지하고, details 는 §6 포맷만 읽도록
+        # 구현한 화면이 사유를 놓치지 않게 하기 위한 것이다(payment 는 본문이라 제외).
+        details = {k: v for k, v in e.extra.items() if k != "payment"}
+        body.setdefault("error", {"code": e.status_code, "message": e.detail, "details": details})
     return Response(body, status=e.status_code)
 
 

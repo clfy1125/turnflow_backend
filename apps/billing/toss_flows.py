@@ -463,29 +463,46 @@ def charge_prorated(
 # ──────────────────────────────────────────────
 
 
+# 제휴 코드를 **못 쓰는 사유**의 머신 키 — `GET /billing/referral/validate/` 의
+# `reason_code` 와 **같은 어휘**를 쓴다. 한 개념에 두 어휘를 두면 프론트가 분기를
+# 두 벌 들고, 영어 화면에는 결국 한국어 문장이 그대로 나간다(2026-10-11 프론트 제보).
+#   코드 자체 상태 : not_found / inactive / not_yet_valid / expired / exhausted
+#   사용자 상태    : already_used (이 사람이 이미 코드를 썼다 — validate 는 비인증이라 못 준다)
+REASON_CODE_REQUIRED = "code_required"
+REASON_ALREADY_USED = "already_used"
+
+
 def _validate_referral_for_trial(user, code_str: str) -> ReferralCode:
     """confirm의 제휴코드 사전 검증 — 외부 호출 전에 fail-fast."""
     code_str = (code_str or "").strip().upper()
     if not code_str:
-        raise BillingFlowError("제휴 코드를 입력해주세요.")
+        raise BillingFlowError(
+            "제휴 코드를 입력해주세요.", extra={"reason_code": REASON_CODE_REQUIRED}
+        )
     if ReferralRedemption.objects.filter(user=user).exists():
-        raise BillingFlowError("이미 제휴/레퍼럴 코드를 사용하셨습니다.")
+        raise BillingFlowError(
+            "이미 제휴/레퍼럴 코드를 사용하셨습니다.",
+            extra={"reason_code": REASON_ALREADY_USED},
+        )
     try:
         code = ReferralCode.objects.select_related("target_plan").get(code=code_str)
     except ReferralCode.DoesNotExist:
-        raise BillingFlowError("존재하지 않는 제휴 코드입니다.") from None
-    ok, reason = code.is_redeemable()
+        raise BillingFlowError(
+            "존재하지 않는 제휴 코드입니다.",
+            extra={"reason_code": ReferralCode.REASON_NOT_FOUND},
+        ) from None
+    ok, reason_code, reason = code.redeemable_state()
     if not ok:
-        raise BillingFlowError(reason)
+        raise BillingFlowError(reason, extra={"reason_code": reason_code})
     return code
 
 
 def _consume_referral(user, code: ReferralCode, now, trial_ends) -> ReferralRedemption:
     """트라이얼 시작 트랜잭션 안에서 호출 — 코드 락 + 사용 처리."""
     locked = ReferralCode.objects.select_for_update().get(pk=code.pk)
-    ok, reason = locked.is_redeemable()
+    ok, reason_code, reason = locked.redeemable_state()
     if not ok:
-        raise BillingFlowError(reason)
+        raise BillingFlowError(reason, extra={"reason_code": reason_code})
     ReferralCode.objects.filter(pk=locked.pk).update(
         current_uses=F("current_uses") + 1, updated_at=now
     )
