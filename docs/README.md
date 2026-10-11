@@ -29,6 +29,7 @@
 
 - [HOME_TEST_ACCOUNTS_RESPONSE.md](frontend/HOME_TEST_ACCOUNTS_RESPONSE.md) — **홈 V2 상태별 dev 테스트 계정 43개**(H/P/I/A 코드 1:1) + 프론트가 직접 쓰는 재시드 API. ★게시물 API 500 해소(목 토큰 접두어) · 사진은 **외부 호스트 0**(data URI) · 「오류」 캠페인은 반드시 `campaign_post_restricted`(60)를 동반해 큰 카드를 밀어낸다 · 못 만든 것 = A04(실 IG user_id 필요) · A03(서버에 구글 가입 표식 필드 없음)
 - [HOME_TEST_ACCOUNTS_FOLLOWUP_RESPONSE.md](frontend/HOME_TEST_ACCOUNTS_FOLLOWUP_RESPONSE.md) — 위 문서에 대한 프론트 확인 결과 9건 회신. ★**조회(GET)만 해도 캠페인 `updated_at` 이 밀리던 운영 결함**(썸네일 백필이 update_fields 에 updated_at 을 넣고 있었다 — 사진 없는 캠페인이 '방금 수정됨'으로 목록 맨 위에) · `media_url` 은 **엔드포인트마다 뜻이 다르다**(목록=Graph CDN 이미지 / 캠페인=permalink — 1차 회신이 틀렸다) · `reason_code`·`kakao_linked_now`·팝업 `reason` 추가 · 복구 뒤 밀린 댓글은 **버튼이 아니라 1시간 배치**가 7일 창 안에서 메운다
+- [HOME_TEST_ACCOUNTS_FOLLOWUP2_RESPONSE.md](frontend/HOME_TEST_ACCOUNTS_FOLLOWUP2_RESPONSE.md) — 2차 확인 결과 6건 회신. ★**dev 는 바인드 마운트라 celery 워커가 옛 코드를 들고 있다**(웹만 리로드된다 — 1차 dev 검증이 그래서 틀렸다) · 운영 `updated_at` 수정은 **실트래픽으로 증명**(배포 전 19% → 후 0%) · **스토리 목록에 목 분기가 없어 502**(게시물 500 과 같은 계열) · 콜백 페이지 **영어 지원**(머신 키는 번역 금지) · 제휴코드 `reason_code` 를 redeem·confirm 까지 확대 · 운영 콜백 origin = `turnflow-api.clfy.ai.kr`(불일치 없음)
 
 **결제·구독**
 - [TOSS_BILLING_FRONTEND.md](frontend/TOSS_BILLING_FRONTEND.md) — 토스 빌링 연동(카드등록 → prepare/confirm, 체험·해지·카드변경)
