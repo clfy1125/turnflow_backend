@@ -41,6 +41,7 @@ from apps.integrations.dm_user_reasons import (
     U_ALREADY_REPLIED,
     U_CONNECTION_LOST,
     U_DELIVERY_UNCONFIRMED,
+    U_DM_ACCESS_DISABLED,
     U_HIDDEN_REQUEST,
     U_POST_RESTRICTED,
     U_RECIPIENT_UNAVAILABLE,
@@ -73,7 +74,9 @@ ADMIN_REASON_TO_USER: dict[str, str] = {
     "recovery_expired": U_HIDDEN_REQUEST,
     # U5 게시물 단위 제한
     "post_blocked": U_POST_RESTRICTED,
-    "scoped_permission": U_POST_RESTRICTED,
+    "scoped_permission": U_POST_RESTRICTED,  # 더 이상 사전에 없음(호환용으로 남김)
+    # U10 계정이 DM 접근을 꺼둠 — 게시물이 아니라 계정 단위다(2026-10-13 정정)
+    "dm_access_disabled": U_DM_ACCESS_DISABLED,
     # U6 이미 답장
     "already_replied": U_ALREADY_REPLIED,
     # U7 도착 미확인

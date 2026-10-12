@@ -49,6 +49,10 @@ U_DELIVERY_UNCONFIRMED = "delivery_unconfirmed"  # U7 도착 미확인
 U_SEND_DELAYED = "send_delayed"  # U8-지연 (아직 발송될 수 있음)
 U_SEND_INCOMPLETE = "send_incomplete"  # U8-종결 (사유 미확인)
 U_ACCOUNT_SEND_PAUSED = "account_send_paused"  # U9 계정 전체 발송 정지 (인스타그램 계정 제한)
+# U10 계정 소유자가 '메시지 액세스 허용'을 꺼둠 — U9 와 **다르다**.
+#   U9  = 인스타가 일시 제한(시간이 지나면 풀림, 우리가 대기시킴)
+#   U10 = 사용자가 끈 설정(켜기 전까지 영구, 사용자만 해제 가능)
+U_DM_ACCESS_DISABLED = "dm_access_disabled"
 
 # 건너뜀(skipped) 8종 — 키는 admin 사전과 **같은 문자열**을 쓴다.
 # 어드민 `?error_reason=` 드릴다운과 네임스페이스를 공유하기 위함이며, 이 문구들을
@@ -94,7 +98,11 @@ _BY_CODE: dict[str, str] = {
     "102": U_CONNECTION_LOST,
     "10": U_SEND_INCOMPLETE,  # 권한/기간 불명 — 우리도 못 가림
     "100": U_WINDOW_EXPIRED,  # 대상 없음/만료 (댓글 삭제·7일 초과 포함)
-    "200": U_POST_RESTRICTED,
+    # ⚠️ 2026-10-13 정정: 종전엔 U_POST_RESTRICTED("다른 게시물로 만드세요")였는데 **정반대**였다.
+    #   code=200 + subcode 없음 = 계정 소유자가 DM 접근을 끈 것(계정 단위)이고,
+    #   게시물 제한은 subcode 2534066 으로 와 1단계에서 먼저 잡힌다.
+    #   prod 전수: code=200 3,531건 = 계정차단 2,693 + 2534066 838, **미분류 0**.
+    "200": U_DM_ACCESS_DISABLED,
     "551": U_RECIPIENT_UNAVAILABLE,
     "613": U_SEND_DELAYED,
     "4": U_SEND_DELAYED,

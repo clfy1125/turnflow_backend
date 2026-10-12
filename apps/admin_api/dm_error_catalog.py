@@ -72,7 +72,8 @@ R_CONNECTION_LOST = "connection_lost"
 R_SESSION_EXPIRED = "session_expired"
 R_PERMISSION_OR_WINDOW_UNKNOWN = "permission_or_window_unknown"
 R_NO_TARGET_OR_EXPIRED = "no_target_or_expired"
-R_SCOPED_PERMISSION = "scoped_permission"
+R_SCOPED_PERMISSION = "scoped_permission"  # (사용 안 함 — 아래 R_DM_ACCESS_DISABLED 로 대체)
+R_DM_ACCESS_DISABLED = "dm_access_disabled"
 R_RECIPIENT_UNREACHABLE = "recipient_unreachable"
 R_RATE_LIMITED = "rate_limited"
 R_APP_RATE_LIMITED = "app_rate_limited"
@@ -335,13 +336,26 @@ _BY_CODE: dict[str, dict] = {
         "없습니다. 한 캠페인에 몰리면 알려주세요.",
         INVESTIGATE,
     ),
+    # ⚠️ 2026-10-13 정정: 종전엔 이 행을 '이 사람·이 게시물 권한 문제'로 읽고 "새 게시물로
+    #   옮기세요" 라고 안내했다. **정반대였다** — prod 전수(code=200 3,531건)를 보면
+    #   subcode 가 비어 있는 2,693건은 전부 본문이
+    #   `The account owner has disabled access to Instagram Direct Messaging.` 이고,
+    #   이는 **계정 소유자가 '연결된 도구 → 메시지 액세스 허용'을 끈 것**이다(계정 단위).
+    #   게시물 제한은 subcode 2534066 으로 와서 위 (code, subcode) 행이 먼저 잡으므로,
+    #   여기로 떨어지는 건 사실상 이 한 종류다(미분류 잔여 0건).
+    #   오분류 피해: @highestlevel33(09-28 문의 → 10-07 해결, 9일·2,671건 실패),
+    #   @zoommaracha(10-12 문의). 둘 다 안내대로 다른 게시물을 시도했다가 또 실패했다.
     "200": _entry(
-        R_SCOPED_PERMISSION,
-        "이 사람·이 게시물에 대한 권한 문제",
-        "계정 전체가 아니라 이 받는 사람 또는 이 게시물에만 걸린 제한입니다. 계정 전체를 "
-        "멈추지 않도록 '도착 미확인'으로 처리합니다.",
-        "한두 건이면 넘어가도 됩니다. 한 게시물에서 반복되면 그 게시물의 자동 DM 이 막힌 "
-        "것이므로 새 게시물로 옮기도록 안내하세요.",
+        R_DM_ACCESS_DISABLED,
+        "계정이 자동 DM 접근을 꺼둠",
+        "계정 소유자가 인스타그램에서 '연결된 도구 → 메시지 액세스 허용'을 끄면 이 계정의 "
+        "**모든** 자동 DM 이 403 으로 거절됩니다. 게시물 제한(2534066)과 code 는 같지만 "
+        "subcode 가 비어 있고 본문이 'The account owner has disabled access…' 입니다. "
+        "계정 단위라 특정 게시물·수신자와 무관합니다.",
+        "고객에게 인스타 앱 → 프로필 → 메뉴 → '메시지 및 스토리 답장' → 메시지 요청 → "
+        "연결된 도구 → **메시지 액세스 허용**을 켜달라고 안내하세요. **다른 게시물로 옮기라고 "
+        "안내하면 안 됩니다** — 계정 전체가 막힌 것이라 똑같이 실패합니다. 켠 뒤에는 창"
+        "(댓글 7일) 안의 건이 되살아납니다.",
         INVESTIGATE,
     ),
     "551": _entry(

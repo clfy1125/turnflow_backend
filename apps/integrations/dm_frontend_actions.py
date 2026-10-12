@@ -52,6 +52,7 @@ from .dm_user_reasons import (
     U_ALREADY_REPLIED,
     U_CONNECTION_LOST,
     U_DELIVERY_UNCONFIRMED,
+    U_DM_ACCESS_DISABLED,
     U_HIDDEN_REQUEST,
     U_POST_RESTRICTED,
     U_RECIPIENT_UNAVAILABLE,
@@ -131,6 +132,14 @@ _USER_COPY: dict[str, dict] = {
         "아직 팔로우하지 않은 분에게 보내는 첫 DM은 받은편지함 대신 '숨겨진 요청'이나 스팸함으로 분류될 수 있어요. 발송은 정상적으로 처리되었고, "
         "수신자가 아직 확인하지 않은 상태예요. 수신자가 요청을 수락하면 이후 DM은 받은편지함으로 도착해요.",
         "실패 DM 복구를 켜두시면 게시물에 안내 댓글을 남기고, 수신자가 다시 댓글을 남기면 자동으로 재발송해요.",
+    ),
+    U_DM_ACCESS_DISABLED: _copy(
+        "인스타그램에서 메시지 접근이 꺼져 있어요",
+        "인스타그램 계정 설정의 '연결된 도구 → 메시지 액세스 허용'이 꺼져 있어 자동 DM 을 보낼 수 "
+        "없어요. 특정 게시물이 아니라 계정 설정이라, 이 계정의 자동 DM 이 모두 함께 멈춰요.",
+        "인스타그램 앱 → 프로필 → 메뉴 → '메시지 및 스토리 답장' 검색 → 메시지 요청 → 연결된 도구 "
+        "→ '메시지 액세스 허용'을 켜주세요. 켜시면 댓글 작성 후 7일이 지나지 않은 건은 다시 "
+        "발송됩니다.",
     ),
     U_POST_RESTRICTED: _copy(
         "이 게시물에는 자동 DM 발송이 제한되어 있어요",
