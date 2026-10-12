@@ -24,6 +24,7 @@ from django.conf import settings
 from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import status
 from rest_framework.permissions import AllowAny
+from rest_framework.renderers import JSONRenderer
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -40,14 +41,41 @@ def _is_prod_settings() -> bool:
     return "prod" in (getattr(settings, "SETTINGS_MODULE", "") or "")
 
 
-def _dev_only():
-    """운영에서는 존재 자체를 숨긴다 (404)."""
-    if settings.DEBUG and not _is_prod_settings():
-        return None
+def _not_found() -> Response:
     return Response(
         {"success": False, "error": {"code": 404, "message": "Not found.", "details": {}}},
         status=status.HTTP_404_NOT_FOUND,
     )
+
+
+def _dev_only():
+    """운영에서는 존재 자체를 숨긴다 (404). 각 핸들러 안에서의 방어선."""
+    if settings.DEBUG and not _is_prod_settings():
+        return None
+    return _not_found()
+
+
+class DevOnlyMixin:
+    """**모든 메서드**가 운영에서 404 가 되게 한다 — ``dispatch`` 에서 먼저 막는다.
+
+    ⚠️ 핸들러(``get``/``post``) 안에서만 막으면 **DRF 가 메서드 검사를 먼저 해서**
+       정의하지 않은 메서드에 ``405 Method Not Allowed`` 가 나간다. 405 는 "이 경로는
+       존재한다" 는 신호라, 운영에서 dev 백도어의 위치를 알려주는 셈이다(실측 확인:
+       GET 은 404 인데 POST 는 405 였다). 핸들러 안의 ``_dev_only()`` 는 그대로 둔다 —
+       이 믹스인을 빠뜨린 뷰가 생겨도 데이터는 새지 않게.
+    """
+
+    permission_classes = [AllowAny]
+    authentication_classes: list = []
+
+    def dispatch(self, request, *args, **kwargs):
+        if not (settings.DEBUG and not _is_prod_settings()):
+            resp = _not_found()
+            resp.accepted_renderer = JSONRenderer()
+            resp.accepted_media_type = "application/json"
+            resp.renderer_context = {}
+            return resp.render()
+        return super().dispatch(request, *args, **kwargs)
 
 
 def _error(message: str, code: str, http_status: int):
@@ -62,11 +90,8 @@ def _error(message: str, code: str, http_status: int):
     )
 
 
-class DevPhoneTestAccountView(APIView):
+class DevPhoneTestAccountView(DevOnlyMixin, APIView):
     """휴대폰 테스트 계정 목록 조회(GET) / 재시드(POST)."""
-
-    permission_classes = [AllowAny]
-    authentication_classes: list = []
 
     @extend_schema(
         tags=["authentication"],
@@ -139,11 +164,8 @@ curl https://dev-api.turnflow.link/api/v1/auth/dev/phone-test-accounts/
         )
 
 
-class DevPhoneTestAccountReseedView(APIView):
+class DevPhoneTestAccountReseedView(DevOnlyMixin, APIView):
     """테스트 계정을 처음 상태로 되돌린다."""
-
-    permission_classes = [AllowAny]
-    authentication_classes: list = []
 
     @extend_schema(
         tags=["authentication"],
@@ -216,11 +238,8 @@ curl -X POST https://dev-api.turnflow.link/api/v1/auth/dev/phone-test-accounts/r
         )
 
 
-class DevPhoneCodeView(APIView):
+class DevPhoneCodeView(DevOnlyMixin, APIView):
     """대기 중인 인증번호를 **알려진 값으로 심고** 돌려준다."""
-
-    permission_classes = [AllowAny]
-    authentication_classes: list = []
 
     @extend_schema(
         tags=["authentication"],

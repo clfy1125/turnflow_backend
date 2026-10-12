@@ -45,6 +45,21 @@ class TestProductionGate:
         res = getattr(APIClient(), method)(reverse(name), {}, format="json")
         assert res.status_code == 404
 
+    @pytest.mark.parametrize("name", [n for _, n in URLS])
+    @pytest.mark.parametrize("method", ["get", "post", "put", "patch", "delete", "options"])
+    def test_every_method_404s_never_405(self, settings, method, name):
+        """⚠️ **405 는 "이 경로는 존재한다" 는 신호다.**
+
+        핸들러 안에서만 막으면 DRF 가 메서드 검사를 먼저 해서 정의하지 않은 메서드에
+        405 를 준다 — 운영에서 dev 백도어의 위치를 알려주는 셈이다(실측으로 걸렸다:
+        GET 은 404 인데 POST 는 405 였다). ``DevOnlyMixin`` 이 dispatch 에서 먼저 막는다.
+        """
+        settings.DEBUG = False
+        res = getattr(APIClient(), method)(reverse(name))
+        assert (
+            res.status_code == 404
+        ), f"{method.upper()} {name} → {res.status_code} (404 여야 한다)"
+
 
 class TestSeeder:
     def test_reseed_creates_all_states(self, dev):
