@@ -71,6 +71,7 @@ from apps.admin_api.views.dashboard_ops import (
     _window_bounds,
 )
 from apps.integrations.campaign_stats import (
+    PEOPLE_ORDERING_FIELDS,
     QUEUE_WAITING_STATUSES,
     SENT_FOR_QUOTA_STATUSES,
     TIMESERIES_RANGES,
@@ -246,6 +247,17 @@ class AdminCampaignListView(generics.ListAPIView):
     ]
     ordering = ["-created_at"]
 
+    def _ordering_needs_people_annotation(self) -> bool:
+        """``?ordering=people_sent`` 처럼 **집계값으로 정렬**해야 하는 요청인가.
+
+        집계값이 정렬 키면 페이지를 먼저 자를 수 없다(어느 20개가 상위인지 집계해야 안다)
+        → 그때만 전체 집합에 annotate 한다. 기본 정렬(``-created_at``)을 비롯한 나머지는
+        :meth:`list` 가 **페이지를 먼저 자르고** 그 20건에만 집계한다.
+        """
+        raw = self.request.query_params.get("ordering") or ""
+        asked = {f.strip().lstrip("-") for f in raw.split(",") if f.strip()}
+        return bool(asked & set(PEOPLE_ORDERING_FIELDS))
+
     def get_queryset(self):
         qs = super().get_queryset()
         ig_connection_id = self.request.query_params.get("ig_connection_id")
@@ -254,9 +266,40 @@ class AdminCampaignListView(generics.ListAPIView):
             qs = qs.filter(ig_connection_id=ig_connection_id)
         if owner:
             qs = qs.filter(ig_connection__workspace__owner_id=owner)
-        # DM-1-b/c: 사람 단위 요약 + 이벤트 단위 enrichment 를 한 번의 LEFT JOIN 으로
-        # annotate (목록 N+1 제거). 정의는 상세 stats 와 같은 campaign_stats 모듈.
-        return annotate_campaign_people(annotate_campaign_stats(qs))
+        # 집계값 정렬일 때만 전 집합 annotate — 그 외에는 list() 가 페이지 단위로 붙인다.
+        if self._ordering_needs_people_annotation():
+            return annotate_campaign_people(annotate_campaign_stats(qs))
+        return qs
+
+    def _annotate_page(self, campaigns):
+        """현재 페이지의 캠페인에만 집계를 붙여 **받은 순서 그대로** 돌려준다.
+
+        ⚠️ 집계(:func:`annotate_campaign_people`)는 ``COUNT(DISTINCT recipient_user_id)``
+        6개를 LEFT JOIN 위에 얹는다. 전 집합에 걸면 Postgres 가 **sent_dm_logs 전체를
+        정렬**해야 하고(실측 433,415행 → work_mem 초과 → 디스크 158MB), 20건을 보여주는
+        목록이 **5.7초** 걸렸다. pk 를 20개로 좁히면 같은 집계가 인덱스 범위 안에서 끝난다.
+        """
+        if not campaigns:
+            return []
+        ids = [c.pk for c in campaigns]
+        rows = annotate_campaign_people(
+            annotate_campaign_stats(super().get_queryset().filter(pk__in=ids))
+        )
+        by_id = {row.pk: row for row in rows}
+        # 정렬·페이지네이션 결과가 기준 — 집계 조회가 빠뜨린 건 원본을 그대로 쓴다.
+        return [by_id.get(c.pk, c) for c in campaigns]
+
+    def list(self, request, *args, **kwargs):
+        if self._ordering_needs_people_annotation():
+            return super().list(request, *args, **kwargs)
+
+        queryset = self.filter_queryset(self.get_queryset())
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(self._annotate_page(page), many=True)
+            return self.get_paginated_response(serializer.data)
+        serializer = self.get_serializer(self._annotate_page(list(queryset)), many=True)
+        return Response(serializer.data)
 
     @extend_schema(
         tags=[TAG],
