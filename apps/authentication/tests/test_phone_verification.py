@@ -522,6 +522,55 @@ class TestRequiredFlagAndDelete:
 # ──────────────────────────────────────────────
 
 
+class TestRequiredIsSignupMethodAgnostic:
+    """⭐ **가입수단과 무관하게** 인증을 강제한다 — 카카오 심사가 늦어도 수집이 멈추지 않는다.
+
+    카카오 `카카오계정(전화번호)` 동의항목은 심사가 2~4주 걸리고, 승인 전까지 카카오는
+    번호를 **주지 않는다**(에러 없이 생략). 그때 "카카오 가입자는 번호가 없으니 봐주자"
+    같은 면제를 넣으면 신규 가입의 38.6%(카카오 실채택률)가 통째로 수집에서 빠진다.
+    → 판정은 **번호 보유 여부 하나만** 본다. 가입수단은 보지 않는다.
+
+    ⚠️ 이 테스트가 깨지면 "소셜 가입자 면제" 가 어딘가에 들어갔다는 뜻이다. 되돌릴 것.
+    """
+
+    @pytest.mark.parametrize(
+        "kind,fields",
+        [
+            ("kakao", {"kakao_id": None}),  # 아래에서 uuid 로 채운다
+            ("instagram", {"instagram_user_id": None}),
+            ("google_or_email", {}),
+        ],
+    )
+    def test_required_regardless_of_signup_method(self, sms_off, kind, fields):
+        sms_off.PHONE_REQUIRED_SINCE = (timezone.now() - timedelta(days=1)).isoformat()
+        kw = {k: uuid.uuid4().hex[:16] for k in fields}
+        u = User.objects.create_user(
+            email=f"{kind}-{uuid.uuid4().hex[:10]}@test.com", password="Pw!23456xyz", **kw
+        )
+        client = APIClient()
+        client.force_authenticate(user=u)
+        res = client.get(reverse("authentication:me"))
+        assert (
+            res.data["phone_verification_required"] is True
+        ), f"{kind} 가입자에게 인증이 강제되지 않는다 — 가입수단별 면제가 들어갔는지 확인할 것"
+
+    def test_kakao_number_skips_our_sms(self, sms_off):
+        """반대 방향 — 카카오가 번호를 주면(동의항목 승인 후) 문자 인증을 건너뛴다."""
+        sms_off.PHONE_REQUIRED_SINCE = (timezone.now() - timedelta(days=1)).isoformat()
+        u = User.objects.create_user(
+            email=f"kakao-ok-{uuid.uuid4().hex[:10]}@test.com",
+            password="Pw!23456xyz",
+            kakao_id=uuid.uuid4().hex[:16],
+            phone="01044445555",
+            phone_verified_at=timezone.now(),
+            phone_source="kakao",
+        )
+        client = APIClient()
+        client.force_authenticate(user=u)
+        res = client.get(reverse("authentication:me"))
+        assert res.data["phone_verification_required"] is False
+
+
 class TestKakaoPhone:
     def test_parses_kakao_format(self):
         from apps.authentication.kakao import _parse_phone
