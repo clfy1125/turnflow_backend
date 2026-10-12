@@ -994,7 +994,7 @@ NCP_SMS_SENDER = config("NCP_SMS_SENDER", default="")
 # 제공사가 허용한 **국내 일일 발송 한도**(SENS 콘솔 > Project > 이용 한도). 가입 시 500건.
 # 코드가 발송을 막는 값이 아니라, 우리 상한이 이것을 넘지 않았는지 기동 때 점검하는 기준이다
 # (apps/sms/checks.py sms.W003). 콘솔에서 한도를 올렸다면 이 값도 같이 올릴 것.
-NCP_SMS_DAILY_QUOTA = config("NCP_SMS_DAILY_QUOTA", default=500, cast=int)
+NCP_SMS_DAILY_QUOTA = config("NCP_SMS_DAILY_QUOTA", default=5000, cast=int)
 # 실제 발송 대신 로그만 남긴다 (INSTAGRAM_MOCK_MODE 와 같은 규약 — 지침 5-7).
 # ⚠️ **기본값이 True 다** — 로컬·CI 에서 실수로 실문자가 나가 요금이 빠지는 일을 구조적으로
 #    막는다. 운영은 반드시 ``SMS_MOCK_MODE=False`` 를 넣어야 하고, 안 넣으면 배포 시
@@ -1019,11 +1019,13 @@ PHONE_VERIFY_MAX_PER_PHONE_PER_DAY = config(
 #    실질 방어는 번호별 상한(5/일)이고, 금액 상한은 전역 캡이다.
 PHONE_VERIFY_MAX_PER_IP_PER_DAY = config("PHONE_VERIFY_MAX_PER_IP_PER_DAY", default=100, cast=int)
 # 서비스 전체 하루 발송 상한 = **최후의 금액 상한**. 0 이면 무제한(권장하지 않음).
-# 일 가입 ~100명 × 1.5회 = 150건이 정상 수요라 450 은 3배 여유다.
-# ⚠️ **제공사(NCP) 일일 한도보다 반드시 낮게 둘 것.** 현재 SENS 국내 한도는 500건/일이고,
-#    우리 상한을 그보다 높이면 NCP 가 먼저 막는다 — 그 거절은 우리 쪽에서 평범한 발송
-#    실패로 보여서 "왜 안 가지"를 한참 헤매게 된다. NCP 한도를 올렸다면 여기도 같이 올릴 것.
-PHONE_VERIFY_GLOBAL_DAILY_CAP = config("PHONE_VERIFY_GLOBAL_DAILY_CAP", default=450, cast=int)
+# 2026-10-12 NCP 한도 상향 승인(일 500 → 5,000)에 맞춰 450 → 3,000 으로 올렸다.
+#   · 정상 피크 예상 ~1,100건/일(신규 340 + 기존 회원 번호 등록 백필 750)의 약 2.7배
+#   · NCP 한도(5,000)보다 낮게 유지 — 아래 ⚠️ 참조
+# ⚠️ **제공사(NCP) 일일 한도보다 반드시 낮게 둘 것.** 우리 상한이 더 높으면 NCP 가 먼저
+#    막는데, 그 거절은 우리 쪽에서 평범한 발송 실패로 보여서 "왜 안 가지"를 한참 헤맨다.
+#    역전되면 기동 점검 sms.W003 이 경고한다. NCP 한도를 또 올리면 여기도 같이 올릴 것.
+PHONE_VERIFY_GLOBAL_DAILY_CAP = config("PHONE_VERIFY_GLOBAL_DAILY_CAP", default=3000, cast=int)
 
 # ── 발송 건강 감시 (sms.check_health) ────────────────────────────────────────
 # ⚠️ 휴대폰 인증이 가입 필수 단계가 된 뒤로, 문자 발송 실패는 "문자 안 감"이 아니라
@@ -1038,8 +1040,10 @@ SMS_HEALTH_WINDOW_MINUTES = config("SMS_HEALTH_WINDOW_MINUTES", default=60, cast
 SMS_HEALTH_MIN_SAMPLE = config("SMS_HEALTH_MIN_SAMPLE", default=5, cast=int)
 SMS_HEALTH_WARN_FAIL_RATE = config("SMS_HEALTH_WARN_FAIL_RATE", default=0.3, cast=float)
 SMS_HEALTH_CRIT_FAIL_RATE = config("SMS_HEALTH_CRIT_FAIL_RATE", default=0.6, cast=float)
-# 당일 발송량 경고선 — 제공사 일일 한도(500)에 닿기 전에 알린다. 어뷰즈 신호이기도 하다.
-SMS_DAILY_VOLUME_WARN = config("SMS_DAILY_VOLUME_WARN", default=300, cast=int)
+# 당일 발송량 경고선 — 우리 전역 상한(3,000)에 닿기 전에 알린다. 어뷰즈 신호이기도 하다.
+# ⚠️ **상한을 올리면 이 값도 같이 올릴 것.** 안 올리면 정상 피크(~1,100건)마다 🟡 가 울려
+#    경보를 아무도 안 보게 된다 — 경보의 가치는 "울리면 진짜"에 있다.
+SMS_DAILY_VOLUME_WARN = config("SMS_DAILY_VOLUME_WARN", default=2000, cast=int)
 SMS_HEALTH_REPEAT_HOURS = config("SMS_HEALTH_REPEAT_HOURS", default=6, cast=int)
 
 # 개인정보 보유기간 — sms.purge_old_logs 가 강제한다.
