@@ -18,6 +18,11 @@ from .deletion_views import (
     AccountDeletionRestoreView,
     AccountDeletionVerifyView,
 )
+from .dev_phone_views import (
+    DevPhoneCodeView,
+    DevPhoneTestAccountReseedView,
+    DevPhoneTestAccountView,
+)
 from .email_views import EmailRegisterVerifyView, EmailRegisterView
 from .instagram_views import InstagramLoginStartView, InstagramLoginView
 from .kakao_views import KakaoLoginView
@@ -54,6 +59,20 @@ urlpatterns = [
     # POST = 인증번호 발송 / DELETE = 등록된 번호 삭제(개인정보 자기결정권)
     path("me/phone/", PhoneSendCodeView.as_view(), name="me-phone"),
     path("me/phone/verify/", PhoneVerifyView.as_view(), name="me-phone-verify"),
+    # ── dev 전용 (운영은 DEBUG=False 라 전부 404 — dev_phone_views._dev_only) ──
+    # 프론트가 dev 에서 **인증 플로우를 끝까지 돌 수 있게** 하는 것이 목적이다:
+    # dev 는 SMS_MOCK_MODE 라 문자가 안 가고 인증번호는 평문 저장이 아니다(HMAC).
+    path(
+        "dev/phone-test-accounts/",
+        DevPhoneTestAccountView.as_view(),
+        name="dev-phone-test-accounts",
+    ),
+    path(
+        "dev/phone-test-accounts/reseed/",
+        DevPhoneTestAccountReseedView.as_view(),
+        name="dev-phone-test-accounts-reseed",
+    ),
+    path("dev/phone-code/", DevPhoneCodeView.as_view(), name="dev-phone-code"),
     path("me/delete/", AccountDeleteView.as_view(), name="account-delete"),
     path("token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
     # Email verification + password reset (implemented in apps.emails)
