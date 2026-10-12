@@ -63,6 +63,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from .block_reorder import apply_block_reorder
 from .image_pipeline import ImageValidationError, process_upload, sanitize_original
 from .models import Block, ContactInquiry, Page, PageMedia, PageSubscription
 from .multi_serializers import (
@@ -1352,8 +1353,9 @@ class MultiBlockReorderView(APIView):
 ```
 
 ## 동작 방식
-- 포함된 id의 block만 order 변경됨 (전체 블록 포함 불필요)
-- 내부적으로 `CASE/WHEN` 단일 UPDATE 쿼리로 처리 — 원자적 순서 교환 보장
+- 전체 블록을 포함할 필요 없음 — 보내지 않은 블록은 현재 상대 순서를 유지
+- 적용 후 블록 order 는 **1부터 빈틈없이 다시 매겨짐.** 응답의 전체 블록 목록을 그대로
+  쓰면 됩니다 (요청에 넣은 `order` 값이 그대로 저장되지는 않습니다)
 - 실패 시 전체 롤백
 
 ## 제약
@@ -1411,11 +1413,9 @@ const handleDragEnd = async (reorderedBlocks: Block[]) => {
             )
 
         id_to_order = {item["id"]: item["order"] for item in orders}
-        with transaction.atomic():
-            cases = [When(pk=pk, then=order) for pk, order in id_to_order.items()]
-            Block.objects.filter(pk__in=id_to_order.keys(), page=page).update(
-                order=Case(*cases, output_field=IntegerField())
-            )
+
+        # ⚠️ 단일 UPDATE 로 바꾸지 말 것 — 사유는 block_reorder.py 참고.
+        apply_block_reorder(page, id_to_order)
 
         # 블록 재정렬 → 라이브가 스냅샷과 달라졌으므로 활성 슬롯 포인터 해제
         page.detach_snapshot_pointer()

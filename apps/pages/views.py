@@ -19,6 +19,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.viewsets import ViewSet
 
+from .block_reorder import apply_block_reorder
 from .models import Block, BlockClick, ContactInquiry, Page, PageSubscription, PageView
 from .permissions import IsPageOwner, IsPublicPageOrOwner
 from .serializers import (
@@ -705,8 +706,10 @@ class BlockReorderView(APIView):
 ```
 
 ## 동작 방식
-- 페이지의 **전체 블록을 모두 포함할 필요는 없습니다** — 포함된 id의 block만 order 변경됨
-- 내부적으로 `CASE/WHEN` 단일 UPDATE 쿼리로 처리 — 원자적 순서 교환 보장
+- 페이지의 **전체 블록을 모두 포함할 필요는 없습니다** — 보내지 않은 블록은 현재 상대
+  순서를 그대로 유지합니다
+- 적용 후 페이지의 블록 order 는 **1부터 빈틈없이 다시 매겨집니다.** 응답에 담긴 전체
+  블록 목록을 그대로 쓰시면 됩니다 (요청에 넣은 `order` 값이 그대로 저장되지는 않습니다)
 - 실패 시 전체 롤백 (원자성 보장)
 
 ## 제약
@@ -755,12 +758,10 @@ const handleDragEnd = async (reorderedBlocks: Block[]) => {
 
         id_to_order = {item["id"]: item["order"] for item in orders}
 
-        with transaction.atomic():
-            # 단일 UPDATE CASE/WHEN — PostgreSQL은 문장 단위로 unique 검사하므로 충돌 없음
-            cases = [When(pk=pk, then=order) for pk, order in id_to_order.items()]
-            Block.objects.filter(pk__in=id_to_order.keys(), page=page).update(
-                order=Case(*cases, output_field=IntegerField())
-            )
+        # ⚠️ 단일 UPDATE 로 바꾸지 말 것 — UNIQUE(page, order) 가 NOT DEFERRABLE 이라
+        #    Postgres 가 **행 단위**로 검사한다. 두 블록 자리를 맞바꾸는 것만으로
+        #    500 이 났다(prod 실측). 사유·방식은 block_reorder.py 참고.
+        apply_block_reorder(page, id_to_order)
 
         # 블록 재정렬 → 라이브가 스냅샷과 달라졌으므로 활성 슬롯 포인터 해제
         page.detach_snapshot_pointer()
