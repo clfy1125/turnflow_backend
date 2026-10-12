@@ -10,16 +10,15 @@ from __future__ import annotations
 from django.conf import settings
 from django.core.checks import Error, Warning, register
 
+_REQUIRED = ("NCP_ACCESS_KEY", "NCP_SECRET_KEY", "NCP_SMS_SERVICE_ID", "NCP_SMS_SENDER")
+
 
 @register()
 def check_sms_configuration(app_configs, **kwargs):
     issues = []
     debug = bool(getattr(settings, "DEBUG", False))
     mock = bool(getattr(settings, "SMS_MOCK_MODE", True))
-    configured = all(
-        (getattr(settings, name, "") or "").strip()
-        for name in ("ALIGO_API_KEY", "ALIGO_USER_ID", "ALIGO_SENDER")
-    )
+    missing = [n for n in _REQUIRED if not (getattr(settings, n, "") or "").strip()]
 
     if debug:
         return issues  # 로컬은 Mock 이 정상이다
@@ -32,21 +31,27 @@ def check_sms_configuration(app_configs, **kwargs):
                 id="sms.W001",
             )
         )
-    elif not configured:
+    elif missing:
         issues.append(
             Error(
-                "알리고 자격증명(ALIGO_API_KEY/ALIGO_USER_ID/ALIGO_SENDER)이 비어 있습니다.",
-                hint="셋을 모두 채우거나, 발송을 끄려면 SMS_MOCK_MODE=True 로 두세요.",
+                f"NCP SENS 자격증명이 비어 있습니다: {', '.join(missing)}",
+                hint="전부 채우거나, 발송을 끄려면 SMS_MOCK_MODE=True 로 두세요.",
                 id="sms.E001",
             )
         )
 
-    if getattr(settings, "ALIGO_TEST_MODE", False):
+    # 우리 전역 상한이 제공사 일일 한도보다 높으면, 제공사가 먼저 막는다. 그 거절은
+    # 평범한 발송 실패로 보여서 원인 추적이 어렵다 — 설정 단계에서 잡는다.
+    our_cap = int(getattr(settings, "PHONE_VERIFY_GLOBAL_DAILY_CAP", 0) or 0)
+    provider_cap = int(getattr(settings, "NCP_SMS_DAILY_QUOTA", 500) or 0)
+    if our_cap and provider_cap and our_cap >= provider_cap:
         issues.append(
             Warning(
-                "ALIGO_TEST_MODE=True — 알리고가 성공 응답만 주고 문자는 보내지 않습니다.",
-                hint="운영에서는 반드시 False 로 두세요.",
-                id="sms.W002",
+                f"PHONE_VERIFY_GLOBAL_DAILY_CAP({our_cap})이 제공사 일일 한도"
+                f"({provider_cap}) 이상입니다 — 우리 상한이 아니라 NCP 가 먼저 거절합니다.",
+                hint="우리 상한을 낮추거나, NCP 콘솔에서 이용 한도를 올린 뒤 "
+                "NCP_SMS_DAILY_QUOTA 를 맞추세요.",
+                id="sms.W003",
             )
         )
     return issues

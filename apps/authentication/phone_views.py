@@ -33,8 +33,8 @@ from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
 from apps.billing import phone_reward
-from apps.sms.aligo import AligoError
 from apps.sms.models import SmsPurpose
+from apps.sms.ncp import SmsProviderError
 from apps.sms.services import send_and_log
 
 from . import phone_guard
@@ -292,7 +292,7 @@ if (!s.phone_verified && s.reward.kind !== 'none') showPhonePopup(s.reward.days)
 - 문자는 건당 비용이 나갑니다. 화면에서 "재발송" 버튼은 `resend_after` 초 동안
   비활성화해 주세요(서버도 막지만, 막힌 요청이 429 로 보이면 사용자가 불안해합니다).
 - `SMS_MOCK_MODE=True`(개발 서버)에서는 **문자가 실제로 가지 않습니다**. dev 에서
-  테스트할 때는 서버 로그 `aligo[mock]` 줄이나 `SmsLog` 를 보세요.
+  테스트할 때는 서버 로그 `ncp_sms[mock]` 줄이나 `SmsLog` 를 보세요.
 
 ## 사용 예시
 ```javascript
@@ -440,14 +440,15 @@ curl -X POST https://api.turnflow.link/api/v1/auth/me/phone/ \\
                 user=user,
                 request_ip=ip,
             )
-        except AligoError as exc:
+        except SmsProviderError as exc:
             # 발송에 실패했으면 그 행은 쓸 수 없다 — 살려 두면 쿨다운만 잡아먹는다.
             PhoneVerification.objects.filter(pk=row.pk).update(invalidated_at=timezone.now())
-            http_status = (
-                status.HTTP_502_BAD_GATEWAY
-                if exc.code in ("SMS_UNAVAILABLE", "SMS_SEND_FAILED")
-                else status.HTTP_400_BAD_REQUEST
-            )
+            http_status = {
+                "SMS_UNAVAILABLE": status.HTTP_502_BAD_GATEWAY,
+                "SMS_SEND_FAILED": status.HTTP_502_BAD_GATEWAY,
+                # 제공사 한도 초과는 우리 전역 상한과 같은 뜻이라 같은 코드로 내보낸다
+                "SMS_CAPACITY_EXCEEDED": status.HTTP_503_SERVICE_UNAVAILABLE,
+            }.get(exc.code, status.HTTP_400_BAD_REQUEST)
             return _error(exc.message, exc.code, http_status)
 
         phone_guard.note_sent(ip=ip)

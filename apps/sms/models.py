@@ -58,7 +58,7 @@ class SmsLog(models.Model):
     status = models.CharField(
         max_length=16, choices=SmsStatus.choices, default=SmsStatus.PENDING, db_index=True
     )
-    provider = models.CharField(max_length=16, default="aligo")
+    provider = models.CharField(max_length=16, default="ncp")
     provider_message_id = models.CharField(max_length=64, blank=True, default="", db_index=True)
     result_code = models.IntegerField(null=True, blank=True, verbose_name="알리고 result_code")
     error_message = models.TextField(blank=True, default="")

@@ -181,11 +181,16 @@ turnflow_backend/
 │   │                           #   닫기는 HomeAlertDismissal(대상 키 단위 — 대상이 바뀌면 다시 뜬다).
 │   │                           #   tasks.py = 이메일 판(24h 미접속 게이트) — **기본 dormant**
 │   │                           #   (HOME_ALERT_EMAILS_ENABLED=False + core 0019 enabled=False 이중 잠금)
-│   ├── sms/                    # 문자 발송(알리고) — aligo.py(클라이언트)·services.py(발송+SmsLog 단일
-│   │                           #   진입점)·checks.py. ⚠️ **HTTP 200 이어도 실패일 수 있다** — 알리고는
-│   │                           #   인증 실패·잔액 부족·미등록 발신번호를 전부 200+`result_code<0` 으로
-│   │                           #   준다. ⚠️ OTP 본문은 90byte(EUC-KR) 넘으면 LMS 로 승급돼 **비용 3배**
-│   │                           #   (테스트가 길이를 못 박는다). SMS_MOCK_MODE 기본 True — 운영은 False
+│   ├── sms/                    # 문자 발송(**네이버 클라우드 SENS**, 2026-10-12 알리고에서 교체) —
+│   │                           #   ncp.py(클라이언트)·services.py(발송+SmsLog 단일 진입점)·checks.py.
+│   │                           #   ⚠️ 서명(v2) = HMAC-SHA256(개행으로 이은 `method uri` + 타임스탬프 +
+│   │                           #   accessKey) — **서명에 쓴 uri 와 실제 요청 경로가 글자 그대로 같아야**
+│   │                           #   한다(서비스 ID 의 `:` 를 한쪽만 인코딩하면 401 인데 '키가 틀렸다'로 보인다).
+│   │                           #   ⚠️ **202 는 '접수'이지 '도착'이 아니다** — 수신 결과는 requestId 로
+│   │                           #   따로 조회(`lookup_result`). ⚠️ OTP 본문 90byte(EUC-KR) 넘으면 LMS 승급.
+│   │                           #   ⚠️ **선불 잔액이 없다**(후불) — 대신 일일/월간 이용 한도가 있고
+│   │                           #   `PHONE_VERIFY_GLOBAL_DAILY_CAP` 을 그보다 낮게 둬야 한다(sms.W003).
+│   │                           #   SMS_MOCK_MODE 기본 True — 운영은 False
 │   └── admin_api/              # 백오피스(어드민) 전용 API — 신원/대시보드(overview + 운영/마케팅: dashboard_ops·dashboard_marketing, 임계값=dashboard_constants.py)/회원/워크스페이스/페이지/자동DM 모니터링/레퍼럴 코드/마케팅 채널링크(marketing/channel-links — UTM 링크 서버 저장 CRUD, MarketingChannelLink·url/channel 서버 계산) (serializers/, views/ 패키지 + AdminActionLog 감사로그). 마운트: /api/v1/admin/
 │                               #   snapshot_rosters.py = 전체 현황 타일의 **모수 쿼리 단일 소스** —
 │                               #   대시보드 타일(_snapshot/_trial_now)과 명단(views/snapshot.py)이 공유해야
@@ -273,12 +278,14 @@ make init           # 빌드 + 실행 + 마이그레이션 한 번에
 - 토스페이먼츠: `TOSS_SECRET_KEY`, `TOSS_CLIENT_KEY`, `TOSS_API_BASE`, `TOSS_DEV_CARD_AUTH_ENABLED`(dev 전용 카드입력 헬퍼 — 운영 반드시 False)
 - 인스타 리포트: `APIFY_API_KEY`(공개 조회수 수집 — 인사이트 권한 미승인 대체), `GEMINI_API_KEY`(영상 피처),
   `DEEPSEEK_API_KEY`(문장 합성), `INSTA_REPORT_FAKE_MODE`(dev 전용 오프라인 모드 — 운영 반드시 False)
-- 문자/휴대폰 인증: `ALIGO_API_KEY`·`ALIGO_USER_ID`·`ALIGO_SENDER`(**사전등록된 발신번호**),
+- 문자/휴대폰 인증: `NCP_ACCESS_KEY`·`NCP_SECRET_KEY`·`NCP_SMS_SERVICE_ID`·`NCP_SMS_SENDER`
+  (**사전등록된 발신번호**). ⚠️ NCP 콘솔 **API 접근 제한**에 prod IP 만 등록해 뒀다 —
+  키가 유출돼도 그 밖에서는 401. **DR(GCP) 전환 시 그쪽 IP 추가 필요**,
   `SMS_MOCK_MODE`(기본 True — 운영 반드시 False, 안 넣으면 기동 시 `sms.W001` 경고),
   `PHONE_VERIFY_*`(TTL 180s·시도 5·쿨다운 60s·번호별 5/일·IP 100/일·전역 2000/일),
   ⭐ `PHONE_REQUIRED_SINCE`(**이 한 개**가 "신규=인증 필수·보상 없음 / 기존=선택·프로 체험 +7일"
   을 가른다. 비우면 아무도 필수가 아님 — **프론트 배포 뒤에** 넣을 것),
-  `ALIGO_BALANCE_*`(잔액 경보 임계),
+  `SMS_HEALTH_*`(발송 실패율 경보 임계)·`NCP_SMS_DAILY_QUOTA`,
   `PHONE_REWARD_*`, `PHONE_COLLECT_EMAIL_ENABLED`(기본 dormant — 보상 고지는 **광고성**이라
   `marketing_opt_in` 동의자 174명뿐. 주력은 인앱 팝업)
 - 카카오 로그인: `KAKAO_REST_API_KEY`, `KAKAO_CLIENT_SECRET`(콘솔에서 활성화 ON → 교환 시 필수),
@@ -422,9 +429,10 @@ make test-cov                             # HTML 커버리지 리포트
   - `billing.notify_pause_resume_reminder` — 매일 09:30 KST (정지 재개 3일 전 사전 고지 메일)
   - `billing.notify_conversion_consent` — 매일 10:30 KST (유료전환 2차 동의 D-14/D-3 메일. **2026-08-10 제품 결정으로 dormant** — `CONVERSION_SECOND_CONSENT_ENABLED=False` 기본이라 즉시 no-op. core 0014 시드)
   - `billing.send_winback_emails` — 매일 10:00 KST (해지 후 복귀 유도, `WINBACK_ENABLED` 게이트·기본 dormant)
-  - `sms.check_balance` — 09:10·18:10 KST (알리고 문자 잔액 감시 → Telegram. **포인트 소진 =
-    휴대폰 인증 불가 = 신규 가입 전면 중단**이라 조용히 지나가면 안 된다. 알리고 자체 알림은
-    **문자로 오므로** 문자가 고장난 상황에서 함께 죽는다 → 경로가 다른 Telegram 으로 따로 운다)
+  - `sms.check_health` — 매시 10분 (문자 발송 **실패율**·당일 발송량 감시 → Telegram.
+    **문자가 막히면 신규 가입 전면 중단**이라 조용히 지나가면 안 된다. 경보를 문자로 보내면
+    같은 고장에 함께 죽으므로 경로가 다른 Telegram 으로 운다. ⭐ '잔액'이 아니라 '실패율'을
+    보는 이유 — 잔액이 남아도 서명 오류·발신번호 말소·한도 초과면 똑같이 가입이 멈춘다)
   - `sms.purge_old_logs` — 매일 03:50 KST (SmsLog 180일·PhoneVerification 30일 파기 — 처리방침 고지 기간을 코드가 강제)
   - `analytics.cleanup_funnel_events` — 매일 03:40 KST (보존 180일 초과 퍼널 이벤트 삭제)
   - `insta_reports.sweep_stale` — 30분 (running 에 박힌 리포트 잡 실패 확정 — 동시생성 1건 제한 해제)

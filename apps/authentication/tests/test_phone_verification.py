@@ -27,8 +27,8 @@ from apps.authentication.phone import (
     mask_phone,
     normalize_phone,
 )
-from apps.sms.aligo import sms_byte_length
 from apps.sms.models import SmsLog, SmsStatus, mask_code
+from apps.sms.ncp import sms_byte_length
 
 User = get_user_model()
 pytestmark = pytest.mark.django_db
@@ -183,7 +183,7 @@ class TestCodeHash:
 class TestSmsCost:
     def test_otp_body_stays_within_sms_limit(self):
         from apps.authentication.phone_views import build_otp_message
-        from apps.sms.aligo import SMS_BYTE_LIMIT
+        from apps.sms.ncp import SMS_BYTE_LIMIT
 
         body = build_otp_message("123456")
         assert sms_byte_length(body) <= SMS_BYTE_LIMIT, (

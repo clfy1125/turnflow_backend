@@ -798,14 +798,13 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": crontab(hour=3, minute=40),  # CELERY_TIMEZONE=Asia/Seoul 기준
         "options": {"queue": "billing"},  # housekeeping 큐 (기존 관례)
     },
-    # 하루 2회(09:10 / 18:10 KST) — 알리고 문자 잔액 감시.
-    # 비면 휴대폰 인증이 막혀 **신규 가입이 전면 중단**되므로 조용히 지나가면 안 된다.
+    # 매시 10분 — 문자 발송 건강(실패율·당일 발송량) 감시.
+    # 문자가 막히면 **신규 가입이 전면 중단**되므로 조용히 지나가면 안 된다.
     # ⚠️ **프로덕션은 이 표를 읽지 않는다** — celery_beat 가 fallback 프로필이라 뜨지 않고,
-    #    외부 tick 이 core.ScheduledJob 을 본다. 운영 반영은 core/0022_seed_sms_jobs.py.
-    #    (그쪽은 cron_hour 목록을 지원하지 않아 09시·18시 **두 행**으로 나눠 둔다)
-    "sms-check-balance": {
-        "task": "sms.check_balance",
-        "schedule": crontab(hour="9,18", minute=10),  # CELERY_TIMEZONE=Asia/Seoul 기준
+    #    외부 tick 이 core.ScheduledJob 을 본다. 운영 반영은 core/0023_sms_health_job.py.
+    "sms-check-health": {
+        "task": "sms.check_health",
+        "schedule": crontab(minute=10),  # 매시 10분, CELERY_TIMEZONE=Asia/Seoul 기준
         "options": {"queue": "billing"},
     },
     # 매일 KST 03:50 — 보존기간 초과 SmsLog(수신번호 보유) + 만료 PhoneVerification 파기.
@@ -977,19 +976,25 @@ AUTO_PRO_TRIAL_REQUIRE_AD_ATTRIBUTION = config(
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 휴대폰 본인확인 + 문자 발송 (알리고) — 2026-10-09 카카오 알림톡 도입
+# 휴대폰 본인확인 + 문자 발송 (네이버 클라우드 SENS) — 2026-10-09 도입 / 10-12 제공사 교체
 # ──────────────────────────────────────────────────────────────────────────────
 # ⭐ 왜 번호를 모으는가: 체험 종료·결제 실패·DM 중단처럼 "지금 알려야 손실을 막는" 사건의
 #    도달 수단이 메일뿐이었다. IG 가입자 349명은 자리표시 이메일이라 메일조차 못 받는다.
 #    도입 시점(2026-10-06) 기준 우리 DB 의 전화번호 보유는 **0건**이었다.
 #
-# 알리고(https://smartsms.aligo.in) — 선불 충전형. 키는 .env 에만 둔다(지침 14).
-ALIGO_API_KEY = config("ALIGO_API_KEY", default="")
-ALIGO_USER_ID = config("ALIGO_USER_ID", default="")
-# ⚠️ 발신번호 사전등록제 — 알리고 콘솔에 등록·승인된 번호가 아니면 전건 거절된다.
-ALIGO_SENDER = config("ALIGO_SENDER", default="")
-# 알리고 테스트 모드(testmode_yn=Y) — 과금·발송 없이 성공 응답만 온다. 운영은 반드시 False.
-ALIGO_TEST_MODE = config("ALIGO_TEST_MODE", default=False, cast=bool)
+# NCP SENS (https://console.ncloud.com/sens/project) — **후불**. 키는 .env 에만 둔다(지침 14).
+# ⚠️ 가능하면 루트 계정 키가 아니라 **SENS 권한만 가진 Sub Account 키**를 쓸 것 —
+#    키가 유출됐을 때 열리는 범위가 '문자 발송'이냐 '클라우드 계정 전체'냐가 갈린다.
+NCP_ACCESS_KEY = config("NCP_ACCESS_KEY", default="")
+NCP_SECRET_KEY = config("NCP_SECRET_KEY", default="")
+# SENS 콘솔 > Project > 서비스 ID (ncp:sms:kr:<번호>:<프로젝트명>)
+NCP_SMS_SERVICE_ID = config("NCP_SMS_SERVICE_ID", default="")
+# ⚠️ 발신번호 사전등록제 — SENS 콘솔에 등록·승인된 번호가 아니면 전건 거절된다.
+NCP_SMS_SENDER = config("NCP_SMS_SENDER", default="")
+# 제공사가 허용한 **국내 일일 발송 한도**(SENS 콘솔 > Project > 이용 한도). 가입 시 500건.
+# 코드가 발송을 막는 값이 아니라, 우리 상한이 이것을 넘지 않았는지 기동 때 점검하는 기준이다
+# (apps/sms/checks.py sms.W003). 콘솔에서 한도를 올렸다면 이 값도 같이 올릴 것.
+NCP_SMS_DAILY_QUOTA = config("NCP_SMS_DAILY_QUOTA", default=500, cast=int)
 # 실제 발송 대신 로그만 남긴다 (INSTAGRAM_MOCK_MODE 와 같은 규약 — 지침 5-7).
 # ⚠️ **기본값이 True 다** — 로컬·CI 에서 실수로 실문자가 나가 요금이 빠지는 일을 구조적으로
 #    막는다. 운영은 반드시 ``SMS_MOCK_MODE=False`` 를 넣어야 하고, 안 넣으면 배포 시
@@ -1014,17 +1019,28 @@ PHONE_VERIFY_MAX_PER_PHONE_PER_DAY = config(
 #    실질 방어는 번호별 상한(5/일)이고, 금액 상한은 전역 캡이다.
 PHONE_VERIFY_MAX_PER_IP_PER_DAY = config("PHONE_VERIFY_MAX_PER_IP_PER_DAY", default=100, cast=int)
 # 서비스 전체 하루 발송 상한 = **최후의 금액 상한**. 0 이면 무제한(권장하지 않음).
-# 일 가입 ~100명 × 1.5회 = 150건이 정상 수요이므로 2,000 은 13배 여유다.
-PHONE_VERIFY_GLOBAL_DAILY_CAP = config("PHONE_VERIFY_GLOBAL_DAILY_CAP", default=2000, cast=int)
+# 일 가입 ~100명 × 1.5회 = 150건이 정상 수요라 450 은 3배 여유다.
+# ⚠️ **제공사(NCP) 일일 한도보다 반드시 낮게 둘 것.** 현재 SENS 국내 한도는 500건/일이고,
+#    우리 상한을 그보다 높이면 NCP 가 먼저 막는다 — 그 거절은 우리 쪽에서 평범한 발송
+#    실패로 보여서 "왜 안 가지"를 한참 헤매게 된다. NCP 한도를 올렸다면 여기도 같이 올릴 것.
+PHONE_VERIFY_GLOBAL_DAILY_CAP = config("PHONE_VERIFY_GLOBAL_DAILY_CAP", default=450, cast=int)
 
-# ── 잔액 감시 (sms.check_balance) ────────────────────────────────────────────
-# ⚠️ 휴대폰 인증이 가입 필수 단계가 된 뒤로, 포인트 소진은 "문자 안 감"이 아니라
-#    **신규 가입 전면 중단**이다. 알리고 자체 알림(10,000P 미만 시 담당자 문자)이 있지만
-#    그건 **문자로 온다** — 문자가 고장난 상황에서 같은 경로로 오는 경보는 함께 죽는다.
-#    그래서 우리 경보는 Telegram 으로 따로 나간다.
-ALIGO_BALANCE_WARN_COUNT = config("ALIGO_BALANCE_WARN_COUNT", default=1000, cast=int)
-ALIGO_BALANCE_CRIT_COUNT = config("ALIGO_BALANCE_CRIT_COUNT", default=200, cast=int)
-ALIGO_BALANCE_REPEAT_HOURS = config("ALIGO_BALANCE_REPEAT_HOURS", default=24, cast=int)
+# ── 발송 건강 감시 (sms.check_health) ────────────────────────────────────────
+# ⚠️ 휴대폰 인증이 가입 필수 단계가 된 뒤로, 문자 발송 실패는 "문자 안 감"이 아니라
+#    **신규 가입 전면 중단**이다. 경보는 Telegram 으로 나간다 — 문자가 고장난 상황에서
+#    문자로 오는 경보는 같은 고장에 함께 죽는다.
+# ⭐ 2026-10-12 알리고(선불) → SENS(후불) 교체로 '잔액 감시'가 무의미해져 **실패율**로
+#    바꿨다. 사실 이쪽이 더 정직하다 — 잔액이 남아도 서명 오류·발신번호 말소·한도 초과면
+#    똑같이 가입이 멈추는데 잔액 감시는 그걸 못 본다. 제공사가 또 바뀌어도 그대로 쓴다.
+SMS_HEALTH_WINDOW_MINUTES = config("SMS_HEALTH_WINDOW_MINUTES", default=60, cast=int)
+# ⚠️ 표본이 이보다 적으면 실패율로 판정하지 않는다 — 1건 중 1건 실패를 100% 로 읽으면
+#    경보가 쓰레기가 된다(memory: ratio-cuts-break-when-sample-grows).
+SMS_HEALTH_MIN_SAMPLE = config("SMS_HEALTH_MIN_SAMPLE", default=5, cast=int)
+SMS_HEALTH_WARN_FAIL_RATE = config("SMS_HEALTH_WARN_FAIL_RATE", default=0.3, cast=float)
+SMS_HEALTH_CRIT_FAIL_RATE = config("SMS_HEALTH_CRIT_FAIL_RATE", default=0.6, cast=float)
+# 당일 발송량 경고선 — 제공사 일일 한도(500)에 닿기 전에 알린다. 어뷰즈 신호이기도 하다.
+SMS_DAILY_VOLUME_WARN = config("SMS_DAILY_VOLUME_WARN", default=300, cast=int)
+SMS_HEALTH_REPEAT_HOURS = config("SMS_HEALTH_REPEAT_HOURS", default=6, cast=int)
 
 # 개인정보 보유기간 — sms.purge_old_logs 가 강제한다.
 SMS_LOG_RETENTION_DAYS = config("SMS_LOG_RETENTION_DAYS", default=180, cast=int)
