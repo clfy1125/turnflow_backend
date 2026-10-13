@@ -33,6 +33,7 @@
 
 **결제·구독**
 - [TRIAL_EXPIRY_RESPONSE.md](frontend/TRIAL_EXPIRY_RESPONSE.md) — **카드 없는 프로 체험 만료** 회신(2026-10-13). ★dev `celery_beat` 가 **스테일 pidfile 로 영구 크래시 루프** → dev 주기잡 전체 정지(운영은 beat 를 안 쓰므로 무관·실행 로그로 확인) · ★**기간이 끝났는데 `trialing` 인 창(최대 1시간)에 카드를 등록하면 과거 시각이 `first_charge_at` 으로 고지되고 10분 뒤 긁혔다** → `charge_now` 로 수정 · ⚠️ `trial_last_day` 와 실제 종료 시각이 **최대 24시간 어긋난다**(지급시각+30일이라 날짜 경계가 아님) — 제품 결정 필요
+- [TRIAL_LAST_DAY_C_APPLIED.md](frontend/TRIAL_LAST_DAY_C_APPLIED.md) — 위 §3 결정 적용(2026-10-13, 배포 `1cbf385`). ★`trial_last_day` = **종료일 당일**(`−1일` 폐기) — 고지와 실제가 최대 24시간 어긋나던 것을 **아무것도 회수하지 않고** 표기만 맞췄다 · 같은 식이 **세 곳에 복제**돼 있어 `models.trial_last_day_for()` 하나로 모았다(규칙을 바꾸자 테스트가 정확히 3건 깨진 것이 증거) · `PaymentConsent` 가 저장하는 건 **첫 결제일**이라 무관
 
 - [TOSS_BILLING_FRONTEND.md](frontend/TOSS_BILLING_FRONTEND.md) — 토스 빌링 연동(카드등록 → prepare/confirm, 체험·해지·카드변경)
 - [EXTRA_IG_ACCOUNT_TRIAL_FRONTEND.md](frontend/EXTRA_IG_ACCOUNT_TRIAL_FRONTEND.md) — ⭐ **v2** · 체험 중 추가 IG 계정 **0원 즉시 추가**(체험 400 폐지 + `trial` 플래그) · 견적 400 사유 노출 요청 · dev 테스트 카드 실측표 · **체험 중 상한 없음 = 의도된 결정**
