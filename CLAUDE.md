@@ -358,6 +358,16 @@ make init           # 빌드 + 실행 + 마이그레이션 한 번에
 
 **스키마 후처리 훅**: `apps/pages/openapi.postprocess_block_data_schema`가 등록돼 있음 — pages 앱의 block 관련 스키마 수정 시 여기 확인.
 
+⚠️⚠️ **4xx 의 `examples` 는 `response=` 없이 쓰면 스키마에서 조용히 사라진다.**
+`OpenApiResponse(description=..., examples=[...])` 는 content 자체를 만들지 않아 예시가
+붙을 자리가 없다. 2026-10-13 dev 스키마 실측: **4xx 예시 0건 / content 없음 827건** —
+지침이 요구한 examples 가 전부 유실돼 있었다. 그 결과 프론트·사내 API MCP 가 보는 건
+산문뿐이고 **분기에 쓸 `code` 값과 응답 모양은 코드를 열어야만** 알 수 있었다
+(에러를 generic 으로 뭉개는 사고가 반복된 배경 — CS #d34572b3 · #247995c5).
+→ 새 4xx 는 **`apps/core/openapi_errors.error_response()`** 를 쓸 것.
+   `{머신키: detail}` 만 주면 키별 예시를 만들어 준다(`http_status` 필수 — 예시 안의
+   `error.code` 가 실제와 달라지면 없느니만 못하다). 기존 827건은 손대는 김에 점진 전환.
+
 ---
 
 ## 8. 코드 스타일

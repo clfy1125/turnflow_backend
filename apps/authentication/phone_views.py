@@ -33,6 +33,7 @@ from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
 from apps.billing import phone_reward
+from apps.core.openapi_errors import error_response
 from apps.sms.models import SmsPurpose
 from apps.sms.ncp import SmsProviderError
 from apps.sms.services import send_and_log
@@ -335,54 +336,48 @@ curl -X POST https://api.turnflow.link/api/v1/auth/me/phone/ \\
                     )
                 ],
             ),
-            400: OpenApiResponse(
-                description="번호 형식 오류 또는 이미 등록된 번호",
-                examples=[
-                    OpenApiExample(
-                        "형식 오류",
-                        value={
-                            "detail": "올바른 휴대폰 번호가 아닙니다. (예: 010-1234-5678)",
-                            "code": "PHONE_INVALID",
-                        },
-                    ),
-                    OpenApiExample(
-                        "이미 등록됨",
-                        value={
-                            "detail": "이미 인증된 번호입니다.",
-                            "code": "PHONE_ALREADY_VERIFIED",
-                        },
-                    ),
-                ],
+            400: error_response(
+                "번호 형식 오류 또는 이미 등록된 번호",
+                {
+                    "PHONE_INVALID": "올바른 휴대폰 번호가 아닙니다. (예: 010-1234-5678)",
+                    "PHONE_ALREADY_VERIFIED": "이미 인증된 번호입니다.",
+                },
+                http_status=400,
             ),
             401: OpenApiResponse(description="인증 실패 — 토큰 없음/만료"),
             403: OpenApiResponse(description="해당 없음"),
             404: OpenApiResponse(description="해당 없음"),
-            429: OpenApiResponse(
-                description="쿨다운·일일 상한·스로틀",
-                examples=[
-                    OpenApiExample(
-                        "쿨다운",
-                        value={
-                            "detail": "43초 후에 다시 요청할 수 있습니다.",
-                            "code": "PHONE_RESEND_TOO_SOON",
-                            "retry_after": 44,
-                        },
-                    )
-                ],
+            429: error_response(
+                "쿨다운·번호별/IP 일일 상한·스로틀",
+                {
+                    "PHONE_RESEND_TOO_SOON": "43초 후에 다시 요청할 수 있습니다.",
+                    "PHONE_DAILY_LIMIT": (
+                        "이 번호로는 하루 5회까지 인증번호를 받을 수 있습니다. "
+                        "내일 다시 시도하거나 고객센터로 문의해 주세요."
+                    ),
+                    "PHONE_IP_LIMIT": "요청이 너무 많습니다. 잠시 후 다시 시도해 주세요.",
+                },
+                # 쿨다운에만 붙는 필드 — 프론트는 이 값으로 카운트다운한다
+                extra={"PHONE_RESEND_TOO_SOON": {"retry_after": 44}},
+                http_status=429,
             ),
-            502: OpenApiResponse(
-                description="문자 게이트웨이 오류 — 재시도 안내",
-                examples=[
-                    OpenApiExample(
-                        "발송 실패",
-                        value={
-                            "detail": "문자 발송에 실패했습니다. 잠시 후 다시 시도해 주세요.",
-                            "code": "SMS_SEND_FAILED",
-                        },
-                    )
-                ],
+            502: error_response(
+                "문자 게이트웨이 오류 — 재시도 버튼을 제공하세요",
+                {
+                    "SMS_SEND_FAILED": "문자 발송에 실패했습니다. 잠시 후 다시 시도해 주세요.",
+                    "SMS_UNAVAILABLE": "문자 서버에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                },
+                http_status=502,
             ),
-            503: OpenApiResponse(description="서비스 전체 일일 발송 상한 도달 (운영 확인 필요)"),
+            503: error_response(
+                "서비스 전체 일일 발송 상한 도달 (운영 확인 필요)",
+                {
+                    "SMS_CAPACITY_EXCEEDED": (
+                        "일시적으로 인증번호를 보낼 수 없습니다. 잠시 후 다시 시도해 주세요."
+                    )
+                },
+                http_status=503,
+            ),
             500: OpenApiResponse(description="서버 오류 — X-Request-ID 와 함께 문의해 주세요"),
         },
     )
@@ -515,17 +510,10 @@ await fetch('/api/v1/auth/me/phone/', {
             401: OpenApiResponse(description="인증 실패 — 토큰 없음/만료"),
             403: OpenApiResponse(description="해당 없음"),
             404: OpenApiResponse(description="해당 없음"),
-            409: OpenApiResponse(
-                description="휴대폰 인증이 필수인 계정 — 삭제 불가",
-                examples=[
-                    OpenApiExample(
-                        "필수 계정",
-                        value={
-                            "detail": "휴대폰 인증이 필요한 계정은 번호를 삭제할 수 없습니다.",
-                            "code": "PHONE_REQUIRED",
-                        },
-                    )
-                ],
+            409: error_response(
+                "휴대폰 인증이 필수인 계정 — 삭제 불가. 바꾸려면 새 번호로 다시 인증하세요",
+                {"PHONE_REQUIRED": "휴대폰 인증이 필요한 계정은 번호를 삭제할 수 없습니다."},
+                http_status=409,
             ),
             500: OpenApiResponse(description="서버 오류 — X-Request-ID 와 함께 문의해 주세요"),
         },
@@ -665,25 +653,18 @@ if (!res.ok && data.code === 'PHONE_CODE_INVALID') {
                     )
                 ],
             ),
-            400: OpenApiResponse(
-                description="진행 중인 인증 없음 / 만료 / 코드 불일치",
-                examples=[
-                    OpenApiExample(
-                        "코드 불일치",
-                        value={
-                            "detail": "인증번호가 올바르지 않습니다.",
-                            "code": "PHONE_CODE_INVALID",
-                            "attempts_left": 3,
-                        },
+            400: error_response(
+                "진행 중인 인증 없음 / 만료 / 코드 불일치",
+                {
+                    "PHONE_CODE_INVALID": "인증번호가 올바르지 않습니다.",
+                    "PHONE_CODE_EXPIRED": "인증번호가 만료되었습니다. 다시 받아 주세요.",
+                    "NO_PENDING_PHONE_VERIFICATION": (
+                        "진행 중인 휴대폰 인증이 없습니다. 인증번호를 다시 받아 주세요."
                     ),
-                    OpenApiExample(
-                        "만료",
-                        value={
-                            "detail": "인증번호가 만료되었습니다. 다시 받아 주세요.",
-                            "code": "PHONE_CODE_EXPIRED",
-                        },
-                    ),
-                ],
+                },
+                # 남은 시도 횟수 — 0 이면 재발송 버튼으로 전환해야 한다
+                extra={"PHONE_CODE_INVALID": {"attempts_left": 3}},
+                http_status=400,
             ),
             401: OpenApiResponse(description="인증 실패 — 토큰 없음/만료"),
             403: OpenApiResponse(description="해당 없음"),
