@@ -49,11 +49,12 @@ class AdminPhoneCollectionView(APIView):
 `Authorization: Bearer <admin access token>` + `is_staff=True`. 미인증 401 / 권한 없음 403.
 
 ## 비즈니스 로직
-- `reachable.informational` = **정보성 알림톡** 발송 가능 인원
-  (본인확인된 번호 보유 · 수신동의 불요 — 체험 종료·결제 실패 등 거래성 고지).
-- `reachable.advertising` = **광고성**(브랜드메시지·프로모션) 발송 가능 인원
-  (`sms_marketing_opt_in=true` — 정보통신망법 §50 사전 동의).
-  ⚠️ 두 숫자를 섞지 마세요. 광고성을 정보성 모수로 보내면 과태료 대상입니다.
+- `reachable.advertising` = **실제로 마케팅 알림톡을 보낼 수 있는 인원**
+  (`sms_marketing_opt_in=true`). 캠페인 복귀 유도는 **광고성**이라 §50 사전 동의가 필요합니다.
+  **캠페인 규모 산정은 이 숫자로 하세요.**
+- `reachable.informational` = 번호를 가진 전체(동의 불요한 거래성 고지의 모수).
+  ⚠️ 현재 거래성 문자/알림톡 발송 계획은 **없습니다**(결제·체험 알림은 이메일).
+  이 숫자를 마케팅 모수로 쓰면 **동의 없는 사람에게 광고를 보내는 것**이라 과태료 대상입니다.
 - `by_source` — `sms`(우리 문자 인증) / `kakao`(카카오 동의항목).
   kakao 가 늘기 시작하면 동의항목 심사가 통과·반영됐다는 뜻입니다.
 - `coverage_pct` 분모는 **살아있는 계정**(`is_active=True`, 탈퇴 유예 제외)입니다.
