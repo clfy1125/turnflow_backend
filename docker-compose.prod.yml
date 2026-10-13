@@ -414,7 +414,11 @@ services:
     init: true
     logging: *default_logging
     ulimits: *default_ulimits
-    command: celery -A config beat -l info --pidfile=/tmp/celerybeat.pid
+    # ⚠️ --pidfile 금지. 컨테이너 1개 = 프로세스 1개라 pidfile 가드는 가치가 없는데,
+    #    restart 시 **죽은 프로세스의 pid 파일이 그대로 남아** beat 가 "이미 실행 중"
+    #    으로 오판하고 영구 크래시 루프에 빠진다(2026-10-13 dev: 주기잡 전체 정지 —
+    #    체험 만료가 며칠째 안 돌았다). 파일시스템은 restart 로 지워지지 않는다.
+    command: celery -A config beat -l info
     env_file: [.env.production]
     environment: *app_env
     volumes:
