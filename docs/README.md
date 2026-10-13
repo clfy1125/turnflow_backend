@@ -32,6 +32,8 @@
 - [HOME_TEST_ACCOUNTS_FOLLOWUP2_RESPONSE.md](frontend/HOME_TEST_ACCOUNTS_FOLLOWUP2_RESPONSE.md) — 2차 확인 결과 6건 회신. ★**dev 는 바인드 마운트라 celery 워커가 옛 코드를 들고 있다**(웹만 리로드된다 — 1차 dev 검증이 그래서 틀렸다) · 운영 `updated_at` 수정은 **실트래픽으로 증명**(배포 전 19% → 후 0%) · **스토리 목록에 목 분기가 없어 502**(게시물 500 과 같은 계열) · 콜백 페이지 **영어 지원**(머신 키는 번역 금지) · 제휴코드 `reason_code` 를 redeem·confirm 까지 확대 · 운영 콜백 origin = `turnflow-api.clfy.ai.kr`(불일치 없음)
 
 **결제·구독**
+- [TRIAL_EXPIRY_RESPONSE.md](frontend/TRIAL_EXPIRY_RESPONSE.md) — **카드 없는 프로 체험 만료** 회신(2026-10-13). ★dev `celery_beat` 가 **스테일 pidfile 로 영구 크래시 루프** → dev 주기잡 전체 정지(운영은 beat 를 안 쓰므로 무관·실행 로그로 확인) · ★**기간이 끝났는데 `trialing` 인 창(최대 1시간)에 카드를 등록하면 과거 시각이 `first_charge_at` 으로 고지되고 10분 뒤 긁혔다** → `charge_now` 로 수정 · ⚠️ `trial_last_day` 와 실제 종료 시각이 **최대 24시간 어긋난다**(지급시각+30일이라 날짜 경계가 아님) — 제품 결정 필요
+
 - [TOSS_BILLING_FRONTEND.md](frontend/TOSS_BILLING_FRONTEND.md) — 토스 빌링 연동(카드등록 → prepare/confirm, 체험·해지·카드변경)
 - [EXTRA_IG_ACCOUNT_TRIAL_FRONTEND.md](frontend/EXTRA_IG_ACCOUNT_TRIAL_FRONTEND.md) — ⭐ **v2** · 체험 중 추가 IG 계정 **0원 즉시 추가**(체험 400 폐지 + `trial` 플래그) · 견적 400 사유 노출 요청 · dev 테스트 카드 실측표 · **체험 중 상한 없음 = 의도된 결정**
 - [EXTRA_IG_ACCOUNT_TRIAL_RESPONSE.md](frontend/EXTRA_IG_ACCOUNT_TRIAL_RESPONSE.md) — 위 문서에 대한 프론트 회신 답변(에러 두 포맷 동시 송출로 수정·배포, 상한 감수 결정, 400 문구 전문)
