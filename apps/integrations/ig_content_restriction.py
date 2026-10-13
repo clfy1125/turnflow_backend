@@ -112,6 +112,61 @@ _LIVE_TIMEOUT = 12.0
 RUNTIME_MIN_FAILURES = 3
 # 판정에 쓰는 최근 시간창.
 RUNTIME_WINDOW = timedelta(hours=24)
+
+# ── 웹훅 침묵 판정 (2026-10-13) ───────────────────────────────────────
+# ⚠️ 이건 **제한 판정(state)이 아니다.** 섞지 말 것.
+#
+# 2026-09 중순부터 Meta 동작이 반쪽만 바뀌었다 — 제한 게시물에서 **private reply 는 다시
+# 성공**하는데(prod 실측 12,539건 중 2534066 0건) **댓글 웹훅은 여전히 안 온다.** 그래서
+#   · 제한 신호 3종(history/runtime/live)은 전부 2534066 건수를 전제로 하므로 **아무것도 못 잡고**
+#   · 사용자는 "DM 이 30분~1시간 늦게 간다"만 겪는데 화면에 아무 설명이 없다.
+# 유일하게 남은 공짜 신호가 **웹훅 침묵**이고, 그 판정을 여기 한 곳에 둔다
+# (폴러 티어링 · check_runtime · 프론트 안내가 같은 정의를 써야 숫자가 갈리지 않는다).
+#
+# ⚠️ "웹훅 총 0건" 으로만 보면 **오다가 끊긴 게시물을 놓친다** — prod 18019915838941500 은
+#    웹훅 2,998건을 정상 수신하다 중간에 끊겼다(제한 시각이 거기서 특정된다).
+#    그래서 ① 처음부터 0건 ② 오다가 끊김 두 모양을 **모두** 본다.
+
+#: ① 웹훅이 한 건도 없는데 폴러가 이만큼 주웠으면 침묵으로 본다.
+SILENCE_MIN_POLL_ONLY = 5
+#: ② 마지막 웹훅 이후 이만큼 지났는데 그 뒤로 폴러만 댓글을 줍고 있으면 침묵으로 본다.
+#:    짧게 잡으면 한산한 게시물(댓글이 원래 드문 것)이 전부 침묵으로 잡힌다.
+SILENCE_AFTER = timedelta(hours=3)
+#: 침묵이어도 **최근 활동이 없으면** 의미가 없다(끝난 캠페인) — 이 창 안에 댓글이 있어야 한다.
+SILENCE_ACTIVITY_WINDOW = timedelta(hours=6)
+#: 웹훅이 끊겼을 때 사용자가 겪는 최대 지연 = 폴러 주기.
+WEBHOOK_SILENT_DELAY_MINUTES = 60
+
+
+def is_webhook_silent(
+    *,
+    n_webhook: int,
+    n_poll: int,
+    last_webhook_at,
+    last_poll_at,
+    now=None,
+) -> bool:
+    """이 게시물의 댓글 웹훅이 끊겼는가 — **판정 단일 소스** (외부 호출 0).
+
+    두 모양을 모두 본다:
+      ① ``n_webhook == 0`` 인데 폴러가 ``SILENCE_MIN_POLL_ONLY`` 건 이상 주움 (태어날 때부터 침묵)
+      ② 마지막 웹훅 이후 ``SILENCE_AFTER`` 넘게 지났고 그 뒤로 폴링 유입이 있음 (오다가 끊김)
+
+    둘 다 **최근 활동**(``SILENCE_ACTIVITY_WINDOW`` 안의 폴링 유입)이 전제다. 활동이 멈춘
+    게시물을 침묵이라 불러봐야 할 일이 없다.
+    """
+    now = now or timezone.now()
+    if not last_poll_at:
+        return False
+    if (now - last_poll_at) > SILENCE_ACTIVITY_WINDOW:
+        return False
+    if not n_webhook:
+        return n_poll >= SILENCE_MIN_POLL_ONLY
+    if not last_webhook_at:
+        return False
+    return (last_poll_at - last_webhook_at) > SILENCE_AFTER
+
+
 # history: 이 media 에서 2534066 이 이만큼 났고, **마지막 성공 이후로도** 이만큼 이어지면 '확정'.
 #
 # ⚠️ 왜 '첫 실패 이후 성공 수'가 아니라 '마지막 성공 이후 실패 수'인가 (2026-09-07 실측):
@@ -146,11 +201,23 @@ class RestrictionVerdict:
     user_reason: str = ""
     #: 판정 근거 수치 — 화면에 그대로 보여줘도 되는 값만 담는다.
     evidence: dict[str, Any] = field(default_factory=dict)
+    #: 댓글 웹훅이 이 게시물에서만 끊겼는가 (= 실시간 발송 불가, 폴러로 최대 1시간 지연).
+    #:
+    #: ⚠️ ``state`` 와 **독립**이다. 제한 게시물도 지금은 발송이 되므로 이 값이 True 라고
+    #:    캠페인을 막거나 정지시키면 안 된다 — 안내(지연 고지)에만 쓴다.
+    webhook_silent: bool = False
+
     #: 캠페인 생성·활성화가 **실제로 막히는가**.
     #:
     #: ⚠️ 프론트 계약 — 이 값은 게이트와 정확히 일치해야 한다. 한때 ``suspected`` 에도 True 를
     #: 넣었는데, 게이트는 ``restricted`` 만 막아서 "blocking=true 인데 201 생성됨" 이 됐다
-    #: (2026-09-08 프론트 B2 지적). 이제 ``state == restricted`` 와 동치다.
+    #: (2026-09-08 프론트 B2 지적).
+    #:
+    #: ⚠️⚠️ **``state == restricted`` 와 동치가 아니다(2026-10-13 변경).** 제한 분류는
+    #: 인스타의 사실 진술이고, 막을지는 **발송이 실제로 막혔는가**로 정한다 — 2026-09 중순부터
+    #: 제한 게시물에서도 private reply 가 성공하기 때문이다(prod 12,539건 중 2534066 0건).
+    #: 그래서 live 신호만으로 ``restricted`` 인데 실패 이력이 0 이면 ``blocking=False`` 다.
+    #: **프론트는 ``state`` 가 아니라 이 값(또는 ``can_create_campaign``)으로 버튼을 막아야 한다.**
     blocking: bool = False
 
     def as_dict(self) -> dict[str, Any]:
@@ -241,18 +308,34 @@ def check_runtime(media_id: str, *, window: timedelta = RUNTIME_WINDOW) -> Restr
         .values_list("created_at", flat=True)
         .first()
     )
+    polls = seen.filter(source=SeenComment.Source.POLL)
+    n_poll = polls.count()
+    last_poll = polls.order_by("-created_at").values_list("created_at", flat=True).first()
     # 마지막 웹훅 이후 폴러로만 들어온 건수 (웹훅 침묵의 크기)
-    poll_after = seen.filter(source=SeenComment.Source.POLL)
+    poll_after = polls
     if last_webhook:
         poll_after = poll_after.filter(created_at__gt=last_webhook)
     n_poll_after = poll_after.count()
+
+    # ★ 웹훅 침묵은 **state 와 별개로** 계산한다 (판정 단일 소스 = is_webhook_silent).
+    #   2026-09 중순 이후 제한 게시물은 발송이 되므로 이 신호로 state 를 올리면
+    #   잘 나가는 캠페인이 '의심'으로 찍히고 스위퍼가 정지시킨다. 플래그만 세운다.
+    v.webhook_silent = is_webhook_silent(
+        n_webhook=n_webhook,
+        n_poll=n_poll,
+        last_webhook_at=last_webhook,
+        last_poll_at=last_poll,
+    )
 
     v.evidence = {
         "failures_2534066": n_fail,
         "successes": n_ok,
         "webhook_comments_total": n_webhook,
         "last_webhook_at": last_webhook.isoformat() if last_webhook else None,
+        "poll_comments_total": n_poll,
+        "last_poll_at": last_poll.isoformat() if last_poll else None,
         "poll_only_comments_after_last_webhook": n_poll_after,
+        "webhook_silent": v.webhook_silent,
         "window_hours": int(window.total_seconds() // 3600),
     }
     if n_fail >= RUNTIME_MIN_FAILURES and n_ok == 0:
@@ -387,18 +470,57 @@ _MESSAGES = {
     STATE_UNKNOWN: "",
 }
 
+#: "인스타는 제한으로 분류했지만 **발송은 되고 있는**" 경우 전용 문구.
+#: ⚠️ STATE_RESTRICTED 기본 문구("보낼 수 없습니다")를 여기 쓰면 **사실과 다른 고지**가 된다
+#:    — 2026-09 중순부터 제한 게시물도 private reply 는 성공한다(실측 12,539건 중 실패 0).
+_MESSAGE_RESTRICTED_DELIVERING = (
+    "인스타그램이 이 게시물을 '연령 제한 콘텐츠'로 분류했습니다. 다만 자동 DM 발송 자체는 "
+    "현재 정상이며, 댓글 알림(웹훅)이 오지 않아 DM이 **최대 1시간 늦게** 도착할 수 있습니다."
+)
+_NEXT_STEPS_RESTRICTED_DELIVERING = [
+    "캠페인은 그대로 두셔도 됩니다 — 발송은 되고 있습니다.",
+    "DM이 즉시 가길 원하시면 제한되지 않은 새 게시물로 캠페인을 하나 더 만드세요.",
+    "인스타그램 앱에서 게시물 '이의 제기'를 넣으면 제한이 풀릴 수 있습니다.",
+]
+
+#: 웹훅 침묵 전용 문구 — **state 문구와 섞지 말 것**(제한이어도 발송은 된다).
+_MESSAGE_WEBHOOK_SILENT = (
+    "이 게시물은 인스타그램이 댓글 알림(웹훅)을 보내주지 않아 자동 DM이 실시간으로 나가지 "
+    "않습니다. 서버가 1시간마다 댓글을 다시 훑어 보내므로 DM이 **최대 1시간 늦게** 도착할 수 "
+    "있습니다. 발송 자체는 정상이며 누락되지 않습니다."
+)
+
 
 def restriction_payload(verdict: RestrictionVerdict) -> dict[str, Any]:
     """API 응답용 dict — 판정값 + 유저에게 그대로 보여줄 문구를 함께 담는다."""
     d = verdict.as_dict()
-    d["user_message"] = _MESSAGES.get(verdict.state, "")
+    # ★ 제한 분류 != 발송 불가. 막힌 증거(실패 이력)가 없으면 blocking=False 로 내려오고,
+    #   그때는 "보낼 수 없습니다" 가 아니라 "늦을 수 있습니다" 가 맞는 고지다.
+    delivering = verdict.state == STATE_RESTRICTED and not verdict.blocking
+    d["user_message"] = (
+        _MESSAGE_RESTRICTED_DELIVERING if delivering else _MESSAGES.get(verdict.state, "")
+    )
     d["how_to_check"] = (
         _HOW_TO_CHECK if verdict.state in (STATE_RESTRICTED, STATE_SUSPECTED) else ""
     )
-    d["next_steps"] = (
-        _NEXT_STEPS_RESTRICTED
-        if verdict.state == STATE_RESTRICTED
-        else (_NEXT_STEPS_SUSPECTED if verdict.state == STATE_SUSPECTED else [])
+    if delivering:
+        d["next_steps"] = _NEXT_STEPS_RESTRICTED_DELIVERING
+    else:
+        d["next_steps"] = (
+            _NEXT_STEPS_RESTRICTED
+            if verdict.state == STATE_RESTRICTED
+            else (_NEXT_STEPS_SUSPECTED if verdict.state == STATE_SUSPECTED else [])
+        )
+    # ★ 지연 고지 — state 와 별개(제한이어도 발송은 되지만 늦는다). 기존 키는 그대로 둔다.
+    d["webhook_silent"] = verdict.webhook_silent
+    d["delay_notice"] = (
+        {
+            "reason": "webhook_silent",
+            "max_delay_minutes": WEBHOOK_SILENT_DELAY_MINUTES,
+            "user_message": _MESSAGE_WEBHOOK_SILENT,
+        }
+        if verdict.webhook_silent
+        else None
     )
     return d
 
@@ -420,6 +542,25 @@ def inspect_media(
 
     best = max(verdicts, key=lambda x: _PRECEDENCE.get(x.state, 0))
     # 근거는 신호별로 모아서 돌려준다 — 프론트가 "왜 그렇게 판정했나"를 보여줄 수 있게.
+    # ⚠️ webhook_silent 는 runtime 신호에만 있다. best 가 history/live 일 수 있으므로
+    #    **명시적으로 옮겨 싣는다** (안 하면 제한 확정 게시물에서 지연 고지가 조용히 사라진다).
+    best.webhook_silent = verdicts[1].webhook_silent
+
+    # ★★ 게이트의 근거를 '인스타의 분류'가 아니라 **'실제로 발송이 막혔다는 증거'** 로 둔다.
+    #
+    #   2026-09 중순부터 제한 게시물에서도 private reply 가 성공한다(prod 12,539건 중
+    #   2534066 0건). 그래서 live 검사만으로 ``restricted`` 가 뜬 게시물을 막으면
+    #   **잘 나갈 캠페인을 409 로 막고, 심지어 "다른 게시물로 만드세요" 라고 안내**하게 된다
+    #   (같은 계열의 오안내 사고가 이미 있었다 — code=200/403 을 게시물 제한으로 읽은 건).
+    #
+    #   history 가 근거인 ``restricted`` 는 **그 게시물에서 실제로 2534066 이 났고 그 뒤로
+    #   성공이 없었다**는 뜻이므로 그대로 막는다. 분류만 있고 실패가 없으면 경고로 내린다.
+    if best.state == STATE_RESTRICTED and best.source == SOURCE_LIVE:
+        observed_failures = (verdicts[0].evidence.get("failures") or 0) + (
+            verdicts[1].evidence.get("failures_2534066") or 0
+        )
+        if not observed_failures:
+            best.blocking = False
     best.evidence = {
         "history": verdicts[0].evidence,
         "runtime": verdicts[1].evidence,

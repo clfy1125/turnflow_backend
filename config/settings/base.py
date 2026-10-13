@@ -688,6 +688,14 @@ CELERY_BEAT_SCHEDULE = {
         "task": "integrations.poll_missed_comments",
         "schedule": 60 * 60,  # 1시간
     },
+    # ===== 웹훅이 끊긴 게시물만 빠르게 보정 (3분) =====
+    # 연령 제한 게시물은 댓글 웹훅이 안 오는데 발송은 정상이라 "늦게 갈 뿐"이다.
+    # 대상은 '침묵 + 최근 활동' 둘 다인 것만이라 평소 10개 안팎(회차당 약 4초).
+    # 실제 구동은 core.ScheduledJob(0024 시드). CELERY_BEAT_SCHEDULE 은 fallback/문서용.
+    "dm-poll-silent-media": {
+        "task": "integrations.poll_silent_media_comments",
+        "schedule": 180,  # 3분
+    },
     # ===== 기존 댓글 소급 발송 대기열 스캔 =====
     # backfill_started_at IS NULL 인 활성·예약창 내 캠페인을 찾아 소급 태스크를 발사한다.
     # 1분 주기인 이유: 예약 캠페인의 "시작 시각 도래"를 감지하는 유일한 경로라서
@@ -1491,7 +1499,48 @@ PRIVATE_REPLY_WINDOW_DAYS = config("PRIVATE_REPLY_WINDOW_DAYS", default=7, cast=
 MISSED_COMMENT_POLL_PAGE_SIZE = config("MISSED_COMMENT_POLL_PAGE_SIZE", default=50, cast=int)
 # 폭주 방지 상한 — 정상 종료는 앵커 또는 7일 baseline. 소진 시 Telegram 경고.
 MISSED_COMMENT_POLL_MAX_PAGES = config("MISSED_COMMENT_POLL_MAX_PAGES", default=20, cast=int)
-MISSED_COMMENT_POLL_MAX_TARGETS = config("MISSED_COMMENT_POLL_MAX_TARGETS", default=1000, cast=int)
+# ⚠️ **안전 상한이지 설계 상한이 아니다.** 1000 이던 시절, 활성 타깃이 1,867 개로 늘면서
+#    867 개(46%)가 **조용히 폴링에서 빠져 있었다**(2026-10-13 실측). 상한에 걸려도 아무 경고가
+#    없었던 것이 몇 달간 안 보인 이유다. 지금은 ① 상한을 실사용의 2배 이상으로 두고
+#    ② 걸리면 Telegram 으로 운다 ③ 활동성 티어링으로 회차당 실제 호출은 비슷하게 유지한다.
+MISSED_COMMENT_POLL_MAX_TARGETS = config("MISSED_COMMENT_POLL_MAX_TARGETS", default=5000, cast=int)
+# 회차당 돌 '휴면' 타깃 수 — 장부에 7일간 아무 활동이 없는 게시물은 회전으로 나눠 돈다.
+# 실측 휴면 1,076 개 / 슬라이스 300 → 약 3.6 시간에 한 바퀴. 0 이면 휴면은 아예 안 돈다(비권장 —
+# "폴링 대상이 아니어서 장부가 비어 있던" 게시물이 영영 승격되지 못한다).
+MISSED_COMMENT_POLL_IDLE_SLICE = config("MISSED_COMMENT_POLL_IDLE_SLICE", default=300, cast=int)
+# 티어 경계. hot = 이 시간 안에 댓글이 있었거나 / 웹훅 침묵이거나 / 새 캠페인.
+MISSED_COMMENT_POLL_ACTIVE_HOURS = config("MISSED_COMMENT_POLL_ACTIVE_HOURS", default=24, cast=int)
+MISSED_COMMENT_POLL_WARM_DAYS = config("MISSED_COMMENT_POLL_WARM_DAYS", default=7, cast=int)
+# 장부가 아직 빈 새 캠페인은 활동 기록이 없어도 hot 으로 본다 — 안 그러면 갓 켠 캠페인이
+# 휴면 회전(수 시간)에 걸려 첫 보정이 늦는다.
+MISSED_COMMENT_POLL_NEW_CAMPAIGN_DAYS = config(
+    "MISSED_COMMENT_POLL_NEW_CAMPAIGN_DAYS", default=7, cast=int
+)
+# ===== 웹훅이 끊긴 게시물 전용 빠른 폴링 (integrations.poll_silent_media_comments) =====
+# 인스타가 '연령 제한'으로 분류한 게시물은 **댓글 웹훅만** 끊기고 발송은 정상이다
+# (2026-09 중순 이후. 제한 게시물 12,539건 중 2534066 0건). 그래서 이 게시물들의 문제는
+# "안 간다"가 아니라 "1시간 폴러를 기다리느라 늦게 간다"이고, 지연이 성과를 깎는 게
+# 측정된다(게이트 통과율 0~3분 63.0% / 30~60분 52.0%, n=9,583).
+#
+# 주기 N분이면 평균 지연 N/2분 → **3분 = 평균 1.5분 = 측정된 최고 구간**. 더 내려도
+# 표본이 작아 신뢰할 수 없다. 실구동은 core.ScheduledJob(0024 시드).
+SILENT_MEDIA_POLL_ENABLED = config("SILENT_MEDIA_POLL_ENABLED", default=True, cast=bool)
+# ⚠️ 여기 값과 ScheduledJob.interval_seconds 를 **같이** 바꿀 것. 이 값은 "한 바퀴가 주기의
+#    절반을 넘으면 운다" 경보 기준으로만 쓰인다(실제 발사 주기는 DB 행이 정한다).
+SILENT_MEDIA_POLL_INTERVAL_SECONDS = config(
+    "SILENT_MEDIA_POLL_INTERVAL_SECONDS", default=180, cast=int
+)
+# 회차당 대상 상한. 넘으면 Telegram. 실측 0.34초/대상이므로 400 이면 한 바퀴 약 136초.
+SILENT_MEDIA_POLL_MAX_TARGETS = config("SILENT_MEDIA_POLL_MAX_TARGETS", default=400, cast=int)
+# 웹훅이 끊겼어도 이 시간 안에 새 댓글이 없으면 빠른 레인에서 뺀다(1시간 레인이 맡는다).
+# 실측상 침묵 게시물 11개 중 4개가 댓글의 대부분이라 이 한 줄이 호출을 절반 이하로 줄인다.
+SILENT_MEDIA_POLL_ACTIVITY_MINUTES = config(
+    "SILENT_MEDIA_POLL_ACTIVITY_MINUTES", default=120, cast=int
+)
+
+# 1 회차 벽시계 예산(초). 주기(3600s)보다 넉넉히 작게 — 넘으면 중단하고 Telegram.
+# 실측 982 타깃 = 330 초이므로 1500 초면 약 4,400 타깃까지 여유.
+MISSED_COMMENT_POLL_MAX_SECONDS = config("MISSED_COMMENT_POLL_MAX_SECONDS", default=1500, cast=int)
 
 # ===== 기존 댓글 소급 발송 (integrations.backfill_campaign_comments) =====
 # 캠페인이 실제 시작되는 시점에 이미 달려 있던 댓글에도 DM 을 보낸다. 폴링 보정(위)은

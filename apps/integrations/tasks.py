@@ -13,6 +13,7 @@ Instagram 통합 Celery 태스크.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta
 
 from celery import shared_task
@@ -3543,6 +3544,165 @@ def _poll_one_media(conn: IGAccountConnection, media_id: str, now) -> dict:
     return {"misses": misses, "scanned": scanned, "stop": "budget_exhausted"}
 
 
+# ===== 폴링 대상 선정 (활동성 티어링) =====
+#
+# ⚠️ 2026-10-13 prod 실측으로 드러난 결함 — **활성 타깃 1,867개 중 1,000개만 돌고 있었다.**
+#   ``MISSED_COMMENT_POLL_MAX_TARGETS`` 상한에 ``AutoDMCampaign.Meta.ordering=['-created_at']``
+#   가 얹혀 **최신 캠페인 1,000개만** 잘려 들어가고 나머지 867개(46%)는 **영구 제외**였다.
+#   조용히 잘렸기 때문에 아무도 몰랐다. 제외된 게시물의 웹훅이 끊기면
+#   - 폴러가 안 도니 보정이 없고
+#   - 장부(SeenComment)도 폴러가 채우므로 **흔적조차 남지 않아** 우리가 알 방법이 없다.
+#
+# 고치는 방향은 "상한을 올려 전부 매시간 돈다"가 아니다. 실측상 돌고 있던 982개 중
+# **56%가 구조적으로 죽은 타깃**이었다(종료사유 ``empty`` 292 + ``window_floor`` 258 =
+# 댓글이 아예 없거나 전부 7일 창 밖). 그 자리를 급한 쪽에 쓴다:
+#
+#   hot  — 웹훅 침묵 / 최근 24h 댓글 / 새 캠페인  → **매 회차 전부**
+#   warm — 최근 7일 댓글                        → **매 회차 전부**
+#   idle — 그 외(장부에 아무 활동 없음)          → **회전 슬라이스** (몇 시간에 한 바퀴)
+#
+# 결과: 커버리지 1,000 → **전수**, 회차당 타깃 수는 비슷(실측 982 → 약 1,100).
+#
+# ⚠️ idle 에는 "폴링 대상이 아니어서 장부가 비어 있던" 게시물도 섞인다(닭-달걀). 회전으로
+#    한 번 돌면 폴링 유입이 생겨 hot/warm 으로 **스스로 승격**한다 — 그래서 회전이 필수다.
+
+TIER_HOT = "hot"
+TIER_WARM = "warm"
+TIER_IDLE = "idle"
+
+#: idle 회전 커서(마지막으로 처리한 정렬키). 유실돼도 처음부터 다시 도는 것뿐이라 무해.
+_IDLE_CURSOR_KEY = "missed_poll:idle_cursor:v1"
+_IDLE_CURSOR_TTL = 7 * 24 * 3600
+
+
+def _poll_ledger_digest() -> dict | None:
+    """media_id -> 장부 요약 (쿼리 1회). 실패하면 ``None`` (호출부가 전수 폴링으로 폴백)."""
+    try:
+        from django.db.models import Max
+
+        rows = (
+            SeenComment.objects.exclude(media_id="")
+            .values("media_id")
+            .annotate(
+                n_webhook=Count("id", filter=Q(source=SeenComment.Source.WEBHOOK)),
+                n_poll=Count("id", filter=Q(source=SeenComment.Source.POLL)),
+                last_webhook=Max("created_at", filter=Q(source=SeenComment.Source.WEBHOOK)),
+                last_poll=Max("created_at", filter=Q(source=SeenComment.Source.POLL)),
+                last_any=Max("created_at"),
+            )
+        )
+        return {r["media_id"]: r for r in rows}
+    except Exception:  # noqa: BLE001
+        logger.exception("poll_missed_comments: 장부 집계 실패 — 전수 폴링으로 폴백")
+        return None
+
+
+def _select_poll_targets(now) -> tuple[list[tuple], dict]:
+    """이번 회차에 돌 (connection, media) 목록과 선정 근거를 돌려준다.
+
+    선정은 **DB 만 읽는다** — Graph 호출 0. 모듈 상단 주석의 티어 정의가 단일 소스다.
+    """
+    from django.core.cache import cache
+
+    from .ig_content_restriction import is_webhook_silent
+
+    hard_cap = getattr(settings, "MISSED_COMMENT_POLL_MAX_TARGETS", 5000)
+    idle_slice = getattr(settings, "MISSED_COMMENT_POLL_IDLE_SLICE", 300)
+    active_window = timedelta(hours=getattr(settings, "MISSED_COMMENT_POLL_ACTIVE_HOURS", 24))
+    warm_window = timedelta(days=getattr(settings, "MISSED_COMMENT_POLL_WARM_DAYS", 7))
+    new_window = timedelta(days=getattr(settings, "MISSED_COMMENT_POLL_NEW_CAMPAIGN_DAYS", 7))
+
+    # ⚠️ order_by() 로 Meta ordering 을 **반드시 끊는다** — 이게 붙어 있으면 상한이
+    #    "최신순 N개"로 잘려 오래된 캠페인이 영영 제외된다(이 결함의 원인).
+    rows = (
+        AutoDMCampaign.objects.filter(status=AutoDMCampaign.Status.ACTIVE)
+        .filter(AutoDMCampaign.schedule_window_q(now))
+        .filter(trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA)
+        .exclude(media_id="")
+        .values_list(
+            "ig_connection_id", "media_id", "started_at", "scheduled_start_at", "created_at"
+        )
+        .order_by()
+        .iterator(chunk_size=2000)
+    )
+    # (conn, media) 중복 제거 — 같은 게시물에 캠페인이 여러 개면 **가장 최근 시작분**을 쓴다.
+    pairs: dict[tuple, datetime] = {}
+    for conn_id, media_id, started_at, sched_at, created_at in rows:
+        eff = started_at or sched_at or created_at
+        key = (conn_id, media_id)
+        cur = pairs.get(key)
+        if cur is None or (eff and eff > cur):
+            pairs[key] = eff
+
+    digest = _poll_ledger_digest()
+    if digest is None:
+        # 폴백: 티어링 없이 전수(상한 안에서). 커버리지를 잃느니 비용을 쓴다.
+        targets = list(pairs)[:hard_cap]
+        return targets, {"total": len(pairs), "selected": len(targets), "degraded": True}
+
+    hot: list[tuple] = []
+    warm: list[tuple] = []
+    idle: list[tuple] = []
+    for (conn_id, media_id), eff in pairs.items():
+        d = digest.get(media_id)
+        last_any = d["last_any"] if d else None
+        silent = (
+            is_webhook_silent(
+                n_webhook=d["n_webhook"],
+                n_poll=d["n_poll"],
+                last_webhook_at=d["last_webhook"],
+                last_poll_at=d["last_poll"],
+                now=now,
+            )
+            if d
+            else False
+        )
+        fresh_campaign = bool(eff and (now - eff) <= new_window)
+        if silent or fresh_campaign or (last_any and (now - last_any) <= active_window):
+            hot.append((conn_id, media_id))
+        elif last_any and (now - last_any) <= warm_window:
+            warm.append((conn_id, media_id))
+        else:
+            idle.append((conn_id, media_id))
+
+    # idle 회전 — 정렬키를 고정해야 커서가 의미를 갖는다.
+    idle.sort(key=lambda t: f"{t[0]}|{t[1]}")
+    picked: list[tuple] = []
+    if idle and idle_slice > 0:
+        cursor = cache.get(_IDLE_CURSOR_KEY) or ""
+        start = 0
+        for i, t in enumerate(idle):
+            if f"{t[0]}|{t[1]}" > cursor:
+                start = i
+                break
+        picked = idle[start : start + idle_slice]
+        # 한 바퀴 돌았으면 앞에서 이어 담되 **커서 앞쪽까지만** — 안 그러면 슬라이스가
+        # 휴면 총수보다 클 때 같은 타깃을 한 회차에 두 번 넣는다(호출 낭비).
+        if len(picked) < idle_slice and start > 0:
+            picked += idle[: min(start, idle_slice - len(picked))]
+        if picked:
+            try:
+                cache.set(_IDLE_CURSOR_KEY, f"{picked[-1][0]}|{picked[-1][1]}", _IDLE_CURSOR_TTL)
+            except Exception:  # noqa: BLE001
+                logger.debug("idle 커서 저장 실패 (non-fatal)", exc_info=True)
+
+    selected = hot + warm + picked
+    capped = len(selected) > hard_cap
+    if capped:
+        # ⚠️ 자를 때는 **idle → warm 순으로** 버린다. hot 은 절대 자르지 않는다.
+        selected = (hot + warm + picked)[:hard_cap]
+    meta = {
+        "total": len(pairs),
+        "hot": len(hot),
+        "warm": len(warm),
+        "idle": len(idle),
+        "idle_picked": len(picked),
+        "selected": len(selected),
+        "capped": capped,
+    }
+    return selected, meta
+
+
 @shared_task(name="integrations.poll_missed_comments")
 def poll_missed_comments():
     """댓글 웹훅 누락 보정 (Beat: 1시간 주기).
@@ -3555,18 +3715,12 @@ def poll_missed_comments():
         return {"enabled": False}
 
     now = timezone.now()
-    max_targets = getattr(settings, "MISSED_COMMENT_POLL_MAX_TARGETS", 1000)
+    started = time.monotonic()
+    budget_seconds = getattr(settings, "MISSED_COMMENT_POLL_MAX_SECONDS", 1500)
 
-    targets = list(
-        AutoDMCampaign.objects.filter(status=AutoDMCampaign.Status.ACTIVE)
-        .filter(AutoDMCampaign.schedule_window_q(now))
-        .filter(trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA)
-        .exclude(media_id="")
-        .values_list("ig_connection_id", "media_id")
-        .distinct()[:max_targets]
-    )
+    targets, tier_meta = _select_poll_targets(now)
     if not targets:
-        return {"targets": 0, "polled": 0, "misses": 0}
+        return {"targets": 0, "polled": 0, "misses": 0, "tiers": tier_meta}
 
     conn_ids = {t[0] for t in targets}
     conns = {
@@ -3582,7 +3736,13 @@ def poll_missed_comments():
     # 실제로 작동 중이라는 뜻이고, budget_exhausted 가 보이면 페이지 상한이 모자란다는 뜻이다.
     # (이 분포 없이 폴러 개선 여부를 판단하려다 오판했다 — 2026-07-30)
     stop_reasons: dict[str, int] = {}
+    budget_stopped = False
     for conn_id, media_id in targets:
+        # ★ 벽시계 예산 — 타깃이 늘어도 다음 회차와 겹치지 않게 한다. 멈춘 자리는
+        #   idle 커서가 기억하므로 다음 회차가 이어서 돈다(hot/warm 은 어차피 매회 전부).
+        if budget_seconds and (time.monotonic() - started) > budget_seconds:
+            budget_stopped = True
+            break
         conn = conns.get(conn_id)
         if conn is None:
             continue
@@ -3598,6 +3758,24 @@ def poll_missed_comments():
 
     if total_misses:
         logger.info("poll_missed_comments: polled=%s misses(enqueued)=%s", polled, total_misses)
+
+    # ⚠️ **조용히 자르지 않는다.** 이 결함(1,867 중 1,000만 폴링)이 몇 달간 안 보였던 이유가
+    #    정확히 "상한에 걸려도 아무 말을 안 해서" 였다.
+    if tier_meta.get("capped") or budget_stopped or tier_meta.get("degraded"):
+        try:
+            from apps.core.telegram import send_telegram_notification
+
+            send_telegram_notification(
+                "⚠️ 댓글 누락 보정 폴러가 전수를 못 돌았습니다 — "
+                f"대상 {tier_meta.get('total')} / 선정 {tier_meta.get('selected')} / "
+                f"실제 {polled} (hot={tier_meta.get('hot')} warm={tier_meta.get('warm')} "
+                f"idle={tier_meta.get('idle_picked')}/{tier_meta.get('idle')}) "
+                f"capped={tier_meta.get('capped')} budget_stopped={budget_stopped} "
+                f"degraded={tier_meta.get('degraded', False)} "
+                f"elapsed={int(time.monotonic() - started)}s"
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("폴러 상한 경고 발송 실패 (non-fatal)", exc_info=True)
 
     # ★ 결과 적재 (2026-07-30) — 웹훅 유실률을 **장기 추적**하기 위한 계측.
     #   지금까지는 misses>0 일 때만 logger.info 였고 컨테이너 로그는 재시작 시 소실돼
@@ -3619,6 +3797,9 @@ def poll_missed_comments():
                 "polled": polled,
                 "misses": total_misses,
                 "stops": stop_reasons,
+                "tiers": tier_meta,
+                "budget_stopped": budget_stopped,
+                "elapsed_s": int(time.monotonic() - started),
             },
             processed_at=_now,  # 후속 워커 pending 조회에 안 걸리게
         )
@@ -3630,7 +3811,205 @@ def poll_missed_comments():
         "polled": polled,
         "misses": total_misses,
         "stops": stop_reasons,
+        "tiers": tier_meta,
+        "budget_stopped": budget_stopped,
+        "elapsed_s": int(time.monotonic() - started),
     }
+
+
+# ===== 웹훅이 끊긴 게시물 전용 빠른 폴링 (3분) =====
+#
+# 왜 이것만 따로 빨리 도는가 (2026-10-13, prod 실측 근거)
+# ──────────────────────────────────────────────────────────────────────────
+# 인스타가 게시물을 '연령 제한 콘텐츠'로 분류하면 **그 게시물의 댓글 웹훅만** 끊긴다.
+# 발송 자체는 2026-09 중순부터 다시 정상이다(제한 게시물 12,539건 중 2534066 **0건**).
+# 그래서 이 게시물들은 "DM 이 안 간다"가 아니라 **"1시간 폴러를 기다리느라 늦게 간다"** 이고,
+# 고객이 "처음엔 가다가 멈췄어요"라고 말하는 상태가 정확히 이것이다.
+#
+# 지연이 성과를 깎는 것이 측정된다 (폴링 발송 30일 n=9,583, 팔로우게이트 통과율):
+#
+#     0~3분 63.0%  ·  3~10분 58.3%  ·  10~30분 53.0%  ·  30~60분 52.0%
+#
+# 주기 N분이면 평균 지연은 N/2분이다. **3분 주기 = 평균 1.5분 = 측정된 최고 구간 전부.**
+# 더 내려도(1~2분) 표본이 작아 신뢰할 수 없고, 자주 긁는 것을 Meta 가 어떻게 보는지는
+# 측정할 방법이 없으므로 굳이 밀어붙이지 않는다.
+#
+# 부하 (10배 성장 가정, 침묵 게시물 280개): 회차당 95초 < 간격 180초(여유 2배),
+# 호출 5,600/h = 앱 쿼터 풀(200 x 연동수)의 **0.19%**. 쿼터는 병목이 아니다.
+#
+# ⚠️ 상한을 "성능 때문에" 몰래 깎지 말 것 — 그 대신 네 겹 안전장치를 둔다:
+#   1) 대상은 **침묵 + 최근 활동** 둘 다인 것만 (조용한 침묵 게시물은 1시간 레인이 맡는다)
+#   2) 대상 수 상한(``SILENT_MEDIA_POLL_MAX_TARGETS``) — 넘으면 Telegram
+#   3) 한 바퀴가 주기의 절반을 넘으면 Telegram (조용히 밀리지 않게)
+#   4) 중복 실행 락 — 회차가 겹쳐 같은 게시물을 동시에 긁지 않게
+#
+# ⚠️ 지금은 기본 큐(``celery``, prefork 8)에서 돈다. 현재 회차당 4초라 전용 워커가 필요 없다.
+#    **한 바퀴가 90초를 넘으면(대상 약 270개) 전용 큐로 분리할 것** — 그때는 기본 큐의
+#    다른 잡(1시간 폴러 330초, 스냅샷 등)과 슬롯을 다투기 시작한다.
+
+_SILENT_POLL_LOCK_KEY = "silent_media_poll:lock:v1"
+
+
+def _select_silent_targets(now) -> tuple[list[tuple], dict]:
+    """웹훅이 끊겼고 **지금도 댓글이 달리는** (connection, media) 만 고른다 (Graph 호출 0)."""
+    from .ig_content_restriction import is_webhook_silent
+
+    max_targets = getattr(settings, "SILENT_MEDIA_POLL_MAX_TARGETS", 400)
+    activity_window = timedelta(
+        minutes=getattr(settings, "SILENT_MEDIA_POLL_ACTIVITY_MINUTES", 120)
+    )
+
+    digest = _poll_ledger_digest()
+    if not digest:
+        # 장부가 없거나 집계가 깨졌으면 **아무것도 하지 않는다.** 1시간 레인이 이미 전수를
+        # 돌고 있으므로 여기서 추측으로 긁는 것보다 쉬는 쪽이 안전하다.
+        return [], {"total": 0, "selected": 0, "degraded": digest is None}
+
+    pairs = set(
+        AutoDMCampaign.objects.filter(status=AutoDMCampaign.Status.ACTIVE)
+        .filter(AutoDMCampaign.schedule_window_q(now))
+        .filter(trigger_type=AutoDMCampaign.TriggerType.SPECIFIC_MEDIA)
+        .exclude(media_id="")
+        .values_list("ig_connection_id", "media_id")
+        .order_by()
+    )
+
+    selected: list[tuple] = []
+    for conn_id, media_id in pairs:
+        d = digest.get(media_id)
+        if not d:
+            continue
+        last_poll = d["last_poll"]
+        # (1) 조용한 침묵 게시물은 강등 — 1시간 레인이 맡는다. 실측상 침묵 11개 중 4개가
+        #     댓글의 대부분이고 나머지는 시간당 0.1~2건이라 이것만으로 호출이 절반 이하가 된다.
+        if not last_poll or (now - last_poll) > activity_window:
+            continue
+        # ⚠️ 소급발송(backfill)도 장부에 source=poll 로 적는다 → 갓 켠 캠페인이 잠깐
+        #    '침묵'으로 보일 수 있다(오탐). 비용은 게시물당 시간당 20콜이고, 진짜 웹훅이
+        #    한 건만 와도 스스로 빠져나간다. 회수(recall) 를 지키려고 **일부러 안 조인다** —
+        #    여기서 조이면 "태어날 때부터 제한된 게시물"을 놓치는데 그게 제일 아픈 케이스다.
+        if not is_webhook_silent(
+            n_webhook=d["n_webhook"],
+            n_poll=d["n_poll"],
+            last_webhook_at=d["last_webhook"],
+            last_poll_at=last_poll,
+            now=now,
+        ):
+            continue
+        selected.append((conn_id, media_id))
+
+    # (2) 상한 — 조용히 자르지 않는다(호출부가 Telegram).
+    capped = len(selected) > max_targets
+    if capped:
+        selected = selected[:max_targets]
+    return selected, {"total": len(pairs), "selected": len(selected), "capped": capped}
+
+
+@shared_task(name="integrations.poll_silent_media_comments")
+def poll_silent_media_comments():
+    """댓글 웹훅이 끊긴 게시물만 3분마다 재조회해 DM 지연을 줄인다.
+
+    발송 경로·중복 방어는 1시간 폴러와 **완전히 동일**하다(``_poll_one_media`` 재사용 →
+    ``SentDMLog.idempotency_key`` 가 중복 발송을 막고 ``rate_governor`` 가 발송량을 조절).
+    여기서 바꾸는 건 **얼마나 자주 보느냐** 하나뿐이다.
+    """
+    from django.core.cache import cache
+
+    if not getattr(settings, "SILENT_MEDIA_POLL_ENABLED", True):
+        return {"enabled": False}
+
+    interval = getattr(settings, "SILENT_MEDIA_POLL_INTERVAL_SECONDS", 180)
+    # (4) 중복 실행 락 — 회차가 밀려 겹치면 같은 게시물을 동시에 긁는다(호출 낭비 + 경합).
+    if not cache.add(_SILENT_POLL_LOCK_KEY, "1", max(60, interval * 3)):
+        logger.warning("poll_silent_media_comments: 직전 회차가 아직 돌고 있어 건너뜀")
+        return {"skipped": "already_running"}
+
+    started = time.monotonic()
+    now = timezone.now()
+    try:
+        targets, meta = _select_silent_targets(now)
+        if not targets:
+            return {"targets": 0, "polled": 0, "misses": 0, "meta": meta}
+
+        conns = {
+            c.id: c
+            for c in IGAccountConnection.objects.filter(
+                id__in={t[0] for t in targets},
+                status=IGAccountConnection.Status.ACTIVE,
+                is_active=True,
+            )
+        }
+        polled = 0
+        misses = 0
+        stop_reasons: dict[str, int] = {}
+        for conn_id, media_id in targets:
+            conn = conns.get(conn_id)
+            if conn is None:
+                continue
+            try:
+                result = _poll_one_media(conn, media_id, now)
+                misses += result.get("misses", 0)
+                _stop = str(result.get("stop") or "unknown")
+                stop_reasons[_stop] = stop_reasons.get(_stop, 0) + 1
+                polled += 1
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "poll_silent_media_comments: 실패 conn=%s media=%s", conn_id, media_id
+                )
+                stop_reasons["error"] = stop_reasons.get("error", 0) + 1
+
+        elapsed = time.monotonic() - started
+        # (2)(3) 상한에 걸렸거나 한 바퀴가 주기의 절반을 넘으면 운다.
+        #        "조용히 잘려서 몇 달간 아무도 몰랐던" 1시간 폴러의 실수를 반복하지 않는다.
+        if meta.get("capped") or elapsed > interval * 0.5:
+            try:
+                from apps.core.telegram import send_telegram_notification
+
+                send_telegram_notification(
+                    "⚠️ 웹훅 침묵 게시물 빠른 폴링 과부하 — "
+                    f"대상 {meta.get('selected')}/{meta.get('total')} · 실제 {polled} · "
+                    f"{elapsed:.0f}초(주기 {interval}초) · capped={meta.get('capped')}"
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug("빠른 폴링 경고 발송 실패 (non-fatal)", exc_info=True)
+
+        if misses:
+            logger.info(
+                "poll_silent_media_comments: polled=%s misses=%s %.1fs", polled, misses, elapsed
+            )
+        try:
+            from .models import EventInbox as _EI
+
+            _now = timezone.now()
+            _EI.objects.create(
+                event_key=f"silentpoll:{int(_now.timestamp() * 1_000_000)}",
+                event_type="silent_poll_stat",
+                payload={
+                    "targets": len(targets),
+                    "polled": polled,
+                    "misses": misses,
+                    "stops": stop_reasons,
+                    "elapsed_s": round(elapsed, 1),
+                    "meta": meta,
+                },
+                processed_at=_now,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("빠른 폴링 결과 적재 실패 (non-fatal)", exc_info=True)
+
+        return {
+            "targets": len(targets),
+            "polled": polled,
+            "misses": misses,
+            "stops": stop_reasons,
+            "elapsed_s": round(elapsed, 1),
+            "meta": meta,
+        }
+    finally:
+        try:
+            cache.delete(_SILENT_POLL_LOCK_KEY)
+        except Exception:  # noqa: BLE001
+            logger.debug("빠른 폴링 락 해제 실패 (non-fatal)", exc_info=True)
 
 
 # ===== 기존 댓글 소급 발송 (backfill) =====

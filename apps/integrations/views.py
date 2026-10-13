@@ -2299,19 +2299,22 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
             return RestrictionVerdict(media_id=media_id or "")
 
     def _assert_media_not_restricted(self, *, media_id, permalink="", allow_live=False):
-        """인스타가 제한한 게시물이면 409 로 차단.
+        """**실제로 발송이 막힌** 게시물이면 409 로 차단.
 
-        ⚠️ **확정(restricted)** 일 때만 막는다. 의심(suspected)은 통과시킨다 — 오탐으로
-        정상 캠페인을 못 만들게 하는 쪽이 손해가 크다. 의심은 조회 API 로만 노출한다.
+        ⚠️ 판단 기준은 ``verdict.blocking`` 하나다. ``state`` 로 보지 말 것 —
+        2026-09 중순부터 인스타가 '연령 제한'으로 분류한 게시물에서도 private reply 는
+        성공한다(prod 실측 12,539건 중 2534066 0건). 분류만 보고 막으면 **잘 나갈 캠페인을
+        막고 "다른 게시물로 만드세요"라고 잘못 안내**하게 된다. ``blocking`` 은
+        ig_content_restriction 이 "실패 이력이 있다"를 확인했을 때만 True 다.
+
+        의심(suspected)은 통과시킨다 — 오탐으로 정상 캠페인을 못 만들게 하는 쪽이 손해가 크다.
         """
-        from .ig_content_restriction import STATE_RESTRICTED
-
         if not (media_id or "").strip():
             return None
         verdict = self._inspect_media_restriction(
             media_id=media_id, permalink=permalink, allow_live=allow_live
         )
-        if verdict.state == STATE_RESTRICTED:
+        if verdict.blocking:
             raise RestrictedMediaError.for_verdict(verdict, permalink=permalink)
         return verdict
 
@@ -4722,8 +4725,28 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         | suspected | 제한 의심 (웹훅 침묵 + 연속 실패) | **생성 허용**. 경고 배너만 |
         | unknown | 판정 불가 (이력 없음 / 점검 실패) | 아무 것도 표시하지 않음 |
 
-        blocking=true 면 생성이 막힙니다. **unknown 은 정상으로 취급하세요** - 새 게시물은
-        대부분 이력이 없어 unknown 입니다.
+        ⚠️ **버튼을 막는 판단은 `state` 가 아니라 `blocking`(= `can_create_campaign` 의 반대)
+        으로 하세요** (2026-10-13 변경). 2026-09 중순부터 인스타가 '연령 제한'으로 분류한
+        게시물에서도 자동 DM 발송 자체는 **성공합니다**(실측 12,539건 중 실패 0). 그래서
+        `state="restricted"` 인데 `blocking=false` 인 조합이 정상적으로 존재합니다 - 이때
+        막아버리면 잘 나갈 캠페인을 막고 "다른 게시물로 만드세요"라고 **반대로 안내**하게 됩니다.
+        `blocking=true` 는 그 게시물에서 **실제로 발송이 실패한 이력**이 있을 때만 켜집니다.
+
+        **unknown 은 정상으로 취급하세요** - 새 게시물은 대부분 이력이 없어 unknown 입니다.
+
+        ## 지연 고지 (`webhook_silent` / `delay_notice`) - 2026-10-13 추가
+
+        제한 게시물은 **댓글 웹훅이 오지 않습니다.** 발송은 되지만 서버가 1시간마다 댓글을
+        다시 훑어 보내므로 DM이 **최대 1시간 늦게** 도착합니다. 고객이 "처음엔 가다가
+        멈췄어요"라고 느끼는 상태가 정확히 이것입니다(실측 지연 중앙값 30분).
+
+        | 필드 | 타입 | 뜻 |
+        |---|---|---|
+        | `webhook_silent` | boolean | 이 게시물의 댓글 웹훅이 끊겼는가 |
+        | `delay_notice` | object 또는 null | `webhook_silent=true` 일 때만. `{reason, max_delay_minutes, user_message}` |
+
+        `delay_notice` 가 있으면 **경고(노랑)** 로 그리세요. 빨강(차단)이 아닙니다 - 발송은
+        정상입니다. 문구는 서버가 주는 `user_message` 를 그대로 쓰세요(하드코딩 금지).
 
         ## 사용 예시
         ```javascript
@@ -4753,9 +4776,22 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
               "user_message": "이 게시물은 인스타그램이 연령 제한 콘텐츠로 분류해 ...",
               "how_to_check": "시크릿 창(로그아웃)에서 게시물 링크를 열어보세요. ...",
               "next_steps": ["다른 게시물로 캠페인을 만드세요.", "..."],
+              "webhook_silent": true,
+              "delay_notice": {
+                "reason": "webhook_silent",
+                "max_delay_minutes": 60,
+                "user_message": "이 게시물은 인스타그램이 댓글 알림(웹훅)을 보내주지 않아 ..."
+              },
               "evidence": {
                 "history": {"failures": 96, "successes_after_first_failure": 0},
-                "runtime": {"failures_2534066": 92, "successes": 0},
+                "runtime": {
+                  "failures_2534066": 92,
+                  "successes": 0,
+                  "webhook_comments_total": 0,
+                  "poll_comments_total": 1405,
+                  "last_webhook_at": null,
+                  "webhook_silent": true
+                },
                 "live": {},
                 "live_check_enabled": false
               }
@@ -4865,8 +4901,14 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
           headers: { Authorization: `Bearer ${token}` },
         });
         const { data } = await r.json();
-        if (data.restriction.blocking) showBanner(data.restriction);
+        // 차단(빨강) - 실제로 발송이 막힌 게시물
+        if (data.restriction.blocking) showBlockingBanner(data.restriction);
+        // 지연(노랑) - 제한이지만 발송은 되는 게시물. 둘은 동시에 뜰 수 있다.
+        else if (data.restriction.delay_notice) showDelayBanner(data.restriction.delay_notice);
         ```
+
+        > ⚠️ `state === "restricted"` 로 빨강을 띄우지 마세요. 2026-09 중순부터 제한 게시물도
+        > 발송은 됩니다 - 그때는 `blocking=false` + `delay_notice` 조합으로 내려갑니다.
         """,
         responses={
             200: OpenApiResponse(description="점검 결과"),
