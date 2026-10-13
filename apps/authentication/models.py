@@ -198,6 +198,18 @@ class User(AbstractUser):
     sms_marketing_opt_in_at = models.DateTimeField(
         null=True, blank=True, verbose_name="문자 수신 동의 시각"
     )
+    # ── 휴대폰 인증 면제 (2026-10-13) ───────────────────────────────────────
+    # ⭐ **국내 번호가 없는 사용자를 계정에서 쫓아내지 않기 위한 탈출구다.**
+    #    우리 인증은 국내 휴대폰(010/011/016~019)만 받는데, 인증이 필수가 되면 해외
+    #    거주자는 강제 화면에서 **영영 빠져나올 수 없다** — 자기 계정에 못 들어간다.
+    #    CS 가 확인 후 켜 주면 그 사용자만 required 가 false 가 된다.
+    # ⚠️ 번호를 가짜로 채워 넣는 식으로 우회하지 말 것 — 그러면 알림톡이 엉뚱한 사람에게
+    #    가고, 수집 지표도 오염된다. 면제는 "번호가 없다" 를 그대로 기록하는 방법이다.
+    phone_required_exempt = models.BooleanField(
+        default=False,
+        verbose_name="휴대폰 인증 면제",
+        help_text="국내 번호가 없는 사용자 등. CS 확인 후 수동으로 켠다.",
+    )
     # 번호 등록 보상(기존 회원 유인 — 프로 체험 연장)을 이미 받았는가. **1인 1회**.
     # 번호를 지웠다가 다시 등록해도 두 번 주지 않기 위해 User 에 둔다(구독 행은 갈릴 수 있다).
     phone_reward_granted_at = models.DateTimeField(

@@ -136,6 +136,9 @@ def phone_verification_required(user) -> bool:
         return False
     if getattr(user, "is_pending_deletion", False):
         return False
+    # 국내 번호가 없는 사용자 등 — CS 가 켜 준 면제. 없으면 자기 계정에서 쫓겨난다.
+    if getattr(user, "phone_required_exempt", False):
+        return False
     return not is_legacy_user(user)
 
 
@@ -241,7 +244,18 @@ def _apply_by_state(user, *, apply: bool) -> RewardResult:
         if days <= 0:
             return RewardResult(kind=KIND_NONE, reason=REASON_NOT_ELIGIBLE)
         if not apply:
-            return RewardResult(kind=KIND_PAID_EXTENDED, days=days)
+            return RewardResult(
+                kind=KIND_PAID_EXTENDED,
+                days=days,
+                # 유료 구독에서 current_period_end 는 '다음 결제일'이다. 체험이 아니지만
+                # 프론트가 날짜 줄 하나만 그리면 되도록 **같은 필드**에 담는다
+                # (필드를 둘로 나누면 화면이 kind 마다 다른 키를 읽어야 한다).
+                trial_ends_at=(
+                    sub.current_period_end + timedelta(days=days)
+                    if sub.current_period_end
+                    else None
+                ),
+            )
         with transaction.atomic():
             locked = UserSubscription.objects.select_for_update(of=("self",)).get(pk=sub.pk)
             if locked.current_period_end is None:
@@ -249,7 +263,9 @@ def _apply_by_state(user, *, apply: bool) -> RewardResult:
             locked.current_period_end = locked.current_period_end + timedelta(days=days)
             locked.save(update_fields=["current_period_end", "updated_at"])
             _mark_granted(user, now)
-        return RewardResult(kind=KIND_PAID_EXTENDED, days=days)
+        return RewardResult(
+            kind=KIND_PAID_EXTENDED, days=days, trial_ends_at=locked.current_period_end
+        )
 
     return RewardResult(kind=KIND_NONE, reason=REASON_NOT_ELIGIBLE)
 

@@ -571,6 +571,112 @@ class TestRequiredIsSignupMethodAgnostic:
         assert res.data["phone_verification_required"] is False
 
 
+class TestFrontendFollowup:
+    """프론트 2차 확인 요청(2026-10-13)에서 계약으로 못 박기로 한 것들."""
+
+    def test_send_failure_keeps_the_previous_code_alive(self, sms_off, api, user):
+        """⭐ Q5 — "다시 받기" 가 실패해도 **앞서 받은 코드**는 살아 있어야 한다.
+
+        종전엔 직전 코드를 **먼저** 죽이고 새 행을 만든 뒤 발송해서, 발송이 실패하면
+        살아있는 코드가 하나도 남지 않았다. 사용자는 문자로 받아 둔 코드를 입력해도
+        NO_PENDING_PHONE_VERIFICATION 을 받는다.
+        """
+        from unittest.mock import patch
+
+        from apps.sms.ncp import SmsProviderError
+
+        _send(api)
+        first_code = _live_code(user)
+        sms_off.PHONE_VERIFY_RESEND_COOLDOWN_SECONDS = 0
+
+        with patch(
+            "apps.sms.services.send_sms",
+            side_effect=SmsProviderError("SMS_SEND_FAILED", "실패"),
+        ):
+            res = _send(api)
+        assert res.status_code == 502
+
+        # 앞 코드로 여전히 인증이 된다
+        done = api.post(
+            reverse("authentication:me-phone-verify"), {"code": first_code}, format="json"
+        )
+        assert done.status_code == 200, done.data
+
+    def test_successful_resend_kills_the_previous_code(self, sms_off, api, user):
+        """반대 방향 — 발송이 **성공**하면 직전 코드는 죽어야 한다(두 코드 동시 유효 금지)."""
+        _send(api)
+        first_code = _live_code(user)
+        sms_off.PHONE_VERIFY_RESEND_COOLDOWN_SECONDS = 0
+        assert _send(api).status_code == 202
+
+        res = api.post(
+            reverse("authentication:me-phone-verify"), {"code": first_code}, format="json"
+        )
+        assert res.status_code == 400
+        assert res.data["code"] == "PHONE_CODE_INVALID"
+
+    def test_cooldown_is_per_phone_so_fixing_a_typo_is_immediate(self, sms_off, api):
+        """Q4 — 쿨다운은 **번호별**이라 오타를 고친 번호는 바로 보낼 수 있다."""
+        assert _send(api, "010-1234-5678").status_code == 202
+        assert _send(api, "010-1234-5678").status_code == 429  # 같은 번호는 막힌다
+        assert _send(api, "010-1234-5679").status_code == 202  # 고친 번호는 통과
+
+    def test_status_exposes_pending_for_resume(self, sms_off, api, user):
+        """Q3 — 새로고침·기기 전환 뒤 2단계를 서버 기준으로 복원할 수 있어야 한다."""
+        res = api.get(reverse("authentication:me-phone"))
+        assert res.data["pending"] is None
+
+        _send(api)
+        res = api.get(reverse("authentication:me-phone"))
+        p = res.data["pending"]
+        assert p["phone_masked"] == "010-****-5678"
+        assert 0 < p["expires_in"] <= 180
+        assert p["attempts_left"] == 5
+
+    def test_status_exposes_deletable(self, sms_off, api, user):
+        """Q6 — [삭제]를 눌러 409 를 받아 보지 않고도 알 수 있어야 한다."""
+        assert api.get(reverse("authentication:me-phone")).data["deletable"] is False  # 번호 없음
+
+        _send(api)
+        api.post(
+            reverse("authentication:me-phone-verify"), {"code": _live_code(user)}, format="json"
+        )
+        assert api.get(reverse("authentication:me-phone")).data["deletable"] is True
+
+        sms_off.PHONE_REQUIRED_SINCE = (timezone.now() - timedelta(days=1)).isoformat()
+        assert api.get(reverse("authentication:me-phone")).data["deletable"] is False
+
+    def test_verify_without_opt_in_keeps_the_existing_consent(self, sms_off, api, user):
+        """Q7 — 번호 **변경** 때 켜 둔 문자 수신이 꺼지면 안 된다."""
+        _send(api)
+        api.post(
+            reverse("authentication:me-phone-verify"),
+            {"code": _live_code(user), "sms_marketing_opt_in": True},
+            format="json",
+        )
+        user.refresh_from_db()
+        assert user.sms_marketing_opt_in is True
+        consented_at = user.sms_marketing_opt_in_at
+
+        sms_off.PHONE_VERIFY_RESEND_COOLDOWN_SECONDS = 0
+        _send(api, "010-2222-3333")
+        api.post(  # opt_in 을 **보내지 않는다**
+            reverse("authentication:me-phone-verify"), {"code": _live_code(user)}, format="json"
+        )
+        user.refresh_from_db()
+        assert user.sms_marketing_opt_in is True
+        assert user.sms_marketing_opt_in_at == consented_at
+
+    def test_exempt_user_is_not_forced(self, sms_off, api, user):
+        """Q9 — 국내 번호가 없는 사용자를 자기 계정에서 쫓아내지 않는다."""
+        sms_off.PHONE_REQUIRED_SINCE = (timezone.now() - timedelta(days=1)).isoformat()
+        assert api.get(reverse("authentication:me")).data["phone_verification_required"] is True
+
+        user.phone_required_exempt = True
+        user.save(update_fields=["phone_required_exempt"])
+        assert api.get(reverse("authentication:me")).data["phone_verification_required"] is False
+
+
 class TestKakaoPhone:
     def test_parses_kakao_format(self):
         from apps.authentication.kakao import _parse_phone

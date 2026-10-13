@@ -152,12 +152,20 @@ class PhoneSendCodeView(APIView):
   "phone_verified": true,
   "phone_source": "sms",
   "required": false,
+  "deletable": true,
   "sms_marketing_opt_in": false,
   "resend_after": 0,
   "daily_remaining": 5,
+  "pending": { "phone_masked": "010-****-5678", "expires_in": 142, "attempts_left": 5 },
   "reward": { "kind": "none", "days": 0, "reason": "already_granted", "trial_ends_at": null }
 }
 ```
+
+| 필드 | 뜻 |
+|---|---|
+| `deletable` | 지금 `DELETE` 를 누르면 되는가. `false` 면 버튼을 비활성화하세요(409 를 받아 보고 알 필요 없음) |
+| `pending` | **진행 중인 인증**. 없으면 `null`. 있으면 코드 입력 단계를 **서버 기준으로 복원**하세요 — `expires_in` 초 남았고 `attempts_left` 번 틀릴 수 있습니다 |
+| `resend_after`·`daily_remaining` | `pending` 이 있으면 **그 번호 기준**, 없으면 등록된 번호 기준 |
 
 ## 주의사항
 - 미등록이면 `phone` 은 빈 문자열이고 `daily_remaining` 은 항상 최대치입니다
@@ -204,22 +212,47 @@ if (!s.phone_verified && s.reward.kind !== 'none') showPhonePopup(s.reward.days)
     )
     def get(self, request):
         user = request.user
+        now = timezone.now()
         from .phone import format_phone
 
+        # ── 진행 중인 인증 (새로고침·기기 전환 뒤 2단계를 서버 기준으로 되살린다) ──
+        # ⚠️ 프론트가 sessionStorage 로 마감 시각을 들고 있으면 **다른 탭·기기에서는
+        #    1단계부터** 다시 시작한다. 서버가 진실을 알고 있으니 서버가 준다.
+        pending = (
+            PhoneVerification.objects.filter(
+                user=user,
+                verified_at__isnull=True,
+                invalidated_at__isnull=True,
+                expires_at__gt=now,
+            )
+            .order_by("-created_at")
+            .first()
+        )
+        pending_block = None
+        if pending is not None:
+            pending_block = {
+                "phone_masked": mask_phone(pending.phone),
+                "expires_in": max(0, int((pending.expires_at - now).total_seconds())),
+                "attempts_left": max(0, phone_guard.max_attempts() - pending.attempts),
+            }
+
+        # ── 재발송 쿨다운·일일 잔여는 **그 번호 기준**이다 ──────────────────
+        # 지금 진행 중인 번호가 있으면 그 번호를, 없으면 등록된 번호를 본다.
+        target = pending.phone if pending is not None else user.phone
         resend_after = 0
         daily_remaining = phone_guard.max_per_phone_per_day()
-        if user.phone:
+        if target:
             last = (
-                PhoneVerification.objects.filter(phone=user.phone)
+                PhoneVerification.objects.filter(phone=target)
                 .order_by("-created_at")
                 .only("created_at")
                 .first()
             )
             if last is not None:
-                elapsed = (timezone.now() - last.created_at).total_seconds()
+                elapsed = (now - last.created_at).total_seconds()
                 resend_after = max(0, int(phone_guard.resend_cooldown_seconds() - elapsed + 0.999))
             sent_today = PhoneVerification.objects.filter(
-                phone=user.phone, created_at__gte=phone_guard._today_start()
+                phone=target, created_at__gte=phone_guard._today_start()
             ).count()
             daily_remaining = max(0, phone_guard.max_per_phone_per_day() - sent_today)
 
@@ -229,9 +262,15 @@ if (!s.phone_verified && s.reward.kind !== 'none') showPhonePopup(s.reward.days)
                 "phone_verified": user.phone_verified,
                 "phone_source": user.phone_source,
                 "required": phone_reward.phone_verification_required(user),
+                # 지금 [삭제]를 누르면 되는가. false 면 버튼을 비활성화하고
+                # "번호를 바꾸려면 새 번호로 다시 인증" 을 안내하세요(409 를 받아 보고
+                # 알 필요가 없도록).
+                "deletable": bool(user.phone) and phone_reward.is_legacy_user(user),
                 "sms_marketing_opt_in": user.sms_marketing_opt_in,
                 "resend_after": resend_after,
                 "daily_remaining": daily_remaining,
+                # 진행 중인 인증이 없으면 null. 있으면 2단계(코드 입력)를 그대로 복원한다.
+                "pending": pending_block,
                 "reward": phone_reward.preview(user).as_dict(),
             },
             status=status.HTTP_200_OK,
@@ -413,19 +452,19 @@ curl -X POST https://api.turnflow.link/api/v1/auth/me/phone/ \\
         ttl = phone_guard.code_ttl_seconds()
         now = timezone.now()
 
-        with transaction.atomic():
-            # 직전 코드를 죽인다 — 살려 두면 두 코드가 동시에 유효해져 시도 횟수 제한이
-            # 사실상 2배가 되고, "방금 받은 코드가 안 먹네" 혼선도 생긴다.
-            PhoneVerification.objects.filter(
-                user=user, verified_at__isnull=True, invalidated_at__isnull=True
-            ).update(invalidated_at=now)
-            row = PhoneVerification.objects.create(
-                user=user,
-                phone=phone,
-                code_hash=hash_code(phone, code),
-                expires_at=now + timezone.timedelta(seconds=ttl),
-                request_ip=ip,
-            )
+        # ⚠️ **직전 코드는 발송이 성공한 뒤에 죽인다.** 먼저 죽이면 발송이 실패했을 때
+        #    살아있는 코드가 하나도 남지 않아, 사용자는 이미 문자로 받아 둔 코드를
+        #    입력해도 NO_PENDING_PHONE_VERIFICATION 을 받는다("다시 받기"가 실패하면
+        #    앞 코드라도 쓸 수 있어야 한다 — 프론트 계약).
+        #    그 사이 두 행이 잠깐 같이 살아 있지만, verify 는 **가장 최근 1건**만 보므로
+        #    시도 횟수가 2배가 되지는 않는다.
+        row = PhoneVerification.objects.create(
+            user=user,
+            phone=phone,
+            code_hash=hash_code(phone, code),
+            expires_at=now + timezone.timedelta(seconds=ttl),
+            request_ip=ip,
+        )
 
         try:
             send_and_log(
@@ -436,7 +475,7 @@ curl -X POST https://api.turnflow.link/api/v1/auth/me/phone/ \\
                 request_ip=ip,
             )
         except SmsProviderError as exc:
-            # 발송에 실패했으면 그 행은 쓸 수 없다 — 살려 두면 쿨다운만 잡아먹는다.
+            # 이 행은 못 쓴다 — 살려 두면 쿨다운만 잡아먹는다. **직전 행은 건드리지 않는다.**
             PhoneVerification.objects.filter(pk=row.pk).update(invalidated_at=timezone.now())
             http_status = {
                 "SMS_UNAVAILABLE": status.HTTP_502_BAD_GATEWAY,
@@ -445,6 +484,12 @@ curl -X POST https://api.turnflow.link/api/v1/auth/me/phone/ \\
                 "SMS_CAPACITY_EXCEEDED": status.HTTP_503_SERVICE_UNAVAILABLE,
             }.get(exc.code, status.HTTP_400_BAD_REQUEST)
             return _error(exc.message, exc.code, http_status)
+
+        # 발송이 성공했으니 이제 직전 코드를 죽인다 — 두 코드가 계속 유효하면
+        # "방금 받은 코드가 안 먹네" 혼선이 생긴다.
+        PhoneVerification.objects.filter(
+            user=user, verified_at__isnull=True, invalidated_at__isnull=True
+        ).exclude(pk=row.pk).update(invalidated_at=timezone.now())
 
         phone_guard.note_sent(ip=ip)
 
