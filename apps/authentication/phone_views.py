@@ -32,7 +32,7 @@ from drf_spectacular.utils import OpenApiExample, OpenApiResponse, extend_schema
 from rest_framework import serializers, status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.throttling import ScopedRateThrottle
+from rest_framework.throttling import ScopedRateThrottle, UserRateThrottle
 from rest_framework.views import APIView
 
 from apps.billing import phone_reward
@@ -119,12 +119,47 @@ class PhoneVerifySerializer(serializers.Serializer):
 # ──────────────────────────────────────────────
 
 
+class PhoneStatusThrottle(UserRateThrottle):
+    """상태 조회(GET) 전용 스로틀 — 사용자별, 넉넉하게.
+
+    ⚠️ **발송 스로틀(`phone_send`)을 조회에 쓰면 안 된다.** 조회는 문자를 보내지 않아
+    비용이 0 인데, `phone_send` 는 **문자 비용**을 막으려고 `5/hour` 로 조여 둔 값이다.
+    """
+
+    scope = "phone_status"
+
+
 class PhoneSendCodeView(APIView):
-    """인증번호 발송 + 등록된 번호 삭제."""
+    """인증번호 발송 + 등록된 번호 삭제 + 상태 조회."""
 
     permission_classes = [IsAuthenticated]
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "phone_send"
+
+    def get_throttles(self):
+        """GET(상태 조회)만 발송 스로틀에서 뺀다.
+
+        사고 (2026-10-13 프론트 보고)
+        ─────────────────────────────────────────────────────────────
+        DRF 의 ``throttle_classes`` 는 **뷰 전체**에 걸린다. 이 뷰 하나에 get/post/delete 가
+        같이 있어서 **조회가 발송 한도(`5/hour`)를 깎고 있었다.**
+
+        · 문자를 한 번도 보낸 적 없는 dev 더미 계정이 ``GET`` 두 번째에 **429** 를 받았다.
+        · 프론트는 이 조회를 **화면이 열릴 때 1회**씩만 부른다(설정·혜택 팝업·본인확인 창).
+          즉 **설정 화면을 한 시간에 다섯 번 열면 그 뒤로 막힌다** — 운영도 같은 값이다.
+        · 바로 위 GET 의 API 문서가 *"부작용이 없고 문자를 보내지 않으므로 팝업/배너를
+          띄울지 판단할 때 **자유롭게 호출하세요**"* 라고 약속하고 있었다. 문서와 구현이
+          정반대였고, 프론트는 문서대로 쓰다 걸렸다.
+
+        막혔을 때 **화면이 깨지지는 않지만**(프론트가 ``/auth/me`` 값으로 그린다) 삭제 불가
+        안내(``deletable``)·혜택 문구·진행 중인 인증번호 되살리기가 **조용히 빠진다** —
+        그래서 더 늦게 발견된다.
+
+        ⚠️ POST(발송)·``verify``(확인)의 제한은 **그대로 둔다.** 그쪽이 돈이 나가는 경로다.
+        """
+        if self.request.method == "GET":
+            return [PhoneStatusThrottle()]
+        return super().get_throttles()
 
     @extend_schema(
         tags=["authentication"],

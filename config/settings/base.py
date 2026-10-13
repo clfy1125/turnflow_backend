@@ -291,6 +291,11 @@ REST_FRAMEWORK = {
         # 6자리 무차별 대입 방어. 시도 5회 제한(PhoneVerification.attempts)과 **별개**다 —
         # 스로틀은 요청 속도를, 시도 횟수는 총량을 막는다. 둘 다 있어야 느린 대입도 막힌다.
         "phone_verify": config("THROTTLE_PHONE_VERIFY", default="10/min"),
+        # 상태 조회(GET /auth/me/phone/) — **문자 비용이 0 이므로 발송 한도와 분리한다.**
+        # ⚠️ 종전엔 이 GET 이 같은 뷰의 `phone_send`(5/hour) 를 깎아서, 문자를 한 번도
+        #    보낸 적 없는 계정이 **설정 화면을 다섯 번 열면 429** 였다(2026-10-13 프론트 보고).
+        #    프론트는 화면이 열릴 때 1회씩만 부른다 — 폴링이 아니다.
+        "phone_status": config("THROTTLE_PHONE_STATUS", default="60/min"),
         "email_send": config("THROTTLE_EMAIL_SEND", default="5/hour"),
         # 이메일 등록 신청(POST /auth/me/email/) — **임의 주소로 메일을 보내는 경로**라
         # 메일 폭격 벡터다. 인증메일 재발송과 같은 급으로 조인다(사용자 기준).
