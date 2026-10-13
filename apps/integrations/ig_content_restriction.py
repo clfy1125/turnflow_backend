@@ -127,7 +127,13 @@ RUNTIME_WINDOW = timedelta(hours=24)
 #    웹훅 2,998건을 정상 수신하다 중간에 끊겼다(제한 시각이 거기서 특정된다).
 #    그래서 ① 처음부터 0건 ② 오다가 끊김 두 모양을 **모두** 본다.
 
-#: ① 웹훅이 한 건도 없는데 폴러가 이만큼 주웠으면 침묵으로 본다.
+#: 최근 창(``SILENCE_ACTIVITY_WINDOW``) 안에서 폴러가 이만큼 주웠어야 '침묵'이다.
+#:
+#: ⚠️ **총 누적이 아니라 '최근 창 안'이어야 한다(2026-10-13 운영 수정).** 처음엔 누적으로
+#:    셌는데, 전 서비스는 평소에도 시간당 100~170건의 웹훅을 흘린다(그래서 1시간 폴러가
+#:    있는 것이다). 그 한두 건이 찍힌 **한산한 게시물**까지 침묵으로 잡혀 빠른 레인 대상이
+#:    12 → 36 → 60 으로 계속 불어났다. 실제 사례: ``wh=1 poll=1`` 인데 마지막 웹훅이
+#:    사흘 전 — 그건 웹훅이 끊긴 게 아니라 **그동안 댓글이 없었던 것**이다.
 SILENCE_MIN_POLL_ONLY = 5
 #: ② 마지막 웹훅 이후 이만큼 지났는데 그 뒤로 폴러만 댓글을 줍고 있으면 침묵으로 본다.
 #:    짧게 잡으면 한산한 게시물(댓글이 원래 드문 것)이 전부 침묵으로 잡힌다.
@@ -141,27 +147,33 @@ WEBHOOK_SILENT_DELAY_MINUTES = 60
 def is_webhook_silent(
     *,
     n_webhook: int,
-    n_poll: int,
+    n_poll_recent: int,
     last_webhook_at,
     last_poll_at,
     now=None,
 ) -> bool:
     """이 게시물의 댓글 웹훅이 끊겼는가 — **판정 단일 소스** (외부 호출 0).
 
-    두 모양을 모두 본다:
-      ① ``n_webhook == 0`` 인데 폴러가 ``SILENCE_MIN_POLL_ONLY`` 건 이상 주움 (태어날 때부터 침묵)
-      ② 마지막 웹훅 이후 ``SILENCE_AFTER`` 넘게 지났고 그 뒤로 폴링 유입이 있음 (오다가 끊김)
+    ``n_poll_recent`` = **최근 ``SILENCE_ACTIVITY_WINDOW`` 안에** 폴러로 들어온 댓글 수.
+    누적이 아니다(위 ``SILENCE_MIN_POLL_ONLY`` 주석의 사고 참고).
 
-    둘 다 **최근 활동**(``SILENCE_ACTIVITY_WINDOW`` 안의 폴링 유입)이 전제다. 활동이 멈춘
-    게시물을 침묵이라 불러봐야 할 일이 없다.
+    통과하려면 세 가지가 모두 성립해야 한다:
+      0) 최근 활동이 있다 — 멈춘 게시물을 침묵이라 불러봐야 할 일이 없다
+      1) 그 창 안에서 폴러가 ``SILENCE_MIN_POLL_ONLY`` 건 이상 주웠다
+         (한두 건은 평소의 웹훅 유실이지 침묵이 아니다)
+      2) 그리고 둘 중 하나 —
+         ① 웹훅이 한 건도 없다 (태어날 때부터 침묵)
+         ② 마지막 웹훅이 마지막 폴링보다 ``SILENCE_AFTER`` 넘게 앞선다 (오다가 끊김)
     """
     now = now or timezone.now()
     if not last_poll_at:
         return False
     if (now - last_poll_at) > SILENCE_ACTIVITY_WINDOW:
         return False
+    if n_poll_recent < SILENCE_MIN_POLL_ONLY:
+        return False
     if not n_webhook:
-        return n_poll >= SILENCE_MIN_POLL_ONLY
+        return True
     if not last_webhook_at:
         return False
     return (last_poll_at - last_webhook_at) > SILENCE_AFTER
@@ -310,6 +322,8 @@ def check_runtime(media_id: str, *, window: timedelta = RUNTIME_WINDOW) -> Restr
     )
     polls = seen.filter(source=SeenComment.Source.POLL)
     n_poll = polls.count()
+    # ⚠️ 침묵 판정에 쓰는 건 **최근 창 안의** 폴링 유입이다(누적이 아니다).
+    n_poll_recent = polls.filter(created_at__gte=timezone.now() - SILENCE_ACTIVITY_WINDOW).count()
     last_poll = polls.order_by("-created_at").values_list("created_at", flat=True).first()
     # 마지막 웹훅 이후 폴러로만 들어온 건수 (웹훅 침묵의 크기)
     poll_after = polls
@@ -322,7 +336,7 @@ def check_runtime(media_id: str, *, window: timedelta = RUNTIME_WINDOW) -> Restr
     #   잘 나가는 캠페인이 '의심'으로 찍히고 스위퍼가 정지시킨다. 플래그만 세운다.
     v.webhook_silent = is_webhook_silent(
         n_webhook=n_webhook,
-        n_poll=n_poll,
+        n_poll_recent=n_poll_recent,
         last_webhook_at=last_webhook,
         last_poll_at=last_poll,
     )
@@ -333,6 +347,7 @@ def check_runtime(media_id: str, *, window: timedelta = RUNTIME_WINDOW) -> Restr
         "webhook_comments_total": n_webhook,
         "last_webhook_at": last_webhook.isoformat() if last_webhook else None,
         "poll_comments_total": n_poll,
+        "poll_comments_recent": n_poll_recent,
         "last_poll_at": last_poll.isoformat() if last_poll else None,
         "poll_only_comments_after_last_webhook": n_poll_after,
         "webhook_silent": v.webhook_silent,

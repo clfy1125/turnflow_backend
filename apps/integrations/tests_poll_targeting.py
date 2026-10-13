@@ -106,7 +106,7 @@ class TestWebhookSilenceSignal:
 
         now = timezone.now()
         assert is_webhook_silent(
-            n_webhook=0, n_poll=50, last_webhook_at=None, last_poll_at=now, now=now
+            n_webhook=0, n_poll_recent=50, last_webhook_at=None, last_poll_at=now, now=now
         )
 
     def test_born_silent_needs_enough_polls(self):
@@ -115,7 +115,7 @@ class TestWebhookSilenceSignal:
 
         now = timezone.now()
         assert not is_webhook_silent(
-            n_webhook=0, n_poll=1, last_webhook_at=None, last_poll_at=now, now=now
+            n_webhook=0, n_poll_recent=1, last_webhook_at=None, last_poll_at=now, now=now
         )
 
     def test_went_silent_midway(self):
@@ -129,7 +129,7 @@ class TestWebhookSilenceSignal:
         now = timezone.now()
         assert is_webhook_silent(
             n_webhook=2998,
-            n_poll=722,
+            n_poll_recent=722,
             last_webhook_at=now - timedelta(hours=9),
             last_poll_at=now - timedelta(minutes=2),
             now=now,
@@ -141,8 +141,40 @@ class TestWebhookSilenceSignal:
         now = timezone.now()
         assert not is_webhook_silent(
             n_webhook=500,
-            n_poll=3,
+            n_poll_recent=3,
             last_webhook_at=now - timedelta(minutes=1),
+            last_poll_at=now - timedelta(minutes=2),
+            now=now,
+        )
+
+    def test_sparse_media_is_not_silent(self):
+        """★ 운영 오탐 회귀 — 댓글이 드문 게시물을 침묵으로 세면 안 된다.
+
+        2026-10-13 배포 직후 실제로 났다: ``wh=1 poll=1`` 인데 마지막 웹훅이 사흘 전인
+        게시물들이 줄줄이 빠른 레인에 끌려와 대상이 12 → 36 → 60 으로 불어났다.
+        그건 웹훅이 끊긴 게 아니라 **그동안 댓글이 없었던 것**이고, 폴링 1건은 전 서비스가
+        평소에도 시간당 100~170건씩 겪는 웹훅 유실이다.
+        """
+        from apps.integrations.ig_content_restriction import is_webhook_silent
+
+        now = timezone.now()
+        assert not is_webhook_silent(
+            n_webhook=1,
+            n_poll_recent=1,
+            last_webhook_at=now - timedelta(days=3),
+            last_poll_at=now - timedelta(minutes=10),
+            now=now,
+        )
+
+    def test_busy_media_that_went_silent_is_still_caught(self):
+        """조여도 **진짜 침묵**은 그대로 잡힌다 (prod 18019915838941500 모양)."""
+        from apps.integrations.ig_content_restriction import is_webhook_silent
+
+        now = timezone.now()
+        assert is_webhook_silent(
+            n_webhook=2998,
+            n_poll_recent=40,
+            last_webhook_at=now - timedelta(hours=9),
             last_poll_at=now - timedelta(minutes=2),
             now=now,
         )
@@ -154,7 +186,7 @@ class TestWebhookSilenceSignal:
         now = timezone.now()
         assert not is_webhook_silent(
             n_webhook=0,
-            n_poll=500,
+            n_poll_recent=500,
             last_webhook_at=None,
             last_poll_at=now - timedelta(days=3),
             now=now,

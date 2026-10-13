@@ -3580,12 +3580,21 @@ def _poll_ledger_digest() -> dict | None:
     try:
         from django.db.models import Max
 
+        from .ig_content_restriction import SILENCE_ACTIVITY_WINDOW
+
+        # ⚠️ ``n_poll_recent`` 는 **최근 창 안의** 폴링 유입이다. 누적으로 세면 평소의
+        #    웹훅 유실(전 서비스 시간당 100~170건)이 찍힌 한산한 게시물까지 '침묵'이 된다.
+        recent_cutoff = timezone.now() - SILENCE_ACTIVITY_WINDOW
         rows = (
             SeenComment.objects.exclude(media_id="")
             .values("media_id")
             .annotate(
                 n_webhook=Count("id", filter=Q(source=SeenComment.Source.WEBHOOK)),
                 n_poll=Count("id", filter=Q(source=SeenComment.Source.POLL)),
+                n_poll_recent=Count(
+                    "id",
+                    filter=Q(source=SeenComment.Source.POLL, created_at__gte=recent_cutoff),
+                ),
                 last_webhook=Max("created_at", filter=Q(source=SeenComment.Source.WEBHOOK)),
                 last_poll=Max("created_at", filter=Q(source=SeenComment.Source.POLL)),
                 last_any=Max("created_at"),
@@ -3649,7 +3658,7 @@ def _select_poll_targets(now) -> tuple[list[tuple], dict]:
         silent = (
             is_webhook_silent(
                 n_webhook=d["n_webhook"],
-                n_poll=d["n_poll"],
+                n_poll_recent=d["n_poll_recent"],
                 last_webhook_at=d["last_webhook"],
                 last_poll_at=d["last_poll"],
                 now=now,
@@ -3890,7 +3899,7 @@ def _select_silent_targets(now) -> tuple[list[tuple], dict]:
         #    여기서 조이면 "태어날 때부터 제한된 게시물"을 놓치는데 그게 제일 아픈 케이스다.
         if not is_webhook_silent(
             n_webhook=d["n_webhook"],
-            n_poll=d["n_poll"],
+            n_poll_recent=d["n_poll_recent"],
             last_webhook_at=d["last_webhook"],
             last_poll_at=last_poll,
             now=now,
