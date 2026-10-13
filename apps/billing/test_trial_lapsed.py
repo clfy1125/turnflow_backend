@@ -149,3 +149,52 @@ class TestBatchAndUserAgreeEitherOrder:
         sub.refresh_from_db()
         assert sub.status == SubscriptionStatus.TRIALING
         assert sub.plan.name == "pro"
+
+
+@pytest.mark.django_db
+class TestTrialLastDayIsSingleSourced:
+    """``trial_last_day`` 는 **종료일 당일**이고, 계산이 한 곳에만 있어야 한다.
+
+    2026-10-13 제품 결정으로 ``−1일`` 에서 바뀌었다. 자동 체험 종료는 `지급시각 + 30일`
+    이라 날짜 경계가 아니어서, ``−1일`` 은 "마지막 이용일" 을 실제보다 하루 당겨 고지했고
+    화면이 "무료로 바뀌었다" 고 말한 뒤에도 서버가 그날 낮까지 프로를 줬다.
+
+    종전엔 같은 식이 **세 곳**(구독 프로퍼티·preview·휴대폰 보상)에 복제돼 있었다 —
+    하나만 고치면 같은 사람에게 서로 다른 날짜가 보인다.
+    """
+
+    def test_helper_returns_the_end_date_itself(self):
+        from apps.billing.models import trial_last_day_for
+
+        # UTC 05:06 = KST 14:06 — 날짜 경계가 아닌 시각이라야 −1일 회귀가 잡힌다
+        end = timezone.now().replace(hour=5, minute=6)
+        assert trial_last_day_for(end) == timezone.localdate(end)
+
+    def test_helper_handles_none(self):
+        from apps.billing.models import trial_last_day_for
+
+        assert trial_last_day_for(None) is None
+
+    def test_subscription_property_matches_helper(self):
+        from apps.billing.models import trial_last_day_for
+
+        _, sub = _trial(ends_in=timedelta(days=5))
+        assert sub.trial_last_day == trial_last_day_for(sub.current_period_end)
+
+    def test_property_is_none_when_not_trialing(self):
+        _, sub = _trial(ends_in=timedelta(days=5))
+        sub.status = SubscriptionStatus.ACTIVE
+        sub.save(update_fields=["status"])
+        assert sub.trial_last_day is None
+
+    def test_preview_and_subscription_agree(self):
+        """견적과 구독 응답이 갈리면 같은 사람에게 다른 날짜가 보인다."""
+        user, sub = _trial(ends_in=timedelta(days=5))
+        d = preview_subscription(user, plan_name="pro")
+        assert d["trial_last_day"] == sub.trial_last_day
+
+    def test_phone_reward_agrees(self):
+        from apps.billing import phone_reward
+
+        _, sub = _trial(ends_in=timedelta(days=5))
+        assert phone_reward._last_day(sub.current_period_end) == sub.trial_last_day

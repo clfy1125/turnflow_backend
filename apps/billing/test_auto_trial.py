@@ -65,13 +65,18 @@ class TestAutoTrialGrant:
         # 결제는 일어나지 않는다
         assert not PaymentHistory.objects.filter(user=user).exists()
 
-    def test_trial_last_day_is_day_before_charge(self, client, user):
-        """표기값 — `current_period_end` 를 날짜로 찍으면 하루 더 써도 되는 것처럼 보인다."""
+    def test_trial_last_day_is_the_end_date_itself(self, client, user):
+        """표기값 = **종료일 당일**(2026-10-13 제품 결정으로 `−1일` 에서 바뀜).
+
+        자동 체험 종료는 `지급시각 + 30일` 이라 날짜 경계가 아니다. `−1일` 로 고지하면
+        화면이 "무료로 바뀌었다" 고 말한 뒤에도 서버는 그날 낮까지 프로를 그대로 줬다
+        (최대 24시간 어긋남). 아무것도 회수하지 않고 표기만 사실에 맞춘다.
+        """
         res = client.post(reverse("billing:trial-auto-grant"), {}, format="json")
         sub = user.subscription
         sub.refresh_from_db()
 
-        expected = timezone.localdate(sub.current_period_end) - timedelta(days=1)
+        expected = timezone.localdate(sub.current_period_end)
         assert sub.trial_last_day == expected
         assert res.json()["subscription"]["trial_last_day"] == str(expected)
 

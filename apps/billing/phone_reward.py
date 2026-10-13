@@ -93,11 +93,12 @@ class RewardResult:
 def _last_day(moment):
     """만료 시각 → 사용자에게 보여줄 **마지막 이용일**(KST 날짜). 없으면 None.
 
-    ⚠️ 정의는 ``UserSubscription.trial_last_day`` 와 **같아야 한다.** 같은 사람이 보는
-       구독 화면과 보상 완료 화면이 하루 어긋나면 그게 곧 허위 고지다. 바꿀 일이 생기면
-       **두 곳을 같이** 고칠 것(거기 docstring 에 이유가 적혀 있다).
+    계산은 ``models.trial_last_day_for`` 하나뿐이다 — 종전엔 같은 식이 여기에도 복제돼
+    있었고, 그러면 구독 화면과 보상 완료 화면이 하루 어긋날 수 있다(= 허위 고지).
     """
-    return None if moment is None else timezone.localdate(moment) - timedelta(days=1)
+    from .models import trial_last_day_for
+
+    return trial_last_day_for(moment)
 
 
 def is_enabled() -> bool:

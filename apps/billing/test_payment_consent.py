@@ -134,10 +134,8 @@ class TestSubscriptionPreview:
         expected = before + timedelta(days=30)
         assert abs((_dt(d["first_charge_at"]) - expected).total_seconds()) < 10
         assert d["trial_ends_at"] == d["first_charge_at"]
-        # 체험 마지막 이용일 = 첫 결제일 − 1일
-        assert _d(d["trial_last_day"]) == timezone.localdate(_dt(d["first_charge_at"])) - timedelta(
-            days=1
-        )
+        # 체험 마지막 이용일 = 첫 결제일 **당일** (2026-10-13 제품 결정)
+        assert _d(d["trial_last_day"]) == timezone.localdate(_dt(d["first_charge_at"]))
         assert d["first_charge_amount"] == d["recurring_amount"]
         assert (_dt(d["next_renewal_at"]) - _dt(d["first_charge_at"])).days == PERIOD_DAYS
 

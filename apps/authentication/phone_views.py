@@ -147,10 +147,9 @@ class PhoneSendCodeView(APIView):
   실제 지급 결과로 돌아옵니다. 두 값은 같은 판정 함수를 쓰므로 어긋나지 않습니다.
 - ⭐ **화면에 날짜를 찍을 때는 `trial_last_day_before` / `trial_last_day_after`(KST 날짜)를
   쓰세요.** "체험 마지막 날 11월 8일 → 11월 15일" 이 그대로 그려집니다.
-  ⚠️ `trial_ends_at` 은 **만료가 일어나는 시각 그 자체**라 날짜로 찍으면 하루 더 써도 되는
-  것처럼 보입니다. 프론트에서 `−1일` 로 역산하지 마세요 — UTC 자정 근처에서 하루가
-  틀어지는데 그 숫자가 곧 고지 문구입니다(같은 이유로 `UserSubscription.trial_last_day`
-  를 서버로 올린 전례가 있습니다).
+  ⚠️ 프론트에서 `trial_ends_at` 에 날짜를 더하거나 빼지 마세요 — UTC 자정 근처에서
+  하루가 틀어지는데 그 숫자가 곧 고지 문구입니다. 이 값들은 `UserSubscription.trial_last_day`
+  와 **같은 계산**(models.trial_last_day_for)을 씁니다. `trial_last_day` 는 **종료일 당일**(KST)입니다 — `trial_ends_at` 의 날짜 그대로. 2026-10-13 제품 결정으로 `−1일` 에서 바뀌었습니다.
   · `trial_granted` = 체험이 **없던** 사람이라 `before` 가 `null` (화살표 없이 한 날짜만)
   · `paid_extended` = 체험이 아니라 **둘 다 `null`** → 그쪽은 `trial_ends_at`(다음 결제일)
 - `reward.kind === "none"` 이면 보상 문구를 **숨기세요**. 있지도 않은 혜택을

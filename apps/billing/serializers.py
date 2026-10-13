@@ -141,10 +141,10 @@ class UserSubscriptionSerializer(serializers.ModelSerializer):
         read_only=True,
         allow_null=True,
         help_text=(
-            "체험 **마지막 이용일**(KST 날짜). 체험 중이 아니면 null. "
-            "화면 문구('…까지 무료')는 이 값을 쓴다 — current_period_end 를 날짜로 찍으면 "
-            "결제가 일어나는 날까지 포함돼 하루 더 써도 되는 것처럼 보인다. "
-            "결제 전 견적(POST /billing/subscription/preview/)의 trial_last_day 와 같은 정의"
+            "체험 **마지막 이용일**(KST 날짜) = trial_ends_at 의 날짜 **그대로**. "
+            "체험 중이 아니면 null. 화면 문구('…까지 무료')는 이 값을 쓰고 프론트에서 "
+            "날짜를 더하거나 빼지 말 것(2026-10-13 제품 결정으로 '−1일' 에서 바뀌었다). "
+            "결제 전 견적(GET /billing/subscription/preview/)의 trial_last_day 와 같은 정의"
         ),
     )
 
@@ -584,8 +584,8 @@ class SubscriptionPreviewSerializer(serializers.Serializer):
     )
     trial_last_day = serializers.DateField(
         allow_null=True,
-        help_text="체험 **마지막 이용일** (= 첫 결제일 − 1일, KST). "
-        "고지 문구의 '~까지 무료' 에 쓰는 값",
+        help_text="체험 **마지막 이용일** (= 첫 결제일 **당일**, KST). "
+        "고지 문구의 '~까지 무료' 에 쓰는 값. 2026-10-13 제품 결정으로 '−1일' 에서 바뀌었다",
     )
     first_charge_at = serializers.DateTimeField(
         allow_null=True, help_text="첫 결제 시각 (= 유료 전환 시점). charge_now 면 지금"

@@ -373,8 +373,8 @@ class RedeemReferralCodeView(APIView):
 ## 주의사항
 - 체험이 **끝난 뒤**에는 쓸 수 없습니다(400). 만료 전에 입력해야 합니다.
 - 코드는 1인 1회입니다. 두 번째 코드는 400.
-- 연장 후 표기는 `GET /billing/my-subscription/` 의 `trial_last_day` 를 쓰세요
-  (`trial_ends_at` 을 날짜로 찍으면 하루 더 써도 되는 것처럼 보입니다).
+- 연장 후 표기는 `GET /billing/my-subscription/` 의 `trial_last_day` 를 쓰세요.
+  `trial_last_day` 는 **종료일 당일**(KST)입니다 — `trial_ends_at` 의 날짜 그대로. 2026-10-13 제품 결정으로 `−1일` 에서 바뀌었습니다.
 
 ## 사용 예시
 ```bash

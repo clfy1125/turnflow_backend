@@ -276,6 +276,30 @@ def generate_customer_key() -> str:
     return f"tf_{uuid.uuid4().hex}"
 
 
+def trial_last_day_for(period_end):
+    """체험 종료 시각 → 사용자에게 보여줄 **마지막 이용일**(KST 날짜). **판정 단일 소스.**
+
+    ⭐ 2026-10-13 제품 결정(사장님)으로 **종료일 당일**이 됐다. 종전에는 ``−1일`` 이었다.
+
+    바꾼 이유: 자동 체험의 종료 시각은 ``지급시각 + 30일`` 이라 **날짜 경계가 아니다.**
+    9/14 14:06 에 지급되면 종료는 10/14 **14:06** 인데, ``−1일`` 규칙은 "마지막 이용일
+    10/13" 으로 고지했다. 그래서 화면이 "무료로 바뀌었다" 고 말한 뒤에도 서버는 10/14
+    14:22(만료 배치)까지 프로를 그대로 줬다 — **고지와 실제가 최대 24시간 어긋났다**
+    (2026-10-13 프론트 제보).
+
+    선택지는 셋이었다. ① 그대로 ② 마지막 이용일 다음 날 0시에 강등(= 이미 준 프로를
+    최대 24시간 **회수**) ③ 문구를 사실에 맞춤. ③ 을 골랐다 — 사용자에게서 아무것도
+    빼앗지 않고 표기만 진실에 맞춘다.
+
+    ⚠️ 이 값은 결제 전 고지 문구("…까지 무료")로 그대로 나간다. 바꾸려면 제품·법무
+       결정이 먼저다. 그리고 **여기 한 곳만** 고칠 것 — 종전엔 같은 식이 세 군데
+       (이 프로퍼티·preview·휴대폰 보상)에 복제돼 있었다.
+    """
+    if period_end is None:
+        return None
+    return timezone.localdate(period_end)
+
+
 class UserSubscription(models.Model):
     """
     User 1:1 구독 정보.
@@ -627,19 +651,11 @@ class UserSubscription(models.Model):
     def trial_last_day(self):
         """체험 **마지막 이용일** (KST 날짜). 체험 중이 아니면 None.
 
-        ⭐ ``current_period_end``(=``trial_ends_at``)는 **결제/만료가 일어나는 시각 그 자체**라
-           날짜로 찍으면 하루 더 써도 되는 것처럼 보인다. 사용자에게 보여줄 "…까지 무료"는
-           그 전날이다. 프론트가 ``trial_ends_at − 1일`` 로 역산하던 것을 서버로 올린다 —
-           역산은 타임존이 어긋나는 순간(UTC 자정 근처) 하루가 틀어지고, 그 숫자가 곧
-           **고지 문구**라서 틀리면 허위 고지가 된다.
-
-        ⚠️ 정의는 ``toss_flows.preview_subscription`` 의 ``trial_last_day`` 와 **같아야**
-           한다(카드 체험은 preview, 카드 없는 체험은 이 프로퍼티를 읽으므로 두 화면이
-           갈리면 같은 사람에게 다른 날짜가 보인다).
+        계산은 :func:`trial_last_day_for` 하나에만 있다 — 복제하지 말 것.
         """
-        if self.status != SubscriptionStatus.TRIALING or self.current_period_end is None:
+        if self.status != SubscriptionStatus.TRIALING:
             return None
-        return timezone.localdate(self.current_period_end) - timedelta(days=1)
+        return trial_last_day_for(self.current_period_end)
 
     @property
     def conversion_consent_required(self) -> bool:

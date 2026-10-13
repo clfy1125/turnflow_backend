@@ -419,10 +419,8 @@ class TestReward:
         # ⭐ 화면에 글자로 찍는 날짜는 서버가 준다 — 프론트가 `trial_ends_at − 1일` 로
         #    역산하면 UTC 자정 근처에서 하루가 틀어지고 그 숫자가 곧 고지 문구가 된다.
         reward = res.data["reward"]
-        assert reward["trial_last_day_before"] == str(timezone.localdate(ends) - timedelta(days=1))
-        assert reward["trial_last_day_after"] == str(
-            timezone.localdate(sub.current_period_end) - timedelta(days=1)
-        )
+        assert reward["trial_last_day_before"] == str(timezone.localdate(ends))
+        assert reward["trial_last_day_after"] == str(timezone.localdate(sub.current_period_end))
         # 두 날짜의 간격이 보상 일수와 같아야 한다 (한쪽만 −1 하는 실수를 잡는다).
         before = date.fromisoformat(reward["trial_last_day_before"])
         after = date.fromisoformat(reward["trial_last_day_after"])

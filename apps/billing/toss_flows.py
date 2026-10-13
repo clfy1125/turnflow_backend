@@ -39,6 +39,7 @@ from .models import (
     TrialKind,
     UserSubscription,
     generate_customer_key,
+    trial_last_day_for,
 )
 from .subscription_utils import ensure_subscription
 from .toss_service import TossBillingClient, TossError, TossNetworkError
@@ -731,11 +732,9 @@ def preview_subscription(
         is_trial = False
 
     next_renewal_at = first_charge_at + timedelta(days=PERIOD_DAYS) if first_charge_at else None
-    # 체험 '마지막 이용일' = 첫 결제일의 전날 (표기용). trial_ends_at 은 결제가 일어나는
-    # 시각 그 자체라 날짜로 찍으면 하루 더 써도 되는 것처럼 보인다.
-    trial_last_day = None
-    if trial_ends is not None:
-        trial_last_day = timezone.localdate(trial_ends) - timedelta(days=1)
+    # 체험 '마지막 이용일' — 계산은 models.trial_last_day_for 하나뿐이다(복제 금지).
+    # 견적과 구독 응답이 갈리면 같은 사람에게 서로 다른 날짜가 보인다.
+    trial_last_day = trial_last_day_for(trial_ends)
 
     return {
         "scenario": scenario,

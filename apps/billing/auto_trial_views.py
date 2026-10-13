@@ -108,8 +108,9 @@ class AutoTrialGrantView(APIView):
 `account_pending_deletion` · `plan_unavailable`(운영 사고).
 
 ## 주의사항
-- **표기는 `subscription.trial_last_day`(KST 날짜)를 쓰세요.** `current_period_end` 를
-  날짜로 찍으면 하루 더 써도 되는 것처럼 보입니다.
+- **표기는 `subscription.trial_last_day`(KST 날짜)를 쓰세요.** 프론트에서 날짜를
+  더하거나 빼지 마세요 — UTC 자정 근처에서 하루가 틀어지는데 그 숫자가 곧 고지 문구입니다.
+  `trial_last_day` 는 **종료일 당일**(KST)입니다 — `trial_ends_at` 의 날짜 그대로. 2026-10-13 제품 결정으로 `−1일` 에서 바뀌었습니다.
 - 이 엔드포인트는 결제를 일으키지 않으므로 결제 전 고지·동의(`POST /billing/consents/`)
   대상이 아닙니다. 동의는 나중에 **카드를 등록하는 시점**에 받습니다.
 - 멱등합니다. 네트워크 재시도로 두 번 호출돼도 기간이 60일이 되지 않습니다.
