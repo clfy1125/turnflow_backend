@@ -55,12 +55,14 @@ def h02(a: Account) -> str:
     # basic + 추가 1 → 허용량 2. 연결 2개가 모두 켜져 있어도 강제 팝업이 뜨지 않는다.
     # 결제 유예는 current_period_end + GRACE_PERIOD_DAYS(7) 이므로 cpe=now → 유예 7일 뒤.
     # ⚠️ next_billing_retry_at 은 **미래**여야 한다. 과거면 process_due_renewals(10분)가
-    #    실제로 과금을 재시도해 상태가 바뀐다.
+    #    가짜 빌링키로 실제 과금을 시도해 상태가 바뀌고 실패 메일까지 나간다.
+    #    ⚠️ 재시드 뒤 **며칠 지나면 과거가 된다** — +2일로 뒀다가 이틀 뒤 due 로 떨어진 적이
+    #    있다(2026-10-13). 유예(7일)보다 길게 둬서 시드가 방치돼도 안전하게 한다.
     a.subscription(
         "basic",
         status="past_due",
         current_period_end=a.now,
-        next_billing_retry_at=a.now + timedelta(days=2),
+        next_billing_retry_at=a.now + timedelta(days=25),
         monthly_amount_snapshot=4900,
         extra_ig_accounts=1,
         renewal_attempts=1,
@@ -437,7 +439,7 @@ def p07(a: Account) -> str:
         "pro",
         status="past_due",
         current_period_end=a.now,
-        next_billing_retry_at=a.now + timedelta(days=2),
+        next_billing_retry_at=a.now + timedelta(days=25),
         monthly_amount_snapshot=14900,
         renewal_attempts=1,
         last_billing_error="카드 한도 초과",
