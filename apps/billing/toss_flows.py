@@ -88,6 +88,35 @@ class ChargePendingError(BillingFlowError):
 # ──────────────────────────────────────────────
 
 
+def trial_window_open(sub, now=None) -> bool:
+    """체험 기간이 **아직 남아 있는가** — ``attach_only`` 로 갈 수 있는 조건. 판정 단일 소스.
+
+    ⚠️ ``status == TRIALING`` 만 보면 안 된다. 만료 배치(``handle_trial_expiry``, 1시간 주기)
+    가 돌기 전까지는 **기간이 끝난 뒤에도 status 가 TRIALING 으로 남아 있다.** 그 창(최대 1시간)
+    에서 카드를 등록하면 종전에는 ``attach_only`` 로 가서:
+
+      · ``first_charge_at`` 이 **과거 시각**으로 고지되고(= PaymentConsent 에 허위 고지가 박힌다)
+      · 화면은 "체험 종료 시 첫 결제가 진행됩니다" 라고 안내하는데
+      · ``process_due_renewals``(10분 주기)가 **즉시** 긁는다
+
+    기간이 끝난 무카드 체험은 **1시간 안에 어차피 free 로 내려간다** — 그때 카드를 등록하면
+    ``charge_now`` 가 된다. 그러니 지금도 같은 결론을 내는 것이 맞고, 배치가 먼저 돌든
+    사용자가 먼저 누르든 결과가 같아진다(레이스 무해).
+
+    빌링키가 **있는** 체험은 여기서 건드리지 않는다 — 그쪽 첫 과금은
+    ``process_due_renewals`` 가 소유하고 멱등 키로 중복을 막는다.
+    """
+    from .models import SubscriptionStatus
+
+    if sub is None or sub.status != SubscriptionStatus.TRIALING:
+        return False
+    if sub.has_billing_key:
+        return True  # 카드 체험 — 만료 처리는 갱신 파이프라인 소관
+    if sub.current_period_end is None:
+        return True  # 종료 시각이 없으면 아직 진행 중으로 본다(보수적)
+    return sub.current_period_end > (now or timezone.now())
+
+
 def get_current_selling_price(plan: SubscriptionPlan) -> int:
     """현재 판매가 — 구독 시작 시 스냅샷돼 그랜드파더링된다."""
     return plan.monthly_price
@@ -628,12 +657,22 @@ def preview_subscription(
     sub = UserSubscription.objects.select_related("plan").filter(user=user).first()
 
     # ── 시나리오 판정 (confirm_billing 과 동일한 순서·조건) ──
-    if sub is not None and sub.status == SubscriptionStatus.TRIALING:
+    # ⚠️ 기간이 끝난 무카드 체험은 **TRIALING 이어도 체험이 아니다**(trial_window_open 주석).
+    #    배치가 1시간 안에 free 로 내리므로, 아래 `is_paid_plan` 가드에도 걸리면 안 된다 —
+    #    걸리면 "이미 유료 구독 중입니다" 로 결제 자체가 막힌다.
+    trial_lapsed = (
+        sub is not None
+        and sub.status == SubscriptionStatus.TRIALING
+        and not trial_window_open(sub, now)
+    )
+    if trial_window_open(sub, now):
         if sub.plan_id != plan.id:
             raise BillingFlowError(
                 "트라이얼 중에는 플랜을 변경할 수 없습니다. 트라이얼 종료 후 변경해주세요."
             )
         scenario = "attach_only"
+    elif trial_lapsed:
+        scenario = "charge_now"
     elif sub is not None and sub.is_paid_plan and sub.plan.name != "admin":
         raise BillingFlowError(
             "이미 유료 구독 중입니다. 플랜 변경 견적은 POST /billing/change-plan/preview/, "
@@ -768,13 +807,17 @@ def confirm_billing(
         if not sub.is_paid_plan:
             raise BillingFlowError("구독할 플랜을 선택해주세요. (plan_name)")
         scenario = "card_change"
-    elif sub.status == SubscriptionStatus.TRIALING:
+    elif trial_window_open(sub):  # now 는 이 지점에선 아직 없다 — 헬퍼가 timezone.now() 를 쓴다
         # 트라이얼 중(무카드 레퍼럴 포함) — 같은 플랜 카드 등록만 허용, 기간 불변
         if sub.plan_id != new_plan.id:
             raise BillingFlowError(
                 "트라이얼 중에는 플랜을 변경할 수 없습니다. 트라이얼 종료 후 변경해주세요."
             )
         scenario = "attach_only"
+    elif sub.status == SubscriptionStatus.TRIALING:
+        # 기간이 끝난 무카드 체험 — 배치가 아직 안 돌았을 뿐이다(preview 와 같은 판정).
+        # attach_only 로 두면 과거 시각이 first_charge_at 으로 고지된다.
+        scenario = "charge_now"
     elif sub.is_paid_plan:
         raise BillingFlowError(
             "이미 유료 구독 중입니다. 플랜 변경은 change-plan API, "
