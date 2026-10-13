@@ -1,6 +1,6 @@
 # 휴대폰 본인확인 — 화면 문구 정정 요청 (⚠️ 배포 전 반영 필요)
 
-> **작성** 2026-10-13 · 백엔드 `89a33b5`
+> **작성** 2026-10-13 · 백엔드 `89a33b5` (+ Q1 필드 추가분)
 > **대상** `worktree-phone-verification` 브랜치로 작업 중인 화면 3종
 > **참고 문서**(필요할 때만) `PHONE_VERIFICATION_HANDOFF.md`(작업 지시서) ·
 > `PHONE_VERIFICATION_FRONTEND.md`(API 계약) ·
@@ -151,6 +151,7 @@
 | 모든 엔드포인트·요청/응답 필드 | 🟢 변경 없음 |
 | 에러 `code` 목록 · `retry_after` · `attempts_left` | 🟢 변경 없음 |
 | `reward.kind` 4종 + `days` + `trial_ends_at`(적용 **후** 값) | 🟢 변경 없음 |
+| `reward` 에 **필드 2개 추가** — `trial_last_day_before`/`after` | 🟡 **추가만** (기존 키 안 건드림, Q1) |
 | `pending` 블록(새로고침 복원) · `deletable` | 🟢 변경 없음 |
 | `sms_marketing_opt_in` 필드명·동작(변경 창에서 생략 시 유지) | 🟢 변경 없음 |
 | 킬스위치 2개(`phoneGate` · `phoneCollectPopup`) | 🟢 그대로 가세요 |
@@ -174,7 +175,7 @@
 
 | # | 질문 | 답 |
 |---|---|---|
-| **Q1** | `reward.trial_ends_at` 이 혜택 **적용 전**인지 **후**인지 | **적용 후**입니다. 프론트 해석이 정확합니다. ⚠️ 다만 **「마지막 날」을 −1일로 역산하지 마세요** — UTC 자정 근처에서 하루가 틀어지고 그 숫자가 곧 고지 문구가 됩니다. 서버에 `UserSubscription.trial_last_day`(KST 마지막 이용일)가 이미 있고 구독 조회 API 가 내려줍니다. 「11/13 → 11/20」을 그리시려면 **전/후 둘 다 서버 값**으로 받으세요 — 🟡 필요하시면 `reward` 에 `trial_last_day_before`/`after` 를 **추가하겠습니다. 요청만 주세요** |
+| **Q1** | `reward.trial_ends_at` 이 혜택 **적용 전**인지 **후**인지 | **적용 후**입니다 — 프론트 해석이 정확합니다. 그리고 「11/8 → 11/15」 완료 화면을 그리신다기에 **전/후 날짜를 서버가 내려주도록 넣었습니다**(요청 안 하셔도 되게): `reward.trial_last_day_before` · `reward.trial_last_day_after` — **KST 날짜 문자열** (`"2026-11-08"`), 그대로 찍으면 됩니다. ⚠️ **`trial_ends_at` 에서 `−1일` 로 역산하지 마세요** — 그 값은 만료가 일어나는 *시각 그 자체*라 UTC 자정 근처에서 하루가 틀어지고, 그 숫자가 곧 고지 문구가 됩니다 (같은 이유로 `UserSubscription.trial_last_day` 를 서버로 올린 전례가 있습니다). · `trial_granted` = 체험이 **없던** 사람이라 `before` 가 `null` → 화살표 없이 한 날짜만 · `paid_extended` = 체험이 아니라 **둘 다 `null`** → 그쪽은 `trial_ends_at`(다음 결제일)을 쓰세요 |
 | **Q2** | `paid_extended` 의 다음 결제일은 어느 필드로 | **`trial_ends_at` 같은 필드**입니다(필드를 나누면 `kind` 마다 다른 키를 읽어야 합니다). 유료 구독에서 그 값 = 다음 결제일. ℹ️ **단 `paid_extended` 는 현재 비활성**(`PHONE_REWARD_PAID_EXTEND_DAYS=0`) — 갱신일을 미루면 실매출이 이연돼 금액 결정이 필요합니다. 화면은 만들어 두시되 **테스트는 불가**합니다 |
 | **Q3** | `GET /auth/me/phone/` 에 남은 시간·보낸 번호 | **`pending` 블록 추가.** sessionStorage 버리셔도 됩니다. `{phone_masked, expires_in, attempts_left}` + `resend_after`(pending 있으면 **그 번호 기준**) + `daily_remaining`. `pending !== null` 이면 코드 입력 단계 복원 — **다른 탭·기기에서도** 됩니다 |
 | **Q5** | 발송 실패 뒤 앞 코드가 살아 있는지 | **고치기 전에는 안 살아 있었습니다.** 순서가 `직전 무효화 → 새 행 → 발송` 이라 발송이 실패하면 **유효한 코드가 0개**였고, 이미 받아 둔 코드를 넣어도 `NO_PENDING_PHONE_VERIFICATION` 이었습니다. 순서를 `새 행 → 발송 → **성공 시** 직전 무효화`로 바꿨습니다. 이제 재발송 성공=직전 죽음 / 재발송 실패=**직전 생존** → **입력 칸을 막지 않는 게 맞습니다** |
@@ -236,7 +237,7 @@
 - [ ] 혜택 문구를 **「번호당 한 번」** 으로 (Q12)
 - [ ] 팝업·설정 거부 고지를 **「거부하셔도 서비스 이용에 제한이 없습니다」** 로 (Q13)
 - [ ] 접힌 고지에 **수집 항목·목적 노출** + 카카오 심사용 **펼친 캡처** 가능하게 (Q14)
-- [ ] 🟡 체험 날짜 전/후를 그리실 거면 `trial_last_day_before`/`after` **요청 주세요** (Q1)
+- [ ] 체험 날짜 전/후는 **`reward.trial_last_day_before`/`after`** 로 찍기 — 역산 금지 (Q1)
 
 ---
 

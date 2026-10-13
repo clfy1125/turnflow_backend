@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import timedelta
+from datetime import date, timedelta
 
 import pytest
 from django.contrib.auth import get_user_model
@@ -415,6 +415,42 @@ class TestReward:
         assert res.data["reward"]["days"] == 7
         sub.refresh_from_db()
         assert abs((sub.current_period_end - (ends + timedelta(days=7))).total_seconds()) < 5
+
+        # ⭐ 화면에 글자로 찍는 날짜는 서버가 준다 — 프론트가 `trial_ends_at − 1일` 로
+        #    역산하면 UTC 자정 근처에서 하루가 틀어지고 그 숫자가 곧 고지 문구가 된다.
+        reward = res.data["reward"]
+        assert reward["trial_last_day_before"] == str(timezone.localdate(ends) - timedelta(days=1))
+        assert reward["trial_last_day_after"] == str(
+            timezone.localdate(sub.current_period_end) - timedelta(days=1)
+        )
+        # 두 날짜의 간격이 보상 일수와 같아야 한다 (한쪽만 −1 하는 실수를 잡는다).
+        before = date.fromisoformat(reward["trial_last_day_before"])
+        after = date.fromisoformat(reward["trial_last_day_after"])
+        assert (after - before).days == 7
+
+    def test_last_day_matches_subscription_property(self, sms_off, api, user):
+        """보상 화면의 날짜와 구독 화면의 날짜가 **같아야** 한다.
+
+        정의가 두 곳(`phone_reward._last_day` / `UserSubscription.trial_last_day`)에 있어
+        한쪽만 고치면 같은 사람에게 서로 다른 '체험 마지막 날'이 보인다 — 그게 곧 허위 고지다.
+        """
+        from apps.billing.models import SubscriptionPlan, SubscriptionStatus
+        from apps.billing.subscription_utils import ensure_subscription
+
+        pro = SubscriptionPlan.objects.filter(name="pro", is_active=True).first()
+        if pro is None:
+            pytest.skip("dev DB 에 pro 플랜이 없다")
+        sub = ensure_subscription(user)
+        sub.plan = pro
+        sub.status = SubscriptionStatus.TRIALING
+        sub.current_period_end = timezone.now() + timedelta(days=10)
+        sub.trial_used_at = timezone.now()
+        sub.save()
+
+        res = self._verify_flow(api, user)
+        assert res.data["reward"]["kind"] == "trial_extended"
+        sub.refresh_from_db()
+        assert res.data["reward"]["trial_last_day_after"] == str(sub.trial_last_day)
 
     def test_new_signup_gets_nothing(self, sms_off, api, user):
         """인증이 **필수**인 신규 가입자는 보상 대상이 아니다 (중복 지급 방지)."""

@@ -67,6 +67,13 @@ class RewardResult:
     days: int = 0
     reason: str = ""
     trial_ends_at: Any = None
+    # ⭐ 화면에 **글자로 찍는** 날짜. `trial_ends_at` 에서 프론트가 역산하지 않게 서버가 준다.
+    #    "체험 마지막 날 11월 13일 → 11월 20일" 완료 화면이 이 두 개로 그려진다.
+    #    `before` 는 혜택 **적용 전**, `after` 는 **적용 후**. 체험이 없던 사람(trial_granted)은
+    #    before 가 None 이고, 유료 연장(paid_extended)은 체험이 아니라 **둘 다 None** 이다
+    #    (그쪽 날짜는 '다음 결제일' 이라 −1 일 하면 안 된다 — `trial_ends_at` 을 그대로 쓸 것).
+    trial_last_day_before: Any = None
+    trial_last_day_after: Any = None
 
     def as_dict(self) -> dict:
         return {
@@ -74,7 +81,23 @@ class RewardResult:
             "days": self.days,
             "reason": self.reason,
             "trial_ends_at": self.trial_ends_at.isoformat() if self.trial_ends_at else None,
+            "trial_last_day_before": (
+                self.trial_last_day_before.isoformat() if self.trial_last_day_before else None
+            ),
+            "trial_last_day_after": (
+                self.trial_last_day_after.isoformat() if self.trial_last_day_after else None
+            ),
         }
+
+
+def _last_day(moment):
+    """만료 시각 → 사용자에게 보여줄 **마지막 이용일**(KST 날짜). 없으면 None.
+
+    ⚠️ 정의는 ``UserSubscription.trial_last_day`` 와 **같아야 한다.** 같은 사람이 보는
+       구독 화면과 보상 완료 화면이 하루 어긋나면 그게 곧 허위 고지다. 바꿀 일이 생기면
+       **두 곳을 같이** 고칠 것(거기 docstring 에 이유가 적혀 있다).
+    """
+    return None if moment is None else timezone.localdate(moment) - timedelta(days=1)
 
 
 def is_enabled() -> bool:
@@ -195,10 +218,13 @@ def _apply_by_state(user, *, apply: bool) -> RewardResult:
         if days <= 0:
             return RewardResult(kind=KIND_NONE, reason=REASON_NOT_ELIGIBLE)
         if not apply:
+            extended = sub.current_period_end + timedelta(days=days)
             return RewardResult(
                 kind=KIND_TRIAL_EXTENDED,
                 days=days,
-                trial_ends_at=sub.current_period_end + timedelta(days=days),
+                trial_ends_at=extended,
+                trial_last_day_before=_last_day(sub.current_period_end),
+                trial_last_day_after=_last_day(extended),
             )
         with transaction.atomic():
             locked = (
@@ -208,6 +234,7 @@ def _apply_by_state(user, *, apply: bool) -> RewardResult:
             )
             if locked.status != SubscriptionStatus.TRIALING or locked.current_period_end is None:
                 return RewardResult(kind=KIND_NONE, reason=REASON_NOT_ELIGIBLE)
+            before_end = locked.current_period_end
             locked.current_period_end = locked.current_period_end + timedelta(days=days)
             locked.save(update_fields=["current_period_end", "updated_at"])
             _mark_granted(user, now)
@@ -215,17 +242,24 @@ def _apply_by_state(user, *, apply: bool) -> RewardResult:
             "phone_reward: 체험 +%s일 user=%s -> %s", days, user.id, locked.current_period_end
         )
         return RewardResult(
-            kind=KIND_TRIAL_EXTENDED, days=days, trial_ends_at=locked.current_period_end
+            kind=KIND_TRIAL_EXTENDED,
+            days=days,
+            trial_ends_at=locked.current_period_end,
+            trial_last_day_before=_last_day(before_end),
+            trial_last_day_after=_last_day(locked.current_period_end),
         )
 
     # ② 체험을 아직 안 썼다 → 자동 프로 체험(30일)을 그대로 쓴다.
     #    ⚠️ 여기서 7일짜리를 따로 만들면 ``trial_used_at`` 이 찍혀 30일 자격이 날아간다.
     if auto_trial.check_eligibility(user, sub) is None:
         if not apply:
+            starts = now + timedelta(days=auto_trial.trial_days())
             return RewardResult(
                 kind=KIND_TRIAL_GRANTED,
                 days=auto_trial.trial_days(),
-                trial_ends_at=now + timedelta(days=auto_trial.trial_days()),
+                trial_ends_at=starts,
+                # 체험이 **없던** 사람이라 '적용 전' 날짜가 존재하지 않는다 → before 는 None.
+                trial_last_day_after=_last_day(starts),
             )
         granted, reason = auto_trial.grant(user, source="phone_verified", provider="phone")
         if granted is None:
@@ -236,6 +270,7 @@ def _apply_by_state(user, *, apply: bool) -> RewardResult:
             kind=KIND_TRIAL_GRANTED,
             days=auto_trial.trial_days(),
             trial_ends_at=granted.current_period_end,
+            trial_last_day_after=_last_day(granted.current_period_end),
         )
 
     # ③ 유료 구독 중 → 기본 미지급(실매출 이연). 환경변수로만 켠다.

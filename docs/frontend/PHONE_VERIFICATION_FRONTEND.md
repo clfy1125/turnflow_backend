@@ -76,7 +76,9 @@ Base: `https://api.turnflow.link/api/v1` (dev: `https://dev-api.turnflow.link/ap
   "sms_marketing_opt_in": false,
   "resend_after": 0,
   "daily_remaining": 5,
-  "reward": { "kind": "trial_extended", "days": 7, "reason": "", "trial_ends_at": "2026-11-16T00:00:00+09:00" }
+  "reward": { "kind": "trial_extended", "days": 7, "reason": "",
+              "trial_ends_at": "2026-11-16T00:00:00+09:00",
+              "trial_last_day_before": "2026-11-08", "trial_last_day_after": "2026-11-15" }
 }
 ```
 
@@ -104,7 +106,8 @@ Base: `https://api.turnflow.link/api/v1` (dev: `https://dev-api.turnflow.link/ap
   "expires_in": 180,        // 초 — 입력 화면 타이머
   "resend_after": 60,       // 초 — 재발송 버튼 비활성 시간
   "daily_remaining": 4,
-  "reward": { "kind": "trial_extended", "days": 7, "reason": "", "trial_ends_at": "..." }
+  "reward": { "kind": "trial_extended", "days": 7, "reason": "", "trial_ends_at": "...",
+              "trial_last_day_before": "2026-11-08", "trial_last_day_after": "2026-11-15" }
 }
 ```
 
@@ -119,7 +122,9 @@ Base: `https://api.turnflow.link/api/v1` (dev: `https://dev-api.turnflow.link/ap
 {
   "detail": "휴대폰 인증이 완료되었습니다.",
   "user": { /* GET /auth/me/ 와 같은 전체 프로필 */ },
-  "reward": { "kind": "trial_extended", "days": 7, "reason": "", "trial_ends_at": "2026-11-16T00:00:00+09:00" }
+  "reward": { "kind": "trial_extended", "days": 7, "reason": "",
+              "trial_ends_at": "2026-11-16T00:00:00+09:00",
+              "trial_last_day_before": "2026-11-08", "trial_last_day_after": "2026-11-15" }
 }
 ```
 
@@ -154,6 +159,13 @@ Base: `https://api.turnflow.link/api/v1` (dev: `https://dev-api.turnflow.link/ap
 제안: *"삭제하면 혜택·이벤트 안내를 받지 못합니다. 결제·체험 안내는 이메일로 계속 발송됩니다."*
 
 ---
+
+> ⭐ **화면에 날짜를 찍을 땐 `trial_last_day_before` / `trial_last_day_after`(KST 날짜)를
+> 쓰세요** — "체험 마지막 날 11월 8일 → 11월 15일" 이 그대로 그려집니다.
+> ⚠️ `trial_ends_at` 은 **만료가 일어나는 시각 그 자체**라 날짜로 찍으면 하루 더 써도 되는
+> 것처럼 보입니다. `−1일` 역산 금지 — UTC 자정 근처에서 하루가 틀어지고 그게 곧 고지 문구입니다.
+> `trial_granted` 는 `before` 가 `null`(체험이 없던 사람), `paid_extended` 는 둘 다 `null`
+> (체험이 아니라 다음 결제일 — `trial_ends_at` 을 쓰세요).
 
 ## 4. 화면 3종
 

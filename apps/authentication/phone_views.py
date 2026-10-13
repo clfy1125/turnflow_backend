@@ -145,6 +145,14 @@ class PhoneSendCodeView(APIView):
 ## 비즈니스 로직
 - `reward` 는 **예고**입니다(지급되지 않음). `verify` 성공 시 같은 모양의 값이
   실제 지급 결과로 돌아옵니다. 두 값은 같은 판정 함수를 쓰므로 어긋나지 않습니다.
+- ⭐ **화면에 날짜를 찍을 때는 `trial_last_day_before` / `trial_last_day_after`(KST 날짜)를
+  쓰세요.** "체험 마지막 날 11월 8일 → 11월 15일" 이 그대로 그려집니다.
+  ⚠️ `trial_ends_at` 은 **만료가 일어나는 시각 그 자체**라 날짜로 찍으면 하루 더 써도 되는
+  것처럼 보입니다. 프론트에서 `−1일` 로 역산하지 마세요 — UTC 자정 근처에서 하루가
+  틀어지는데 그 숫자가 곧 고지 문구입니다(같은 이유로 `UserSubscription.trial_last_day`
+  를 서버로 올린 전례가 있습니다).
+  · `trial_granted` = 체험이 **없던** 사람이라 `before` 가 `null` (화살표 없이 한 날짜만)
+  · `paid_extended` = 체험이 아니라 **둘 다 `null`** → 그쪽은 `trial_ends_at`(다음 결제일)
 - `reward.kind === "none"` 이면 보상 문구를 **숨기세요**. 있지도 않은 혜택을
   약속하면 그대로 허위 고지가 됩니다.
 - `resend_after` 는 **지금 발송을 요청하면 몇 초 뒤에 가능한가**입니다. 0 이면 즉시 가능.
@@ -161,7 +169,8 @@ class PhoneSendCodeView(APIView):
   "resend_after": 0,
   "daily_remaining": 5,
   "pending": { "phone_masked": "010-****-5678", "expires_in": 142, "attempts_left": 5 },
-  "reward": { "kind": "none", "days": 0, "reason": "already_granted", "trial_ends_at": null }
+  "reward": { "kind": "none", "days": 0, "reason": "already_granted",
+              "trial_ends_at": null, "trial_last_day_before": null, "trial_last_day_after": null }
 }
 ```
 
@@ -202,6 +211,8 @@ if (!s.phone_verified && s.reward.kind !== 'none') showPhonePopup(s.reward.days)
                                 "days": 7,
                                 "reason": "",
                                 "trial_ends_at": "2026-11-16T00:00:00+09:00",
+                                "trial_last_day_before": "2026-11-08",
+                                "trial_last_day_after": "2026-11-15",
                             },
                         },
                     )
@@ -324,7 +335,9 @@ if (!s.phone_verified && s.reward.kind !== 'none') showPhonePopup(s.reward.days)
   "expires_in": 180,
   "resend_after": 60,
   "daily_remaining": 4,
-  "reward": { "kind": "trial_extended", "days": 7, "reason": "", "trial_ends_at": "2026-11-16T00:00:00+09:00" }
+  "reward": { "kind": "trial_extended", "days": 7, "reason": "",
+              "trial_ends_at": "2026-11-16T00:00:00+09:00",
+              "trial_last_day_before": "2026-11-08", "trial_last_day_after": "2026-11-15" }
 }
 ```
 `reward` 는 **아직 지급되지 않은 예고**입니다(부작용 없음). 인증을 마치면 같은 모양의
@@ -374,6 +387,8 @@ curl -X POST https://api.turnflow.link/api/v1/auth/me/phone/ \\
                                 "days": 7,
                                 "reason": "",
                                 "trial_ends_at": "2026-11-16T00:00:00+09:00",
+                                "trial_last_day_before": "2026-11-08",
+                                "trial_last_day_after": "2026-11-15",
                             },
                         },
                     )
@@ -654,7 +669,9 @@ class PhoneVerifyView(APIView):
 {
   "detail": "휴대폰 인증이 완료되었습니다.",
   "user": { "phone": "010-1234-5678", "phone_verified": true, "phone_verification_required": false },
-  "reward": { "kind": "trial_extended", "days": 7, "reason": "", "trial_ends_at": "2026-11-16T00:00:00+09:00" }
+  "reward": { "kind": "trial_extended", "days": 7, "reason": "",
+              "trial_ends_at": "2026-11-16T00:00:00+09:00",
+              "trial_last_day_before": "2026-11-08", "trial_last_day_after": "2026-11-15" }
 }
 ```
 
@@ -700,6 +717,8 @@ if (!res.ok && data.code === 'PHONE_CODE_INVALID') {
                                 "days": 7,
                                 "reason": "",
                                 "trial_ends_at": "2026-11-16T00:00:00+09:00",
+                                "trial_last_day_before": "2026-11-08",
+                                "trial_last_day_after": "2026-11-15",
                             },
                         },
                     )
