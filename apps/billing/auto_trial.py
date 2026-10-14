@@ -52,6 +52,9 @@ REASON_NOT_NEW_USER = "not_new_user"  # 가입 후 허용 창을 넘었다 (창�
 REASON_NOT_AD_ATTRIBUTED = "not_ad_attributed"  # 광고 귀속 아님 (그 판정을 켠 경우만)
 REASON_PENDING_DELETION = "account_pending_deletion"  # 탈퇴 유예 중
 REASON_PLAN_UNAVAILABLE = "plan_unavailable"  # 대상 플랜이 DB 에 없다 (운영 사고)
+REASON_SUBSCRIPTION_UNAVAILABLE = (
+    "subscription_unavailable"  # 구독 행을 잠그지 못했다 (동시 요청 경쟁 — 다음 호출에 지급됨)
+)
 
 # 광고로 판정할 채널 — analytics.channels 의 유료 광고 계열.
 # ⚠️ 기본 정책에서는 쓰이지 않는다(REQUIRE_AD_ATTRIBUTION=False). 켤 때를 위한 정의.
@@ -162,12 +165,24 @@ def grant(
         logger.error("auto_trial: 대상 플랜(%s)이 DB 에 없음", plan_name())
         return None, REASON_PLAN_UNAVAILABLE
 
-    sub = ensure_subscription(user)
-    locked = (
-        UserSubscription.objects.select_for_update(of=("self",))
-        .select_related("plan")
-        .get(pk=sub.pk)
-    )
+    ensure_subscription(user)
+    try:
+        # ⚠️ `ensure_subscription()` 이 돌려주는 것은 **요청 시작 시점에 캐시된**
+        #    `user.subscription` 일 수 있다(auto_trial_views.post 의 같은 주의 참고).
+        #    그 객체의 `pk` 로 읽으면 캐시가 가리키는 행이 더 이상 없을 때
+        #    `DoesNotExist` 가 그대로 튀어나가 **500** 이 된다(prod 실측 2026-10-14 16:41).
+        #    권위 키인 `user_id` 로 읽어 캐시에 기대지 않는다.
+        locked = (
+            UserSubscription.objects.select_for_update(of=("self",))
+            .select_related("plan")
+            .get(user_id=user.pk)
+        )
+    except UserSubscription.DoesNotExist:
+        # 동시 요청 경쟁 등으로 방금 보장한 행이 이 트랜잭션에서 안 보이는 경우.
+        # 지급 실패는 500 이 아니라 **사유**로 돌려준다 — 이 엔드포인트는 지급/미지급
+        # 둘 다 200 이 계약이고, 다음 호출에서 정상 지급된다.
+        logger.error("auto_trial: 구독 행을 잠그지 못함 user=%s", getattr(user, "pk", None))
+        return None, REASON_SUBSCRIPTION_UNAVAILABLE
 
     reason = check_eligibility(user, locked, now=now)
     if reason is not None:

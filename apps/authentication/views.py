@@ -681,10 +681,20 @@ class TokenRefreshView(generics.GenericAPIView):
         },
     )
     def post(self, request):
+        from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
         from rest_framework_simplejwt.serializers import TokenRefreshSerializer
 
         serializer = TokenRefreshSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+        try:
+            serializer.is_valid(raise_exception=True)
+        except TokenError as exc:
+            # ⚠️ simplejwt 의 기본 `TokenRefreshView` 가 하는 변환을 이 커스텀 뷰가
+            #    빠뜨리고 있었다. `TokenRefreshSerializer.validate()` 는 만료/위조 토큰에
+            #    대해 DRF 예외가 아닌 **`TokenError`** 를 던지므로, 그대로 두면 DRF 핸들러가
+            #    못 잡고 **500** 으로 나간다(prod 실측 2026-10-14 17:25).
+            #    세션이 그냥 만료된 것뿐인데 프론트는 "서버 고장"과 구별할 수 없었다.
+            #    `InvalidToken` 은 `AuthenticationFailed` 계열이라 401 + §6 envelope 로 나간다.
+            raise InvalidToken(exc.args[0]) from exc
 
         return Response(serializer.validated_data, status=status.HTTP_200_OK)
 
