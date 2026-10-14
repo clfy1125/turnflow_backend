@@ -4245,17 +4245,28 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
             "**메시징 창(댓글 7일 / DM 24시간)이 남아 있는 한 자동으로 다시 큐에 들어갑니다** "
             "(재개 응답의 `revive_queued`). 즉 정지는 '취소'가 아니라 '보류'입니다.\n\n"
             "응답은 **목록 항목과 동일한 형태(통계 enrichment 포함)** 의 갱신된 캠페인 객체라,"
-            " 인라인 토글 후 해당 1건만 교체하면 됩니다."
+            " 인라인 토글 후 해당 1건만 교체하면 됩니다.\n\n"
+            "**이미 정지 상태여도 200** 입니다(상태 전제 없음). 게시물 제한으로 **시스템이 자동 "
+            "정지**(`auto_paused_at` 있음)한 캠페인에 이 API 를 보내면 그 표식을 **비웁니다** "
+            "— 사용자가 직접 끈 것으로 바뀌므로 응답의 `auto_paused_at`·`auto_paused_reason` 은 "
+            '각각 `null`·`""` 입니다. 제한 때문에 재개(`resume`)가 409 로 막히는 캠페인을 '
+            "사용자가 끌 수 있는 **유일한 경로**이니, 그 행의 토글 끄기는 이 API 로 보내세요."
         ),
         responses={200: AutoDMCampaignListSerializer},
         tags=["Auto DM"],
     )
     @action(detail=True, methods=["post"])
     def pause(self, request, pk=None):
-        """캠페인 일시정지"""
+        """캠페인 일시정지 (시스템 자동 정지 표식은 '사용자 정지'로 전환)"""
         campaign = self.get_object()
         campaign.status = AutoDMCampaign.Status.PAUSED
-        campaign.save()
+        # 사용자가 직접 껐다 → 시스템 자동 정지 표식 해제. 안 지우면 프론트 행이 계속
+        # "게시물 제한 · 켜짐"으로 보여 사용자가 끈 사실이 화면에서 지워진다(2026-10-14 프론트 보고).
+        # 스위퍼는 status=ACTIVE 만 보므로, 표식을 지워도 정지 상태인 동안 다시 잡히지 않는다.
+        campaign.clear_auto_pause()
+        campaign.save(
+            update_fields=["status", "auto_paused_at", "auto_paused_reason", "updated_at"]
+        )
         serializer = self.get_serializer(campaign)
         return Response(serializer.data)
 
@@ -4559,7 +4570,15 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
             try:
                 if op == "pause":
                     campaign.status = AutoDMCampaign.Status.PAUSED
-                    campaign.save(update_fields=["status", "updated_at"])
+                    campaign.clear_auto_pause()  # 단건 pause 와 동일 규칙 (사용자가 직접 껐다)
+                    campaign.save(
+                        update_fields=[
+                            "status",
+                            "auto_paused_at",
+                            "auto_paused_reason",
+                            "updated_at",
+                        ]
+                    )
                 elif op == "resume":
                     # 중복 방지: 같은 게시물에 이미 다른 활성 캠페인이 있으면 이 건만 실패로 격리
                     # (벌크는 건별 부분 성공이므로 raise 하지 않고 failed 에 사유를 담는다).

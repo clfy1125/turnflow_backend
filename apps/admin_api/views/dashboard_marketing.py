@@ -502,7 +502,17 @@ TRIGGER_FEATURE_LABELS = {
     "spam_advanced": "스팸 방어 고급",
     "multi_ig": "다계정 연결",
     "ai_page": "AI 페이지 생성",
+    "ai_tokens": "AI 토큰 소진",
     "analytics_export": "분석 다운로드",
+    "insta_report": "인스타 성장 리포트",
+    "dm_recovery": "실패 DM 복구",
+    # DM 자동화 고급 트리거 (2026-10-14 프론트 요청) — 베이직부터 사용 가능하므로
+    # 이름에 pro 를 넣지 않는다. 기능별로 갈라 둬야 "무엇이 결제를 끌었나"가 보인다.
+    "dm_trigger_all_posts": "모든 게시물 트리거",
+    "dm_trigger_next_media": "다음 새 게시물 트리거",
+    "dm_trigger_story_reply": "스토리 답장 트리거",
+    "dm_follow_gate": "팔로우 확인 후 보상",
+    "dm_trigger_advanced": "DM 고급 트리거(미분류)",
     "pricing_direct": "가격표 직접 진입",
     "direct": "가격표 직접 진입",
     "": "미지정",

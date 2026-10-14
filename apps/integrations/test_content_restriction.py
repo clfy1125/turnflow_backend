@@ -561,6 +561,66 @@ class TestResumeClearsMark:
         assert c.auto_paused_reason == ""
 
 
+# ── 8-2. 사용자가 '끄기' 로 자동정지를 벗어나는 경로 (2026-10-14 프론트 보고) ──
+@pytest.mark.django_db
+class TestPauseClearsMark:
+    """제한으로 재개가 409 인 캠페인을 사용자가 끌 수 있는 유일한 경로."""
+
+    def _auto_paused(self, conn):
+        c = _campaign(conn, _media(), status=AutoDMCampaign.Status.PAUSED)
+        c.auto_paused_at = timezone.now()
+        c.auto_paused_reason = "post_restricted"
+        c.save()
+        return c
+
+    def test_이미_정지된_건에_pause_를_보내도_200(self, client, conn):
+        c = self._auto_paused(conn)
+        r = client.post(f"/api/v1/integrations/auto-dm-campaigns/{c.id}/pause/")
+        assert r.status_code == 200
+
+    def test_pause_가_자동정지_표식을_비운다(self, client, conn):
+        c = self._auto_paused(conn)
+        r = client.post(f"/api/v1/integrations/auto-dm-campaigns/{c.id}/pause/")
+        assert r.status_code == 200
+        # 응답 본문으로 바로 행을 갱신해도 "게시물 제한 · 켜짐" 으로 돌아가지 않아야 한다.
+        assert r.data["auto_paused_at"] is None
+        assert r.data["auto_paused_reason"] == ""
+        c.refresh_from_db()
+        assert c.status == AutoDMCampaign.Status.PAUSED
+        assert c.auto_paused_at is None
+        assert c.auto_paused_reason == ""
+
+    def test_일괄정지도_같은_규칙(self, client, conn):
+        c = self._auto_paused(conn)
+        r = client.post(
+            "/api/v1/integrations/auto-dm-campaigns/bulk-pause/",
+            {"ids": [str(c.id)]},
+            format="json",
+        )
+        assert r.status_code == 200
+        assert r.data["succeeded"] == [str(c.id)]
+        c.refresh_from_db()
+        assert c.auto_paused_at is None
+        assert c.auto_paused_reason == ""
+
+    def test_끈_뒤에도_재개는_여전히_409(self, client, conn):
+        """표식을 지우는 것이 제한 게이트를 뚫는 뒷문이 되면 안 된다."""
+        mid = _media()
+        c = _campaign(conn, mid, status=AutoDMCampaign.Status.ACTIVE)
+        for _ in range(icr.HISTORY_MIN_FAILURES):
+            _log(c, mid, status=SentDMLog.Status.FAILED_NO_TRACE, subcode=SUB)
+        c.status = AutoDMCampaign.Status.PAUSED
+        c.auto_paused_at = timezone.now()
+        c.auto_paused_reason = "post_restricted"
+        c.save()
+
+        assert (
+            client.post(f"/api/v1/integrations/auto-dm-campaigns/{c.id}/pause/").status_code == 200
+        )
+        r = client.post(f"/api/v1/integrations/auto-dm-campaigns/{c.id}/resume/")
+        assert r.status_code == 409
+
+
 # ── 9. 프론트 계약 (2026-09-08 B1·B2·B3·B6) ───────────────────────────
 @pytest.mark.django_db
 class TestFrontendContract:

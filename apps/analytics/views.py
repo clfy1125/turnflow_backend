@@ -268,7 +268,12 @@ class TrackCheckoutEventView(APIView):
 |------|:----:|------|
 | `event` | ✅ | paywall_viewed / checkout_started / pricing_page_viewed / paywall_cta_clicked / plan_selected / feature_limit_reached / premium_feature_attempted |
 | `entry_source` | 선택 | paywall / pricing_page / upgrade_button / direct |
-| `trigger_feature` | 선택 | dm_limit / page_limit / badge_removal / spam_advanced / multi_ig / ai_page / analytics_export / pricing_direct |
+| `trigger_feature` | 선택 | **자유 문자열(40자 이내)** — 서버는 값을 검증하지 않습니다. 현재 쓰는 어휘: dm_limit / page_limit / badge_removal / spam_advanced / multi_ig / ai_page / ai_tokens / analytics_export / insta_report / dm_recovery / dm_trigger_all_posts / dm_trigger_next_media / dm_trigger_story_reply / dm_follow_gate / pricing_direct |
+
+> `trigger_feature` 는 **enum 이 아닙니다**. 새 값을 보내도 400 이 나지 않고 그대로 저장되며,
+> 어드민 대시보드는 라벨이 없으면 원문 키로 표기합니다(집계는 정상). 새 값을 쓰기 시작할 때
+> `dashboard_marketing.TRIGGER_FEATURE_LABELS` 에 한국어 라벨만 추가하면 됩니다 —
+> **백엔드 배포를 기다릴 필요 없이 프론트가 먼저 보내도 됩니다.**
 | `source_page` | 선택 | 발생 화면 경로 |
 | `current_plan` / `required_plan` / `selected_plan` | 선택 | 플랜 컨텍스트 |
 | `usage_count` / `limit_count` | 선택 | 한도 도달 컨텍스트 |

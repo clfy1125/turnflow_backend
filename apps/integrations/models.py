@@ -1061,7 +1061,7 @@ class AutoDMCampaign(models.Model):
         verbose_name="시스템 자동 정지 시각",
         help_text=(
             "게시물이 인스타그램에 의해 제한돼 시스템이 캠페인을 멈춘 시각. "
-            "사용자가 직접 재개하면 비운다."
+            "사용자가 직접 재개하거나 **직접 끄면**(pause) 비운다 — 둘 다 '사용자가 정한 상태'다."
         ),
     )
     auto_paused_reason = models.CharField(
@@ -1086,7 +1086,12 @@ class AutoDMCampaign(models.Model):
         return f"{self.name} ({target})"
 
     def clear_auto_pause(self) -> None:
-        """사용자가 직접 재개할 때 시스템 정지 표식을 지운다 (저장은 호출자 책임)."""
+        """사용자가 직접 재개/정지할 때 시스템 정지 표식을 지운다 (저장은 호출자 책임).
+
+        재개(resume/schedule/PATCH status=active)뿐 아니라 **직접 끄기(pause)** 도 호출한다.
+        게시물 제한으로 재개가 409 인 캠페인은 사용자가 '끄기'로만 벗어날 수 있는데, 표식이
+        남으면 화면이 계속 "게시물 제한 · 켜짐"을 보여 끈 사실이 지워진다.
+        """
         self.auto_paused_at = None
         self.auto_paused_reason = ""
 
