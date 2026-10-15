@@ -868,6 +868,16 @@ curl -X DELETE http://localhost:8000/api/v1/auth/me/delete/ \\
             except Exception:  # noqa: BLE001 - 빌링키 정리 실패가 탈퇴를 막으면 안 됨
                 pass
 
+        # 카카오 앱 연결 끊기 — ⚠️ **user.delete() 보다 먼저** 해야 한다. 행이 사라지면
+        # kakao_id 를 잃어 영영 못 끊고, 그러면 재가입 때 카카오가 동의 화면을 건너뛴다
+        # (= 전화번호를 다시 받을 기회 상실). 실패해도 탈퇴는 계속한다.
+        try:
+            from .account_deletion import release_kakao_link
+
+            release_kakao_link(user)
+        except Exception:  # noqa: BLE001 — unlink 실패가 탈퇴를 막으면 안 됨
+            logger.warning("account_delete: 카카오 unlink 실패 user_id=%s", user.pk, exc_info=True)
+
         # Outstanding refresh token을 블랙리스트에 추가하여 즉시 무효화
         try:
             from rest_framework_simplejwt.token_blacklist.models import OutstandingToken

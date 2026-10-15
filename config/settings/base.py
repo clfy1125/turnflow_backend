@@ -513,6 +513,18 @@ KAKAO_CLIENT_SECRET = config("KAKAO_CLIENT_SECRET", default="")
 # 앱 ID(숫자). 네이티브가 액세스 토큰을 직접 보낼 때 "이 토큰이 우리 앱 것인가"를
 # 확인하는 데 쓴다 = 구글 aud 검사. 비어 있으면 그 경로는 fail-closed 로 막힌다.
 KAKAO_APP_ID = config("KAKAO_APP_ID", default="")
+# 어드민 키 — **탈퇴 시 연결 끊기(unlink) 전용**. 사용자 액세스 토큰 없이 서버가 단독으로
+# 카카오 쪽 앱 연결을 끊을 때 쓴다(탈퇴 시점엔 그 사람 토큰이 이미 없다).
+# ⭐ **왜 unlink 가 필요한가** — 우리 DB 에서 계정을 지워도 카카오 쪽 "턴플로우와 연결됨"
+#    은 남는다. 그러면 그 사람이 다시 가입할 때 카카오가 **이미 연결된 사용자로 보고 동의
+#    화면을 건너뛴다** → 닉네임·이메일·전화번호를 다시 받을 기회가 사라진다.
+# ⚠️ 비어 있으면 unlink 를 **조용히 건너뛴다**(탈퇴 자체는 정상 진행). 외부 호출 실패가
+#    탈퇴를 막으면 안 되기 때문이다 — IG 연동 해제와 같은 원칙.
+# ⚠️ 콘솔에서 **'카카오 로그인' API 로만 범위를 좁히고 prod IP 를 걸어 둔 전용 키**다
+#    (`turnflow-prod-unlink`). 대표 키(전체 API·IP 무제한)를 여기 쓰지 말 것.
+#    DR(GCP) 로 넘어가면 그쪽 IP 를 콘솔에 추가해야 unlink 가 돈다 — NCP SENS 와 같은 함정.
+# ❌ 평문 로그 금지 (지침 14).
+KAKAO_ADMIN_KEY = config("KAKAO_ADMIN_KEY", default="")
 
 # Redis & Caching
 REDIS_HOST = config("REDIS_HOST", default="localhost")

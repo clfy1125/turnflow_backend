@@ -221,8 +221,7 @@ def fetch_profile(access_token: str) -> KakaoProfile:
         # 필요한 필드만 요청한다 (개인정보 최소 수집 — 지침 5-6).
         params={
             "property_keys": (
-                '["kakao_account.email","kakao_account.profile",'
-                '"kakao_account.phone_number"]'
+                '["kakao_account.email","kakao_account.profile",' '"kakao_account.phone_number"]'
             )
         },
     )
@@ -293,3 +292,56 @@ def resolve_profile(
     else:
         assert_token_belongs_to_us(access_token)
     return fetch_profile(access_token)
+
+
+def unlink_by_kakao_id(kakao_id: str | int) -> bool:
+    """탈퇴 시 **카카오 쪽 앱 연결을 끊는다**. 성공하면 True.
+
+    ⭐ **왜 필요한가** — 우리 DB 에서 계정을 지워도 카카오 쪽 "턴플로우와 연결됨" 은 남는다.
+       카카오는 **이미 연결된 사용자에게 동의 화면을 띄우지 않으므로**, 그 사람이 다시
+       가입할 때 닉네임·이메일·전화번호를 **다시 받을 기회가 영영 사라진다.**
+       (2026-10-15 실측: 탈퇴 후 재로그인했는데 동의 화면 없이 그대로 통과)
+
+    ⭐ **어드민 키를 쓰는 이유** — 탈퇴 시점엔 그 사용자의 액세스 토큰이 없다. 서버가
+       단독으로 끊으려면 어드민 키 + `target_id` 방식뿐이다.
+
+    ⚠️ **실패해도 예외를 던지지 않는다.** 이 함수를 부르는 곳은 탈퇴 흐름이고, 외부 호출
+       실패가 탈퇴를 막으면 안 된다(IG 연동 해제와 같은 원칙). 실패는 로그로만 남긴다.
+
+    ⚠️ **되돌릴 수 없다.** 끊긴 사용자는 다음 로그인이 '첫 연결'이 되어 동의 화면을 다시
+       본다 — 그게 목적이다. 탈퇴 유예 중 복구(restore)해도 카카오 연결은 안 살아난다
+       (IG 와 같은 성질 — 복구 안내에 그 사실이 들어가야 한다).
+    """
+    admin_key = getattr(settings, "KAKAO_ADMIN_KEY", "")
+    if not admin_key:
+        # 키가 없으면 조용히 건너뛴다 — 설정 누락이 탈퇴를 깨뜨리면 안 된다.
+        logger.warning("kakao unlink 건너뜀: KAKAO_ADMIN_KEY 미설정")
+        return False
+    if not kakao_id:
+        return False
+
+    try:
+        with httpx.Client(timeout=TIMEOUT) as client:
+            resp = client.post(
+                f"{KAPI_BASE}/v1/user/unlink",
+                headers={"Authorization": f"KakaoAK {admin_key}"},
+                data={"target_id_type": "user_id", "target_id": str(kakao_id)},
+            )
+    except httpx.HTTPError as exc:
+        logger.warning("kakao unlink 실패(네트워크) kakao_id=%s: %s", kakao_id, exc)
+        return False
+
+    if resp.status_code == 200:
+        logger.info("kakao unlink 성공 kakao_id=%s", kakao_id)
+        return True
+
+    # 이미 끊겨 있거나 없는 사용자 — 목적은 달성된 상태라 경고까지 올리지 않는다.
+    body = _safe_error_body(resp)
+    if body.get("code") == -101:  # not a registered user of this app
+        logger.info("kakao unlink 생략(이미 연결 없음) kakao_id=%s", kakao_id)
+        return True
+
+    logger.warning(
+        "kakao unlink 실패 kakao_id=%s status=%s body=%s", kakao_id, resp.status_code, body
+    )
+    return False

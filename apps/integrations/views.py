@@ -34,7 +34,7 @@ from apps.core.exceptions import DuplicateActiveCampaignError, RestrictedMediaEr
 from apps.core.throttling import AI_GENERATE_THROTTLES
 from apps.workspace.models import Workspace
 
-from . import connect_service, oauth_callback_pages, oauth_return
+from . import connect_service, dm_plan_gate, oauth_callback_pages, oauth_return
 from .campaign_stats import (
     TIMESERIES_RANGES,
     annotate_campaign_stats,
@@ -3987,6 +3987,10 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         except Workspace.DoesNotExist:
             return Response({"error": "Workspace not found"}, status=status.HTTP_404_NOT_FOUND)
 
+        # 프로 전용 4기능 게이트 — 생성은 전부 "새로 켜는 것"이라 current=None.
+        # 플랜 주체는 요청자가 아니라 **워크스페이스 주인**이다(dm_plan_gate 참고).
+        dm_plan_gate.guard(owner=workspace.owner, requested=serializer.validated_data)
+
         # 멀티 IG: body 의 ig_connection_id 가 우선, 미지정 시 첫 활성 connection 사용.
         # validated_data 에 같은 이름의 필드가 남아 있으면 ORM create() 가 충돌하니
         # 먼저 pop 해서 분리한다.
@@ -4105,6 +4109,13 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         campaign = self.get_object()
         serializer = self.get_serializer(campaign, data=request.data, partial=False)
         serializer.is_valid(raise_exception=True)
+        # 프로 전용 4기능 게이트 — **꺼짐→켜짐일 때만** 막는다(같은 값 재전송은 통과).
+        # 재개는 여기 안 걸린다: 값이 안 바뀌므로 features_in 차집합이 비어 있다.
+        dm_plan_gate.guard(
+            owner=campaign.ig_connection.workspace.owner,
+            requested=serializer.validated_data,
+            current=campaign,
+        )
         self._guard_update_active_conflict(campaign, serializer.validated_data)
         before = (campaign.media_id, campaign.trigger_type)
         previous_status = campaign.status
@@ -4146,6 +4157,13 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         campaign = self.get_object()
         serializer = self.get_serializer(campaign, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
+        # 프로 전용 4기능 게이트 — **꺼짐→켜짐일 때만** 막는다(같은 값 재전송은 통과).
+        # 재개는 여기 안 걸린다: 값이 안 바뀌므로 features_in 차집합이 비어 있다.
+        dm_plan_gate.guard(
+            owner=campaign.ig_connection.workspace.owner,
+            requested=serializer.validated_data,
+            current=campaign,
+        )
         self._guard_update_active_conflict(campaign, serializer.validated_data)
         before = (campaign.media_id, campaign.trigger_type)
         previous_status = campaign.status
@@ -4692,10 +4710,19 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         source = self.get_object()  # 테넌시/권한 + 404 자동 처리
         in_ser = AutoDMCampaignCopySerializer(data=request.data)
         in_ser.is_valid(raise_exception=True)
-        # ⚠️ 복사에는 제한 게이트를 걸지 않는다 (2026-09-08 제품 결정, 프론트 B5).
+        # ⚠️ 복사에는 **발송량/중복** 게이트를 걸지 않는다 (2026-09-08 제품 결정, 프론트 B5).
         #    복사본은 항상 INACTIVE 라 그 자체로는 한 건도 발송되지 않고, 사용자가 복사한 뒤
-        #    게시물을 바꿔 쓰는 정상 흐름이 있다. 실제 피해는 '활성화'에서 나므로 게이트는
+        #    게시물을 바꿔 쓰는 정상 흐름이 있다. 실제 피해는 '활성화'에서 나므로 그 게이트는
         #    생성(항상 ACTIVE)과 활성화 경로에만 둔다 — _guard_activation_conflict 참고.
+        #
+        # ⭐ 다만 **플랜 기능 게이트는 여기서 건다**(2026-10-15). 성질이 다르다 —
+        #    위 게이트는 "지금 보내도 되나"(상태 의존)이고, 이건 "이 기능을 쓸 자격이 있나"
+        #    (자격 의존)다. 복사본은 새 자동화이므로 프로 기능이 켜진 채로는 못 만든다.
+        #    활성화 시점으로 미루면 **만들어 놓고 영영 못 켜는** 캠페인이 생겨 더 나쁘다.
+        dm_plan_gate.guard(
+            owner=source.ig_connection.workspace.owner,
+            requested=source,  # 복사본은 원본 값을 그대로 물려받는다
+        )
         new_campaign = source.copy(new_name=in_ser.validated_data.get("name") or None)
         # 복사본은 media_id 를 그대로 물려받지만 media_url 은 원본이 비어 있으면 같이 빈다 →
         # 어드민 게시물 링크용 permalink 를 여기서도 백필한다.

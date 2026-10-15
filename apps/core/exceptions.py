@@ -122,10 +122,57 @@ class PlanLimitExceededError(Exception):
         super().__init__(self.message)
 
 
+class PlanRequiredError(Exception):
+    """특정 **기능** 자체가 상위 플랜 전용일 때 (사용량 초과가 아니다).
+
+    ⚠️ ``PlanLimitExceededError``(429) 와 **의미도 상태코드도 다르다.**
+       저건 "이번 달 다 썼다"(기다리거나 결제), 이건 "이 기능은 프로부터"(결제만이 길).
+       프론트가 429 를 '한도 모달', 403+``plan_required`` 를 '요금제 창'으로 분기한다.
+
+    ``feature`` 는 **어느 기능에서 걸렸는지** 알려 준다 — 요금제 창 문구를 기능별로
+    쓸 수 있게 하려는 것이다(없으면 "프로 전용입니다" 한 문장밖에 못 띄운다).
+    """
+
+    def __init__(self, feature: str, required_plan: str = "pro"):
+        self.feature = feature
+        self.required_plan = required_plan
+        self.message = f"'{feature}' requires {required_plan} plan"
+        super().__init__(self.message)
+
+
 def custom_exception_handler(exc, context):
     """
     Custom exception handler that provides standardized error responses
     """
+    # 기능 자체가 상위 플랜 전용 — 403. (사용량 초과 429 와 구분한다)
+    if isinstance(exc, PlanRequiredError):
+        from apps.integrations.dm_plan_gate import FEATURE_LABELS
+
+        label = FEATURE_LABELS.get(exc.feature, "")
+        msg = (
+            f"'{label}' 기능은 프로 요금제에서 사용할 수 있습니다."
+            if label
+            else "프로 요금제에서 사용할 수 있는 기능입니다."
+        )
+        return Response(
+            {
+                # detail/code 는 envelope 과 **함께** 내보낸다 — 이 저장소 규약(지침 §6).
+                "detail": msg,
+                "code": "PLAN_REQUIRED",
+                "success": False,
+                "error": {
+                    "code": 403,
+                    "message": msg,
+                    "details": {
+                        "code": "plan_required",
+                        "required_plan": exc.required_plan,
+                        "feature": exc.feature,
+                    },
+                },
+            },
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
     # Handle plan limit exceeded error
     if isinstance(exc, PlanLimitExceededError):
         error_data = {

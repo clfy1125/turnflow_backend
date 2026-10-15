@@ -236,6 +236,9 @@ def confirm_deletion(*, raw_token: str) -> dict:
     # DB 트랜잭션이 외부 HTTP 를 붙들게 된다. 실패해도 탈퇴는 계속된다.
     instagram = release_ig_connections(user)
 
+    # 카카오 연결 끊기도 같은 이유로 트랜잭션 밖. 실패해도 탈퇴는 계속된다.
+    kakao_unlinked = release_kakao_link(user)
+
     now = timezone.now()
     deadline = _grace_deadline(now)
 
@@ -257,11 +260,12 @@ def confirm_deletion(*, raw_token: str) -> dict:
     _blacklist_tokens(user)
 
     logger.info(
-        "account_deletion: 확정 user_id=%s purge_at=%s paid=%s ig_released=%s",
+        "account_deletion: 확정 user_id=%s purge_at=%s paid=%s ig_released=%s kakao_unlinked=%s",
         user.pk,
         deadline.isoformat(),
         billing.get("was_paid"),
         instagram["released"],
+        kakao_unlinked,
     )
 
     # 접수 확인 + 복구 링크 메일 (best-effort — 실패가 탈퇴를 되돌리면 안 된다)
@@ -331,6 +335,35 @@ def release_ig_connections(user) -> dict:
             failed,
         )
     return {"released": released, "failed": failed}
+
+
+def release_kakao_link(user) -> bool:
+    """탈퇴에 수반되는 **카카오 앱 연결 끊기**. 끊었거나 끊을 게 없으면 True.
+
+    ⭐ **왜 우리 DB 만 지우면 안 되는가** — 카카오 쪽 "턴플로우와 연결됨" 이 남아 있으면,
+    그 사람이 **다시 가입할 때 카카오가 동의 화면을 건너뛴다**(이미 연결된 사용자로 본다).
+    그러면 닉네임·이메일·전화번호를 다시 받을 기회가 사라진다. IG 점유를 유예까지 끌면
+    안 되는 것과 같은 성질이라, **확정 시점에** 끊는다.
+
+    ⚠️ ``kakao_id`` 는 여기서 지우지 않는다 — 나중에 재시도하거나 일괄 정리할 때
+    (``manage.py kakao_unlink_deleted``) 대상을 찾을 열쇠가 그것뿐이다. 실제 파기는
+    ``purge_deleted_accounts`` 가 유예 만료 후에 한다.
+    """
+    kakao_id = (getattr(user, "kakao_id", "") or "").strip()
+    if not kakao_id:
+        return True  # 카카오로 가입한 적이 없다 — 끊을 것이 없다
+
+    from .kakao import unlink_by_kakao_id
+
+    try:
+        ok = unlink_by_kakao_id(kakao_id)
+    except Exception:  # noqa: BLE001 — unlink 실패가 탈퇴를 막으면 안 된다
+        logger.warning("account_deletion: 카카오 unlink 예외 user_id=%s", user.pk, exc_info=True)
+        return False
+
+    if not ok:
+        logger.warning("account_deletion: 카카오 unlink 실패 user_id=%s", user.pk)
+    return ok
 
 
 def _blacklist_tokens(user) -> None:
