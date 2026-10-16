@@ -12,15 +12,20 @@
 NOTE(test-db-not-clean): 테스트 DB 가 깨끗하지 않을 수 있어 내가 만든 객체 기준으로만 단언한다.
 NOTE(pytest-tests-prefix-not-autocollected): 파일명이 tests_*.py 라 자동수집 대상이 아니다 →
     이 파일은 경로를 명시해 실행한다(예: pytest apps/integrations/tests_duplicate_campaign.py).
+    ⚠️ 그래서 2026-10-15 생성 경로에 플랜 게이트가 붙었을 때 any_media/story_reply 케이스
+    2건이 빨간 채로 남아 있었다(둘 다 프로 기능 → 403). 아래 fixture 가 프로를 부여해
+    복구했다 — 게이트 자체는 의도된 동작이고, 여기서 보려는 건 **중복 방지**다.
 """
 
 import uuid
+from datetime import timedelta
 
 import pytest
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 from rest_framework.test import APIClient
 
+from apps.billing.models import SubscriptionPlan, UserSubscription
 from apps.integrations.models import AutoDMCampaign, IGAccountConnection
 from apps.workspace.models import Membership, Workspace
 
@@ -35,6 +40,14 @@ def workspace_and_user(db):
     )
     ws = Workspace.objects.create(name="Dup WS", slug=f"dup-ws-{uuid.uuid4().hex[:8]}", owner=user)
     Membership.objects.create(workspace=ws, user=user, role=Membership.Role.OWNER)
+    # any_media / story_reply 는 **프로 기능**이라 무료 소유자면 생성이 403 이고, 그러면
+    # 이 파일의 관심사인 중복 방지 판정에 닿지도 못한다(2026-10-15 플랜 게이트).
+    plan = SubscriptionPlan.objects.get(name="pro")
+    sub, _ = UserSubscription.objects.get_or_create(user=user, defaults={"plan": plan})
+    sub.plan = plan
+    sub.status = "active"
+    sub.current_period_end = timezone.now() + timedelta(days=20)
+    sub.save()
     return ws, user
 
 

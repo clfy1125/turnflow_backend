@@ -1325,6 +1325,12 @@ class AutoDMCampaign(models.Model):
 
         _meta.fields 인트로스펙션 + EXCLUDE denylist 방식이라, 향후 설정 필드가 추가돼도
         자동으로 복사된다(통계/타임스탬프만 명시적으로 제외).
+
+        ⚠️ **denylist 라 기본이 '복사'다** — 새 필드가 설정이 아니라 **누계·실행기록**이면
+        반드시 여기에 추가할 것. 안 하면 "한 번도 안 돌린 복사본이 이미 다 쓴 상태"로
+        태어난다. 실제 사고: ``public_reply_posted_count`` 가 빠져 있어 복사본이 원본의
+        대댓글 누계(200)를 물려받았고, 기본 상한도 200이라 **켜는 즉시 상한 도달** →
+        대댓글이 한 건도 안 달렸다(prod CS #2c9258cd @brotherfish.official).
         """
         EXCLUDE = {
             "id",
@@ -1342,6 +1348,22 @@ class AutoDMCampaign(models.Model):
             # 설정값 backfill_existing_comments 는 (EXCLUDE 밖이라) 정상 복사된다.
             "backfill_started_at",
             "backfill_stats",
+            # 공개 답글 **누계**. 설정값 public_reply_limit 은 복사하되 누계는 0 에서 시작해야
+            # 한다 — 안 그러면 limit 이 기본값(200)인 복사본은 limit_reached() 가 처음부터
+            # True 라 대댓글을 한 건도 못 단다. DM 발송은 영향이 없어 더 안 보인다.
+            "public_reply_posted_count",
+            # 시스템 자동 정지 표식. 복사본은 한 번도 발송한 적이 없으니 정지된 적도 없다.
+            # 남으면 ①화면이 새 캠페인에 "게시물 제한 · 자동 정지"를 보여주고 ②자동 정지
+            # 스위퍼가 auto_paused_at 이 찍힌 캠페인을 건드리지 않으므로(사용자 재개 존중)
+            # 복사본만 **영구히 스위퍼 사각지대**에 남는다.
+            "auto_paused_at",
+            "auto_paused_reason",
+            # 썸네일 **실패 기록**. 결과(thumbnail_url/source_url/synced_at)는 같은 media_id
+            # 라 그대로 물려받는 게 맞지만(Graph 호출 절약), 재시도 횟수·에러까지 따라오면
+            # 원본이 상한까지 실패한 경우 복사본은 스위퍼 대상
+            # (attempts < THUMBNAIL_MAX_SYNC_ATTEMPTS)에서 빠져 영영 썸네일이 안 생긴다.
+            "thumbnail_sync_attempts",
+            "thumbnail_sync_error",
         }
         data = {}
         for f in self._meta.fields:

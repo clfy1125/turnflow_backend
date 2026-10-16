@@ -11,6 +11,16 @@ POST /api/v1/integrations/auto-dm-campaigns/{id}/copy/
   - 발송 로그(SentDMLog) 미복사
   - 인증 필요(401)
 
+누계·실행기록을 물려주지 않는지(공개답글 누계·자동정지 표식·썸네일 실패기록)는
+`test_campaign_copy_counters.py` 가 본다 — 그쪽은 `make test` 가 자동수집한다.
+
+NOTE(pytest-tests-prefix): 파일명이 tests_*.py 라 `python_files` 패턴 밖 → 자동수집 안 됨.
+    경로를 명시해 실행할 것:
+        docker compose exec web pytest apps/integrations/tests_copy_campaign.py
+    ⚠️ 그래서 2026-10-15 복사 경로에 플랜 게이트가 붙었을 때 이 파일 5건이 빨간 채로
+    남아 있었다(기본 트리거가 ANY_MEDIA = 프로 기능이라 403). 아래 fixture 에서 프로를
+    부여해 복구했다 — 게이트 자체는 의도된 동작이다.
+
 NOTE(test-db-not-clean): 테스트 DB 가 깨끗하지 않을 수 있어 전역 카운트 대신
 내가 만든 캠페인 id 기준으로 단언한다.
 """
@@ -22,6 +32,7 @@ from django.contrib.auth import get_user_model
 from django.utils import timezone
 from rest_framework.test import APIClient
 
+from apps.billing.models import SubscriptionPlan, UserSubscription
 from apps.integrations.models import AutoDMCampaign, IGAccountConnection, SentDMLog
 from apps.workspace.models import Membership, Workspace
 
@@ -34,6 +45,16 @@ def workspace_and_user(db):
     )
     ws = Workspace.objects.create(name="Copy WS", slug="copy-ws", owner=user)
     Membership.objects.create(workspace=ws, user=user, role=Membership.Role.OWNER)
+    # 복사 경로는 **플랜 기능 게이트**를 통과해야 한다(2026-10-15). 여기 캠페인 기본
+    # 트리거가 ANY_MEDIA(='모든 게시물' = 프로 기능)라 무료 소유자면 403 이고,
+    # 그러면 복사 **계약** 자체를 한 건도 검증하지 못한다. 게이트 판정은
+    # tests_dm_plan_gate.py / test_plan_gates.py 담당.
+    plan = SubscriptionPlan.objects.get(name="pro")
+    sub, _ = UserSubscription.objects.get_or_create(user=user, defaults={"plan": plan})
+    sub.plan = plan
+    sub.status = "active"
+    sub.current_period_end = timezone.now() + timedelta(days=20)
+    sub.save()
     return ws, user
 
 
