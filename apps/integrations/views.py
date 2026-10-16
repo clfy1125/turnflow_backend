@@ -31,6 +31,7 @@ from apps.ai_jobs.serializers import (
     DmOpeningDiversifyRequestSerializer,
 )
 from apps.core.exceptions import DuplicateActiveCampaignError, RestrictedMediaError
+from apps.core.ssrf import UnsafeURLError, assert_public_url
 from apps.core.throttling import AI_GENERATE_THROTTLES
 from apps.workspace.models import Workspace
 
@@ -3069,6 +3070,25 @@ class AutoDMCampaignViewSet(viewsets.ModelViewSet):
         caption = (vd.get("caption") or "").strip()
         image_url = (vd.get("image_url") or "").strip()
         media_type = (vd.get("media_type") or "").strip()
+        # SSRF 입구 차단(감사 M-10, 2026-10-16). 이 값은 요청 본문 그대로 워커에 실려가
+        # `_download` 가 fetch 하고, 실패하면 비전 모델에 URL 로 넘어간다 — 즉 **우리 워커와
+        # LLM 프록시 둘 다** 도커 네트워크 안에서 임의 주소를 찌를 수 있는 입구다.
+        # 워커 쪽에도 가드가 있지만(이중 방어), 여기서 막아야 사용자가 400 으로 원인을 안다.
+        # ⚠️ 사유 문자열에 DNS 해석 결과를 담지 않는다 — 내부 IP 를 알려주는 꼴이 된다.
+        if image_url:
+            try:
+                assert_public_url(image_url)
+            except UnsafeURLError as exc:
+                logger.warning(
+                    "[ai-suggest] 안전하지 않은 image_url 거절 user=%s reason=%s",
+                    request.user.pk,
+                    exc,
+                )
+                raise DRFValidationError(
+                    {
+                        "image_url": "이미지 주소가 올바르지 않습니다. 공개된 http(s) 주소만 사용할 수 있습니다."
+                    }
+                ) from None
         media_id = (vd.get("media_id") or "").strip()
         ig_connection_id = vd.get("ig_connection_id")
 

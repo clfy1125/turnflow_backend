@@ -6,7 +6,24 @@
 # Backup secrets & artifacts (GATE-0) — *.example 템플릿은 추적 유지(이름이 달라 매칭 안 됨)
 .env.backup
 .env.bak*
+# ⚠️ 위 `.env.bak*` 는 `.env.production.bak.*` 을 잡지 못한다(접두가 `.env.production`).
+#    2026-10-16 보안점검 실측: prod `/opt/turnflow_backend` 에 롤백용 백업 18개가 쌓여 있었고
+#    전부 `git status` 에 추적 대상으로 떠 있었다 — `git add -A` 한 번이면 DB 비밀번호·
+#    JWT 개인키·META_APP_SECRET·토스/NCP 키가 통째로 GitHub 에 올라간다(커밋된 적은 없었다).
+#    백업 파일명이 자유롭게 붙으므로 접두 전체를 막는다.
+.env.*.bak*
+.env.production.bak*
+.env.production.bak-*
 .deploy.prev
+
+# DB 덤프·아카이브·임시 백업 — prod 작업 디렉터리에 쌓인다.
+# 2026-10-16 실측: /opt/turnflow_backend 에 13MB 전체 덤프(backup_2026-04-22.sql,
+# 고객 테이블 포함)와 email_templates.bak.*.sql 이 **untracked 이면서 ignore 도 안 된 채**
+# `git status` 에 떠 있었다. 추적 중인 *.sql/*.tar.gz/*.bak.* 은 0건이라 전면 차단해도 안전하다.
+*.sql
+*.tar.gz
+*.bak.*
+*.bak-*
 
 # 이메일 템플릿 미리보기 산출물 (scripts/preview_emails.py) — 커밋 불필요
 /email_previews/

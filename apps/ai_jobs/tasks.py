@@ -979,10 +979,24 @@ def run_dm_campaign_assist_job(self, job_id: str):
         if image_url:
             job.set_stage(AiJob.Stage.PREPARING_PROMPT, 15, "게시물 이미지를 불러오는 중입니다.")
             try:
+                from apps.core.ssrf import UnsafeURLError
+
                 from .services.image_resolver import _download
 
                 image_bytes = _download(image_url)
+            except UnsafeURLError as exc:
+                # SSRF 차단(감사 M-10). ⚠️ 여기서 image_url 을 **비워야** 한다 —
+                # 안 비우면 아래 suggest_campaign_fields 가 URL 을 그대로 비전 모델에
+                # 넘기고(dm_campaign_assistant._image_block 의 image_bytes 없을 때 분기),
+                # 그러면 우리가 막은 주소를 **LLM 프록시가 대신 긁는다**. 다운로드만
+                # 막고 URL 을 남겨두면 가드를 우회시키는 셈이 된다.
+                logger.warning(
+                    "dm_assist: 안전하지 않은 image_url 차단 — 이미지 없이 진행. %s", exc
+                )
+                image_bytes = None
+                image_url = ""
             except Exception as exc:  # noqa: BLE001
+                # 네트워크·404 등 평범한 실패는 종전대로 URL 패스스루(모델이 직접 받게).
                 logger.warning("dm_assist: 이미지 다운로드 실패 → URL 패스스루. %s", exc)
                 image_bytes = None
 

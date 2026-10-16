@@ -16,6 +16,13 @@
 #         프록시 불가 → 직결로 API 를 서빙하면 CF 를 우회하는 경로가 열린다(실증됨).
 #
 #    실서버 상태·검증·롤백 절차는 PROD_HARDENING_2026-08-04.md 에 있다.
+#
+#      5) origin-api.turnflow.link 블록 — 실서버에만 있다(2026-09-28 CloudFront 오리진 신설).
+#         ⚠️ 그 블록을 turnflow-api 에서 복제할 때 **3) admin IP 허용목록만 빠져** 2026-09-28~
+#            10-16 동안 https://api.turnflow.link/admin/ 이 전 세계에 열려 있었다(외부 IP 실측 200).
+#            그 블록은 CloudFront 대역을 trusted_proxies 에 넣지 않아 client_ip = CF 엣지 IP 라
+#            IP 허용목록을 복사하면 운영자까지 403 이다 → **/admin 전면 403** 이 정답.
+#            새 오리진 블록을 또 만들 때 반드시 같이 넣을 것. DR(Caddyfile.gcp)에도 동일 사항.
 #    ⚠️ 은퇴한 api.turnflow 로 프론트가 API 를 호출하면 CORS 프리플라이트(OPTIONS)가 301 을 받아
 #       브라우저가 "Redirect is not allowed for a preflight request" 로 전면 차단한다
 #       (2026-08-04 어드민 콘솔 로그인 장애의 원인). 프론트는 turnflow-api.clfy.ai.kr 를 쓸 것.

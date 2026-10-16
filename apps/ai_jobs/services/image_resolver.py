@@ -22,7 +22,7 @@ import logging
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from decouple import config
@@ -30,6 +30,7 @@ from django.conf import settings
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
 
+from apps.core.ssrf import UnsafeURLError, assert_public_url  # noqa: F401 (재노출)
 from apps.pages.image_pipeline import ImageValidationError, process_upload
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,8 @@ _USER_IMAGE_PATTERN = re.compile(r"\{\{user_image:(\d+)\}\}")
 # 다운로드 제한 (Pixabay webformatURL 은 보통 1~2MB 수준)
 _MAX_DOWNLOAD_BYTES = 15 * 1024 * 1024  # 15MB
 _DOWNLOAD_TIMEOUT = 15.0
+# SSRF 가드용 리다이렉트 상한 — hop 마다 공인 IP 를 재검증하므로 무한 추적을 막는다.
+_MAX_DOWNLOAD_REDIRECTS = 5
 
 # 재호스팅 경로 프리픽스 (R2/로컬 공통)
 _HOSTED_PREFIX = "ai_images"
@@ -366,17 +369,40 @@ def _rank_by_relevance(hits: list, query: str) -> list[tuple[int, str]]:
 
 
 def _download(url: str) -> bytes:
-    """원격 이미지 다운로드. 크기 상한 초과 시 예외. (429 대응은 _host_candidate 서킷브레이커가 담당.)"""
-    with httpx.stream("GET", url, timeout=_DOWNLOAD_TIMEOUT, follow_redirects=True) as r:
-        r.raise_for_status()
-        buf = io.BytesIO()
-        total = 0
-        for chunk in r.iter_bytes(chunk_size=64 * 1024):
-            total += len(chunk)
-            if total > _MAX_DOWNLOAD_BYTES:
-                raise ValueError(f"다운로드 크기 초과: >{_MAX_DOWNLOAD_BYTES} bytes")
-            buf.write(chunk)
-        return buf.getvalue()
+    """원격 이미지 다운로드. 크기 상한 초과 시 예외. (429 대응은 _host_candidate 서킷브레이커가 담당.)
+
+    ⚠️ **SSRF 가드**(감사 M-10, 2026-10-16). 이 함수에 들어오는 URL 은 Pixabay 응답만이
+    아니다 — ``POST /api/v1/integrations/auto-dm-campaigns/ai-suggest/`` 의 ``image_url``
+    이 사용자 요청 본문 그대로 흘러들어온다(``apps/ai_jobs/tasks.py`` 의 DM 캠페인 어시스트).
+    가드가 없으면 **로그인한 사용자 누구나** 워커를 시켜 도커 네트워크 내부
+    (``litellm-proxy:4000``·netdata·내부 web 티어)를 긁게 만들 수 있고, 받아온 바이트가
+    비전 모델을 거쳐 ``result_json`` 으로 되돌아온다(= 내용 일부 회수 가능).
+
+    리다이렉트를 **hop 마다 재검증**하는 이유: 공인 주소로 시작해 302 로 내부망에 들어가는
+    우회를 막는다. ``reupload._download`` 와 같은 정책인데, 거기는 urllib opener 로
+    처리하고 여기는 httpx 라 수동 추적한다(``follow_redirects=False`` 가 핵심 —
+    True 로 되돌리면 가드가 **첫 URL 에만** 걸려 사실상 무력해진다).
+    """
+    current = url
+    for _hop in range(_MAX_DOWNLOAD_REDIRECTS + 1):
+        assert_public_url(current)  # 위반 시 UnsafeURLError (호출부가 폴백 처리)
+        with httpx.stream("GET", current, timeout=_DOWNLOAD_TIMEOUT, follow_redirects=False) as r:
+            if r.status_code in (301, 302, 303, 307, 308):
+                location = r.headers.get("Location")
+                if not location:
+                    raise ValueError("Location 없는 리다이렉트")
+                current = urljoin(current, location)
+                continue
+            r.raise_for_status()
+            buf = io.BytesIO()
+            total = 0
+            for chunk in r.iter_bytes(chunk_size=64 * 1024):
+                total += len(chunk)
+                if total > _MAX_DOWNLOAD_BYTES:
+                    raise ValueError(f"다운로드 크기 초과: >{_MAX_DOWNLOAD_BYTES} bytes")
+                buf.write(chunk)
+            return buf.getvalue()
+    raise ValueError(f"리다이렉트 횟수 초과: >{_MAX_DOWNLOAD_REDIRECTS}")
 
 
 def _store_hosted(raw: bytes, *, source_url: str) -> tuple[str, str]:

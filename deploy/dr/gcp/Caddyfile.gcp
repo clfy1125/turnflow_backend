@@ -34,6 +34,19 @@ turnflow-api.clfy.ai.kr {
 		respond "Method Not Allowed" 405
 	}
 
+	# ── [보안 P0-5] Django 관리자 화면(/admin)은 운영자 IP 만. colo Caddyfile 과 동기화 ──
+	#   ⚠️ DR 전환 시 이게 없으면 /admin 이 전 세계에 열린다(콜로에만 있고 여기 없던 상태가
+	#      2026-10-16 점검에서 드러났다). /api/v1/admin/* 은 절대 포함하지 말 것 —
+	#      어드민 콘솔과 외주 marketing_viewer 가 쓰며 JWT + RBAC 로 이미 보호된다.
+	#   client_ip 사용(remote_ip 아님): CF 프록시 뒤에서도 그대로 동작한다.
+	@django_admin_denied {
+		path /admin /admin/*
+		not client_ip 121.133.95.25 14.52.76.113
+	}
+	handle @django_admin_denied {
+		respond "Forbidden" 403
+	}
+
 	# 헬스 → web_dashboard (CF/모니터 일관)
 	@health path /api/v1/healthz /api/v1/healthz/live /api/v1/healthz/ready /api/v1/healthz/diag
 	handle @health {
