@@ -31,6 +31,11 @@ NON_URL_FIELDS: frozenset = frozenset({"email", "phone", "whatsapp"})
 # 정규화 대상 = social 레지스트리 키 중 URL 계열.
 NORMALIZABLE_FIELDS: frozenset = SOCIAL_FIELD_IDS - NON_URL_FIELDS
 
+# 핸들이라는 개념 자체가 없는 필드 — 값은 언제나 주소다.
+# 그래서 ``llldesign36.com`` 처럼 스킴만 빠진 값에 스킴을 채워도 모호하지 않다.
+# (핸들 패턴이 있는 플랫폼에 이 규칙을 쓰면 점 든 핸들이 도메인으로 오인된다.)
+URL_ONLY_FIELDS: frozenset = frozenset({"homepage"})
+
 _ALREADY_LINKED_PREFIXES = ("http://", "https://", "mailto:", "tel:", "//")
 
 
@@ -86,6 +91,8 @@ def normalize_social_value_safe(field_id: str, raw: str) -> str:
         candidate = handle_url(field_id, value[1:].strip("/"))
     elif "/" in value:
         candidate = "https://" + value.lstrip("/")
+    elif field_id in URL_ONLY_FIELDS:
+        candidate = "https://" + value
     else:
         candidate = handle_url(field_id, value)
 

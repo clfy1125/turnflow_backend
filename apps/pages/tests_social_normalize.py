@@ -86,8 +86,22 @@ class TestLeftAlone:
 
         지금 상태(상대경로)보다 나을 게 없으므로 건드리지 않는다.
         """
-        assert normalize_social_value_safe("facebook", "john") == "john"
         assert normalize_social_value_safe("naver_blog", "someone") == "someone"
+        assert normalize_social_value_safe("kakao_talk", "anda830") == "anda830"
+        # 웹 프로필 주소라는 게 없는 플랫폼 — 펼 방법이 아예 없다.
+        assert normalize_social_value_safe("wechat", "jeongeun_p") == "jeongeun_p"
+
+    def test_facebook_handle_expands(self):
+        assert (
+            normalize_social_value_safe("facebook", "choi.sangwon.5")
+            == "https://www.facebook.com/choi.sangwon.5"
+        )
+
+    def test_url_only_field_gets_scheme(self):
+        """homepage 는 핸들 개념이 없어 스킴만 채우면 된다."""
+        assert (
+            normalize_social_value_safe("homepage", "llldesign36.com") == "https://llldesign36.com"
+        )
 
     def test_non_social_block_untouched(self):
         data = {

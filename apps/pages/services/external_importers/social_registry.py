@@ -80,6 +80,9 @@ _ALIAS_TO_ID = {
 # naver_*, kakao_* 등) 은 소스가 항상 full URL 을 주므로 핸들 패턴이 필요 없다.
 _HANDLE_URL = {
     'instagram': 'https://www.instagram.com/{}/',
+    # facebook 은 소스가 항상 full URL 을 줘서 패턴이 없었는데, 사람이 직접 치는
+    # 에디터에서는 핸들이 들어온다(prod 'choi.sangwon.5'). 형식은 확정적이다.
+    'facebook': 'https://www.facebook.com/{}',
     'youtube': 'https://www.youtube.com/@{}',
     'twitter': 'https://twitter.com/{}',
     'tiktok': 'https://www.tiktok.com/@{}',
