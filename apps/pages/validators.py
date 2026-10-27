@@ -9,6 +9,8 @@ from urllib.parse import urlparse
 
 from rest_framework.exceptions import ValidationError
 
+from apps.pages.social_normalize import normalize_social_block_data
+
 # ────────────────────────────────────────────
 # 공통 유틸
 # ────────────────────────────────────────────
@@ -132,6 +134,12 @@ def validate_block_data(block_type: str, data):
     """
     1. data는 dict(object)여야 한다.
     2. 타입별 최소 스키마 검증 수행.
+    3. social 블록이면 SNS 값을 full URL 로 **제자리에서** 정규화한다.
+
+    3번은 검증이 아니라 보정이지만 여기서 한다 — 블록을 쓰는 네 경로(에디터
+    시리얼라이저·AI 생성·AI 잡 적용·외부 임포터)가 모두 이 함수를 지나는
+    유일한 지점이라, 다른 곳에 두면 한 경로가 조용히 빠진다.
+    (렌더러가 값을 그대로 ``<a href>`` 에 쓰므로 핸들이 저장되면 링크가 죽는다.)
     """
     if not isinstance(data, dict):
         raise ValidationError({"data": "data는 JSON object(dict) 여야 합니다."})
@@ -142,3 +150,5 @@ def validate_block_data(block_type: str, data):
         raise ValidationError({"type": f"지원하지 않는 블록 타입입니다: {block_type}"})
 
     validator(data)
+
+    normalize_social_block_data(data)

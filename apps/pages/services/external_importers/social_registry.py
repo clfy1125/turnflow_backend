@@ -106,6 +106,18 @@ def map_social_type(raw_type: Optional[str]) -> Optional[str]:
     return _ALIAS_TO_ID.get(_norm_key(raw_type or ''))
 
 
+def handle_url(field_id: str, handle: str) -> Optional[str]:
+    """플랫폼 핸들 → full URL. 그 플랫폼에 핸들 패턴이 없으면 ``None``.
+
+    ``normalize_social_value`` 는 패턴이 없을 때 ``'https://' + 핸들`` 로 폴백하는데,
+    소스가 항상 full URL 을 주는 임포터에서는 안전해도 사람이 손으로 치는 경로에서는
+    ``https://john`` 같은 가짜 호스트를 만든다. 호출부가 그 경우를 **직접 판단**할 수
+    있도록 폴백 없는 조회를 따로 노출한다.
+    """
+    pattern = _HANDLE_URL.get(field_id)
+    return pattern.format(handle) if pattern else None
+
+
 def normalize_social_value(field_id: str, raw: Optional[str]) -> str:
     """레지스트리 id + 소스 원본 값 → social 블록에 저장할 값.
     ``email``/``phone``/``whatsapp`` 은 raw(렌더러가 mailto:/tel:/wa.me 조립), 그 외는 full URL."""
