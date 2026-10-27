@@ -145,7 +145,7 @@ __BODY__
 | `{{ company_ceo }}` | `김시현` |
 | `{{ company_reg_no }}` | `582-86-03901` |
 | `{{ company_address }}` | `울산광역시 울주군 언양읍 유니스트길 50, 251동 1층 101호` |
-| `{{ company_phone }}` | `070-8098-7102` |
+| `{{ company_phone }}` | `070-5236-4516` |
 
 메일별 변수(예: `{{ full_name }}`, `{{ ticket_id }}`, `{{ action_url }}`)는 각 발송 시점에 추가로 넣으면 됩니다.
 

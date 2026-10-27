@@ -697,7 +697,7 @@ SAMPLE_CONTEXT: dict[str, str] = {
     "company_ceo": "김시현",
     "company_reg_no": "582-86-03901",
     "company_address": "울산광역시 울주군 언양읍 유니스트길 50, 251동 1층 101호",
-    "company_phone": "070-8098-7102",
+    "company_phone": "070-5236-4516",
     "brand_url": "https://turnflow.link",
     # 미리보기에서는 email_previews/ 에 복사된 로컬 PNG 를 참조한다.
     # 실제 발송은 settings.EMAIL_LOGO_URL(R2 공개 URL)이 주입된다.

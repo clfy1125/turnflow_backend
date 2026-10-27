@@ -1401,7 +1401,7 @@ COMPANY_REG_NO = config("COMPANY_REG_NO", default="582-86-03901")
 COMPANY_ADDRESS = config(
     "COMPANY_ADDRESS", default="울산광역시 울주군 언양읍 유니스트길 50, 251동 1층 101호"
 )
-COMPANY_PHONE = config("COMPANY_PHONE", default="070-8098-7102")
+COMPANY_PHONE = config("COMPANY_PHONE", default="070-5236-4516")
 
 # Email token lifetimes
 EMAIL_VERIFICATION_TTL_MINUTES = config("EMAIL_VERIFICATION_TTL_MINUTES", default=30, cast=int)
