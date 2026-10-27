@@ -1080,6 +1080,23 @@ PHONE_VERIFICATION_RETENTION_DAYS = config(
     "PHONE_VERIFICATION_RETENTION_DAYS", default=30, cast=int
 )
 
+# ── 대표번호(제로콜 070) 전화 → 문의 안내 문자 (apps/sms/zerocall.py) ─────────
+# 웹훅 URL 경로 시크릿. 비우면 기능이 꺼진다(웹훅 404). 제로콜 웹훅엔 서명이 없어 이게 유일한 인증.
+ZEROCALL_WEBHOOK_SECRET = config("ZEROCALL_WEBHOOK_SECRET", default="")
+# ⚠️ 단문(EUC-KR 90byte) 안에 둘 것 — 넘으면 LMS 로 단가가 3배 넘게 뛴다(기동 점검 sms.W004).
+ZEROCALL_INQUIRY_SMS_BODY = config(
+    "ZEROCALL_INQUIRY_SMS_BODY",
+    default=(
+        "[턴플로우] 전화 감사합니다\n"
+        "서비스문의 turnflow.link/support\n"
+        "제휴문의 contact@clfy.ai.kr"
+    ),
+)
+ZEROCALL_INQUIRY_COOLDOWN_HOURS = config("ZEROCALL_INQUIRY_COOLDOWN_HOURS", default=24, cast=int)
+# 휴대폰 인증과 NCP 일일 한도를 공유한다 — OTP 상한(PHONE_VERIFY_GLOBAL_DAILY_CAP)보다 한참 낮게.
+ZEROCALL_INQUIRY_HOURLY_CAP = config("ZEROCALL_INQUIRY_HOURLY_CAP", default=30, cast=int)
+ZEROCALL_INQUIRY_DAILY_CAP = config("ZEROCALL_INQUIRY_DAILY_CAP", default=100, cast=int)
+
 # ── 필수화 시점 + 기존 회원 보상 (billing/phone_reward.py 단일 소스) ──────────
 # ⭐ 이 **한 개**의 값이 두 정책을 동시에 가른다. 둘로 나누면 "인증은 필수인데 보상도
 #    받는" 신규 가입자가 생긴다.

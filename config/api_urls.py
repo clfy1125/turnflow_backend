@@ -26,6 +26,8 @@ urlpatterns = [
     path("ai/", include("apps.ai_jobs.urls", namespace="ai_jobs")),
     path("insights/", include("apps.insights.urls", namespace="insights")),
     path("track/", include("apps.analytics.urls", namespace="analytics")),
+    # 대표번호(제로콜) 웹훅 → 문의 안내 문자
+    path("sms/", include("apps.sms.urls", namespace="sms")),
     # 인스타 성장 리포트(프로 전용, PDF). integrations 라우터가 `instagram` 을 ViewSet
     # prefix 로 쓰고 있어 `integrations/instagram/reports/` 는 pk="reports" 로 먹힌다 → 별도 prefix.
     path("insta-reports/", include("apps.insta_reports.urls", namespace="insta_reports")),

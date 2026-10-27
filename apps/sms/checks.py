@@ -20,6 +20,20 @@ def check_sms_configuration(app_configs, **kwargs):
     mock = bool(getattr(settings, "SMS_MOCK_MODE", True))
     missing = [n for n in _REQUIRED if not (getattr(settings, n, "") or "").strip()]
 
+    # 대표번호 안내 문자가 단문 한도를 넘으면 조용히 LMS 로 나가 단가가 3배 넘게 뛴다.
+    from .ncp import SMS_BYTE_LIMIT, sms_byte_length
+
+    inquiry = getattr(settings, "ZEROCALL_INQUIRY_SMS_BODY", "") or ""
+    if inquiry and sms_byte_length(inquiry) > SMS_BYTE_LIMIT:
+        issues.append(
+            Warning(
+                f"ZEROCALL_INQUIRY_SMS_BODY 가 {sms_byte_length(inquiry)}byte 로 단문 한도"
+                f"({SMS_BYTE_LIMIT})를 넘습니다 — LMS 로 발송돼 건당 비용이 3배 넘게 듭니다.",
+                hint="문구를 줄이세요(EUC-KR 기준 한글 2byte).",
+                id="sms.W004",
+            )
+        )
+
     if debug:
         return issues  # 로컬은 Mock 이 정상이다
 

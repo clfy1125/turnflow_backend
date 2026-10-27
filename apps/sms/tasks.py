@@ -169,3 +169,15 @@ def check_health() -> dict:
         sent_today,
     )
     return result
+
+
+@shared_task(name="sms.send_phone_inquiry_guide", ignore_result=True)
+def send_phone_inquiry_guide(from_number: str, call_id: str = "") -> str:
+    """대표번호(제로콜) 전화 → 문의 안내 문자. 판정·발송은 ``apps.sms.zerocall``.
+
+    재시도하지 않는다 — 실패한 안내 문자를 몇 분 뒤에 다시 보내는 것보다, 고객이 다시
+    전화했을 때 보내는 편이 덜 이상하다(쿨다운은 성공·대기 건만 센다).
+    """
+    from .zerocall import send_inquiry_guide
+
+    return send_inquiry_guide(from_number=from_number, call_id=call_id)

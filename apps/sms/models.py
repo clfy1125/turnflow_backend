@@ -30,6 +30,7 @@ def mask_code(body: str) -> str:
 class SmsPurpose(models.TextChoices):
     PHONE_VERIFY = "phone_verify", "휴대폰 본인확인"
     NOTICE = "notice", "정보성 안내"
+    PHONE_INQUIRY = "phone_inquiry", "대표번호 문의 안내"  # 제로콜 ARS → apps.sms.zerocall
 
 
 class SmsStatus(models.TextChoices):
