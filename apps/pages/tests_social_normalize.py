@@ -64,6 +64,23 @@ class TestLeftAlone:
         assert data["phone"] == "010-1234-5678"
         assert data["whatsapp"] == "821012345678"
 
+    def test_value_with_inner_whitespace_is_left_as_is(self):
+        """카카오 공유 문구를 통째로 붙여넣은 값이 prod 에 실제로 있었다.
+
+        스킴만 붙이면 "보세요." 의 점이 호스트의 점으로 읽혀 URL 검사를 통과한다.
+        """
+        pasted = (
+            "카카오톡 오픈채팅을 시작해 보세요. 링크를 선택하면 카카오톡이 실행됩니다. "
+            "https://open.kakao.com/o/sUEF3YRi"
+        )
+        assert normalize_social_value_safe("kakao_talk", pasted) == pasted
+
+    def test_surrounding_whitespace_is_still_normalized(self):
+        assert (
+            normalize_social_value_safe("instagram", "  beopmin77  ")
+            == "https://www.instagram.com/beopmin77/"
+        )
+
     def test_platform_without_handle_pattern_is_left_as_is(self):
         """핸들 패턴이 없는 플랫폼을 억지로 펴면 ``https://john`` 이 된다.
 

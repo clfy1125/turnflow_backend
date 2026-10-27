@@ -75,6 +75,12 @@ def normalize_social_value_safe(field_id: str, raw: str) -> str:
         return raw
     if value.lower().startswith(_ALREADY_LINKED_PREFIXES):
         return raw
+    if any(ch.isspace() for ch in value):
+        # 공백이 든 값은 핸들도 주소도 아니다 — 카카오 공유 문구를 통째로 붙여넣은
+        # 경우가 실제로 있었다("카카오톡 오픈채팅을 ... https://open.kakao.com/o/XXX").
+        # 스킴만 붙이면 "보세요." 의 점이 호스트의 점으로 읽혀 검사를 통과해 버린다.
+        # 무엇을 의도했는지 알 수 없으므로 추측하지 않는다.
+        return raw
 
     if value.startswith("@"):
         candidate = handle_url(field_id, value[1:].strip("/"))
