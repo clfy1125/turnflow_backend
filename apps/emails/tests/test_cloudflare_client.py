@@ -165,6 +165,9 @@ def test_send_email_sync_marks_sent(monkeypatch, settings):
     # 배선하면 SPF/DKIM 정렬이 깨져 전체 메일이 스팸행이 되는데, clfy.ai.kr 에는
     # SPF·DMARC·Cloudflare DKIM 이 없다. 그 사고를 여기서 잡는다.
     settings.SUPPORT_EMAIL = "contact@clfy.ai.kr"
+    # 이 파일은 **레거시 Cloudflare 경로**를 단언한다. 기본 공급자는 ses 라서
+    # 명시하지 않으면 디스패처가 SES 로 가고 아래 monkeypatch 가 먹지 않는다.
+    settings.EMAIL_PROVIDER = "cloudflare"
     log = _pending_log()
 
     mock_send = MagicMock(return_value="cf_provider_id")
@@ -185,7 +188,8 @@ def test_send_email_sync_marks_sent(monkeypatch, settings):
 
 
 @pytest.mark.django_db
-def test_send_email_sync_marks_failed(monkeypatch):
+def test_send_email_sync_marks_failed(monkeypatch, settings):
+    settings.EMAIL_PROVIDER = "cloudflare"
     log = _pending_log()
     monkeypatch.setattr(
         sender,

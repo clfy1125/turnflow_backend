@@ -22,8 +22,12 @@ from django.utils import timezone
 from ..models import EmailLog, EmailStatus, EmailTemplate
 from .cloudflare_client import CloudflareSendError, send_cloudflare_email
 from .renderer import render_template
+from .ses_client import SESSendError, send_ses_email
 
 logger = logging.getLogger(__name__)
+
+# 공급자가 던지는 예외를 하나로 묶어 둔다 — 호출부가 공급자를 알 필요가 없다.
+ProviderSendError = (CloudflareSendError, SESSendError)
 
 
 class EmailTemplateMissing(Exception):
@@ -178,9 +182,15 @@ def send_email_sync(log_id: int) -> EmailLog:
 
     from_name = (log.template.from_name if log.template else "") or settings.EMAIL_FROM_NAME
 
+    # ⚠️ 함수 안에서 이름을 고르는 이유 — 모듈 전역을 **호출 시점에** 찾으므로
+    # 테스트가 ``sender.send_ses_email`` 을 monkeypatch 하면 그대로 먹는다.
+    # import 시점에 dict 로 묶어 두면 패치가 안 걸린다.
+    provider = (getattr(settings, "EMAIL_PROVIDER", "ses") or "ses").lower()
+    provider_send = send_cloudflare_email if provider == "cloudflare" else send_ses_email
+
     log.attempts += 1
     try:
-        message_id = send_cloudflare_email(
+        message_id = provider_send(
             to_email=log.to_email,
             subject=log.subject,
             html_body=log.rendered_html,
@@ -193,7 +203,7 @@ def send_email_sync(log_id: int) -> EmailLog:
         log.provider_message_id = message_id
         log.sent_at = timezone.now()
         log.error_message = ""
-    except CloudflareSendError as exc:
+    except ProviderSendError as exc:
         log.status = EmailStatus.FAILED
         log.error_message = str(exc)[:4000]
     log.save(

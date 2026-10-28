@@ -832,6 +832,15 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": crontab(minute=10),  # 매시 10분, CELERY_TIMEZONE=Asia/Seoul 기준
         "options": {"queue": "billing"},
     },
+    # 매시 25분 — 메일 발송 건강(실패율) 감시. 문자와 **같은 이유**로 존재한다:
+    # 메일이 막히면 가입 인증코드·비밀번호 재설정·결제 영수증이 전부 멈춘다.
+    # ⭐ 이 감시가 없어서 2026-10-19~29 발송 100% 중단이 **10일간 안 보였다**.
+    # ⚠️ 운영 반영은 core/0028_seed_email_health_job.py (이 표는 dev beat 전용).
+    "emails-check-health": {
+        "task": "emails.check_health",
+        "schedule": crontab(minute=25),
+        "options": {"queue": "billing"},
+    },
     # 매일 KST 03:50 — 보존기간 초과 SmsLog(수신번호 보유) + 만료 PhoneVerification 파기.
     # 개인정보 최소 보유 원칙 — 처리방침에 고지한 기간을 코드가 강제한다.
     "sms-purge-old-logs": {
@@ -1342,9 +1351,24 @@ GOOGLE_OAUTH_REDIRECT_URI = config("GOOGLE_OAUTH_REDIRECT_URI", default="")
 YOUTUBE_MOCK_MODE = config("YOUTUBE_MOCK_MODE", default=True, cast=bool)
 YOUTUBE_DAILY_QUOTA = config("YOUTUBE_DAILY_QUOTA", default=10000, cast=int)
 
-# Cloudflare Email Sending (Cloudflare Email Service — transactional email)
-# API 토큰(cfut_…)은 "Email Sending: Edit" 권한 필요. 발신 도메인(turnflow.link)은
-# Cloudflare DNS에 온보딩되어 SPF/DKIM/DMARC 가 검증된 상태여야 실제 발송된다.
+# ── 트랜잭션 메일 공급자 ────────────────────────────────────────────
+# ⚠️ 2026-10-29 Cloudflare Email Sending → **Amazon SES** 로 교체.
+#    CF 는 발신 도메인이 **Cloudflare DNS 존에 있을 때만** 발송을 허용한다.
+#    2026-10-18 turnflow.link 네임서버를 Route 53 으로 옮기면서 존이 빠졌고,
+#    그 순간부터 전 발송이 `email.invalid` 로 거절됐다(10일간 819건 전량 실패,
+#    성공 0). DNS 와 메일 공급자를 **같은 곳**에 두는 것이 교훈이라 SES 로 간다.
+#    `cloudflare` 값은 롤백용으로만 남긴다 — 존이 없어 실제로는 동작하지 않는다.
+EMAIL_PROVIDER = config("EMAIL_PROVIDER", default="ses")  # ses | cloudflare
+
+# Amazon SES v2 (boto3). 자격증명을 비우면 boto3 기본 체인을 쓴다.
+# 발신 도메인 turnflow.link 는 SES 에 Easy DKIM(RSA 2048)으로 등록돼 있고
+# DKIM CNAME 3개는 Route 53 에 자동 게시됐다.
+AWS_SES_REGION = config("AWS_SES_REGION", default="ap-northeast-2")
+AWS_SES_ACCESS_KEY_ID = config("AWS_SES_ACCESS_KEY_ID", default="")
+AWS_SES_SECRET_ACCESS_KEY = config("AWS_SES_SECRET_ACCESS_KEY", default="")
+AWS_SES_CONFIGURATION_SET = config("AWS_SES_CONFIGURATION_SET", default="")
+
+# Cloudflare Email Sending — 레거시(롤백 경로). 존이 사라져 현재는 쓰이지 않는다.
 CLOUDFLARE_EMAIL_API_KEY = config("CLOUDFLARE_EMAIL_API_KEY", default="")
 CLOUDFLARE_EMAIL_ACCOUNT_ID = config(
     "CLOUDFLARE_EMAIL_ACCOUNT_ID", default="65a4ccd1932e500ae946fa11e5b90817"
@@ -1352,6 +1376,14 @@ CLOUDFLARE_EMAIL_ACCOUNT_ID = config(
 EMAIL_FROM_ADDRESS = config("EMAIL_FROM_ADDRESS", default="contact@turnflow.link")
 EMAIL_FROM_NAME = config("EMAIL_FROM_NAME", default="TurnFlow")
 
+# 발송 건강 감시(`emails.check_health`) — 문자(SMS_HEALTH_*)와 같은 규약.
+# ⚠️ 창이 180분인 이유: 메일은 일 ~75통(시간당 3통)이라 60분 창이면 표본
+#    미달로 **영영 판정하지 않는** 감시가 된다.
+EMAIL_HEALTH_WINDOW_MINUTES = config("EMAIL_HEALTH_WINDOW_MINUTES", default=180, cast=int)
+EMAIL_HEALTH_MIN_SAMPLE = config("EMAIL_HEALTH_MIN_SAMPLE", default=5, cast=int)
+EMAIL_HEALTH_WARN_FAIL_RATE = config("EMAIL_HEALTH_WARN_FAIL_RATE", default=0.3, cast=float)
+EMAIL_HEALTH_CRIT_FAIL_RATE = config("EMAIL_HEALTH_CRIT_FAIL_RATE", default=0.6, cast=float)
+EMAIL_HEALTH_REPEAT_HOURS = config("EMAIL_HEALTH_REPEAT_HOURS", default=6, cast=int)
 # Frontend URL (used in email verification / password reset links)
 FRONTEND_URL = config("FRONTEND_URL", default="http://localhost:3000")
 
@@ -1383,9 +1415,9 @@ SERVICE_NAME = config("SERVICE_NAME", default="TurnFlow")
 # 사용자에게 보여주는 문의 주소 + 메일 Reply-To.
 # ⚠️ EMAIL_FROM_ADDRESS(발신)와 **다른 도메인이어도 문제없다** — Reply-To 는 SPF/DKIM
 #    정렬 대상이 아니다. 반대로 발신 주소를 clfy.ai.kr 로 바꾸면 안 된다:
-#    clfy.ai.kr 에는 SPF·DMARC·Cloudflare DKIM 이 없고(MX 는 larksuite 수신 전용),
-#    turnflow.link 만 Cloudflare 발송용으로 온보딩돼 있다(2026-08-21 실측).
-#    바꾸면 전체 메일이 정렬 실패로 스팸행이 된다.
+#    clfy.ai.kr 은 SES 에서 **미확인(unverified)** 상태이고 SPF·DMARC 도 없다
+#    (MX 는 larksuite 수신 전용). turnflow.link 만 SES 에 DKIM 확인돼 있고
+#    `_dmarc` 가 **p=reject** 라, 정렬이 깨지면 스팸이 아니라 **거부**된다.
 SUPPORT_EMAIL = config("SUPPORT_EMAIL", default="contact@clfy.ai.kr")
 
 # Brand / company metadata (email footer, receipts). See rag-docs 01-service-overview.

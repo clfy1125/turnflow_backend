@@ -30,12 +30,16 @@ from .constants import (
     TEMPLATE_WELCOME,
     TEMPLATE_WINBACK,
 )
-from .models import EmailToken, EmailTokenPurpose, OnboardingSchedule
+from .models import EmailStatus, EmailToken, EmailTokenPurpose, OnboardingSchedule
 from .services.sender import EmailTemplateMissing, send_email, send_email_sync
 
 logger = logging.getLogger(__name__)
 
 User = get_user_model()
+
+
+class EmailDeliveryFailed(Exception):
+    """공급자가 메시지를 거절했다 — Celery 재시도를 유발하기 위한 신호."""
 
 
 @shared_task(
@@ -48,6 +52,12 @@ User = get_user_model()
 )
 def send_email_task(log_id: int) -> str:
     log = send_email_sync(log_id)
+    if log.status == EmailStatus.FAILED:
+        # ⚠️ ``send_email_sync`` 은 공급자 예외를 **삼켜서** FAILED 로 적고 정상 반환한다.
+        # 그래서 위의 ``autoretry_for``/``max_retries`` 가 한 번도 돌지 않았다 —
+        # 2026-10-19~29 Cloudflare 발신 중단 때 819건 전량이 재시도 0회로 끝난 원인이다.
+        # 재시도 판단은 태스크의 몫이므로 여기서 다시 올린다(로그는 이미 FAILED 로 남았다).
+        raise EmailDeliveryFailed(log.error_message or "email provider rejected the message")
     return log.status
 
 
@@ -547,3 +557,117 @@ def send_insta_report_ready_email(user_id: int, report_id: str) -> None:
         send_email(TEMPLATE_INSTA_REPORT_READY, user.email, ctx, user=user)
     except EmailTemplateMissing:
         logger.error("insta_report_ready template missing — run seed_email_templates")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 발송 건강 감시
+# ──────────────────────────────────────────────────────────────────────
+# 경보 규약은 ``sms.check_health`` 와 **같다**(등급이 나빠지면 즉시, 같으면 N시간마다
+# 1회, 경보가 나갔던 경우에만 회복). 규약이 갈리면 운영자가 메시지마다 다른 해석을 한다.
+#
+# ⭐ 이 잡이 왜 생겼나 — 2026-10-19 ``turnflow.link`` 존이 Cloudflare 를 떠나면서
+# 발신이 **100% 막혔는데 10일간 아무도 몰랐다**(819건 전량 실패, 성공 0). 문자에는
+# 같은 감시(``sms.check_health``)가 있어서 못 보고 지나칠 수 없는데 메일에는 없었다.
+# 메일이 막히면 가입 인증코드·비밀번호 재설정·결제 영수증이 전부 멈춘다.
+
+_EMAIL_HEALTH_ALERT_STATE_KEY = "ops:email_health:alert_state"
+_EMAIL_HEALTH_STATE_TTL = 60 * 60 * 24 * 30  # 30일
+
+EMAIL_LEVEL_OK = "ok"
+EMAIL_LEVEL_WARN = "warn"
+EMAIL_LEVEL_CRIT = "crit"
+_EMAIL_LEVEL_RANK = {EMAIL_LEVEL_OK: 0, EMAIL_LEVEL_WARN: 1, EMAIL_LEVEL_CRIT: 2}
+
+
+@shared_task(name="emails.check_health", queue="billing")
+def check_email_health() -> dict:
+    """최근 발송 실패율 감시 → 임계 초과면 Telegram 경보.
+
+    표본이 ``EMAIL_HEALTH_MIN_SAMPLE`` 미만이면 **판정하지 않는다** — 1건 중 1건
+    실패를 100% 로 읽으면 경보가 쓰레기가 된다.
+
+    창(``EMAIL_HEALTH_WINDOW_MINUTES``)이 문자(60분)보다 긴 이유는 메일 물량이
+    훨씬 적기 때문이다(일 ~75통 = 시간당 3통). 창이 짧으면 표본 미달로 **영영
+    판정하지 않는** 감시가 된다.
+    """
+    from django.core.cache import cache
+
+    from apps.core.telegram import send_telegram_notification
+
+    from .models import EmailLog
+
+    window_min = int(getattr(settings, "EMAIL_HEALTH_WINDOW_MINUTES", 180))
+    min_sample = int(getattr(settings, "EMAIL_HEALTH_MIN_SAMPLE", 5))
+    warn_rate = float(getattr(settings, "EMAIL_HEALTH_WARN_FAIL_RATE", 0.3))
+    crit_rate = float(getattr(settings, "EMAIL_HEALTH_CRIT_FAIL_RATE", 0.6))
+    repeat_h = int(getattr(settings, "EMAIL_HEALTH_REPEAT_HOURS", 6))
+
+    now = timezone.now()
+    since = now - timedelta(minutes=window_min)
+    recent = EmailLog.objects.filter(created_at__gte=since)
+    total = recent.count()
+    failed = recent.filter(status=EmailStatus.FAILED).count()
+    fail_rate = (failed / total) if total else 0.0
+
+    if total >= min_sample and fail_rate >= crit_rate:
+        level = EMAIL_LEVEL_CRIT
+    elif total >= min_sample and fail_rate >= warn_rate:
+        level = EMAIL_LEVEL_WARN
+    else:
+        level = EMAIL_LEVEL_OK
+
+    state = cache.get(_EMAIL_HEALTH_ALERT_STATE_KEY) or {}
+    last_level = state.get("level", EMAIL_LEVEL_OK)
+    last_ts = float(state.get("ts", 0))
+    now_ts = now.timestamp()
+    result = {
+        "ok": True,
+        "window_minutes": window_min,
+        "attempts": total,
+        "failed": failed,
+        "fail_rate": round(fail_rate, 3),
+        "level": level,
+        "alerted": False,
+    }
+
+    if level == EMAIL_LEVEL_OK:
+        if _EMAIL_LEVEL_RANK[last_level] > 0:  # 경보가 나갔던 에피소드만 회복을 알린다
+            send_telegram_notification(
+                f"🟢 *메일 발송 정상화* — 최근 {window_min}분 {total}건 중 실패 {failed}건"
+            )
+            result["alerted"] = True
+        cache.set(
+            _EMAIL_HEALTH_ALERT_STATE_KEY,
+            {"level": level, "ts": now_ts},
+            _EMAIL_HEALTH_STATE_TTL,
+        )
+        return result
+
+    worsened = _EMAIL_LEVEL_RANK[level] > _EMAIL_LEVEL_RANK[last_level]
+    stale = (now_ts - last_ts) >= repeat_h * 3600
+    if not (worsened or stale):
+        return result
+
+    provider = (getattr(settings, "EMAIL_PROVIDER", "ses") or "ses").lower()
+    sample = recent.filter(status=EmailStatus.FAILED).order_by("-created_at").first()
+    icon = "🔴" if level == EMAIL_LEVEL_CRIT else "🟡"
+    lines = [
+        f"{icon} *메일 발송 이상* (공급자 {provider})",
+        f"최근 {window_min}분 **{total}건 중 {failed}건 실패** ({fail_rate:.0%})",
+        "메일이 막히면 **가입 인증코드·비밀번호 재설정·결제 영수증**이 전부 멈춥니다.",
+    ]
+    if sample is not None:
+        lines.append(f"최근 오류: `{(sample.error_message or '')[:160]}`")
+    lines.append("확인: 발신 도메인 인증 상태 · 자격증명 · 발송 한도 · EmailLog.error_message")
+
+    send_telegram_notification("\n".join(lines))
+    cache.set(
+        _EMAIL_HEALTH_ALERT_STATE_KEY,
+        {"level": level, "ts": now_ts},
+        _EMAIL_HEALTH_STATE_TTL,
+    )
+    result["alerted"] = True
+    logger.error(
+        "메일 발송 경보: level=%s 실패율=%.0f%% (%s/%s)", level, fail_rate * 100, failed, total
+    )
+    return result
